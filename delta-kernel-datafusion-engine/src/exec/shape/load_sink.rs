@@ -20,15 +20,16 @@ use datafusion_physical_plan::{
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::types::{Int32Type, Int64Type};
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, StructArray, UInt32Array,
+    Array, ArrayRef, AsArray, BooleanArray, LargeListArray, ListArray, MapArray, RecordBatch,
+    StructArray, UInt32Array,
 };
 use delta_kernel::arrow::compute::{filter_record_batch, take};
-use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Fields};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
+use delta_kernel::plans::ir::nodes::{DvKind, DvRef, FileType, LoadSink};
 use delta_kernel::scan::selection_vector;
 use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 use delta_kernel::{Engine, FileMeta};
@@ -407,14 +408,37 @@ fn optional_selection_vector_for_row(
     let Some(ref dv_cn) = sink.dv_ref else {
         return Ok(None);
     };
-    let arr = extract_column_array(batch, dv_cn)?;
+    let dv_column = match dv_cn {
+        DvRef::Skip(v) => {
+            if v.kind != DvKind::Descriptor {
+                return Err(crate::error::unsupported(format!(
+                    "Load sink dv_ref.skip kind {:?} is not supported",
+                    v.kind
+                )));
+            }
+            &v.column
+        }
+        DvRef::Keep(v) => {
+            return Err(crate::error::unsupported(format!(
+                "Load sink dv_ref.keep is not supported yet (column `{}` kind {:?})",
+                v.column, v.kind
+            )));
+        }
+        DvRef::KeepDiff(v) => {
+            return Err(crate::error::unsupported(format!(
+                "Load sink dv_ref.keep_diff is not supported yet (dv `{}`, subtract `{}` kind {:?})",
+                v.dv, v.subtract, v.kind
+            )));
+        }
+    };
+    let arr = extract_column_array(batch, dv_column)?;
     if arr.is_null(row) {
         return Ok(None);
     }
     let struct_arr = arr.as_struct_opt().ok_or_else(|| {
         crate::error::internal_error(format!(
             "Load sink dv_ref column `{}` must be a struct matching DeletionVectorDescriptor",
-            dv_cn
+            dv_column
         ))
     })?;
     let descriptor = dv_descriptor_from_struct_row(struct_arr, row)?;
@@ -643,8 +667,99 @@ fn arrow_columns_align_to_schema(
                 f.name()
             ))
         })?;
-        cols.push(batch.column(idx).clone());
+        cols.push(realign_array_to_field(batch.column(idx), f.as_ref())?);
     }
     RecordBatch::try_new(wanted, cols)
         .map_err(|e| crate::error::internal_error(format!("align schema batch failed: {e}")))
+}
+
+fn realign_array_to_field(array: &ArrayRef, target_field: &Field) -> Result<ArrayRef, DeltaError> {
+    match target_field.data_type() {
+        ArrowDataType::Struct(target_fields) => realign_struct_array(array, target_fields),
+        ArrowDataType::List(target_inner) => realign_list_array(array, target_inner.as_ref()),
+        ArrowDataType::LargeList(target_inner) => {
+            realign_large_list_array(array, target_inner.as_ref())
+        }
+        ArrowDataType::Map(target_entries, _) => realign_map_array(array, target_entries.as_ref()),
+        _ => Ok(array.clone()),
+    }
+}
+
+fn realign_struct_array(array: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef, DeltaError> {
+    let struct_arr = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| crate::error::internal_error("expected StructArray while aligning"))?;
+    let new_columns = target_fields
+        .iter()
+        .zip(struct_arr.columns())
+        .map(|(f, c)| realign_array_to_field(c, f.as_ref()))
+        .collect::<Result<Vec<_>, DeltaError>>()?;
+    Ok(Arc::new(StructArray::new(
+        target_fields.clone(),
+        new_columns,
+        struct_arr.nulls().cloned(),
+    )))
+}
+
+fn realign_list_array(
+    array: &ArrayRef,
+    target_element_field: &Field,
+) -> Result<ArrayRef, DeltaError> {
+    let list_arr = array
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| crate::error::internal_error("expected ListArray while aligning"))?;
+    let values = realign_array_to_field(list_arr.values(), target_element_field)?;
+    Ok(Arc::new(ListArray::new(
+        Arc::new(target_element_field.clone()),
+        list_arr.offsets().clone(),
+        values,
+        list_arr.nulls().cloned(),
+    )))
+}
+
+fn realign_large_list_array(
+    array: &ArrayRef,
+    target_element_field: &Field,
+) -> Result<ArrayRef, DeltaError> {
+    let list_arr = array
+        .as_any()
+        .downcast_ref::<LargeListArray>()
+        .ok_or_else(|| crate::error::internal_error("expected LargeListArray while aligning"))?;
+    let values = realign_array_to_field(list_arr.values(), target_element_field)?;
+    Ok(Arc::new(LargeListArray::new(
+        Arc::new(target_element_field.clone()),
+        list_arr.offsets().clone(),
+        values,
+        list_arr.nulls().cloned(),
+    )))
+}
+
+fn realign_map_array(
+    array: &ArrayRef,
+    target_entries_field: &Field,
+) -> Result<ArrayRef, DeltaError> {
+    let map_arr = array
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| crate::error::internal_error("expected MapArray while aligning"))?;
+    let ArrowDataType::Struct(target_entry_fields) = target_entries_field.data_type() else {
+        return Err(crate::error::internal_error(
+            "map entries target must be struct",
+        ));
+    };
+    let entries_ref: ArrayRef = Arc::new(map_arr.entries().clone());
+    let new_entries = realign_struct_array(&entries_ref, target_entry_fields)?;
+    let entries_struct = new_entries
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| crate::error::internal_error("aligned map entries not struct"))?;
+    Ok(Arc::new(MapArray::new(
+        Arc::new(target_entries_field.clone()),
+        map_arr.offsets().clone(),
+        entries_struct.clone(),
+        map_arr.nulls().cloned(),
+        false,
+    )))
 }

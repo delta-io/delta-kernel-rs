@@ -13,10 +13,9 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
-use datafusion_physical_plan::ExecutionPlanProperties;
 use delta_kernel::arrow::array::RecordBatch;
 use futures::{Stream, StreamExt};
 
@@ -41,7 +40,7 @@ impl RelationSinkExec {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             // This sink is executed from partition 0 only; it drains every child partition
-            // internally and materializes to the relation registry as one logical output stream.
+            // internally and materializes to the relation registry partition-by-partition.
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -113,10 +112,11 @@ impl ExecutionPlan for RelationSinkExec {
         for child_partition in 0..self.child.output_partitioning().partition_count() {
             inners.push(self.child.execute(child_partition, Arc::clone(&context))?);
         }
+        let partitioned_batches = (0..inners.len()).map(|_| Vec::new()).collect();
         Ok(Box::pin(RelationSinkStream {
             inners,
             current_inner: 0,
-            batches: Vec::new(),
+            partitioned_batches,
             handle_id: self.handle_id,
             registry: Arc::clone(&self.registry),
             schema: self.schema.clone(),
@@ -128,7 +128,7 @@ impl ExecutionPlan for RelationSinkExec {
 struct RelationSinkStream {
     inners: Vec<SendableRecordBatchStream>,
     current_inner: usize,
-    batches: Vec<RecordBatch>,
+    partitioned_batches: Vec<Vec<RecordBatch>>,
     handle_id: u64,
     registry: Arc<RelationBatchRegistry>,
     schema: delta_kernel::arrow::datatypes::SchemaRef,
@@ -144,15 +144,16 @@ impl Stream for RelationSinkStream {
         }
         loop {
             if self.current_inner >= self.inners.len() {
-                let batches = std::mem::take(&mut self.batches);
-                self.registry.register(self.handle_id, batches);
+                let partitions = std::mem::take(&mut self.partitioned_batches);
+                self.registry
+                    .register_partitions(self.handle_id, partitions);
                 self.registered = true;
                 return Poll::Ready(None);
             }
             let idx = self.current_inner;
             match self.inners[idx].poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
-                    self.batches.push(batch);
+                    self.partitioned_batches[idx].push(batch);
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => {

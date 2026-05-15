@@ -47,7 +47,7 @@
 //! ## Terminals
 //!
 //! - [`DeclarativePlanNode::into_plan`] — explicit sink.
-//! - [`DeclarativePlanNode::into_results`] — sugar for `into_plan(SinkType::Results)`.
+//! - [`DeclarativePlanNode::into_results`] — sugar for `into_plan(SinkType::Results(None))`.
 //! - [`DeclarativePlanNode::into_relation`] — pipe output into a named
 //!   [`RelationHandle`](super::nodes::RelationHandle) for another plan in the same
 //!   `PhaseOperation::Plans(...)` to consume.
@@ -510,8 +510,16 @@ impl DeclarativePlanNode {
     }
 
     /// Terminal: stream every output batch to the caller.
+    ///
+    /// Leaves result schema inference to the executor (`SinkType::Results(None)`).
     pub fn into_results(self) -> Plan {
-        self.into_plan(SinkType::Results)
+        self.into_plan(SinkType::Results(None))
+    }
+
+    /// Terminal: stream every output batch to the caller with an explicit
+    /// output schema contract.
+    pub fn into_results_with_schema(self, schema: SchemaRef) -> Plan {
+        self.into_plan(SinkType::Results(Some(schema)))
     }
 
     /// Terminal: stream every output batch to the named relation. Another
@@ -602,7 +610,7 @@ mod tests {
     use super::*;
     use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
-    use crate::plans::ir::nodes::{OrderingSpec, WindowFunction};
+    use crate::plans::ir::nodes::{DvKind, DvRef, OrderingSpec, WindowFunction};
     use crate::plans::kdf::{ConsumerKdf, Kdf, KdfControl, KdfOutput};
     use crate::schema::{DataType, StructField, StructType};
 
@@ -740,7 +748,6 @@ mod tests {
             },
             dv_ref: None,
             passthrough_columns: vec![],
-            row_index_column: None,
             file_type: FileType::Parquet,
         };
         let plan = DeclarativePlanNode::scan_json(vec![], simple_schema()).into_load(load);
@@ -766,15 +773,17 @@ mod tests {
                 size: None,
                 record_count: None,
             },
-            dv_ref: Some(dv_col.clone()),
+            dv_ref: Some(DvRef::skip(dv_col.clone(), DvKind::Descriptor)),
             passthrough_columns: vec![],
-            row_index_column: None,
             file_type: FileType::Parquet,
         };
         let plan = DeclarativePlanNode::scan_json(vec![], simple_schema()).into_load(load);
         match plan.sink.sink_type {
             SinkType::Load(ls) => {
-                assert_eq!(ls.dv_ref.as_ref(), Some(&dv_col));
+                assert_eq!(
+                    ls.dv_ref.as_ref(),
+                    Some(&DvRef::skip(dv_col.clone(), DvKind::Descriptor))
+                );
                 assert_eq!(ls.output_relation, out_handle);
             }
             other => panic!("expected Load sink, got {other:?}"),
@@ -824,7 +833,7 @@ mod tests {
     fn into_results_terminal() {
         let base = DeclarativePlanNode::scan_json(vec![], simple_schema());
         let results_plan = base.into_results();
-        assert_eq!(results_plan.sink.sink_type, SinkType::Results);
+        assert_eq!(results_plan.sink.sink_type, SinkType::Results(None));
     }
 
     #[test]

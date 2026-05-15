@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use datafusion_common::{JoinType as DfJoinType, NullEquality};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_common::{DFSchema, JoinType as DfJoinType, NullEquality};
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_physical_expr::planner::create_physical_expr;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_plan::joins::{HashJoinExec, JoinOn, PartitionMode};
 use datafusion_physical_plan::ExecutionPlan;
@@ -14,6 +15,7 @@ use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType};
 use delta_kernel::plans::ir::DeclarativePlanNode;
 
 use super::{compile_declarative_node, CompileContext};
+use crate::compile::expr_translator::kernel_expr_to_df;
 
 /// Lower a kernel join to [`HashJoinExec`] for supported join types.
 pub(super) fn compile_join(
@@ -85,20 +87,9 @@ fn join_key_to_physical(
     expr: &Arc<Expression>,
     input: &ArrowSchema,
 ) -> Result<PhysicalExprRef, DeltaError> {
-    match expr.as_ref() {
-        Expression::Column(name) => {
-            let path = name.path();
-            if path.len() != 1 {
-                return Err(crate::error::unsupported(
-                    "only top-level column join keys are supported in the DataFusion engine",
-                ));
-            }
-            let col = Column::new_with_schema(path[0].as_str(), input)
-                .map_err(|e| crate::error::plan_compilation(format!("join key column: {e}")))?;
-            Ok(Arc::new(col) as PhysicalExprRef)
-        }
-        _ => Err(crate::error::unsupported(
-            "only column expressions are supported as join keys in the DataFusion engine",
-        )),
-    }
+    let logical_expr = kernel_expr_to_df(expr.as_ref())?;
+    let input_schema = DFSchema::try_from(input.clone())
+        .map_err(|e| crate::error::plan_compilation(format!("join key schema: {e}")))?;
+    create_physical_expr(&logical_expr, &input_schema, &ExecutionProps::new())
+        .map_err(crate::error::datafusion_err_to_delta)
 }

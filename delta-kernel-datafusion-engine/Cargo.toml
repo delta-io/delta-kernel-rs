@@ -18,6 +18,8 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
 ] }
 
 datafusion-common = { version = "53", default-features = false }
+datafusion = { version = "53", default-features = false }
+datafusion-catalog-listing = { version = "53", default-features = false }
 datafusion-expr = { version = "53", default-features = false }
 datafusion-execution = { version = "53", default-features = false }
 datafusion-physical-expr = { version = "53", default-features = false }
@@ -26,6 +28,7 @@ datafusion-physical-optimizer = { version = "53", default-features = false }
 datafusion-functions-window = { version = "53", default-features = false }
 datafusion-functions = { version = "53", default-features = false }
 datafusion-functions-nested = { version = "53", default-features = false }
+datafusion-functions-json = { version = "0.53", default-features = false }
 datafusion-datasource = { version = "53", default-features = false }
 datafusion-datasource-json = { version = "53", default-features = false }
 datafusion-datasource-parquet = { version = "53", default-features = false }

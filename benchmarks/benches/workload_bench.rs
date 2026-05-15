@@ -29,13 +29,7 @@ fn workload_benchmarks(c: &mut Criterion) {
         match &workload.spec {
             Spec::Read(read_spec) => {
                 for operation in [ReadOperation::ReadMetadata, ReadOperation::ReadData] {
-                    for config in build_read_configs(&workload.table_info.name) {
-                        if matches!(
-                            (&operation, &config.read_engine),
-                            (ReadOperation::ReadMetadata, ReadEngine::PlansDatafusion)
-                        ) {
-                            continue;
-                        }
+                    for config in build_read_configs(&workload.table_info.name, operation) {
                         let runner = create_read_runner(
                             &workload.table_info,
                             &workload.case_name,
@@ -80,19 +74,35 @@ fn run_benchmark(c: &mut Criterion, runner: &dyn WorkloadRunner, reporter: &Coun
     }
 }
 
-fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
-    // Choose which benchmark configurations to run for a given table
-    // TODO: This function will take in table info to choose the appropriate configs for a given
-    // table
-    let mut configs = default_read_configs();
-    if table_name.contains("V2Chkpt") {
-        configs.push(ReadConfig {
-            name: "sm_parallel2".into(),
-            read_engine: ReadEngine::StateMachine,
-            parallel_scan: ParallelScan::Enabled { num_threads: 2 },
-        });
+fn build_read_configs(table_name: &str, operation: ReadOperation) -> Vec<ReadConfig> {
+    match operation {
+        ReadOperation::ReadMetadata => {
+            // Metadata benchmark comparison modes:
+            // 1) default-engine serial
+            // 2) default-engine parallel
+            // 3) datafusion-backed state-machine execution
+            let mut configs = vec![
+                ReadConfig {
+                    name: "default_engine_serial".into(),
+                    read_engine: ReadEngine::DefaultEngine,
+                    parallel_scan: ParallelScan::Disabled,
+                },
+                ReadConfig {
+                    name: "datafusion".into(),
+                    read_engine: ReadEngine::Datafusion,
+                    parallel_scan: ParallelScan::Disabled,
+                },
+            ];
+            let num_threads = if table_name.contains("V2Chkpt") { 2 } else { 4 };
+            configs.push(ReadConfig {
+                name: format!("default_engine_parallel{num_threads}"),
+                read_engine: ReadEngine::DefaultEngine,
+                parallel_scan: ParallelScan::Enabled { num_threads },
+            });
+            configs
+        }
+        ReadOperation::ReadData => default_read_configs(),
     }
-    configs
 }
 
 criterion_group!(benches, workload_benchmarks);

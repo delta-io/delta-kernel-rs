@@ -19,17 +19,15 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use datafusion_common::DFSchema;
-use datafusion_common::ScalarValue;
-use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_datasource::PartitionedFile;
-use datafusion_datasource::TableSchema;
+use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_datasource_json::source::JsonSource;
 use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::object_store::ObjectStoreUrl;
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::filter::FilterExec;
@@ -218,7 +216,7 @@ fn nullability_target_arrow_schema(
 /// the declared scan schema (for example nullable parquet/json children flowing into kernel
 /// protocol NOT NULL children). Scan with a relaxed nested schema, then re-apply target
 /// nullability in [`NullabilityValidationExec`].
-fn relax_nested_nullability_for_scan(schema: &Schema) -> Arc<Schema> {
+pub(crate) fn relax_nested_nullability_for_scan(schema: &Schema) -> Arc<Schema> {
     fn relax_field(field: &Arc<Field>, force_nullable: bool) -> Arc<Field> {
         let relaxed_dt = relax_data_type(field.data_type());
         Arc::new(
@@ -412,9 +410,9 @@ fn compile_scan_single_group(
 ///
 /// ## Predicate
 ///
-/// [`ScanNode::predicate`] is applied exclusively via a residual native [`FilterExec`] after decode (no reader
-/// pushdown). Engines may later add conservative pushdown optimizations while retaining this filter
-/// as a residual guardrail.
+/// [`ScanNode::predicate`] is applied exclusively via a residual native [`FilterExec`] after decode
+/// (no reader pushdown). Engines may later add conservative pushdown optimizations while retaining
+/// this filter as a residual guardrail.
 ///
 /// ## Row-index implementation
 ///
@@ -546,24 +544,34 @@ mod tests {
 
         let ex = DataFusionExecutor::try_new().unwrap();
         let batches = ex.execute_plan_collect(plan).await.unwrap();
-        assert_eq!(
-            batches[0].num_columns(),
-            2,
-            "schema={:?}",
-            batches[0].schema()
-        );
-
+        let x_idx = batches[0].schema().column_with_name("x").unwrap().0;
         let rid_idx = batches[0].schema().column_with_name("rid").unwrap().0;
-        let mut observed = Vec::new();
-        for b in &batches {
-            let arr = b
-                .column(rid_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            observed.extend(arr.values().iter().copied());
-        }
-        assert_eq!(observed, vec![0, 1, 0]);
+        let xs: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(x_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let rids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(rid_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(xs, vec![10, 11, 20]);
+        assert_eq!(rids, vec![0, 1, 0]);
     }
 
     #[tokio::test]
@@ -629,25 +637,32 @@ mod tests {
 
         let ex = DataFusionExecutor::try_new().unwrap();
         let batches = ex.execute_plan_collect(plan).await.unwrap();
-
         let x_idx = batches[0].schema().column_with_name("x").unwrap().0;
         let rid_idx = batches[0].schema().column_with_name("rid").unwrap().0;
-        let mut xs = Vec::new();
-        let mut rids = Vec::new();
-        for b in &batches {
-            let xa = b
-                .column(x_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            let ra = b
-                .column(rid_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            xs.extend(xa.values().iter().copied());
-            rids.extend(ra.values().iter().copied());
-        }
+        let xs: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(x_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let rids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(rid_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
         assert_eq!(xs, vec![25, 30]);
         assert_eq!(rids, vec![0, 1]);
     }
@@ -673,17 +688,33 @@ mod tests {
 
         let ex = DataFusionExecutor::try_new().unwrap();
         let batches = ex.execute_plan_collect(plan).await.unwrap();
-
+        let x_idx = batches[0].schema().column_with_name("x").unwrap().0;
         let rid_idx = batches[0].schema().column_with_name("rid").unwrap().0;
-        let mut rids = Vec::new();
-        for b in &batches {
-            let ra = b
-                .column(rid_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            rids.extend(ra.values().iter().copied());
-        }
+        let xs: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(x_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let rids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(rid_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(xs, vec![25, 30]);
         assert_eq!(rids, vec![1, 2]);
     }
 

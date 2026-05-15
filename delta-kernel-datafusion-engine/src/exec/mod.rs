@@ -4,9 +4,11 @@ mod literal;
 mod shape;
 mod sources;
 
-pub use literal::LiteralExec;
+pub use literal::build_literal_exec;
 pub use shape::{
     KernelAssertExec, KernelConsumeByKdfExec, KernelLoadSinkExec, KernelPartitionedWriteExec,
     NullabilityValidationExec, OrderedUnionExec, RelationSinkExec, RowIndexExec,
 };
-pub use sources::{FileListingExec, RelationBatchRegistry, build_relation_ref_exec};
+pub use sources::{
+    build_relation_ref_exec, build_relation_ref_logical, FileListingExec, RelationBatchRegistry,
+};

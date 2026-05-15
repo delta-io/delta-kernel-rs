@@ -200,6 +200,14 @@ impl ScanBuilder {
         self
     }
 
+    /// Include parsed statistics in scan metadata.
+    ///
+    /// This is the canonical "stats-on" knob for declarative replay builders.
+    /// It is equivalent to [`ScanBuilder::include_all_stats_columns`].
+    pub fn with_stats(self) -> Self {
+        self.include_all_stats_columns()
+    }
+
     /// Include specific columns in the scan metadata.
     ///
     /// When `columns` is non-empty, only those columns' statistics appear in `stats_parsed`.
@@ -508,6 +516,7 @@ impl HasSelectionVector for ScanMetadata {
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
+#[derive(Clone)]
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
@@ -571,6 +580,18 @@ impl Scan {
         } else {
             None
         }
+    }
+
+    /// Get the physical stats schema used for `stats_parsed` in scan metadata.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn physical_stats_schema(&self) -> Option<SchemaRef> {
+        self.state_info.physical_stats_schema.clone()
+    }
+
+    /// Get the physical partition schema used for `partitionValues_parsed` in scan metadata.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn physical_partition_schema(&self) -> Option<SchemaRef> {
+        self.state_info.physical_partition_schema.clone()
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
@@ -841,7 +862,7 @@ impl Scan {
     /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
     /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
     /// arms replace them with TRUE to conservatively prevent pruning.
-    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+    pub(crate) fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };

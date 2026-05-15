@@ -19,11 +19,8 @@ use delta_kernel::arrow::util::display::array_value_to_string;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::expressions::{Expression, UnaryExpressionOp};
-use delta_kernel::expressions::PredicateRef;
+use delta_kernel::expressions::{Expression, PredicateRef, UnaryExpressionOp};
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::plans::ir::nodes::FileType;
-use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::{DeltaResult, Engine, Error, FileMeta, Snapshot};
@@ -370,6 +367,7 @@ impl ReadDataStateMachineRunner {
         table_info: &TableInfo,
         case_name: &str,
         read_spec: &ReadSpec,
+        config: ReadConfig,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
@@ -387,10 +385,11 @@ impl ReadDataStateMachineRunner {
             .map(|cols| snapshot.schema().project(cols))
             .transpose()?;
         let name = format!(
-            "{}/{}/{}/sm",
+            "{}/{}/{}/{}",
             table_info.name,
             case_name,
-            ReadOperation::ReadData.as_str()
+            ReadOperation::ReadData.as_str(),
+            config.name,
         );
         Ok(Self {
             snapshot,
@@ -426,10 +425,10 @@ impl WorkloadRunner for ReadDataStateMachineRunner {
 
 pub struct ReadDataPlansRunner {
     snapshot: Arc<Snapshot>,
-    engine: Arc<dyn Engine>,
     executor: DataFusionExecutor,
     runtime: Arc<tokio::runtime::Runtime>,
     name: String,
+    predicate: Option<PredicateRef>,
     projected_schema: Option<delta_kernel::schema::SchemaRef>,
 }
 
@@ -440,11 +439,28 @@ async fn collect_fsr_file_metas(
 ) -> DeltaResult<Vec<FileMeta>> {
     let executor = DataFusionExecutor::try_new_with_engine(Arc::clone(&engine))
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let sm = snapshot.full_state()?;
-    let ((), fsr_batches) = executor
-        .drive_coroutine_sm_collecting_results(sm)
-        .await
-        .map_err(|e| Error::generic(format!("execute full_state via DataFusionExecutor: {e}")))?;
+    let sm = match snapshot.full_state() {
+        Ok(sm) => sm,
+        Err(e) => {
+            let detail = e.to_string();
+            if detail.contains("coroutine completed during start without yielding any work") {
+                return Ok(Vec::new());
+            }
+            return Err(e);
+        }
+    };
+    let ((), fsr_batches) = match executor.drive_coroutine_sm_collecting_results(sm).await {
+        Ok(result) => result,
+        Err(e) => {
+            let detail = e.to_string();
+            if detail.contains("coroutine completed during start without yielding any work") {
+                return Ok(Vec::new());
+            }
+            return Err(Error::generic(format!(
+                "execute full_state via DataFusionExecutor: {e}"
+            )));
+        }
+    };
 
     let mut files = Vec::new();
     for batch in fsr_batches {
@@ -545,6 +561,7 @@ impl ReadDataPlansRunner {
         table_info: &TableInfo,
         case_name: &str,
         read_spec: &ReadSpec,
+        config: ReadConfig,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
@@ -555,40 +572,105 @@ impl ReadDataPlansRunner {
             .as_ref()
             .map(|cols| snapshot.schema().project(cols))
             .transpose()?;
+        let predicate = read_spec
+            .predicate
+            .as_deref()
+            .map(|sql| parse_predicate(sql, &snapshot.schema()))
+            .transpose()?
+            .map(Arc::new);
         let executor = DataFusionExecutor::try_new_with_engine(engine.clone())
             .map_err(|e| format!("DataFusion executor setup failed: {e}"))?;
         let name = format!(
-            "{}/{}/{}/plans_df",
+            "{}/{}/{}/{}",
             table_info.name,
             case_name,
-            ReadOperation::ReadData.as_str()
+            ReadOperation::ReadData.as_str(),
+            config.name,
         );
         Ok(Self {
             snapshot,
-            engine,
             executor,
             runtime,
             name,
+            predicate,
             projected_schema,
         })
     }
 }
 
-impl WorkloadRunner for ReadDataPlansRunner {
+pub struct ReadMetadataDatafusionRunner {
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn Engine>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    name: String,
+}
+
+impl ReadMetadataDatafusionRunner {
+    pub fn setup(
+        table_info: &TableInfo,
+        case_name: &str,
+        read_spec: &ReadSpec,
+        config: ReadConfig,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        let snapshot =
+            strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
+        let name = format!(
+            "{}/{}/{}/{}",
+            table_info.name,
+            case_name,
+            ReadOperation::ReadMetadata.as_str(),
+            config.name,
+        );
+        Ok(Self {
+            snapshot,
+            engine,
+            runtime,
+            name,
+        })
+    }
+}
+
+impl WorkloadRunner for ReadMetadataDatafusionRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let schema = self
-            .projected_schema
-            .clone()
-            .unwrap_or_else(|| self.snapshot.schema().clone());
         let files = self.runtime.block_on(collect_fsr_file_metas(
             Arc::clone(&self.snapshot),
             Arc::clone(&self.engine),
             &self.snapshot.table_root(),
         ))?;
-        let plan = DeclarativePlanNode::scan(FileType::Parquet, files, schema).into_results();
-        let batches = self
+        for file in files {
+            black_box(file);
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl WorkloadRunner for ReadDataPlansRunner {
+    fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut builder = self.snapshot.clone().scan_builder();
+        if let Some(schema) = &self.projected_schema {
+            builder = builder.with_schema(schema.clone());
+        }
+        if let Some(predicate) = &self.predicate {
+            builder = builder.with_predicate(predicate.clone());
+        }
+        let replay_scan = builder
+            .build_replay()
+            .map_err(|e| format!("build replay scan failed: {e}"))?;
+        let replay_sm = replay_scan
+            .replay_scan_state_machine()
+            .map_err(|e| format!("build replay scan SM failed: {e}"))?;
+        let (_done, batches) = self
             .runtime
-            .block_on(self.executor.execute_plan_collect(plan))
+            .block_on(
+                self.executor
+                    .drive_coroutine_sm_collecting_results(replay_sm),
+            )
             .map_err(|e| format!("DataFusion read execution failed: {e}"))?;
         for batch in batches {
             black_box(batch);
@@ -611,17 +693,17 @@ pub fn create_read_runner(
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
     match (operation, &config.read_engine) {
-        (ReadOperation::ReadMetadata, ReadEngine::StateMachine) => Ok(Box::new(
+        (ReadOperation::ReadMetadata, ReadEngine::DefaultEngine) => Ok(Box::new(
             ReadMetadataRunner::setup(table_info, case_name, read_spec, config, runtime)?,
         )),
-        (ReadOperation::ReadMetadata, ReadEngine::PlansDatafusion) => {
-            Err("ReadMetadata is only supported for StateMachine engine".into())
-        }
-        (ReadOperation::ReadData, ReadEngine::StateMachine) => Ok(Box::new(
-            ReadDataStateMachineRunner::setup(table_info, case_name, read_spec, runtime)?,
+        (ReadOperation::ReadMetadata, ReadEngine::Datafusion) => Ok(Box::new(
+            ReadMetadataDatafusionRunner::setup(table_info, case_name, read_spec, config, runtime)?,
         )),
-        (ReadOperation::ReadData, ReadEngine::PlansDatafusion) => Ok(Box::new(
-            ReadDataPlansRunner::setup(table_info, case_name, read_spec, runtime)?,
+        (ReadOperation::ReadData, ReadEngine::DefaultEngine) => Ok(Box::new(
+            ReadDataStateMachineRunner::setup(table_info, case_name, read_spec, config, runtime)?,
+        )),
+        (ReadOperation::ReadData, ReadEngine::Datafusion) => Ok(Box::new(
+            ReadDataPlansRunner::setup(table_info, case_name, read_spec, config, runtime)?,
         )),
     }
 }
@@ -667,10 +749,12 @@ impl WorkloadRunner for SnapshotConstructionRunner {
             &self.runtime,
             self.time_travel.as_ref(),
         )?;
-        let (protocol, metadata) = self.runtime.block_on(extract_snapshot_protocol_metadata_from_fsr(
-            Arc::clone(&snapshot),
-            Arc::clone(&self.engine),
-        ))?;
+        let (protocol, metadata) =
+            self.runtime
+                .block_on(extract_snapshot_protocol_metadata_from_fsr(
+                    Arc::clone(&snapshot),
+                    Arc::clone(&self.engine),
+                ))?;
         black_box((snapshot.version(), protocol, metadata));
         Ok(())
     }
@@ -686,10 +770,14 @@ mod tests {
 
     use datafusion_physical_plan::displayable;
     use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
-    use delta_kernel::plans::state_machines::framework::state_machine::{AdvanceResult, StateMachine};
+    use delta_kernel::plans::state_machines::framework::state_machine::{
+        AdvanceResult, StateMachine,
+    };
 
     use super::*;
-    use crate::models::{ParallelScan, ReadConfig, ReadEngine, ReadSpec, Spec, TableInfo, TimeTravel};
+    use crate::models::{
+        ParallelScan, ReadConfig, ReadEngine, ReadSpec, Spec, TableInfo, TimeTravel,
+    };
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
@@ -744,17 +832,25 @@ mod tests {
 
     fn serial_config() -> ReadConfig {
         ReadConfig {
-            name: "serial".to_string(),
-            read_engine: ReadEngine::StateMachine,
+            name: "default_engine_serial".to_string(),
+            read_engine: ReadEngine::DefaultEngine,
             parallel_scan: ParallelScan::Disabled,
         }
     }
 
     fn parallel_config() -> ReadConfig {
         ReadConfig {
-            name: "parallel2".to_string(),
-            read_engine: ReadEngine::StateMachine,
+            name: "default_engine_parallel2".to_string(),
+            read_engine: ReadEngine::DefaultEngine,
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
+        }
+    }
+
+    fn datafusion_config() -> ReadConfig {
+        ReadConfig {
+            name: "datafusion".to_string(),
+            read_engine: ReadEngine::Datafusion,
+            parallel_scan: ParallelScan::Disabled,
         }
     }
 
@@ -770,7 +866,7 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/testCase/readMetadata/serial"
+            "basic_partitioned/testCase/readMetadata/default_engine_serial"
         );
         assert!(runner.execute().is_ok());
     }
@@ -787,7 +883,7 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/testCase/readMetadata/parallel2"
+            "basic_partitioned/testCase/readMetadata/default_engine_parallel2"
         );
         assert!(runner.execute().is_ok());
     }
@@ -848,7 +944,9 @@ mod tests {
             test_runtime(),
         )
         .expect("create_read_runner should succeed");
-        assert!(runner.execute().is_ok());
+        if let Err(e) = runner.execute() {
+            panic!("read_data_plans_datafusion execute failed: {e}");
+        }
     }
 
     #[test]
@@ -901,14 +999,14 @@ mod tests {
             "testCase",
             &test_read_spec(),
             ReadOperation::ReadData,
-            ReadConfig {
-                name: "plans_df".to_string(),
-                read_engine: ReadEngine::PlansDatafusion,
-                parallel_scan: ParallelScan::Disabled,
-            },
+            datafusion_config(),
             test_runtime(),
         )
         .expect("create_read_runner should succeed");
+        assert_eq!(
+            runner.name(),
+            "basic_partitioned/testCase/readData/datafusion"
+        );
         assert!(runner.execute().is_ok());
     }
 
@@ -954,6 +1052,7 @@ mod tests {
             &table_info,
             "readV60",
             &read_spec,
+            datafusion_config(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -962,15 +1061,25 @@ mod tests {
             .projected_schema
             .clone()
             .unwrap_or_else(|| runner.snapshot.schema().clone());
-        let files = runner
-            .runtime
-            .block_on(collect_fsr_file_metas(
-                Arc::clone(&runner.snapshot),
-                Arc::clone(&runner.engine),
-                runner.snapshot.table_root(),
-            ))
-            .expect("collect_fsr_file_metas should succeed");
-        let plan = DeclarativePlanNode::scan(FileType::Parquet, files, schema).into_results();
+        let replay_scan = runner
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_schema(schema)
+            .build_replay()
+            .expect("build replay scan should succeed");
+        let plans = replay_scan
+            .replay_scan_plans()
+            .expect("replay scan plans should succeed");
+        let plan = plans
+            .into_iter()
+            .find(|p| {
+                matches!(
+                    p.sink.sink_type,
+                    delta_kernel::plans::ir::nodes::SinkType::Results(_)
+                )
+            })
+            .expect("expected replay plans to include a Results sink");
         let physical = runner
             .executor
             .compile_plan(&plan)
@@ -1001,36 +1110,35 @@ mod tests {
             &table_info,
             "readV60",
             &read_spec,
+            datafusion_config(),
             test_runtime(),
         )
         .expect("setup should succeed");
 
         let mut sm = runner.snapshot.full_state().expect("build full_state SM");
-        runner
-            .runtime
-            .block_on(async {
-                loop {
-                    let op = sm.get_operation().expect("sm.get_operation");
-                    if let PhaseOperation::Plans(plans) = &op {
-                        for (idx, plan) in plans.iter().enumerate() {
-                            let physical = runner
-                                .executor
-                                .compile_plan(plan)
-                                .expect("compile fsr phase plan");
-                            println!(
-                                "=== FSR Phase Plan {} ({:?}) ===\n{}",
-                                idx,
-                                plan.sink.sink_type,
-                                displayable(physical.as_ref()).indent(true)
-                            );
-                        }
-                    }
-                    let phase_result = runner.executor.execute_phase_operation(op).await;
-                    match sm.advance(phase_result).expect("sm.advance") {
-                        AdvanceResult::Continue => {}
-                        AdvanceResult::Done(_) => break,
+        runner.runtime.block_on(async {
+            loop {
+                let op = sm.get_operation().expect("sm.get_operation");
+                if let PhaseOperation::Plans(plans) = &op {
+                    for (idx, plan) in plans.iter().enumerate() {
+                        let physical = runner
+                            .executor
+                            .compile_plan(plan)
+                            .expect("compile fsr phase plan");
+                        println!(
+                            "=== FSR Phase Plan {} ({:?}) ===\n{}",
+                            idx,
+                            plan.sink.sink_type,
+                            displayable(physical.as_ref()).indent(true)
+                        );
                     }
                 }
-            });
+                let phase_result = runner.executor.execute_phase_operation(op).await;
+                match sm.advance(phase_result).expect("sm.advance") {
+                    AdvanceResult::Continue => {}
+                    AdvanceResult::Done(_) => break,
+                }
+            }
+        });
     }
 }

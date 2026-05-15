@@ -6,24 +6,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use acceptance::acceptance_workloads::validation::validate_read_result;
-use acceptance::acceptance_workloads::workload::ReadResult;
-use acceptance::acceptance_workloads::TestCase;
-use delta_kernel::actions::{Metadata, Protocol};
-use delta_kernel::arrow::array::{Array, AsArray, Int64Array, RecordBatch, StringArray};
-use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::arrow::util::display::array_value_to_string;
-use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
-use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-use delta_kernel::expressions::{Expression, UnaryExpressionOp};
-use delta_kernel::expressions::Predicate;
-use delta_kernel::plans::ir::nodes::FileType;
-use delta_kernel::plans::ir::DeclarativePlanNode;
-use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::{DeltaResult, Engine, Error, FileMeta, Snapshot};
-use delta_kernel_benchmarks::models::{
-    ReadSpec, SnapshotConstructionSpec, SnapshotExpected, Spec, TimeTravel,
+use acceptance::acceptance_workloads::validation::{validate_read_result, validate_snapshot};
+use acceptance::acceptance_workloads::workload::{
+    execute_and_validate_workload, ReadResult, SnapshotResult,
 };
+use acceptance::acceptance_workloads::TestCase;
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+use delta_kernel::expressions::Predicate;
+use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
+use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
+use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_benchmarks::predicate_parser::parse_predicate;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 
@@ -58,184 +52,46 @@ fn should_skip_datafusion_spec_type(spec_type: Option<&str>) -> Option<&'static 
     }
 }
 
-/// Root-cause buckets for known DataFusion read-workload divergences.
-fn classify_expected_df_failure(message: &str) -> Option<&'static str> {
-    if message.contains("Scan node has no files") {
-        return Some("Plans scan currently rejects empty file sets");
-    }
-    if message.contains("Internal invariant violated in `<operation>`: <detail>") {
-        return Some("Placeholder invariant surfaced from DataFusion execution path");
-    }
-    if message.contains("Data mismatch:") && message.contains("|     |") {
-        return Some("Partition values are dropped in DataFusion read path");
-    }
-    if message.contains("Data mismatch:") {
-        return Some("General data mismatch between state-machine and DataFusion plans");
-    }
-    if message.contains("Schema mismatch:") {
-        return Some("Schema mismatch between state-machine and DataFusion plans");
-    }
-    if message.contains("Timestamp-based time travel is not yet supported") {
-        return Some("Timestamp-based time travel unsupported");
-    }
-    if message.contains("Unsupported Delta table type: 'void'") {
-        return Some("Void type unsupported");
-    }
-    if message.contains("Unknown type variant: interval")
-        || message.contains("Unknown type variant: day-time interval")
-    {
-        return Some("Interval types unsupported");
-    }
-    if message.contains("Invalid right value for (NOT) IN comparison") {
-        return Some("Column IN (literal list) evaluation unsupported");
-    }
-    if message.contains("Failed to parse value") && message.contains("decimal(") {
-        return Some("Decimal parsing mismatch");
-    }
-    if message.contains("Cannot determine types for: Function(") {
-        return Some("Function typing unsupported in predicate parser/evaluator");
-    }
-    if message.contains("Cannot determine type for: CAST(") {
-        return Some("Type-cast function unsupported in predicate parser/evaluator");
-    }
-    if message.contains("Cannot determine type for: date_add(")
-        || message.contains("Cannot determine type for: date_sub(")
-    {
-        return Some("Date arithmetic functions unsupported in predicate parser/evaluator");
-    }
-    if message.contains("Unsupported expression:") && message.contains("LIKE") {
-        return Some("LIKE predicates unsupported in predicate parser/evaluator");
-    }
-    if message.contains(
-        "Failed to concat batches: Invalid argument error: It is not possible to concatenate arrays of different data types",
-    ) {
-        return Some("Variant typed_value schema mismatch across files");
-    }
-    if message.contains("Predicate references unknown column") {
-        return Some("Predicate column-resolution mismatch");
-    }
-    if message.contains("Expected error '") && message.contains("' but succeeded") {
-        return Some("Error-spec workloads currently succeed in DataFusion harness");
-    }
-    None
+#[derive(Clone, Copy, Debug)]
+struct ReadReplayConfig {
+    name: &'static str,
+    split_phases: bool,
 }
 
-async fn collect_fsr_file_metas(
-    snapshot: Arc<Snapshot>,
-    engine: Arc<dyn Engine>,
-    table_root: &url::Url,
-) -> DeltaResult<Vec<FileMeta>> {
-    let executor = DataFusionExecutor::try_new_with_engine(Arc::clone(&engine))
-        .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let sm = snapshot.full_state()?;
-    let ((), fsr_batches) = executor
-        .drive_coroutine_sm_collecting_results(sm)
-        .await
-        .map_err(|e| Error::generic(format!("execute full_state via DataFusionExecutor: {e}")))?;
+const READ_REPLAY_CONFIGS: &[ReadReplayConfig] = &[
+    ReadReplayConfig {
+        name: "combined_scan_sm",
+        split_phases: false,
+    },
+    ReadReplayConfig {
+        name: "split_scan_sm",
+        split_phases: true,
+    },
+];
 
-    let mut files = Vec::new();
-    for batch in fsr_batches {
-        let add_idx = batch
-            .schema()
-            .index_of("add")
-            .map_err(|e| Error::generic(format!("full_state add column missing: {e}")))?;
-        let add_col = batch
-            .column(add_idx)
-            .as_struct_opt()
-            .ok_or_else(|| Error::generic("full_state add column was not Struct"))?;
-        let path_col = add_col.column_by_name("path").cloned().ok_or_else(|| {
-            Error::generic(format!(
-                "full_state add.path column missing in schema {:?}",
-                add_col.data_type()
-            ))
-        })?;
-        let size_arr = add_col
-            .column_by_name("size")
-            .cloned()
-            .ok_or_else(|| Error::generic("full_state add.size column missing"))?;
-        let size_col = size_arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| Error::generic("full_state add.size column was not Int64"))?;
-        let mod_time_arr = add_col
-            .column_by_name("modificationTime")
-            .cloned()
-            .ok_or_else(|| Error::generic("full_state add.modificationTime column missing"))?;
-        let mod_time_col = mod_time_arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| Error::generic("full_state add.modificationTime column was not Int64"))?;
-
-        for i in 0..batch.num_rows() {
-            // Prefer nested add.path validity over parent add struct validity.
-            // Parent struct nullability can be lossy in some streams even when child
-            // values are present.
-            if !path_col.is_valid(i) {
-                continue;
-            }
-            let path = array_value_to_string(path_col.as_ref(), i)
-                .map_err(|e| Error::generic(format!("stringify scan path row {i}: {e}")))?;
-            let location = table_root.join(&path).map_err(|e| {
-                Error::generic(format!(
-                    "failed to resolve selected file path '{path}' against table root {table_root}: {e}"
-                ))
-            })?;
-            let size = u64::try_from(size_col.value(i))
-                .map_err(|_| Error::generic("negative file size in scan metadata"))?;
-            files.push(FileMeta::new(location, mod_time_col.value(i), size));
-        }
-    }
-    Ok(files)
+#[derive(Clone, Copy, Debug)]
+struct SnapshotReplayConfig {
+    name: &'static str,
+    use_full_state_builder: bool,
 }
 
-fn evaluate_to_json_column(batch: &RecordBatch, col: &'static str) -> DeltaResult<StringArray> {
-    let arr = evaluate_expression(
-        &Expression::unary(UnaryExpressionOp::ToJson, Expression::column([col])),
-        batch,
-        Some(&KernelDataType::STRING),
-    )?;
-    Ok(arr.as_string::<i32>().clone())
-}
-
-fn extract_protocol_and_metadata_rows_from_fsr_commit_dedup(
-    dedup_batches: &[RecordBatch],
-) -> DeltaResult<(Vec<Protocol>, Vec<Metadata>)> {
-    let mut protocol_rows = Vec::new();
-    let mut metadata_rows = Vec::new();
-
-    for batch in dedup_batches {
-        let protocol_col = evaluate_to_json_column(batch, "protocol")?;
-        let metadata_col = evaluate_to_json_column(batch, "metaData")?;
-        for i in 0..batch.num_rows() {
-            if protocol_col.is_valid(i) {
-                if let Ok(parsed) = serde_json::from_str::<Protocol>(protocol_col.value(i)) {
-                    protocol_rows.push(parsed);
-                }
-            }
-            if metadata_col.is_valid(i) {
-                if let Ok(parsed) = serde_json::from_str::<Metadata>(metadata_col.value(i)) {
-                    metadata_rows.push(parsed);
-                }
-            }
-        }
-    }
-    Ok((protocol_rows, metadata_rows))
-}
-
-#[derive(Debug)]
-struct SnapshotFsrResult {
-    version: u64,
-    fsr_protocol_rows: Vec<Protocol>,
-    fsr_metadata_rows: Vec<Metadata>,
-    validated_protocol: Protocol,
-    validated_metadata: Metadata,
-}
+const SNAPSHOT_REPLAY_CONFIGS: &[SnapshotReplayConfig] = &[
+    SnapshotReplayConfig {
+        name: "snapshot_full_state_sm",
+        use_full_state_builder: false,
+    },
+    SnapshotReplayConfig {
+        name: "snapshot_full_state_builder",
+        use_full_state_builder: true,
+    },
+];
 
 async fn execute_snapshot_workload_datafusion(
     engine: Arc<dyn Engine>,
     table_root: &url::Url,
     snapshot_spec: &SnapshotConstructionSpec,
-) -> DeltaResult<SnapshotFsrResult> {
+    config: SnapshotReplayConfig,
+) -> DeltaResult<SnapshotResult> {
     let version = snapshot_spec
         .time_travel
         .as_ref()
@@ -248,65 +104,42 @@ async fn execute_snapshot_workload_datafusion(
         builder = builder.at_version(version);
     }
     let snapshot = builder.build(engine.as_ref())?;
-    let validated_protocol = snapshot.protocol().clone();
-    let validated_metadata = snapshot.metadata().clone();
 
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let sm = snapshot.full_state()?;
-    let ((), fsr_batches) = executor
-        .drive_coroutine_sm_collecting_results(sm)
-        .await
-        .map_err(|e| Error::generic(format!("execute full_state via DataFusionExecutor: {e}")))?;
-    let (fsr_protocol_rows, fsr_metadata_rows) =
-        extract_protocol_and_metadata_rows_from_fsr_commit_dedup(&fsr_batches)?;
-    Ok(SnapshotFsrResult {
-        version: snapshot.version(),
-        fsr_protocol_rows,
-        fsr_metadata_rows,
-        validated_protocol,
-        validated_metadata,
-    })
-}
-
-fn validate_snapshot_from_fsr_rows(
-    result: DeltaResult<SnapshotFsrResult>,
-    expected: &SnapshotExpected,
-) -> Result<(), String> {
-    match (result, expected) {
-        (Ok(result), SnapshotExpected::Success { expected }) => {
-            if result.validated_protocol != *expected.protocol {
-                return Err(format!(
-                    "Validated snapshot protocol mismatch.\nExpected: {:?}\nValidated: {:?}\nRaw FSR protocol rows: {:?}\nSnapshot version: {}",
-                    expected.protocol,
-                    result.validated_protocol,
-                    result.fsr_protocol_rows,
-                    result.version,
-                ));
-            }
-            if result.validated_metadata != *expected.metadata {
-                return Err(format!(
-                    "Validated snapshot metadata mismatch.\nExpected: {:?}\nValidated: {:?}\nRaw FSR metadata rows: {:?}\nSnapshot version: {}",
-                    expected.metadata,
-                    result.validated_metadata,
-                    result.fsr_metadata_rows,
-                    result.version,
-                ));
-            }
-            Ok(())
-        }
-        (Err(kernel_err), SnapshotExpected::Error { .. }) => {
-            let _ = kernel_err;
-            Ok(())
-        }
-        (Ok(_), SnapshotExpected::Error { error }) => Err(format!(
-            "Expected error '{}' but succeeded",
-            error.error_code
-        )),
-        (Err(e), SnapshotExpected::Success { .. }) => {
-            Err(format!("Expected success but got error: {}", e))
-        }
+    if config.use_full_state_builder {
+        let plans = snapshot
+            .full_state_builder()
+            .with_stats()
+            .build()
+            .map_err(|e| Error::generic(format!("build full_state plans via builder: {e}")))?;
+        let _state = executor
+            .execute_phase_operation(PhaseOperation::Plans(plans))
+            .await
+            .map_err(|e| {
+                Error::generic(format!(
+                    "execute full_state builder plans via DataFusionExecutor ({}): {e}",
+                    config.name
+                ))
+            })?;
+    } else {
+        let sm = snapshot.full_state()?;
+        let ((), _) = executor
+            .drive_coroutine_sm_collecting_results(sm)
+            .await
+            .map_err(|e| {
+                Error::generic(format!(
+                    "execute full_state via DataFusionExecutor ({}): {e}",
+                    config.name
+                ))
+            })?;
     }
+    let table_configuration = snapshot.table_configuration();
+    Ok(SnapshotResult {
+        version: snapshot.version(),
+        protocol: table_configuration.protocol().clone(),
+        metadata: table_configuration.metadata().clone(),
+    })
 }
 
 fn filter_batches_with_predicate(
@@ -330,6 +163,7 @@ async fn execute_read_workload_datafusion(
     engine: Arc<dyn Engine>,
     table_root: &url::Url,
     read_spec: &ReadSpec,
+    config: ReadReplayConfig,
 ) -> DeltaResult<ReadResult> {
     let version = read_spec
         .time_travel
@@ -356,14 +190,56 @@ async fn execute_read_workload_datafusion(
         table_schema.clone()
     };
 
-    let files = collect_fsr_file_metas(Arc::clone(&snapshot), Arc::clone(&engine), table_root).await?;
-    let plan = DeclarativePlanNode::scan(FileType::Parquet, files, schema.clone()).into_results();
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let batches = executor
-        .execute_plan_collect(plan)
-        .await
-        .map_err(|e| Error::generic(format!("execute DataFusion plan for workload: {e}")))?;
+    let mut scan_builder = snapshot.scan_builder().with_schema(schema.clone());
+    if let Some(predicate_ref) = predicate.clone() {
+        scan_builder = scan_builder.with_predicate(predicate_ref);
+    }
+    let replay_scan = scan_builder
+        .build_replay()
+        .map_err(|e| Error::generic(format!("build replay scan: {e}")))?;
+    let batches = if config.split_phases {
+        let metadata_sm = replay_scan
+            .replay_scan_metadata_state_machine()
+            .map_err(|e| Error::generic(format!("build metadata-only replay scan SM: {e}")))?;
+        let (live_actions, _) = executor
+            .drive_coroutine_sm_collecting_results(metadata_sm)
+            .await
+            .map_err(|e| {
+                Error::generic(format!(
+                    "execute metadata-only replay scan SM via DataFusionExecutor ({}): {e:?}",
+                    config.name
+                ))
+            })?;
+        let data_sm = replay_scan
+            .replay_scan_data_state_machine(live_actions)
+            .map_err(|e| Error::generic(format!("build data-only replay scan SM: {e}")))?;
+        let (_done, batches) = executor
+            .drive_coroutine_sm_collecting_results(data_sm)
+            .await
+            .map_err(|e| {
+                Error::generic(format!(
+                    "execute data-only replay scan SM via DataFusionExecutor ({}): {e:?}",
+                    config.name
+                ))
+            })?;
+        batches
+    } else {
+        let replay_sm = replay_scan
+            .replay_scan_state_machine()
+            .map_err(|e| Error::generic(format!("build replay scan SM: {e}")))?;
+        let (_done, batches) = executor
+            .drive_coroutine_sm_collecting_results(replay_sm)
+            .await
+            .map_err(|e| {
+                Error::generic(format!(
+                    "execute combined replay scan SM via DataFusionExecutor ({}): {e:?}",
+                    config.name
+                ))
+            })?;
+        batches
+    };
     let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
     let row_count = batches.iter().map(|b| b.num_rows() as u64).sum();
 
@@ -395,31 +271,44 @@ fn acceptance_workloads_datafusion_test(spec_path: &Path) -> datatest_stable::Re
 
     let test_case = TestCase::from_spec_path(&spec_path_abs);
     let table_root = test_case.table_root().expect("Failed to get table URL");
-    let engine = test_utils::create_default_engine(&table_root).expect("Failed to create engine");
+    let engine: Arc<dyn Engine> =
+        test_utils::create_default_engine(&table_root).expect("Failed to create engine");
+
+    // Keep DataFusion comparison scoped to workloads that pass in kernel's default engine harness.
+    // This makes DataFusion ignore the same failing set as kernel.
+    if execute_and_validate_workload(
+        Arc::clone(&engine),
+        &table_root,
+        &test_case.spec,
+        &test_case.expected_dir(),
+    )
+    .is_err()
+    {
+        return Ok(());
+    }
+
     match &test_case.spec {
         Spec::Read(read_spec) => {
             let expected = match read_spec.expected.as_ref() {
                 Some(expected) => expected,
                 None => return Ok(()),
             };
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(execute_read_workload_datafusion(
-                    engine,
-                    &table_root,
-                    read_spec,
-                ));
-            match validate_read_result(result, &test_case.expected_dir(), expected) {
-                Ok(()) => {}
-                Err(e) => {
+            for config in READ_REPLAY_CONFIGS {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(execute_read_workload_datafusion(
+                        Arc::clone(&engine),
+                        &table_root,
+                        read_spec,
+                        *config,
+                    ));
+                if let Err(e) = validate_read_result(result, &test_case.expected_dir(), expected) {
                     let rendered = e.to_string();
-                    if classify_expected_df_failure(&rendered).is_none() {
-                        return Err(Box::new(std::io::Error::other(format!(
-                            "DataFusion workload '{}' failed unexpectedly: {rendered}",
-                            test_case.workload_name
-                        ))));
-                    }
+                    return Err(Box::new(std::io::Error::other(format!(
+                        "DataFusion workload '{}' failed for read replay config '{}': {rendered}",
+                        test_case.workload_name, config.name
+                    ))));
                 }
             }
         }
@@ -428,19 +317,20 @@ fn acceptance_workloads_datafusion_test(spec_path: &Path) -> datatest_stable::Re
                 Some(expected) => expected,
                 None => return Ok(()),
             };
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(execute_snapshot_workload_datafusion(
-                    engine,
-                    &table_root,
-                    snapshot_spec.as_ref(),
-                ));
-            if let Err(rendered) = validate_snapshot_from_fsr_rows(result, expected) {
-                if classify_expected_df_failure(&rendered).is_none() {
+            for config in SNAPSHOT_REPLAY_CONFIGS {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(execute_snapshot_workload_datafusion(
+                        Arc::clone(&engine),
+                        &table_root,
+                        snapshot_spec.as_ref(),
+                        *config,
+                    ));
+                if let Err(rendered) = validate_snapshot(result, expected) {
                     return Err(Box::new(std::io::Error::other(format!(
-                        "DataFusion snapshot workload '{}' failed unexpectedly: {rendered}",
-                        test_case.workload_name
+                        "DataFusion snapshot workload '{}' failed for snapshot replay config '{}': {rendered}",
+                        test_case.workload_name, config.name
                     ))));
                 }
             }

@@ -431,6 +431,6 @@ pub struct AssertNode {
 mod sinks;
 
 pub use sinks::{
-    ConsumeByKdfSink, LoadSink, PartitionedWriteSink, RelationHandle, ScanFileColumns, SinkNode,
-    SinkType, WriteFileFormat, WriteSink,
+    ConsumeByKdfSink, DvKeep, DvKeepDiff, DvKind, DvRef, DvSkip, LoadSink, PartitionedWriteSink,
+    RelationHandle, ScanFileColumns, SinkNode, SinkType, WriteFileFormat, WriteSink,
 };

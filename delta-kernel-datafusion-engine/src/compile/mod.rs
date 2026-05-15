@@ -25,33 +25,37 @@ use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_fn::cast;
 use datafusion_expr::lit;
-use datafusion_functions::core::expr_fn::named_struct;
+use datafusion_expr::logical_plan::LogicalPlan;
+use datafusion_functions::core::expr_fn::{get_field, named_struct};
 use datafusion_physical_expr::create_physical_expr;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::{JoinType, RelationHandle, SinkType, WriteSink};
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::plans::kdf::FinishedHandle;
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{MetadataColumnSpec, SchemaRef, StructField, StructType};
 use delta_kernel::Engine;
 
 use crate::exec::{
-    FileListingExec, KernelAssertExec, KernelConsumeByKdfExec, KernelPartitionedWriteExec,
-    LiteralExec, OrderedUnionExec, RelationBatchRegistry, RelationSinkExec, build_relation_ref_exec,
+    build_literal_exec, build_relation_ref_exec, FileListingExec, KernelAssertExec,
+    KernelConsumeByKdfExec, KernelPartitionedWriteExec, OrderedUnionExec, RelationBatchRegistry,
 };
 
 pub mod expr_translator;
 mod join;
+mod json_parse;
 mod load_sink;
+pub mod logical;
 pub mod scan;
 mod window;
 mod write_sink;
+pub(crate) use load_sink::physical_read_schema;
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
 #[derive(Clone)]
@@ -93,18 +97,8 @@ pub fn compile_plan(
     ctx: &CompileContext,
 ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
     match &plan.sink.sink_type {
-        SinkType::Results => compile_declarative_node(&plan.root, ctx),
-        SinkType::Relation(handle) => {
-            let mut inner = compile_declarative_node(&plan.root, ctx)?;
-            if inner.output_partitioning().partition_count() > 1 {
-                inner = Arc::new(CoalescePartitionsExec::new(inner));
-            }
-            Ok(Arc::new(RelationSinkExec::new(
-                inner,
-                handle.id,
-                Arc::clone(&ctx.relation_registry),
-            )))
-        }
+        SinkType::Results(_) => compile_declarative_node(&plan.root, ctx),
+        SinkType::Relation(_) => compile_declarative_node(&plan.root, ctx),
         SinkType::ConsumeByKdf(sink) => {
             let inner = compile_declarative_node(&plan.root, ctx)?;
             Ok(Arc::new(KernelConsumeByKdfExec::try_new(
@@ -126,6 +120,17 @@ pub fn compile_plan(
     }
 }
 
+/// Attempt to compile a complete [`Plan`] to a DataFusion [`LogicalPlan`].
+///
+/// Returns `Ok(None)` when the logical compiler does not yet support this plan shape and callers
+/// should fall back to [`compile_plan`].
+pub fn compile_plan_logical(
+    plan: &Plan,
+    ctx: &CompileContext,
+) -> Result<Option<LogicalPlan>, DeltaError> {
+    logical::compile_plan_logical(plan, ctx)
+}
+
 fn compile_write_terminal(
     root: &DeclarativePlanNode,
     ctx: &CompileContext,
@@ -140,10 +145,7 @@ pub(super) fn compile_declarative_node(
     ctx: &CompileContext,
 ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
     match node {
-        DeclarativePlanNode::Values(n) => Ok(Arc::new(LiteralExec::try_new(
-            n.schema.clone(),
-            n.rows.clone(),
-        )?)),
+        DeclarativePlanNode::Values(n) => build_literal_exec(n.schema.clone(), n.rows.clone()),
         DeclarativePlanNode::Scan(node) => scan::compile_scan(node),
         DeclarativePlanNode::FileListing(node) => {
             Ok(Arc::new(FileListingExec::new(node.path.clone())))
@@ -211,9 +213,24 @@ pub(super) fn compile_declarative_node(
     }
 }
 
-fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DeltaError> {
+pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DeltaError> {
     match node {
-        DeclarativePlanNode::Scan(n) => Ok(n.schema.clone()),
+        DeclarativePlanNode::Scan(n) => {
+            if let Some(name) = &n.row_index_column {
+                let mut fields: Vec<StructField> = n.schema.fields().cloned().collect();
+                fields.push(StructField::create_metadata_column(
+                    name.clone(),
+                    MetadataColumnSpec::RowIndex,
+                ));
+                StructType::try_new(fields).map(Arc::new).map_err(|e| {
+                    crate::error::plan_compilation(format!(
+                        "scan output schema with row index is invalid: {e}"
+                    ))
+                })
+            } else {
+                Ok(n.schema.clone())
+            }
+        }
         DeclarativePlanNode::Values(n) => Ok(n.schema.clone()),
         DeclarativePlanNode::RelationRef(h) => Ok(h.schema.clone()),
         DeclarativePlanNode::Project { node, .. } => Ok(node.output_schema.clone()),
@@ -349,7 +366,7 @@ fn compile_native_projection(
     Ok(Arc::new(native))
 }
 
-fn expand_projection_columns(
+pub(super) fn expand_projection_columns(
     columns: &[Arc<delta_kernel::expressions::Expression>],
     expected_output_fields: usize,
 ) -> Result<Vec<Arc<delta_kernel::expressions::Expression>>, DeltaError> {
@@ -391,10 +408,56 @@ fn expand_projection_columns(
     Ok(expanded)
 }
 
-fn translate_projection_expr(
+pub(super) fn translate_projection_expr(
     expr: &delta_kernel::expressions::Expression,
     output_field: &delta_kernel::schema::StructField,
 ) -> Result<datafusion_expr::Expr, DeltaError> {
+    if let delta_kernel::expressions::Expression::ParseJson(parse_json) = expr {
+        let json_expr = expr_translator::kernel_expr_to_df(parse_json.json_expr.as_ref())?;
+        let target_struct = match output_field.data_type() {
+            delta_kernel::schema::DataType::Struct(target_struct) => target_struct,
+            other => {
+                return Err(crate::error::plan_compilation(format!(
+                    "ParseJson projection requires Struct output type, got {other:?}"
+                )));
+            }
+        };
+        let extractions = json_parse::generate_schema_extractions(&json_expr, target_struct)?;
+        let mut struct_args = Vec::with_capacity(extractions.len() * 2);
+        for (parsed_expr, field_name) in extractions {
+            struct_args.push(lit(field_name));
+            struct_args.push(parsed_expr);
+        }
+        return Ok(named_struct(struct_args));
+    }
+    if let delta_kernel::expressions::Expression::MapToStruct(map_to_struct) = expr {
+        if let delta_kernel::schema::DataType::Struct(target_struct) = output_field.data_type() {
+            let map_expr = expr_translator::kernel_expr_to_df(map_to_struct.map_expr.as_ref())?;
+            let mut args = Vec::with_capacity(target_struct.fields().count() * 2);
+            for target_field in target_struct.fields() {
+                let arrow_ty: delta_kernel::arrow::datatypes::DataType =
+                    target_field.data_type().try_into_arrow().map_err(|e| {
+                        crate::error::plan_compilation(format!(
+                            "MapToStruct target field `{}` type conversion failed: {e}",
+                            target_field.name()
+                        ))
+                    })?;
+                // Intentionally rely on native DataFusion map access semantics for MapToStruct.
+                // Delta partitionValues maps are expected to have unique keys; duplicate keys are
+                // treated as corrupt/undefined input, and we do not enforce a custom duplicate-key
+                // policy in this compiler path.
+                let raw_value = get_field(map_expr.clone(), target_field.name().to_string());
+                let coerced_value = cast(raw_value, arrow_ty);
+                args.push(lit(target_field.name().to_string()));
+                args.push(coerced_value);
+            }
+            return Ok(named_struct(args));
+        }
+        return Err(crate::error::plan_compilation(format!(
+            "MapToStruct projection requires Struct output type, got {:?}",
+            output_field.data_type()
+        )));
+    }
     if let delta_kernel::expressions::Expression::Struct(children, nullability_predicate) = expr {
         if nullability_predicate.is_some() {
             return Err(crate::error::unsupported(
@@ -406,7 +469,7 @@ fn translate_projection_expr(
                 let mut args = Vec::with_capacity(children.len() * 2);
                 for (child_expr, child_field) in children.iter().zip(target_struct.fields()) {
                     args.push(lit(child_field.name().to_string()));
-                    args.push(expr_translator::kernel_expr_to_df(child_expr.as_ref())?);
+                    args.push(translate_projection_expr(child_expr.as_ref(), child_field)?);
                 }
                 return Ok(named_struct(args));
             }

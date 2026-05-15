@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use delta_kernel::arrow::array::{Array, AsArray, RecordBatch, StringArray};
 use delta_kernel::arrow::compute::concat_batches;
@@ -33,6 +33,8 @@ use delta_kernel::plans::state_machines::fsr::{
 };
 use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
+use delta_kernel_datafusion_engine::compile::{compile_plan_logical, CompileContext};
+use delta_kernel_datafusion_engine::exec::RelationBatchRegistry;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
@@ -164,6 +166,30 @@ fn build_synthetic_protocol_metadata_domain_table() -> TempDir {
     let log_dir = dir.path().join("_delta_log");
     fs::create_dir_all(&log_dir).expect("mkdir _delta_log");
     write_json_commit(&log_dir.join("00000000000000000000.json"));
+    dir
+}
+
+fn write_json_commit_lines(path: &Path, lines: &[&str]) {
+    fs::write(path, format!("{}\n", lines.join("\n"))).expect("write commit json");
+}
+
+fn build_synthetic_metadata_replace_table() -> TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = dir.path().join("_delta_log");
+    fs::create_dir_all(&log_dir).expect("mkdir _delta_log");
+    write_json_commit_lines(
+        &log_dir.join("00000000000000000000.json"),
+        &[
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"mid-old","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1}}"#,
+        ],
+    );
+    write_json_commit_lines(
+        &log_dir.join("00000000000000000001.json"),
+        &[
+            r#"{"metaData":{"id":"mid-new","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":2}}"#,
+        ],
+    );
     dir
 }
 
@@ -343,6 +369,19 @@ fn full_action_payload_rows(batch: &RecordBatch) -> Vec<(String, JsonValue)> {
     rows
 }
 
+fn assert_singleton_protocol_and_metadata(rows: &[(String, JsonValue)]) {
+    let protocol_count = rows.iter().filter(|(k, _)| k == "protocol").count();
+    let metadata_count = rows.iter().filter(|(k, _)| k == "metaData").count();
+    assert_eq!(
+        protocol_count, 1,
+        "FSR commit-dedup must contain exactly one protocol row"
+    );
+    assert_eq!(
+        metadata_count, 1,
+        "FSR commit-dedup must contain exactly one metadata row"
+    );
+}
+
 #[tokio::test]
 async fn fsr_results_no_checkpoint_expected_rows() {
     let batches = run_full_state_results("app-txn-no-checkpoint").await;
@@ -389,6 +428,38 @@ async fn fsr_commit_dedup_includes_protocol_metadata_and_domain_metadata_rows() 
         "txn".to_string(),
     ];
     assert_eq!(actual_kinds, expected_kinds);
+}
+
+#[tokio::test]
+async fn fsr_commit_dedup_keeps_latest_metadata_singleton() {
+    let dir = build_synthetic_metadata_replace_table();
+    let table_url =
+        Url::from_directory_path(dir.path().canonicalize().expect("canon tmp table")).expect("url");
+    let engine = default_engine();
+    let snapshot = Snapshot::builder_for(table_url)
+        .build(engine.as_ref())
+        .expect("snapshot");
+    let dedup_batches = commit_dedup_batches_for_snapshot(snapshot, engine).await;
+    let merged = if dedup_batches.len() == 1 {
+        dedup_batches[0].clone()
+    } else {
+        concat_batches(&dedup_batches[0].schema(), &dedup_batches).expect("concat commit-dedup")
+    };
+    let payloads = full_action_payload_rows(&merged);
+    let metadata_rows: Vec<_> = payloads
+        .iter()
+        .filter_map(|(kind, payload)| (kind == "metaData").then_some(payload))
+        .collect();
+    assert_eq!(
+        metadata_rows.len(),
+        1,
+        "FSR commit dedup must keep exactly one metadata row"
+    );
+    assert_eq!(
+        metadata_rows[0].get("id").and_then(JsonValue::as_str),
+        Some("mid-new"),
+        "FSR commit dedup must keep latest metadata row by commit version"
+    );
 }
 
 #[tokio::test]
@@ -463,6 +534,7 @@ async fn fsr_commit_dedup_full_rows_expected_table_includes_protocol_metadata_do
 async fn fsr_commit_dedup_real_table_with_dv_small_full_to_json_payloads() {
     let merged = commit_dedup_merged_for_real_fixture("table-with-dv-small").await;
     let actual = full_action_payload_rows(&merged);
+    assert_singleton_protocol_and_metadata(&actual);
 
     let expected: Vec<(String, JsonValue)> = vec![
         (
@@ -538,6 +610,7 @@ async fn fsr_commit_dedup_real_table_with_dv_small_full_to_json_payloads() {
 async fn fsr_commit_dedup_real_app_txn_no_checkpoint_full_to_json_payloads() {
     let merged = commit_dedup_merged_for_real_fixture("app-txn-no-checkpoint").await;
     let actual = full_action_payload_rows(&merged);
+    assert_singleton_protocol_and_metadata(&actual);
 
     let expected: Vec<(String, JsonValue)> = vec![
         (
@@ -624,6 +697,42 @@ async fn fsr_matches_scan_for_all_v2_checkpoint_fixtures() {
         "v2-parquet-sidecars-struct-stats-only",
     ] {
         assert_fsr_matches_scan_paths(table).await;
+    }
+}
+
+#[tokio::test]
+async fn fsr_plans_compile_on_logical_path() {
+    let fixture = fixture_table("table-with-dv-small");
+    let engine = default_engine();
+    let snapshot = Snapshot::builder_for(fixture.url)
+        .build(engine.as_ref())
+        .expect("snapshot");
+    let shape = checkpoint_shape_from_last_checkpoint(&snapshot).expect("shape");
+    let plans = build_fsr_plans(&snapshot, shape).expect("build fsr plans");
+    let ctx = CompileContext::new(
+        Arc::new(RelationBatchRegistry::new()),
+        Arc::new(Mutex::new(None)),
+        Arc::clone(&engine),
+    );
+
+    for plan in &plans {
+        let logical = compile_plan_logical(plan, &ctx).expect("logical compile");
+        match &plan.sink.sink_type {
+            SinkType::Write(_) | SinkType::PartitionedWrite(_) => {
+                assert!(
+                    logical.is_none(),
+                    "expected non-logical sink family to retain fallback path; sink={:?}",
+                    plan.sink.sink_type
+                );
+            }
+            _ => {
+                assert!(
+                    logical.is_some(),
+                    "expected full_state FSR plan to compile through logical path; sink={:?}",
+                    plan.sink.sink_type
+                );
+            }
+        }
     }
 }
 

@@ -20,21 +20,21 @@ pub struct ReadConfig {
 
 #[derive(Clone, Debug)]
 pub enum ReadEngine {
-    StateMachine,
-    PlansDatafusion,
+    DefaultEngine,
+    Datafusion,
 }
 
 /// Provides a default set of read configs for a given table, read spec, and operation
 pub fn default_read_configs() -> Vec<ReadConfig> {
     vec![
         ReadConfig {
-            name: "sm_serial".into(),
-            read_engine: ReadEngine::StateMachine,
+            name: "default_engine_serial".into(),
+            read_engine: ReadEngine::DefaultEngine,
             parallel_scan: ParallelScan::Disabled,
         },
         ReadConfig {
-            name: "plans_df".into(),
-            read_engine: ReadEngine::PlansDatafusion,
+            name: "datafusion".into(),
+            read_engine: ReadEngine::Datafusion,
             parallel_scan: ParallelScan::Disabled,
         },
     ]

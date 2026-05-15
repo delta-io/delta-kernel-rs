@@ -7,5 +7,5 @@ pub mod full_state;
 pub use full_state::{
     build_fsr_plans, checkpoint_shape_from_last_checkpoint, checkpoint_shape_from_schema,
     first_checkpoint_url, full_state_sm, snapshot_has_checkpoint_files, CheckpointShape,
-    CommitFileMeta,
+    CommitFileMeta, FullState, FullStateBuilder,
 };

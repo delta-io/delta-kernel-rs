@@ -173,7 +173,7 @@ mod tests {
             schema,
         ));
         let sink = SinkNode {
-            sink_type: SinkType::Results,
+            sink_type: SinkType::Results(None),
         };
         Plan::new(root, sink)
     }

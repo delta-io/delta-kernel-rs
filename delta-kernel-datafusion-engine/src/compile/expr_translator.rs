@@ -9,21 +9,22 @@
 //! Supported today:
 //! - `Literal` (all primitive scalar types + typed NULL)
 //! - `Column` (top-level + nested via DataFusion `get_field`)
-//! - `Predicate` wrappers (BooleanExpression, Not, Junction And/Or, Unary IsNull,
-//!   Binary Eq/Lt/Gt/Distinct/In)
+//! - `Predicate` wrappers (BooleanExpression, Not, Junction And/Or, Unary IsNull, Binary
+//!   Eq/Lt/Gt/Distinct/In)
 //! - `Binary` arithmetic (Plus, Minus, Multiply, Divide)
 //! - `Variadic(Coalesce)` (lowered to a nested CASE chain so we don't depend on the
 //!   datafusion-functions `coalesce` UDF)
 //! - `If` (lowered to `Expr::Case`)
 //!
 //! Deferred (returns Unsupported with TODO):
-//! - `Struct` with nullability predicates, `Transform`, `Unary(ToJson)`, `ParseJson`,
-//!   `MapToStruct`
+//! - `Struct` with nullability predicates, `Transform`, `Unary(ToJson)`, `MapToStruct`
 //! - `Opaque`, `Unknown`
 //! - `Predicate::Opaque`, `Predicate::Unknown`
 
 use std::sync::Arc;
 
+use datafusion_common::arrow::array::StructArray;
+use datafusion_common::arrow::datatypes::Field as ArrowField;
 use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::expr::{BinaryExpr, Case, InList};
 use datafusion_expr::{Expr, Operator};
@@ -33,7 +34,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
     Expression, IfExpression, JunctionPredicate, JunctionPredicateOp, Predicate, Scalar,
-    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    StructData, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::schema::{DataType, PrimitiveType};
@@ -69,9 +70,19 @@ pub fn kernel_expr_to_df(expr: &Expression) -> Result<Expr, DeltaError> {
         Expression::Unary(_) => Err(unsupported(
             "expr_translator: Unary(ToJson) is not yet supported",
         )),
-        Expression::ParseJson(_) => Err(unsupported(
-            "expr_translator: ParseJson is not yet supported",
-        )),
+        Expression::ParseJson(parse_json) => {
+            let json_expr = kernel_expr_to_df(parse_json.json_expr.as_ref())?;
+            let extracted = crate::compile::json_parse::generate_schema_extractions(
+                &json_expr,
+                &parse_json.output_schema,
+            )?;
+            let mut args = Vec::with_capacity(extracted.len() * 2);
+            for (field_expr, field_name) in extracted {
+                args.push(Expr::Literal(ScalarValue::Utf8(Some(field_name)), None));
+                args.push(field_expr);
+            }
+            Ok(datafusion_functions::core::expr_fn::named_struct(args))
+        }
         Expression::MapToStruct(_) => Err(unsupported(
             "expr_translator: MapToStruct is not yet supported",
         )),
@@ -298,7 +309,8 @@ fn scalar_value_to_df(scalar: &Scalar) -> Result<ScalarValue, DeltaError> {
             ScalarValue::Decimal128(Some(d.bits()), ty.precision(), ty.scale() as i8)
         }
         Scalar::Null(dt) => typed_null_to_df(dt)?,
-        Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => {
+        Scalar::Struct(v) => scalar_struct_value_to_df(v)?,
+        Scalar::Array(_) | Scalar::Map(_) => {
             return Err(unsupported(format!(
                 "expr_translator: complex literal scalar {:?} is not yet supported",
                 scalar.data_type()
@@ -306,6 +318,35 @@ fn scalar_value_to_df(scalar: &Scalar) -> Result<ScalarValue, DeltaError> {
         }
     };
     Ok(val)
+}
+
+fn scalar_struct_value_to_df(struct_data: &StructData) -> Result<ScalarValue, DeltaError> {
+    let fields: Vec<ArrowField> = struct_data
+        .fields()
+        .iter()
+        .map(|f| {
+            f.try_into_arrow().map_err(|e| {
+                unsupported(format!(
+                    "expr_translator: struct literal field `{}` conversion failed: {e}",
+                    f.name()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, DeltaError>>()?;
+    let values = struct_data
+        .values()
+        .iter()
+        .map(|v| {
+            scalar_value_to_df(v)?
+                .to_array()
+                .map_err(crate::error::datafusion_err_to_delta)
+        })
+        .collect::<Result<Vec<_>, DeltaError>>()?;
+    Ok(ScalarValue::Struct(Arc::new(StructArray::new(
+        fields.into(),
+        values,
+        None,
+    ))))
 }
 
 fn typed_null_to_df(data_type: &DataType) -> Result<ScalarValue, DeltaError> {
@@ -354,7 +395,7 @@ mod tests {
     use delta_kernel::expressions::{
         column_expr, ArrayData, ColumnName, Expression as Expr_, Predicate as Pred, Scalar,
     };
-    use delta_kernel::schema::{ArrayType, DataType};
+    use delta_kernel::schema::{ArrayType, DataType, StructField, StructType};
 
     use super::{kernel_expr_to_df, kernel_pred_to_df};
 
@@ -629,6 +670,18 @@ mod tests {
         let kernel = Expr_::struct_from([Arc::new(column_expr!("a")), Arc::new(column_expr!("b"))]);
         let df = kernel_expr_to_df(&kernel).unwrap();
         assert_eq!(format!("{df}"), "struct(a, b)");
+    }
+
+    #[test]
+    fn parse_json_translates_to_json_get_and_named_struct() {
+        let output_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("numRecords", DataType::LONG)]).unwrap(),
+        );
+        let kernel = Expr_::parse_json(column_expr!("stats"), output_schema);
+        let df = kernel_expr_to_df(&kernel).unwrap();
+        let lowered = format!("{df}");
+        assert!(lowered.contains("named_struct"));
+        assert!(lowered.contains("json_get_int"));
     }
 
     #[test]

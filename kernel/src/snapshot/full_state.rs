@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use crate::plans::errors::DeltaErrAsKernel;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
-use crate::plans::state_machines::fsr::full_state_sm;
+use crate::plans::state_machines::fsr::{full_state_sm, FullStateBuilder};
+use crate::scan::ScanBuilder as KernelScanBuilder;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Snapshot};
 
@@ -39,5 +40,15 @@ impl Snapshot {
     /// kernel replay instead.
     pub fn full_state(self: &SnapshotRef) -> DeltaResult<CoroutineSM<()>> {
         full_state_sm(Arc::clone(self)).map_err(|e| e.into_kernel_default())
+    }
+
+    /// Create a canonical FSR plan builder rooted at this snapshot.
+    pub fn full_state_builder(self: &SnapshotRef) -> FullStateBuilder {
+        crate::plans::state_machines::fsr::FullState::for_table(Arc::clone(self))
+    }
+
+    /// Create a split-phase scan replay plan builder rooted at this snapshot.
+    pub fn scan_replay_builder(self: &SnapshotRef) -> KernelScanBuilder {
+        KernelScanBuilder::new(Arc::clone(self))
     }
 }

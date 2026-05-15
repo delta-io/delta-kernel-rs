@@ -103,6 +103,12 @@ pub struct RelationHandle {
     pub schema: SchemaRef,
 }
 
+/// Typed relation identity carried across sink/ref boundaries.
+///
+/// `RelationId` is currently an alias of [`RelationHandle`], kept to smooth
+/// migration from id-only wiring to explicit `(name, schema)` contracts.
+pub(crate) type RelationId = RelationHandle;
+
 impl RelationHandle {
     /// Mint a fresh handle with the given diagnostic name and producer
     /// output schema. Distinct ids regardless of `name` collisions, so names
@@ -153,9 +159,62 @@ pub struct ScanFileColumns {
     pub record_count: Option<ColumnName>,
 }
 
+/// Deletion-vector encoding kind for [`DvRef`] variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DvKind {
+    /// Descriptor struct matching
+    /// [`crate::actions::deletion_vector::DeletionVectorDescriptor`].
+    Descriptor,
+}
+
+/// Skip rows present in the deletion vector named by `column`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DvSkip {
+    pub column: ColumnName,
+    pub kind: DvKind,
+}
+
+/// Keep only rows present in the deletion vector named by `column`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DvKeep {
+    pub column: ColumnName,
+    pub kind: DvKind,
+}
+
+/// Keep rows in `dv` minus rows in `subtract`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DvKeepDiff {
+    pub dv: ColumnName,
+    pub subtract: ColumnName,
+    pub kind: DvKind,
+}
+
+/// Deletion-vector reference attached to a [`LoadSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DvRef {
+    Skip(DvSkip),
+    Keep(DvKeep),
+    KeepDiff(DvKeepDiff),
+}
+
+impl DvRef {
+    /// Build a skip-style DV reference.
+    pub fn skip(column: ColumnName, kind: DvKind) -> Self {
+        Self::Skip(DvSkip { column, kind })
+    }
+
+    /// Return the primary DV column reference when this variant has one.
+    pub fn primary_column(&self) -> &ColumnName {
+        match self {
+            Self::Skip(v) => &v.column,
+            Self::Keep(v) => &v.column,
+            Self::KeepDiff(v) => &v.dv,
+        }
+    }
+}
+
 /// File-reader sink. For each upstream row, opens the resolved file in
-/// [`Self::file_type`], reads [`Self::file_schema`] columns, optionally
-/// emits a [`Self::row_index_column`], and broadcasts the row's
+/// [`Self::file_type`], reads [`Self::file_schema`] columns, and broadcasts the row's
 /// [`Self::passthrough_columns`] alongside each emitted file row.
 ///
 /// The materialized result is named via [`Self::output_relation`] so that
@@ -171,7 +230,7 @@ pub struct ScanFileColumns {
 pub struct LoadSink {
     /// Where Load's output is materialized. Downstream plans reference this
     /// handle via [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
-    pub output_relation: RelationHandle,
+    pub output_relation: RelationId,
     /// Desired per-file output columns (nullability follows
     /// [`crate::ParquetHandler::read_parquet_files`] semantics).
     pub file_schema: SchemaRef,
@@ -180,17 +239,12 @@ pub struct LoadSink {
     pub base_url: Option<url::Url>,
     /// Column-name hints used to read per-row file metadata from upstream.
     pub file_meta: ScanFileColumns,
-    /// Optional upstream column holding the per-row deletion vector descriptor
-    /// (persisted path or inline DV string). When `None`, IR does not request
-    /// DV-masked reads from engines.
-    pub dv_ref: Option<ColumnName>,
+    /// Optional upstream deletion-vector policy. When `None`, IR does not request
+    /// DV-based masking in load.
+    pub dv_ref: Option<DvRef>,
     /// Names of upstream columns to broadcast verbatim onto every output row
     /// (e.g. `add.path` for downstream joins back to the manifest).
     pub passthrough_columns: Vec<ColumnName>,
-    /// Optional name for a synthetic per-file `LONG NOT NULL` row-index
-    /// column. Must not collide with [`Self::file_schema`] or
-    /// [`Self::passthrough_columns`].
-    pub row_index_column: Option<String>,
     /// Read format. Phase 0.6 supports `Parquet` and `Json`; later stacks
     /// add the spec's full `FileFormat` tagged union.
     pub file_type: FileType,
@@ -314,11 +368,14 @@ impl PartitionedWriteSink {
 #[derive(Debug, Clone)]
 pub enum SinkType {
     /// Stream every output batch to the caller.
-    Results,
+    ///
+    /// `None` means "infer from root output schema". Newer plan builders should
+    /// prefer setting `Some(schema)` explicitly.
+    Results(Option<SchemaRef>),
     /// Stream every output batch to the named [`RelationHandle`]. Another
     /// plan in the same phase consumes via
     /// [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
-    Relation(RelationHandle),
+    Relation(RelationId),
     /// Drain every output batch through the wrapped consumer KDF. The KDF's
     /// finalized per-partition state is harvested by the engine into the
     /// phase's `PhaseState` (and recovered by the typed
@@ -337,7 +394,7 @@ pub enum SinkType {
 impl PartialEq for SinkType {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (SinkType::Results, SinkType::Results) => true,
+            (SinkType::Results(a), SinkType::Results(b)) => a == b,
             (SinkType::Relation(a), SinkType::Relation(b)) => a == b,
             (SinkType::ConsumeByKdf(a), SinkType::ConsumeByKdf(b)) => a.token == b.token,
             (SinkType::Load(a), SinkType::Load(b)) => a == b,
@@ -360,12 +417,19 @@ impl SinkNode {
     /// `Results`-sink convenience constructor.
     pub fn results() -> Self {
         Self {
-            sink_type: SinkType::Results,
+            sink_type: SinkType::Results(None),
+        }
+    }
+
+    /// `Results`-sink constructor with explicit output schema.
+    pub fn results_with_schema(schema: SchemaRef) -> Self {
+        Self {
+            sink_type: SinkType::Results(Some(schema)),
         }
     }
 
     /// `Relation`-sink convenience constructor.
-    pub fn relation(handle: RelationHandle) -> Self {
+    pub fn relation(handle: RelationId) -> Self {
         Self {
             sink_type: SinkType::Relation(handle),
         }

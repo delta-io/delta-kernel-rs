@@ -6,8 +6,8 @@
 //! `test_case_info.json`:
 //!
 //! - `"scan"` (default): validate via `Snapshot::scan`.
-//! - `"fsr_add_only"`: validate DataFusion-driven `Snapshot::full_state` by
-//!   comparing its terminal add-action path set against selected scan files.
+//! - `"fsr_add_only"`: validate DataFusion-driven `Snapshot::full_state` by comparing its terminal
+//!   add-action path set against selected scan files.
 //!
 //! Missing `read_mode` is treated as `"scan"` for backward compatibility.
 

@@ -29,8 +29,9 @@ mod tests {
 
     use delta_kernel::expressions::{Expression, Scalar};
     use delta_kernel::plans::errors::DeltaErrorCode;
-    use delta_kernel::plans::ir::nodes::AssertCheck;
+    use delta_kernel::plans::ir::nodes::{AssertCheck, RelationHandle};
     use delta_kernel::plans::ir::DeclarativePlanNode;
+    use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use futures::TryStreamExt;
 
@@ -167,5 +168,58 @@ mod tests {
             "expected earlier declared check to fail first: {rendered}"
         );
         assert!(!rendered.contains("SECOND"));
+    }
+
+    #[tokio::test]
+    async fn logical_results_sink_streams_batches() {
+        let ex = DataFusionExecutor::try_new().unwrap();
+        let plan = DeclarativePlanNode::values(
+            two_bool_schema(),
+            vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],
+        )
+        .unwrap()
+        .project(
+            vec![
+                Arc::new(Expression::column(["a"])),
+                Arc::new(Expression::column(["b"])),
+            ],
+            two_bool_schema(),
+        )
+        .into_results();
+        let batches = ex.execute_plan_collect(plan).await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn logical_relation_sink_materializes_into_registry() {
+        let ex = DataFusionExecutor::try_new().unwrap();
+        let schema = two_bool_schema();
+        let handle = RelationHandle::fresh("logical_relation_test", Arc::clone(&schema));
+        let plan = DeclarativePlanNode::values(
+            Arc::clone(&schema),
+            vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],
+        )
+        .unwrap()
+        .project(
+            vec![
+                Arc::new(Expression::column(["a"])),
+                Arc::new(Expression::column(["b"])),
+            ],
+            Arc::clone(&schema),
+        )
+        .into_relation(handle.clone());
+
+        ex.execute_phase_operation(PhaseOperation::Plans(vec![plan]))
+            .await
+            .unwrap();
+        let relation_batches = ex
+            .relation_batch_registry()
+            .get_cloned(handle.id)
+            .expect("relation sink should materialize output batches");
+        assert_eq!(relation_batches.len(), 1);
+        assert_eq!(relation_batches[0].num_rows(), 1);
+        assert_eq!(relation_batches[0].num_columns(), 2);
     }
 }

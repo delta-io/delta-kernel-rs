@@ -5,7 +5,7 @@ use std::sync::Arc;
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
+use delta_kernel::plans::ir::nodes::{DvRef, FileType, LoadSink};
 use delta_kernel::plans::ir::Plan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, StructField, StructType};
 
@@ -61,30 +61,15 @@ pub(super) fn expected_materialized_schema(
     for cn in &load.passthrough_columns {
         fields.push(passthrough_output_field(upstream, cn)?);
     }
-    if let Some(name) = &load.row_index_column {
-        fields.push(StructField::create_metadata_column(
-            name.clone(),
-            MetadataColumnSpec::RowIndex,
-        ));
-    }
     StructType::try_new(fields).map(Arc::new).map_err(|e| {
         crate::error::plan_compilation(format!("invalid Load materialized schema: {e}"))
     })
 }
 
-pub(super) fn physical_read_schema(
+pub(crate) fn physical_read_schema(
     load: &LoadSink,
 ) -> Result<delta_kernel::schema::SchemaRef, DeltaError> {
-    let mut fields: Vec<StructField> = load.file_schema.fields().cloned().collect();
-    if let Some(name) = &load.row_index_column {
-        fields.push(StructField::create_metadata_column(
-            name.clone(),
-            MetadataColumnSpec::RowIndex,
-        ));
-    }
-    StructType::try_new(fields).map(Arc::new).map_err(|e| {
-        crate::error::plan_compilation(format!("invalid Load physical read schema: {e}"))
-    })
+    Ok(load.file_schema.clone())
 }
 
 fn ensure_column(upstream: &StructType, cn: &ColumnName) -> Result<(), DeltaError> {
@@ -97,9 +82,13 @@ pub(super) fn validate_load_sink(load: &LoadSink, upstream: &StructType) -> Resu
             "Load sink with Json file_type does not support dv_ref masking in the DataFusion engine",
         ));
     }
-    if matches!(load.file_type, FileType::Json) && load.row_index_column.is_some() {
+    if matches!(load.file_type, FileType::Json)
+        && load
+            .file_schema
+            .contains_metadata_column(&MetadataColumnSpec::RowIndex)
+    {
         return Err(crate::error::unsupported(
-            "Load sink with Json file_type does not support row_index_column in the DataFusion engine yet",
+            "Load sink with Json file_type does not support RowIndex metadata column in file_schema in the DataFusion engine yet",
         ));
     }
     ensure_column(upstream, &load.file_meta.path)?;
@@ -110,7 +99,14 @@ pub(super) fn validate_load_sink(load: &LoadSink, upstream: &StructType) -> Resu
         ensure_column(upstream, rc)?;
     }
     if let Some(ref dv) = load.dv_ref {
-        ensure_column(upstream, dv)?;
+        match dv {
+            DvRef::Skip(v) => ensure_column(upstream, &v.column)?,
+            DvRef::Keep(v) => ensure_column(upstream, &v.column)?,
+            DvRef::KeepDiff(v) => {
+                ensure_column(upstream, &v.dv)?;
+                ensure_column(upstream, &v.subtract)?;
+            }
+        }
     }
     for cn in &load.passthrough_columns {
         ensure_column(upstream, cn)?;
