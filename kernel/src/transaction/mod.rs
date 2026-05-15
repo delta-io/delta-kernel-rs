@@ -293,10 +293,7 @@ where
     add_files_metadata.map(move |add_files_batch| {
         let transform = Expression::transform(
             Transform::new_top_level()
-                .with_inserted_field(
-                    Some("modificationTime"),
-                    Expression::literal(data_change),
-                )
+                .with_inserted_field(Some("modificationTime"), Expression::literal(data_change))
                 .with_replaced_field(
                     "stats",
                     Expression::unary(ToJson, Expression::column(["stats"])),

@@ -1411,8 +1411,7 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let transform =
-            Transform::new_top_level().with_replaced_field("missing", Expr::literal(1));
+        let transform = Transform::new_top_level().with_replaced_field("missing", Expr::literal(1));
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
@@ -1431,8 +1430,8 @@ mod tests {
             .contains("reference invalid input field names"));
 
         // Test unused insertion keys
-        let transform2 = Transform::new_top_level()
-            .with_inserted_field(Some("nonexistent"), Expr::literal(1));
+        let transform2 =
+            Transform::new_top_level().with_inserted_field(Some("nonexistent"), Expr::literal(1));
 
         let expr2 = Expr::Transform(transform2);
         let result2 = evaluate_expression(

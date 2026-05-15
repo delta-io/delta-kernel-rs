@@ -74,10 +74,10 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::expr_ext::{any_of, col, lit, ExpressionExt, PredicateExt};
 use crate::plans::ir::nodes::{
-    DvRef, FileFormat, FileType, JoinHint, JoinNode, JoinType, LoadSink, OrderingSpec,
-    RelationHandle, ScanFileColumns, WindowFunction,
+    DvRef, FileFormat, FileType, LoadSink, OrderingSpec, RelationHandle, ScanFileColumns,
 };
-use crate::plans::ir::{DeclarativePlanNode, Extractor, Plan};
+use crate::plans::ir::schema_ext::{schema_builder, SchemaBuildExt};
+use crate::plans::ir::{plan, DeclarativePlanNode, Extractor, Plan};
 use crate::plans::kdf::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
@@ -493,9 +493,7 @@ fn build_sidecar_discovery_plan(
         .collect();
     let sidecar_scan =
         DeclarativePlanNode::scan(checkpoint_format, checkpoint_files, sidecar_only_schema())
-            .filter(Arc::new(
-                Predicate::is_not_null(Expression::column(["sidecar"])).into(),
-            ));
+            .filter(Arc::new(col("sidecar").is_not_null().into()));
     Ok(sidecar_scan.consume(SidecarCollector::new(
         snapshot.log_segment().log_root.clone(),
     )))
@@ -541,20 +539,16 @@ fn scan_metadata_plans_with_shape(
                 ),
             );
         }
-        let add_path_present = Predicate::is_not_null(Expression::column(["add", "path"]));
+        let add_path_present = col(ADD_PATH).is_not_null();
         // Data-skipping predicates are best-effort and must never introduce false negatives.
         // Keep rows when the skipping predicate evaluates to NULL (unknown) to avoid over-pruning
         // files with incomplete / partially-missing stats coverage.
-        let skip_or_unknown = Predicate::or(
-            predicate.as_ref().clone(),
-            Predicate::is_null(predicate.as_ref().clone()),
-        );
-        let combined = Predicate::and(add_path_present, skip_or_unknown);
+        let pred = predicate.as_ref().clone();
+        let skip_or_unknown = pred.clone().or(Predicate::is_null(pred));
+        let combined = add_path_present.and(skip_or_unknown);
         metadata_root = metadata_root.filter(Arc::new(combined.into()));
     } else {
-        metadata_root = metadata_root.filter(Arc::new(
-            Predicate::is_not_null(Expression::column(["add", "path"])).into(),
-        ));
+        metadata_root = metadata_root.filter(Arc::new(col(ADD_PATH).is_not_null().into()));
     }
     let live_actions = metadata_root.project(
         scan_live_actions_projection(!partition_columns.is_empty()),
@@ -941,22 +935,19 @@ fn scan_live_actions_schema(partition_values_parsed_schema: Option<&SchemaRef>) 
 
 fn scan_live_actions_projection(with_partition_values_parsed: bool) -> Vec<Arc<Expression>> {
     let mut file_constant_exprs = vec![
-        Expression::column(["add", "partitionValues"]),
-        Expression::column(["add", "baseRowId"]),
-        Expression::column(["add", "defaultRowCommitVersion"]),
-        Expression::column(["add", "tags"]),
-        Expression::column(["add", "clusteringProvider"]),
+        col(["add", "partitionValues"]),
+        col(["add", "baseRowId"]),
+        col(["add", "defaultRowCommitVersion"]),
+        col(["add", "tags"]),
+        col(["add", "clusteringProvider"]),
     ];
     if with_partition_values_parsed {
-        file_constant_exprs.push(Expression::map_to_struct(Expression::column([
-            "add",
-            "partitionValues",
-        ])));
+        file_constant_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])));
     }
     vec![
-        Arc::new(Expression::column(["add", "path"])),
-        Arc::new(Expression::column(["add", "size"])),
-        Arc::new(Expression::column(["add", "deletionVector"])),
+        Arc::new(col(["add", "path"])),
+        Arc::new(col(["add", "size"])),
+        Arc::new(col(["add", "deletionVector"])),
         Arc::new(Expression::struct_from(file_constant_exprs)),
     ]
 }
@@ -993,37 +984,37 @@ fn scan_actions_with_parsed_projection(
     partition_values_parsed_schema: Option<&SchemaRef>,
 ) -> Vec<Arc<Expression>> {
     let mut add_exprs = vec![
-        Arc::new(Expression::column(["add", "path"])),
-        Arc::new(Expression::column(["add", "partitionValues"])),
-        Arc::new(Expression::column(["add", "size"])),
-        Arc::new(Expression::column(["add", "modificationTime"])),
-        Arc::new(Expression::column(["add", "dataChange"])),
-        Arc::new(Expression::column(["add", "stats"])),
-        Arc::new(Expression::column(["add", "tags"])),
-        Arc::new(Expression::column(["add", "deletionVector"])),
-        Arc::new(Expression::column(["add", "baseRowId"])),
-        Arc::new(Expression::column(["add", "defaultRowCommitVersion"])),
-        Arc::new(Expression::column(["add", "clusteringProvider"])),
+        Arc::new(col(["add", "path"])),
+        Arc::new(col(["add", "partitionValues"])),
+        Arc::new(col(["add", "size"])),
+        Arc::new(col(["add", "modificationTime"])),
+        Arc::new(col(["add", "dataChange"])),
+        Arc::new(col(["add", "stats"])),
+        Arc::new(col(["add", "tags"])),
+        Arc::new(col(["add", "deletionVector"])),
+        Arc::new(col(["add", "baseRowId"])),
+        Arc::new(col(["add", "defaultRowCommitVersion"])),
+        Arc::new(col(["add", "clusteringProvider"])),
     ];
     if let Some(schema) = stats_parsed_schema {
         add_exprs.push(Arc::new(Expression::parse_json(
-            Expression::column(["add", "stats"]),
+            col(["add", "stats"]),
             schema.clone(),
         )));
     }
     if partition_values_parsed_schema.is_some() {
-        add_exprs.push(Arc::new(Expression::map_to_struct(Expression::column([
+        add_exprs.push(Arc::new(Expression::map_to_struct(col([
             "add",
             "partitionValues",
         ]))));
     }
     vec![
         Arc::new(Expression::struct_from(add_exprs)),
-        Arc::new(Expression::column([REMOVE_NAME])),
-        Arc::new(Expression::column([PROTOCOL_NAME])),
-        Arc::new(Expression::column([METADATA_NAME])),
-        Arc::new(Expression::column([DOMAIN_METADATA_NAME])),
-        Arc::new(Expression::column([SET_TRANSACTION_NAME])),
+        Arc::new(col([REMOVE_NAME])),
+        Arc::new(col([PROTOCOL_NAME])),
+        Arc::new(col([METADATA_NAME])),
+        Arc::new(col([DOMAIN_METADATA_NAME])),
+        Arc::new(col([SET_TRANSACTION_NAME])),
     ]
 }
 
@@ -1066,17 +1057,17 @@ fn scan_data_projection(
         .fields()
         .map(|field| {
             let expr = match field.get_metadata_column_spec() {
-                Some(MetadataColumnSpec::RowIndex) => Expression::column([row_index_name.as_str()]),
+                Some(MetadataColumnSpec::RowIndex) => col([row_index_name.as_str()]),
                 Some(MetadataColumnSpec::RowCommitVersion) => {
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
+                    col([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
                 }
                 Some(MetadataColumnSpec::RowId) => Expression::binary(
                     BinaryExpressionOp::Plus,
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
-                    Expression::column([row_index_name.as_str()]),
+                    col([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
+                    col([row_index_name.as_str()]),
                 ),
-                Some(MetadataColumnSpec::FilePath) => Expression::column(["path"]),
-                None if partition_columns.contains(field.name()) => Expression::column([
+                Some(MetadataColumnSpec::FilePath) => col(["path"]),
+                None if partition_columns.contains(field.name()) => col([
                     FILE_CONSTANT_VALUES_NAME,
                     "partitionValues_parsed",
                     field.physical_name(column_mapping_mode),
@@ -1092,7 +1083,7 @@ fn scan_data_projection(
                             ),
                         )
                     })?;
-                    Expression::column([physical_field.name().as_str()])
+                    col([physical_field.name().as_str()])
                 }
             };
             Ok(Arc::new(expr))
@@ -1122,9 +1113,9 @@ fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
 /// `txn_expiration_cutoff` is `None` when `delta.setTransactionRetentionDuration` is unset — txn
 /// rows are not filtered by age.
 fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
-    let remove_ok = col("remove")
-        .is_null()
-        .or(col(REMOVE_DELETION_TIMESTAMP).or_lit(0i64).gt(lit(min_file_ts)));
+    let remove_ok = col("remove").is_null().or(col(REMOVE_DELETION_TIMESTAMP)
+        .or_lit(0i64)
+        .gt(lit(min_file_ts)));
     let txn_ok = match txn_expiry {
         None => Predicate::literal(true),
         Some(cutoff) => any_of([
@@ -1139,7 +1130,7 @@ fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
 fn action_identity_projection() -> Vec<Arc<Expression>> {
     action_read_schema()
         .fields()
-        .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+        .map(|f| Arc::new(col([f.name().as_str()])))
         .collect()
 }
 
@@ -1187,7 +1178,9 @@ fn fsr_dedup_key() -> Expression {
     Expression::case_when(
         vec![
             (
-                col(ADD_PATH).is_not_null().or(col(REMOVE_PATH).is_not_null()),
+                col(ADD_PATH)
+                    .is_not_null()
+                    .or(col(REMOVE_PATH).is_not_null()),
                 file_arm,
             ),
             (col("protocol").is_not_null(), proto_arm),
@@ -1278,30 +1271,20 @@ fn build_commit_dedup_plan(
     let project_with_key_and_version: Vec<Arc<Expression>> = action_identity_projection()
         .into_iter()
         .chain(std::iter::once(Arc::clone(&dedup_expr)))
-        .chain(std::iter::once(Arc::new(Expression::column(["version"]))))
+        .chain(std::iter::once(Arc::new(col(["version"]))))
         .collect();
-    let projected = DeclarativePlanNode::relation_ref(commit_raw_handle.clone())
+    let projected = plan::relation_ref(commit_raw_handle)
         .project(project_with_key_and_version, with_key_and_version_schema)
-        .filter(Arc::new(
-            Predicate::is_not_null(Expression::column([FSR_JOIN_KEY_COL])).into(),
-        ));
+        .filter(Arc::new(col(FSR_JOIN_KEY_COL).is_not_null().into()));
     let windowed = projected
-        .window(
-            vec![WindowFunction {
-                output_col: "__kernel_rn".into(),
-            }],
-            vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
+        .window_row_number(
+            "__kernel_rn",
+            vec![Arc::new(col(FSR_JOIN_KEY_COL))],
             vec![OrderingSpec::desc(ColumnName::new(["version"]))],
         )
         .map_err(|e| e.into_delta_default())?;
 
-    let rn_top_k = Arc::new(
-        Predicate::le(
-            Expression::column(["__kernel_rn"]),
-            Expression::literal(Scalar::Long(FSR_COMMIT_DEDUP_TOP_K)),
-        )
-        .into(),
-    );
+    let rn_top_k = Arc::new(col("__kernel_rn").le(lit(FSR_COMMIT_DEDUP_TOP_K)).into());
 
     // Final project: drop `version` and `__rn`; keep action_cols + __fsr_join_k.
     let final_proj: Vec<Arc<Expression>> = action_identity_projection()
@@ -1341,14 +1324,12 @@ fn build_sidecar_load_plan(
     sidecar_handle: &RelationHandle,
     log_root: &Url,
 ) -> Result<Plan, DeltaError> {
-    let scan = DeclarativePlanNode::relation_ref(checkpoint_top_handle.clone())
-        .filter(Arc::new(
-            Predicate::is_not_null(Expression::column([SIDECAR_NAME])).into(),
-        ))
+    let scan = plan::relation_ref(checkpoint_top_handle)
+        .filter(Arc::new(col(SIDECAR_NAME).is_not_null().into()))
         .project(
             vec![
-                Arc::new(Expression::column([SIDECAR_NAME, "path"])),
-                Arc::new(Expression::column([SIDECAR_NAME, "sizeInBytes"])),
+                Arc::new(col([SIDECAR_NAME, "path"])),
+                Arc::new(col([SIDECAR_NAME, "sizeInBytes"])),
             ],
             path_size_schema(false),
         );
@@ -1413,14 +1394,12 @@ fn build_results_plan(
     // No checkpoint parts: there is no checkpoint side to anti-join. The full snapshot state is
     // entirely determined by commit winners.
     if !has_checkpoint_files {
-        return Ok(
-            DeclarativePlanNode::relation_ref(commit_dedup_handle.clone())
-                .filter(Arc::new(
-                    retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
-                ))
-                .project(action_identity_projection(), action_read_schema())
-                .into_results(),
-        );
+        return Ok(plan::relation_ref(commit_dedup_handle)
+            .filter(Arc::new(
+                retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
+            ))
+            .project(action_identity_projection(), action_read_schema())
+            .into_results());
     }
 
     let dedup_expr = Arc::new(fsr_dedup_key());
@@ -1428,15 +1407,14 @@ fn build_results_plan(
 
     // Top-level checkpoint rows are preloaded once into `FSR_CHECKPOINT_TOP`; project action
     // columns here so schema aligns with sidecar/action relations.
-    let top_scan = DeclarativePlanNode::relation_ref(checkpoint_top_handle.clone())
+    let top_scan = plan::relation_ref(checkpoint_top_handle)
         .project(action_identity_projection(), action_read_schema());
 
     let checkpoint_full = match sidecar_handle {
-        Some(handle) => DeclarativePlanNode::union_unordered(vec![
-            top_scan,
-            DeclarativePlanNode::relation_ref(handle.clone()),
-        ])
-        .map_err(|e| e.into_delta_default())?,
+        Some(handle) => {
+            DeclarativePlanNode::union_unordered(vec![top_scan, plan::relation_ref(handle)])
+                .map_err(|e| e.into_delta_default())?
+        }
         None => top_scan,
     };
 
@@ -1452,31 +1430,25 @@ fn build_results_plan(
 
     // Build side: just the dedup keys from commit winners (one column wide). LeftAnti emits
     // probe rows whose key is NOT in the build set, mirroring the probe child's schema.
-    let join_key_only_schema = StructType::try_new([StructField::nullable(
-        FSR_JOIN_KEY_COL,
-        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-    )])
-    .map(Arc::new)
-    .map_err(|e| e.into_delta_default())?;
-    let commit_keys = DeclarativePlanNode::relation_ref(commit_dedup_handle.clone()).project(
-        vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
-        join_key_only_schema,
-    );
+    let join_key_only_schema = schema_builder()
+        .with_nullable(
+            FSR_JOIN_KEY_COL,
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+        )
+        .build()
+        .map_err(|e| e.into_delta_default())?;
+    let commit_keys = plan::relation_ref(commit_dedup_handle)
+        .project(vec![Arc::new(col(FSR_JOIN_KEY_COL))], join_key_only_schema);
 
-    let survivors = DeclarativePlanNode::join(
-        JoinNode {
-            build_keys: vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
-            probe_keys: vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
-            join_type: JoinType::LeftAnti,
-            hint: JoinHint::Hash,
-        },
+    let survivors = checkpoint_keyed.left_anti_join_on(
         commit_keys,
-        checkpoint_keyed,
+        vec![Arc::new(col(FSR_JOIN_KEY_COL))],
+        vec![Arc::new(col(FSR_JOIN_KEY_COL))],
     );
 
     // Union directly on augmented rows (action + join key); drop join key once at the end.
     let everything = DeclarativePlanNode::union_unordered(vec![
-        DeclarativePlanNode::relation_ref(commit_dedup_handle.clone()),
+        plan::relation_ref(commit_dedup_handle),
         survivors,
     ])
     .map_err(|e| e.into_delta_default())?;
@@ -1497,17 +1469,14 @@ fn build_results_plan(
 /// [`build_commit_dedup_plan`]'s row_number window (`ORDER BY version DESC`) and is dropped
 /// before the relation is persisted, so its presence in the schema is plan-internal.
 fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
-    let mut fields: Vec<_> = action_read_schema().fields().cloned().collect();
-    fields.push(StructField::nullable(
-        FSR_JOIN_KEY_COL,
-        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-    ));
+    let join_key_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, true)));
+    let mut b = action_read_schema()
+        .build_on()
+        .with_nullable(FSR_JOIN_KEY_COL, join_key_type);
     if with_version {
-        fields.push(StructField::not_null("version", DataType::LONG));
+        b = b.with_not_null("version", DataType::LONG);
     }
-    StructType::try_new(fields)
-        .map(Arc::new)
-        .map_err(|e| e.into_delta_default())
+    b.build().map_err(|e| e.into_delta_default())
 }
 
 fn fsr_row_has_identity_predicate() -> Predicate {
@@ -1573,8 +1542,7 @@ mod tests {
     ) -> Result<Scan, DeltaError> {
         let mut builder = ScanBuilder::new(snapshot).with_stats();
         if cfg.with_predicate {
-            builder = builder
-                .with_predicate(Arc::new(Predicate::is_not_null(Expression::column(["id"]))));
+            builder = builder.with_predicate(Arc::new(col("id").is_not_null()));
         }
         builder.build_replay()
     }
@@ -1738,7 +1706,7 @@ mod tests {
     fn scan_metadata_with_predicate_materializes_parsed_stats() {
         let (_engine, snapshot, _tmp) = load_test_table("basic_partitioned").unwrap();
         let predicate = Arc::new(Predicate::gt(
-            Expression::column(["number"]),
+            col(["number"]),
             Expression::literal(Scalar::Long(1)),
         ));
         let scan = ScanBuilder::new(Arc::clone(&snapshot))
@@ -1769,8 +1737,7 @@ mod tests {
         let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
         let mut builder = ScanBuilder::new(Arc::clone(&snapshot)).with_stats();
         if with_predicate {
-            builder = builder
-                .with_predicate(Arc::new(Predicate::is_not_null(Expression::column(["id"]))));
+            builder = builder.with_predicate(Arc::new(col("id").is_not_null()));
         }
         let scan = builder.build_replay().unwrap();
         let (metadata, _) = scan.scan_metadata_state_machine().unwrap();

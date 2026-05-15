@@ -121,10 +121,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         .with_replaced_field("replaceme", Expr::literal(42))
         .with_inserted_field(None::<&str>, Expr::literal("prepended"))
         .with_inserted_field(Some("a".to_string()), Expr::literal("first"))
-        .with_inserted_field(
-            Some("a".to_string()),
-            Expr::transform(nested_transform),
-        )
+        .with_inserted_field(Some("a".to_string()), Expr::transform(nested_transform))
         .with_inserted_field(Some("a".to_string()), Expr::literal("third"));
 
     let mut sub_exprs = vec![

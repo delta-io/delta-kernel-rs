@@ -10,10 +10,10 @@
 //! [`relation_ref`]) parallel the inherent associated functions on [`DeclarativePlanNode`].
 //! They exist for two reasons:
 //!
-//! 1. **Borrow, don't move** for handles — [`relation_ref`] takes `&RelationHandle` so callers
-//!    can reuse the same handle in multiple plans without manual `.clone()`.
-//! 2. **Top-down readability** — `plan::relation_ref(&h).filter(...).into_results()` reads
-//!    cleaner than `DeclarativePlanNode::relation_ref(h.clone()).filter(...).into_results()`.
+//! 1. **Borrow, don't move** for handles — [`relation_ref`] takes `&RelationHandle` so callers can
+//!    reuse the same handle in multiple plans without manual `.clone()`.
+//! 2. **Top-down readability** — `plan::relation_ref(&h).filter(...).into_results()` reads cleaner
+//!    than `DeclarativePlanNode::relation_ref(h.clone()).filter(...).into_results()`.
 
 use super::declarative::DeclarativePlanNode;
 use super::nodes::{FileFormat, RelationHandle, SinkNode};
