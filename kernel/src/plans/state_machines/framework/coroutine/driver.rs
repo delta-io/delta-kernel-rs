@@ -1,5 +1,5 @@
 //! The [`CoroutineSM`] driver: compiles [`PhaseYield`] sequences into the
-//! [`StateMachine`] contract on top of [`genawaiter2::sync::Gen`].
+//! [`StateMachine`] contract.
 //!
 //! The protocol is strictly 1:1: each yield carries exactly one
 //! [`PhaseOperation`], the driver hands it to the engine via
@@ -15,28 +15,30 @@
 //! **Invariant:** a successfully constructed [`CoroutineSM`] always has
 //! at least one concrete phase queued. Zero-phase coroutines are invalid;
 //! the builder must short-circuit before constructing an SM.
+//!
+//! ## Errors
+//!
+//! Driver/body protocol bugs surface as
+//! [`GenError`](super::generator::GenError) from the underlying
+//! [`Gen`](super::generator::Gen); this module lifts them into
+//! [`DeltaError`] (`DeltaCommandInvariantViolation`). User-facing failures
+//! produced by the engine flow through [`PhaseResume`] as
+//! `Result<PhaseState, EngineError>` and are not handled here.
 
 use std::future::Future;
-use std::pin::Pin;
-
-use genawaiter2::sync::{Co, Gen};
-use genawaiter2::GeneratorState;
 
 use super::super::engine_error::EngineError;
 use super::super::phase_operation::PhaseOperation;
 use super::super::phase_state::PhaseState;
 use super::super::state_machine::{AdvanceResult, StateMachine};
+use super::generator::{Co, Gen, GenError, GeneratorState};
 use super::phase::{PhaseCo, PhaseResume, PhaseYield};
-use crate::bail_delta;
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
+use crate::{bail_delta, delta_error};
 
-/// Boxed body future that the [`Gen`] drives. Erasing the producer's `Fut`
-/// type keeps [`CoroutineSM`] generic only in the SM result `R`, so callers
-/// don't need to mention an unnameable closure-future combo.
-type BodyFut<R> = Pin<Box<dyn Future<Output = Result<R, DeltaError>> + Send>>;
-type InnerGen<R> = Gen<PhaseYield, PhaseResume, BodyFut<R>>;
+type InnerGen<R> = Gen<PhaseYield, PhaseResume, Result<R, DeltaError>>;
 
-/// A state machine driven by a [`genawaiter2`] stackless coroutine.
+/// A state machine driven by a hand-rolled stackless coroutine.
 ///
 /// At each phase the body yields a single [`PhaseYield`] (operation +
 /// static phase name) and awaits the engine outcome. The driver simply
@@ -63,16 +65,11 @@ impl<R: Send + 'static> CoroutineSM<R> {
         F: FnOnce(PhaseCo) -> Fut + Send + 'static,
         Fut: Future<Output = Result<R, DeltaError>> + Send + 'static,
     {
-        let mut gen: InnerGen<R> = Gen::new(move |co: Co<PhaseYield, PhaseResume>| {
-            let fut: BodyFut<R> = Box::pin(producer(co));
-            fut
-        });
-        // `genawaiter2::Gen` has no separate `start` — `resume_with(R)` both
-        // starts and steps. The body's first action must be `Phase::execute`,
-        // which yields *before* awaiting; the stub `R` we pass here is never
-        // observed. If a producer awaits something else first and the stub
-        // leaks through, that's a kernel bug.
-        match gen.resume_with(PhaseResume::stub()) {
+        let mut gen: InnerGen<R> = Gen::new(move |co: Co<PhaseYield, PhaseResume>| producer(co));
+        match gen
+            .start()
+            .map_err(|e| lift_gen_error(e, "CoroutineSM::new"))?
+        {
             GeneratorState::Yielded(phase) => Ok(Self {
                 gen,
                 pending: Some(phase),
@@ -119,7 +116,11 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
             );
         }
 
-        match self.gen.resume_with(PhaseResume(result)) {
+        match self
+            .gen
+            .resume_with(PhaseResume(result))
+            .map_err(|e| lift_gen_error(e, "CoroutineSM::advance"))?
+        {
             GeneratorState::Yielded(next) => {
                 self.pending = Some(next);
                 Ok(AdvanceResult::Continue)
@@ -137,6 +138,18 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
             None => "complete",
         }
     }
+}
+
+/// Convert a coroutine-shim protocol bug into a kernel-level `DeltaError`.
+/// All [`GenError`] variants signal a kernel-internal contract violation;
+/// they should never be observed at runtime in correct code.
+fn lift_gen_error(e: GenError, operation: &'static str) -> DeltaError {
+    delta_error!(
+        DeltaErrorCode::DeltaCommandInvariantViolation,
+        operation = operation,
+        detail = e.to_string(),
+        source = e,
+    )
 }
 
 #[cfg(test)]
