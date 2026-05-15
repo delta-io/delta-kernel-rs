@@ -39,7 +39,7 @@ use delta_kernel::plans::ir::nodes::{JoinType, RelationHandle, SinkType, WriteSi
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::plans::kdf::FinishedHandle;
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
-use delta_kernel::schema::{MetadataColumnSpec, SchemaRef, StructField, StructType};
+use delta_kernel::schema::SchemaRef;
 use delta_kernel::Engine;
 
 use crate::exec::{
@@ -215,22 +215,11 @@ pub(super) fn compile_declarative_node(
 
 pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DeltaError> {
     match node {
-        DeclarativePlanNode::Scan(n) => {
-            if let Some(name) = &n.row_index_column {
-                let mut fields: Vec<StructField> = n.schema.fields().cloned().collect();
-                fields.push(StructField::create_metadata_column(
-                    name.clone(),
-                    MetadataColumnSpec::RowIndex,
-                ));
-                StructType::try_new(fields).map(Arc::new).map_err(|e| {
-                    crate::error::plan_compilation(format!(
-                        "scan output schema with row index is invalid: {e}"
-                    ))
-                })
-            } else {
-                Ok(n.schema.clone())
-            }
-        }
+        DeclarativePlanNode::Scan(n) => n.effective_output_schema().map_err(|e| {
+            crate::error::plan_compilation(format!(
+                "scan output schema with row index is invalid: {e}"
+            ))
+        }),
         DeclarativePlanNode::Values(n) => Ok(n.schema.clone()),
         DeclarativePlanNode::RelationRef(h) => Ok(h.schema.clone()),
         DeclarativePlanNode::Project { node, .. } => Ok(node.output_schema.clone()),

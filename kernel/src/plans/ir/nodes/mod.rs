@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use crate::expressions::{ColumnName, Expression, Scalar};
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Error, FileMeta};
 
 // ============================================================================
@@ -81,6 +81,27 @@ impl ScanNode {
             predicate: None,
             ordered: false,
         }
+    }
+
+    /// Output schema of the scan, including a row-index metadata column when
+    /// [`Self::row_index_column`] is set. Engine compilers should use this
+    /// instead of reconstructing the schema-plus-row-index shape themselves.
+    pub fn effective_output_schema(&self) -> DeltaResult<SchemaRef> {
+        let Some(name) = &self.row_index_column else {
+            return Ok(self.schema.clone());
+        };
+        let mut fields: Vec<StructField> = self.schema.fields().cloned().collect();
+        fields.push(StructField::create_metadata_column(
+            name.clone(),
+            crate::schema::MetadataColumnSpec::RowIndex,
+        ));
+        StructType::try_new(fields)
+            .map(std::sync::Arc::new)
+            .map_err(|e| {
+                Error::generic(format!(
+                    "scan output schema with row index is invalid: {e}"
+                ))
+            })
     }
 }
 
