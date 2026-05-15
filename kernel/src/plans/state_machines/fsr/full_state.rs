@@ -83,7 +83,7 @@ use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::plans::state_machines::framework::phase_operation::{PhaseOperation, SchemaQueryNode};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
-use crate::scan::{Scan, ScanBuilder};
+use crate::scan::Scan;
 use crate::schema::{
     ArrayType, DataType, MetadataColumnSpec, SchemaRef, StructField, StructType, ToSchema,
 };
@@ -179,13 +179,6 @@ impl FullStateBuilder {
     /// rewrite needed at this layer.
     pub fn with_stats(self) -> Self {
         self
-    }
-}
-
-impl ScanBuilder {
-    /// Build a kernel scan for declarative replay.
-    pub fn build_replay(self) -> Result<Scan, DeltaError> {
-        self.build().map_err(|e| e.into_delta_default())
     }
 }
 
