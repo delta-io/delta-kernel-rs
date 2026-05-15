@@ -1153,61 +1153,45 @@ fn action_identity_projection() -> Vec<Arc<Expression>> {
 }
 
 fn fsr_dedup_key() -> Expression {
-    let null_str = Expression::literal(Scalar::Null(DataType::STRING));
-    let file_arm_cond = Predicate::or(
-        Predicate::is_not_null(Expression::column(["add", "path"])),
-        Predicate::is_not_null(Expression::column(["remove", "path"])),
+    let null_str = || Expression::literal(Scalar::Null(DataType::STRING));
+    let arm = |kind: &str, id1: Expression, id2: Expression, id3: Expression| {
+        Expression::array(vec![
+            Expression::literal(Scalar::String(kind.into())),
+            id1,
+            id2,
+            id3,
+        ])
+    };
+    let is_not_null = |path: &[&str]| Predicate::is_not_null(Expression::column(path.iter().copied()));
+    let coalesce = |path: &[&str]| {
+        Expression::coalesce([
+            Expression::column(["add"].into_iter().chain(path.iter().copied())),
+            Expression::column(["remove"].into_iter().chain(path.iter().copied())),
+        ])
+    };
+
+    let file_arm = arm(
+        "file",
+        coalesce(&["path"]),
+        coalesce(&["deletionVector", "storageType"]),
+        coalesce(&["deletionVector", "pathOrInlineDv"]),
     );
-
-    let path_coalesce = Expression::coalesce([
-        Expression::column(["add", "path"]),
-        Expression::column(["remove", "path"]),
-    ]);
-    let dv_storage_coalesce = Expression::coalesce([
-        Expression::column(["add", "deletionVector", "storageType"]),
-        Expression::column(["remove", "deletionVector", "storageType"]),
-    ]);
-    let dv_path_coalesce = Expression::coalesce([
-        Expression::column(["add", "deletionVector", "pathOrInlineDv"]),
-        Expression::column(["remove", "deletionVector", "pathOrInlineDv"]),
-    ]);
-
-    let file_arm = Expression::array(vec![
-        Expression::literal(Scalar::String("file".into())),
-        path_coalesce,
-        dv_storage_coalesce,
-        dv_path_coalesce,
-    ]);
-
-    let proto_arm = Expression::array(vec![
-        Expression::literal(Scalar::String(PROTOCOL_NAME.into())),
-        null_str.clone(),
-        null_str.clone(),
-        null_str.clone(),
-    ]);
-
-    let meta_arm = Expression::array(vec![
-        Expression::literal(Scalar::String("metadata".into())),
-        // Metadata is a singleton table state action: latest row wins regardless of prior id.
-        null_str.clone(),
-        null_str.clone(),
-        null_str.clone(),
-    ]);
-
-    let domain_arm = Expression::array(vec![
-        Expression::literal(Scalar::String(DOMAIN_METADATA_NAME.into())),
-        // Domain metadata is keyed by domain; newer rows replace older configs for that domain.
+    let proto_arm = arm(PROTOCOL_NAME, null_str(), null_str(), null_str());
+    // Metadata is a singleton table state action: latest row wins regardless of prior id.
+    let meta_arm = arm("metadata", null_str(), null_str(), null_str());
+    // Domain metadata is keyed by domain; newer rows replace older configs for that domain.
+    let domain_arm = arm(
+        DOMAIN_METADATA_NAME,
         Expression::column(["domainMetadata", "domain"]),
-        null_str.clone(),
-        null_str.clone(),
-    ]);
-
-    let txn_arm = Expression::array(vec![
-        Expression::literal(Scalar::String(SET_TRANSACTION_NAME.into())),
+        null_str(),
+        null_str(),
+    );
+    let txn_arm = arm(
+        SET_TRANSACTION_NAME,
         Expression::column(["txn", "appId"]),
-        null_str.clone(),
-        null_str.clone(),
-    ]);
+        null_str(),
+        null_str(),
+    );
 
     let null_list = Expression::literal(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
         DataType::STRING,
@@ -1216,20 +1200,14 @@ fn fsr_dedup_key() -> Expression {
 
     Expression::case_when(
         vec![
-            (file_arm_cond, file_arm),
             (
-                Predicate::is_not_null(Expression::column(["protocol"])),
-                proto_arm,
+                Predicate::or(is_not_null(&["add", "path"]), is_not_null(&["remove", "path"])),
+                file_arm,
             ),
-            (
-                Predicate::is_not_null(Expression::column(["metaData", "id"])),
-                meta_arm,
-            ),
-            (
-                Predicate::is_not_null(Expression::column(["domainMetadata"])),
-                domain_arm,
-            ),
-            (Predicate::is_not_null(Expression::column(["txn"])), txn_arm),
+            (is_not_null(&["protocol"]), proto_arm),
+            (is_not_null(&["metaData", "id"]), meta_arm),
+            (is_not_null(&["domainMetadata"]), domain_arm),
+            (is_not_null(&["txn"]), txn_arm),
         ],
         null_list,
     )
