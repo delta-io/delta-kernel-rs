@@ -238,8 +238,7 @@ impl TryFrom<&Crc> for CrcRaw {
                 .set_transactions
                 .as_ref()
                 .map(|m| m.values().cloned().collect()),
-            // Only Complete survives the round-trip; Partial drops to absent so the next
-            // read does not mistake it for an authoritative Complete cache.
+            // Only `Complete` is written; `Partial` is dropped.
             domain_metadata: match &crc.domain_metadata_state {
                 DomainMetadataState::Complete(m) => Some(m.values().cloned().collect()),
                 DomainMetadataState::Partial(_) => None,
@@ -310,11 +309,11 @@ mod tests {
     /// populated.
     fn crc_with(
         txns: Option<HashMap<String, SetTransaction>>,
-        domains: DomainMetadataState,
+        domain_metadata_state: DomainMetadataState,
     ) -> Crc {
         Crc {
             set_transactions: txns,
-            domain_metadata_state: domains,
+            domain_metadata_state,
             ..Default::default()
         }
     }
@@ -488,9 +487,6 @@ mod tests {
         assert_eq!(json_value["domainMetadata"], serde_json::json!([]));
     }
 
-    /// Round-tripping a Partial DM through serde drops the field on serialize and produces
-    /// `Partial(empty)` on the next deserialize, regardless of the Partial cache's contents.
-    /// This is the deliberate "Partial is not persisted" contract.
     #[test]
     fn round_trip_partial_dm_drops_entries_back_to_empty_partial() {
         let mut partial = HashMap::new();

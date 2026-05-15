@@ -214,10 +214,6 @@ mod tests {
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
     }
 
-    /// Pins the current writer contract: a `Partial` DM does NOT block the write. The CRC
-    /// lands on disk with `domainMetadata` absent (Partial is non-authoritative, so the
-    /// serializer drops it), and the next read deserializes back to `Partial(empty)`.
-    /// Any future change that gates writes on DM completeness must update this test.
     #[test]
     fn test_write_with_partial_dm_succeeds_and_persists_no_dm_field() {
         let store = Arc::new(InMemory::new());

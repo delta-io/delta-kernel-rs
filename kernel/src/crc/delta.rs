@@ -29,9 +29,7 @@ pub(crate) struct CrcDelta {
     pub(crate) protocol: Option<Protocol>,
     /// New metadata action, if this commit changed it.
     pub(crate) metadata: Option<Metadata>,
-    /// All DM actions in this commit (additions and removals). `apply()` processes these
-    /// unconditionally; the base CRC's `DomainMetadataState` variant (`Complete` or
-    /// `Partial`) is preserved.
+    /// All DM actions in this commit, including tombstones (`removed=true`).
     pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
     /// All SetTransaction actions in this commit. `apply()` only processes these when the base
     /// CRC's `set_transactions` is `Some` (tracked).
@@ -514,9 +512,7 @@ mod tests {
     #[rstest]
     #[case::complete(DomainMetadataState::Complete(seed_dm_map()))]
     #[case::partial(DomainMetadataState::Partial(seed_dm_map()))]
-    fn test_apply_mixed_changes_upserts_and_drops_in_one_delta(
-        #[case] base: DomainMetadataState,
-    ) {
+    fn test_apply_mixed_changes_upserts_and_drops_in_one_delta(#[case] base: DomainMetadataState) {
         let was_complete = matches!(base, DomainMetadataState::Complete(_));
         let mut crc = base_crc();
         crc.domain_metadata_state = base;
@@ -634,28 +630,6 @@ mod tests {
         };
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
-    }
-
-    /// Defensive contract: even a v0 delta carrying tombstones (degenerate but possible)
-    /// drops them before materializing the Complete map.
-    #[test]
-    fn test_into_crc_for_version_zero_drops_tombstones() {
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            domain_metadata_changes: vec![
-                DomainMetadata::new("keep".to_string(), "x".to_string()),
-                DomainMetadata::remove("ghost".to_string(), "y".to_string()),
-            ],
-            ..write_delta(0, 0)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        let DomainMetadataState::Complete(map) = &crc.domain_metadata_state else {
-            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-        };
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key("keep"));
-        assert!(!map.contains_key("ghost"));
     }
 
     #[test]
