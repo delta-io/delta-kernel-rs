@@ -888,8 +888,6 @@ mod tests {
         assert_eq!(encoded, "5<w-%>:JjlQ/G/]6C<1m");
     }
 
-    // === try_new validation ===
-
     #[rstest::rstest]
     #[case::inline_with_offset(DeletionVectorStorageType::Inline, "ABC", Some(0), 4, 1, "inline")]
     #[case::persisted_relative_short_path(

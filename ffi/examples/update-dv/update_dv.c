@@ -212,11 +212,10 @@ int main(int argc, char* argv[]) {
 
   ExternResultbool update_res =
       transaction_update_deletion_vectors(txn, map, scan_iter, engine);
-  map = NULL; // consumed by transaction_update_deletion_vectors even on error
+  // map and scan_iter are consumed by transaction_update_deletion_vectors even on error.
   if (update_res.tag != Okbool) {
     print_error("transaction_update_deletion_vectors failed.", (Error*)update_res.err);
     free_error((Error*)update_res.err);
-    free_scan_metadata_iter(scan_iter);
     free_scan(scan_handle);
     free_snapshot(snapshot);
     free_transaction(txn);
@@ -224,7 +223,6 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  free_scan_metadata_iter(scan_iter);
   free_scan(scan_handle);
   free_snapshot(snapshot);
 

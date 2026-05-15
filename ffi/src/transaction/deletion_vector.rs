@@ -226,11 +226,10 @@ fn dv_descriptor_map_insert_impl(
 /// Matched scan metadata must include an accurate `numRecords` statistic because the Delta
 /// protocol requires it for files with deletion vectors.
 ///
-/// Consumes `dv_map`. On success, drains `scan_iter` so subsequent calls to
-/// `scan_metadata_next` return `false`; on error, the iterator may be partially consumed.
-/// The engine should pass an iterator that covers at least every file path mentioned in the
-/// map; extra files are ignored. If the map references a path that does not appear in the
-/// iterator, the call returns an error and leaves the transaction unchanged.
+/// Consumes both `dv_map` and `scan_iter`. The engine should pass an iterator that covers
+/// at least every file path mentioned in the map; extra files are ignored. If the map
+/// references a path that does not appear in the iterator, the call returns an error and
+/// leaves the transaction unchanged.
 ///
 /// This stages data-changing DV updates by default. Call
 /// [`crate::transaction::set_data_change`] first for maintenance operations that should commit
@@ -238,12 +237,10 @@ fn dv_descriptor_map_insert_impl(
 ///
 /// # Safety
 ///
-/// Caller must pass valid handles. The transaction handle is borrowed in place and
-/// remains valid after this call; the caller is expected to follow with `commit` (or
-/// `free_transaction`) on the same handle. The DV map handle is consumed and must not
-/// be used or freed after this call. The scan iterator handle is borrowed but drained
-/// or partially drained (the iterator's mutex is held for the duration of this call),
-/// and afterwards may only be passed to `free_scan_metadata_iter`.
+/// Caller must pass valid handles. The transaction handle is borrowed in place and remains
+/// valid after this call; the caller is expected to follow with `commit` (or
+/// `free_transaction`) on the same handle. The DV map and scan iterator handles are
+/// consumed and must not be used or freed after this call.
 #[no_mangle]
 pub unsafe extern "C" fn transaction_update_deletion_vectors(
     mut txn: Handle<ExclusiveTransaction>,
@@ -253,11 +250,13 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
 ) -> ExternResult<bool> {
     let txn_ref = unsafe { txn.as_mut() };
     let dv_map = unsafe { dv_map.into_inner() };
-    let scan_iter_ref = unsafe { scan_iter.as_ref() };
     let engine_ref = unsafe { engine.as_ref() };
-    transaction_update_deletion_vectors_impl(txn_ref, *dv_map, scan_iter_ref)
-        .map(|_| true)
-        .into_extern_result(&engine_ref)
+    let result = {
+        let scan_iter_ref = unsafe { scan_iter.as_ref() };
+        transaction_update_deletion_vectors_impl(txn_ref, *dv_map, scan_iter_ref)
+    };
+    unsafe { scan_iter.drop_handle() };
+    result.map(|_| true).into_extern_result(&engine_ref)
 }
 
 fn transaction_update_deletion_vectors_impl(

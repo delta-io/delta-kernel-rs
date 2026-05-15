@@ -74,10 +74,10 @@ transaction()
 ```
 
 The engine authors the DV file and passes descriptor fields to `dv_descriptor_new`. The
-descriptor map is consumed by `transaction_update_deletion_vectors`; descriptor handles are
-consumed by `dv_descriptor_map_insert` only on success and must be freed by the caller on error.
-DV updates require both the `deletionVectors` reader/writer feature and
-`delta.enableDeletionVectors=true`.
+descriptor map and scan iterator are both consumed by `transaction_update_deletion_vectors`;
+descriptor handles are consumed by `dv_descriptor_map_insert` only on success and must be
+freed by the caller on error. DV updates require both the `deletionVectors` reader/writer
+feature and `delta.enableDeletionVectors=true`.
 
 ## Building
 

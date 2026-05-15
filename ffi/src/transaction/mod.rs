@@ -2157,9 +2157,7 @@ mod tests {
             KernelDeletionVector, StreamingDeletionVectorWriter,
         };
         use delta_kernel::object_store::path::Path as ObjectStorePath;
-        use delta_kernel_ffi::scan::{
-            free_scan, free_scan_metadata_iter, scan, scan_metadata_iter_init,
-        };
+        use delta_kernel_ffi::scan::{free_scan, scan, scan_metadata_iter_init};
         use delta_kernel_ffi::transaction::{
             dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
             transaction_update_deletion_vectors, KernelDvStorageType,
@@ -2296,7 +2294,7 @@ mod tests {
             transaction_update_deletion_vectors(
                 txn.shallow_copy(),
                 map,
-                scan_iter.shallow_copy(),
+                scan_iter,
                 engine.shallow_copy(),
             )
         });
@@ -2316,7 +2314,6 @@ mod tests {
         assert_eq!(total, 2, "expected 2 surviving rows");
 
         unsafe {
-            free_scan_metadata_iter(scan_iter);
             free_scan(scan_handle);
             free_snapshot(snap_handle);
             free_engine(engine);
