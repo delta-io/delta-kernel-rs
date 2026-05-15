@@ -49,9 +49,7 @@ fn row_number_resets_on_partition_change_ordered_by_v() {
         .expect("literal")
         .window(
             vec![WindowFunction {
-                function_name: "row_number".into(),
-                args: vec![],
-                output_col: "_rn".into(),
+                                output_col: "_rn".into(),
             }],
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::asc(ColumnName::new(["v"]))],
@@ -79,8 +77,6 @@ fn row_number_global_when_no_partition_keys() {
         .expect("literal")
         .window(
             vec![WindowFunction {
-                function_name: "ROW_NUMBER".into(),
-                args: vec![],
                 output_col: "rn".into(),
             }],
             vec![],
@@ -108,14 +104,10 @@ fn multiple_row_number_functions_duplicate_rank_column() {
         .window(
             vec![
                 WindowFunction {
-                    function_name: "row_number".into(),
-                    args: vec![],
-                    output_col: "a".into(),
+                                        output_col: "a".into(),
                 },
                 WindowFunction {
-                    function_name: "row_number".into(),
-                    args: vec![],
-                    output_col: "b".into(),
+                                        output_col: "b".into(),
                 },
             ],
             vec![Arc::new(Expression::column(["part"]))],
@@ -151,9 +143,7 @@ fn row_number_with_order_by_desc_assigns_rank_within_partition() {
         .expect("literal")
         .window(
             vec![WindowFunction {
-                function_name: "row_number".into(),
-                args: vec![],
-                output_col: "_rn".into(),
+                                output_col: "_rn".into(),
             }],
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::desc(ColumnName::new(["v"]))],
@@ -203,9 +193,7 @@ fn row_number_with_order_by_asc_matches_inverted_desc() {
         .expect("literal")
         .window(
             vec![WindowFunction {
-                function_name: "row_number".into(),
-                args: vec![],
-                output_col: "_rn".into(),
+                                output_col: "_rn".into(),
             }],
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::asc(ColumnName::new(["v"]))],

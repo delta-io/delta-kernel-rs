@@ -12,13 +12,13 @@
 //! use delta_kernel::plans::ir::DeclarativePlanNode;
 //!
 //! // Untyped pipeline: scan JSON, project to a sub-schema, stream results.
-//! let plan = DeclarativePlanNode::scan_json_as::<CheckpointHintRecord>(files)
+//! let plan = DeclarativePlanNode::scan_json(files, schema)
 //!     .project(projection, output_schema)
 //!     .into_results();
 //!
 //! // Typed pipeline: scan JSON, drain into a typed consumer KDF, recover
 //! // the typed output from the resulting PhaseState.
-//! let (plan, extractor) = DeclarativePlanNode::scan_json_as::<CheckpointHintRecord>(files)
+//! let (plan, extractor) = DeclarativePlanNode::scan_json(files, schema)
 //!     .consume(CheckpointHintReader::default());
 //! // ... after `phase.execute(PhaseOperation::Plans(vec![plan]), name).await?` ...
 //! // let hint = extractor.extract(&state)?;
@@ -39,7 +39,6 @@
 //! - [`DeclarativePlanNode::project`] — projection.
 //! - [`DeclarativePlanNode::window`] — window functions (`row_number`).
 //! - [`DeclarativePlanNode::assert`] — schema-preserving row-level invariants.
-//! - [`DeclarativePlanNode::apply_opt`] — conditional chain composition.
 //!
 //! ## Terminals
 //!
@@ -68,8 +67,6 @@
 //!
 //! [`scan_json`]: DeclarativePlanNode::scan_json
 //! [`scan_parquet`]: DeclarativePlanNode::scan_parquet
-//! [`scan_json_as`]: DeclarativePlanNode::scan_json_as
-//! [`scan_parquet_as`]: DeclarativePlanNode::scan_parquet_as
 //! [`values_row`]: DeclarativePlanNode::values_row
 //! [`union_unordered`]: DeclarativePlanNode::union_unordered
 //! [`with_row_index`]: DeclarativePlanNode::with_row_index
@@ -79,6 +76,8 @@
 //! [`PartitionedWriteSink`]: super::nodes::PartitionedWriteSink
 
 use std::sync::Arc;
+
+use url::Url;
 
 use super::nodes::*;
 use super::plan::Plan;
@@ -883,9 +882,7 @@ mod tests {
     fn window_rejects_empty_order_by() {
         let plan = DeclarativePlanNode::scan_json(vec![], simple_schema());
         let wf = WindowFunction {
-            function_name: "row_number".into(),
-            args: vec![],
-            output_col: "_rn".into(),
+                        output_col: "_rn".into(),
         };
         let err = plan
             .window(
@@ -904,9 +901,7 @@ mod tests {
     #[test]
     fn window_accepts_nonempty_order_by() {
         let wf = WindowFunction {
-            function_name: "row_number".into(),
-            args: vec![],
-            output_col: "_rn".into(),
+                        output_col: "_rn".into(),
         };
         let plan = DeclarativePlanNode::scan_json(vec![], simple_schema())
             .window(
