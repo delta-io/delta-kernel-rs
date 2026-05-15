@@ -3,6 +3,7 @@
 //! [`Snapshot::full_state`](crate::snapshot::Snapshot::full_state).
 
 pub mod full_state;
+mod schemas;
 
 pub use full_state::{
     build_fsr_plans, checkpoint_shape_from_last_checkpoint, checkpoint_shape_from_schema,
