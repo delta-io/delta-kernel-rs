@@ -6,6 +6,17 @@
 use datafusion_common::error::DataFusionError;
 use delta_kernel::plans::errors::{DeltaError, DeltaErrorCode};
 
+/// Wrap an arbitrary error chain into a [`DataFusionError::External`].
+///
+/// Reduces `DataFusionError::External(Box::new(e))` to `wrap_delta_err(e)` at every Stream-error
+/// translation site across exec/* modules.
+pub fn wrap_delta_err<E>(err: E) -> DataFusionError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    DataFusionError::External(Box::new(err))
+}
+
 /// Typed plan-compilation failure for the DataFusion engine path.
 pub fn plan_compilation(detail: impl Into<String>) -> DeltaError {
     let detail = detail.into();

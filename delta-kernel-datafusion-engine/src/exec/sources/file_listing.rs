@@ -181,7 +181,7 @@ impl Stream for FileListingStream {
                 let metas = chunk
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    .map_err(|e| crate::error::wrap_delta_err(e))?;
                 Poll::Ready(Some(metas_to_batch(&metas, &self.schema, &self.base_url)))
             }
             None => Poll::Ready(None),
@@ -243,7 +243,7 @@ impl Stream for SortedFileListingStream {
                         Some(Ok(meta)) => collected.push(meta),
                         Some(Err(e)) => {
                             self.state = SortedStreamState::Done;
-                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))));
+                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
                         }
                         None => {
                             let mut sorted = std::mem::take(collected);

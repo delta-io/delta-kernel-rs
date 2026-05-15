@@ -121,7 +121,7 @@ impl ExecutionPlan for KernelPartitionedWriteExec {
         let child = super::expect_single_child(children, "KernelPartitionedWriteExec")?;
         Ok(Arc::new(
             KernelPartitionedWriteExec::try_new(child, self.sink.clone())
-                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                .map_err(|e| crate::error::wrap_delta_err(e))?,
         ))
     }
 
@@ -137,7 +137,7 @@ impl ExecutionPlan for KernelPartitionedWriteExec {
         }
         let inner = self.child.execute(partition, context)?;
         let base_dir = destination_base_dir(&self.sink.destination)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(|e| crate::error::wrap_delta_err(e))?;
         Ok(Box::pin(PartitionedWriteStream {
             inner,
             sink: self.sink.clone(),
@@ -352,17 +352,13 @@ impl Stream for PartitionedWriteStream {
                         {
                             Ok(s) => s,
                             Err(e) => {
-                                return Poll::Ready(Some(Err(DataFusionError::External(Box::new(
-                                    e,
-                                )))))
+                                return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))))
                             }
                         };
                     for (rel, slice) in splits {
                         if let Some(w) = self.writers.get_mut(&rel) {
                             if let Err(err) = w.write_batch(&slice) {
-                                return Poll::Ready(Some(Err(DataFusionError::External(
-                                    Box::new(err),
-                                ))));
+                                return Poll::Ready(Some(Err(crate::error::wrap_delta_err(err))));
                             }
                         } else {
                             let mut w = match open_writer_for_partition(
@@ -379,9 +375,7 @@ impl Stream for PartitionedWriteStream {
                                 }
                             };
                             if let Err(err) = w.write_batch(&slice) {
-                                return Poll::Ready(Some(Err(DataFusionError::External(
-                                    Box::new(err),
-                                ))));
+                                return Poll::Ready(Some(Err(crate::error::wrap_delta_err(err))));
                             }
                             self.writers.insert(rel, w);
                         }

@@ -142,7 +142,7 @@ impl ExecutionPlan for KernelLoadSinkExec {
                 Arc::clone(&self.registry),
                 self.physical_read_schema.clone(),
             )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            .map_err(|e| crate::error::wrap_delta_err(e))?,
         ))
     }
 
@@ -201,7 +201,7 @@ impl Stream for KernelLoadSinkStream {
                     ) {
                         Ok(mut outs) => self.materialized.append(&mut outs),
                         Err(e) => {
-                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))));
+                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
                         }
                     }
                 }

@@ -128,7 +128,7 @@ impl ExecutionPlan for KernelConsumeByKdfExec {
                 Arc::clone(&self.harvest_slot),
                 self.phase_state.clone(),
             )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            .map_err(|e| crate::error::wrap_delta_err(e))?,
         ))
     }
 
@@ -231,7 +231,7 @@ impl Stream for ConsumeKdfStream {
                         }
                         Err(e) => {
                             self.finalize();
-                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))));
+                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
                         }
                     }
                 }

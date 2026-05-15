@@ -6,7 +6,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use datafusion_common::error::DataFusionError;
 use datafusion_common::Result as DfResult;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::EquivalenceProperties;
@@ -160,13 +159,13 @@ impl Stream for KernelAssertStream {
                     let pred_data = match check.evaluator.evaluate(&batch_for_eval) {
                         Ok(v) => v,
                         Err(e) => {
-                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))));
+                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
                         }
                     };
                     let pred_batch = match pred_data.try_into_record_batch() {
                         Ok(rb) => rb,
                         Err(e) => {
-                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))));
+                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
                         }
                     };
                     predicate_cols.push(pred_batch.column(0).as_boolean().clone());
@@ -185,9 +184,9 @@ impl Stream for KernelAssertStream {
                                 row,
                                 failed_null,
                             );
-                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(
+                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(
                                 delta_err,
-                            )))));
+                            ))));
                         }
                     }
                 }
