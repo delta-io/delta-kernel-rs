@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(crc.metadata, expected_metadata);
 
         // Verify domain metadatas
-        let dms = crc.domain_metadata.as_ref().unwrap();
+        let dms = crc.domain_metadata_state.expect_complete();
         assert_eq!(dms.len(), 3);
 
         assert!(dms["delta.clustering"]

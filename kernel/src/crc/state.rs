@@ -5,10 +5,15 @@
 //! invalid reads unrepresentable: the compiler prevents reading an absolute count from a
 //! degraded state because the field does not exist there.
 //!
-//! Today this module hosts [`FileStatsState`]; follow-up PRs add `DomainMetadataState` and
-//! `SetTransactionState` (Complete / Partial variants).
+//! - [`FileStatsState`] tracks file-stat validity (Complete / Indeterminate).
+//! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
+//!
+//! TODO: introduce `SetTransactionState` with the same shape as `DomainMetadataState`.
+
+use std::collections::HashMap;
 
 use super::file_stats::FileStats;
+use crate::actions::DomainMetadata;
 
 /// The state of file statistics for a CRC.
 ///
@@ -61,6 +66,51 @@ impl FileStatsState {
 impl Default for FileStatsState {
     fn default() -> Self {
         Self::Complete(FileStats::default())
+    }
+}
+
+// ============================================================================
+// Domain metadata state
+// ============================================================================
+
+/// The completeness state of cached domain metadata in a CRC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainMetadataState {
+    /// The CRC file had the `domainMetadata` field (possibly as an empty array). The map
+    /// is the full set of active (non-removed) domains at this version; a domain not in the
+    /// map does not exist.
+    Complete(HashMap<String, DomainMetadata>),
+
+    /// The CRC file did not have the `domainMetadata` field. The map starts empty and gets
+    /// populated by incremental CRC replay over the JSON commits after the latest stale CRC.
+    /// Hits are authoritative (definitely present at this version); misses are NOT
+    /// (the domain may exist in older commits), so callers must do a further log scan.
+    Partial(HashMap<String, DomainMetadata>),
+}
+
+impl Default for DomainMetadataState {
+    fn default() -> Self {
+        Self::Partial(HashMap::new())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::panic)]
+impl DomainMetadataState {
+    /// Test-only: returns the map if `Complete`, panics otherwise.
+    pub fn expect_complete(&self) -> &HashMap<String, DomainMetadata> {
+        match self {
+            Self::Complete(map) => map,
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    /// Test-only: returns the map if `Partial`, panics otherwise.
+    pub fn expect_partial(&self) -> &HashMap<String, DomainMetadata> {
+        match self {
+            Self::Partial(map) => map,
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 }
 
@@ -120,6 +170,16 @@ mod tests {
                 table_size_bytes: 0,
                 file_size_histogram: None,
             })
+        );
+    }
+
+    // ===== DomainMetadataState =====
+
+    #[test]
+    fn dm_state_default_is_empty_partial() {
+        assert_eq!(
+            DomainMetadataState::default(),
+            DomainMetadataState::Partial(HashMap::new())
         );
     }
 }

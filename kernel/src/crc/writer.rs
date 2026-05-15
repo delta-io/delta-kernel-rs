@@ -36,7 +36,7 @@ mod tests {
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
-    use crate::crc::{FileSizeHistogram, FileStats, FileStatsState};
+    use crate::crc::{DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -83,7 +83,7 @@ mod tests {
             txn_id: None,
             in_commit_timestamp_opt: Some(ict),
             set_transactions: Some(set_transactions),
-            domain_metadata: Some(domain_metadata),
+            domain_metadata_state: DomainMetadataState::Complete(domain_metadata),
             ..Default::default()
         }
     }
