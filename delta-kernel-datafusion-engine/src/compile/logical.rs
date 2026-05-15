@@ -801,7 +801,6 @@ fn compile_declarative_node_logical(
             let join_type = match node.join_type {
                 KernelJoinType::Inner => DfJoinType::Inner,
                 KernelJoinType::LeftAnti => DfJoinType::RightAnti,
-                _ => return Ok(None),
             };
             let plan = LogicalPlanBuilder::from(build_plan)
                 .join_with_expr_keys(probe_plan, join_type, (left_keys, right_keys), None)
@@ -822,11 +821,6 @@ fn compile_declarative_node_logical(
                                 "logical inner join combined output schema is invalid: {e}"
                             ))
                         })?
-                }
-                other => {
-                    return Err(crate::error::unsupported(format!(
-                        "logical join output schema inference for {other:?} is not supported"
-                    )))
                 }
             };
             canonicalize_output_to_kernel_schema(plan, &target_schema).map(Some)

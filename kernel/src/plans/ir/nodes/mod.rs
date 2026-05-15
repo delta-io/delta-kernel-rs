@@ -229,29 +229,12 @@ pub struct UnionNode {
 
 /// SQL join semantics. Selects what gets emitted, independent of how (see
 /// [`JoinHint`]).
-///
-/// Today the executor only ships [`JoinType::LeftAnti`]; other variants exist
-/// in the IR so plans can carry intent forward without a kernel migration —
-/// when an executor implementation lands, no plan-author code changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
-    /// Emit `(left, right)` pairs whose join keys match. Reserved.
+    /// Emit `(left, right)` pairs whose join keys match.
     Inner,
-    /// Inner ∪ unmatched left rows (right cols nulled). Reserved.
-    LeftOuter,
-    /// Inner ∪ unmatched right rows (left cols nulled). Reserved.
-    RightOuter,
-    /// LeftOuter ∪ RightOuter. Reserved.
-    FullOuter,
-    /// Emit each left row whose key matches any right row. Reserved.
-    LeftSemi,
     /// Emit each left row whose key does NOT match any right row.
-    /// **The only variant the read-path executor implements today.**
     LeftAnti,
-    /// Emit each right row whose key matches any left row. Reserved.
-    RightSemi,
-    /// Emit each right row whose key does NOT match any left row. Reserved.
-    RightAnti,
 }
 
 /// Strategy hint for the executor. Today only [`JoinHint::Hash`] is consumed;

@@ -261,9 +261,6 @@ pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef
                         ))
                     })
             }
-            other_join => Err(crate::error::unsupported(format!(
-                "Schema inference for join type {other_join:?} is not implemented yet",
-            ))),
         },
         DeclarativePlanNode::FileListing(_) => Err(crate::error::unsupported(
             "FileListing schema inference for Filter/Project is not wired yet",

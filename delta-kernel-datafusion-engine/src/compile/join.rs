@@ -46,12 +46,6 @@ pub(super) fn compile_join(
         // Kernel [`JoinType::LeftAnti`] keeps the probe side; DF `LeftAnti` keeps the build (left)
         // side, so use `RightAnti` with HashJoin `(left=build, right=probe)`.
         JoinType::LeftAnti => DfJoinType::RightAnti,
-        other => {
-            return Err(crate::error::unsupported(format!(
-                "join type {:?} is not implemented in the DataFusion engine",
-                other
-            )));
-        }
     };
 
     let build_plan = compile_declarative_node(build, ctx)?;

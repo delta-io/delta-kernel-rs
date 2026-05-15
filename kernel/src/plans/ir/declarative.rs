@@ -27,9 +27,6 @@
 //! ## Leaves
 //!
 //! - [`DeclarativePlanNode::scan`] / [`scan_json`] / [`scan_parquet`] — explicit-schema scans.
-//! - [`DeclarativePlanNode::scan_as`] / [`scan_json_as`] / [`scan_parquet_as`] — schemas inferred
-//!   from a struct via [`crate::schema::ToSchema`].
-//! - [`DeclarativePlanNode::listing`] — storage prefix listing.
 //! - [`DeclarativePlanNode::values`] / [`values_row`] — kernel-provided constant rows
 //!   (`VALUES`-style). Aligned with [`crate::EvaluationHandler::create_many`].
 //! - [`DeclarativePlanNode::union`] / [`union_unordered`] — concatenate N children.
@@ -83,8 +80,6 @@
 
 use std::sync::Arc;
 
-use url::Url;
-
 use super::nodes::*;
 use super::plan::Plan;
 use crate::expressions::{Expression, Scalar};
@@ -92,7 +87,7 @@ use crate::plans::kdf::typed::ExtractFn;
 use crate::plans::kdf::{downcast_all, ConsumerKdf, KdfOutput, KdfStateToken};
 use crate::plans::state_machines::framework::engine_error::EngineError;
 use crate::plans::state_machines::framework::phase_state::PhaseState;
-use crate::schema::{SchemaRef, StructType, ToSchema};
+use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta};
 
 /// A single node in the declarative plan tree.
@@ -175,48 +170,12 @@ impl DeclarativePlanNode {
         Self::Scan(ScanNode::new(FileType::Parquet, files, schema))
     }
 
-    /// Scan a fixed file list with a schema inferred from `T`.
-    ///
-    /// Shortcut for [`Self::scan`] with `schema = Arc::new(T::to_schema())`.
-    pub fn scan_as<T: ToSchema>(format: FileFormat, files: Vec<FileMeta>) -> Self {
-        Self::scan(format, files, Arc::new(T::to_schema()))
-    }
-
-    /// Scan JSON files with a schema inferred from `T`.
-    pub fn scan_json_as<T: ToSchema>(files: Vec<FileMeta>) -> Self {
-        Self::scan_as::<T>(FileType::Json, files)
-    }
-
-    /// Scan Parquet files with a schema inferred from `T`.
-    pub fn scan_parquet_as<T: ToSchema>(files: Vec<FileMeta>) -> Self {
-        Self::scan_as::<T>(FileType::Parquet, files)
-    }
-
-    /// List files under a storage prefix.
-    pub fn listing(path: Url) -> Self {
-        Self::FileListing(FileListingNode { path })
-    }
-
     /// Read batches from a relation produced by another plan in the same
     /// `PhaseOperation::Plans(...)`. The producing plan terminates in
     /// [`SinkType::Relation`](super::nodes::SinkType::Relation) referencing
     /// the same handle.
     pub fn relation_ref(handle: RelationHandle) -> Self {
         Self::RelationRef(handle)
-    }
-
-    /// Empty values node — zero rows with an empty-struct schema.
-    ///
-    /// Useful as a placeholder for pipelines that must exist structurally but
-    /// produce no rows.
-    pub fn empty() -> Self {
-        let schema = Arc::new(StructType::new_unchecked(
-            Vec::<crate::schema::StructField>::new(),
-        ));
-        Self::Values(ValuesNode {
-            schema,
-            rows: Vec::new(),
-        })
     }
 
     /// Multi-row `VALUES`-style literal table. Rows × columns layout; see [`ValuesNode`]
@@ -466,36 +425,6 @@ impl<O> std::fmt::Debug for Extractor<O> {
         f.debug_struct("Extractor")
             .field("token", &self.token)
             .finish_non_exhaustive()
-    }
-}
-
-// ============================================================================
-// Chain helpers
-// ============================================================================
-
-impl DeclarativePlanNode {
-    /// Apply `f` to the chain only if `opt` is `Some`.
-    ///
-    /// Useful for optional sub-pipelines (data skipping, etc.) that leave the
-    /// chain unchanged when absent.
-    ///
-    /// ```ignore
-    /// let plan = base
-    ///     .apply_opt(data_skipping, |node, ds| {
-    ///         node.project(ds.select_columns, ds.select_schema)
-    ///             .filter(ds.predicate)
-    ///     })
-    ///     .project(final_cols, final_schema)
-    ///     .into_results();
-    /// ```
-    pub fn apply_opt<T, F>(self, opt: Option<T>, f: F) -> Self
-    where
-        F: FnOnce(Self, T) -> Self,
-    {
-        match opt {
-            Some(t) => f(self, t),
-            None => self,
-        }
     }
 }
 
@@ -809,24 +738,6 @@ mod tests {
             }
             _ => panic!("expected Assert"),
         }
-    }
-
-    #[test]
-    fn apply_opt_none_is_noop() {
-        let plan = DeclarativePlanNode::scan_json(vec![], simple_schema())
-            .apply_opt(None::<()>, |node, _| {
-                node.filter(Arc::new(Expression::literal(true)))
-            });
-        assert!(plan.is_leaf());
-    }
-
-    #[test]
-    fn apply_opt_some_applies() {
-        let plan = DeclarativePlanNode::scan_json(vec![], simple_schema())
-            .apply_opt(Some(()), |node, _| {
-                node.filter(Arc::new(Expression::literal(true)))
-            });
-        assert!(matches!(plan, DeclarativePlanNode::Filter { .. }));
     }
 
     #[test]

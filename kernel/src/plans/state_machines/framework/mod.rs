@@ -12,12 +12,9 @@
 //!   the kernel-to-caller error).
 //! - [`coroutine`] — [`CoroutineSM`](coroutine::driver::CoroutineSM), the async-fn-backed
 //!   `StateMachine` impl + its hand-rolled `Gen`/`Co` generator shim.
-//! - [`operation_type`] — coarse [`OperationType`](operation_type::OperationType) tag used only for
-//!   diagnostics (tracing spans / metric labels), not on any execution-critical path.
 
 pub mod coroutine;
 pub mod engine_error;
-pub mod operation_type;
 pub mod phase_operation;
 pub mod phase_state;
 pub mod state_machine;
