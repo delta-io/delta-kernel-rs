@@ -865,7 +865,7 @@ impl TableConfiguration {
         self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
 
-    /// TODO(#2538): Row-tracking is not fully supported for remove actions currently.
+    /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
     /// See `crate::table_features::ROW_TRACKING_INFO` for more details.
     pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
         // RowTracking is a prerequisite for IcebergCompatV3, so the IcebergCompatV3 arm is

@@ -10,8 +10,8 @@ use url::Url;
 
 use crate::common::write_utils::set_table_properties;
 
-/// The remove-block gate fires whenever row tracking is _supported_ and not _suspended_,
-/// which is broader than _enabled_.
+/// `Transaction::commit` is rejected when it contains staged removeFiles and row
+/// tracking is _supported_ and not _suspended_, which is broader than _enabled_.
 #[rstest::rstest]
 #[case::enabled(
     &[("delta.enableRowTracking", "true")],
