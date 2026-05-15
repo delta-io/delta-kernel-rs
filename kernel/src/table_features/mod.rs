@@ -347,7 +347,8 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// TODO(#2538): Currently we block remove actions on RowTracking-enabled tables because
+// TODO(#2538): Currently we reject `Transaction::commit` when it contains staged remove-file
+// actions on RowTracking-supported (and not-suspended) tables because
 //   1. kernel does not yet materialize stable row IDs / commit versions on write, which blocks COW
 //      rewrites,
 //   2. kernel does not yet validate if remove actions correctly reserved row IDs / commit versions.

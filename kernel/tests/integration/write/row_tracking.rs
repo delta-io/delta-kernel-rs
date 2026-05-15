@@ -28,6 +28,12 @@ use crate::common::write_utils::set_table_properties;
     true,  /* suspend_after_create */
     false, /* expect_err */
 )]
+#[case::iceberg_compat_v3(
+    // V3 auto-enables row tracking, so the gate fires.
+    &[("delta.enableIcebergCompatV3", "true")],
+    false, /* suspend_after_create */
+    true,  /* expect_err */
+)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_row_tracking_remove_gate(
     #[case] create_properties: &[(&str, &str)],
