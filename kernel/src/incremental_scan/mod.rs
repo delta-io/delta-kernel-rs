@@ -314,6 +314,7 @@ fn process_batch(
         seen_file_keys,
         true, // commit batches always update the seen set
         ADD_PATH_INDEX,
+        ADD_SIZE_INDEX,
         REMOVE_PATH_INDEX,
         ADD_DV_START_INDEX,
         REMOVE_DV_START_INDEX,
@@ -337,10 +338,11 @@ fn process_batch(
 
 // Indices of the leaf columns visited per row; must match `selected_column_names_and_types`.
 const ADD_PATH_INDEX: usize = 0;
-const ADD_DV_START_INDEX: usize = 1; // .storageType, .pathOrInlineDv, .offset
-const REMOVE_PATH_INDEX: usize = 4;
-const REMOVE_DV_START_INDEX: usize = 5; // .storageType, .pathOrInlineDv, .offset
-const NUM_GETTERS: usize = 8; // 4 add + 4 remove columns
+const ADD_SIZE_INDEX: usize = 1;
+const ADD_DV_START_INDEX: usize = 2; // .storageType, .pathOrInlineDv, .offset
+const REMOVE_PATH_INDEX: usize = 5;
+const REMOVE_DV_START_INDEX: usize = 6; // .storageType, .pathOrInlineDv, .offset
+const NUM_GETTERS: usize = 9; // 5 add + 4 remove columns
 
 // We share `FileActionDeduplicator` with the scan path but not `AddRemoveDedupVisitor`:
 // that visitor is wired to scan-only state (`StateInfo`, `ScanMetrics`, per-row transform
@@ -365,8 +367,10 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             const STRING: DataType = DataType::STRING;
             const INTEGER: DataType = DataType::INTEGER;
+            const LONG: DataType = DataType::LONG;
             let columns = vec![
                 (STRING, column_name!("add.path")),
+                (LONG, column_name!("add.size")),
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),

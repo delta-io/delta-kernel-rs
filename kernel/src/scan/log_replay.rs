@@ -836,6 +836,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &mut self.seen_file_keys,
             is_log_batch,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::REMOVE_PATH_INDEX,
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,

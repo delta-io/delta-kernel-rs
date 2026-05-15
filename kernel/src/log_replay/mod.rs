@@ -76,6 +76,8 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     is_log_batch: bool,
     /// Index of the getter containing the add.path column
     add_path_index: usize,
+    /// Index of the getter containing the add.size column
+    add_size_index: usize,
     /// Index of the getter containing the remove.path column
     remove_path_index: usize,
     /// Starting index for add action deletion vector columns
@@ -89,6 +91,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
         is_log_batch: bool,
         add_path_index: usize,
+        add_size_index: usize,
         remove_path_index: usize,
         add_dv_start_index: usize,
         remove_dv_start_index: usize,
@@ -97,6 +100,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
             seen_file_keys,
             is_log_batch,
             add_path_index,
+            add_size_index,
             remove_path_index,
             add_dv_start_index,
             remove_dv_start_index,
@@ -157,6 +161,7 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     ) -> DeltaResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
+            //let size = getters[self.si
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
             return Ok(Some(FileActionInfo {
                 key: FileActionKey::new(path, dv_unique_id),
@@ -449,6 +454,7 @@ mod tests {
             seen,
             is_log_batch,
             0, // add_path_index
+            1, // add_size_index,
             5, // remove_path_index
             2, // add_dv_start_index
             6, // remove_dv_start_index
