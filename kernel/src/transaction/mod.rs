@@ -30,6 +30,7 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
+use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -364,6 +365,13 @@ impl<S> Transaction<S> {
         }
 
         self.validate_blind_append_semantics()?;
+
+        // Validate that the schema supports data writes when files are being added.
+        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
+        // Reads and metadata-only commits are always allowed.
+        if !self.add_files_metadata.is_empty() {
+            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+        }
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -837,20 +845,37 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a Transform expression that drops partition columns from the input
-        // (unless they should be materialized).
+        // Build a Transform expression that drops partition columns (unless materialized) and
+        // void columns at all nesting levels.
         let mut transform = Transform::new_top_level();
         if !should_materialize_partition_columns {
             for col in &partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
             }
         }
+        let transform = add_void_stripping(
+            transform,
+            &self.effective_table_config.logical_schema(),
+            &[],
+        );
         Expression::transform(transform)
     }
 
     /// Returns the logical partition column names for this table.
     pub fn logical_partition_columns(&self) -> &[String] {
         self.effective_table_config.partition_columns()
+    }
+
+    /// Validates that the table's logical schema supports data writes.
+    ///
+    /// Called at the top of [`partitioned_write_context`](Self::partitioned_write_context) and
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context), before any Parquet is
+    /// written, so connectors fail fast when the schema contains void placements that cannot
+    /// produce valid files (void inside Array/Map, all-void structs, all-void tables).
+    /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
+    /// that reach [`add_files`](Self::add_files) without going through a write context.
+    fn validate_for_data_write(&self) -> DeltaResult<()> {
+        validate_schema_for_write(&self.effective_table_config.logical_schema())
     }
 
     /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
@@ -914,6 +939,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
+        self.validate_for_data_write()?;
         let shared = self.shared_write_state();
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -961,6 +987,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
+        self.validate_for_data_write()?;
         let shared = self.shared_write_state();
         require!(
             shared.logical_partition_columns.is_empty(),

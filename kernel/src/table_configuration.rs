@@ -23,6 +23,7 @@ use crate::scan::data_skipping::stats_schema::{
 };
 use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
+use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
@@ -481,15 +482,17 @@ impl TableConfiguration {
     ///
     /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
-    /// schema with partition columns excluded.
+    /// schema with partition columns excluded. Void columns are always stripped from the
+    /// returned schema, since they are never written to Parquet.
     ///
     /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.should_materialize_partition_columns() {
+        let with_partition_cols = if self.should_materialize_partition_columns() {
             self.physical_schema()
         } else {
             self.physical_data_schema_without_partition_columns()
-        }
+        };
+        strip_void_from_schema(with_partition_cols)
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -2367,6 +2370,49 @@ mod test {
         // physical schema as expected.
         let field_names: Vec<&str> = write_schema.fields().map(|f| f.name.as_str()).collect();
         assert_eq!(field_names, expected_field_names);
+    }
+
+    #[test]
+    fn test_physical_write_schema_strips_void_columns() {
+        // Pins the invariant that `physical_write_schema()` strips void columns from the
+        // returned schema (top level and nested), so callers receive a Parquet-writable
+        // schema without needing to apply `strip_void_from_schema` themselves.
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("v", DataType::VOID),
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("nested_void", DataType::VOID),
+                ]),
+            ),
+        ]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(Vec::<TableFeature>::new()),
+        )
+        .unwrap();
+        let config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+
+        let write_schema = config.physical_write_schema();
+
+        // Top-level void is dropped.
+        let top_names: Vec<&str> = write_schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(top_names, vec!["id", "s"]);
+
+        // Nested void is also dropped, leaving only `a` inside `s`.
+        let s_field = write_schema.field("s").expect("s present after strip");
+        let DataType::Struct(s_inner) = s_field.data_type() else {
+            panic!("s should still be a struct");
+        };
+        let s_names: Vec<&str> = s_inner.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(s_names, vec!["a"]);
     }
 
     #[test]

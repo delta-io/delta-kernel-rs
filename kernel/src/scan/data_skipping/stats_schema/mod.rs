@@ -402,6 +402,10 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 /// Note: Boolean and Binary are intentionally excluded as min/max statistics provide minimal
 /// skipping benefit for low-cardinality or opaque data types.
 ///
+/// Void is also excluded: void columns are never materialized to Parquet, so min/max are not
+/// meaningful. When `nullCount` stats are present for a void column, `eval_pred_is_null` can
+/// use them for `IS NULL` / `IS NOT NULL` file skipping.
+///
 /// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
 pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
