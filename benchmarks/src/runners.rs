@@ -635,7 +635,6 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 mod tests {
     use std::sync::LazyLock;
 
-    use datafusion_physical_plan::displayable;
     use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
     use delta_kernel::plans::state_machines::framework::state_machine::{
         AdvanceResult, StateMachine,
@@ -947,14 +946,14 @@ mod tests {
                 )
             })
             .expect("expected replay plans to include a Results sink");
-        let physical = runner
+        let logical = runner
             .executor
-            .compile_plan(&plan)
-            .expect("compile_plan should succeed");
+            .compile_plan_logical_for_inspection(&plan)
+            .expect("compile_plan_logical should succeed");
 
         println!(
-            "=== DataFusion Physical Plan ===\n{}",
-            displayable(physical.as_ref()).indent(true)
+            "=== DataFusion Logical Plan ===\n{}",
+            logical.display_indent()
         );
     }
 
@@ -988,19 +987,15 @@ mod tests {
                 let op = sm.get_operation().expect("sm.get_operation");
                 if let PhaseOperation::Plans(plans) = &op {
                     for (idx, plan) in plans.iter().enumerate() {
-                        // Physical compile is only supported for non-Window shapes (Window must
-                        // be lowered via the logical path per the executor's own dispatch). This
-                        // print loop is a debug helper; skip plans the physical compiler rejects
-                        // rather than failing the test.
-                        match runner.executor.compile_plan(plan) {
-                            Ok(physical) => println!(
+                        match runner.executor.compile_plan_logical_for_inspection(plan) {
+                            Ok(logical) => println!(
                                 "=== FSR Phase Plan {} ({:?}) ===\n{}",
                                 idx,
                                 plan.sink.sink_type,
-                                displayable(physical.as_ref()).indent(true)
+                                logical.display_indent()
                             ),
                             Err(e) => println!(
-                                "=== FSR Phase Plan {} ({:?}) — physical compile skipped: {} ===",
+                                "=== FSR Phase Plan {} ({:?}) — compile skipped: {} ===",
                                 idx, plan.sink.sink_type, e
                             ),
                         }

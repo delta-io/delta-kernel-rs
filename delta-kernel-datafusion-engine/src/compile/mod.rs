@@ -1,51 +1,37 @@
-//! Declarative [`Plan`] -> DataFusion [`ExecutionPlan`] compilation.
+//! Declarative [`Plan`] -> DataFusion [`LogicalPlan`] compilation.
+//!
+//! Every kernel IR shape lowers to a [`LogicalPlan`] via [`compile_plan_logical`]; the executor
+//! optimizes + materializes physical execution and wraps sink-specific [`ExecutionPlan`]s on
+//! top of that. There is no parallel physical compile path.
 //!
 //! Sinks: [`SinkType::Results`] (stream batches), [`SinkType::Relation`] /
 //! [`SinkType::Load`] (drain + the executor materializes the result as a
 //! [`datafusion::datasource::MemTable`] under
 //! [`crate::executor::DataFusionExecutor::session_ctx`] for downstream
 //! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::ConsumeByKdf`] (drain via
-//! [`KernelConsumeByKdfExec`]).
-//!
-//! Leaves: `Values`, `Scan`, `FileListing`, `RelationRef` (resolved via a per-compile
-//! [`CompileContext::relation_providers`] map prefetched from the executor's
-//! [`SessionContext`](datafusion::execution::context::SessionContext)).
+//! [`KernelConsumeByKdfExec`](crate::exec::KernelConsumeByKdfExec)).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datafusion::catalog::TableProvider;
-use datafusion::datasource::MemTable;
-use datafusion_common::DFSchema;
-use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_fn::cast;
 use datafusion_expr::lit;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_functions::core::expr_fn::{get_field, named_struct};
-use datafusion_physical_expr::create_physical_expr;
-use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::projection::ProjectionExec;
-use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::ExecutionPlan;
-use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{JoinType, RelationHandle, SinkType};
+use delta_kernel::plans::ir::nodes::JoinType;
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::plans::kdf::FinishedHandle;
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::Engine;
 
-use crate::exec::{build_literal_exec, FileListingExec, KernelConsumeByKdfExec};
-
 pub mod expr_translator;
 mod json_parse;
 mod load_sink;
 pub mod logical;
-pub mod scan;
 pub(crate) use load_sink::physical_read_schema;
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
@@ -88,95 +74,10 @@ impl CompileContext {
     }
 }
 
-/// Compile a complete [`Plan`] when the sink envelope is supported.
-pub fn compile_plan(
-    plan: &Plan,
-    ctx: &CompileContext,
-) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    match &plan.sink.sink_type {
-        SinkType::Results(_) => compile_declarative_node(&plan.root, ctx),
-        SinkType::Relation(_) => compile_declarative_node(&plan.root, ctx),
-        SinkType::ConsumeByKdf(sink) => {
-            let inner = compile_declarative_node(&plan.root, ctx)?;
-            Ok(Arc::new(KernelConsumeByKdfExec::try_new(
-                inner,
-                sink.clone(),
-                Arc::clone(&ctx.kdf_harvest_slot),
-                ctx.phase_state.clone(),
-            )?))
-        }
-        SinkType::Load(_) => load_sink::compile_load_terminal(plan, ctx),
-    }
-}
-
 /// Compile a complete [`Plan`] to a DataFusion [`LogicalPlan`]. Always succeeds for valid
-/// kernel IR or surfaces a typed [`DeltaError`] — the caller does not need to fall back to a
-/// physical compile path.
+/// kernel IR or surfaces a typed [`DeltaError`].
 pub fn compile_plan_logical(plan: &Plan, ctx: &CompileContext) -> Result<LogicalPlan, DeltaError> {
     logical::compile_plan_logical(plan, ctx)
-}
-
-pub(super) fn compile_declarative_node(
-    node: &DeclarativePlanNode,
-    ctx: &CompileContext,
-) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    match node {
-        DeclarativePlanNode::Values(n) => build_literal_exec(n.schema.clone(), n.rows.clone()),
-        DeclarativePlanNode::Scan(node) => scan::compile_scan(node),
-        DeclarativePlanNode::FileListing(node) => {
-            Ok(Arc::new(FileListingExec::new(node.path.clone())))
-        }
-        DeclarativePlanNode::RelationRef(handle) => compile_relation(handle, ctx),
-        DeclarativePlanNode::Filter { child, node } => {
-            let child_plan = compile_declarative_node(child, ctx)?;
-            let input_schema = node_output_schema(child)?;
-            compile_native_filter(child_plan, &input_schema, node.predicate.as_ref())
-        }
-        DeclarativePlanNode::Project { child, node } => {
-            let child_plan = compile_declarative_node(child, ctx)?;
-            let input_schema = node_output_schema(child)?;
-            compile_native_projection(
-                child_plan,
-                &input_schema,
-                &node.columns,
-                &node.output_schema,
-            )
-        }
-        DeclarativePlanNode::Window { .. } => Err(crate::error::unsupported(
-            "compile/mod: physical Window compile is unsupported; compile via the logical path \
-             which uses LogicalPlanBuilder::window_plan(row_number()) — per user directive, \
-             Window MUST be a logical plan",
-        )),
-        DeclarativePlanNode::Union { children, node } => {
-            if children.is_empty() {
-                return Err(crate::error::unsupported(
-                    "Union with zero children is not supported yet",
-                ));
-            }
-            let child_plans = children
-                .iter()
-                .map(|child| compile_declarative_node(child, ctx))
-                .collect::<Result<Vec<_>, DeltaError>>()?;
-            if node.ordered {
-                let coalesced = child_plans
-                    .into_iter()
-                    .map(|plan| {
-                        Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>
-                    })
-                    .collect::<Vec<_>>();
-                scan::compile_ordered_union_via_ordinal(coalesced)
-                    .map_err(crate::error::datafusion_err_to_delta)
-            } else {
-                let unioned = UnionExec::try_new(child_plans)
-                    .map_err(crate::error::datafusion_err_to_delta)?;
-                Ok(Arc::new(CoalescePartitionsExec::new(unioned)))
-            }
-        }
-        DeclarativePlanNode::Join { .. } => Err(crate::error::unsupported(
-            "compile/mod: physical Join compile is unsupported; compile via the logical path \
-             which uses LogicalPlanBuilder::join_with_expr_keys",
-        )),
-    }
 }
 
 pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DeltaError> {
@@ -231,136 +132,6 @@ pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef
             "FileListing schema inference for Filter/Project is not wired yet",
         )),
     }
-}
-
-fn compile_relation(
-    handle: &RelationHandle,
-    ctx: &CompileContext,
-) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    let provider = ctx.relation_providers.get(&handle.id).ok_or_else(|| {
-        crate::error::plan_compilation(format!(
-            "RelationRef references unregistered handle id {} (name `{}`); the producing plan \
-             must run before any consumer compiles",
-            handle.id, handle.name
-        ))
-    })?;
-    let mem = provider
-        .as_any()
-        .downcast_ref::<MemTable>()
-        .ok_or_else(|| {
-            crate::error::internal_error(format!(
-                "RelationRef provider for handle id {} (name `{}`) is not a MemTable; \
-                 RelationBatchRegistry only registers MemTables",
-                handle.id, handle.name
-            ))
-        })?;
-    // MemTable's PartitionData wraps a `tokio::sync::RwLock`; physical compile is sync, so we
-    // grab the read guard non-blockingly. Relation MemTables are immutable post-registration so
-    // try_read should always succeed; contention here would indicate a concurrent writer that
-    // shouldn't exist.
-    let partitions: Vec<Vec<RecordBatch>> = mem
-        .batches
-        .iter()
-        .map(|p| {
-            p.try_read().map(|g| g.clone()).map_err(|_| {
-                crate::error::internal_error(format!(
-                    "MemTable partition for handle id {} is locked by a concurrent writer",
-                    handle.id
-                ))
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    MemorySourceConfig::try_new_exec(&partitions, provider.schema(), None)
-        .map(|exec| exec as Arc<dyn ExecutionPlan>)
-        .map_err(crate::error::datafusion_err_to_delta)
-}
-
-fn compile_native_filter(
-    child_plan: Arc<dyn ExecutionPlan>,
-    input_schema: &SchemaRef,
-    predicate: &delta_kernel::expressions::Expression,
-) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    let arrow_schema: datafusion_common::arrow::datatypes::Schema =
-        input_schema.as_ref().try_into_arrow().map_err(|e| {
-            crate::error::plan_compilation(format!(
-                "Filter compilation failed to convert schema to Arrow: {e}"
-            ))
-        })?;
-    let df_schema = DFSchema::try_from(arrow_schema).map_err(|e| {
-        crate::error::plan_compilation(format!("Filter compilation failed to build DFSchema: {e}"))
-    })?;
-    let props = ExecutionProps::new();
-    let logical = expr_translator::kernel_expr_to_df(predicate)?;
-    let physical = create_physical_expr(&logical, &df_schema, &props).map_err(|e| {
-        crate::error::plan_compilation(format!(
-            "Filter predicate is not translatable to DataFusion: {e}"
-        ))
-    })?;
-    let native =
-        FilterExec::try_new(physical, child_plan).map_err(crate::error::datafusion_err_to_delta)?;
-    Ok(Arc::new(native))
-}
-
-fn compile_native_projection(
-    child_plan: Arc<dyn ExecutionPlan>,
-    input_schema: &SchemaRef,
-    columns: &[Arc<delta_kernel::expressions::Expression>],
-    output_schema: &SchemaRef,
-) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    let expanded_columns = expand_projection_columns(columns, output_schema.fields().count())?;
-
-    let arrow_schema: datafusion_common::arrow::datatypes::Schema =
-        input_schema.as_ref().try_into_arrow().map_err(|e| {
-            crate::error::plan_compilation(format!(
-                "Projection compilation failed to convert schema to Arrow: {e}"
-            ))
-        })?;
-    let df_schema = DFSchema::try_from(arrow_schema).map_err(|e| {
-        crate::error::plan_compilation(format!(
-            "Projection compilation failed to build DFSchema: {e}"
-        ))
-    })?;
-    let props = ExecutionProps::new();
-    let output_arrow_schema: datafusion_common::arrow::datatypes::Schema =
-        output_schema.as_ref().try_into_arrow().map_err(|e| {
-            crate::error::plan_compilation(format!(
-                "Projection compilation failed to convert output schema to Arrow: {e}"
-            ))
-        })?;
-    let projection_exprs = expanded_columns
-        .iter()
-        .zip(output_schema.fields().zip(output_arrow_schema.fields()))
-        .map(|(kernel_expr, (field, output_arrow_field))| {
-            let base_logical = translate_projection_expr(kernel_expr.as_ref(), field)?;
-            let logical = if matches!(
-                (kernel_expr.as_ref(), field.data_type()),
-                (
-                    delta_kernel::expressions::Expression::Column(_),
-                    delta_kernel::schema::DataType::Struct(_)
-                )
-            ) || matches!(
-                (kernel_expr.as_ref(), field.data_type()),
-                (
-                    delta_kernel::expressions::Expression::Struct(_, _),
-                    delta_kernel::schema::DataType::Struct(_)
-                )
-            ) {
-                base_logical
-            } else {
-                cast(base_logical, output_arrow_field.data_type().clone())
-            };
-            let physical = create_physical_expr(&logical, &df_schema, &props).map_err(|e| {
-                crate::error::plan_compilation(format!(
-                    "Projection expression `{}` is not translatable to DataFusion: {e}",
-                    field.name()
-                ))
-            })?;
-            Ok((physical, field.name().to_string()))
-        })
-        .collect::<Result<Vec<_>, DeltaError>>()?;
-    let native = ProjectionExec::try_new(projection_exprs, child_plan)
-        .map_err(crate::error::datafusion_err_to_delta)?;
-    Ok(Arc::new(native))
 }
 
 pub(super) fn expand_projection_columns(

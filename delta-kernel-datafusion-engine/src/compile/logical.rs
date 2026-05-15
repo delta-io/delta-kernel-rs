@@ -286,6 +286,66 @@ fn canonicalize_output_to_kernel_schema(
         .map_err(crate::error::datafusion_err_to_delta)
 }
 
+/// DataFusion file sources fail planning when decoded nested field nullability is wider than
+/// the declared scan schema (for example nullable parquet/json children flowing into kernel
+/// protocol NOT NULL children). Relax nested nullability before handing the schema to a file
+/// source so planning succeeds; downstream operators carry the relaxed nullability.
+fn relax_nested_nullability_for_scan(schema: &ArrowSchema) -> Arc<ArrowSchema> {
+    use datafusion_common::arrow::datatypes::{DataType, Field};
+    fn relax_field(field: &Arc<Field>, force_nullable: bool) -> Arc<Field> {
+        let relaxed_dt = relax_data_type(field.data_type());
+        Arc::new(
+            Field::new(
+                field.name(),
+                relaxed_dt,
+                if force_nullable {
+                    true
+                } else {
+                    field.is_nullable()
+                },
+            )
+            .with_metadata(field.metadata().clone()),
+        )
+    }
+    fn relax_data_type(dt: &DataType) -> DataType {
+        match dt {
+            DataType::Struct(fields) => {
+                DataType::Struct(fields.iter().map(|f| relax_field(f, true)).collect())
+            }
+            DataType::List(inner) => DataType::List(relax_field(inner, true)),
+            DataType::LargeList(inner) => DataType::LargeList(relax_field(inner, true)),
+            DataType::FixedSizeList(inner, n) => {
+                DataType::FixedSizeList(relax_field(inner, true), *n)
+            }
+            DataType::Map(entries, sorted) => {
+                let relaxed_entries = match entries.data_type() {
+                    DataType::Struct(entry_fields) if entry_fields.len() == 2 => {
+                        let key = relax_field(&entry_fields[0], false);
+                        let val = relax_field(&entry_fields[1], true);
+                        Arc::new(
+                            Field::new(
+                                entries.name(),
+                                DataType::Struct(vec![key, val].into()),
+                                entries.is_nullable(),
+                            )
+                            .with_metadata(entries.metadata().clone()),
+                        )
+                    }
+                    _ => relax_field(entries, true),
+                };
+                DataType::Map(relaxed_entries, *sorted)
+            }
+            other => other.clone(),
+        }
+    }
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| relax_field(f, false))
+        .collect();
+    Arc::new(ArrowSchema::new(fields))
+}
+
 fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaError> {
     if node.files.is_empty() {
         let arrow_schema: ArrowSchema =
@@ -308,8 +368,8 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
     let row_index_name = node.row_index_column.clone();
     let build_listing_scan = |files: &[delta_kernel::FileMeta]| -> Result<LogicalPlan, DeltaError> {
         let file_schema = Arc::new(full_schema.clone());
-        let file_schema = if matches!(node.file_type, FileType::Json) {
-            crate::compile::scan::relax_nested_nullability_for_scan(file_schema.as_ref())
+        let file_schema = if node.file_type == FileType::Json {
+            relax_nested_nullability_for_scan(file_schema.as_ref())
         } else {
             file_schema
         };

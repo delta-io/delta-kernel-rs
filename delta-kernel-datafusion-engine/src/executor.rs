@@ -25,7 +25,6 @@ use datafusion_common::TableReference;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::LogicalPlan;
-use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use delta_kernel::arrow::datatypes::{
@@ -52,7 +51,7 @@ use futures::TryStreamExt;
 use url::Url;
 
 use crate::compile::{
-    compile_plan, compile_plan_logical, node_output_schema, physical_read_schema, CompileContext,
+    compile_plan_logical, node_output_schema, physical_read_schema, CompileContext,
 };
 use crate::error::{datafusion_err_to_delta, LiftDeltaErr};
 use crate::exec::{KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec};
@@ -153,8 +152,6 @@ fn execute_schema_query_phase(
 pub struct DataFusionExecutor {
     task_ctx: Arc<TaskContext>,
     session_ctx: SessionContext,
-    session_config: SessionConfig,
-    physical_optimizer: PhysicalOptimizer,
     kdf_harvest_slot: Arc<Mutex<Option<FinishedHandle>>>,
     engine: Arc<dyn Engine>,
 }
@@ -181,34 +178,34 @@ impl DataFusionExecutor {
             .options_mut()
             .optimizer
             .enable_leaf_expression_pushdown = false;
-        let session_ctx = SessionContext::new_with_config(session_config.clone());
+        let session_ctx = SessionContext::new_with_config(session_config);
         let _ = session_ctx.remove_optimizer_rule("optimize_projections");
         let _ = session_ctx.remove_optimizer_rule("optimize_unions");
         let kdf_harvest_slot = Arc::new(Mutex::new(None));
         Ok(Self {
             task_ctx: Arc::new(TaskContext::default()),
             session_ctx,
-            session_config,
-            physical_optimizer: PhysicalOptimizer::new(),
             kdf_harvest_slot,
             engine,
         })
     }
 
-    /// Compile a [`Plan`] into a physical node via the kernel sink dispatch table. Used by
+    /// Compile a kernel [`Plan`] to a DataFusion [`LogicalPlan`] for inspection. Used by
     /// debug/inspection callers (e.g. benchmark plan printers) that do not have any registered
     /// relations to resolve against; production execution goes through
     /// [`Self::prepare_execution_plan`].
-    pub fn compile_plan(&self, plan: &Plan) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-        let physical = compile_plan(
+    pub fn compile_plan_logical_for_inspection(
+        &self,
+        plan: &Plan,
+    ) -> Result<LogicalPlan, DeltaError> {
+        compile_plan_logical(
             plan,
             &CompileContext::new(
                 Arc::new(HashMap::new()),
                 Arc::clone(&self.kdf_harvest_slot),
                 Arc::clone(&self.engine),
             ),
-        )?;
-        self.optimize_physical_plan(physical)
+        )
     }
 
     /// Build the executable [`ExecutionPlan`] for a kernel [`Plan`] by:
@@ -328,23 +325,6 @@ impl DataFusionExecutor {
             .register_table(TableReference::bare(name), Arc::new(mem))
             .map_err(datafusion_err_to_delta)?;
         Ok(())
-    }
-
-    fn optimize_physical_plan(
-        &self,
-        mut plan: Arc<dyn ExecutionPlan>,
-    ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-        for rule in &self.physical_optimizer.rules {
-            plan = rule
-                .optimize(plan, self.session_config.options())
-                .map_err(|e| {
-                    crate::error::internal_error(format!(
-                        "DataFusion physical optimizer `{}` failed: {e}",
-                        rule.name()
-                    ))
-                })?;
-        }
-        Ok(plan)
     }
 
     /// Drain a [`PhaseOperation`] against the executor and return the resulting [`PhaseState`].
