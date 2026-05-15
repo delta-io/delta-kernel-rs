@@ -236,9 +236,10 @@ impl From<EngineErrorKind> for EngineError {
     }
 }
 
-// === Manual Clone ===
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -336,21 +337,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn from_wire_degrades_unknown_to_internal() {
-        assert_eq!(EngineErrorCode::from_wire(999), EngineErrorCode::Internal);
-        assert_eq!(EngineErrorCode::from_wire(0), EngineErrorCode::Internal);
-    }
-
-    #[test]
-    fn from_wire_matches_assigned_discriminants() {
-        assert_eq!(EngineErrorCode::from_wire(1), EngineErrorCode::FileNotFound);
-        assert_eq!(EngineErrorCode::from_wire(2), EngineErrorCode::IoError);
-        assert_eq!(EngineErrorCode::from_wire(3), EngineErrorCode::EmptyInput);
-        assert_eq!(
-            EngineErrorCode::from_wire(4),
-            EngineErrorCode::CommitConflict
-        );
+    #[rstest]
+    #[case(0, EngineErrorCode::Internal)]
+    #[case(1, EngineErrorCode::FileNotFound)]
+    #[case(2, EngineErrorCode::IoError)]
+    #[case(3, EngineErrorCode::EmptyInput)]
+    #[case(4, EngineErrorCode::CommitConflict)]
+    #[case(999, EngineErrorCode::Internal)]
+    fn from_wire_value_round_trips_or_degrades_to_internal(
+        #[case] wire: u32,
+        #[case] expected: EngineErrorCode,
+    ) {
+        assert_eq!(EngineErrorCode::from_wire(wire), expected);
+        if (expected as u32) == wire {
+            assert_eq!(expected as u32, wire, "discriminant must equal wire value");
+        }
     }
 
     #[test]
@@ -358,14 +359,5 @@ mod tests {
         assert!(EngineErrorCode::CommitConflict
             .construct("not-a-number".into())
             .is_none());
-    }
-
-    #[test]
-    fn code_discriminants_match_wire_values() {
-        assert_eq!(EngineErrorCode::Internal as u32, 0);
-        assert_eq!(EngineErrorCode::FileNotFound as u32, 1);
-        assert_eq!(EngineErrorCode::IoError as u32, 2);
-        assert_eq!(EngineErrorCode::EmptyInput as u32, 3);
-        assert_eq!(EngineErrorCode::CommitConflict as u32, 4);
     }
 }
