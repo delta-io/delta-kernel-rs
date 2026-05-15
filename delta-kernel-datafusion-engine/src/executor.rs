@@ -214,6 +214,16 @@ impl DataFusionExecutor {
         plan: &Plan,
         ctx: &CompileContext,
     ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
+        // SinkType::Write / SinkType::PartitionedWrite always go through the physical compile
+        // path: their lowering is bound to DataSinkExec / KernelPartitionedWriteExec which the
+        // logical compiler does not model. Read-path sinks (Results/Relation/ConsumeByKdf/Load)
+        // prefer the logical path.
+        if matches!(
+            plan.sink.sink_type,
+            SinkType::Write(_) | SinkType::PartitionedWrite(_)
+        ) {
+            return self.compile_plan(plan);
+        }
         if let Some(logical) = compile_plan_logical(plan, ctx)? {
             let state = self.session_ctx.state();
             let optimized = state.optimize(&logical).map_err(datafusion_err_to_delta)?;
@@ -291,10 +301,11 @@ impl DataFusionExecutor {
                 (_, Err(e)) => Err(e),
             };
         }
-        Err(crate::error::unsupported(format!(
-            "logical compiler does not support plan root {:?} with sink {:?}; physical fallback is disabled",
-            plan.root, plan.sink.sink_type
-        )))
+        // Logical compiler doesn't yet cover this plan shape (e.g. ordered Union, certain
+        // Write paths). Fall back to the physical compile path. User directive: Window MUST
+        // be logical-only, and the physical compile arm explicitly errors out for Window —
+        // anything else falls back here.
+        self.compile_plan(plan)
     }
 
     fn optimize_physical_plan(
