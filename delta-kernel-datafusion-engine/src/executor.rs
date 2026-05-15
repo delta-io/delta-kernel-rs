@@ -1,21 +1,27 @@
 //! DataFusion-backed [`DataFusionExecutor`] for compiling kernel [`Plan`] values.
 //!
-//! Relation sinks ([`delta_kernel::plans::ir::nodes::SinkType::Relation`]) materialize batches into
-//! [`crate::exec::RelationBatchRegistry`] when their stream is drained; subsequent plans read via a
+//! Relation sinks ([`SinkType::Relation`]) materialize their drained batches as a
+//! [`MemTable`] registered in [`Self::session_ctx`] under `__dk_rel_{handle_id}`; downstream
 //! [`DeclarativePlanNode::RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef)
-//! leaf. [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) drains
-//! through a [`KernelConsumeByKdfExec`](crate::exec::KernelConsumeByKdfExec); harvest the finalized
-//! handle with [`DataFusionExecutor::take_last_kdf_finished`] after fully draining the stream.
-//! [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) materializes per-row parquet
-//! or JSON reads via [`KernelLoadSinkExec`](crate::exec::KernelLoadSinkExec) and the kernel's
-//! parquet/json handlers.
+//! leaves resolve to that provider during compile via a per-plan prefetched
+//! [`CompileContext::relation_providers`] map. The same path is taken for
+//! [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load): the
+//! [`KernelLoadSinkExec`](crate::exec::KernelLoadSinkExec) streams materialized batches and
+//! the executor registers the result.
 //!
-//! [`SinkType::ConsumeByKdf`] finalized handles submit into [`PhaseState`] during
+//! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) drains
+//! through a [`KernelConsumeByKdfExec`](crate::exec::KernelConsumeByKdfExec); harvest the
+//! finalized handle with [`DataFusionExecutor::take_last_kdf_finished`] after fully draining
+//! the stream. [`SinkType::ConsumeByKdf`] finalized handles submit into [`PhaseState`] during
 //! [`Self::execute_phase_operation`] using [`crate::compile::CompileContext::phase_state`].
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use datafusion::catalog::TableProvider;
+use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
+use datafusion_common::TableReference;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
@@ -27,8 +33,8 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::SinkType;
-use delta_kernel::plans::ir::Plan;
+use delta_kernel::plans::ir::nodes::{RelationHandle, SinkType};
+use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::plans::kdf::FinishedHandle;
 use delta_kernel::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use delta_kernel::plans::state_machines::framework::engine_error::{EngineError, EngineErrorKind};
@@ -45,9 +51,11 @@ use crate::compile::{
     compile_plan, compile_plan_logical, node_output_schema, physical_read_schema, CompileContext,
 };
 use crate::error::{datafusion_err_to_delta, LiftDeltaErr};
-use crate::exec::{
-    KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec, RelationBatchRegistry,
-};
+use crate::exec::{KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec};
+
+fn relation_table_name(handle_id: u64) -> String {
+    format!("__dk_rel_{handle_id}")
+}
 
 fn default_kernel_engine() -> Arc<dyn Engine> {
     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
@@ -127,7 +135,6 @@ pub struct DataFusionExecutor {
     session_ctx: SessionContext,
     session_config: SessionConfig,
     physical_optimizer: PhysicalOptimizer,
-    relation_registry: Arc<RelationBatchRegistry>,
     kdf_harvest_slot: Arc<Mutex<Option<FinishedHandle>>>,
     engine: Arc<dyn Engine>,
 }
@@ -157,25 +164,26 @@ impl DataFusionExecutor {
         let session_ctx = SessionContext::new_with_config(session_config.clone());
         let _ = session_ctx.remove_optimizer_rule("optimize_projections");
         let _ = session_ctx.remove_optimizer_rule("optimize_unions");
-        let relation_registry = Arc::new(RelationBatchRegistry::new());
         let kdf_harvest_slot = Arc::new(Mutex::new(None));
         Ok(Self {
             task_ctx: Arc::new(TaskContext::default()),
             session_ctx,
             session_config,
             physical_optimizer: PhysicalOptimizer::new(),
-            relation_registry,
             kdf_harvest_slot,
             engine,
         })
     }
 
-    /// Compile a [`Plan`] into a physical node via the kernel sink dispatch table.
+    /// Compile a [`Plan`] into a physical node via the kernel sink dispatch table. Used by
+    /// debug/inspection callers (e.g. benchmark plan printers) that do not have any registered
+    /// relations to resolve against; production execution goes through
+    /// [`Self::compile_plan_for_execution`].
     pub fn compile_plan(&self, plan: &Plan) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
         let physical = compile_plan(
             plan,
             &CompileContext::new(
-                Arc::clone(&self.relation_registry),
+                Arc::new(HashMap::new()),
                 Arc::clone(&self.kdf_harvest_slot),
                 Arc::clone(&self.engine),
             ),
@@ -248,7 +256,6 @@ impl DataFusionExecutor {
                         root,
                         sink.clone(),
                         Arc::clone(&ctx.engine),
-                        Arc::clone(&ctx.relation_registry),
                         physical_read_schema(sink)?,
                     )?))
                 }
@@ -258,7 +265,62 @@ impl DataFusionExecutor {
         // Logical compiler doesn't yet cover this plan shape (e.g. ordered Union). Fall back to
         // the physical compile path. User directive: Window MUST be logical-only, and the
         // physical compile arm explicitly errors out for Window — anything else falls back here.
-        self.compile_plan(plan)
+        let physical = compile_plan(plan, ctx)?;
+        self.optimize_physical_plan(physical)
+    }
+
+    /// Walk `plan` and return an `Arc<HashMap>` keyed by handle id covering every
+    /// `RelationRef` leaf, with each value resolved against [`Self::session_ctx`]'s catalog.
+    /// Used to seed [`CompileContext::relation_providers`] before sync compile.
+    async fn prefetch_relation_providers(
+        &self,
+        plan: &Plan,
+    ) -> Result<Arc<HashMap<u64, Arc<dyn TableProvider>>>, DeltaError> {
+        let mut handles: Vec<RelationHandle> = Vec::new();
+        collect_relation_handles(&plan.root, &mut handles);
+        let mut providers: HashMap<u64, Arc<dyn TableProvider>> =
+            HashMap::with_capacity(handles.len());
+        for handle in handles {
+            if providers.contains_key(&handle.id) {
+                continue;
+            }
+            let table_name = relation_table_name(handle.id);
+            let provider = self
+                .session_ctx
+                .table_provider(TableReference::bare(table_name.clone()))
+                .await
+                .map_err(|e| {
+                    crate::error::plan_compilation(format!(
+                        "RelationRef references handle id {} (name `{}`), but no \
+                         provider is registered as `{}` in the session catalog: {e}",
+                        handle.id, handle.name, table_name
+                    ))
+                })?;
+            providers.insert(handle.id, provider);
+        }
+        Ok(Arc::new(providers))
+    }
+
+    /// Materialize `batches` as a [`MemTable`] under `__dk_rel_{handle_id}` in
+    /// [`Self::session_ctx`], replacing any prior registration for that handle.
+    fn register_relation_into_session(
+        &self,
+        handle: &RelationHandle,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(), DeltaError> {
+        let schema: delta_kernel::arrow::datatypes::SchemaRef =
+            Arc::new(handle.schema.as_ref().try_into_arrow().map_err(|e| {
+                crate::error::plan_compilation(format!("relation schema conversion: {e}"))
+            })?);
+        let mem = MemTable::try_new(schema, vec![batches]).map_err(datafusion_err_to_delta)?;
+        let name = relation_table_name(handle.id);
+        let _ = self
+            .session_ctx
+            .deregister_table(TableReference::bare(name.clone()));
+        self.session_ctx
+            .register_table(TableReference::bare(name), Arc::new(mem))
+            .map_err(datafusion_err_to_delta)?;
+        Ok(())
     }
 
     fn optimize_physical_plan(
@@ -287,37 +349,50 @@ impl DataFusionExecutor {
         match op {
             PhaseOperation::Plans(plans) => {
                 let state = PhaseState::empty();
-                let ctx = CompileContext {
-                    relation_registry: Arc::clone(&self.relation_registry),
-                    kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
-                    phase_state: Some(state.clone()),
-                    engine: Arc::clone(&self.engine),
-                };
                 for plan in plans {
+                    let providers = self
+                        .prefetch_relation_providers(&plan)
+                        .await
+                        .map_err(EngineError::internal)?;
+                    let ctx = CompileContext {
+                        relation_providers: providers,
+                        kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
+                        phase_state: Some(state.clone()),
+                        engine: Arc::clone(&self.engine),
+                    };
                     let physical = self
                         .compile_plan_for_execution(&plan, &ctx)
                         .await
                         .map_err(EngineError::internal)?;
-                    if matches!(plan.sink.sink_type, SinkType::Results(_)) {
-                        self.drain_results_stream(physical)
-                            .await
-                            .map_err(EngineError::internal)?;
-                    } else if let SinkType::Relation(handle) = &plan.sink.sink_type {
-                        let batches = self
-                            .collect_all_partitions(physical)
-                            .await
-                            .map_err(EngineError::internal)?;
-                        self.register_relation_batches(handle, batches)
-                            .map_err(EngineError::internal)?;
-                    } else {
-                        self.drain_plan_stream(physical)
-                            .await
-                            .map_err(EngineError::internal)?;
-                    }
+                    self.drain_and_register(&plan, physical)
+                        .await
+                        .map_err(EngineError::internal)?;
                 }
                 Ok(state)
             }
             PhaseOperation::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
+        }
+    }
+
+    /// Drain `physical` according to `plan`'s sink type. For [`SinkType::Relation`] and
+    /// [`SinkType::Load`] the collected batches are registered into [`Self::session_ctx`] as a
+    /// [`MemTable`] keyed by the sink's output [`RelationHandle`].
+    async fn drain_and_register(
+        &self,
+        plan: &Plan,
+        physical: Arc<dyn ExecutionPlan>,
+    ) -> Result<(), DeltaError> {
+        match &plan.sink.sink_type {
+            SinkType::Results(_) => self.drain_results_stream(physical).await,
+            SinkType::Relation(handle) => {
+                let batches = self.collect_all_partitions(physical).await?;
+                self.register_relation_into_session(handle, batches)
+            }
+            SinkType::Load(sink) => {
+                let batches = self.collect_all_partitions(physical).await?;
+                self.register_relation_into_session(&sink.output_relation, batches)
+            }
+            SinkType::ConsumeByKdf(_) => self.drain_plan_stream(physical).await,
         }
     }
 
@@ -335,14 +410,18 @@ impl DataFusionExecutor {
         match op {
             PhaseOperation::Plans(plans) => {
                 let state = PhaseState::empty();
-                let ctx = CompileContext {
-                    relation_registry: Arc::clone(&self.relation_registry),
-                    kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
-                    phase_state: Some(state.clone()),
-                    engine: Arc::clone(&self.engine),
-                };
                 let mut last_results_batches: Option<Vec<RecordBatch>> = None;
                 for plan in plans {
+                    let providers = self
+                        .prefetch_relation_providers(&plan)
+                        .await
+                        .map_err(EngineError::internal)?;
+                    let ctx = CompileContext {
+                        relation_providers: providers,
+                        kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
+                        phase_state: Some(state.clone()),
+                        engine: Arc::clone(&self.engine),
+                    };
                     let physical = self
                         .compile_plan_for_execution(&plan, &ctx)
                         .await
@@ -361,15 +440,8 @@ impl DataFusionExecutor {
                             batches.push(batch);
                         }
                         last_results_batches = Some(batches);
-                    } else if let SinkType::Relation(handle) = &plan.sink.sink_type {
-                        let batches = self
-                            .collect_all_partitions(physical)
-                            .await
-                            .map_err(EngineError::internal)?;
-                        self.register_relation_batches(handle, batches)
-                            .map_err(EngineError::internal)?;
                     } else {
-                        self.drain_plan_stream(physical)
+                        self.drain_and_register(&plan, physical)
                             .await
                             .map_err(EngineError::internal)?;
                     }
@@ -469,7 +541,7 @@ impl DataFusionExecutor {
     ) -> Result<SendableRecordBatchStream, DeltaError> {
         self.clear_kdf_harvest_slot();
         let ctx = CompileContext::new(
-            Arc::clone(&self.relation_registry),
+            self.prefetch_relation_providers(&plan).await?,
             Arc::clone(&self.kdf_harvest_slot),
             Arc::clone(&self.engine),
         );
@@ -496,20 +568,42 @@ impl DataFusionExecutor {
     ) -> Result<Vec<delta_kernel::arrow::array::RecordBatch>, DeltaError> {
         self.clear_kdf_harvest_slot();
         let ctx = CompileContext::new(
-            Arc::clone(&self.relation_registry),
+            self.prefetch_relation_providers(&plan).await?,
             Arc::clone(&self.kdf_harvest_slot),
             Arc::clone(&self.engine),
         );
         let physical = self.compile_plan_for_execution(&plan, &ctx).await?;
         let batches = self.collect_all_partitions(physical).await?;
-        if let SinkType::Relation(handle) = &plan.sink.sink_type {
-            self.register_relation_batches(handle, batches.clone())?;
+        match &plan.sink.sink_type {
+            SinkType::Relation(handle) => {
+                self.register_relation_into_session(handle, batches.clone())?;
+            }
+            SinkType::Load(sink) => {
+                self.register_relation_into_session(&sink.output_relation, batches.clone())?;
+            }
+            SinkType::Results(_) | SinkType::ConsumeByKdf(_) => {}
         }
         Ok(batches)
     }
 
-    pub fn relation_batch_registry(&self) -> &Arc<RelationBatchRegistry> {
-        &self.relation_registry
+    /// Collect all batches for a previously-registered relation from the session catalog.
+    /// Used by tests that need to inspect the materialized output of a relation/load sink.
+    pub async fn collect_relation(
+        &self,
+        handle: &RelationHandle,
+    ) -> Result<Vec<RecordBatch>, DeltaError> {
+        let name = relation_table_name(handle.id);
+        let df = self
+            .session_ctx
+            .table(TableReference::bare(name.clone()))
+            .await
+            .map_err(|e| {
+                crate::error::plan_compilation(format!(
+                    "no relation registered for handle id {} (name `{}`) as `{}`: {e}",
+                    handle.id, handle.name, name
+                ))
+            })?;
+        df.collect().await.map_err(datafusion_err_to_delta)
     }
 
     pub fn engine(&self) -> &Arc<dyn Engine> {
@@ -526,15 +620,6 @@ impl DataFusionExecutor {
             out.push(batch);
         }
         Ok(out)
-    }
-
-    fn register_relation_batches(
-        &self,
-        handle: &delta_kernel::plans::ir::nodes::RelationHandle,
-        batches: Vec<RecordBatch>,
-    ) -> Result<(), DeltaError> {
-        self.relation_registry.register(handle.id, batches);
-        Ok(())
     }
 
     fn single_results_stream(
@@ -591,13 +676,17 @@ impl DataFusionExecutor {
         match op {
             PhaseOperation::Plans(plans) => {
                 let state = PhaseState::empty();
-                let ctx = CompileContext {
-                    relation_registry: Arc::clone(&self.relation_registry),
-                    kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
-                    phase_state: Some(state.clone()),
-                    engine: Arc::clone(&self.engine),
-                };
                 for plan in plans {
+                    let providers = self
+                        .prefetch_relation_providers(&plan)
+                        .await
+                        .map_err(EngineError::internal)?;
+                    let ctx = CompileContext {
+                        relation_providers: providers,
+                        kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
+                        phase_state: Some(state.clone()),
+                        engine: Arc::clone(&self.engine),
+                    };
                     let physical = self
                         .compile_plan_for_execution(&plan, &ctx)
                         .await
@@ -614,15 +703,8 @@ impl DataFusionExecutor {
                         {
                             on_batch(batch).map_err(EngineError::internal)?;
                         }
-                    } else if let SinkType::Relation(handle) = &plan.sink.sink_type {
-                        let batches = self
-                            .collect_all_partitions(physical)
-                            .await
-                            .map_err(EngineError::internal)?;
-                        self.register_relation_batches(handle, batches)
-                            .map_err(EngineError::internal)?;
                     } else {
-                        self.drain_plan_stream(physical)
+                        self.drain_and_register(&plan, physical)
                             .await
                             .map_err(EngineError::internal)?;
                     }
@@ -631,5 +713,26 @@ impl DataFusionExecutor {
             }
             PhaseOperation::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
         }
+    }
+}
+
+fn collect_relation_handles(node: &DeclarativePlanNode, out: &mut Vec<RelationHandle>) {
+    match node {
+        DeclarativePlanNode::RelationRef(handle) => out.push(handle.clone()),
+        DeclarativePlanNode::Filter { child, .. }
+        | DeclarativePlanNode::Project { child, .. }
+        | DeclarativePlanNode::Window { child, .. } => collect_relation_handles(child, out),
+        DeclarativePlanNode::Union { children, .. } => {
+            for c in children {
+                collect_relation_handles(c, out);
+            }
+        }
+        DeclarativePlanNode::Join { build, probe, .. } => {
+            collect_relation_handles(build, out);
+            collect_relation_handles(probe, out);
+        }
+        DeclarativePlanNode::Scan(_)
+        | DeclarativePlanNode::FileListing(_)
+        | DeclarativePlanNode::Values(_) => {}
     }
 }

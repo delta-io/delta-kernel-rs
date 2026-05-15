@@ -1,14 +1,23 @@
 //! Declarative [`Plan`] -> DataFusion [`ExecutionPlan`] compilation.
 //!
-//! Sinks: [`SinkType::Results`] (collect), [`SinkType::Relation`] (materialize into
-//! [`RelationBatchRegistry`]), [`SinkType::ConsumeByKdf`] (drain via [`KernelConsumeByKdfExec`]),
-//! [`SinkType::Load`] (per-row parquet/json kernel-handler reads).
+//! Sinks: [`SinkType::Results`] (stream batches), [`SinkType::Relation`] /
+//! [`SinkType::Load`] (drain + the executor materializes the result as a
+//! [`datafusion::datasource::MemTable`] under
+//! [`crate::executor::DataFusionExecutor::session_ctx`] for downstream
+//! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::ConsumeByKdf`] (drain via
+//! [`KernelConsumeByKdfExec`]).
 //!
-//! Leaves: `Values`, `Scan`, `FileListing`, `RelationRef`.
+//! Leaves: `Values`, `Scan`, `FileListing`, `RelationRef` (resolved via a per-compile
+//! [`CompileContext::relation_providers`] map prefetched from the executor's
+//! [`SessionContext`](datafusion::execution::context::SessionContext)).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use datafusion::catalog::TableProvider;
+use datafusion::datasource::MemTable;
 use datafusion_common::DFSchema;
+use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_fn::cast;
 use datafusion_expr::lit;
@@ -20,6 +29,7 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
+use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::{JoinType, RelationHandle, SinkType};
@@ -29,10 +39,7 @@ use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::Engine;
 
-use crate::exec::{
-    build_literal_exec, build_relation_ref_exec, FileListingExec, KernelConsumeByKdfExec,
-    RelationBatchRegistry,
-};
+use crate::exec::{build_literal_exec, FileListingExec, KernelConsumeByKdfExec};
 
 pub mod expr_translator;
 mod json_parse;
@@ -44,7 +51,13 @@ pub(crate) use load_sink::physical_read_schema;
 /// Context shared by the compiler for leaf nodes that need runtime side state.
 #[derive(Clone)]
 pub struct CompileContext {
-    pub relation_registry: Arc<RelationBatchRegistry>,
+    /// Relations referenced by [`DeclarativePlanNode::RelationRef`] leaves, prefetched from
+    /// the executor's
+    /// [`SessionContext`](datafusion::execution::context::SessionContext) catalog before
+    /// compilation begins. Keyed by [`RelationHandle::id`]. An empty map is fine when the
+    /// plan being compiled does not reference any relations (or for inspection-only paths
+    /// like benchmark physical-plan dumps).
+    pub relation_providers: Arc<HashMap<u64, Arc<dyn TableProvider>>>,
     /// Latest finalized [`FinishedHandle`] from a [`SinkType::ConsumeByKdf`] plan run on this
     /// executor.
     pub kdf_harvest_slot: Arc<Mutex<Option<FinishedHandle>>>,
@@ -62,12 +75,12 @@ pub struct CompileContext {
 
 impl CompileContext {
     pub fn new(
-        relation_registry: Arc<RelationBatchRegistry>,
+        relation_providers: Arc<HashMap<u64, Arc<dyn TableProvider>>>,
         kdf_harvest_slot: Arc<Mutex<Option<FinishedHandle>>>,
         engine: Arc<dyn Engine>,
     ) -> Self {
         Self {
-            relation_registry,
+            relation_providers,
             kdf_harvest_slot,
             phase_state: None,
             engine,
@@ -228,7 +241,42 @@ fn compile_relation(
     handle: &RelationHandle,
     ctx: &CompileContext,
 ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    build_relation_ref_exec(handle, &ctx.relation_registry)
+    let provider = ctx.relation_providers.get(&handle.id).ok_or_else(|| {
+        crate::error::plan_compilation(format!(
+            "RelationRef references unregistered handle id {} (name `{}`); the producing plan \
+             must run before any consumer compiles",
+            handle.id, handle.name
+        ))
+    })?;
+    let mem = provider
+        .as_any()
+        .downcast_ref::<MemTable>()
+        .ok_or_else(|| {
+            crate::error::internal_error(format!(
+                "RelationRef provider for handle id {} (name `{}`) is not a MemTable; \
+                 RelationBatchRegistry only registers MemTables",
+                handle.id, handle.name
+            ))
+        })?;
+    // MemTable's PartitionData wraps a `tokio::sync::RwLock`; physical compile is sync, so we
+    // grab the read guard non-blockingly. Relation MemTables are immutable post-registration so
+    // try_read should always succeed; contention here would indicate a concurrent writer that
+    // shouldn't exist.
+    let partitions: Vec<Vec<RecordBatch>> = mem
+        .batches
+        .iter()
+        .map(|p| {
+            p.try_read().map(|g| g.clone()).map_err(|_| {
+                crate::error::internal_error(format!(
+                    "MemTable partition for handle id {} is locked by a concurrent writer",
+                    handle.id
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    MemorySourceConfig::try_new_exec(&partitions, provider.schema(), None)
+        .map(|exec| exec as Arc<dyn ExecutionPlan>)
+        .map_err(crate::error::datafusion_err_to_delta)
 }
 
 fn compile_native_filter(

@@ -6,6 +6,4 @@ mod sources;
 
 pub use literal::build_literal_exec;
 pub use shape::{KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec};
-pub use sources::{
-    build_relation_ref_exec, build_relation_ref_logical, FileListingExec, RelationBatchRegistry,
-};
+pub use sources::FileListingExec;

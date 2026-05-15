@@ -1,5 +1,9 @@
-//! Materialize [`LoadSink`] output into [`crate::exec::RelationBatchRegistry`] using kernel
-//! parquet/json handlers (passthrough columns + optional DV masking).
+//! Stream [`LoadSink`] output batches produced by kernel parquet/json handlers (passthrough
+//! columns + optional DV masking). The executor collects the stream and registers the result
+//! in the [`SessionContext`](datafusion::execution::context::SessionContext) under
+//! `__dk_rel_{handle_id}` so downstream
+//! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
+//! it as a [`MemTable`](datafusion::datasource::MemTable).
 
 use std::any::Any;
 use std::fmt;
@@ -36,8 +40,6 @@ use delta_kernel::{Engine, FileMeta};
 use futures::{Stream, StreamExt};
 use url::Url;
 
-use crate::exec::RelationBatchRegistry;
-
 fn kernel_err(e: delta_kernel::Error) -> DeltaError {
     crate::error::internal_error(e.to_string())
 }
@@ -46,7 +48,6 @@ pub struct KernelLoadSinkExec {
     child: Arc<dyn ExecutionPlan>,
     sink: LoadSink,
     engine: Arc<dyn Engine>,
-    registry: Arc<RelationBatchRegistry>,
     arrow_schema: delta_kernel::arrow::datatypes::SchemaRef,
     physical_read_schema: KernelSchemaRef,
     properties: Arc<PlanProperties>,
@@ -57,7 +58,6 @@ impl KernelLoadSinkExec {
         child: Arc<dyn ExecutionPlan>,
         sink: LoadSink,
         engine: Arc<dyn Engine>,
-        registry: Arc<RelationBatchRegistry>,
         physical_read_schema: KernelSchemaRef,
     ) -> Result<Self, DeltaError> {
         let arrow_schema: delta_kernel::arrow::datatypes::SchemaRef = Arc::new(
@@ -81,7 +81,6 @@ impl KernelLoadSinkExec {
             child,
             sink,
             engine,
-            registry,
             arrow_schema,
             physical_read_schema,
             properties,
@@ -139,7 +138,6 @@ impl ExecutionPlan for KernelLoadSinkExec {
                 child,
                 self.sink.clone(),
                 Arc::clone(&self.engine),
-                Arc::clone(&self.registry),
                 self.physical_read_schema.clone(),
             )
             .map_err(crate::error::wrap_delta_err)?,
@@ -161,12 +159,9 @@ impl ExecutionPlan for KernelLoadSinkExec {
             inner,
             sink: self.sink.clone(),
             engine: Arc::clone(&self.engine),
-            registry: Arc::clone(&self.registry),
-            handle_id: self.sink.output_relation.id,
             physical_read_schema: self.physical_read_schema.clone(),
             output_arrow_schema: self.arrow_schema.clone(),
-            materialized: Vec::new(),
-            registered: false,
+            pending: Vec::new(),
         }))
     }
 }
@@ -175,22 +170,19 @@ struct KernelLoadSinkStream {
     inner: SendableRecordBatchStream,
     sink: LoadSink,
     engine: Arc<dyn Engine>,
-    registry: Arc<RelationBatchRegistry>,
-    handle_id: u64,
     physical_read_schema: KernelSchemaRef,
     output_arrow_schema: delta_kernel::arrow::datatypes::SchemaRef,
-    materialized: Vec<RecordBatch>,
-    registered: bool,
+    pending: Vec<RecordBatch>,
 }
 
 impl Stream for KernelLoadSinkStream {
     type Item = DfResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.registered {
-            return Poll::Ready(None);
-        }
         loop {
+            if !self.pending.is_empty() {
+                return Poll::Ready(Some(Ok(self.pending.remove(0))));
+            }
             match self.inner.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
                     match materialize_upstream_batch(
@@ -199,19 +191,14 @@ impl Stream for KernelLoadSinkStream {
                         self.engine.as_ref(),
                         self.physical_read_schema.clone(),
                     ) {
-                        Ok(mut outs) => self.materialized.append(&mut outs),
+                        Ok(outs) => self.pending = outs,
                         Err(e) => {
                             return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
                         }
                     }
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => {
-                    let batches = std::mem::take(&mut self.materialized);
-                    Arc::clone(&self.registry).register(self.handle_id, batches);
-                    self.registered = true;
-                    return Poll::Ready(None);
-                }
+                Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }

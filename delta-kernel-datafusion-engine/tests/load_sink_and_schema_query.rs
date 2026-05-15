@@ -103,14 +103,14 @@ async fn load_sink_broadcasts_passthrough_columns() {
     let producer_plan = lit.into_load(sink);
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    assert!(
-        executor
-            .execute_plan_collect(producer_plan)
-            .await
-            .unwrap()
-            .is_empty(),
-        "Load sink yields nothing to the caller"
-    );
+    let producer_rows: usize = executor
+        .execute_plan_collect(producer_plan)
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(producer_rows, 4);
 
     let consumer_plan = DeclarativePlanNode::relation_ref(handle).into_results();
     let batches = executor.execute_plan_collect(consumer_plan).await.unwrap();
@@ -180,11 +180,14 @@ async fn load_sink_without_dv_reads_full_parquet_row_group() {
     });
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    assert!(executor
+    let producer_rows: usize = executor
         .execute_plan_collect(lit.into_load(sink))
         .await
         .unwrap()
-        .is_empty());
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(producer_rows, 10);
 
     let consumer_plan = DeclarativePlanNode::relation_ref(handle).into_results();
     let batches = executor.execute_plan_collect(consumer_plan).await.unwrap();
@@ -259,11 +262,14 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
     });
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    assert!(executor
+    let producer_rows: usize = executor
         .execute_plan_collect(lit.into_load(sink))
         .await
         .unwrap()
-        .is_empty());
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(producer_rows, 8);
 
     let consumer_plan = DeclarativePlanNode::relation_ref(handle).into_results();
     let batches = executor.execute_plan_collect(consumer_plan).await.unwrap();
@@ -308,11 +314,14 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
     });
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    assert!(executor
+    let producer_rows: usize = executor
         .execute_plan_collect(lit.into_load(sink))
         .await
         .unwrap()
-        .is_empty());
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(producer_rows, 2);
 
     let consumer_plan = DeclarativePlanNode::relation_ref(handle).into_results();
     let batches = executor.execute_plan_collect(consumer_plan).await.unwrap();

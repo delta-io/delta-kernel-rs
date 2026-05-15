@@ -200,8 +200,8 @@ async fn commit_dedup_batches_for_snapshot(
     ex.execute_phase_operation(PhaseOperation::Plans(plans))
         .await
         .expect("run fsr plans");
-    ex.relation_batch_registry()
-        .get_cloned(commit_dedup_handle.id)
+    ex.collect_relation(&commit_dedup_handle)
+        .await
         .expect("commit_dedup relation batches")
 }
 

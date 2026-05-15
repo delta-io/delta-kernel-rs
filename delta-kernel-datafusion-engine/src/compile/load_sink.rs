@@ -131,7 +131,6 @@ pub(super) fn compile_load_terminal(
         inner,
         sink.clone(),
         Arc::clone(&ctx.engine),
-        Arc::clone(&ctx.relation_registry),
         physical_read_schema(sink)?,
     )?))
 }

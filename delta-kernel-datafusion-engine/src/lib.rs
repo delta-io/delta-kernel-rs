@@ -1,14 +1,15 @@
 //! DataFusion execution scaffold for Delta Kernel declarative [`Plan`] trees.
 //!
 //! Supported sinks include [`delta_kernel::plans::ir::nodes::SinkType::Results`] (stream batches to
-//! the caller), [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation)
-//! (materialize into an in-memory registry after draining),
+//! the caller), [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation) /
+//! [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) (materialize batches as a
+//! [`MemTable`](datafusion::datasource::MemTable) registered in the executor's
+//! [`SessionContext`](datafusion::execution::context::SessionContext) so downstream
+//! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
+//! it), and
 //! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) (observe
-//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]), and
-//! [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) (per-row parquet or JSON
-//! reads via kernel parquet/json handlers into the relation registry).
-//! Unsupported constructs still return
-//! [`delta_kernel::plans::errors::DeltaError`] via [`error::unsupported`].
+//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Unsupported constructs still
+//! return [`delta_kernel::plans::errors::DeltaError`] via [`error::unsupported`].
 
 pub mod compile;
 pub mod error;
@@ -60,7 +61,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_relation_sink_materializes_into_registry() {
+    async fn logical_relation_sink_materializes_into_session_ctx() {
         let ex = DataFusionExecutor::try_new().unwrap();
         let schema = two_bool_schema();
         let handle = RelationHandle::fresh("logical_relation_test", Arc::clone(&schema));
@@ -82,8 +83,8 @@ mod tests {
             .await
             .unwrap();
         let relation_batches = ex
-            .relation_batch_registry()
-            .get_cloned(handle.id)
+            .collect_relation(&handle)
+            .await
             .expect("relation sink should materialize output batches");
         assert_eq!(relation_batches.len(), 1);
         assert_eq!(relation_batches[0].num_rows(), 1);

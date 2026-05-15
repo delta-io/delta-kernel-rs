@@ -34,7 +34,6 @@ use delta_kernel::transforms::ExpressionTransform;
 use super::CompileContext;
 use crate::compile::expr_translator::kernel_expr_to_df;
 use crate::error::plan_compilation;
-use crate::exec::build_relation_ref_logical;
 
 /// Walk every kernel projection expression and collect the set of unique top-level column
 /// roots (the first segment of any [`ColumnName`] reference). Used by the `Project` lowering
@@ -765,7 +764,22 @@ fn compile_declarative_node_logical(
             Ok(Some(unioned))
         }
         DeclarativePlanNode::RelationRef(handle) => {
-            build_relation_ref_logical(handle, &ctx.relation_registry).map(Some)
+            let provider = ctx.relation_providers.get(&handle.id).ok_or_else(|| {
+                plan_compilation(format!(
+                    "RelationRef references unregistered handle id {} (name `{}`); the \
+                     producing plan must run before any consumer compiles",
+                    handle.id, handle.name
+                ))
+            })?;
+            let plan = LogicalPlanBuilder::scan(
+                format!("relation_{}", handle.id),
+                provider_as_source(Arc::clone(provider)),
+                None,
+            )
+            .map_err(crate::error::datafusion_err_to_delta)?
+            .build()
+            .map_err(crate::error::datafusion_err_to_delta)?;
+            Ok(Some(plan))
         }
         DeclarativePlanNode::Scan(node) => {
             let plan = scan_to_listing_logical_plan(node)?;
