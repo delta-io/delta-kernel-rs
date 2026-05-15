@@ -414,6 +414,12 @@ fn compile_scan_single_group(
 /// (no reader pushdown). Engines may later add conservative pushdown optimizations while retaining
 /// this filter as a residual guardrail.
 ///
+/// **Why no pushdown:** kernel NULL semantics keep a row when a predicate references a NULL value
+/// (vs SQL three-valued logic, which drops it). DataFusion's parquet filter pushdown applies SQL
+/// semantics, so enabling it would silently change kernel behavior. Future contributors: pushdown
+/// MUST stay disabled at the scan layer; opt-in pushdown belongs only behind kernel-side
+/// null-aware filter rewriting.
+///
 /// ## Row-index implementation
 ///
 /// Parquet uses arrow-rs [`RowNumber`] virtual columns decoded with each batch. JSON uses

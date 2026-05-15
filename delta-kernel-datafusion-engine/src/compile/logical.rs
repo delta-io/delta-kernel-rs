@@ -387,7 +387,11 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
     };
     if let Some(predicate) = &node.predicate {
         let pred = kernel_expr_to_df(predicate.as_ref())?;
-        // Scan predicate preserves kernel semantics: NULL keeps row.
+        // Kernel NULL semantics keep a row when the predicate references a NULL value (SQL
+        // three-valued logic would drop it). We wrap the predicate with `pred OR pred IS NULL` so
+        // the downstream Filter behaves like kernel scan-skipping. Do NOT swap this for parquet
+        // filter pushdown — pushdown applies SQL semantics and would silently change kernel
+        // behavior on NULL.
         let null_preserving = pred.clone().or(pred.is_null());
         scan_plan = LogicalPlanBuilder::from(scan_plan)
             .filter(null_preserving)
