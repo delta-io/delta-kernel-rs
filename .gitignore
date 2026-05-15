@@ -28,3 +28,7 @@ ffi/examples/visit-expression/build
 /target
 
 /benchmarks/workloads/
+
+# FSR plan-dump debug artifacts
+fsr_phase_plan_dump.txt
+plan_dump.txt

@@ -225,13 +225,8 @@ impl DataFusionExecutor {
                 .map_err(datafusion_err_to_delta);
             return match (&plan.sink.sink_type, physical_root) {
                 (SinkType::Results(result_schema_opt), Ok(root)) => {
-                    let root = if let DeclarativePlanNode::Assert { node, .. } = &plan.root {
-                        let input_schema =
-                            if let DeclarativePlanNode::Assert { child, .. } = &plan.root {
-                                node_output_schema(child.as_ref())?
-                            } else {
-                                unreachable!()
-                            };
+                    let root = if let DeclarativePlanNode::Assert { child, node } = &plan.root {
+                        let input_schema = node_output_schema(child.as_ref())?;
                         Arc::new(KernelAssertExec::try_new(root, input_schema, &node.checks)?)
                             as Arc<dyn ExecutionPlan>
                     } else {

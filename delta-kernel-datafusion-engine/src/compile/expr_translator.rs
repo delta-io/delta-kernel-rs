@@ -39,7 +39,7 @@ use delta_kernel::expressions::{
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::schema::{DataType, PrimitiveType};
 
-use crate::error::unsupported;
+use crate::error::{internal_error, unsupported};
 
 /// Translate a kernel [`Expression`] to a DataFusion [`Expr`].
 pub fn kernel_expr_to_df(expr: &Expression) -> Result<Expr, DeltaError> {
@@ -177,7 +177,11 @@ fn binary_pred_to_df(
         BinaryPredicateOp::LessThan => Operator::Lt,
         BinaryPredicateOp::GreaterThan => Operator::Gt,
         BinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
-        BinaryPredicateOp::In => unreachable!("handled above"),
+        BinaryPredicateOp::In => {
+            return Err(internal_error(
+                "BinaryPredicateOp::In must be dispatched via in_pred_to_df above",
+            ));
+        }
     };
     Ok(Expr::BinaryExpr(BinaryExpr::new(
         Box::new(l),
