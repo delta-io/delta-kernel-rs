@@ -443,10 +443,37 @@ impl TableProvider for NullabilityEnforcingTableProvider {
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let inner = self.inner.scan(state, projection, filters, limit).await?;
+        // Schema we promise to deliver after wrapping: strict schema, then projection.
+        // NullabilityValidationExec zips this against the inner batches positionally and casts
+        // each column to the matching field, so the column count and order must match the
+        // inner plan's output.
+        let projected_schema: Arc<ArrowSchema> =
+            match projection {
+                Some(p) => Arc::new(self.strict_schema.project(p).map_err(|e| {
+                    datafusion_common::DataFusionError::ArrowError(Box::new(e), None)
+                })?),
+                None => Arc::clone(&self.strict_schema),
+            };
+        // Drop validations whose top-level root was projected out — they reference columns
+        // that don't exist in `projected_schema` and would fail by-name lookup at runtime.
+        let kept_roots: HashSet<&str> = projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        let validations: Vec<(String, String)> = self
+            .nested_validations
+            .iter()
+            .filter(|(parent_path, _)| {
+                let root = parent_path.split('.').next().unwrap_or(parent_path);
+                kept_roots.contains(root)
+            })
+            .cloned()
+            .collect();
         Ok(Arc::new(NullabilityValidationExec::new(
             inner,
-            self.nested_validations.clone(),
-            Arc::clone(&self.strict_schema),
+            validations,
+            projected_schema,
         )))
     }
     fn supports_filters_pushdown(
@@ -1051,4 +1078,55 @@ fn compile_ordered_union(children: Vec<LogicalPlan>) -> Result<LogicalPlan, Delt
         .build()
         .map_err(crate::error::datafusion_err_to_delta)?;
     drop_named_column(sorted, ORDINAL_COL)
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::context::SessionContext;
+    use datafusion_common::arrow::datatypes::{DataType, Field, Fields};
+
+    use super::*;
+
+    /// Schema with a top-level struct `meta` (nullable) containing a NOT NULL child `id`, plus
+    /// a top-level int field `x`. Returns the strict schema; the matching relaxed schema used
+    /// by the inner provider widens `meta.id` to nullable so file decoders accept it.
+    fn schemas() -> (Arc<ArrowSchema>, Arc<ArrowSchema>) {
+        let strict_meta_children: Fields =
+            vec![Arc::new(Field::new("id", DataType::Utf8, false))].into();
+        let strict_meta = Field::new("meta", DataType::Struct(strict_meta_children), true);
+        let strict_x = Field::new("x", DataType::Int64, false);
+        let strict = Arc::new(ArrowSchema::new(vec![strict_meta, strict_x]));
+        let relaxed = relax_nested_nullability_for_scan(strict.as_ref());
+        (strict, relaxed)
+    }
+
+    #[tokio::test]
+    async fn wrapper_unprojected_scan_returns_strict_schema() {
+        let (strict, relaxed) = schemas();
+        let inner: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(Arc::clone(&relaxed), vec![vec![]]).unwrap());
+        let provider = NullabilityEnforcingTableProvider::new(inner, Arc::clone(&strict));
+        let ctx = SessionContext::new();
+        let plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        assert_eq!(plan.schema().as_ref(), strict.as_ref());
+    }
+
+    #[tokio::test]
+    async fn wrapper_projected_scan_returns_projected_strict_schema() {
+        let (strict, relaxed) = schemas();
+        let inner: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(Arc::clone(&relaxed), vec![vec![]]).unwrap());
+        let provider = NullabilityEnforcingTableProvider::new(inner, Arc::clone(&strict));
+        let ctx = SessionContext::new();
+        // Drop `meta`, keep `x`. The wrapper must rebuild its target schema + validations to
+        // match the inner plan's projected output; otherwise NullabilityValidationExec's
+        // positional zip mismatches at runtime.
+        let plan = provider
+            .scan(&ctx.state(), Some(&vec![1]), &[], None)
+            .await
+            .unwrap();
+        let expected = Arc::new(strict.project(&[1]).unwrap());
+        assert_eq!(plan.schema().as_ref(), expected.as_ref());
+    }
 }
