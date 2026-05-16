@@ -1878,29 +1878,16 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    async fn test_create_table_build_with_empty_schema_returns_error(
+    async fn test_create_table_build_with_empty_schema_succeeds(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
-        // An empty schema is always invalid for table creation
+        // CREATE TABLE with no columns is permitted by the Delta protocol; users may
+        // populate the schema later via ALTER TABLE ADD COLUMN.
         let (_table_path, engine, builder) = create_table_builder(&tmp_dir, vec![]);
 
-        let result = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
-        match result {
-            ExternResult::Err(e) => {
-                let error = unsafe { recover_error(e) };
-                assert!(
-                    error.message.contains("schema")
-                        || error.message.contains("field")
-                        || error.message.contains("empty"),
-                    "Expected schema-related error, got: {}",
-                    error.message
-                );
-            }
-            ExternResult::Ok(txn) => {
-                unsafe { create_table_free_transaction(txn) };
-                panic!("Expected error for empty schema");
-            }
-        }
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        unsafe { create_table_free_transaction(txn) };
 
         unsafe { free_engine(engine) };
         Ok(())
