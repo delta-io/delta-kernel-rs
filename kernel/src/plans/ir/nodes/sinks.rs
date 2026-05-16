@@ -62,6 +62,18 @@ impl std::fmt::Debug for ConsumeByKdfSink {
     }
 }
 
+// Token identity drives equality: tokens are process-unique by serial, and the
+// `initial_state` trait object (`Box<dyn ConsumerKdf>`) is not `Eq`-able. Two
+// sinks sharing a token were constructed from the same plan node and therefore
+// describe the same consumer.
+impl PartialEq for ConsumeByKdfSink {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token
+    }
+}
+
+impl Eq for ConsumeByKdfSink {}
+
 /// Identifier for a relation produced by one plan and consumed by another in
 /// the same `PhaseOperation::Plans(...)`. Created via [`RelationHandle::fresh`];
 /// each handle is unique across all kernel plans for the lifetime of the
@@ -217,7 +229,7 @@ impl Eq for LoadSink {}
 /// Sink shapes include: `Results` (stream batches to the caller), `Relation`
 /// (pipe into another plan), `ConsumeByKdf` (drain into a [`ConsumerKdf`]),
 /// and `Load` (per-row file read).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkType {
     /// Stream every output batch to the caller.
     ///
@@ -238,20 +250,6 @@ pub enum SinkType {
     /// the result under [`LoadSink::output_relation`]. See [`LoadSink`].
     Load(LoadSink),
 }
-
-impl PartialEq for SinkType {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (SinkType::Results(a), SinkType::Results(b)) => a == b,
-            (SinkType::Relation(a), SinkType::Relation(b)) => a == b,
-            (SinkType::ConsumeByKdf(a), SinkType::ConsumeByKdf(b)) => a.token == b.token,
-            (SinkType::Load(a), SinkType::Load(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for SinkType {}
 
 /// Terminal node of a [`crate::plans::ir::plan::Plan`], carrying a [`SinkType`].
 #[derive(Debug, Clone, PartialEq, Eq)]

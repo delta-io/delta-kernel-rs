@@ -429,16 +429,20 @@ pub struct Extractor<O> {
 
 impl<O: Send + 'static> Extractor<O> {
     /// Token identifying the entries this extractor will pull from a [`PhaseState`].
-    pub fn token(&self) -> &KdfStateToken {
+    ///
+    /// Test-only: production code receives the typed payload through
+    /// [`Extractor::extract`] and does not need direct access to the token.
+    #[cfg(test)]
+    pub(crate) fn token(&self) -> &KdfStateToken {
         &self.token
     }
 
     /// Pull this extractor's payload from `state` and decode it.
     ///
-    /// Drains the entries under [`Self::token`] from `state` (so a second
-    /// call would see them empty) and runs the typed reduction. Decoding
-    /// failures are wrapped in [`EngineError::internal`] so SM bodies can
-    /// uniformly handle them on the engine-error path.
+    /// Drains the entries under this extractor's [`KdfStateToken`] from
+    /// `state` (so a second call would see them empty) and runs the typed
+    /// reduction. Decoding failures are wrapped in [`EngineError::internal`]
+    /// so SM bodies can uniformly handle them on the engine-error path.
     pub fn extract(self, state: &PhaseState) -> Result<O, EngineError> {
         let parts = state.take_by_token(&self.token);
         (self.extract)(parts).map_err(EngineError::internal)

@@ -46,28 +46,6 @@ impl std::fmt::Display for KdfStateToken {
     }
 }
 
-impl KdfStateToken {
-    /// Parse [`Display`] output (`kdf_id` + `#` + decimal serial).
-    ///
-    /// Uses the **last** `#` so `kdf_id` may contain `#` without ambiguity for the serial suffix.
-    pub fn parse_display(s: &str) -> crate::DeltaResult<Self> {
-        let (kdf_id, serial_str) = s.rsplit_once('#').ok_or_else(|| {
-            crate::Error::generic(format!(
-                "KdfStateToken::parse_display: missing `#` separator in `{s}`"
-            ))
-        })?;
-        let serial = serial_str.parse::<u64>().map_err(|e| {
-            crate::Error::generic(format!(
-                "KdfStateToken::parse_display: invalid serial in `{s}`: {e}"
-            ))
-        })?;
-        Ok(Self {
-            kdf_id: kdf_id.to_string(),
-            serial,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,21 +65,5 @@ mod tests {
             serial: 42,
         };
         assert_eq!(t.to_string(), "consumer.checkpoint_hint#42");
-    }
-
-    #[test]
-    fn parse_display_round_trips_display() {
-        let t = KdfStateToken {
-            kdf_id: "consumer.checkpoint_hint".to_string(),
-            serial: 42,
-        };
-        assert_eq!(KdfStateToken::parse_display(&t.to_string()).unwrap(), t);
-    }
-
-    #[test]
-    fn parse_display_last_hash_splits_serial() {
-        let t = KdfStateToken::parse_display("a#b#3").unwrap();
-        assert_eq!(t.kdf_id, "a#b");
-        assert_eq!(t.serial, 3);
     }
 }
