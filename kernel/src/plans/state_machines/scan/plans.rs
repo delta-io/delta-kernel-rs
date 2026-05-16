@@ -113,6 +113,7 @@ pub fn build_fsr_plans(
             passthrough_columns: vec![ColumnName::new(["version"])],
             file_meta: default_scan_file_columns(),
             file_type: FileType::Json,
+            dv_ref: None,
         },
     );
 
@@ -188,6 +189,7 @@ pub fn build_fsr_plans(
                 passthrough_columns: vec![],
                 file_meta: default_scan_file_columns(),
                 file_type: FileType::Parquet,
+                dv_ref: None,
             },
         ))
     } else {

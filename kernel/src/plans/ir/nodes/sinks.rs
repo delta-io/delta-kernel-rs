@@ -291,6 +291,9 @@ pub struct LoadSpec {
     pub file_meta: ScanFileColumns,
     /// File format opened by the resulting [`LoadSink`].
     pub file_type: FileType,
+    /// Optional upstream deletion-vector policy. When `None`, IR does not
+    /// request DV-based masking in load.
+    pub dv_ref: Option<DvRef>,
 }
 
 impl LoadSpec {
@@ -356,7 +359,14 @@ impl LoadSpec {
             passthrough_columns,
             file_meta: default_scan_file_columns(),
             file_type: format,
+            dv_ref: None,
         }
+    }
+
+    /// Attach a deletion-vector reference to the resulting [`LoadSink`].
+    pub fn with_dv_ref(mut self, dv_ref: DvRef) -> Self {
+        self.dv_ref = Some(dv_ref);
+        self
     }
 
     /// Materialized output schema for this spec: the file schema fields

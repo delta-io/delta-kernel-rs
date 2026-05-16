@@ -131,7 +131,7 @@ pub(super) fn load_materialized_schema(
 
 /// Action schema augmented with the [`Add`] slot replaced by an augmented struct that
 /// carries optionally-parsed `stats_parsed` / `partitionValues_parsed` sub-fields. Used by
-/// [`super::scan_replay`] when a predicate forces data-skipping projection.
+/// [`super::file_scan`] when a predicate forces data-skipping projection.
 pub(super) fn action_schema_with_augmented_add(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,

@@ -530,7 +530,7 @@ impl WorkloadRunner for ReadDataPlansRunner {
             .build_replay()
             .map_err(|e| format!("build replay scan failed: {e}"))?;
         let replay_sm = replay_scan
-            .replay_scan_state_machine()
+            .scan_state_machine()
             .map_err(|e| format!("build replay scan SM failed: {e}"))?;
         let (_done, batches) = self
             .runtime
@@ -935,7 +935,7 @@ mod tests {
             .build_replay()
             .expect("build replay scan should succeed");
         let plans = replay_scan
-            .replay_scan_plans()
+            .scan_plans()
             .expect("replay scan plans should succeed");
         let plan = plans
             .into_iter()

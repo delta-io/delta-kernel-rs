@@ -1,9 +1,15 @@
-//! Scan replay state machines.
+//! Scan-time plan builders and state machines.
 //!
-//! Hosts the `impl Scan { ... }` block that builds replay plans from a
-//! [`Scan`] (the two-phase metadata + data flow), the supporting
-//! [`scan_metadata_plans_with_shape`] composer, and the partition-column
-//! projection helper used by both halves.
+//! Hosts the `impl Scan { ... }` block that builds the two-phase scan plans
+//! (metadata then data) and exposes them as coroutine state machines. The
+//! supporting [`scan_metadata_plans_with_shape`] composer and the
+//! partition-column projection helpers used by both halves live here too.
+//!
+//! Naming convention:
+//! - `*_plans` builders return the raw `Vec<Plan>` (plus any handle the downstream consumer needs);
+//!   they are `pub(super)` because the public surface is the SM wrappers.
+//! - `*_state_machine` returns a [`CoroutineSM`]; this is the canonical entry point external
+//!   engines drive.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,13 +26,16 @@ use crate::actions::{
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::delta_error;
-use crate::expressions::{BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate};
+use crate::expressions::{
+    col, BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate,
+};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
-use crate::plans::ir::{DeclarativePlanNode, Plan};
+use crate::plans::ir::{plan, Plan, PlanCollector};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
+use crate::plans::state_machines::framework::phase_state::PhaseState;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::scan::Scan;
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType, ToSchema};
@@ -42,39 +51,69 @@ fn replay_partition_columns(scan: &Scan) -> HashSet<String> {
         .collect()
 }
 
+/// Run a single SM phase, wrapping any phase-execution error as a
+/// [`DeltaError`] with a stable `{label}` site tag. Used by every SM body
+/// in this module so the call sites stay one-liners.
+async fn run_phase(
+    phase: &mut Phase<'_>,
+    op: PhaseOperation,
+    label: &'static str,
+) -> Result<PhaseState, DeltaError> {
+    phase.execute(op, label).await.map_err(|e| {
+        let detail = e.display_with_source_chain();
+        delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            source = e,
+            "scan::{label}: {detail}",
+        )
+    })
+}
+
 impl Scan {
-    /// Build replay plans for the metadata phase.
+    /// Build the metadata-phase plans plus the live-actions handle the
+    /// data-phase plan consumes.
     ///
-    /// Returns the metadata plans and the live-actions relation handle that must be fed
-    /// into [`Self::replay_scan_data_plans`].
-    pub fn scan_metadata_state_machine(&self) -> Result<(Vec<Plan>, RelationHandle), DeltaError> {
+    /// Internal helper used by both the metadata-only SM and the combined SM;
+    /// not exposed on the public surface.
+    pub(super) fn scan_metadata_plans(&self) -> Result<(Vec<Plan>, RelationHandle), DeltaError> {
         let checkpoint_shape = checkpoint_shape_from_last_checkpoint(self.snapshot().as_ref())?;
         scan_metadata_plans_with_shape(self, checkpoint_shape)
     }
 
-    /// Build replay plans for the data phase.
-    pub fn replay_scan_data_plans(
+    /// Build the data-phase plans given the live-actions relation handle
+    /// materialized by the metadata phase.
+    pub fn scan_data_from_metadata_plans(
         &self,
         live_actions_relation: RelationHandle,
     ) -> Result<Vec<Plan>, DeltaError> {
         let snapshot = self.snapshot();
         let partition_columns = replay_partition_columns(self);
         let file_schema = scan_data_file_schema(self.physical_schema(), self.logical_schema())?;
-        let data_rows_raw_relation = RelationHandle::fresh(
-            "scan.data_rows_raw",
-            load_materialized_schema(
-                &file_schema,
-                &scan_live_actions_schema(
-                    scan_partition_values_physical_schema(
-                        snapshot.as_ref(),
-                        self.logical_schema(),
-                    )?
+        let logical_schema = self.logical_schema().clone();
+        let logical_projection = scan_data_projection(
+            &logical_schema,
+            self.physical_schema(),
+            &partition_columns,
+            snapshot.table_configuration().column_mapping_mode(),
+        )?;
+        let materialized_schema = load_materialized_schema(
+            &file_schema,
+            &scan_live_actions_schema(
+                scan_partition_values_physical_schema(snapshot.as_ref(), self.logical_schema())?
                     .as_ref(),
-                ),
-                &[FILE_CONSTANT_VALUES_NAME, "path"],
-            )?,
-        );
-        let load = LoadSink {
+            ),
+            &[FILE_CONSTANT_VALUES_NAME, "path"],
+        )?;
+
+        // === data load: per-file parquet read keyed by the live-actions relation ===
+        // PlanCollector::add_load does not accept a dv_ref, so the LoadSink is built
+        // directly. The materialized schema is computed by load_materialized_schema
+        // (file_schema + named passthroughs) rather than the spec's resolver because
+        // the row-id projection augments file_schema beyond the load's physical read
+        // schema.
+        let data_rows_raw_relation =
+            RelationHandle::fresh("scan.data_rows_raw", materialized_schema);
+        let load_sink = LoadSink {
             output_relation: data_rows_raw_relation.clone(),
             file_schema: self.physical_schema().clone(),
             base_url: Some(snapshot.table_root().clone()),
@@ -90,124 +129,97 @@ impl Scan {
             ],
             file_type: FileType::Parquet,
         };
-        let f1 = DeclarativePlanNode::relation_ref(live_actions_relation).into_load(load);
-        let logical_schema = self.logical_schema().clone();
-        let logical_projection = scan_data_projection(
-            &logical_schema,
-            self.physical_schema(),
-            &partition_columns,
-            self.snapshot().table_configuration().column_mapping_mode(),
-        )?;
-        let f2 = DeclarativePlanNode::relation_ref(data_rows_raw_relation)
+        let load_plan = plan::relation_ref(&live_actions_relation).into_load(load_sink);
+
+        // === final projection: physical -> logical schema, terminating in Results ===
+        let results_plan = plan::relation_ref(&data_rows_raw_relation)
             .project(logical_projection, logical_schema.clone())
             .into_results_with_schema(logical_schema);
-        Ok(vec![f1, f2])
+
+        Ok(vec![load_plan, results_plan])
     }
 
-    /// Build replay plans for the full composed scan.
-    pub fn replay_scan_plans(&self) -> Result<Vec<Plan>, DeltaError> {
-        let (mut plans, live_actions_relation) = self.scan_metadata_state_machine()?;
-        plans.extend(self.replay_scan_data_plans(live_actions_relation)?);
+    /// Build the full composed scan plan vector: metadata phase followed by
+    /// data phase, sharing the live-actions relation handle.
+    pub fn scan_plans(&self) -> Result<Vec<Plan>, DeltaError> {
+        let (mut plans, live_actions_relation) = self.scan_metadata_plans()?;
+        plans.extend(self.scan_data_from_metadata_plans(live_actions_relation)?);
         Ok(plans)
     }
 
-    /// Build a coroutine SM for metadata-only replay scan execution.
+    /// Coroutine SM for metadata-only scan execution.
     ///
-    /// The SM resolves checkpoint shape hints the same way as
-    /// [`Self::replay_scan_state_machine`], executes metadata replay plans, and
-    /// returns the materialized live-actions relation handle.
-    pub fn replay_scan_metadata_state_machine(
-        &self,
-    ) -> Result<CoroutineSM<RelationHandle>, DeltaError> {
+    /// Resolves checkpoint shape (running schema-query phases when the
+    /// `_last_checkpoint` hint is missing), executes the metadata replay
+    /// plans, and returns the materialized live-actions relation handle so
+    /// the caller can feed it into [`Self::scan_data_from_metadata_state_machine`].
+    pub fn scan_metadata_state_machine(&self) -> Result<CoroutineSM<RelationHandle>, DeltaError> {
         let scan = self.clone();
         CoroutineSM::new(move |mut co| async move {
             let mut phase = Phase(&mut co);
             let shape = resolve_checkpoint_shape_for_scan(&mut phase, &scan).await?;
             let (metadata, live_actions_relation) = scan_metadata_plans_with_shape(&scan, shape)?;
-            let _metadata_state = phase
-                .execute(PhaseOperation::Plans(metadata), "scan.replay.metadata")
-                .await
-                .map_err(|e| {
-                    let detail = e.display_with_source_chain();
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        source = e,
-                        "scan::replay_scan_metadata_state_machine::metadata_phase: {detail}",
-                    )
-                })?;
+            run_phase(
+                &mut phase,
+                PhaseOperation::Plans(metadata),
+                "scan.replay.metadata",
+            )
+            .await?;
             Ok(live_actions_relation)
         })
     }
 
-    /// Build a coroutine SM for data-only replay scan execution.
+    /// Coroutine SM for data-only scan execution.
     ///
     /// The caller provides the live-actions relation produced by metadata
     /// replay. The SM executes only the data-phase plans.
-    pub fn replay_scan_data_state_machine(
+    pub fn scan_data_from_metadata_state_machine(
         &self,
         live_actions_relation: RelationHandle,
     ) -> Result<CoroutineSM<()>, DeltaError> {
         let scan = self.clone();
         CoroutineSM::new(move |mut co| async move {
             let mut phase = Phase(&mut co);
-            let data = scan.replay_scan_data_plans(live_actions_relation)?;
-            let _data_state = phase
-                .execute(PhaseOperation::Plans(data), "scan.replay.data")
-                .await
-                .map_err(|e| {
-                    let detail = e.display_with_source_chain();
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        source = e,
-                        "scan::replay_scan_data_state_machine::data_phase: {detail}",
-                    )
-                })?;
+            let data = scan.scan_data_from_metadata_plans(live_actions_relation)?;
+            run_phase(&mut phase, PhaseOperation::Plans(data), "scan.replay.data").await?;
             Ok(())
         })
     }
 
-    /// Build a coroutine SM for replay scan execution.
+    /// Coroutine SM for combined metadata + data scan execution.
     ///
-    /// This is the canonical replay path when checkpoint shape is ambiguous: if `_last_checkpoint`
-    /// does not provide schema hints, the SM runs a checkpoint-schema query first, and for V2
-    /// checkpoints with sidecars it runs sidecar discovery (`ConsumeByKdf`) followed by a sidecar
+    /// This is the canonical replay path when checkpoint shape is ambiguous:
+    /// if `_last_checkpoint` does not provide schema hints, the SM runs a
+    /// checkpoint-schema query first, and for V2 checkpoints with sidecars
+    /// it runs sidecar discovery (`ConsumeByKdf`) followed by a sidecar
     /// schema query before building metadata/data plans.
-    pub fn replay_scan_state_machine(&self) -> Result<CoroutineSM<()>, DeltaError> {
+    pub fn scan_state_machine(&self) -> Result<CoroutineSM<()>, DeltaError> {
         let scan = self.clone();
         CoroutineSM::new(move |mut co| async move {
             let mut phase = Phase(&mut co);
             let shape = resolve_checkpoint_shape_for_scan(&mut phase, &scan).await?;
-
             let (metadata, live_actions_relation) =
                 scan_metadata_plans_with_shape(&scan, shape.clone())?;
-            let _metadata_state = phase
-                .execute(PhaseOperation::Plans(metadata), "scan.replay.metadata")
-                .await
-                .map_err(|e| {
-                    let detail = e.display_with_source_chain();
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        source = e,
-                        "scan::replay_scan_state_machine::metadata_phase: {detail}",
-                    )
-                })?;
-            let data = scan.replay_scan_data_plans(live_actions_relation)?;
-            let _data_state = phase
-                .execute(PhaseOperation::Plans(data), "scan.replay.data")
-                .await
-                .map_err(|e| {
-                    let detail = e.display_with_source_chain();
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        source = e,
-                        "scan::replay_scan_state_machine::data_phase: {detail}",
-                    )
-                })?;
+            run_phase(
+                &mut phase,
+                PhaseOperation::Plans(metadata),
+                "scan.replay.metadata",
+            )
+            .await?;
+            let data = scan.scan_data_from_metadata_plans(live_actions_relation)?;
+            run_phase(&mut phase, PhaseOperation::Plans(data), "scan.replay.data").await?;
             Ok(())
         })
     }
 }
 
+/// Compose the metadata-phase plans for `scan` using the resolved checkpoint
+/// shape.
+///
+/// Builds on top of [`build_fsr_plans`] by rebinding the FSR-results plan to
+/// a fresh relation handle, layering on the actions-side projection /
+/// predicate / dedup chain, and finally materializing the `scan.live_actions`
+/// relation that the data phase consumes.
 fn scan_metadata_plans_with_shape(
     scan: &Scan,
     checkpoint_shape: CheckpointShape,
@@ -218,56 +230,75 @@ fn scan_metadata_plans_with_shape(
     let predicate_partition_schema = scan.physical_partition_schema();
     let partition_values_schema =
         scan_partition_values_physical_schema(snapshot.as_ref(), scan.logical_schema())?;
-    let live_actions_relation = RelationHandle::fresh(
-        "scan.live_actions",
-        scan_live_actions_schema(partition_values_schema.as_ref()),
-    );
-    let mut plans = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
-    let last = plans.pop().ok_or_else(|| {
+
+    // === FSR plans: build, rebind the terminal Results plan to a fresh relation ===
+    // build_fsr_plans returns a vector ending in a Results sink. Inside the scan SM the
+    // terminal output is the actions-projected live-actions relation, so pop the FSR
+    // results plan and rebind its root to a named handle the actions chain can reference.
+    // The handle's published schema is action_output_schema() (strict per-action ToSchema)
+    // because the downstream actions chain references nested fields by name; some FSR
+    // results branches emit action_read_schema() (all-nullable nested), so we pin the
+    // handle to the strict schema to keep the actions chain's input shape stable.
+    let mut p = PlanCollector::new();
+    let mut fsr_plans = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
+    let fsr_results_plan = fsr_plans.pop().ok_or_else(|| {
         delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
             "fsr::scan::scan_metadata: expected at least one plan from build_fsr_plans",
         )
     })?;
+    for prior in fsr_plans {
+        p.push_plan(prior);
+    }
     let fsr_results_relation = RelationHandle::fresh("scan.fsr_results", action_output_schema());
-    plans.push(last.root.into_relation(fsr_results_relation.clone()));
-    let mut metadata_root = DeclarativePlanNode::relation_ref(fsr_results_relation);
-    if let Some(predicate) = scan.build_actions_meta_predicate() {
-        let needs_augmented_projection =
-            predicate_stats_schema.is_some() || predicate_partition_schema.is_some();
-        if needs_augmented_projection {
-            metadata_root = metadata_root.project(
-                scan_actions_with_parsed_projection(
-                    predicate_stats_schema.as_ref(),
-                    predicate_partition_schema.as_ref(),
-                ),
-                action_schema_with_augmented_add(
-                    predicate_stats_schema.as_ref(),
-                    predicate_partition_schema.as_ref(),
-                ),
-            );
+    p.push_plan(
+        fsr_results_plan
+            .root
+            .into_relation(fsr_results_relation.clone()),
+    );
+
+    // === actions chain: filter live add paths, optionally augmenting with parsed stats /
+    // partitionValues columns when a data-skipping predicate is in play ===
+    let actions_root = plan::relation_ref(&fsr_results_relation);
+    let live_actions_node = match scan.build_actions_meta_predicate() {
+        Some(predicate) => {
+            let projected =
+                if predicate_stats_schema.is_some() || predicate_partition_schema.is_some() {
+                    actions_root.project(
+                        scan_actions_with_parsed_projection(
+                            predicate_stats_schema.as_ref(),
+                            predicate_partition_schema.as_ref(),
+                        ),
+                        action_schema_with_augmented_add(
+                            predicate_stats_schema.as_ref(),
+                            predicate_partition_schema.as_ref(),
+                        ),
+                    )
+                } else {
+                    actions_root
+                };
+            // Data-skipping predicates are best-effort: keep rows when the predicate evaluates to
+            // NULL (unknown) to avoid over-pruning files with partial stats coverage.
+            let add_path_present = Expression::Column(ADD_PATH.into_column_name()).is_not_null();
+            let pred = predicate.as_ref().clone();
+            let skip_or_unknown = Predicate::or(pred.clone(), Predicate::is_null(pred));
+            projected.filter(Arc::new(
+                Predicate::and(add_path_present, skip_or_unknown).into(),
+            ))
         }
-        let add_path_present = Expression::Column(ADD_PATH.into_column_name()).is_not_null();
-        // Data-skipping predicates are best-effort and must never introduce false negatives.
-        // Keep rows when the skipping predicate evaluates to NULL (unknown) to avoid over-pruning
-        // files with incomplete / partially-missing stats coverage.
-        let pred = predicate.as_ref().clone();
-        let skip_or_unknown = Predicate::or(pred.clone(), Predicate::is_null(pred));
-        let combined = Predicate::and(add_path_present, skip_or_unknown);
-        metadata_root = metadata_root.filter(Arc::new(combined.into()));
-    } else {
-        metadata_root = metadata_root.filter(Arc::new(
+        None => actions_root.filter(Arc::new(
             Expression::Column(ADD_PATH.into_column_name())
                 .is_not_null()
                 .into(),
-        ));
+        )),
     }
-    let live_actions = metadata_root.project(
+    .project(
         scan_live_actions_projection(!partition_columns.is_empty()),
         scan_live_actions_schema(partition_values_schema.as_ref()),
     );
-    plans.push(live_actions.into_relation(live_actions_relation.clone()));
-    Ok((plans, live_actions_relation))
+
+    let live_actions_relation = p.add_relation("scan.live_actions", live_actions_node);
+    Ok((p.into_vec(), live_actions_relation))
 }
 
 pub(super) fn scan_partition_values_schema(
@@ -340,22 +371,19 @@ pub(super) fn scan_live_actions_projection(
     with_partition_values_parsed: bool,
 ) -> Vec<Arc<Expression>> {
     let mut file_constant_exprs = vec![
-        Expression::column(["add", "partitionValues"]),
-        Expression::column(["add", "baseRowId"]),
-        Expression::column(["add", "defaultRowCommitVersion"]),
-        Expression::column(["add", "tags"]),
-        Expression::column(["add", "clusteringProvider"]),
+        col(["add", "partitionValues"]),
+        col(["add", "baseRowId"]),
+        col(["add", "defaultRowCommitVersion"]),
+        col(["add", "tags"]),
+        col(["add", "clusteringProvider"]),
     ];
     if with_partition_values_parsed {
-        file_constant_exprs.push(Expression::map_to_struct(Expression::column([
-            "add",
-            "partitionValues",
-        ])));
+        file_constant_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])));
     }
     vec![
-        Arc::new(Expression::column(["add", "path"])),
-        Arc::new(Expression::column(["add", "size"])),
-        Arc::new(Expression::column(["add", "deletionVector"])),
+        Arc::new(col(["add", "path"])),
+        Arc::new(col(["add", "size"])),
+        Arc::new(col(["add", "deletionVector"])),
         Arc::new(Expression::struct_from(file_constant_exprs)),
     ]
 }
@@ -365,37 +393,37 @@ pub(super) fn scan_actions_with_parsed_projection(
     partition_values_parsed_schema: Option<&SchemaRef>,
 ) -> Vec<Arc<Expression>> {
     let mut add_exprs = vec![
-        Arc::new(Expression::column(["add", "path"])),
-        Arc::new(Expression::column(["add", "partitionValues"])),
-        Arc::new(Expression::column(["add", "size"])),
-        Arc::new(Expression::column(["add", "modificationTime"])),
-        Arc::new(Expression::column(["add", "dataChange"])),
-        Arc::new(Expression::column(["add", "stats"])),
-        Arc::new(Expression::column(["add", "tags"])),
-        Arc::new(Expression::column(["add", "deletionVector"])),
-        Arc::new(Expression::column(["add", "baseRowId"])),
-        Arc::new(Expression::column(["add", "defaultRowCommitVersion"])),
-        Arc::new(Expression::column(["add", "clusteringProvider"])),
+        Arc::new(col(["add", "path"])),
+        Arc::new(col(["add", "partitionValues"])),
+        Arc::new(col(["add", "size"])),
+        Arc::new(col(["add", "modificationTime"])),
+        Arc::new(col(["add", "dataChange"])),
+        Arc::new(col(["add", "stats"])),
+        Arc::new(col(["add", "tags"])),
+        Arc::new(col(["add", "deletionVector"])),
+        Arc::new(col(["add", "baseRowId"])),
+        Arc::new(col(["add", "defaultRowCommitVersion"])),
+        Arc::new(col(["add", "clusteringProvider"])),
     ];
     if let Some(schema) = stats_parsed_schema {
         add_exprs.push(Arc::new(Expression::parse_json(
-            Expression::column(["add", "stats"]),
+            col(["add", "stats"]),
             schema.clone(),
         )));
     }
     if partition_values_parsed_schema.is_some() {
-        add_exprs.push(Arc::new(Expression::map_to_struct(Expression::column([
+        add_exprs.push(Arc::new(Expression::map_to_struct(col([
             "add",
             "partitionValues",
         ]))));
     }
     vec![
         Arc::new(Expression::struct_from(add_exprs)),
-        Arc::new(Expression::column([REMOVE_NAME])),
-        Arc::new(Expression::column([PROTOCOL_NAME])),
-        Arc::new(Expression::column([METADATA_NAME])),
-        Arc::new(Expression::column([DOMAIN_METADATA_NAME])),
-        Arc::new(Expression::column([SET_TRANSACTION_NAME])),
+        Arc::new(col([REMOVE_NAME])),
+        Arc::new(col([PROTOCOL_NAME])),
+        Arc::new(col([METADATA_NAME])),
+        Arc::new(col([DOMAIN_METADATA_NAME])),
+        Arc::new(col([SET_TRANSACTION_NAME])),
     ]
 }
 
@@ -435,17 +463,17 @@ pub(super) fn scan_data_projection(
         .fields()
         .map(|field| {
             let expr = match field.get_metadata_column_spec() {
-                Some(MetadataColumnSpec::RowIndex) => Expression::column([row_index_name.as_str()]),
+                Some(MetadataColumnSpec::RowIndex) => col([row_index_name.as_str()]),
                 Some(MetadataColumnSpec::RowCommitVersion) => {
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
+                    col([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
                 }
                 Some(MetadataColumnSpec::RowId) => Expression::binary(
                     BinaryExpressionOp::Plus,
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
-                    Expression::column([row_index_name.as_str()]),
+                    col([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
+                    col([row_index_name.as_str()]),
                 ),
-                Some(MetadataColumnSpec::FilePath) => Expression::column(["path"]),
-                None if partition_columns.contains(field.name()) => Expression::column([
+                Some(MetadataColumnSpec::FilePath) => col(["path"]),
+                None if partition_columns.contains(field.name()) => col([
                     FILE_CONSTANT_VALUES_NAME,
                     "partitionValues_parsed",
                     field.physical_name(column_mapping_mode),
@@ -458,7 +486,7 @@ pub(super) fn scan_data_projection(
                             field.name(),
                         )
                     })?;
-                    Expression::column([physical_field.name().as_str()])
+                    col([physical_field.name().as_str()])
                 }
             };
             Ok(Arc::new(expr))
@@ -473,8 +501,6 @@ mod tests {
     use super::*;
     use crate::expressions::Scalar;
     use crate::plans::ir::nodes::SinkType;
-    use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
-    use crate::plans::state_machines::framework::state_machine::{AdvanceResult, StateMachine};
     use crate::scan::ScanBuilder;
     use crate::snapshot::Snapshot;
     use crate::utils::test_utils::load_test_table;
@@ -522,20 +548,20 @@ mod tests {
         for cfg in replay_coverage_configs() {
             let (_engine, snapshot, _tmp) = load_test_table(cfg.table).unwrap();
             let scan = build_scan_for_config(Arc::clone(&snapshot), cfg).unwrap();
-            let (metadata, live_actions) = scan.scan_metadata_state_machine().unwrap();
+            let (metadata, live_actions) = scan.scan_metadata_plans().unwrap();
             assert!(
                 !metadata.is_empty(),
                 "metadata plans must be non-empty for {}",
                 cfg.table
             );
-            let data = scan.replay_scan_data_plans(live_actions).unwrap();
+            let data = scan.scan_data_from_metadata_plans(live_actions).unwrap();
             assert_eq!(
                 data.len(),
                 2,
                 "data phase should remain two plans for {}",
                 cfg.table
             );
-            let combined = scan.replay_scan_plans().unwrap();
+            let combined = scan.scan_plans().unwrap();
             assert_eq!(
                 combined.len(),
                 metadata.len() + data.len(),
@@ -543,89 +569,6 @@ mod tests {
                 cfg.table
             );
         }
-    }
-
-    #[test]
-    fn scan_replay_metadata_only_sm_returns_live_actions_handle() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-no-checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let mut sm = scan.replay_scan_metadata_state_machine().unwrap();
-        assert_eq!(sm.phase_name(), "scan.replay.metadata");
-        let op = sm.get_operation().unwrap();
-        assert!(matches!(op, PhaseOperation::Plans(_)));
-        let done = sm.advance(Ok(
-            crate::plans::state_machines::framework::phase_state::PhaseState::empty(),
-        ));
-        match done.unwrap() {
-            AdvanceResult::Done(handle) => assert_eq!(handle.name, "scan.live_actions"),
-            AdvanceResult::Continue => panic!("metadata-only scan SM should finish in one phase"),
-        }
-    }
-
-    #[test]
-    fn scan_replay_data_only_sm_runs_single_data_phase() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let (_, live_actions) = scan.scan_metadata_state_machine().unwrap();
-        let mut sm = scan.replay_scan_data_state_machine(live_actions).unwrap();
-        assert_eq!(sm.phase_name(), "scan.replay.data");
-        let op = sm.get_operation().unwrap();
-        match op {
-            PhaseOperation::Plans(plans) => assert_eq!(plans.len(), 2),
-            _ => panic!("expected data-only scan SM to yield plans"),
-        }
-        let done = sm.advance(Ok(
-            crate::plans::state_machines::framework::phase_state::PhaseState::empty(),
-        ));
-        assert!(matches!(done.unwrap(), AdvanceResult::Done(())));
-    }
-
-    #[test]
-    fn replay_scan_state_machine_queries_checkpoint_schema_when_hint_missing() {
-        let (_engine, snapshot, _tmp) =
-            load_test_table("with_checkpoint_no_last_checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let mut sm = scan.replay_scan_state_machine().unwrap();
-        let op = sm.get_operation().unwrap();
-        assert!(matches!(op, PhaseOperation::SchemaQuery(_)));
-    }
-
-    #[test]
-    fn scan_metadata_terminal_materializes_live_actions_relation() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let (metadata, _) = scan.scan_metadata_state_machine().unwrap();
-        let last = metadata.last().expect("scan metadata plans");
-        match &last.sink.sink_type {
-            SinkType::Relation(h) => assert_eq!(h.name, "scan.live_actions"),
-            other => panic!("expected terminal relation sink, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn scan_data_emits_load_then_results() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let (_, live_actions) = scan.scan_metadata_state_machine().unwrap();
-        let data = scan.replay_scan_data_plans(live_actions).unwrap();
-        assert_eq!(data.len(), 2);
-        assert!(matches!(data[0].sink.sink_type, SinkType::Load(_)));
-        assert!(matches!(data[1].sink.sink_type, SinkType::Results(_)));
     }
 
     #[test]
@@ -640,7 +583,7 @@ mod tests {
             .with_stats()
             .build_replay()
             .unwrap();
-        let (metadata, _) = scan.scan_metadata_state_machine().unwrap();
+        let (metadata, _) = scan.scan_metadata_plans().unwrap();
         let debug = format!("{metadata:#?}");
         assert!(
             debug.contains("ParseJson"),
@@ -652,26 +595,6 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    #[case::classic_checkpoint("app-txn-checkpoint", false)]
-    #[case::v2_checkpoint("v2-checkpoints-parquet-without-sidecars", true)]
-    #[case::multipart_checkpoint("v2-checkpoints-parquet-with-sidecars", true)]
-    fn scan_metadata_with_stats_terminates_in_relation_sink(
-        #[case] table: &str,
-        #[case] with_predicate: bool,
-    ) {
-        let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
-        let mut builder = ScanBuilder::new(Arc::clone(&snapshot)).with_stats();
-        if with_predicate {
-            builder = builder.with_predicate(Arc::new(Expression::column(["id"]).is_not_null()));
-        }
-        let scan = builder.build_replay().unwrap();
-        let (metadata, _) = scan.scan_metadata_state_machine().unwrap();
-        assert!(!metadata.is_empty());
-        let terminal = metadata.last().expect("metadata plans should be non-empty");
-        assert!(matches!(terminal.sink.sink_type, SinkType::Relation(_)));
-    }
-
     #[test]
     fn scan_data_load_uses_flat_live_actions_columns() {
         let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
@@ -679,8 +602,8 @@ mod tests {
             .with_stats()
             .build_replay()
             .unwrap();
-        let (_, live_actions) = scan.scan_metadata_state_machine().unwrap();
-        let data = scan.replay_scan_data_plans(live_actions).unwrap();
+        let (_, live_actions) = scan.scan_metadata_plans().unwrap();
+        let data = scan.scan_data_from_metadata_plans(live_actions).unwrap();
         let load = match &data[0].sink.sink_type {
             SinkType::Load(load) => load,
             other => panic!("expected load sink, got {other:?}"),

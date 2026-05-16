@@ -4,9 +4,9 @@
 
 mod action;
 mod checkpoint_shape;
+mod file_scan;
 pub mod full_state;
 mod plans;
-mod scan_replay;
 
 pub use checkpoint_shape::{
     checkpoint_shape_from_last_checkpoint, checkpoint_shape_from_schema, first_checkpoint_url,

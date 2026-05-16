@@ -118,11 +118,19 @@ impl PlanCollector {
             passthrough_columns: spec.passthrough_columns,
             file_meta: spec.file_meta,
             file_type: spec.file_type,
-            dv_ref: None,
+            dv_ref: spec.dv_ref,
         };
         let plan = spec.scan_node.into_load(sink);
         self.plans.push(plan);
         handle
+    }
+
+    /// Append a pre-built [`Plan`] verbatim. Useful when composing on top of
+    /// a plan vector that was built outside the collector (for example, plans
+    /// returned by [`build_fsr_plans`](crate::plans::state_machines::scan::build_fsr_plans))
+    /// so the collector can continue minting downstream handles.
+    pub fn push_plan(&mut self, plan: Plan) {
+        self.plans.push(plan);
     }
 
     /// Consume the collector and return the accumulated plans in submission

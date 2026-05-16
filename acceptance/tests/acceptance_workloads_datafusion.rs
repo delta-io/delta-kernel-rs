@@ -201,7 +201,7 @@ async fn execute_read_workload_datafusion(
         .map_err(|e| Error::generic(format!("build replay scan: {e}")))?;
     let batches = if config.split_phases {
         let metadata_sm = replay_scan
-            .replay_scan_metadata_state_machine()
+            .scan_metadata_state_machine()
             .map_err(|e| Error::generic(format!("build metadata-only replay scan SM: {e}")))?;
         let (live_actions, _) = executor
             .drive_coroutine_sm_collecting_results(metadata_sm)
@@ -213,7 +213,7 @@ async fn execute_read_workload_datafusion(
                 ))
             })?;
         let data_sm = replay_scan
-            .replay_scan_data_state_machine(live_actions)
+            .scan_data_from_metadata_state_machine(live_actions)
             .map_err(|e| Error::generic(format!("build data-only replay scan SM: {e}")))?;
         let (_done, batches) = executor
             .drive_coroutine_sm_collecting_results(data_sm)
@@ -227,7 +227,7 @@ async fn execute_read_workload_datafusion(
         batches
     } else {
         let replay_sm = replay_scan
-            .replay_scan_state_machine()
+            .scan_state_machine()
             .map_err(|e| Error::generic(format!("build replay scan SM: {e}")))?;
         let (_done, batches) = executor
             .drive_coroutine_sm_collecting_results(replay_sm)
