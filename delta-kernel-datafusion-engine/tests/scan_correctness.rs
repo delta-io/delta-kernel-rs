@@ -2,36 +2,26 @@
 //! per-file row indices, unordered scans with row-index columns, and scan predicates vs a direct
 //! parquet read + kernel filter reference.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::run_to_batches as scan_collect;
 use delta_kernel::arrow::array::{Array, AsArray, BooleanArray};
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::{column_expr, Expression, Predicate};
-use delta_kernel::plans::ir::nodes::RelationHandle;
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType as KernelDataType, StructType};
 use delta_kernel::{EvaluationHandler, FileMeta};
-use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::parquet::{file_meta, write_i64_parquet};
 use test_utils::schemas::single_long_schema;
-
-/// Run `scan` through the executor: terminate in a Relation sink, run the plan, and return
-/// the materialized batches.
-async fn scan_collect(scan: DeclarativePlanNode) -> Vec<RecordBatch> {
-    let schema = scan.output_schema();
-    let handle = RelationHandle::fresh("scan_out", schema);
-    let plan = scan.into_relation(handle.clone());
-    let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&[plan]).await.unwrap();
-    executor.collect_relation(&handle).await.unwrap()
-}
 
 fn read_parquet_batches(path: &Path) -> Vec<RecordBatch> {
     let file = File::open(path).unwrap();

@@ -1,25 +1,17 @@
 //! Integration tests for declarative `Window` (`row_number`) compilation and execution.
 
+mod common;
+
 use std::sync::Arc;
 
+use common::run_to_batches_with_blocking as run_to_batches;
 use delta_kernel::arrow::array::{AsArray, RecordBatch};
 use delta_kernel::arrow::datatypes::Int64Type;
 use delta_kernel::expressions::{ColumnName, Expression, Scalar};
-use delta_kernel::plans::ir::nodes::{OrderingSpec, RelationHandle, WindowFunction};
+use delta_kernel::plans::ir::nodes::{OrderingSpec, WindowFunction};
 use delta_kernel::plans::ir::DeclarativePlanNode;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
-
-/// Run `node` with a Relation sink on `exec` and return the materialized batches.
-fn run_to_batches(exec: &DataFusionExecutor, node: DeclarativePlanNode) -> Vec<RecordBatch> {
-    let schema: SchemaRef = node.output_schema();
-    let handle = RelationHandle::fresh("test_out", schema);
-    let plan = node.into_relation(handle.clone());
-    futures::executor::block_on(async {
-        exec.execute_plans(&[plan]).await.expect("execute");
-        exec.collect_relation(&handle).await.expect("collect")
-    })
-}
 
 fn rn_column(batch: &RecordBatch, name: &str) -> Vec<i64> {
     let schema = batch.schema();

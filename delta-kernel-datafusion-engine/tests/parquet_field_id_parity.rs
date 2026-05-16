@@ -5,10 +5,13 @@
 //! field ID first, then fall back to column name. Nested struct paths are **not** field-ID-resolved
 //! here.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 
+use common::run_to_batches_with as run_scan;
 use delta_kernel::arrow::array::{Int64Array, StringArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -60,19 +63,6 @@ fn flatten_i64_col(batches: &[RecordBatch], name: &str) -> Vec<i64> {
                 .copied()
         })
         .collect()
-}
-
-/// Drive `scan` through the executor: terminate in a Relation sink, run the plan, and return
-/// the materialized batches.
-async fn run_scan(
-    ex: &DataFusionExecutor,
-    scan: DeclarativePlanNode,
-) -> Vec<delta_kernel::arrow::array::RecordBatch> {
-    let schema = scan.output_schema();
-    let handle = delta_kernel::plans::ir::nodes::RelationHandle::fresh("scan_out", schema);
-    let plan = scan.into_relation(handle.clone());
-    ex.execute_plans(&[plan]).await.unwrap();
-    ex.collect_relation(&handle).await.unwrap()
 }
 
 #[tokio::test]
