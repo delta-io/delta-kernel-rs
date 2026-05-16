@@ -1209,6 +1209,24 @@ impl<S> Transaction<S> {
             &self.remove_files_metadata,
             bin_boundaries,
         )?;
+        let is_incremental_safe = self
+            .operation
+            .as_deref()
+            .is_some_and(FileStatsDelta::is_incremental_safe);
+        // PREFACTOR-PR: these Vec -> HashMap conversions exist because the caller chain
+        // (`generate_domain_metadata_actions`, `create_commit_metadata`) still deals in
+        // `Vec`. The pre-factor PR that switches `CrcDelta`'s fields to `HashMap` should
+        // also push the HashMap shape back up the chain so this conversion vanishes.
+        let domain_metadata = dm_changes
+            .into_iter()
+            .map(|dm| (dm.domain().to_string(), dm))
+            .collect();
+        let set_transactions = self
+            .set_transactions
+            .iter()
+            .cloned()
+            .map(|t| (t.app_id.clone(), t))
+            .collect();
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1217,11 +1235,14 @@ impl<S> Transaction<S> {
             metadata: self
                 .should_emit_metadata
                 .then(|| self.effective_table_config.metadata().clone()),
-            domain_metadata_changes: dm_changes,
-            set_transaction_changes: self.set_transactions.clone(),
+            domain_metadata,
+            set_transactions,
             in_commit_timestamp,
-            operation: self.operation.clone(),
-            has_missing_file_size: false, // writes always have sizes
+            // The "missing remove.size" cause of `is_incremental_safe = false` is not
+            // possible here: `try_compute_for_txn` above visits every add/remove with a
+            // `get` (not `get_opt`) on `size`, which errors on null. So whenever this
+            // line runs, the operation safety classification alone is sufficient.
+            is_incremental_safe,
         })
     }
 
