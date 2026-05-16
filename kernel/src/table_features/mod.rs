@@ -347,9 +347,16 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-/// TODO: When kernel writes the materialized `row_id` / `row_commit_version`
-/// columns, they must use the reserved parquet field IDs defined by the
-/// protocol on IcebergCompatV3 tables, not auto-assigned IDs.
+// TODO(#2538): Currently we reject `Transaction::commit` when it contains staged remove-file
+// actions on RowTracking-supported (and not-suspended) tables because
+//   1. kernel does not yet materialize stable row IDs / commit versions on write, which blocks COW
+//      rewrites,
+//   2. kernel does not yet validate if remove actions correctly reserved row IDs / commit versions.
+// Unblock after both 1 and 2 are supported.
+//
+// TODO: When kernel writes the materialized `row_id` / `row_commit_version` columns, they must
+// use the reserved parquet field IDs defined by the protocol on IcebergCompatV3 tables, not
+// auto-assigned IDs.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
