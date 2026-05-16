@@ -1,0 +1,292 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "legacy_1_2": {"minReaderVersion": 1, "minWriterVersion": 2},
+    "legacy_1_1": {"minReaderVersion": 1, "minWriterVersion": 1},
+    "modern_3_7_append_only": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["appendOnly"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    }
+  },
+  "$notes": {},
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "append_only_create_table_1_1_succeeds",
+      "flavor": "orphan",
+      "feature": "appendOnly",
+      "description": "Creating a (1,1) table with delta.appendOnly=true succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_1",
+        "metadata": {
+          "configuration": {"delta.appendOnly": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "append_only_create_table_1_2_true",
+      "flavor": "legacy",
+      "feature": "appendOnly",
+      "description": "Creating a (1,2) table with delta.appendOnly=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2",
+        "metadata": {
+          "configuration": {"delta.appendOnly": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "append_only_create_table_1_2_false",
+      "flavor": "legacy",
+      "feature": "appendOnly",
+      "description": "Creating a (1,2) table with delta.appendOnly=false succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2",
+        "metadata": {
+          "configuration": {"delta.appendOnly": "false"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "append_only_empty_commit_1_2_succeeds",
+      "flavor": "legacy",
+      "feature": "appendOnly",
+      "description": "Committing to a (1,2) table with delta.appendOnly=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_2"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "append_only_create_table_3_7_no_feature_listed_with_property_succeeds",
+      "flavor": "orphan",
+      "feature": "appendOnly",
+      "description": "Creating a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {
+          "configuration": {"delta.appendOnly": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "append_only_empty_commit_3_7_no_feature_listed_with_property_succeeds",
+      "flavor": "orphan",
+      "feature": "appendOnly",
+      "description": "Committing to a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "append_only_read_snapshot_3_7_no_feature_listed_with_property",
+      "flavor": "orphan",
+      "feature": "appendOnly",
+      "description": "Reading a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "append_only_create_table_3_7_feature_listed_succeeds",
+      "feature": "appendOnly",
+      "description": "Creating a (3,7)+[appendOnly] table with delta.appendOnly=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_append_only",
+        "metadata": {
+          "configuration": {"delta.appendOnly": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "append_only_supported_not_active_empty_commit_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "appendOnly",
+      "description": "Committing to a (3,7)+[appendOnly] table with no delta.appendOnly property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_append_only"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "append_only_supported_not_active_read_snapshot_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "appendOnly",
+      "description": "Reading a (3,7)+[appendOnly] table with no delta.appendOnly property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_append_only"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "append_only_supported_active_empty_commit_succeeds",
+      "feature": "appendOnly",
+      "description": "Committing to a (3,7)+[appendOnly] table with delta.appendOnly=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_append_only"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "append_only_supported_active_read_snapshot_succeeds",
+      "feature": "appendOnly",
+      "description": "Reading a (3,7)+[appendOnly] table with delta.appendOnly=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_append_only"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "append_only_read_snapshot_1_2_with_property_succeeds",
+      "flavor": "legacy",
+      "feature": "appendOnly",
+      "description": "Reading a (1,2) table with delta.appendOnly=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_2"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "append_only_supported_not_active_create_table_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "appendOnly",
+      "description": "Creating a (3,7)+[appendOnly] table with no delta.appendOnly property succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_append_only",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "append_only_empty_commit_1_1_succeeds",
+      "flavor": "orphan",
+      "feature": "appendOnly",
+      "description": "Committing to a (1,1) table with delta.appendOnly=true succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_1"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "modern_3_7_materialize_partition_columns": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["materializePartitionColumns"]
+    }
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "materialize_partition_columns_create_table_3_7_feature_listed_succeeds",
+      "feature": "materializePartitionColumns",
+      "description": "Creating a (3,7)+[materializePartitionColumns] table succeeds; the feature instructs writers to store partition column values in data files in addition to the partition metadata.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_materialize_partition_columns",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "materialize_partition_columns_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "materializePartitionColumns",
+      "description": "Reading a (3,7)+[materializePartitionColumns] table succeeds; materializePartitionColumns is writer-only and readers need not understand writer-only features.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_materialize_partition_columns"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    }
+  ]
+}
