@@ -66,16 +66,17 @@
 //! [`with_row_index`]: DeclarativePlanNode::with_row_index
 //! [`window`]: DeclarativePlanNode::window
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::nodes::*;
 use super::plan::Plan;
-use crate::expressions::{Expression, Scalar};
+use crate::expressions::{Expression, Predicate, Scalar};
 use crate::plans::kdf::typed::ExtractFn;
 use crate::plans::kdf::{downcast_all, ConsumerKdf, KdfOutput, KdfStateToken};
 use crate::plans::state_machines::framework::engine_error::EngineError;
 use crate::plans::state_machines::framework::phase_state::PhaseState;
-use crate::schema::SchemaRef;
+use crate::schema::{arc_schema, DataType, SchemaRef, StructField};
 use crate::{DeltaResult, Error, FileMeta};
 
 /// A single node in the declarative plan tree.
@@ -364,6 +365,98 @@ impl DeclarativePlanNode {
         )
     }
 
+    /// Append a computed column to the row stream.
+    ///
+    /// Existing columns flow through unchanged; `expr` is appended as the new
+    /// rightmost field. Materializes as a [`Project`](Self::Project) listing
+    /// every prior column as a column reference plus `expr`. Use
+    /// [`Self::output_schema`] to inspect the resulting schema.
+    pub fn add_column<E: Into<Arc<Expression>>>(self, field: StructField, expr: E) -> Self {
+        let expr = expr.into();
+        let schema = self.output_schema();
+        let mut projection: Vec<Arc<Expression>> = schema
+            .fields()
+            .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+            .collect();
+        projection.push(expr);
+        let new_schema = schema.build_on().with_field(field).build_unchecked();
+        self.project(projection, new_schema)
+    }
+
+    /// Drop a single column. No-op when the name is absent from the current
+    /// schema (the chain is returned unchanged with no [`Project`](Self::Project)
+    /// emitted).
+    pub fn drop_column(self, name: &str) -> Self {
+        self.drop_columns([name])
+    }
+
+    /// Drop multiple columns in one step.
+    ///
+    /// Names absent from the current schema are silently skipped. If every
+    /// requested name is absent the chain is returned unchanged.
+    pub fn drop_columns<I, S>(self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let dropped: HashSet<String> = names.into_iter().map(|s| s.as_ref().to_string()).collect();
+        let schema = self.output_schema();
+        let kept_fields: Vec<StructField> = schema
+            .fields()
+            .filter(|f| !dropped.contains(f.name().as_str()))
+            .cloned()
+            .collect();
+        if kept_fields.len() == schema.fields().count() {
+            return self;
+        }
+        let projection: Vec<Arc<Expression>> = kept_fields
+            .iter()
+            .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+            .collect();
+        let new_schema = arc_schema(kept_fields);
+        self.project(projection, new_schema)
+    }
+
+    /// Keep only the newest row per `partition_by` group, ranked by `order_by`.
+    ///
+    /// Internally appends `row_number()` over the window, filters `rn <= 1`,
+    /// then projects back to the original schema so the synthetic row-number
+    /// column is invisible to the caller.
+    ///
+    /// Returns `Err` when `order_by` is empty (deterministic row_number
+    /// requires explicit ordering) or when the reserved internal column name
+    /// already exists on the current schema.
+    pub fn window_dedup_by<P, O>(
+        self,
+        partition_by: impl IntoIterator<Item = P>,
+        order_by: impl IntoIterator<Item = O>,
+    ) -> DeltaResult<Self>
+    where
+        P: Into<Arc<Expression>>,
+        O: Into<OrderingSpec>,
+    {
+        const RN_COL: &str = "__kernel_dedup_rn";
+        let schema = self.output_schema();
+        if schema.contains(RN_COL) {
+            return Err(Error::generic(format!(
+                "window_dedup_by: schema already contains reserved column `{RN_COL}`",
+            )));
+        }
+        let partitions: Vec<Arc<Expression>> = partition_by.into_iter().map(Into::into).collect();
+        let orderings: Vec<OrderingSpec> = order_by.into_iter().map(Into::into).collect();
+
+        let windowed = self.window_row_number(RN_COL, partitions, orderings)?;
+        let rn_le_one: Predicate = Expression::column([RN_COL]).le(Expression::literal(1i64));
+        let filtered = windowed.filter(Arc::new(Expression::from_pred(rn_le_one)));
+
+        // Restore the original schema by selecting each prior column by name.
+        let projection: Vec<Arc<Expression>> = schema
+            .fields()
+            .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+            .collect();
+        Ok(filtered.project(projection, schema))
+    }
+
     /// Typed KDF consumer terminal. Wraps `self` in a [`Plan`] terminating in
     /// [`SinkType::ConsumeByKdf`] and returns the plan paired with an
     /// [`Extractor<O>`] that pulls the typed output from the resulting
@@ -525,6 +618,79 @@ impl DeclarativePlanNode {
             Self::Scan(..) | Self::FileListing(..) | Self::Values(..) | Self::RelationRef(..)
         )
     }
+
+    /// Schema of the row stream this subtree produces.
+    ///
+    /// Walks the tree, deriving each node's output from its children plus the
+    /// node-local schema metadata (project's output schema, window's appended
+    /// row-number columns, etc.). Schemas are returned via
+    /// [`crate::schema::arc_schema`] / [`crate::schema::SchemaBuilder::build_unchecked`]
+    /// because every shape encountered here was already validated by the
+    /// constructor that produced the node — there are no duplicate-name paths
+    /// to surface.
+    ///
+    /// For `Union`, the canonical schema is the first child's (matching
+    /// [`UnionNode`] semantics); a zero-child union yields the empty struct.
+    /// For `Join::LeftAnti`, the output mirrors the probe child; for
+    /// `Join::Inner` it concatenates build then probe.
+    pub fn output_schema(&self) -> SchemaRef {
+        match self {
+            Self::Scan(scan) => scan_output_schema(scan),
+            Self::FileListing(_) => file_listing_output_schema(),
+            Self::Values(v) => v.schema.clone(),
+            Self::RelationRef(handle) => handle.schema.clone(),
+            Self::Filter { child, .. } => child.output_schema(),
+            Self::Project { node, .. } => node.output_schema.clone(),
+            Self::Window { child, node } => {
+                let mut fields: Vec<StructField> =
+                    child.output_schema().fields().cloned().collect();
+                for func in &node.functions {
+                    fields.push(StructField::not_null(
+                        func.output_col.clone(),
+                        DataType::LONG,
+                    ));
+                }
+                arc_schema(fields)
+            }
+            Self::Union { children, .. } => match children.first() {
+                Some(first) => first.output_schema(),
+                None => arc_schema(Vec::<StructField>::new()),
+            },
+            Self::Join {
+                build, probe, node, ..
+            } => match node.join_type {
+                JoinType::LeftAnti => probe.output_schema(),
+                JoinType::Inner => {
+                    let mut fields: Vec<StructField> =
+                        build.output_schema().fields().cloned().collect();
+                    fields.extend(probe.output_schema().fields().cloned());
+                    arc_schema(fields)
+                }
+            },
+        }
+    }
+}
+
+/// Output schema for a [`ScanNode`], including any synthetic row-index column.
+///
+/// `ScanNode::effective_output_schema` only fails when the configured row-index
+/// column name collides with an existing field; that collision is the IR
+/// node's responsibility to reject at construction. When it does slip through,
+/// fall back on the bare scan schema so callers get a usable answer.
+fn scan_output_schema(scan: &ScanNode) -> SchemaRef {
+    scan.effective_output_schema()
+        .unwrap_or_else(|_| scan.schema.clone())
+}
+
+/// Canonical schema for [`DeclarativePlanNode::FileListing`]: one row per object
+/// with `path`, `size`, and `modification_time` columns. Mirrors the columns
+/// engines emit when they materialize a directory listing.
+fn file_listing_output_schema() -> SchemaRef {
+    arc_schema([
+        StructField::not_null("path", DataType::STRING),
+        StructField::not_null("size", DataType::LONG),
+        StructField::not_null("modification_time", DataType::LONG),
+    ])
 }
 
 /// Static label for a node variant; used in error messages and diagnostics.
