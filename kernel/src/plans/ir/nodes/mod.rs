@@ -373,5 +373,6 @@ impl WindowNode {
 mod sinks;
 
 pub use sinks::{
-    ConsumeByKdfSink, DvRef, LoadSink, RelationHandle, ScanFileColumns, SinkNode, SinkType,
+    ConsumeByKdfSink, DvRef, LoadSink, LoadSpec, RelationHandle, ScanFileColumns, SinkNode,
+    SinkType,
 };

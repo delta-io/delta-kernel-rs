@@ -16,7 +16,7 @@
 //!    than `DeclarativePlanNode::relation_ref(h.clone()).filter(...).into_results()`.
 
 use super::declarative::DeclarativePlanNode;
-use super::nodes::{FileFormat, RelationHandle, SinkNode};
+use super::nodes::{FileFormat, LoadSink, LoadSpec, RelationHandle, SinkNode, SinkType};
 use crate::expressions::Scalar;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileMeta};
@@ -67,4 +67,141 @@ pub fn values_row(schema: SchemaRef, values: Vec<Scalar>) -> DeltaResult<Declara
 /// reuse the same `&RelationHandle` across multiple plans without writing `.clone()`.
 pub fn relation_ref(handle: &RelationHandle) -> DeclarativePlanNode {
     DeclarativePlanNode::relation_ref(handle.clone())
+}
+
+// ============================================================================
+// PlanCollector
+// ============================================================================
+
+/// Accumulator that turns a sequence of declarative chains and load specs into
+/// a `Vec<Plan>` suitable for a single `PhaseOperation::Plans(...)`.
+///
+/// Each `add_*` method mints a fresh [`RelationHandle`] from the chain's
+/// output schema, binds the chain's sink to that handle, pushes the resulting
+/// plan onto the internal vector, and returns the handle for downstream
+/// consumers to reference.
+#[derive(Default)]
+pub struct PlanCollector {
+    plans: Vec<Plan>,
+}
+
+impl PlanCollector {
+    /// Empty collector. Equivalent to `PlanCollector::default()`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint a fresh handle from `node.output_schema()`, terminate the chain in
+    /// a [`SinkType::Relation`] sink keyed by that handle, and return the
+    /// handle.
+    pub fn add_relation(&mut self, name: &str, node: DeclarativePlanNode) -> RelationHandle {
+        let handle = RelationHandle::fresh(name, node.output_schema());
+        let plan = node.into_plan(SinkType::Relation(handle.clone()));
+        self.plans.push(plan);
+        handle
+    }
+
+    /// Mint a fresh handle whose schema is `spec.file_schema ++ resolved passthrough fields`,
+    /// terminate `spec.scan_node` in the corresponding [`LoadSink`], push the resulting
+    /// plan, and return the handle.
+    ///
+    /// Passthrough column types are resolved against the scan's published
+    /// schema when possible. Names absent from the scan's schema fall back to
+    /// nullable STRING in the materialized relation.
+    pub fn add_load(&mut self, name: &str, spec: LoadSpec) -> RelationHandle {
+        let output_schema = spec.compute_output_schema();
+        let handle = RelationHandle::fresh(name, output_schema);
+        let sink = LoadSink {
+            output_relation: handle.clone(),
+            file_schema: spec.file_schema,
+            base_url: Some(spec.base_url),
+            passthrough_columns: spec.passthrough_columns,
+            file_meta: spec.file_meta,
+            file_type: spec.file_type,
+            dv_ref: None,
+        };
+        let plan = spec.scan_node.into_load(sink);
+        self.plans.push(plan);
+        handle
+    }
+
+    /// Consume the collector and return the accumulated plans in submission
+    /// order.
+    pub fn into_vec(self) -> Vec<Plan> {
+        self.plans
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plans::ir::nodes::{FileType, SinkType};
+    use crate::schema::{arc_schema, DataType, StructField};
+
+    fn ints_schema() -> SchemaRef {
+        arc_schema([
+            StructField::not_null("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+        ])
+    }
+
+    fn fresh_handle(name: &str) -> RelationHandle {
+        RelationHandle::fresh(name, ints_schema())
+    }
+
+    #[test]
+    fn plan_collector_mints_handle_from_chain_output_schema() {
+        let h = fresh_handle("src");
+        let mut p = PlanCollector::new();
+        let added = p.add_relation("derived", relation_ref(&h).drop_column("name"));
+        assert_eq!(added.name, "derived");
+        assert_eq!(added.schema.fields().count(), 1);
+        let plans = p.into_vec();
+        assert_eq!(plans.len(), 1);
+        match &plans[0].sink.sink_type {
+            SinkType::Relation(got) => assert_eq!(got, &added),
+            other => panic!("expected Relation sink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_publishes_scan_schema() {
+        let read_schema = arc_schema([StructField::not_null("v", DataType::LONG)]);
+        let mut p = PlanCollector::new();
+        let h = p.add_relation(
+            "scanned",
+            DeclarativePlanNode::scan(FileType::Json, vec![], read_schema.clone()),
+        );
+        assert_eq!(h.schema, read_schema);
+        let plans = p.into_vec();
+        assert!(matches!(plans[0].root, DeclarativePlanNode::Scan(_)));
+    }
+
+    #[test]
+    fn add_load_emits_load_sink_against_minted_handle() {
+        use url::Url;
+        let scan_schema = arc_schema([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+        ]);
+        let file_schema = arc_schema([StructField::nullable("payload", DataType::STRING)]);
+        let base = Url::parse("memory:///log/").unwrap();
+        let mut p = PlanCollector::new();
+        let h = p.add_load(
+            "raw",
+            LoadSpec::json(vec![], scan_schema, file_schema.clone(), base, &[]),
+        );
+        let plans = p.into_vec();
+        match &plans[0].sink.sink_type {
+            SinkType::Load(ls) => {
+                assert_eq!(ls.output_relation, h);
+                assert_eq!(ls.file_schema, file_schema);
+            }
+            other => panic!("expected Load sink, got {other:?}"),
+        }
+    }
 }

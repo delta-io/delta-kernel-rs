@@ -1,9 +1,17 @@
 //! Sink IR types — relation piping, [`ConsumeByKdf`], and file-reader [`LoadSink`].
+//!
+//! Also hosts [`LoadSpec`], a plain-data builder for [`LoadSink`] minus the
+//! output-relation handle (the handle is minted by
+//! [`PlanCollector::add_load`](crate::plans::ir::plan::PlanCollector::add_load)).
 
-use super::{FileType, OrderingSpec};
+use url::Url;
+
+use super::{FileFormat, FileType, OrderingSpec};
 use crate::expressions::ColumnName;
+use crate::plans::ir::declarative::DeclarativePlanNode;
 use crate::plans::kdf::{ConsumerKdf, Handle, KdfStateToken, TraceContext};
-use crate::schema::SchemaRef;
+use crate::schema::{arc_schema, DataType, SchemaRef, StructField};
+use crate::FileMeta;
 
 /// Template for draining a row stream into a [`ConsumerKdf`] via
 /// [`SinkType::ConsumeByKdf`]. KDF lives exclusively under sinks in the IR.
@@ -255,4 +263,153 @@ pub enum SinkType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkNode {
     pub sink_type: SinkType,
+}
+
+// ============================================================================
+// LoadSpec — builder for LoadSink (output relation minted by PlanCollector)
+// ============================================================================
+
+/// Plain data describing a per-file [`LoadSink`] except for the output relation
+/// (minted by [`PlanCollector::add_load`](crate::plans::ir::plan::PlanCollector::add_load)).
+///
+/// Holds the upstream scan node plus the file-level read schema, base URL, and
+/// passthrough columns that the materialized Load will broadcast onto every
+/// emitted row. The file-meta column hints default to the FSR convention
+/// (`path: "path"`, `size: Some("size")`, `record_count: None`); callers that
+/// need other hints can build a [`LoadSink`] directly and use
+/// [`DeclarativePlanNode::into_load`].
+pub struct LoadSpec {
+    /// Upstream scan node producing one row per file to open.
+    pub scan_node: DeclarativePlanNode,
+    /// Per-file output schema read from each opened file.
+    pub file_schema: SchemaRef,
+    /// URL prefix joined with each per-row path on the scan.
+    pub base_url: Url,
+    /// Columns from the upstream relation broadcast alongside each file row.
+    pub passthrough_columns: Vec<ColumnName>,
+    /// Column-name hints used to read per-row file metadata from upstream.
+    pub file_meta: ScanFileColumns,
+    /// File format opened by the resulting [`LoadSink`].
+    pub file_type: FileType,
+}
+
+impl LoadSpec {
+    /// Build a [`LoadSpec`] for JSON files.
+    ///
+    /// `passthrough` lists top-level column names on `scan_schema` to broadcast
+    /// onto each emitted row. Names that resolve against `scan_schema` keep their
+    /// original type and nullability on the materialized relation; names that do
+    /// not resolve fall back to nullable STRING.
+    pub fn json(
+        files: Vec<FileMeta>,
+        scan_schema: SchemaRef,
+        file_schema: SchemaRef,
+        base_url: Url,
+        passthrough: &[&str],
+    ) -> Self {
+        Self::for_format(
+            FileType::Json,
+            files,
+            scan_schema,
+            file_schema,
+            base_url,
+            passthrough,
+        )
+    }
+
+    /// Build a [`LoadSpec`] for Parquet files. See [`LoadSpec::json`] for
+    /// `passthrough` semantics.
+    pub fn parquet(
+        files: Vec<FileMeta>,
+        scan_schema: SchemaRef,
+        file_schema: SchemaRef,
+        base_url: Url,
+        passthrough: &[&str],
+    ) -> Self {
+        Self::for_format(
+            FileType::Parquet,
+            files,
+            scan_schema,
+            file_schema,
+            base_url,
+            passthrough,
+        )
+    }
+
+    /// Format-parametric [`LoadSpec`] constructor. Used by call sites that pick
+    /// the file format at runtime (for example FSR checkpoint shape selection).
+    pub fn for_format(
+        format: FileFormat,
+        files: Vec<FileMeta>,
+        scan_schema: SchemaRef,
+        file_schema: SchemaRef,
+        base_url: Url,
+        passthrough: &[&str],
+    ) -> Self {
+        let passthrough_columns: Vec<ColumnName> =
+            passthrough.iter().map(|s| ColumnName::new([*s])).collect();
+        let scan_node = DeclarativePlanNode::scan(format, files, scan_schema);
+        Self {
+            scan_node,
+            file_schema,
+            base_url,
+            passthrough_columns,
+            file_meta: default_scan_file_columns(),
+            file_type: format,
+        }
+    }
+
+    /// Materialized output schema for this spec: the file schema fields
+    /// followed by passthrough fields resolved against the scan's published
+    /// schema. Passthrough names that don't resolve fall back to nullable
+    /// STRING so the relation still publishes a usable shape.
+    pub(crate) fn compute_output_schema(&self) -> SchemaRef {
+        let scan_schema = self.scan_node.output_schema();
+        let mut fields: Vec<StructField> = self.file_schema.fields().cloned().collect();
+        for col in &self.passthrough_columns {
+            let leaf_name = col.path().first().cloned().unwrap_or_default();
+            let field = scan_schema
+                .field(leaf_name.as_str())
+                .cloned()
+                .unwrap_or_else(|| StructField::nullable(leaf_name, DataType::STRING));
+            fields.push(field);
+        }
+        arc_schema(fields)
+    }
+}
+
+/// Default file-meta column hints used by [`LoadSpec::for_format`] /
+/// [`LoadSpec::json`] / [`LoadSpec::parquet`]. Matches the convention used
+/// across FSR plan builders.
+fn default_scan_file_columns() -> ScanFileColumns {
+    ScanFileColumns {
+        path: ColumnName::new(["path"]),
+        size: Some(ColumnName::new(["size"])),
+        record_count: None,
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{arc_schema, DataType, StructField};
+
+    #[test]
+    fn load_passthrough_widens_relation_schema() {
+        let scan_schema = arc_schema([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("version", DataType::LONG),
+        ]);
+        let file_schema = arc_schema([StructField::nullable("payload", DataType::STRING)]);
+        let base = Url::parse("memory:///log/").unwrap();
+        let spec = LoadSpec::json(vec![], scan_schema, file_schema, base, &["version"]);
+        let output_schema = spec.compute_output_schema();
+        let names: Vec<String> = output_schema.fields().map(|f| f.name().clone()).collect();
+        assert_eq!(names, vec!["payload", "version"]);
+    }
 }

@@ -671,6 +671,19 @@ impl DeclarativePlanNode {
     }
 }
 
+// ============================================================================
+// Free-function entry points
+// ============================================================================
+
+/// Start a chain from an upstream relation handle.
+///
+/// Clones the handle internally so the same `&RelationHandle` can feed multiple
+/// plans without manual `.clone()` calls. The returned node's output schema
+/// matches the relation's published schema.
+pub fn relation_ref(handle: &RelationHandle) -> DeclarativePlanNode {
+    DeclarativePlanNode::relation_ref(handle.clone())
+}
+
 /// Output schema for a [`ScanNode`], including any synthetic row-index column.
 ///
 /// `ScanNode::effective_output_schema` only fails when the configured row-index
@@ -1025,5 +1038,121 @@ mod tests {
         assert_eq!(node.token.kdf_id, "consumer.noop");
         let s = node.token.to_string();
         assert!(s.starts_with("consumer.noop#"), "got: {s}");
+    }
+
+    // === Chain-method tests (free `relation_ref` + transforms on DeclarativePlanNode) ===
+
+    fn ints_schema() -> SchemaRef {
+        arc_schema([
+            StructField::not_null("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+        ])
+    }
+
+    fn fresh_handle(name: &str) -> RelationHandle {
+        RelationHandle::fresh(name, ints_schema())
+    }
+
+    #[test]
+    fn relation_ref_initial_schema_matches_handle() {
+        let h = fresh_handle("src");
+        let node = relation_ref(&h);
+        assert_eq!(node.output_schema(), h.schema);
+    }
+
+    #[test]
+    fn add_column_appends_field_and_projects() {
+        use crate::expressions::col;
+        let h = fresh_handle("src");
+        let node =
+            relation_ref(&h).add_column(StructField::nullable("k", DataType::STRING), col("name"));
+        let schema = node.output_schema();
+        let names: Vec<String> = schema.fields().map(|f| f.name().clone()).collect();
+        assert_eq!(names, vec!["id", "name", "k"]);
+        match node {
+            DeclarativePlanNode::Project { node, .. } => {
+                assert_eq!(node.columns.len(), 3);
+                assert_eq!(node.output_schema.fields().count(), 3);
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_removes_field_and_skips_missing() {
+        let h = fresh_handle("src");
+        let dropped = relation_ref(&h).drop_column("name");
+        let schema = dropped.output_schema();
+        let names: Vec<String> = schema.fields().map(|f| f.name().clone()).collect();
+        assert_eq!(names, vec!["id"]);
+
+        // Dropping an absent column is a no-op (no Project emitted).
+        let unchanged = relation_ref(&h).drop_column("nope");
+        assert_eq!(unchanged.output_schema().fields().count(), 2);
+        assert!(matches!(unchanged, DeclarativePlanNode::RelationRef(_)));
+    }
+
+    #[test]
+    fn drop_columns_removes_multiple_fields() {
+        let h = fresh_handle("src");
+        let node = relation_ref(&h).drop_columns(["id", "name"]);
+        assert_eq!(node.output_schema().fields().count(), 0);
+    }
+
+    #[test]
+    fn filter_accepts_bare_predicate_and_wraps_in_filter_node() {
+        use crate::expressions::col;
+        let h = fresh_handle("src");
+        let pred = col("id").is_not_null();
+        let expr = Arc::new(Expression::from_pred(pred));
+        let node = relation_ref(&h).filter(expr);
+        match node {
+            DeclarativePlanNode::Filter { .. } => {}
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_dedup_by_appends_window_filter_project_and_preserves_schema() {
+        use crate::expressions::col;
+        let h = fresh_handle("src");
+        let node = relation_ref(&h)
+            .window_dedup_by([col("id")], [OrderingSpec::desc(ColumnName::new(["id"]))])
+            .unwrap();
+        assert_eq!(node.output_schema(), h.schema);
+        let DeclarativePlanNode::Project { child, node } = node else {
+            panic!("expected Project at top of window_dedup_by");
+        };
+        assert_eq!(node.output_schema.fields().count(), 2);
+        assert!(matches!(child.as_ref(), DeclarativePlanNode::Filter { .. }));
+    }
+
+    #[test]
+    fn window_dedup_by_errors_on_empty_order_by() {
+        let h = fresh_handle("src");
+        let err = relation_ref(&h)
+            .window_dedup_by(Vec::<Arc<Expression>>::new(), Vec::<OrderingSpec>::new())
+            .unwrap_err();
+        assert!(format!("{err}").contains("non-empty order_by"));
+    }
+
+    #[test]
+    fn chained_pipeline_records_each_step_as_separate_ir_node() {
+        use crate::expressions::col;
+        let h = fresh_handle("src");
+        let pipeline = relation_ref(&h)
+            .add_column(StructField::nullable("k", DataType::STRING), col("name"))
+            .filter(Arc::new(Expression::from_pred(col("k").is_not_null())))
+            .drop_column("k");
+        let schema = pipeline.output_schema();
+        let names: Vec<String> = schema.fields().map(|f| f.name().clone()).collect();
+        assert_eq!(names, vec!["id", "name"]);
+        let DeclarativePlanNode::Project { child, .. } = pipeline else {
+            panic!("outermost should be Project from drop_column");
+        };
+        let DeclarativePlanNode::Filter { child, .. } = *child else {
+            panic!("middle should be Filter");
+        };
+        assert!(matches!(*child, DeclarativePlanNode::Project { .. }));
     }
 }
