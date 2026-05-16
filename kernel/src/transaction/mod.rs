@@ -1487,7 +1487,6 @@ pub struct RetryableTransaction<S = ExistingTable> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use rstest::rstest;
@@ -1513,8 +1512,9 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
-        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
-        test_schema_with_array, test_schema_with_map,
+        load_test_table, string_array_to_engine_data, sync_engine_and_snapshot,
+        sync_engine_and_snapshot_at, test_schema_flat, test_schema_nested, test_schema_with_array,
+        test_schema_with_map,
     };
     use crate::{EvaluationHandler, Snapshot};
 
@@ -1578,24 +1578,11 @@ mod tests {
 
     /// Sets up a snapshot for a table with deletion vector support at version 1
     fn setup_dv_enabled_table() -> (SyncEngine, Arc<Snapshot>) {
-        let engine = SyncEngine::new();
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url)
-            .at_version(1)
-            .build(&engine)
-            .unwrap();
-        (engine, snapshot)
+        sync_engine_and_snapshot_at("./tests/data/table-with-dv-small/", Some(1))
     }
 
     fn setup_non_dv_table() -> (SyncEngine, Arc<Snapshot>) {
-        let engine = SyncEngine::new();
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        (engine, snapshot)
+        sync_engine_and_snapshot("./tests/data/table-without-dv-small/")
     }
 
     /// Creates a test deletion vector descriptor with default values (the DV might not exist on
@@ -1626,14 +1613,8 @@ mod tests {
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
     #[test]
     fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url)
-            .at_version(1)
-            .build(&engine)
-            .unwrap();
+        let (engine, snapshot) =
+            sync_engine_and_snapshot_at("./tests/data/table-with-dv-small/", Some(1));
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
@@ -1664,14 +1645,9 @@ mod tests {
 
     #[test]
     fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url.clone())
-            .at_version(1)
-            .build(&engine)
-            .unwrap();
+        let (engine, snapshot) =
+            sync_engine_and_snapshot_at("./tests/data/table-with-dv-small/", Some(1));
+        let url_str = snapshot.table_root().as_str().to_string();
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
@@ -1680,13 +1656,13 @@ mod tests {
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
         let abs_path1 = dv_path1.absolute_path()?;
-        assert!(abs_path1.as_str().contains(url.as_str()));
+        assert!(abs_path1.as_str().contains(&url_str));
 
         // Test with non-empty prefix
         let prefix = String::from("dv_test");
         let dv_path2 = write_context.new_deletion_vector_path(prefix.clone());
         let abs_path2 = dv_path2.absolute_path()?;
-        assert!(abs_path2.as_str().contains(url.as_str()));
+        assert!(abs_path2.as_str().contains(&url_str));
         assert!(abs_path2.as_str().contains(&prefix));
 
         // Test that two paths with same prefix are different (unique UUIDs)
@@ -1699,10 +1675,7 @@ mod tests {
 
     #[test]
     fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let (engine, snapshot) = sync_engine_and_snapshot("./tests/data/basic_partitioned/");
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
@@ -1747,10 +1720,7 @@ mod tests {
     fn snapshot_and_partitioned_write_context(
         table_path: &str,
     ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let (engine, snapshot) = sync_engine_and_snapshot(table_path);
         let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
@@ -1842,13 +1812,10 @@ mod tests {
     #[test]
     fn test_physical_schema_includes_partition_columns_when_materialized(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from(
+        let (engine, snapshot) = sync_engine_and_snapshot_at(
             "./tests/data/partitioned_with_materialize_feature/",
-        ))
-        .unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+            Some(1),
+        );
 
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_context = txn.partitioned_write_context(HashMap::from([(
@@ -1885,10 +1852,7 @@ mod tests {
         #[case] call_partitioned: bool,
         #[case] expected_msg: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let (engine, snapshot) = sync_engine_and_snapshot(table_path);
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let result = if call_partitioned {
             txn.partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]))

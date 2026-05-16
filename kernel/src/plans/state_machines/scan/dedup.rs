@@ -107,18 +107,13 @@ pub(super) fn fsr_row_has_identity_predicate() -> Predicate {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::super::schemas::action_read_schema;
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::{AsArray, StringArray};
-    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::evaluate_expression::evaluate_expression;
-    use crate::engine::sync::SyncEngine;
     use crate::expressions::UnaryExpressionOp;
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use crate::Engine;
+    use crate::utils::test_utils::parse_json_to_record_batch;
 
     #[test]
     fn fsr_dedup_key_eval_add_row_carries_path_and_dv_components() {
@@ -127,20 +122,11 @@ mod tests {
         // path and DV identity components verbatim (any consumer that reduces over equality of
         // full JSON strings still dedups identical DVs).
         let line = r#"{"add":{"path":"p1.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dvpath","offset":7,"sizeInBytes":1,"cardinality":2}}}"#;
-        let engine = SyncEngine::new();
-        let parsed = engine
-            .json_handler()
-            .parse_json(
-                string_array_to_engine_data(StringArray::from(vec![line])),
-                action_read_schema(),
-            )
-            .unwrap();
-        let arrow = ArrowEngineData::try_from_engine_data(parsed).unwrap();
-        let batch = arrow.record_batch();
+        let batch = parse_json_to_record_batch(StringArray::from(vec![line]), action_read_schema());
 
         let out = evaluate_expression(
             &Expression::unary(UnaryExpressionOp::ToJson, fsr_dedup_key()),
-            batch,
+            &batch,
             Some(&DataType::STRING),
         )
         .unwrap();
@@ -169,21 +155,12 @@ mod tests {
 
     #[test]
     fn fsr_dedup_key_eval_various_action_types() {
-        let engine = SyncEngine::new();
         let schema = action_read_schema();
         let check = |line: &str, subs: &[&str]| {
-            let parsed = engine
-                .json_handler()
-                .parse_json(
-                    string_array_to_engine_data(StringArray::from(vec![line])),
-                    Arc::clone(&schema),
-                )
-                .unwrap();
-            let arrow = ArrowEngineData::try_from_engine_data(parsed).unwrap();
-            let batch = arrow.record_batch();
+            let batch = parse_json_to_record_batch(StringArray::from(vec![line]), schema.clone());
             let out = evaluate_expression(
                 &Expression::unary(UnaryExpressionOp::ToJson, fsr_dedup_key()),
-                batch,
+                &batch,
                 Some(&DataType::STRING),
             )
             .unwrap();
@@ -217,8 +194,6 @@ mod tests {
 
     #[test]
     fn fsr_row_has_identity_accepts_protocol_metadata_domain_and_file_actions() {
-        let engine = SyncEngine::new();
-        let schema = action_read_schema();
         let rows = StringArray::from(vec![
             // file actions
             r#"{"add":{"path":"a.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true}}"#,
@@ -231,16 +206,11 @@ mod tests {
             // no action payload
             r#"{}"#,
         ]);
-        let parsed = engine
-            .json_handler()
-            .parse_json(string_array_to_engine_data(rows), Arc::clone(&schema))
-            .unwrap();
-        let arrow = ArrowEngineData::try_from_engine_data(parsed).unwrap();
-        let batch = arrow.record_batch();
+        let batch = parse_json_to_record_batch(rows, action_read_schema());
 
         let out = evaluate_expression(
             &fsr_row_has_identity_predicate().into(),
-            batch,
+            &batch,
             Some(&DataType::BOOLEAN),
         )
         .unwrap();

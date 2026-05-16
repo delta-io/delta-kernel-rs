@@ -802,6 +802,57 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Build a [`SyncEngine`] and snapshot for a test table referenced by relative path
+    /// (e.g. `"./tests/data/basic_partitioned/"`). Pinning the version is optional.
+    /// Panics on any error -- intended for unit-test setup.
+    pub(crate) fn sync_engine_and_snapshot_at(
+        table_rel_path: &str,
+        version: Option<crate::Version>,
+    ) -> (SyncEngine, SnapshotRef) {
+        let path = std::fs::canonicalize(PathBuf::from(table_rel_path)).unwrap();
+        let url = Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let mut builder = Snapshot::builder_for(url);
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+        let snapshot = builder.build(&engine).unwrap();
+        (engine, snapshot)
+    }
+
+    /// Build a [`SyncEngine`] and snapshot at the latest version for a test table referenced
+    /// by relative path. See [`sync_engine_and_snapshot_at`].
+    pub(crate) fn sync_engine_and_snapshot(table_rel_path: &str) -> (SyncEngine, SnapshotRef) {
+        sync_engine_and_snapshot_at(table_rel_path, None)
+    }
+
+    /// Like [`sync_engine_and_snapshot`] but returns an `Arc<SyncEngine>` for callers that
+    /// need to clone the engine across multiple uses.
+    pub(crate) fn sync_engine_arc_and_snapshot(
+        table_rel_path: &str,
+    ) -> (Arc<SyncEngine>, SnapshotRef) {
+        let (engine, snapshot) = sync_engine_and_snapshot_at(table_rel_path, None);
+        (Arc::new(engine), snapshot)
+    }
+
+    /// Parse a `StringArray` of JSON rows against the given schema using a [`SyncEngine`],
+    /// and return the resulting Arrow `RecordBatch`. Convenience for tests that build a
+    /// small fixture batch from JSON literals.
+    pub(crate) fn parse_json_to_record_batch(
+        rows: StringArray,
+        schema: crate::schema::SchemaRef,
+    ) -> RecordBatch {
+        let engine = SyncEngine::new();
+        let parsed = engine
+            .json_handler()
+            .parse_json(string_array_to_engine_data(rows), schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed)
+            .unwrap()
+            .record_batch()
+            .clone()
+    }
+
     /// Load a test table from tests/data directory.
     /// Tries compressed (tar.zst) first, falls back to extracted.
     /// Returns (engine, snapshot, optional tempdir). The TempDir must be kept alive
