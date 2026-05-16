@@ -22,8 +22,7 @@ pub fn plan_compilation(detail: impl Into<String>) -> DeltaError {
     let detail = detail.into();
     delta_kernel::delta_error!(
         DeltaErrorCode::DeltaCommandInvariantViolation,
-        operation = "PlanCompilation",
-        detail = detail,
+        "PlanCompilation: {detail}",
     )
 }
 
@@ -32,8 +31,7 @@ pub fn unsupported(detail: impl Into<String>) -> DeltaError {
     let detail = detail.into();
     delta_kernel::delta_error!(
         DeltaErrorCode::DeltaCommandInvariantViolation,
-        operation = "Unsupported",
-        detail = detail,
+        "Unsupported: {detail}",
     )
 }
 
@@ -41,8 +39,7 @@ pub fn internal_error(detail: impl Into<String>) -> DeltaError {
     let detail = detail.into();
     delta_kernel::delta_error!(
         DeltaErrorCode::DeltaCommandInvariantViolation,
-        operation = "Internal",
-        detail = detail,
+        "Internal: {detail}",
     )
 }
 
@@ -54,10 +51,13 @@ pub fn datafusion_err_to_delta(e: DataFusionError) -> DeltaError {
     match e {
         DataFusionError::External(inner) => match inner.downcast::<DeltaError>() {
             Ok(delta_err) => *delta_err,
-            Err(orig) => delta_kernel::delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                source = DataFusionError::External(orig),
-            ),
+            Err(orig) => {
+                let wrapped = DataFusionError::External(orig);
+                delta_kernel::delta_error!(
+                    DeltaErrorCode::DeltaCommandInvariantViolation,
+                    source = wrapped,
+                )
+            }
         },
         other => delta_kernel::delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,

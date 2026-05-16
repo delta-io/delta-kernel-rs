@@ -51,8 +51,8 @@ pub fn first_checkpoint_url(snapshot: &Snapshot) -> Result<String, DeltaError> {
         .ok_or_else(|| {
             delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "fsr::first_checkpoint_url",
-                detail = "snapshot has no checkpoint parts but schema prelude was requested",
+                "fsr::first_checkpoint_url: snapshot has no checkpoint parts but schema prelude \
+                 was requested",
             )
         })
 }
@@ -142,18 +142,18 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                 )
                 .await
                 .map_err(|e| {
+                    let detail = e.display_with_source_chain();
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema",
-                        detail = e.display_with_source_chain(),
                         source = e,
+                        "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema: {detail}",
                     )
                 })?;
             let checkpoint_schema = checkpoint_state.take_schema().ok_or_else(|| {
                 delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
-                    operation = "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema",
-                    detail = "schema query phase returned no schema",
+                    "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema: schema query \
+                     phase returned no schema",
                 )
             })?;
             shape = checkpoint_shape_from_schema(&checkpoint_schema)?;
@@ -169,19 +169,19 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                 )
                 .await
                 .map_err(|e| {
+                    let detail = e.display_with_source_chain();
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "scan::resolve_checkpoint_shape_for_scan::sidecar_discovery",
-                        detail = e.display_with_source_chain(),
                         source = e,
+                        "scan::resolve_checkpoint_shape_for_scan::sidecar_discovery: {detail}",
                     )
                 })?;
             let sidecar_files = extract_sidecars.extract(&sidecar_state).map_err(|e| {
+                let detail = e.display_with_source_chain();
                 delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
-                    operation = "scan::resolve_checkpoint_shape_for_scan::extract_sidecars",
-                    detail = e.display_with_source_chain(),
                     source = e,
+                    "scan::resolve_checkpoint_shape_for_scan::extract_sidecars: {detail}",
                 )
             })?;
             if let Some(first_sidecar) = sidecar_files.first() {
@@ -194,18 +194,18 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                     )
                     .await
                     .map_err(|e| {
+                        let detail = e.display_with_source_chain();
                         delta_error!(
                             DeltaErrorCode::DeltaCommandInvariantViolation,
-                            operation = "scan::resolve_checkpoint_shape_for_scan::sidecar_schema",
-                            detail = e.display_with_source_chain(),
                             source = e,
+                            "scan::resolve_checkpoint_shape_for_scan::sidecar_schema: {detail}",
                         )
                     })?;
                 let sidecar_schema = sidecar_state.take_schema().ok_or_else(|| {
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "scan::resolve_checkpoint_shape_for_scan::sidecar_schema",
-                        detail = "sidecar schema query phase returned no schema",
+                        "scan::resolve_checkpoint_shape_for_scan::sidecar_schema: sidecar schema \
+                         query phase returned no schema",
                     )
                 })?;
                 let mut sidecar_shape = checkpoint_shape_from_schema(&sidecar_schema)?;

@@ -76,9 +76,8 @@ impl<R: Send + 'static> CoroutineSM<R> {
             }),
             GeneratorState::Complete(_) => bail_delta!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "CoroutineSM::new",
-                detail = "coroutine completed during start without yielding any work; \
-                          the caller should short-circuit before constructing an SM",
+                "CoroutineSM::new: coroutine completed during start without yielding any work; \
+                 the caller should short-circuit before constructing an SM",
             ),
         }
     }
@@ -98,8 +97,7 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
             Some(phase) => Ok((*phase.operation).clone()),
             None => bail_delta!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "CoroutineSM::get_operation",
-                detail = "state machine already completed",
+                "CoroutineSM::get_operation: state machine already completed",
             ),
         }
     }
@@ -111,8 +109,7 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
         if self.pending.is_none() {
             bail_delta!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "CoroutineSM::advance",
-                detail = "cannot advance, already completed",
+                "CoroutineSM::advance: cannot advance, already completed",
             );
         }
 
@@ -144,11 +141,11 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
 /// All [`GenError`] variants signal a kernel-internal contract violation;
 /// they should never be observed at runtime in correct code.
 fn lift_gen_error(e: GenError, operation: &'static str) -> DeltaError {
+    let detail = e.to_string();
     delta_error!(
         DeltaErrorCode::DeltaCommandInvariantViolation,
-        operation = operation,
-        detail = e.to_string(),
         source = e,
+        "{operation}: {detail}",
     )
 }
 
@@ -276,11 +273,11 @@ mod tests {
 
     impl EngineError {
         fn into_delta_error_for_test(self) -> DeltaError {
+            let detail = self.display_with_source_chain();
             crate::delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "test::lift_engine_error",
-                detail = self.display_with_source_chain(),
                 source = self,
+                "test::lift_engine_error: {detail}",
             )
         }
     }

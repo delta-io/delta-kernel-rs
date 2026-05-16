@@ -133,11 +133,11 @@ pub fn full_state_sm(snapshot: Arc<Snapshot>) -> Result<CoroutineSM<()>, DeltaEr
             .execute(PhaseOperation::Plans(plans), "fsr.full_state")
             .await
             .map_err(|e| {
+                let detail = e.display_with_source_chain();
                 delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
-                    operation = "fsr::full_state::execute",
-                    detail = e.display_with_source_chain(),
                     source = e,
+                    "fsr::full_state::execute: {detail}",
                 )
             })?;
         Ok(())

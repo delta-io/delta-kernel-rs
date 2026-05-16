@@ -165,11 +165,8 @@ pub(super) fn load_materialized_schema(
         let field = up.fields().find(|f| f.name() == *name).ok_or_else(|| {
             delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "fsr::load_materialized_schema",
-                detail = format!(
-                    "upstream schema {:?} missing passthrough `{name}`",
-                    upstream
-                ),
+                "fsr::load_materialized_schema: upstream schema {:?} missing passthrough `{name}`",
+                upstream,
             )
         })?;
         fields.push(StructField::new(
@@ -295,8 +292,8 @@ fn build_commit_dedup_plan(
         if !commit_raw_handle.schema.contains(field) {
             return Err(delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "fsr::build_commit_dedup_plan::schema_check",
-                detail = format!("commit raw relation schema is missing required field `{field}`"),
+                "fsr::build_commit_dedup_plan::schema_check: commit raw relation schema is \
+                 missing required field `{field}`",
             ));
         }
     }
@@ -371,8 +368,7 @@ fn build_sidecar_load_plan(
     let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
         delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
-            operation = "fsr::build_sidecar_load_plan::join_sidecar_base",
-            detail = format!("join _sidecars base URL: {e}"),
+            "fsr::build_sidecar_load_plan::join_sidecar_base: join _sidecars base URL: {e}",
         )
     })?;
     let sink = LoadSink {

@@ -59,13 +59,10 @@ pub fn downcast_all<S: Any>(
             Err(_) => {
                 return Err(delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
-                    operation = "kdf::downcast_all",
-                    detail = format!(
-                        "expected `{}` for token `{}`, partition {} had wrong type",
-                        std::any::type_name::<S>(),
-                        token,
-                        i,
-                    ),
+                    "kdf::downcast_all: expected `{}` for token `{}`, partition {} had wrong type",
+                    std::any::type_name::<S>(),
+                    token,
+                    i,
                 ));
             }
         }
@@ -81,18 +78,14 @@ pub fn take_single<S>(mut parts: Vec<S>, token: &KdfStateToken) -> Result<S, Del
         return parts.pop().ok_or_else(|| {
             delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "kdf::take_single",
-                detail = "internal: len==1 but pop returned None".to_string(),
+                "kdf::take_single: internal: len==1 but pop returned None",
             )
         });
     }
     Err(delta_error!(
         DeltaErrorCode::DeltaCommandInvariantViolation,
-        operation = "kdf::take_single",
-        detail = format!(
-            "token `{}`: expected 1 partition, got {}",
-            token,
-            parts.len()
-        ),
+        "kdf::take_single: token `{}`: expected 1 partition, got {}",
+        token,
+        parts.len(),
     ))
 }

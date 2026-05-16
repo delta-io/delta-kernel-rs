@@ -70,8 +70,7 @@ impl KdfOutput for SidecarCollector {
                 sidecar.to_filemeta(&log_root).map_err(|e| {
                     crate::delta_error!(
                         crate::plans::errors::DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "sidecar_collector.into_output",
-                        detail = format!("to_filemeta: {e}"),
+                        "sidecar_collector.into_output: to_filemeta: {e}",
                     )
                 })
             })

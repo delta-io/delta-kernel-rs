@@ -256,11 +256,8 @@ pub(super) fn scan_data_file_schema(
         if physical_schema.contains(row_index_field.name.as_str()) {
             return Err(delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "fsr::scan::scan_data_file_schema",
-                detail = format!(
-                    "row-id projection requires row-index metadata field `{}` but schema already contains a field with that name",
-                    row_index_field.name
-                ),
+                "fsr::scan::scan_data_file_schema: row-id projection requires row-index metadata field `{}` but schema already contains a field with that name",
+                row_index_field.name,
             ));
         }
         return physical_schema
@@ -303,11 +300,8 @@ pub(super) fn scan_data_projection(
                     let physical_field = physical_fields.next().ok_or_else(|| {
                         delta_error!(
                             DeltaErrorCode::DeltaCommandInvariantViolation,
-                            operation = "fsr::scan_data_projection",
-                            detail = format!(
-                                "missing physical field for logical field `{}`",
-                                field.name()
-                            ),
+                            "fsr::scan_data_projection: missing physical field for logical field `{}`",
+                            field.name(),
                         )
                     })?;
                     col([physical_field.name().as_str()])

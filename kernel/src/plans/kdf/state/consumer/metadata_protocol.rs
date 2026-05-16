@@ -79,8 +79,7 @@ impl KdfOutput for MetadataProtocolReader {
 fn missing(what: &str, token: &KdfStateToken) -> DeltaError {
     crate::delta_error!(
         crate::plans::errors::DeltaErrorCode::DeltaCommandInvariantViolation,
-        operation = "metadata_protocol.into_output",
-        detail = format!("token `{token}`: missing {what} after scan completed"),
+        "metadata_protocol.into_output: token `{token}`: missing {what} after scan completed",
     )
 }
 

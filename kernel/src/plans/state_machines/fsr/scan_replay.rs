@@ -125,11 +125,11 @@ impl Scan {
                 .execute(PhaseOperation::Plans(metadata), "scan.replay.metadata")
                 .await
                 .map_err(|e| {
+                    let detail = e.display_with_source_chain();
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "scan::replay_scan_metadata_state_machine::metadata_phase",
-                        detail = e.display_with_source_chain(),
                         source = e,
+                        "scan::replay_scan_metadata_state_machine::metadata_phase: {detail}",
                     )
                 })?;
             Ok(live_actions_relation)
@@ -152,11 +152,11 @@ impl Scan {
                 .execute(PhaseOperation::Plans(data), "scan.replay.data")
                 .await
                 .map_err(|e| {
+                    let detail = e.display_with_source_chain();
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "scan::replay_scan_data_state_machine::data_phase",
-                        detail = e.display_with_source_chain(),
                         source = e,
+                        "scan::replay_scan_data_state_machine::data_phase: {detail}",
                     )
                 })?;
             Ok(())
@@ -181,11 +181,11 @@ impl Scan {
                 .execute(PhaseOperation::Plans(metadata), "scan.replay.metadata")
                 .await
                 .map_err(|e| {
+                    let detail = e.display_with_source_chain();
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "scan::replay_scan_state_machine::metadata_phase",
-                        detail = e.display_with_source_chain(),
                         source = e,
+                        "scan::replay_scan_state_machine::metadata_phase: {detail}",
                     )
                 })?;
             let data = scan.replay_scan_data_plans(live_actions_relation)?;
@@ -193,11 +193,11 @@ impl Scan {
                 .execute(PhaseOperation::Plans(data), "scan.replay.data")
                 .await
                 .map_err(|e| {
+                    let detail = e.display_with_source_chain();
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
-                        operation = "scan::replay_scan_state_machine::data_phase",
-                        detail = e.display_with_source_chain(),
                         source = e,
+                        "scan::replay_scan_state_machine::data_phase: {detail}",
                     )
                 })?;
             Ok(())
@@ -223,8 +223,7 @@ fn scan_metadata_plans_with_shape(
     let last = plans.pop().ok_or_else(|| {
         delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
-            operation = "fsr::scan::scan_metadata",
-            detail = "expected at least one plan from build_fsr_plans",
+            "fsr::scan::scan_metadata: expected at least one plan from build_fsr_plans",
         )
     })?;
     let fsr_results_relation = RelationHandle::fresh("scan.fsr_results", action_output_schema());
