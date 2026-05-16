@@ -8,11 +8,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::action::{action_output_schema, action_schema_with_augmented_add, ADD_PATH};
+use super::action::{
+    action_output_schema, action_schema_with_augmented_add, load_materialized_schema, ADD_PATH,
+};
 use super::checkpoint_shape::{
     checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape_for_scan, CheckpointShape,
 };
-use super::plans::{build_fsr_plans, load_materialized_schema};
+use super::plans::build_fsr_plans;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,

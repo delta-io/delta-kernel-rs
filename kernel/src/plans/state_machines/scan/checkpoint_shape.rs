@@ -28,8 +28,8 @@ use crate::snapshot::Snapshot;
 use crate::{delta_error, FileMeta};
 
 /// Resolved checkpoint encoding + schema hints. `actions_schema_subset` keys the top-level
-/// checkpoint scan in [`build_results_plan`](super::full_state); `has_sidecars` decides whether
-/// [`build_sidecar_load_plan`](super::full_state) is appended to the plan vector.
+/// checkpoint scan in [`super::plans::build_fsr_plans`]; `has_sidecars` decides whether
+/// the FSR sidecar Load is appended to the plan vector.
 #[derive(Clone, Debug)]
 pub struct CheckpointShape {
     pub file_format: FileFormat,

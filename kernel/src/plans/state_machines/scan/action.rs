@@ -6,14 +6,15 @@
 //! `LazyLock` caches), and the row-identity / retention predicates that the FSR pipeline
 //! composes.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use crate::actions::{
     Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, ADD_NAME,
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
+use crate::delta_error;
 use crate::expressions::{ColumnName, Expression, IntoColumnName, Predicate, Scalar};
-use crate::plans::errors::{DeltaError, KernelErrAsDelta};
+use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::schema::{
     arc_schema, ArrayType, DataType, SchemaRef, StructField, StructType, ToSchema,
@@ -93,6 +94,39 @@ pub(super) fn path_size_schema(with_version: bool) -> SchemaRef {
         fields.push(StructField::not_null("version", DataType::LONG));
     }
     arc_schema(fields)
+}
+
+/// Compose a materialized-relation schema from a `LoadSink`'s `file_schema` plus the
+/// upstream-row columns it broadcasts onto each emitted row. The returned schema lists
+/// the file columns first, then every `passthrough` name resolved against `upstream`
+/// preserving the original type and nullability.
+///
+/// Returns [`DeltaErrorCode::DeltaCommandInvariantViolation`] if any requested
+/// `passthrough` name is absent from `upstream`.
+pub(super) fn load_materialized_schema(
+    file_schema: &SchemaRef,
+    upstream: &SchemaRef,
+    passthrough: &[&str],
+) -> Result<SchemaRef, DeltaError> {
+    let mut fields: Vec<StructField> = file_schema.fields().cloned().collect();
+    let up = upstream.as_ref();
+    for name in passthrough {
+        let field = up.fields().find(|f| f.name() == *name).ok_or_else(|| {
+            delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "fsr::load_materialized_schema: upstream schema {:?} missing passthrough `{name}`",
+                upstream,
+            )
+        })?;
+        fields.push(StructField::new(
+            *name,
+            field.data_type().clone(),
+            field.is_nullable(),
+        ));
+    }
+    StructType::try_new(fields)
+        .map(Arc::new)
+        .map_err(|e| e.into_delta_default())
 }
 
 /// Action schema augmented with the [`Add`] slot replaced by an augmented struct that
@@ -241,8 +275,6 @@ pub(super) fn fsr_row_has_identity_predicate() -> Predicate {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::{AsArray, StringArray};
