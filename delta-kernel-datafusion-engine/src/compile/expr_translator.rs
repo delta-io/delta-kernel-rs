@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use datafusion_common::arrow::array::StructArray;
 use datafusion_common::arrow::datatypes::Field as ArrowField;
+use datafusion_common::error::DataFusionError;
 use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::expr::{BinaryExpr, Case, InList};
 use datafusion_expr::{Expr, Operator};
@@ -36,13 +37,12 @@ use delta_kernel::expressions::{
     Expression, IfExpression, JunctionPredicate, JunctionPredicateOp, Predicate, Scalar,
     StructData, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::schema::{DataType, PrimitiveType};
 
 use crate::error::{internal_error, unsupported};
 
 /// Translate a kernel [`Expression`] to a DataFusion [`Expr`].
-pub fn kernel_expr_to_df(expr: &Expression) -> Result<Expr, DeltaError> {
+pub fn kernel_expr_to_df(expr: &Expression) -> Result<Expr, DataFusionError> {
     match expr {
         Expression::Literal(scalar) => scalar_to_df(scalar),
         Expression::Column(name) => column_to_df(name),
@@ -97,7 +97,7 @@ pub fn kernel_expr_to_df(expr: &Expression) -> Result<Expr, DeltaError> {
 }
 
 /// Translate a kernel [`Predicate`] to a boolean-typed DataFusion [`Expr`].
-pub fn kernel_pred_to_df(pred: &Predicate) -> Result<Expr, DeltaError> {
+pub fn kernel_pred_to_df(pred: &Predicate) -> Result<Expr, DataFusionError> {
     match pred {
         Predicate::BooleanExpression(expr) => kernel_expr_to_df(expr),
         Predicate::Not(inner) => Ok(Expr::Not(Box::new(kernel_pred_to_df(inner)?))),
@@ -115,7 +115,7 @@ pub fn kernel_pred_to_df(pred: &Predicate) -> Result<Expr, DeltaError> {
     }
 }
 
-fn column_to_df(name: &ColumnName) -> Result<Expr, DeltaError> {
+fn column_to_df(name: &ColumnName) -> Result<Expr, DataFusionError> {
     let parts: Vec<&str> = name.iter().map(String::as_str).collect();
     match parts.as_slice() {
         [single] => Ok(Expr::Column(Column::new_unqualified(*single))),
@@ -136,7 +136,7 @@ fn binary_expr_to_df(
     op: BinaryExpressionOp,
     left: &Expression,
     right: &Expression,
-) -> Result<Expr, DeltaError> {
+) -> Result<Expr, DataFusionError> {
     let l = kernel_expr_to_df(left)?;
     let r = kernel_expr_to_df(right)?;
     let df_op = match op {
@@ -152,7 +152,7 @@ fn binary_expr_to_df(
     )))
 }
 
-fn unary_pred_to_df(op: UnaryPredicateOp, expr: &Expression) -> Result<Expr, DeltaError> {
+fn unary_pred_to_df(op: UnaryPredicateOp, expr: &Expression) -> Result<Expr, DataFusionError> {
     let inner = kernel_expr_to_df(expr)?;
     match op {
         UnaryPredicateOp::IsNull => Ok(Expr::IsNull(Box::new(inner))),
@@ -163,7 +163,7 @@ fn binary_pred_to_df(
     op: BinaryPredicateOp,
     left: &Expression,
     right: &Expression,
-) -> Result<Expr, DeltaError> {
+) -> Result<Expr, DataFusionError> {
     // `In` is special: kernel models it as `Binary(In, value, array_literal)` where the right side
     // is a constant `Scalar::Array`. DataFusion's `Expr::InList` carries the list as a Vec<Expr>.
     if matches!(op, BinaryPredicateOp::In) {
@@ -190,7 +190,7 @@ fn binary_pred_to_df(
     )))
 }
 
-fn in_pred_to_df(value: &Expression, list: &Expression) -> Result<Expr, DeltaError> {
+fn in_pred_to_df(value: &Expression, list: &Expression) -> Result<Expr, DataFusionError> {
     let value_df = kernel_expr_to_df(value)?;
     let elements = match list {
         Expression::Literal(Scalar::Array(arr)) => arr
@@ -211,7 +211,7 @@ fn in_pred_to_df(value: &Expression, list: &Expression) -> Result<Expr, DeltaErr
     )))
 }
 
-fn junction_to_df(op: JunctionPredicateOp, preds: &[Predicate]) -> Result<Expr, DeltaError> {
+fn junction_to_df(op: JunctionPredicateOp, preds: &[Predicate]) -> Result<Expr, DataFusionError> {
     if preds.is_empty() {
         return Err(unsupported(
             "expr_translator: empty Junction (And/Or) cannot be lowered",
@@ -230,7 +230,7 @@ fn junction_to_df(op: JunctionPredicateOp, preds: &[Predicate]) -> Result<Expr, 
     Ok(acc)
 }
 
-fn variadic_to_df(op: VariadicExpressionOp, exprs: &[Expression]) -> Result<Expr, DeltaError> {
+fn variadic_to_df(op: VariadicExpressionOp, exprs: &[Expression]) -> Result<Expr, DataFusionError> {
     match op {
         VariadicExpressionOp::Coalesce => coalesce_to_df(exprs),
         VariadicExpressionOp::Array => {
@@ -251,7 +251,7 @@ fn variadic_to_df(op: VariadicExpressionOp, exprs: &[Expression]) -> Result<Expr
 ///                              ELSE CASE WHEN e2 IS NOT NULL THEN e2 ELSE e3 END
 ///                         END
 /// ```
-fn coalesce_to_df(exprs: &[Expression]) -> Result<Expr, DeltaError> {
+fn coalesce_to_df(exprs: &[Expression]) -> Result<Expr, DataFusionError> {
     if exprs.is_empty() {
         return Err(unsupported(
             "expr_translator: COALESCE() requires at least one argument",
@@ -264,7 +264,7 @@ fn coalesce_to_df(exprs: &[Expression]) -> Result<Expr, DeltaError> {
     Ok(datafusion_functions::core::expr_fn::coalesce(translated))
 }
 
-fn if_to_df(if_expr: &IfExpression) -> Result<Expr, DeltaError> {
+fn if_to_df(if_expr: &IfExpression) -> Result<Expr, DataFusionError> {
     let cond = kernel_pred_to_df(&if_expr.condition)?;
     let then = kernel_expr_to_df(&if_expr.then_expr)?;
     let r#else = kernel_expr_to_df(&if_expr.else_expr)?;
@@ -276,12 +276,12 @@ fn if_to_df(if_expr: &IfExpression) -> Result<Expr, DeltaError> {
     )))
 }
 
-fn scalar_to_df(scalar: &Scalar) -> Result<Expr, DeltaError> {
+fn scalar_to_df(scalar: &Scalar) -> Result<Expr, DataFusionError> {
     let val = scalar_value_to_df(scalar)?;
     Ok(Expr::Literal(val, None))
 }
 
-fn scalar_value_to_df(scalar: &Scalar) -> Result<ScalarValue, DeltaError> {
+fn scalar_value_to_df(scalar: &Scalar) -> Result<ScalarValue, DataFusionError> {
     let val = match scalar {
         Scalar::Integer(v) => ScalarValue::Int32(Some(*v)),
         Scalar::Long(v) => ScalarValue::Int64(Some(*v)),
@@ -311,7 +311,7 @@ fn scalar_value_to_df(scalar: &Scalar) -> Result<ScalarValue, DeltaError> {
     Ok(val)
 }
 
-fn scalar_struct_value_to_df(struct_data: &StructData) -> Result<ScalarValue, DeltaError> {
+fn scalar_struct_value_to_df(struct_data: &StructData) -> Result<ScalarValue, DataFusionError> {
     let fields: Vec<ArrowField> = struct_data
         .fields()
         .iter()
@@ -323,16 +323,12 @@ fn scalar_struct_value_to_df(struct_data: &StructData) -> Result<ScalarValue, De
                 ))
             })
         })
-        .collect::<Result<Vec<_>, DeltaError>>()?;
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
     let values = struct_data
         .values()
         .iter()
-        .map(|v| {
-            scalar_value_to_df(v)?
-                .to_array()
-                .map_err(crate::error::datafusion_err_to_delta)
-        })
-        .collect::<Result<Vec<_>, DeltaError>>()?;
+        .map(|v| scalar_value_to_df(v)?.to_array())
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
     Ok(ScalarValue::Struct(Arc::new(StructArray::new(
         fields.into(),
         values,
@@ -340,7 +336,7 @@ fn scalar_struct_value_to_df(struct_data: &StructData) -> Result<ScalarValue, De
     ))))
 }
 
-fn typed_null_to_df(data_type: &DataType) -> Result<ScalarValue, DeltaError> {
+fn typed_null_to_df(data_type: &DataType) -> Result<ScalarValue, DataFusionError> {
     if let DataType::Primitive(p) = data_type {
         return Ok(match p {
             PrimitiveType::Integer => ScalarValue::Int32(None),

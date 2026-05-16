@@ -4,12 +4,12 @@
 //! JSON strings using `datafusion-functions-json`.
 
 use datafusion_common::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+use datafusion_common::error::DataFusionError;
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{lit, Expr};
 use datafusion_functions_json::udfs::{
     json_get_bool_udf, json_get_float_udf, json_get_int_udf, json_get_str_udf,
 };
-use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
 
 /// Generate extraction expression for a single field in `target_schema`.
@@ -17,7 +17,7 @@ pub(crate) fn generate_json_extract_expr(
     json_col: &Expr,
     field: &StructField,
     path: &[String],
-) -> Result<Expr, DeltaError> {
+) -> Result<Expr, DataFusionError> {
     let mut field_path = path.to_vec();
     field_path.push(field.name().to_string());
 
@@ -43,7 +43,7 @@ fn generate_primitive_extract(
     json_col: &Expr,
     prim: &PrimitiveType,
     path: &[String],
-) -> Result<Expr, DeltaError> {
+) -> Result<Expr, DataFusionError> {
     let mut args = vec![json_col.clone()];
     args.extend(path.iter().map(|p| lit(p.clone())));
 
@@ -98,7 +98,7 @@ fn generate_struct_extract(
     json_col: &Expr,
     struct_type: &StructType,
     path: &[String],
-) -> Result<Expr, DeltaError> {
+) -> Result<Expr, DataFusionError> {
     let mut args = Vec::new();
     for field in struct_type.fields() {
         args.push(lit(field.name().to_string()));
@@ -111,7 +111,7 @@ fn generate_struct_extract(
 pub(crate) fn generate_schema_extractions(
     json_col: &Expr,
     target_schema: &StructType,
-) -> Result<Vec<(Expr, String)>, DeltaError> {
+) -> Result<Vec<(Expr, String)>, DataFusionError> {
     let mut out = Vec::new();
     for field in target_schema.fields() {
         out.push((

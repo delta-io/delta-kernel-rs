@@ -23,6 +23,8 @@ use delta_kernel::plans::kdf::{ConsumerKdf, FinishedHandle, Handle, KdfControl, 
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
 use futures::{Stream, StreamExt};
 
+use crate::error::unsupported;
+
 pub struct KernelConsumeByKdfExec {
     child: Arc<dyn ExecutionPlan>,
     sink: Arc<Mutex<ConsumeByKdfSink>>,
@@ -38,9 +40,9 @@ impl KernelConsumeByKdfExec {
         sink: ConsumeByKdfSink,
         harvest_slot: Arc<Mutex<Option<FinishedHandle>>>,
         phase_state: Option<PhaseState>,
-    ) -> Result<Self, delta_kernel::plans::errors::DeltaError> {
+    ) -> Result<Self, DataFusionError> {
         if sink.requires_ordering.is_some() {
-            return Err(crate::error::unsupported(
+            return Err(unsupported(
                 "ConsumeByKdf with requires_ordering is not implemented for the DataFusion engine",
             ));
         }
@@ -114,22 +116,19 @@ impl ExecutionPlan for KernelConsumeByKdfExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let child = super::expect_single_child(children, "KernelConsumeByKdfExec")?;
-        Ok(Arc::new(
-            KernelConsumeByKdfExec::try_new(
-                child,
-                self.sink
-                    .lock()
-                    .map_err(|_| {
-                        DataFusionError::Internal(
-                            "KernelConsumeByKdfExec: mutex poisoned rebuilding children".into(),
-                        )
-                    })?
-                    .clone(),
-                Arc::clone(&self.harvest_slot),
-                self.phase_state.clone(),
-            )
-            .map_err(crate::error::wrap_delta_err)?,
-        ))
+        Ok(Arc::new(KernelConsumeByKdfExec::try_new(
+            child,
+            self.sink
+                .lock()
+                .map_err(|_| {
+                    DataFusionError::Internal(
+                        "KernelConsumeByKdfExec: mutex poisoned rebuilding children".into(),
+                    )
+                })?
+                .clone(),
+            Arc::clone(&self.harvest_slot),
+            self.phase_state.clone(),
+        )?))
     }
 
     fn execute(

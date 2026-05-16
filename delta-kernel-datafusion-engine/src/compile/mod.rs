@@ -15,12 +15,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datafusion::catalog::TableProvider;
+use datafusion_common::error::DataFusionError;
 use datafusion_expr::expr_fn::cast;
 use datafusion_expr::lit;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_functions::core::expr_fn::{get_field, named_struct};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::JoinType;
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::plans::kdf::FinishedHandle;
@@ -75,12 +75,15 @@ impl CompileContext {
 }
 
 /// Compile a complete [`Plan`] to a DataFusion [`LogicalPlan`]. Always succeeds for valid
-/// kernel IR or surfaces a typed [`DeltaError`].
-pub fn compile_plan_logical(plan: &Plan, ctx: &CompileContext) -> Result<LogicalPlan, DeltaError> {
+/// kernel IR or surfaces a typed [`DataFusionError`].
+pub fn compile_plan_logical(
+    plan: &Plan,
+    ctx: &CompileContext,
+) -> Result<LogicalPlan, DataFusionError> {
     logical::compile_plan_logical(plan, ctx)
 }
 
-pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DeltaError> {
+pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DataFusionError> {
     match node {
         DeclarativePlanNode::Scan(n) => n.effective_output_schema().map_err(|e| {
             crate::error::plan_compilation(format!(
@@ -137,7 +140,7 @@ pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef
 pub(super) fn expand_projection_columns(
     columns: &[Arc<delta_kernel::expressions::Expression>],
     expected_output_fields: usize,
-) -> Result<Vec<Arc<delta_kernel::expressions::Expression>>, DeltaError> {
+) -> Result<Vec<Arc<delta_kernel::expressions::Expression>>, DataFusionError> {
     let mut expanded = Vec::new();
     for (idx, expr) in columns.iter().enumerate() {
         let remaining_output = expected_output_fields
@@ -179,7 +182,7 @@ pub(super) fn expand_projection_columns(
 pub(super) fn translate_projection_expr(
     expr: &delta_kernel::expressions::Expression,
     output_field: &delta_kernel::schema::StructField,
-) -> Result<datafusion_expr::Expr, DeltaError> {
+) -> Result<datafusion_expr::Expr, DataFusionError> {
     if let delta_kernel::expressions::Expression::ParseJson(parse_json) = expr {
         let json_expr = expr_translator::kernel_expr_to_df(parse_json.json_expr.as_ref())?;
         let target_struct = match output_field.data_type() {

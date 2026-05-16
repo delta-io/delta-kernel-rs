@@ -32,7 +32,6 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Fields};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
 use delta_kernel::scan::selection_vector;
 use delta_kernel::schema::SchemaRef as KernelSchemaRef;
@@ -40,7 +39,7 @@ use delta_kernel::{Engine, FileMeta};
 use futures::{Stream, StreamExt};
 use url::Url;
 
-fn kernel_err(e: delta_kernel::Error) -> DeltaError {
+fn kernel_err(e: delta_kernel::Error) -> DataFusionError {
     crate::error::internal_error(e.to_string())
 }
 
@@ -59,7 +58,7 @@ impl KernelLoadSinkExec {
         sink: LoadSink,
         engine: Arc<dyn Engine>,
         physical_read_schema: KernelSchemaRef,
-    ) -> Result<Self, DeltaError> {
+    ) -> Result<Self, DataFusionError> {
         let arrow_schema: delta_kernel::arrow::datatypes::SchemaRef = Arc::new(
             sink.output_relation
                 .schema
@@ -133,15 +132,12 @@ impl ExecutionPlan for KernelLoadSinkExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let child = super::expect_single_child(children, "KernelLoadSinkExec")?;
-        Ok(Arc::new(
-            Self::try_new(
-                child,
-                self.sink.clone(),
-                Arc::clone(&self.engine),
-                self.physical_read_schema.clone(),
-            )
-            .map_err(crate::error::wrap_delta_err)?,
-        ))
+        Ok(Arc::new(Self::try_new(
+            child,
+            self.sink.clone(),
+            Arc::clone(&self.engine),
+            self.physical_read_schema.clone(),
+        )?))
     }
 
     fn execute(
@@ -192,9 +188,7 @@ impl Stream for KernelLoadSinkStream {
                         self.physical_read_schema.clone(),
                     ) {
                         Ok(outs) => self.pending = outs,
-                        Err(e) => {
-                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
-                        }
+                        Err(e) => return Poll::Ready(Some(Err(e))),
                     }
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
@@ -227,7 +221,7 @@ fn parent_directory_url(url: &Url) -> Url {
     out
 }
 
-fn resolve_file_location(base: &Option<Url>, path_str: &str) -> Result<Url, DeltaError> {
+fn resolve_file_location(base: &Option<Url>, path_str: &str) -> Result<Url, DataFusionError> {
     let path_str = path_str.trim();
     if let Some(base) = base {
         base.join(path_str).map_err(|e| {
@@ -247,7 +241,7 @@ fn resolve_file_location(base: &Option<Url>, path_str: &str) -> Result<Url, Delt
 pub(crate) fn extract_column_array(
     batch: &RecordBatch,
     cn: &ColumnName,
-) -> Result<ArrayRef, DeltaError> {
+) -> Result<ArrayRef, DataFusionError> {
     let parts = cn.path();
     if parts.is_empty() {
         return Err(crate::error::plan_compilation(format!(
@@ -286,7 +280,7 @@ pub(crate) fn extract_column_array(
     Ok(current)
 }
 
-fn utf8_value_at(arr: &ArrayRef, row: usize) -> Result<Option<String>, DeltaError> {
+fn utf8_value_at(arr: &ArrayRef, row: usize) -> Result<Option<String>, DataFusionError> {
     if arr.is_null(row) {
         return Ok(None);
     }
@@ -300,7 +294,7 @@ fn utf8_value_at(arr: &ArrayRef, row: usize) -> Result<Option<String>, DeltaErro
     }
 }
 
-fn column_pref(sa: &StructArray, snake: &str, camel: &str) -> Result<ArrayRef, DeltaError> {
+fn column_pref(sa: &StructArray, snake: &str, camel: &str) -> Result<ArrayRef, DataFusionError> {
     sa.column_by_name(snake)
         .or_else(|| sa.column_by_name(camel))
         .cloned()
@@ -314,7 +308,7 @@ fn column_pref(sa: &StructArray, snake: &str, camel: &str) -> Result<ArrayRef, D
 fn dv_descriptor_from_struct_row(
     sa: &StructArray,
     row: usize,
-) -> Result<DeletionVectorDescriptor, DeltaError> {
+) -> Result<DeletionVectorDescriptor, DataFusionError> {
     let storage_arr = column_pref(sa, "storage_type", "storageType")?;
     let storage_raw = utf8_value_at(&storage_arr, row)?.ok_or_else(|| {
         crate::error::internal_error("Load sink dv_ref.storage_type was NULL".to_string())
@@ -345,7 +339,11 @@ fn dv_descriptor_from_struct_row(
     })
 }
 
-fn read_optional_i32(sa: &StructArray, row: usize, field: &str) -> Result<Option<i32>, DeltaError> {
+fn read_optional_i32(
+    sa: &StructArray,
+    row: usize,
+    field: &str,
+) -> Result<Option<i32>, DataFusionError> {
     let arr = sa.column_by_name(field).cloned().ok_or_else(|| {
         crate::error::internal_error(format!(
             "deletion vector struct missing `{field}` for optional integer field"
@@ -357,7 +355,7 @@ fn read_optional_i32(sa: &StructArray, row: usize, field: &str) -> Result<Option
     Ok(Some(read_required_i32(&arr, row, field)?))
 }
 
-fn read_required_i32(arr: &ArrayRef, row: usize, label: &str) -> Result<i32, DeltaError> {
+fn read_required_i32(arr: &ArrayRef, row: usize, label: &str) -> Result<i32, DataFusionError> {
     match arr.data_type() {
         ArrowDataType::Int32 => Ok(arr.as_primitive::<Int32Type>().value(row)),
         ArrowDataType::Int64 => Ok(arr
@@ -371,7 +369,7 @@ fn read_required_i32(arr: &ArrayRef, row: usize, label: &str) -> Result<i32, Del
     }
 }
 
-fn read_required_i64(arr: &ArrayRef, row: usize, label: &str) -> Result<i64, DeltaError> {
+fn read_required_i64(arr: &ArrayRef, row: usize, label: &str) -> Result<i64, DataFusionError> {
     match arr.data_type() {
         ArrowDataType::Int64 => Ok(arr.as_primitive::<Int64Type>().value(row)),
         ArrowDataType::Int32 => Ok(i64::from(arr.as_primitive::<Int32Type>().value(row))),
@@ -387,7 +385,7 @@ fn optional_selection_vector_for_row(
     row: usize,
     engine: &dyn Engine,
     table_root: &Url,
-) -> Result<Option<Vec<bool>>, DeltaError> {
+) -> Result<Option<Vec<bool>>, DataFusionError> {
     let Some(ref dv_cn) = sink.dv_ref else {
         return Ok(None);
     };
@@ -421,7 +419,7 @@ fn apply_optional_dv(
     rb: RecordBatch,
     mask: Option<&Vec<bool>>,
     row_offset: &mut usize,
-) -> Result<RecordBatch, DeltaError> {
+) -> Result<RecordBatch, DataFusionError> {
     let Some(mask) = mask else {
         *row_offset += rb.num_rows();
         return Ok(rb);
@@ -434,7 +432,7 @@ fn apply_optional_dv(
         .map_err(|e| crate::error::internal_error(format!("DV filter_record_batch failed: {e}")))
 }
 
-fn replicate_row(arr: &ArrayRef, row: usize, len: usize) -> Result<ArrayRef, DeltaError> {
+fn replicate_row(arr: &ArrayRef, row: usize, len: usize) -> Result<ArrayRef, DataFusionError> {
     let idx = UInt32Array::from(vec![row as u32; len]);
     take(arr.as_ref(), &idx, None)
         .map_err(|e| crate::error::internal_error(format!("broadcast take failed: {e}")))
@@ -444,7 +442,7 @@ fn concat_with_passthrough(
     base: RecordBatch,
     passthrough: Vec<ArrayRef>,
     passthrough_names: &[String],
-) -> Result<RecordBatch, DeltaError> {
+) -> Result<RecordBatch, DataFusionError> {
     debug_assert_eq!(passthrough.len(), passthrough_names.len());
     let mut cols = base.columns().to_vec();
     let mut fields: Vec<delta_kernel::arrow::datatypes::Field> = base
@@ -471,7 +469,7 @@ fn broadcast_passthrough_for_batch(
     sink: &LoadSink,
     row: usize,
     target_len: usize,
-) -> Result<(Vec<String>, Vec<ArrayRef>), DeltaError> {
+) -> Result<(Vec<String>, Vec<ArrayRef>), DataFusionError> {
     let mut names = Vec::with_capacity(sink.passthrough_columns.len());
     let mut arrays = Vec::with_capacity(sink.passthrough_columns.len());
     for cn in &sink.passthrough_columns {
@@ -489,7 +487,7 @@ fn read_rows_for_location(
     size: i64,
     mask: Option<&Vec<bool>>,
     physical_read_schema: KernelSchemaRef,
-) -> Result<Vec<RecordBatch>, DeltaError> {
+) -> Result<Vec<RecordBatch>, DataFusionError> {
     let meta = FileMeta::new(url, 0, u64::try_from(size.max(0)).unwrap_or(0));
     let mut out = Vec::new();
     match sink.file_type {
@@ -529,7 +527,7 @@ fn optional_i64(
     batch: &RecordBatch,
     cn: &ColumnName,
     row: usize,
-) -> Result<Option<i64>, DeltaError> {
+) -> Result<Option<i64>, DataFusionError> {
     let arr = extract_column_array(batch, cn)?;
     if arr.is_null(row) {
         return Ok(None);
@@ -549,7 +547,7 @@ fn materialize_upstream_batch(
     sink: &LoadSink,
     engine: &dyn Engine,
     physical_read_schema: KernelSchemaRef,
-) -> Result<Vec<RecordBatch>, DeltaError> {
+) -> Result<Vec<RecordBatch>, DataFusionError> {
     let mut merged = Vec::new();
     let path_cn = &sink.file_meta.path;
     let maybe_size_cn = sink.file_meta.size.as_ref();
@@ -616,7 +614,7 @@ fn materialize_upstream_batch(
 fn arrow_columns_align_to_schema(
     batch: RecordBatch,
     wanted: delta_kernel::arrow::datatypes::SchemaRef,
-) -> Result<RecordBatch, DeltaError> {
+) -> Result<RecordBatch, DataFusionError> {
     if batch.schema().as_ref() == wanted.as_ref() {
         return Ok(batch);
     }
@@ -634,7 +632,10 @@ fn arrow_columns_align_to_schema(
         .map_err(|e| crate::error::internal_error(format!("align schema batch failed: {e}")))
 }
 
-fn realign_array_to_field(array: &ArrayRef, target_field: &Field) -> Result<ArrayRef, DeltaError> {
+fn realign_array_to_field(
+    array: &ArrayRef,
+    target_field: &Field,
+) -> Result<ArrayRef, DataFusionError> {
     match target_field.data_type() {
         ArrowDataType::Struct(target_fields) => realign_struct_array(array, target_fields),
         ArrowDataType::List(target_inner) => realign_list_array(array, target_inner.as_ref()),
@@ -646,7 +647,10 @@ fn realign_array_to_field(array: &ArrayRef, target_field: &Field) -> Result<Arra
     }
 }
 
-fn realign_struct_array(array: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef, DeltaError> {
+fn realign_struct_array(
+    array: &ArrayRef,
+    target_fields: &Fields,
+) -> Result<ArrayRef, DataFusionError> {
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
@@ -655,7 +659,7 @@ fn realign_struct_array(array: &ArrayRef, target_fields: &Fields) -> Result<Arra
         .iter()
         .zip(struct_arr.columns())
         .map(|(f, c)| realign_array_to_field(c, f.as_ref()))
-        .collect::<Result<Vec<_>, DeltaError>>()?;
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
     Ok(Arc::new(StructArray::new(
         target_fields.clone(),
         new_columns,
@@ -666,7 +670,7 @@ fn realign_struct_array(array: &ArrayRef, target_fields: &Fields) -> Result<Arra
 fn realign_list_array(
     array: &ArrayRef,
     target_element_field: &Field,
-) -> Result<ArrayRef, DeltaError> {
+) -> Result<ArrayRef, DataFusionError> {
     let list_arr = array
         .as_any()
         .downcast_ref::<ListArray>()
@@ -683,7 +687,7 @@ fn realign_list_array(
 fn realign_large_list_array(
     array: &ArrayRef,
     target_element_field: &Field,
-) -> Result<ArrayRef, DeltaError> {
+) -> Result<ArrayRef, DataFusionError> {
     let list_arr = array
         .as_any()
         .downcast_ref::<LargeListArray>()
@@ -700,7 +704,7 @@ fn realign_large_list_array(
 fn realign_map_array(
     array: &ArrayRef,
     target_entries_field: &Field,
-) -> Result<ArrayRef, DeltaError> {
+) -> Result<ArrayRef, DataFusionError> {
     let map_arr = array
         .as_any()
         .downcast_ref::<MapArray>()

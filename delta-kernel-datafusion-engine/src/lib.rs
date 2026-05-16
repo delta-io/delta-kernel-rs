@@ -8,15 +8,16 @@
 //! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
 //! it), and
 //! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) (observe
-//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Unsupported constructs still
-//! return [`delta_kernel::plans::errors::DeltaError`] via [`error::unsupported`].
+//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Unsupported constructs surface a
+//! [`datafusion_common::error::DataFusionError::NotImplemented`] via [`error::unsupported`];
+//! the engine -> kernel boundary methods on [`DataFusionExecutor`] translate that into a
+//! [`delta_kernel::plans::errors::DeltaError`].
 
 pub mod compile;
 pub mod error;
 pub mod exec;
 pub mod executor;
 
-pub use error::{datafusion_err_to_delta, LiftDeltaErr};
 pub use executor::DataFusionExecutor;
 
 #[cfg(test)]

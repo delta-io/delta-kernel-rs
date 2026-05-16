@@ -20,6 +20,7 @@ use datafusion::datasource::provider_as_source;
 use datafusion_common::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
+use datafusion_common::error::DataFusionError;
 use datafusion_common::{Column, DFSchema};
 use datafusion_datasource_json::file_format::JsonFormat;
 use datafusion_datasource_parquet::file_format::ParquetFormat;
@@ -34,7 +35,6 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     ColumnName, Expression, MapToStructExpression, ParseJsonExpression,
 };
-use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::{
     FileListingNode, FileType, JoinHint, JoinType as KernelJoinType, ScanNode,
 };
@@ -202,7 +202,7 @@ impl<'a> ExpressionTransform<'a> for RewriteHoistedPath<'_> {
 fn hoist_repeated_column_paths(
     working_plan: LogicalPlan,
     columns: Vec<Arc<Expression>>,
-) -> Result<(LogicalPlan, Vec<Arc<Expression>>), DeltaError> {
+) -> Result<(LogicalPlan, Vec<Arc<Expression>>), DataFusionError> {
     let mut counter = ColumnPathCounter::default();
     for expr in &columns {
         let _ = counter.transform_expr(expr.as_ref());
@@ -249,10 +249,8 @@ fn hoist_repeated_column_paths(
     }
 
     let hoisted_plan = LogicalPlanBuilder::from(working_plan)
-        .project(proj_exprs)
-        .map_err(crate::error::datafusion_err_to_delta)?
-        .build()
-        .map_err(crate::error::datafusion_err_to_delta)?;
+        .project(proj_exprs)?
+        .build()?;
 
     let mut rewriter = RewriteHoistedPath {
         hoist_map: &hoist_map,
@@ -275,7 +273,7 @@ fn hoist_repeated_column_paths(
 fn canonicalize_output_to_kernel_schema(
     plan: LogicalPlan,
     kernel_schema: &KernelSchemaRef,
-) -> Result<LogicalPlan, DeltaError> {
+) -> Result<LogicalPlan, DataFusionError> {
     let source_cols = plan.schema().columns().to_vec();
     let target_len = kernel_schema.fields().count();
     if source_cols.len() < target_len {
@@ -289,11 +287,7 @@ fn canonicalize_output_to_kernel_schema(
         .zip(source_cols)
         .map(|(field, source_col)| Expr::Column(source_col).alias(field.name().to_string()))
         .collect::<Vec<_>>();
-    LogicalPlanBuilder::from(plan)
-        .project(projection)
-        .map_err(crate::error::datafusion_err_to_delta)?
-        .build()
-        .map_err(crate::error::datafusion_err_to_delta)
+    LogicalPlanBuilder::from(plan).project(projection)?.build()
 }
 
 /// DataFusion file sources fail planning when decoded nested field nullability is wider than
@@ -530,16 +524,13 @@ impl TableProvider for FileListingTableProvider {
     }
 }
 
-fn file_listing_to_logical_plan(node: &FileListingNode) -> Result<LogicalPlan, DeltaError> {
+fn file_listing_to_logical_plan(node: &FileListingNode) -> Result<LogicalPlan, DataFusionError> {
     let provider: Arc<dyn TableProvider> =
         Arc::new(FileListingTableProvider::new(node.path.clone()));
-    LogicalPlanBuilder::scan("file_listing", provider_as_source(provider), None)
-        .map_err(crate::error::datafusion_err_to_delta)?
-        .build()
-        .map_err(crate::error::datafusion_err_to_delta)
+    LogicalPlanBuilder::scan("file_listing", provider_as_source(provider), None)?.build()
 }
 
-fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaError> {
+fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DataFusionError> {
     if node.files.is_empty() {
         let arrow_schema: ArrowSchema =
             node.schema.as_ref().try_into_arrow().map_err(|e| {
@@ -559,55 +550,50 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
         .try_into_arrow()
         .map_err(|e| plan_compilation(format!("Logical Scan schema conversion failed: {e}")))?;
     let row_index_name = node.row_index_column.clone();
-    let build_listing_scan = |files: &[delta_kernel::FileMeta]| -> Result<LogicalPlan, DeltaError> {
-        let file_schema = Arc::new(full_schema.clone());
-        let file_schema = if node.file_type == FileType::Json {
-            relax_nested_nullability_for_scan(file_schema.as_ref())
-        } else {
-            file_schema
+    let build_listing_scan =
+        |files: &[delta_kernel::FileMeta]| -> Result<LogicalPlan, DataFusionError> {
+            let file_schema = Arc::new(full_schema.clone());
+            let file_schema = if node.file_type == FileType::Json {
+                relax_nested_nullability_for_scan(file_schema.as_ref())
+            } else {
+                file_schema
+            };
+            let partition_cols: Vec<(String, ArrowDataType)> = Vec::new();
+            let format: Arc<dyn datafusion_datasource::file_format::FileFormat> =
+                match node.file_type {
+                    FileType::Parquet => Arc::new(ParquetFormat::default()),
+                    FileType::Json => Arc::new(JsonFormat::default().with_newline_delimited(true)),
+                };
+            let options = ListingOptions::new(format)
+                .with_file_extension(match node.file_type {
+                    FileType::Parquet => ".parquet",
+                    FileType::Json => ".json",
+                })
+                .with_table_partition_cols(partition_cols)
+                .with_collect_stat(true)
+                .with_target_partitions(1);
+            let paths = files
+                .iter()
+                .map(|f| ListingTableUrl::parse(f.location.as_str()))
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
+            let config = ListingTableConfig::new_with_multi_paths(paths)
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema));
+            let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
+            // JSON file sources don't enforce declared nullability and DataFusion's own
+            // `check_not_null_constraints` only covers top-level columns. Wrap JSON scans with a
+            // provider that re-asserts the strict kernel schema (top-level + nested) at the scan
+            // boundary. Parquet's decoder handles nullability natively, so it scans naked.
+            let provider: Arc<dyn TableProvider> = if node.file_type == FileType::Json {
+                Arc::new(NullabilityEnforcingTableProvider::new(
+                    listing,
+                    Arc::new(full_schema.clone()),
+                ))
+            } else {
+                listing
+            };
+            LogicalPlanBuilder::scan("scan", provider_as_source(provider), None)?.build()
         };
-        let partition_cols: Vec<(String, ArrowDataType)> = Vec::new();
-        let format: Arc<dyn datafusion_datasource::file_format::FileFormat> = match node.file_type {
-            FileType::Parquet => Arc::new(ParquetFormat::default()),
-            FileType::Json => Arc::new(JsonFormat::default().with_newline_delimited(true)),
-        };
-        let options = ListingOptions::new(format)
-            .with_file_extension(match node.file_type {
-                FileType::Parquet => ".parquet",
-                FileType::Json => ".json",
-            })
-            .with_table_partition_cols(partition_cols)
-            .with_collect_stat(true)
-            .with_target_partitions(1);
-        let paths = files
-            .iter()
-            .map(|f| {
-                ListingTableUrl::parse(f.location.as_str())
-                    .map_err(crate::error::datafusion_err_to_delta)
-            })
-            .collect::<Result<Vec<_>, DeltaError>>()?;
-        let config = ListingTableConfig::new_with_multi_paths(paths)
-            .with_listing_options(options)
-            .with_schema(Arc::clone(&file_schema));
-        let listing: Arc<dyn TableProvider> =
-            Arc::new(ListingTable::try_new(config).map_err(crate::error::datafusion_err_to_delta)?);
-        // JSON file sources don't enforce declared nullability and DataFusion's own
-        // `check_not_null_constraints` only covers top-level columns. Wrap JSON scans with a
-        // provider that re-asserts the strict kernel schema (top-level + nested) at the scan
-        // boundary. Parquet's decoder handles nullability natively, so it scans naked.
-        let provider: Arc<dyn TableProvider> = if node.file_type == FileType::Json {
-            Arc::new(NullabilityEnforcingTableProvider::new(
-                listing,
-                Arc::new(full_schema.clone()),
-            ))
-        } else {
-            listing
-        };
-        LogicalPlanBuilder::scan("scan", provider_as_source(provider), None)
-            .map_err(crate::error::datafusion_err_to_delta)?
-            .build()
-            .map_err(crate::error::datafusion_err_to_delta)
-    };
     // Row indexes are per-file (0-based position within the originating parquet/json file), so a
     // scan with `row_index_column = Some(_)` must branch per file, append the row_number window
     // to each branch, and Union them. Without a row index, a single multi-file ListingTable scan
@@ -620,17 +606,13 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
                 let plan = build_listing_scan(std::slice::from_ref(f))?;
                 append_row_index_column(plan, name)
             })
-            .collect::<Result<Vec<_>, DeltaError>>()?
+            .collect::<Result<Vec<_>, DataFusionError>>()?
             .into_iter();
         let first = branches.next().ok_or_else(|| {
             plan_compilation("logical scan with row index expected at least one file")
         })?;
         branches.try_fold(first, |acc, right| {
-            LogicalPlanBuilder::from(acc)
-                .union(right)
-                .map_err(crate::error::datafusion_err_to_delta)?
-                .build()
-                .map_err(crate::error::datafusion_err_to_delta)
+            LogicalPlanBuilder::from(acc).union(right)?.build()
         })?
     } else {
         build_listing_scan(&node.files)?
@@ -644,10 +626,8 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
         // behavior on NULL.
         let null_preserving = pred.clone().or(pred.is_null());
         scan_plan = LogicalPlanBuilder::from(scan_plan)
-            .filter(null_preserving)
-            .map_err(crate::error::datafusion_err_to_delta)?
-            .build()
-            .map_err(crate::error::datafusion_err_to_delta)?;
+            .filter(null_preserving)?
+            .build()?;
     }
     Ok(scan_plan)
 }
@@ -655,11 +635,10 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
 fn append_row_index_column(
     plan: LogicalPlan,
     row_index_name: &str,
-) -> Result<LogicalPlan, DeltaError> {
+) -> Result<LogicalPlan, DataFusionError> {
     let input_col_count = plan.schema().columns().len();
     let row_number_expr = row_number();
-    let window_plan = LogicalPlanBuilder::window_plan(plan.clone(), vec![row_number_expr])
-        .map_err(crate::error::datafusion_err_to_delta)?;
+    let window_plan = LogicalPlanBuilder::window_plan(plan.clone(), vec![row_number_expr])?;
     let row_num_col = window_plan
         .schema()
         .columns()
@@ -682,17 +661,15 @@ fn append_row_index_column(
             .alias(row_index_name.to_string()),
     );
     LogicalPlanBuilder::from(window_plan)
-        .project(projection)
-        .map_err(crate::error::datafusion_err_to_delta)?
+        .project(projection)?
         .build()
-        .map_err(crate::error::datafusion_err_to_delta)
 }
 
 fn append_constant_i64_column(
     plan: LogicalPlan,
     column_name: &str,
     value: i64,
-) -> Result<LogicalPlan, DeltaError> {
+) -> Result<LogicalPlan, DataFusionError> {
     let mut projection = plan
         .schema()
         .columns()
@@ -701,17 +678,13 @@ fn append_constant_i64_column(
         .map(Expr::Column)
         .collect::<Vec<_>>();
     projection.push(lit(value).alias(column_name.to_string()));
-    LogicalPlanBuilder::from(plan)
-        .project(projection)
-        .map_err(crate::error::datafusion_err_to_delta)?
-        .build()
-        .map_err(crate::error::datafusion_err_to_delta)
+    LogicalPlanBuilder::from(plan).project(projection)?.build()
 }
 
 fn plan_column_by_name(
     plan: &LogicalPlan,
     name: &str,
-) -> Result<datafusion_common::Column, DeltaError> {
+) -> Result<datafusion_common::Column, DataFusionError> {
     plan.schema()
         .columns()
         .iter()
@@ -725,7 +698,7 @@ fn plan_column_by_name(
         })
 }
 
-fn drop_named_column(plan: LogicalPlan, drop_name: &str) -> Result<LogicalPlan, DeltaError> {
+fn drop_named_column(plan: LogicalPlan, drop_name: &str) -> Result<LogicalPlan, DataFusionError> {
     let projection = plan
         .schema()
         .columns()
@@ -734,16 +707,15 @@ fn drop_named_column(plan: LogicalPlan, drop_name: &str) -> Result<LogicalPlan, 
         .cloned()
         .map(Expr::Column)
         .collect::<Vec<_>>();
-    LogicalPlanBuilder::from(plan)
-        .project(projection)
-        .map_err(crate::error::datafusion_err_to_delta)?
-        .build()
-        .map_err(crate::error::datafusion_err_to_delta)
+    LogicalPlanBuilder::from(plan).project(projection)?.build()
 }
 
 /// Lower an entire [`Plan`] to a DataFusion [`LogicalPlan`]. Always succeeds or surfaces a
-/// typed [`DeltaError`].
-pub fn compile_plan_logical(plan: &Plan, ctx: &CompileContext) -> Result<LogicalPlan, DeltaError> {
+/// typed [`DataFusionError`].
+pub fn compile_plan_logical(
+    plan: &Plan,
+    ctx: &CompileContext,
+) -> Result<LogicalPlan, DataFusionError> {
     let _ = plan.sink.sink_type; // sink-type dispatch happens at the caller.
     compile_declarative_node_logical(&plan.root, ctx)
 }
@@ -751,7 +723,7 @@ pub fn compile_plan_logical(plan: &Plan, ctx: &CompileContext) -> Result<Logical
 fn compile_declarative_node_logical(
     node: &DeclarativePlanNode,
     ctx: &CompileContext,
-) -> Result<LogicalPlan, DeltaError> {
+) -> Result<LogicalPlan, DataFusionError> {
     match node {
         DeclarativePlanNode::Values(values) => {
             let arrow_schema: ArrowSchema =
@@ -774,23 +746,18 @@ fn compile_declarative_node_logical(
                 .map(|row| {
                     row.iter()
                         .map(|s| kernel_expr_to_df(&Expression::literal(s.clone())))
-                        .collect::<Result<Vec<_>, DeltaError>>()
+                        .collect::<Result<Vec<_>, DataFusionError>>()
                 })
-                .collect::<Result<Vec<_>, DeltaError>>()?;
-            let plan = LogicalPlanBuilder::values_with_schema(rows, &df_schema)
-                .map_err(crate::error::datafusion_err_to_delta)?
-                .build()
-                .map_err(crate::error::datafusion_err_to_delta)?;
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
+            let plan = LogicalPlanBuilder::values_with_schema(rows, &df_schema)?.build()?;
             canonicalize_output_to_kernel_schema(plan, &values.schema)
         }
         DeclarativePlanNode::Filter { child, node } => {
             let child_plan = compile_declarative_node_logical(child, ctx)?;
             let predicate = kernel_expr_to_df(node.predicate.as_ref())?;
             LogicalPlanBuilder::from(child_plan)
-                .filter(predicate)
-                .map_err(crate::error::datafusion_err_to_delta)?
+                .filter(predicate)?
                 .build()
-                .map_err(crate::error::datafusion_err_to_delta)
         }
         DeclarativePlanNode::Project { child, node } => {
             let child_plan = compile_declarative_node_logical(child, ctx)?;
@@ -851,10 +818,8 @@ fn compile_declarative_node_logical(
                         })
                         .collect();
                     let renamed_plan = LogicalPlanBuilder::from(child_plan)
-                        .project(rename_projection)
-                        .map_err(crate::error::datafusion_err_to_delta)?
-                        .build()
-                        .map_err(crate::error::datafusion_err_to_delta)?;
+                        .project(rename_projection)?
+                        .build()?;
                     let mut rewriter = RewriteRootColumn {
                         rename: &colliding_inputs,
                     };
@@ -917,14 +882,12 @@ fn compile_declarative_node_logical(
                     } else {
                         cast(base_logical, output_arrow_field.data_type().clone())
                     };
-                    Ok::<Expr, DeltaError>(logical.alias(field.name().to_string()))
+                    Ok::<Expr, DataFusionError>(logical.alias(field.name().to_string()))
                 })
-                .collect::<Result<Vec<_>, DeltaError>>()?;
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
             LogicalPlanBuilder::from(working_plan)
-                .project(projection)
-                .map_err(crate::error::datafusion_err_to_delta)?
+                .project(projection)?
                 .build()
-                .map_err(crate::error::datafusion_err_to_delta)
         }
         DeclarativePlanNode::Union { children, node } => {
             if children.is_empty() {
@@ -935,7 +898,7 @@ fn compile_declarative_node_logical(
             let mut compiled: Vec<LogicalPlan> = children
                 .iter()
                 .map(|child| compile_declarative_node_logical(child, ctx))
-                .collect::<Result<_, DeltaError>>()?;
+                .collect::<Result<_, DataFusionError>>()?;
             if compiled.len() == 1 {
                 return Ok(compiled.remove(0));
             }
@@ -944,11 +907,7 @@ fn compile_declarative_node_logical(
             } else {
                 let first = compiled.remove(0);
                 compiled.into_iter().try_fold(first, |acc, right| {
-                    LogicalPlanBuilder::from(acc)
-                        .union(right)
-                        .map_err(crate::error::datafusion_err_to_delta)?
-                        .build()
-                        .map_err(crate::error::datafusion_err_to_delta)
+                    LogicalPlanBuilder::from(acc).union(right)?.build()
                 })
             }
         }
@@ -964,10 +923,8 @@ fn compile_declarative_node_logical(
                 format!("relation_{}", handle.id),
                 provider_as_source(Arc::clone(provider)),
                 None,
-            )
-            .map_err(crate::error::datafusion_err_to_delta)?
+            )?
             .build()
-            .map_err(crate::error::datafusion_err_to_delta)
         }
         DeclarativePlanNode::Scan(node) => scan_to_listing_logical_plan(node),
         DeclarativePlanNode::Join { build, probe, node } => {
@@ -1001,10 +958,8 @@ fn compile_declarative_node_logical(
                 KernelJoinType::LeftAnti => DfJoinType::RightAnti,
             };
             let plan = LogicalPlanBuilder::from(build_plan)
-                .join_with_expr_keys(probe_plan, join_type, (left_keys, right_keys), None)
-                .map_err(crate::error::datafusion_err_to_delta)?
-                .build()
-                .map_err(crate::error::datafusion_err_to_delta)?;
+                .join_with_expr_keys(probe_plan, join_type, (left_keys, right_keys), None)?
+                .build()?;
             let target_schema = match node.join_type {
                 KernelJoinType::LeftAnti => super::node_output_schema(probe)?,
                 KernelJoinType::Inner => {
@@ -1039,7 +994,7 @@ fn compile_declarative_node_logical(
                 .partition_by
                 .iter()
                 .map(|e| kernel_expr_to_df(e.as_ref()))
-                .collect::<Result<Vec<_>, DeltaError>>()?;
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
             let order_by = node
                 .order_by
                 .iter()
@@ -1047,7 +1002,7 @@ fn compile_declarative_node_logical(
                     let expr = kernel_expr_to_df(&Expression::from(spec.column.clone()))?;
                     Ok(expr.sort(!spec.descending, spec.nulls_first))
                 })
-                .collect::<Result<Vec<_>, DeltaError>>()?;
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
             // Multiple identical row_number() PARTITION BY / ORDER BY exprs collide on
             // DataFusion's "windows require unique expression names" validation. Emit a single
             // window expression and replicate its output to each requested output_col via the
@@ -1055,19 +1010,15 @@ fn compile_declarative_node_logical(
             let row_number_expr = row_number()
                 .partition_by(partition_by.clone())
                 .order_by(order_by.clone())
-                .build()
-                .map_err(crate::error::datafusion_err_to_delta)?;
-            let expr_name = row_number_expr
-                .name_for_alias()
-                .map_err(crate::error::datafusion_err_to_delta)?;
+                .build()?;
+            let expr_name = row_number_expr.name_for_alias()?;
             let window_exprs = vec![row_number_expr];
             let window_expr_names: Vec<(String, String)> = node
                 .functions
                 .iter()
                 .map(|wf| (expr_name.clone(), wf.output_col.clone()))
                 .collect();
-            let window_plan = LogicalPlanBuilder::window_plan(child_plan.clone(), window_exprs)
-                .map_err(crate::error::datafusion_err_to_delta)?;
+            let window_plan = LogicalPlanBuilder::window_plan(child_plan.clone(), window_exprs)?;
             let input_col_count = child_plan.schema().columns().len();
             let mut projection = child_plan
                 .schema()
@@ -1092,10 +1043,8 @@ fn compile_declarative_node_logical(
                 cast(Expr::Column(src_col.clone()), ArrowDataType::Int64).alias(to.clone())
             }));
             let plan = LogicalPlanBuilder::from(window_plan)
-                .project(projection)
-                .map_err(crate::error::datafusion_err_to_delta)?
-                .build()
-                .map_err(crate::error::datafusion_err_to_delta)?;
+                .project(projection)?
+                .build()?;
             Ok(plan)
         }
         DeclarativePlanNode::FileListing(node) => file_listing_to_logical_plan(node),
@@ -1106,7 +1055,7 @@ fn compile_declarative_node_logical(
 /// literal i64 ordinal onto each child, [`LogicalPlanBuilder::union`] the lot, sort by ordinal,
 /// then project to drop it. Same recipe as [`super::scan::compile_ordered_union_via_ordinal`]
 /// but emitted at the logical layer so the optimizer sees it.
-fn compile_ordered_union(children: Vec<LogicalPlan>) -> Result<LogicalPlan, DeltaError> {
+fn compile_ordered_union(children: Vec<LogicalPlan>) -> Result<LogicalPlan, DataFusionError> {
     const ORDINAL_COL: &str = "__dk_ord";
     let mut tagged: Vec<LogicalPlan> = Vec::with_capacity(children.len());
     for (idx, child) in children.into_iter().enumerate() {
@@ -1117,18 +1066,12 @@ fn compile_ordered_union(children: Vec<LogicalPlan>) -> Result<LogicalPlan, Delt
         .next()
         .expect("compile_ordered_union: at least one child");
     let unioned = iter.try_fold(first, |acc, right| {
-        LogicalPlanBuilder::from(acc)
-            .union(right)
-            .map_err(crate::error::datafusion_err_to_delta)?
-            .build()
-            .map_err(crate::error::datafusion_err_to_delta)
+        LogicalPlanBuilder::from(acc).union(right)?.build()
     })?;
     let ordinal_col = plan_column_by_name(&unioned, ORDINAL_COL)?;
     let sorted = LogicalPlanBuilder::from(unioned)
-        .sort(vec![Expr::Column(ordinal_col).sort(true, true)])
-        .map_err(crate::error::datafusion_err_to_delta)?
-        .build()
-        .map_err(crate::error::datafusion_err_to_delta)?;
+        .sort(vec![Expr::Column(ordinal_col).sort(true, true)])?
+        .build()?;
     drop_named_column(sorted, ORDINAL_COL)
 }
 
