@@ -18,8 +18,7 @@ use datafusion_common::error::DataFusionError;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::types::{Int32Type, Int64Type};
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, LargeListArray, ListArray, MapArray, RecordBatch,
-    StructArray, UInt32Array,
+    Array, ArrayRef, AsArray, BooleanArray, MapArray, RecordBatch, StructArray, UInt32Array,
 };
 use delta_kernel::arrow::compute::{filter_record_batch, take};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Fields};
@@ -474,25 +473,25 @@ fn arrow_columns_align_to_schema(
         .map_err(|e| crate::error::internal_error(format!("align schema batch failed: {e}")))
 }
 
+/// Walk `array` against the shape of `target_field`, rebuilding any nested
+/// struct/list/map containers so the result's element/field types match the target. Primitive
+/// arrays pass through unchanged. The recursion handles nullability propagation: each container
+/// is rebuilt with the target child field(s), so any tightening or relaxing of nested
+/// nullability lands in the output without rewriting actual values.
 fn realign_array_to_field(
     array: &ArrayRef,
     target_field: &Field,
 ) -> Result<ArrayRef, DataFusionError> {
     match target_field.data_type() {
-        ArrowDataType::Struct(target_fields) => realign_struct_array(array, target_fields),
-        ArrowDataType::List(target_inner) => realign_list_array(array, target_inner.as_ref()),
-        ArrowDataType::LargeList(target_inner) => {
-            realign_large_list_array(array, target_inner.as_ref())
-        }
-        ArrowDataType::Map(target_entries, _) => realign_map_array(array, target_entries.as_ref()),
+        ArrowDataType::Struct(target_fields) => realign_struct(array, target_fields),
+        ArrowDataType::List(target_inner) => realign_list::<i32>(array, target_inner.as_ref()),
+        ArrowDataType::LargeList(target_inner) => realign_list::<i64>(array, target_inner.as_ref()),
+        ArrowDataType::Map(target_entries, _) => realign_map(array, target_entries.as_ref()),
         _ => Ok(array.clone()),
     }
 }
 
-fn realign_struct_array(
-    array: &ArrayRef,
-    target_fields: &Fields,
-) -> Result<ArrayRef, DataFusionError> {
+fn realign_struct(array: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef, DataFusionError> {
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
@@ -509,41 +508,37 @@ fn realign_struct_array(
     )))
 }
 
-fn realign_list_array(
+/// Generic recursion for `ListArray` / `LargeListArray`. `O = i32` recovers the
+/// standard `ListArray`; `O = i64` recovers `LargeListArray`. Both downcast to
+/// `GenericListArray<O>` and rebuild it with the target element field.
+fn realign_list<O>(
     array: &ArrayRef,
     target_element_field: &Field,
-) -> Result<ArrayRef, DataFusionError> {
+) -> Result<ArrayRef, DataFusionError>
+where
+    O: delta_kernel::arrow::array::OffsetSizeTrait,
+{
     let list_arr = array
         .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| crate::error::internal_error("expected ListArray while aligning"))?;
+        .downcast_ref::<delta_kernel::arrow::array::GenericListArray<O>>()
+        .ok_or_else(|| {
+            crate::error::internal_error(format!(
+                "expected GenericListArray<{}> while aligning",
+                std::any::type_name::<O>()
+            ))
+        })?;
     let values = realign_array_to_field(list_arr.values(), target_element_field)?;
-    Ok(Arc::new(ListArray::new(
-        Arc::new(target_element_field.clone()),
-        list_arr.offsets().clone(),
-        values,
-        list_arr.nulls().cloned(),
-    )))
+    Ok(Arc::new(
+        delta_kernel::arrow::array::GenericListArray::<O>::new(
+            Arc::new(target_element_field.clone()),
+            list_arr.offsets().clone(),
+            values,
+            list_arr.nulls().cloned(),
+        ),
+    ))
 }
 
-fn realign_large_list_array(
-    array: &ArrayRef,
-    target_element_field: &Field,
-) -> Result<ArrayRef, DataFusionError> {
-    let list_arr = array
-        .as_any()
-        .downcast_ref::<LargeListArray>()
-        .ok_or_else(|| crate::error::internal_error("expected LargeListArray while aligning"))?;
-    let values = realign_array_to_field(list_arr.values(), target_element_field)?;
-    Ok(Arc::new(LargeListArray::new(
-        Arc::new(target_element_field.clone()),
-        list_arr.offsets().clone(),
-        values,
-        list_arr.nulls().cloned(),
-    )))
-}
-
-fn realign_map_array(
+fn realign_map(
     array: &ArrayRef,
     target_entries_field: &Field,
 ) -> Result<ArrayRef, DataFusionError> {
@@ -557,7 +552,7 @@ fn realign_map_array(
         ));
     };
     let entries_ref: ArrayRef = Arc::new(map_arr.entries().clone());
-    let new_entries = realign_struct_array(&entries_ref, target_entry_fields)?;
+    let new_entries = realign_struct(&entries_ref, target_entry_fields)?;
     let entries_struct = new_entries
         .as_any()
         .downcast_ref::<StructArray>()

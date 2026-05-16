@@ -188,13 +188,32 @@ pub(super) fn scan_to_listing_logical_plan(
     Ok(scan_plan)
 }
 
+/// Build a projection that passes through every column of `pass_through_schema_src` and
+/// appends `new_column` aliased as `new_column_name`. Used for the "all-existing-columns plus
+/// one synthesized column" pattern that drives row-index plumbing and ordered-union ordinals.
+fn project_pass_through_with(
+    plan: LogicalPlan,
+    pass_through_schema_src: &LogicalPlan,
+    new_column: Expr,
+    new_column_name: &str,
+) -> Result<LogicalPlan, DataFusionError> {
+    let mut projection = pass_through_schema_src
+        .schema()
+        .columns()
+        .iter()
+        .cloned()
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    projection.push(new_column.alias(new_column_name.to_string()));
+    LogicalPlanBuilder::from(plan).project(projection)?.build()
+}
+
 pub(super) fn append_row_index_column(
     plan: LogicalPlan,
     row_index_name: &str,
 ) -> Result<LogicalPlan, DataFusionError> {
     let input_col_count = plan.schema().columns().len();
-    let row_number_expr = row_number();
-    let window_plan = LogicalPlanBuilder::window_plan(plan.clone(), vec![row_number_expr])?;
+    let window_plan = LogicalPlanBuilder::window_plan(plan.clone(), vec![row_number()])?;
     let row_num_col = window_plan
         .schema()
         .columns()
@@ -205,20 +224,10 @@ pub(super) fn append_row_index_column(
                 "logical scan row index: missing row_number output at index {input_col_count}"
             ))
         })?;
-    let mut projection = plan
-        .schema()
-        .columns()
-        .iter()
-        .cloned()
-        .map(Expr::Column)
-        .collect::<Vec<_>>();
-    projection.push(
-        (cast(Expr::Column(row_num_col), ArrowDataType::Int64) - lit(1_i64))
-            .alias(row_index_name.to_string()),
-    );
-    LogicalPlanBuilder::from(window_plan)
-        .project(projection)?
-        .build()
+    // 0-based row index within each scanned file: `row_number() - 1`, cast to i64 to match the
+    // Delta scan-row schema's expected type.
+    let row_index_expr = cast(Expr::Column(row_num_col), ArrowDataType::Int64) - lit(1_i64);
+    project_pass_through_with(window_plan, &plan, row_index_expr, row_index_name)
 }
 
 pub(super) fn append_constant_i64_column(
@@ -226,15 +235,8 @@ pub(super) fn append_constant_i64_column(
     column_name: &str,
     value: i64,
 ) -> Result<LogicalPlan, DataFusionError> {
-    let mut projection = plan
-        .schema()
-        .columns()
-        .iter()
-        .cloned()
-        .map(Expr::Column)
-        .collect::<Vec<_>>();
-    projection.push(lit(value).alias(column_name.to_string()));
-    LogicalPlanBuilder::from(plan).project(projection)?.build()
+    let plan_clone = plan.clone();
+    project_pass_through_with(plan_clone, &plan, lit(value), column_name)
 }
 
 pub(super) fn plan_column_by_name(

@@ -239,22 +239,41 @@ impl DataFusionExecutor {
         Ok(())
     }
 
-    /// Drain a [`PhaseOperation`] against the executor and return the resulting [`PhaseState`].
+    /// Drain a [`PhaseOperation`] against the executor and return the resulting [`PhaseState`],
+    /// discarding any batches produced by [`SinkType::Results`] plans.
+    ///
+    /// Use [`Self::execute_phase_operation_with_sink`] (or one of the SM drivers) when the caller
+    /// needs to capture or stream `Results` batches.
     pub async fn execute_phase_operation(
         &self,
         op: PhaseOperation,
     ) -> Result<PhaseState, EngineError> {
+        self.execute_phase_operation_with_sink(op, &mut ResultSink::Discard)
+            .await
+    }
+
+    /// Variant of [`Self::execute_phase_operation`] parameterized by how [`SinkType::Results`]
+    /// plan batches are consumed across the `PhaseOperation::Plans` slice; see [`ResultSink`].
+    async fn execute_phase_operation_with_sink(
+        &self,
+        op: PhaseOperation,
+        result_sink: &mut ResultSink<'_>,
+    ) -> Result<PhaseState, EngineError> {
         self.clear_kdf_harvest_slot();
         match op {
             PhaseOperation::Plans(plans) => self
-                .execute_plans(plans)
+                .execute_plans(plans, result_sink)
                 .await
                 .map_err(EngineError::internal),
             PhaseOperation::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
         }
     }
 
-    async fn execute_plans(&self, plans: Vec<Plan>) -> Result<PhaseState, DataFusionError> {
+    async fn execute_plans(
+        &self,
+        plans: Vec<Plan>,
+        result_sink: &mut ResultSink<'_>,
+    ) -> Result<PhaseState, DataFusionError> {
         let state = PhaseState::empty();
         for plan in plans {
             let providers = self.prefetch_relation_providers(&plan).await?;
@@ -265,15 +284,24 @@ impl DataFusionExecutor {
                 engine: Arc::clone(&self.engine),
             };
             let physical = self.prepare_execution_plan(&plan, &ctx).await?;
-            self.drain_and_register(&plan, physical, &ctx).await?;
+            if matches!(plan.sink.sink_type, SinkType::Results(_)) {
+                let stream = self.single_results_stream(physical)?;
+                result_sink.consume_results_stream(stream).await?;
+            } else {
+                self.drain_and_register(&plan, physical, &ctx).await?;
+            }
         }
         Ok(state)
     }
 
-    /// Drain `physical` according to `plan`'s sink type. For [`SinkType::Relation`] the collected
-    /// batches are registered into [`Self::session_ctx`] as a [`MemTable`] keyed by the sink's
-    /// output [`RelationHandle`]; [`SinkType::Load`] runs the upstream batches through
-    /// [`load::materialize_upstream_batch`] first.
+    /// Drain `physical` according to `plan`'s sink type, registering any materialized rows back
+    /// into [`Self::session_ctx`].
+    ///
+    /// For [`SinkType::Relation`] the collected batches are registered as a [`MemTable`] keyed by
+    /// the sink's output [`RelationHandle`]; [`SinkType::Load`] runs the upstream batches through
+    /// [`load::materialize_upstream_batch`] first. [`SinkType::ConsumeByKdf`] drains into a
+    /// kernel KDF handle. [`SinkType::Results`] is handled by the unified driver via
+    /// [`ResultSink`] and never reaches this method.
     async fn drain_and_register(
         &self,
         plan: &Plan,
@@ -281,7 +309,6 @@ impl DataFusionExecutor {
         ctx: &CompileContext,
     ) -> Result<(), DataFusionError> {
         match &plan.sink.sink_type {
-            SinkType::Results(_) => self.drain_results_stream(physical).await,
             SinkType::Relation(handle) => {
                 let batches = self.collect_all_partitions(physical).await?;
                 self.register_relation_into_session(handle, batches)
@@ -291,6 +318,10 @@ impl DataFusionExecutor {
                 self.register_relation_into_session(&sink.output_relation, batches)
             }
             SinkType::ConsumeByKdf(sink) => self.drain_consume_by_kdf(physical, sink, ctx).await,
+            SinkType::Results(_) => Err(crate::error::internal_error(
+                "drain_and_register reached unreachable SinkType::Results arm; \
+                 the unified driver should route Results through ResultSink",
+            )),
         }
     }
 
@@ -355,58 +386,6 @@ impl DataFusionExecutor {
         Ok(out)
     }
 
-    /// Same draining semantics as [`Self::execute_phase_operation`], plus capture of the batches
-    /// produced by the **last** [`SinkType::Results`] plan in the [`PhaseOperation::Plans`] slice
-    /// (when present). Used by [`Self::drive_coroutine_sm_collecting_results`] and in-crate tests
-    /// that need to verify row content of an SM-driven `Results` sink without rewriting the SM's
-    /// `Output` contract.
-    async fn execute_phase_operation_with_results_capture(
-        &self,
-        op: PhaseOperation,
-    ) -> Result<(PhaseState, Option<Vec<RecordBatch>>), EngineError> {
-        self.clear_kdf_harvest_slot();
-
-        match op {
-            PhaseOperation::Plans(plans) => self
-                .execute_plans_with_results_capture(plans)
-                .await
-                .map_err(EngineError::internal),
-            PhaseOperation::SchemaQuery(node) => {
-                let state = execute_schema_query_phase(&self.engine, node)?;
-                Ok((state, None))
-            }
-        }
-    }
-
-    async fn execute_plans_with_results_capture(
-        &self,
-        plans: Vec<Plan>,
-    ) -> Result<(PhaseState, Option<Vec<RecordBatch>>), DataFusionError> {
-        let state = PhaseState::empty();
-        let mut last_results_batches: Option<Vec<RecordBatch>> = None;
-        for plan in plans {
-            let providers = self.prefetch_relation_providers(&plan).await?;
-            let ctx = CompileContext {
-                relation_providers: providers,
-                kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
-                phase_state: Some(state.clone()),
-                engine: Arc::clone(&self.engine),
-            };
-            let physical = self.prepare_execution_plan(&plan, &ctx).await?;
-            if matches!(plan.sink.sink_type, SinkType::Results(_)) {
-                let mut stream = self.single_results_stream(physical)?;
-                let mut batches = Vec::new();
-                while let Some(batch) = stream.try_next().await? {
-                    batches.push(batch);
-                }
-                last_results_batches = Some(batches);
-            } else {
-                self.drain_and_register(&plan, physical, &ctx).await?;
-            }
-        }
-        Ok((state, last_results_batches))
-    }
-
     fn clear_kdf_harvest_slot(&self) {
         let mut guard = self
             .kdf_harvest_slot
@@ -415,19 +394,13 @@ impl DataFusionExecutor {
         *guard = None;
     }
 
-    /// Drive a [`CoroutineSM`] until [`AdvanceResult::Done`].
+    /// Drive a [`CoroutineSM`] until [`AdvanceResult::Done`], discarding any
+    /// [`SinkType::Results`] batches produced along the way.
     pub async fn drive_coroutine_sm<R: Send + 'static>(
         &self,
-        mut sm: CoroutineSM<R>,
+        sm: CoroutineSM<R>,
     ) -> Result<R, DeltaError> {
-        loop {
-            let op = sm.get_operation()?;
-            let phase_result = self.execute_phase_operation(op).await;
-            match sm.advance(phase_result)? {
-                AdvanceResult::Continue => {}
-                AdvanceResult::Done(v) => return Ok(v),
-            }
-        }
+        self.drive_sm_with_sink(sm, &mut ResultSink::Discard).await
     }
 
     /// Drive a [`CoroutineSM`] until [`AdvanceResult::Done`] *and* capture the
@@ -440,25 +413,13 @@ impl DataFusionExecutor {
     /// registry or rewrite the SM's `Output` contract.
     pub async fn drive_coroutine_sm_collecting_results<R: Send + 'static>(
         &self,
-        mut sm: CoroutineSM<R>,
+        sm: CoroutineSM<R>,
     ) -> Result<(R, Vec<RecordBatch>), DeltaError> {
-        let mut last_results: Vec<RecordBatch> = Vec::new();
-        loop {
-            let op = sm.get_operation()?;
-            let phase_result = self
-                .execute_phase_operation_with_results_capture(op)
-                .await
-                .map(|(state, batches)| {
-                    if let Some(b) = batches {
-                        last_results = b;
-                    }
-                    state
-                });
-            match sm.advance(phase_result)? {
-                AdvanceResult::Continue => {}
-                AdvanceResult::Done(v) => return Ok((v, last_results)),
-            }
-        }
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let value = self
+            .drive_sm_with_sink(sm, &mut ResultSink::Collect(&mut batches))
+            .await?;
+        Ok((value, batches))
     }
 
     /// Drive a [`CoroutineSM`] to completion while streaming `Results` sink output batches to a
@@ -467,17 +428,26 @@ impl DataFusionExecutor {
     /// batches in memory first.
     pub async fn drive_coroutine_sm_streaming_results<R, F>(
         &self,
-        mut sm: CoroutineSM<R>,
+        sm: CoroutineSM<R>,
         mut on_batch: F,
     ) -> Result<R, DeltaError>
     where
         R: Send + 'static,
         F: FnMut(RecordBatch) -> Result<(), DeltaError> + Send,
     {
+        let mut sink = ResultSink::Stream(&mut on_batch);
+        self.drive_sm_with_sink(sm, &mut sink).await
+    }
+
+    async fn drive_sm_with_sink<R: Send + 'static>(
+        &self,
+        mut sm: CoroutineSM<R>,
+        result_sink: &mut ResultSink<'_>,
+    ) -> Result<R, DeltaError> {
         loop {
             let op = sm.get_operation()?;
             let phase_result = self
-                .execute_phase_operation_streaming_results(op, &mut on_batch)
+                .execute_phase_operation_with_sink(op, result_sink)
                 .await;
             match sm.advance(phase_result)? {
                 AdvanceResult::Continue => {}
@@ -656,62 +626,47 @@ impl DataFusionExecutor {
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         physical.execute(0, Arc::clone(&self.task_ctx))
     }
+}
 
-    async fn drain_results_stream(
-        &self,
-        physical: Arc<dyn ExecutionPlan>,
+/// Per-driver policy for consuming the [`RecordBatch`] streams of [`SinkType::Results`] plans
+/// yielded by an SM.
+///
+/// - [`ResultSink::Discard`] drains the Results stream to completion without materializing any of
+///   its batches.
+/// - [`ResultSink::Collect`] overwrites the caller's `Vec<RecordBatch>` with the batches of the
+///   **last** Results plan in the `PhaseOperation::Plans` slice across all phase operations driven
+///   by this sink. Previous captures are dropped when a new Results plan starts.
+/// - [`ResultSink::Stream`] forwards each batch to the caller callback as it arrives, without
+///   buffering across batches or plans.
+enum ResultSink<'a> {
+    Discard,
+    Collect(&'a mut Vec<RecordBatch>),
+    Stream(&'a mut (dyn FnMut(RecordBatch) -> Result<(), DeltaError> + Send)),
+}
+
+impl ResultSink<'_> {
+    /// Consume every batch in `stream` according to this sink's variant. For
+    /// [`ResultSink::Collect`], replaces any previously-collected batches (so only the most
+    /// recent `Results` plan's output is retained).
+    async fn consume_results_stream(
+        &mut self,
+        mut stream: SendableRecordBatchStream,
     ) -> Result<(), DataFusionError> {
-        let mut stream = self.single_results_stream(physical)?;
-        while stream.try_next().await?.is_some() {}
-        Ok(())
-    }
-
-    async fn execute_phase_operation_streaming_results<F>(
-        &self,
-        op: PhaseOperation,
-        on_batch: &mut F,
-    ) -> Result<PhaseState, EngineError>
-    where
-        F: FnMut(RecordBatch) -> Result<(), DeltaError> + Send,
-    {
-        self.clear_kdf_harvest_slot();
-        match op {
-            PhaseOperation::Plans(plans) => self
-                .execute_plans_streaming_results(plans, on_batch)
-                .await
-                .map_err(EngineError::internal),
-            PhaseOperation::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
-        }
-    }
-
-    async fn execute_plans_streaming_results<F>(
-        &self,
-        plans: Vec<Plan>,
-        on_batch: &mut F,
-    ) -> Result<PhaseState, DataFusionError>
-    where
-        F: FnMut(RecordBatch) -> Result<(), DeltaError> + Send,
-    {
-        let state = PhaseState::empty();
-        for plan in plans {
-            let providers = self.prefetch_relation_providers(&plan).await?;
-            let ctx = CompileContext {
-                relation_providers: providers,
-                kdf_harvest_slot: Arc::clone(&self.kdf_harvest_slot),
-                phase_state: Some(state.clone()),
-                engine: Arc::clone(&self.engine),
-            };
-            let physical = self.prepare_execution_plan(&plan, &ctx).await?;
-            if matches!(plan.sink.sink_type, SinkType::Results(_)) {
-                let mut stream = self.single_results_stream(physical)?;
+        match self {
+            ResultSink::Discard => while stream.try_next().await?.is_some() {},
+            ResultSink::Collect(buf) => {
+                buf.clear();
                 while let Some(batch) = stream.try_next().await? {
-                    on_batch(batch).map_err(crate::error::wrap_delta_err)?;
+                    buf.push(batch);
                 }
-            } else {
-                self.drain_and_register(&plan, physical, &ctx).await?;
+            }
+            ResultSink::Stream(cb) => {
+                while let Some(batch) = stream.try_next().await? {
+                    cb(batch).map_err(crate::error::wrap_delta_err)?;
+                }
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
