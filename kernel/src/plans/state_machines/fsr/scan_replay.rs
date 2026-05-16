@@ -18,9 +18,8 @@ use super::schemas::{
     scan_live_actions_schema, scan_partition_values_physical_schema, ADD_PATH,
 };
 use crate::delta_error;
-use crate::expressions::{ColumnName, Predicate};
+use crate::expressions::{ColumnName, Expression, IntoColumnName, Predicate};
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
-use crate::plans::ir::expr_ext::{col, PredicateExt};
 use crate::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
 use crate::plans::ir::{DeclarativePlanNode, Plan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
@@ -244,16 +243,20 @@ fn scan_metadata_plans_with_shape(
                 ),
             );
         }
-        let add_path_present = col(ADD_PATH).is_not_null();
+        let add_path_present = Expression::Column(ADD_PATH.into_column_name()).is_not_null();
         // Data-skipping predicates are best-effort and must never introduce false negatives.
         // Keep rows when the skipping predicate evaluates to NULL (unknown) to avoid over-pruning
         // files with incomplete / partially-missing stats coverage.
         let pred = predicate.as_ref().clone();
-        let skip_or_unknown = pred.clone().or(Predicate::is_null(pred));
-        let combined = add_path_present.and(skip_or_unknown);
+        let skip_or_unknown = Predicate::or(pred.clone(), Predicate::is_null(pred));
+        let combined = Predicate::and(add_path_present, skip_or_unknown);
         metadata_root = metadata_root.filter(Arc::new(combined.into()));
     } else {
-        metadata_root = metadata_root.filter(Arc::new(col(ADD_PATH).is_not_null().into()));
+        metadata_root = metadata_root.filter(Arc::new(
+            Expression::Column(ADD_PATH.into_column_name())
+                .is_not_null()
+                .into(),
+        ));
     }
     let live_actions = metadata_root.project(
         scan_live_actions_projection(!partition_columns.is_empty()),
@@ -268,7 +271,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::expressions::{Expression, Scalar};
+    use crate::expressions::Scalar;
     use crate::plans::ir::nodes::SinkType;
     use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
     use crate::plans::state_machines::framework::state_machine::{AdvanceResult, StateMachine};
@@ -309,7 +312,7 @@ mod tests {
     ) -> Result<Scan, DeltaError> {
         let mut builder = ScanBuilder::new(snapshot).with_stats();
         if cfg.with_predicate {
-            builder = builder.with_predicate(Arc::new(col("id").is_not_null()));
+            builder = builder.with_predicate(Arc::new(Expression::column(["id"]).is_not_null()));
         }
         builder.build_replay()
     }
@@ -429,7 +432,7 @@ mod tests {
     fn scan_metadata_with_predicate_materializes_parsed_stats() {
         let (_engine, snapshot, _tmp) = load_test_table("basic_partitioned").unwrap();
         let predicate = Arc::new(Predicate::gt(
-            col(["number"]),
+            Expression::column(["number"]),
             Expression::literal(Scalar::Long(1)),
         ));
         let scan = ScanBuilder::new(Arc::clone(&snapshot))
@@ -460,7 +463,7 @@ mod tests {
         let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
         let mut builder = ScanBuilder::new(Arc::clone(&snapshot)).with_stats();
         if with_predicate {
-            builder = builder.with_predicate(Arc::new(col("id").is_not_null()));
+            builder = builder.with_predicate(Arc::new(Expression::column(["id"]).is_not_null()));
         }
         let scan = builder.build_replay().unwrap();
         let (metadata, _) = scan.scan_metadata_state_machine().unwrap();

@@ -10,7 +10,7 @@ use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::column_names::{
     column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    ColumnName, IntoColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -895,6 +895,21 @@ impl Expression {
     /// evaluator's `result_type`.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
+    }
+
+    /// `COALESCE(self, lit(default))` -- substitute NULL with a default scalar.
+    pub fn or_lit<S: Into<Scalar>>(self, default: S) -> Expression {
+        Expression::coalesce([self, Expression::literal(default)])
+    }
+
+    /// `COALESCE(self, other)` -- substitute NULL with another expression.
+    pub fn or_else(self, other: impl Into<Expression>) -> Expression {
+        Expression::coalesce([self, other.into()])
+    }
+
+    /// `TO_JSON(self)` -- encode this expression as a JSON-formatted string column.
+    pub fn to_json(self) -> Expression {
+        Expression::unary(UnaryExpressionOp::ToJson, self)
     }
 }
 

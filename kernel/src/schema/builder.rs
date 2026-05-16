@@ -1,35 +1,49 @@
-//! Fluent extension trait for [`SchemaRef`] / [`StructType`] augmentation.
+//! Fluent [`SchemaBuilder`] for incrementally constructing or augmenting [`StructType`] /
+//! [`SchemaRef`] values.
 //!
 //! Plan builders frequently start from a kernel-defined action schema and add or replace one or
-//! two fields (`__fsr_join_k`, `version`, `partitionValues_parsed`, `stats_parsed`). Today that's
-//! a `Vec::collect().push().push().try_new()` ritual. This trait collapses it to method chains:
+//! two fields (`__fsr_join_k`, `version`, `partitionValues_parsed`, `stats_parsed`). The
+//! builder collapses the otherwise-verbose `Vec::collect().push().push().try_new()` ritual to
+//! a method chain:
 //!
 //! ```ignore
-//! use delta_kernel::plans::ir::schema_ext::SchemaBuildExt;
-//!
 //! let augmented = action_read_schema()
+//!     .build_on()
 //!     .with_nullable(FSR_JOIN_KEY_COL, DataType::Array(Box::new(ArrayType::new(
 //!         DataType::STRING, true))))
 //!     .with_not_null("version", DataType::LONG)
 //!     .build()?;
 //! ```
 //!
-//! No new types — the trait targets `&StructType` / `&SchemaRef` and returns a small
-//! [`SchemaBuilder`] that finalizes via [`SchemaBuilder::build`] (validating) or
-//! [`SchemaBuilder::build_unchecked`] (when the caller knows there are no duplicates).
+//! Finalize via [`SchemaBuilder::build`] (validating) or [`SchemaBuilder::build_unchecked`]
+//! (when the caller knows there are no duplicates).
 
 use std::sync::Arc;
 
 use crate::error::Error;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 
-/// Append-only builder produced by [`SchemaBuildExt`] methods. Finalize with
-/// [`Self::build`] (validated) or [`Self::build_unchecked`] (caller-asserted unique names).
+/// Append-only builder used to construct a [`StructType`] / [`SchemaRef`]. Open one via
+/// [`SchemaBuilder::new`] or [`StructType::build_on`]; finalize via [`Self::build`]
+/// (validated) or [`Self::build_unchecked`] (caller-asserted unique names).
 pub struct SchemaBuilder {
     fields: Vec<StructField>,
 }
 
 impl SchemaBuilder {
+    /// Open an empty [`SchemaBuilder`]. Equivalent to calling [`StructType::build_on`] on an
+    /// empty struct but reads better when constructing a schema from scratch.
+    pub fn new() -> Self {
+        Self { fields: Vec::new() }
+    }
+
+    /// Open a builder seeded with the fields of `schema`.
+    pub fn from_schema(schema: &StructType) -> Self {
+        Self {
+            fields: schema.fields().cloned().collect(),
+        }
+    }
+
     /// Add a field. The field's nullability is taken from the [`StructField`] itself; this is
     /// the lowest-level append.
     pub fn with_field(mut self, field: StructField) -> Self {
@@ -53,7 +67,7 @@ impl SchemaBuilder {
         self
     }
 
-    /// Validating finalize — fails if field names are duplicated. Returns an [`Arc`]-wrapped
+    /// Validating finalize -- fails if field names are duplicated. Returns an [`Arc`]-wrapped
     /// schema so the result is directly assignable to [`SchemaRef`] slots.
     pub fn build(self) -> Result<SchemaRef, Error> {
         StructType::try_new(self.fields).map(Arc::new)
@@ -66,30 +80,10 @@ impl SchemaBuilder {
     }
 }
 
-/// Open a fluent [`SchemaBuilder`] from an existing struct or schema.
-pub trait SchemaBuildExt {
-    /// Start a builder seeded with the fields of `self`.
-    fn build_on(&self) -> SchemaBuilder;
-}
-
-impl SchemaBuildExt for StructType {
-    fn build_on(&self) -> SchemaBuilder {
-        SchemaBuilder {
-            fields: self.fields().cloned().collect(),
-        }
+impl Default for SchemaBuilder {
+    fn default() -> Self {
+        Self::new()
     }
-}
-
-impl SchemaBuildExt for SchemaRef {
-    fn build_on(&self) -> SchemaBuilder {
-        self.as_ref().build_on()
-    }
-}
-
-/// Open an empty [`SchemaBuilder`]. Equivalent to calling [`SchemaBuildExt::build_on`] on an
-/// empty struct but reads better when constructing a schema from scratch.
-pub fn schema_builder() -> SchemaBuilder {
-    SchemaBuilder { fields: Vec::new() }
 }
 
 #[cfg(test)]
@@ -117,7 +111,7 @@ mod tests {
     #[test]
     fn build_unchecked_dedups_duplicate_field_names() {
         // `StructType::new_unchecked` silently deduplicates (last writer wins).
-        let schema = schema_builder()
+        let schema = SchemaBuilder::new()
             .with_not_null("x", DataType::LONG)
             .with_not_null("x", DataType::STRING)
             .build_unchecked();

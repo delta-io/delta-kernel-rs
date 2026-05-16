@@ -14,9 +14,9 @@ use crate::actions::{
     ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
+use crate::expressions::Expression;
 use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::expr_ext::col;
 use crate::plans::ir::nodes::FileFormat;
 use crate::plans::ir::{DeclarativePlanNode, Extractor, Plan};
 use crate::plans::kdf::SidecarCollector;
@@ -232,7 +232,9 @@ pub(super) fn build_sidecar_discovery_plan(
         .collect();
     let sidecar_scan =
         DeclarativePlanNode::scan(checkpoint_format, checkpoint_files, sidecar_only_schema())
-            .filter(Arc::new(col("sidecar").is_not_null().into()));
+            .filter(Arc::new(
+                Expression::column(["sidecar"]).is_not_null().into(),
+            ));
     Ok(sidecar_scan.consume(SidecarCollector::new(
         snapshot.log_segment().log_root.clone(),
     )))

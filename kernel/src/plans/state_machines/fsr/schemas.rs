@@ -16,9 +16,10 @@ use crate::actions::{
     SIDECAR_NAME,
 };
 use crate::delta_error;
-use crate::expressions::{BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar};
+use crate::expressions::{
+    BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate, Scalar,
+};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::expr_ext::{any_of, col, lit, ExpressionExt, PredicateExt};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::schema::{
@@ -162,19 +163,22 @@ pub(super) fn scan_live_actions_projection(
     with_partition_values_parsed: bool,
 ) -> Vec<Arc<Expression>> {
     let mut file_constant_exprs = vec![
-        col(["add", "partitionValues"]),
-        col(["add", "baseRowId"]),
-        col(["add", "defaultRowCommitVersion"]),
-        col(["add", "tags"]),
-        col(["add", "clusteringProvider"]),
+        Expression::column(["add", "partitionValues"]),
+        Expression::column(["add", "baseRowId"]),
+        Expression::column(["add", "defaultRowCommitVersion"]),
+        Expression::column(["add", "tags"]),
+        Expression::column(["add", "clusteringProvider"]),
     ];
     if with_partition_values_parsed {
-        file_constant_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])));
+        file_constant_exprs.push(Expression::map_to_struct(Expression::column([
+            "add",
+            "partitionValues",
+        ])));
     }
     vec![
-        Arc::new(col(["add", "path"])),
-        Arc::new(col(["add", "size"])),
-        Arc::new(col(["add", "deletionVector"])),
+        Arc::new(Expression::column(["add", "path"])),
+        Arc::new(Expression::column(["add", "size"])),
+        Arc::new(Expression::column(["add", "deletionVector"])),
         Arc::new(Expression::struct_from(file_constant_exprs)),
     ]
 }
@@ -211,37 +215,37 @@ pub(super) fn scan_actions_with_parsed_projection(
     partition_values_parsed_schema: Option<&SchemaRef>,
 ) -> Vec<Arc<Expression>> {
     let mut add_exprs = vec![
-        Arc::new(col(["add", "path"])),
-        Arc::new(col(["add", "partitionValues"])),
-        Arc::new(col(["add", "size"])),
-        Arc::new(col(["add", "modificationTime"])),
-        Arc::new(col(["add", "dataChange"])),
-        Arc::new(col(["add", "stats"])),
-        Arc::new(col(["add", "tags"])),
-        Arc::new(col(["add", "deletionVector"])),
-        Arc::new(col(["add", "baseRowId"])),
-        Arc::new(col(["add", "defaultRowCommitVersion"])),
-        Arc::new(col(["add", "clusteringProvider"])),
+        Arc::new(Expression::column(["add", "path"])),
+        Arc::new(Expression::column(["add", "partitionValues"])),
+        Arc::new(Expression::column(["add", "size"])),
+        Arc::new(Expression::column(["add", "modificationTime"])),
+        Arc::new(Expression::column(["add", "dataChange"])),
+        Arc::new(Expression::column(["add", "stats"])),
+        Arc::new(Expression::column(["add", "tags"])),
+        Arc::new(Expression::column(["add", "deletionVector"])),
+        Arc::new(Expression::column(["add", "baseRowId"])),
+        Arc::new(Expression::column(["add", "defaultRowCommitVersion"])),
+        Arc::new(Expression::column(["add", "clusteringProvider"])),
     ];
     if let Some(schema) = stats_parsed_schema {
         add_exprs.push(Arc::new(Expression::parse_json(
-            col(["add", "stats"]),
+            Expression::column(["add", "stats"]),
             schema.clone(),
         )));
     }
     if partition_values_parsed_schema.is_some() {
-        add_exprs.push(Arc::new(Expression::map_to_struct(col([
+        add_exprs.push(Arc::new(Expression::map_to_struct(Expression::column([
             "add",
             "partitionValues",
         ]))));
     }
     vec![
         Arc::new(Expression::struct_from(add_exprs)),
-        Arc::new(col([REMOVE_NAME])),
-        Arc::new(col([PROTOCOL_NAME])),
-        Arc::new(col([METADATA_NAME])),
-        Arc::new(col([DOMAIN_METADATA_NAME])),
-        Arc::new(col([SET_TRANSACTION_NAME])),
+        Arc::new(Expression::column([REMOVE_NAME])),
+        Arc::new(Expression::column([PROTOCOL_NAME])),
+        Arc::new(Expression::column([METADATA_NAME])),
+        Arc::new(Expression::column([DOMAIN_METADATA_NAME])),
+        Arc::new(Expression::column([SET_TRANSACTION_NAME])),
     ]
 }
 
@@ -281,17 +285,17 @@ pub(super) fn scan_data_projection(
         .fields()
         .map(|field| {
             let expr = match field.get_metadata_column_spec() {
-                Some(MetadataColumnSpec::RowIndex) => col([row_index_name.as_str()]),
+                Some(MetadataColumnSpec::RowIndex) => Expression::column([row_index_name.as_str()]),
                 Some(MetadataColumnSpec::RowCommitVersion) => {
-                    col([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
                 }
                 Some(MetadataColumnSpec::RowId) => Expression::binary(
                     BinaryExpressionOp::Plus,
-                    col([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
-                    col([row_index_name.as_str()]),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
+                    Expression::column([row_index_name.as_str()]),
                 ),
-                Some(MetadataColumnSpec::FilePath) => col(["path"]),
-                None if partition_columns.contains(field.name()) => col([
+                Some(MetadataColumnSpec::FilePath) => Expression::column(["path"]),
+                None if partition_columns.contains(field.name()) => Expression::column([
                     FILE_CONSTANT_VALUES_NAME,
                     "partitionValues_parsed",
                     field.physical_name(column_mapping_mode),
@@ -304,7 +308,7 @@ pub(super) fn scan_data_projection(
                             field.name(),
                         )
                     })?;
-                    col([physical_field.name().as_str()])
+                    Expression::column([physical_field.name().as_str()])
                 }
             };
             Ok(Arc::new(expr))
@@ -334,38 +338,42 @@ pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRe
 /// `txn_expiration_cutoff` is `None` when `delta.setTransactionRetentionDuration` is unset — txn
 /// rows are not filtered by age.
 pub(super) fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
-    let remove_ok = col("remove").is_null().or(col(REMOVE_DELETION_TIMESTAMP)
-        .or_lit(0i64)
-        .gt(lit(min_file_ts)));
+    let remove_ok = Predicate::or(
+        Expression::column(["remove"]).is_null(),
+        Expression::Column(REMOVE_DELETION_TIMESTAMP.into_column_name())
+            .or_lit(0i64)
+            .gt(Expression::literal(min_file_ts)),
+    );
     let txn_ok = match txn_expiry {
         None => Predicate::literal(true),
-        Some(cutoff) => any_of([
-            col("txn").is_null(),
-            col(TXN_LAST_UPDATED).is_null(),
-            col(TXN_LAST_UPDATED).gt(lit(cutoff)),
+        Some(cutoff) => Predicate::or_from([
+            Expression::column(["txn"]).is_null(),
+            Expression::Column(TXN_LAST_UPDATED.into_column_name()).is_null(),
+            Expression::Column(TXN_LAST_UPDATED.into_column_name()).gt(Expression::literal(cutoff)),
         ]),
     };
-    remove_ok.and(txn_ok)
+    Predicate::and(remove_ok, txn_ok)
 }
 
 pub(super) fn action_identity_projection() -> Vec<Arc<Expression>> {
     action_read_schema()
         .fields()
-        .map(|f| Arc::new(col([f.name().as_str()])))
+        .map(|f| Arc::new(Expression::column([f.name().as_str()])))
         .collect()
 }
 
 pub(super) fn fsr_dedup_key() -> Expression {
-    let null_str = || lit(Scalar::Null(DataType::STRING));
+    let null_str = || Expression::literal(Scalar::Null(DataType::STRING));
     let arm = |kind: &str, id1: Expression, id2: Expression, id3: Expression| {
-        Expression::array(vec![lit(kind), id1, id2, id3])
+        Expression::array(vec![Expression::literal(kind), id1, id2, id3])
     };
     // For file rows, the identity components come from either add or remove (one is non-null per
     // row); coalesce picks whichever side carries the value.
     let file_field = |suffix: &[&str]| {
         let add_path = ["add"].into_iter().chain(suffix.iter().copied());
         let remove_path = ["remove"].into_iter().chain(suffix.iter().copied());
-        col(ColumnName::new(add_path)).or_else(col(ColumnName::new(remove_path)))
+        Expression::Column(ColumnName::new(add_path))
+            .or_else(Expression::Column(ColumnName::new(remove_path)))
     };
 
     let file_arm = arm(
@@ -380,18 +388,18 @@ pub(super) fn fsr_dedup_key() -> Expression {
     // Domain metadata is keyed by domain; newer rows replace older configs for that domain.
     let domain_arm = arm(
         DOMAIN_METADATA_NAME,
-        col(("domainMetadata", "domain")),
+        Expression::column(["domainMetadata", "domain"]),
         null_str(),
         null_str(),
     );
     let txn_arm = arm(
         SET_TRANSACTION_NAME,
-        col(("txn", "appId")),
+        Expression::column(["txn", "appId"]),
         null_str(),
         null_str(),
     );
 
-    let null_list = lit(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+    let null_list = Expression::literal(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
         DataType::STRING,
         true,
     )))));
@@ -399,15 +407,22 @@ pub(super) fn fsr_dedup_key() -> Expression {
     Expression::case_when(
         vec![
             (
-                col(ADD_PATH)
-                    .is_not_null()
-                    .or(col(REMOVE_PATH).is_not_null()),
+                Predicate::or(
+                    Expression::Column(ADD_PATH.into_column_name()).is_not_null(),
+                    Expression::Column(REMOVE_PATH.into_column_name()).is_not_null(),
+                ),
                 file_arm,
             ),
-            (col("protocol").is_not_null(), proto_arm),
-            (col(METADATA_ID).is_not_null(), meta_arm),
-            (col("domainMetadata").is_not_null(), domain_arm),
-            (col("txn").is_not_null(), txn_arm),
+            (Expression::column(["protocol"]).is_not_null(), proto_arm),
+            (
+                Expression::Column(METADATA_ID.into_column_name()).is_not_null(),
+                meta_arm,
+            ),
+            (
+                Expression::column(["domainMetadata"]).is_not_null(),
+                domain_arm,
+            ),
+            (Expression::column(["txn"]).is_not_null(), txn_arm),
         ],
         null_list,
     )
@@ -421,7 +436,6 @@ pub(super) fn fsr_dedup_key() -> Expression {
 /// `build_commit_dedup_plan`'s row_number window (`ORDER BY version DESC`) and is dropped
 /// before the relation is persisted, so its presence in the schema is plan-internal.
 pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
-    use crate::plans::ir::schema_ext::SchemaBuildExt;
     let join_key_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, true)));
     let mut b = action_read_schema()
         .build_on()
@@ -433,13 +447,13 @@ pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, D
 }
 
 pub(super) fn fsr_row_has_identity_predicate() -> Predicate {
-    any_of([
-        col(ADD_PATH).is_not_null(),
-        col(REMOVE_PATH).is_not_null(),
-        col(PROTOCOL_MIN_READER).is_not_null(),
-        col(METADATA_ID).is_not_null(),
-        col(DOMAIN_METADATA_DOMAIN).is_not_null(),
-        col(TXN_APP_ID).is_not_null(),
+    Predicate::or_from([
+        Expression::Column(ADD_PATH.into_column_name()).is_not_null(),
+        Expression::Column(REMOVE_PATH.into_column_name()).is_not_null(),
+        Expression::Column(PROTOCOL_MIN_READER.into_column_name()).is_not_null(),
+        Expression::Column(METADATA_ID.into_column_name()).is_not_null(),
+        Expression::Column(DOMAIN_METADATA_DOMAIN.into_column_name()).is_not_null(),
+        Expression::Column(TXN_APP_ID.into_column_name()).is_not_null(),
     ])
 }
 

@@ -23,13 +23,11 @@ use crate::actions::SIDECAR_NAME;
 use crate::expressions::{ColumnName, Expression, Scalar};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::expr_ext::{col, lit};
 use crate::plans::ir::nodes::{
     FileFormat, LoadSink, OrderingSpec, RelationHandle, ScanFileColumns,
 };
-use crate::plans::ir::schema_ext::schema_builder;
 use crate::plans::ir::{plan, DeclarativePlanNode, Plan};
-use crate::schema::{ArrayType, DataType, SchemaRef, StructField, StructType};
+use crate::schema::{ArrayType, DataType, SchemaBuilder, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
 use crate::{delta_error, FileMeta, Version};
@@ -302,20 +300,26 @@ fn build_commit_dedup_plan(
     let project_with_key_and_version: Vec<Arc<Expression>> = action_identity_projection()
         .into_iter()
         .chain(std::iter::once(Arc::clone(&dedup_expr)))
-        .chain(std::iter::once(Arc::new(col(["version"]))))
+        .chain(std::iter::once(Arc::new(Expression::column(["version"]))))
         .collect();
     let projected = plan::relation_ref(commit_raw_handle)
         .project(project_with_key_and_version, with_key_and_version_schema)
-        .filter(Arc::new(col(FSR_JOIN_KEY_COL).is_not_null().into()));
+        .filter(Arc::new(
+            Expression::column([FSR_JOIN_KEY_COL]).is_not_null().into(),
+        ));
     let windowed = projected
         .window_row_number(
             "__kernel_rn",
-            vec![Arc::new(col(FSR_JOIN_KEY_COL))],
+            vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
             vec![OrderingSpec::desc(ColumnName::new(["version"]))],
         )
         .map_err(|e| e.into_delta_default())?;
 
-    let rn_top_k = Arc::new(col("__kernel_rn").le(lit(FSR_COMMIT_DEDUP_TOP_K)).into());
+    let rn_top_k = Arc::new(
+        Expression::column(["__kernel_rn"])
+            .le(Expression::literal(FSR_COMMIT_DEDUP_TOP_K))
+            .into(),
+    );
 
     // Final project: drop `version` and `__rn`; keep action_cols + __fsr_join_k.
     let final_proj: Vec<Arc<Expression>> = action_identity_projection()
@@ -356,11 +360,13 @@ fn build_sidecar_load_plan(
     log_root: &Url,
 ) -> Result<Plan, DeltaError> {
     let scan = plan::relation_ref(checkpoint_top_handle)
-        .filter(Arc::new(col(SIDECAR_NAME).is_not_null().into()))
+        .filter(Arc::new(
+            Expression::column([SIDECAR_NAME]).is_not_null().into(),
+        ))
         .project(
             vec![
-                Arc::new(col([SIDECAR_NAME, "path"])),
-                Arc::new(col([SIDECAR_NAME, "sizeInBytes"])),
+                Arc::new(Expression::column([SIDECAR_NAME, "path"])),
+                Arc::new(Expression::column([SIDECAR_NAME, "sizeInBytes"])),
             ],
             path_size_schema(false),
         );
@@ -460,20 +466,22 @@ fn build_results_plan(
 
     // Build side: just the dedup keys from commit winners (one column wide). LeftAnti emits
     // probe rows whose key is NOT in the build set, mirroring the probe child's schema.
-    let join_key_only_schema = schema_builder()
+    let join_key_only_schema = SchemaBuilder::new()
         .with_nullable(
             FSR_JOIN_KEY_COL,
             DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
         )
         .build()
         .map_err(|e| e.into_delta_default())?;
-    let commit_keys = plan::relation_ref(commit_dedup_handle)
-        .project(vec![Arc::new(col(FSR_JOIN_KEY_COL))], join_key_only_schema);
+    let commit_keys = plan::relation_ref(commit_dedup_handle).project(
+        vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
+        join_key_only_schema,
+    );
 
     let survivors = checkpoint_keyed.left_anti_join_on(
         commit_keys,
-        vec![Arc::new(col(FSR_JOIN_KEY_COL))],
-        vec![Arc::new(col(FSR_JOIN_KEY_COL))],
+        vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
+        vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
     );
 
     // Union directly on augmented rows (action + join key); drop join key once at the end.

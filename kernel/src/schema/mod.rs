@@ -21,6 +21,8 @@ use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+pub mod builder;
+pub use builder::SchemaBuilder;
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -651,6 +653,13 @@ impl StructType {
 
     pub fn builder() -> StructTypeBuilder {
         StructTypeBuilder::new()
+    }
+
+    /// Open a fluent [`SchemaBuilder`] seeded with the fields of this struct. Use this when
+    /// you want to add a few extra columns to an existing schema and finalize as a
+    /// [`SchemaRef`].
+    pub fn build_on(&self) -> SchemaBuilder {
+        SchemaBuilder::from_schema(self)
     }
 
     /// Creates a new [`StructType`] from the given fields without validating them.

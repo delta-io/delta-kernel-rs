@@ -119,6 +119,61 @@ impl ColumnName {
     }
 }
 
+/// Conversion into a [`ColumnName`] from common shapes (single string, array, tuple).
+pub trait IntoColumnName {
+    fn into_column_name(self) -> ColumnName;
+}
+
+impl IntoColumnName for ColumnName {
+    fn into_column_name(self) -> ColumnName {
+        self
+    }
+}
+
+impl IntoColumnName for &str {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self])
+    }
+}
+
+impl IntoColumnName for String {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self])
+    }
+}
+
+impl<A: Into<String>, const N: usize> IntoColumnName for [A; N] {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new(self.into_iter().map(Into::into))
+    }
+}
+
+impl IntoColumnName for &[&str] {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new(self.iter().copied())
+    }
+}
+
+impl<A: Into<String>, B: Into<String>> IntoColumnName for (A, B) {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self.0.into(), self.1.into()])
+    }
+}
+
+impl<A: Into<String>, B: Into<String>, C: Into<String>> IntoColumnName for (A, B, C) {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self.0.into(), self.1.into(), self.2.into()])
+    }
+}
+
+impl<A: Into<String>, B: Into<String>, C: Into<String>, D: Into<String>> IntoColumnName
+    for (A, B, C, D)
+{
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self.0.into(), self.1.into(), self.2.into(), self.3.into()])
+    }
+}
+
 /// Creates a new column name from a path of field names. Each field name is taken as-is, and may
 /// contain arbitrary characters (including periods, spaces, etc.).
 impl<A: Into<String>> FromIterator<A> for ColumnName {
