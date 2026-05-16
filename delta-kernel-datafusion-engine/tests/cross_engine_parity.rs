@@ -10,21 +10,20 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::sync::Arc;
 
-use common::run_to_batches;
+use common::{
+    assert_batch_column_data_equal, concat_or_clone, kernel_literal_batch, run_to_batches,
+};
 use delta_kernel::arrow::array::{AsArray, BooleanArray, Int64Array, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::Int64Type;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
-use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::{
     column_expr, BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar,
 };
 use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType, OrderingSpec, WindowFunction};
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::EvaluationHandler;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::parquet::{file_meta, write_i64_parquet};
 
@@ -33,16 +32,6 @@ fn scalar_long(s: &Scalar) -> i64 {
         Scalar::Long(v) => *v,
         other => panic!("expected LONG scalar, got {other:?}"),
     }
-}
-
-fn kernel_literal_batch(schema: Arc<StructType>, rows: &[Vec<Scalar>]) -> RecordBatch {
-    let handler = ArrowEvaluationHandler;
-    let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
-    handler
-        .create_many(schema, &row_refs)
-        .expect("create_many")
-        .try_into_record_batch()
-        .expect("record batch")
 }
 
 fn kernel_filter(batch: &RecordBatch, predicate: &Expression) -> RecordBatch {
@@ -63,7 +52,7 @@ fn kernel_project(
         output_schema
             .as_ref()
             .try_into_arrow()
-            .expect("schema→arrow"),
+            .expect("schema->arrow"),
     );
     let arrays: Vec<_> = columns
         .iter()
@@ -73,14 +62,6 @@ fn kernel_project(
         })
         .collect();
     RecordBatch::try_new(arrow_schema, arrays).expect("project batch")
-}
-
-fn concat_or_clone(batches: &[RecordBatch]) -> RecordBatch {
-    match batches.len() {
-        0 => panic!("empty batches"),
-        1 => batches[0].clone(),
-        _ => concat_batches(&batches[0].schema(), batches).expect("concat_batches"),
-    }
 }
 
 fn assert_batches_equal(expected: &RecordBatch, actual: &[RecordBatch]) {
@@ -93,26 +74,6 @@ fn assert_batches_equal(expected: &RecordBatch, actual: &[RecordBatch]) {
     );
     assert_eq!(expected.schema(), actual.schema(), "schema mismatch");
     assert_eq!(expected, &actual, "batch equality");
-}
-
-/// Parquet metadata can differ from DataFusion scan headers; compare column data only.
-fn assert_batch_column_data_equal(
-    kernel_schema: &Arc<StructType>,
-    expected: &RecordBatch,
-    actual: &RecordBatch,
-) {
-    assert_eq!(expected.num_rows(), actual.num_rows(), "row count");
-    assert_eq!(expected.num_columns(), actual.num_columns(), "column count");
-    let canonical: Arc<delta_kernel::arrow::datatypes::Schema> = Arc::new(
-        kernel_schema
-            .as_ref()
-            .try_into_arrow()
-            .expect("kernel→arrow schema"),
-    );
-    let exp = RecordBatch::try_new(canonical.clone(), expected.columns().to_vec())
-        .expect("canonical expected");
-    let act = RecordBatch::try_new(canonical, actual.columns().to_vec()).expect("canonical actual");
-    assert_eq!(exp, act);
 }
 
 #[tokio::test]

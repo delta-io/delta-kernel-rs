@@ -21,6 +21,36 @@ fn col(name: &str) -> ColumnName {
     ColumnName::from_naive_str_split(name)
 }
 
+/// `ScanFileColumns` with only the upstream `path` column wired (no size/count). Matches the
+/// shape used by every `LoadSink` test in this file.
+fn scan_file_path_only() -> ScanFileColumns {
+    ScanFileColumns {
+        path: col("path"),
+        size: None,
+        record_count: None,
+    }
+}
+
+/// Resolve `kernel/tests/data/table-with-dv-small` to a base directory URL. The DV fixture is
+/// reused by multiple `LoadSink` tests.
+fn dv_small_fixture_base_url() -> Url {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = std::fs::canonicalize(manifest_dir.join("../kernel/tests/data/table-with-dv-small"))
+        .unwrap();
+    Url::from_directory_path(&root).unwrap()
+}
+
+/// Sum `num_rows` across every batch registered under `handle` after the producing plan has run.
+async fn relation_row_count(executor: &DataFusionExecutor, handle: &RelationHandle) -> usize {
+    executor
+        .collect_relation(handle)
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum()
+}
+
 #[tokio::test]
 async fn load_sink_broadcasts_passthrough_columns() {
     let dir = tempfile::tempdir().unwrap();
@@ -60,11 +90,7 @@ async fn load_sink_broadcasts_passthrough_columns() {
         output_relation: handle.clone(),
         file_schema,
         base_url: Some(base_url),
-        file_meta: ScanFileColumns {
-            path: col("path"),
-            size: None,
-            record_count: None,
-        },
+        file_meta: scan_file_path_only(),
         dv_ref: None,
         passthrough_columns: vec![col("tag")],
         file_type: FileType::Parquet,
@@ -85,14 +111,7 @@ async fn load_sink_broadcasts_passthrough_columns() {
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor.execute_plans(&[producer_plan]).await.unwrap();
-    let producer_rows: usize = executor
-        .collect_relation(&handle)
-        .await
-        .unwrap()
-        .iter()
-        .map(|b| b.num_rows())
-        .sum();
-    assert_eq!(producer_rows, 4);
+    assert_eq!(relation_row_count(&executor, &handle).await, 4);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
 
@@ -126,10 +145,7 @@ async fn load_sink_broadcasts_passthrough_columns() {
 
 #[tokio::test]
 async fn load_sink_without_dv_reads_full_parquet_row_group() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root = std::fs::canonicalize(manifest_dir.join("../kernel/tests/data/table-with-dv-small"))
-        .unwrap();
-    let base_url = Url::from_directory_path(&root).unwrap();
+    let base_url = dv_small_fixture_base_url();
     let path_str =
         "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string();
 
@@ -145,11 +161,7 @@ async fn load_sink_without_dv_reads_full_parquet_row_group() {
         output_relation: handle.clone(),
         file_schema: Arc::clone(&file_schema),
         base_url: Some(base_url),
-        file_meta: ScanFileColumns {
-            path: col("path"),
-            size: None,
-            record_count: None,
-        },
+        file_meta: scan_file_path_only(),
         dv_ref: None,
         passthrough_columns: Vec::new(),
         file_type: FileType::Parquet,
@@ -165,14 +177,7 @@ async fn load_sink_without_dv_reads_full_parquet_row_group() {
         .execute_plans(&[lit.into_load(sink)])
         .await
         .unwrap();
-    let producer_rows: usize = executor
-        .collect_relation(&handle)
-        .await
-        .unwrap()
-        .iter()
-        .map(|b| b.num_rows())
-        .sum();
-    assert_eq!(producer_rows, 10);
+    assert_eq!(relation_row_count(&executor, &handle).await, 10);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -201,10 +206,7 @@ fn dv_example_scalar() -> Scalar {
 
 #[tokio::test]
 async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root = std::fs::canonicalize(manifest_dir.join("../kernel/tests/data/table-with-dv-small"))
-        .unwrap();
-    let base_url = Url::from_directory_path(&root).unwrap();
+    let base_url = dv_small_fixture_base_url();
     let path_str =
         "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string();
 
@@ -230,11 +232,7 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
         output_relation: handle.clone(),
         file_schema: Arc::clone(&file_schema),
         base_url: Some(base_url),
-        file_meta: ScanFileColumns {
-            path: col("path"),
-            size: None,
-            record_count: None,
-        },
+        file_meta: scan_file_path_only(),
         dv_ref: Some(DvRef::skip(dv_cn)),
         passthrough_columns: Vec::new(),
         file_type: FileType::Parquet,
@@ -250,14 +248,7 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
         .execute_plans(&[lit.into_load(sink)])
         .await
         .unwrap();
-    let producer_rows: usize = executor
-        .collect_relation(&handle)
-        .await
-        .unwrap()
-        .iter()
-        .map(|b| b.num_rows())
-        .sum();
-    assert_eq!(producer_rows, 8);
+    assert_eq!(relation_row_count(&executor, &handle).await, 8);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -285,11 +276,7 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
         output_relation: handle.clone(),
         file_schema: Arc::clone(&file_schema),
         base_url: Some(base_url),
-        file_meta: ScanFileColumns {
-            path: col("path"),
-            size: None,
-            record_count: None,
-        },
+        file_meta: scan_file_path_only(),
         dv_ref: None,
         passthrough_columns: Vec::new(),
         file_type: FileType::Json,
@@ -305,14 +292,7 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
         .execute_plans(&[lit.into_load(sink)])
         .await
         .unwrap();
-    let producer_rows: usize = executor
-        .collect_relation(&handle)
-        .await
-        .unwrap()
-        .iter()
-        .map(|b| b.num_rows())
-        .sum();
-    assert_eq!(producer_rows, 2);
+    assert_eq!(relation_row_count(&executor, &handle).await, 2);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);

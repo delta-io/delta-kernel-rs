@@ -1,51 +1,26 @@
 //! [`delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation`]
 //! wiring for [`delta_kernel_datafusion_engine::DataFusionExecutor`] (`execute_phase_operation`).
 
-use std::any::Any;
+mod common;
+
 use std::fs::File;
 use std::sync::Arc;
 
+use common::SumRowsConsumer;
 use delta_kernel::arrow::array::Int64Array;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch as ArrowRecordBatch;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::ir::nodes::{ConsumeByKdfSink, RelationHandle};
 use delta_kernel::plans::ir::DeclarativePlanNode;
-use delta_kernel::plans::kdf::{ConsumerKdf, Kdf, KdfControl};
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
 };
-use delta_kernel::{DeltaResult, EngineData};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 use test_utils::schemas::single_long_schema;
 use url::Url;
-
-#[derive(Debug, Clone)]
-struct SumRowsConsumer(usize);
-
-impl Kdf for SumRowsConsumer {
-    fn kdf_id(&self) -> &'static str {
-        "consumer.sum_rows_phase_op"
-    }
-
-    fn finish(self: Box<Self>) -> Box<dyn Any + Send> {
-        Box::new(self.0)
-    }
-}
-
-impl ConsumerKdf for SumRowsConsumer {
-    fn apply(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
-        let arrow = batch
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| delta_kernel::Error::generic("expected ArrowEngineData"))?;
-        self.0 += arrow.record_batch().num_rows();
-        Ok(KdfControl::Continue)
-    }
-}
 
 #[tokio::test]
 async fn phase_plans_runs_relation_producer_and_registers_relation() {
@@ -78,7 +53,7 @@ async fn phase_plans_runs_relation_producer_and_registers_relation() {
 async fn phase_plans_submits_consume_by_kdf_into_phase_kdf_state() {
     let schema = single_long_schema();
     let rows = vec![vec![Scalar::Long(10)], vec![Scalar::Long(20)]];
-    let sink = ConsumeByKdfSink::new_consumer(SumRowsConsumer(0));
+    let sink = ConsumeByKdfSink::new_consumer(SumRowsConsumer::new("consumer.sum_rows_phase_op"));
     let token = sink.token.clone();
     let plan = DeclarativePlanNode::values(schema, rows)
         .expect("literal")

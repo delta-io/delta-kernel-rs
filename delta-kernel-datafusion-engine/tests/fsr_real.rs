@@ -13,12 +13,14 @@
 //!    action today (`crc-full` only lists `domainMetadata` in protocol writerFeatures); synthetic
 //!    rows still cover domain metadata payloads.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::concat_or_clone;
 use delta_kernel::arrow::array::{Array, AsArray, RecordBatch, StringArray};
-use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::util::display::array_value_to_string;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -90,12 +92,29 @@ fn default_engine() -> Arc<dyn KernelEngine> {
     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
 }
 
+/// Build a kernel `(engine, snapshot)` pair for the table at `table_url`. Common scaffolding for
+/// FSR tests that drive snapshots over either real fixtures or synthetic temp tables.
+fn open_snapshot(table_url: Url) -> (Arc<dyn KernelEngine>, Arc<Snapshot>) {
+    let engine = default_engine();
+    let snapshot = Snapshot::builder_for(table_url)
+        .build(engine.as_ref())
+        .expect("snapshot");
+    (engine, snapshot)
+}
+
+/// `open_snapshot` keyed by a fixture name resolved via [`fixture_table`].
+fn open_snapshot_for_fixture(table: &str) -> (Arc<dyn KernelEngine>, Arc<Snapshot>) {
+    open_snapshot(fixture_table(table).url)
+}
+
+/// Canonicalize the path of an extracted/synthetic table directory into a `file://` URL.
+fn synthetic_table_url(dir: &TempDir) -> Url {
+    Url::from_directory_path(dir.path().canonicalize().expect("canon tmp table"))
+        .expect("table url")
+}
+
 fn extract_sorted_non_null_paths_from_results(batches: &[RecordBatch]) -> Vec<String> {
-    let merged = if batches.len() == 1 {
-        batches[0].clone()
-    } else {
-        concat_batches(&batches[0].schema(), batches).expect("concat results batches")
-    };
+    let merged = concat_or_clone(batches);
     let add_idx = merged.schema().index_of("add").expect("add idx");
     let add_col = merged.column(add_idx).as_struct_opt().expect("add struct");
     let path_col = add_col.column_by_name("path").expect("add.path");
@@ -108,11 +127,7 @@ fn extract_sorted_non_null_paths_from_results(batches: &[RecordBatch]) -> Vec<St
 }
 
 async fn run_full_state_results(table: &str) -> Vec<RecordBatch> {
-    let fixture = fixture_table(table);
-    let engine = default_engine();
-    let snapshot = Snapshot::builder_for(fixture.url)
-        .build(engine.as_ref())
-        .expect("snapshot");
+    let (engine, snapshot) = open_snapshot_for_fixture(table);
     let ex = DataFusionExecutor::try_new_with_engine(Arc::clone(&engine)).expect("executor");
     let sm = snapshot.full_state().expect("full_state SM");
     let rp = ex.drive_to_completion(sm).await.expect("drive full_state");
@@ -122,11 +137,7 @@ async fn run_full_state_results(table: &str) -> Vec<RecordBatch> {
 }
 
 fn expected_live_file_count_from_scan_metadata(table: &str) -> usize {
-    let fixture = fixture_table(table);
-    let engine = default_engine();
-    let snapshot = Snapshot::builder_for(fixture.url)
-        .build(engine.as_ref())
-        .expect("snapshot");
+    let (engine, snapshot) = open_snapshot_for_fixture(table);
     let scan = snapshot.scan_builder().build().expect("build scan");
     scan.scan_metadata(engine.as_ref())
         .expect("scan metadata")
@@ -201,50 +212,39 @@ async fn commit_dedup_batches_for_snapshot(
         .expect("commit_dedup relation batches")
 }
 
-async fn dedup_action_kinds_for_synthetic_table() -> Vec<String> {
-    let dir = build_synthetic_protocol_metadata_domain_table();
-    let table_url =
-        Url::from_directory_path(dir.path().canonicalize().expect("canon tmp table")).expect("url");
-    let engine = default_engine();
-    let snapshot = Snapshot::builder_for(table_url)
-        .build(engine.as_ref())
-        .expect("snapshot");
-    let batches = commit_dedup_batches_for_snapshot(snapshot, engine).await;
+/// Action kind columns inspected to label commit-dedup rows by their non-null top-level field.
+const DEDUP_ACTION_KINDS: &[&str] = &[
+    "add",
+    "remove",
+    "protocol",
+    "metaData",
+    "domainMetadata",
+    "txn",
+];
 
+async fn dedup_action_kinds_for_synthetic_table() -> Vec<String> {
+    let batches = dedup_full_rows_for_synthetic_table().await;
     let mut kinds = Vec::new();
     for b in batches {
         let schema = b.schema();
-        let idx_add = schema.index_of("add").expect("add idx");
-        let idx_remove = schema.index_of("remove").expect("remove idx");
-        let idx_protocol = schema.index_of("protocol").expect("protocol idx");
-        let idx_meta = schema.index_of("metaData").expect("metaData idx");
-        let idx_domain = schema.index_of("domainMetadata").expect("domain idx");
-        let idx_txn = schema.index_of("txn").expect("txn idx");
-        let add = b.column(idx_add).as_struct_opt().expect("add struct");
-        let remove = b.column(idx_remove).as_struct_opt().expect("remove struct");
-        let protocol = b
-            .column(idx_protocol)
-            .as_struct_opt()
-            .expect("protocol struct");
-        let meta = b.column(idx_meta).as_struct_opt().expect("meta struct");
-        let domain = b.column(idx_domain).as_struct_opt().expect("domain struct");
-        let txn = b.column(idx_txn).as_struct_opt().expect("txn struct");
+        let columns: Vec<_> = DEDUP_ACTION_KINDS
+            .iter()
+            .map(|name| {
+                let idx = schema
+                    .index_of(name)
+                    .unwrap_or_else(|_| panic!("{name} idx"));
+                b.column(idx)
+                    .as_struct_opt()
+                    .unwrap_or_else(|| panic!("{name} struct"))
+            })
+            .collect();
         for i in 0..b.num_rows() {
-            if add.is_valid(i) {
-                kinds.push("add".to_string());
-            } else if remove.is_valid(i) {
-                kinds.push("remove".to_string());
-            } else if protocol.is_valid(i) {
-                kinds.push("protocol".to_string());
-            } else if meta.is_valid(i) {
-                kinds.push("metaData".to_string());
-            } else if domain.is_valid(i) {
-                kinds.push("domainMetadata".to_string());
-            } else if txn.is_valid(i) {
-                kinds.push("txn".to_string());
-            } else {
-                kinds.push("none".to_string());
-            }
+            let kind = DEDUP_ACTION_KINDS
+                .iter()
+                .zip(&columns)
+                .find_map(|(name, arr)| arr.is_valid(i).then_some(*name))
+                .unwrap_or("none");
+            kinds.push(kind.to_string());
         }
     }
     kinds.sort();
@@ -253,27 +253,14 @@ async fn dedup_action_kinds_for_synthetic_table() -> Vec<String> {
 
 async fn dedup_full_rows_for_synthetic_table() -> Vec<RecordBatch> {
     let dir = build_synthetic_protocol_metadata_domain_table();
-    let table_url =
-        Url::from_directory_path(dir.path().canonicalize().expect("canon tmp table")).expect("url");
-    let engine = default_engine();
-    let snapshot = Snapshot::builder_for(table_url)
-        .build(engine.as_ref())
-        .expect("snapshot");
+    let (engine, snapshot) = open_snapshot(synthetic_table_url(&dir));
     commit_dedup_batches_for_snapshot(snapshot, engine).await
 }
 
 async fn commit_dedup_merged_for_real_fixture(table_name: &str) -> RecordBatch {
-    let fixture = fixture_table(table_name);
-    let engine = default_engine();
-    let snapshot = Snapshot::builder_for(fixture.url)
-        .build(engine.as_ref())
-        .expect("snapshot");
+    let (engine, snapshot) = open_snapshot_for_fixture(table_name);
     let dedup_batches = commit_dedup_batches_for_snapshot(snapshot, engine).await;
-    if dedup_batches.len() == 1 {
-        dedup_batches.into_iter().next().expect("one batch")
-    } else {
-        concat_batches(&dedup_batches[0].schema(), &dedup_batches).expect("concat commit-dedup")
-    }
+    concat_or_clone(&dedup_batches)
 }
 
 async fn assert_fsr_matches_scan_paths(table_name: &str) {
@@ -327,32 +314,15 @@ fn evaluate_to_json_column(batch: &RecordBatch, col: &'static str) -> StringArra
 }
 
 fn full_action_payload_rows(batch: &RecordBatch) -> Vec<(String, JsonValue)> {
-    let add_json = evaluate_to_json_column(batch, "add");
-    let remove_json = evaluate_to_json_column(batch, "remove");
-    let protocol_json = evaluate_to_json_column(batch, "protocol");
-    let metadata_json = evaluate_to_json_column(batch, "metaData");
-    let domain_json = evaluate_to_json_column(batch, "domainMetadata");
-    let txn_json = evaluate_to_json_column(batch, "txn");
+    let json_columns: Vec<_> = DEDUP_ACTION_KINDS
+        .iter()
+        .map(|name| (*name, evaluate_to_json_column(batch, name)))
+        .collect();
     let mut rows = Vec::new();
     for i in 0..batch.num_rows() {
-        let push = |kind: &str, s: &str, out: &mut Vec<(String, JsonValue)>| {
-            out.push((
-                kind.to_string(),
-                serde_json::from_str::<JsonValue>(s).expect("json payload"),
-            ));
-        };
-        if add_json.is_valid(i) {
-            push("add", add_json.value(i), &mut rows);
-        } else if remove_json.is_valid(i) {
-            push("remove", remove_json.value(i), &mut rows);
-        } else if protocol_json.is_valid(i) {
-            push("protocol", protocol_json.value(i), &mut rows);
-        } else if metadata_json.is_valid(i) {
-            push("metaData", metadata_json.value(i), &mut rows);
-        } else if domain_json.is_valid(i) {
-            push("domainMetadata", domain_json.value(i), &mut rows);
-        } else if txn_json.is_valid(i) {
-            push("txn", txn_json.value(i), &mut rows);
+        if let Some((kind, arr)) = json_columns.iter().find(|(_, arr)| arr.is_valid(i)) {
+            let payload = serde_json::from_str::<JsonValue>(arr.value(i)).expect("json payload");
+            rows.push((kind.to_string(), payload));
         }
     }
     rows.sort_by(|(k1, v1), (k2, v2)| {
@@ -425,18 +395,9 @@ async fn fsr_commit_dedup_includes_protocol_metadata_and_domain_metadata_rows() 
 #[tokio::test]
 async fn fsr_commit_dedup_keeps_latest_metadata_singleton() {
     let dir = build_synthetic_metadata_replace_table();
-    let table_url =
-        Url::from_directory_path(dir.path().canonicalize().expect("canon tmp table")).expect("url");
-    let engine = default_engine();
-    let snapshot = Snapshot::builder_for(table_url)
-        .build(engine.as_ref())
-        .expect("snapshot");
+    let (engine, snapshot) = open_snapshot(synthetic_table_url(&dir));
     let dedup_batches = commit_dedup_batches_for_snapshot(snapshot, engine).await;
-    let merged = if dedup_batches.len() == 1 {
-        dedup_batches[0].clone()
-    } else {
-        concat_batches(&dedup_batches[0].schema(), &dedup_batches).expect("concat commit-dedup")
-    };
+    let merged = concat_or_clone(&dedup_batches);
     let payloads = full_action_payload_rows(&merged);
     let metadata_rows: Vec<_> = payloads
         .iter()
@@ -457,11 +418,7 @@ async fn fsr_commit_dedup_keeps_latest_metadata_singleton() {
 #[tokio::test]
 async fn fsr_commit_dedup_full_rows_expected_table_includes_protocol_metadata_domain() {
     let dedup_batches = dedup_full_rows_for_synthetic_table().await;
-    let merged = if dedup_batches.len() == 1 {
-        dedup_batches[0].clone()
-    } else {
-        concat_batches(&dedup_batches[0].schema(), &dedup_batches).expect("concat commit-dedup")
-    };
+    let merged = concat_or_clone(&dedup_batches);
     let actual = full_action_payload_rows(&merged);
     let expected = vec![
         (
