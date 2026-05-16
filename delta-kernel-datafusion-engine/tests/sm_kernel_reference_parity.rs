@@ -15,10 +15,11 @@ use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
 };
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::EvaluationHandler;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use tempfile::tempdir;
+use test_utils::schemas::single_long_schema;
 use url::Url;
 
 fn concat_or_clone(batches: &[RecordBatch]) -> RecordBatch {
@@ -46,13 +47,6 @@ fn assert_batch_column_data_equal(
         .expect("canonical exp");
     let act = RecordBatch::try_new(canonical, actual.columns().to_vec()).expect("canonical act");
     assert_eq!(exp, act);
-}
-
-fn long_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked([StructField::not_null(
-        "x",
-        DataType::LONG,
-    )]))
 }
 
 fn kernel_literal_record_batch(schema: SchemaRef, rows: &[Vec<Scalar>]) -> RecordBatch {
@@ -111,7 +105,7 @@ async fn parity_phase_schema_query_matches_kernel_parquet_footer_read() {
 
 #[tokio::test]
 async fn parity_phase_plans_relation_pipe_matches_kernel_literal_materialization() {
-    let schema = long_schema();
+    let schema = single_long_schema();
     let rows = vec![vec![Scalar::Long(100)], vec![Scalar::Long(200)]];
     let kernel_reference_batch = kernel_literal_record_batch(Arc::clone(&schema), &rows);
 

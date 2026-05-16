@@ -16,21 +16,12 @@ use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType as KernelDataType, MetadataValue, StructField, StructType,
 };
-use delta_kernel::FileMeta;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
-use url::Url;
+use test_utils::parquet::file_meta;
 
 fn parquet_field_id_meta(id: i64) -> HashMap<String, String> {
     HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
-}
-
-fn file_meta(path: &std::path::Path) -> FileMeta {
-    FileMeta::new(
-        Url::from_file_path(path).unwrap(),
-        0,
-        std::fs::metadata(path).unwrap().len(),
-    )
 }
 
 fn write_parquet(path: &std::path::Path, schema: Arc<ArrowSchema>, batch: RecordBatch) {

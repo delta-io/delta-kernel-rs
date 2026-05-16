@@ -1,13 +1,11 @@
 //! Integration tests for [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load),
 //! DV masking via [`LoadSink::dv_ref`], and parquet footer reads (SchemaQuery-shaped API).
 
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
-use delta_kernel::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::array::AsArray;
 use delta_kernel::expressions::{ColumnName, Scalar, StructData};
 use delta_kernel::plans::ir::nodes::{
     DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, ValuesNode,
@@ -16,28 +14,11 @@ use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType, ToSchema};
 use delta_kernel::FileMeta;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
-use parquet::arrow::ArrowWriter;
+use test_utils::parquet::write_i64_parquet;
 use url::Url;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::from_naive_str_split(name)
-}
-
-fn write_i64_parquet(path: &std::path::Path, field: &str, values: &[i64]) {
-    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-        field,
-        ArrowDataType::Int64,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int64Array::from_iter_values(values.iter().copied())) as ArrayRef],
-    )
-    .unwrap();
-    let file = File::create(path).unwrap();
-    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
 }
 
 #[tokio::test]

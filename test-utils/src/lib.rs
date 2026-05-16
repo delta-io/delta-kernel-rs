@@ -1,6 +1,8 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
 pub mod counting_reporter;
+pub mod parquet;
+pub mod schemas;
 pub mod table_builder;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

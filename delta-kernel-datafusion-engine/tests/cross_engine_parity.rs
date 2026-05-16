@@ -21,10 +21,10 @@ use delta_kernel::expressions::{
 use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType, OrderingSpec, WindowFunction};
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::{EvaluationHandler, FileMeta};
+use delta_kernel::EvaluationHandler;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use url::Url;
+use test_utils::parquet::{file_meta, write_i64_parquet};
 
 fn scalar_long(s: &Scalar) -> i64 {
     match s {
@@ -414,35 +414,11 @@ async fn parity_left_anti_join_matches_reference_probe_order() {
     assert_batches_equal(&expected_batch, std::slice::from_ref(&batch));
 }
 
-fn write_i64_parquet(path: &std::path::Path, values: &[i64]) {
-    use delta_kernel::arrow::datatypes::{DataType as ArrowDT, Field, Schema};
-    let schema = Arc::new(Schema::new(vec![Field::new("x", ArrowDT::Int64, false)]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int64Array::from_iter_values(
-            values.iter().copied(),
-        ))],
-    )
-    .unwrap();
-    let file = File::create(path).unwrap();
-    let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-}
-
-fn file_meta(path: &std::path::Path) -> FileMeta {
-    FileMeta::new(
-        Url::from_file_path(path).unwrap(),
-        0,
-        std::fs::metadata(path).unwrap().len(),
-    )
-}
-
 #[tokio::test]
 async fn parity_scan_single_parquet_matches_arrow_reader() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.parquet");
-    write_i64_parquet(&path, &[7, 8, 9]);
+    write_i64_parquet(&path, "x", &[7, 8, 9]);
 
     let kernel_schema =
         Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap());

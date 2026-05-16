@@ -16,19 +16,12 @@ use delta_kernel::plans::kdf::{ConsumerKdf, Kdf, KdfControl};
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
 };
-use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::{DeltaResult, EngineData};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
+use test_utils::schemas::single_long_schema;
 use url::Url;
-
-fn long_schema() -> delta_kernel::schema::SchemaRef {
-    Arc::new(StructType::new_unchecked([StructField::not_null(
-        "x",
-        DataType::LONG,
-    )]))
-}
 
 #[derive(Debug, Clone)]
 struct SumRowsConsumer(usize);
@@ -56,7 +49,7 @@ impl ConsumerKdf for SumRowsConsumer {
 
 #[tokio::test]
 async fn phase_plans_runs_relation_producer_and_registers_relation() {
-    let schema = long_schema();
+    let schema = single_long_schema();
     let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
     let handle = RelationHandle::fresh("pipe", schema.clone());
 
@@ -83,7 +76,7 @@ async fn phase_plans_runs_relation_producer_and_registers_relation() {
 
 #[tokio::test]
 async fn phase_plans_submits_consume_by_kdf_into_phase_kdf_state() {
-    let schema = long_schema();
+    let schema = single_long_schema();
     let rows = vec![vec![Scalar::Long(10)], vec![Scalar::Long(20)]];
     let sink = ConsumeByKdfSink::new_consumer(SumRowsConsumer(0));
     let token = sink.token.clone();

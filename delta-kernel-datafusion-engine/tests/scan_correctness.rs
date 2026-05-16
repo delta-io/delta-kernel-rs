@@ -7,20 +7,20 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Array, AsArray, BooleanArray, Int64Array};
+use delta_kernel::arrow::array::{Array, AsArray, BooleanArray};
 use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::{column_expr, Expression, Predicate};
 use delta_kernel::plans::ir::nodes::RelationHandle;
 use delta_kernel::plans::ir::DeclarativePlanNode;
-use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, StructType};
 use delta_kernel::{EvaluationHandler, FileMeta};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use url::Url;
+use test_utils::parquet::{file_meta, write_i64_parquet};
+use test_utils::schemas::single_long_schema;
 
 /// Run `scan` through the executor: terminate in a Relation sink, run the plan, and return
 /// the materialized batches.
@@ -31,37 +31,6 @@ async fn scan_collect(scan: DeclarativePlanNode) -> Vec<RecordBatch> {
     let executor = DataFusionExecutor::try_new().unwrap();
     executor.execute_plans(&[plan]).await.unwrap();
     executor.collect_relation(&handle).await.unwrap()
-}
-
-fn kernel_schema_one_i64() -> Arc<StructType> {
-    Arc::new(StructType::try_new([StructField::new("x", KernelDataType::LONG, false)]).unwrap())
-}
-
-fn write_i64_parquet(path: &Path, values: &[i64]) {
-    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-        "x",
-        ArrowDataType::Int64,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int64Array::from_iter_values(
-            values.iter().copied(),
-        ))],
-    )
-    .unwrap();
-    let file = File::create(path).unwrap();
-    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-}
-
-fn file_meta(path: &Path) -> FileMeta {
-    FileMeta::new(
-        Url::from_file_path(path).unwrap(),
-        0,
-        std::fs::metadata(path).unwrap().len(),
-    )
 }
 
 fn read_parquet_batches(path: &Path) -> Vec<RecordBatch> {
@@ -128,10 +97,10 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
     let dir = tempfile::tempdir().unwrap();
     let p1 = dir.path().join("a.parquet");
     let p2 = dir.path().join("b.parquet");
-    write_i64_parquet(&p1, &[100, 101, 102]);
-    write_i64_parquet(&p2, &[200, 201]);
+    write_i64_parquet(&p1, "x", &[100, 101, 102]);
+    write_i64_parquet(&p2, "x", &[200, 201]);
 
-    let schema = kernel_schema_one_i64();
+    let schema = single_long_schema();
     let plan = DeclarativePlanNode::scan_parquet(
         vec![file_meta(&p1), file_meta(&p2)],
         Arc::clone(&schema),
@@ -164,10 +133,10 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
     let dir = tempfile::tempdir().unwrap();
     let p1 = dir.path().join("one.parquet");
     let p2 = dir.path().join("two.parquet");
-    write_i64_parquet(&p1, &[10, 11]);
-    write_i64_parquet(&p2, &[20]);
+    write_i64_parquet(&p1, "x", &[10, 11]);
+    write_i64_parquet(&p2, "x", &[20]);
 
-    let schema = kernel_schema_one_i64();
+    let schema = single_long_schema();
     let plan = DeclarativePlanNode::scan_parquet(
         vec![file_meta(&p1), file_meta(&p2)],
         Arc::clone(&schema),
@@ -193,11 +162,11 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
         .iter()
         .map(|n| dir.path().join(n))
         .collect();
-    write_i64_parquet(&paths[0], &[5, 8, 12]);
-    write_i64_parquet(&paths[1], &[25, 30]);
-    write_i64_parquet(&paths[2], &[3, 100]);
+    write_i64_parquet(&paths[0], "x", &[5, 8, 12]);
+    write_i64_parquet(&paths[1], "x", &[25, 30]);
+    write_i64_parquet(&paths[2], "x", &[3, 100]);
 
-    let kernel_schema = kernel_schema_one_i64();
+    let kernel_schema = single_long_schema();
     let pred = Arc::new(Expression::from_pred(Predicate::gt(
         column_expr!("x"),
         Expression::literal(delta_kernel::expressions::Scalar::Long(10)),
