@@ -10,12 +10,11 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::checkpoint_shape::CheckpointShape;
-use super::schemas::{
-    action_identity_projection, action_output_schema, action_read_schema, augmented_action_schema,
-    checkpoint_manifest_scan_schema, fsr_dedup_key, fsr_row_has_identity_predicate,
-    path_size_schema, retention_filter, FSR_JOIN_KEY_COL,
+use super::action::{
+    action_output_schema, action_read_schema, augmented_action_schema, fsr_dedup_key,
+    fsr_row_has_identity_predicate, path_size_schema, retention_filter, FSR_JOIN_KEY_COL,
 };
+use super::checkpoint_shape::{checkpoint_manifest_scan_schema, CheckpointShape};
 use crate::action_reconciliation::{
     calculate_transaction_expiration_timestamp, deleted_file_retention_timestamp_with_time,
 };
@@ -297,8 +296,9 @@ fn build_commit_dedup_plan(
     }
     let dedup_expr = Arc::new(fsr_dedup_key());
     let with_key_and_version_schema = augmented_action_schema(true)?;
-    let project_with_key_and_version: Vec<Arc<Expression>> = action_identity_projection()
-        .into_iter()
+    let project_with_key_and_version: Vec<Arc<Expression>> = action_read_schema()
+        .fields()
+        .map(|f| Arc::new(Expression::column([f.name().as_str()])))
         .chain(std::iter::once(Arc::clone(&dedup_expr)))
         .chain(std::iter::once(Arc::new(Expression::column(["version"]))))
         .collect();
@@ -322,8 +322,9 @@ fn build_commit_dedup_plan(
     );
 
     // Final project: drop `version` and `__rn`; keep action_cols + __fsr_join_k.
-    let final_proj: Vec<Arc<Expression>> = action_identity_projection()
-        .into_iter()
+    let final_proj: Vec<Arc<Expression>> = action_read_schema()
+        .fields()
+        .map(|f| Arc::new(Expression::column([f.name().as_str()])))
         .chain(std::iter::once(Arc::clone(&dedup_expr)))
         .collect();
 
@@ -434,17 +435,16 @@ fn build_results_plan(
             .filter(Arc::new(
                 retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
             ))
-            .project(action_identity_projection(), action_read_schema())
+            .drop_column(FSR_JOIN_KEY_COL)
             .into_results());
     }
 
     let dedup_expr = Arc::new(fsr_dedup_key());
     let augmented_schema = augmented_action_schema(false)?;
 
-    // Top-level checkpoint rows are preloaded once into `FSR_CHECKPOINT_TOP`; project action
-    // columns here so schema aligns with sidecar/action relations.
-    let top_scan = plan::relation_ref(checkpoint_top_handle)
-        .project(action_identity_projection(), action_read_schema());
+    // Top-level checkpoint rows are preloaded once into `FSR_CHECKPOINT_TOP`; drop the optional
+    // sidecar column so the schema aligns with sidecar/action relations.
+    let top_scan = plan::relation_ref(checkpoint_top_handle).drop_column(SIDECAR_NAME);
 
     let checkpoint_full = match sidecar_handle {
         Some(handle) => {
@@ -457,8 +457,9 @@ fn build_results_plan(
     let checkpoint_keyed = checkpoint_full
         .filter(Arc::new(fsr_row_has_identity_predicate().into()))
         .project(
-            action_identity_projection()
-                .into_iter()
+            action_read_schema()
+                .fields()
+                .map(|f| Arc::new(Expression::column([f.name().as_str()])))
                 .chain(std::iter::once(Arc::clone(&dedup_expr)))
                 .collect(),
             augmented_schema.clone(),
@@ -495,6 +496,12 @@ fn build_results_plan(
         .filter(Arc::new(
             retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
         ))
-        .project(action_identity_projection(), action_output_schema())
+        .project(
+            action_read_schema()
+                .fields()
+                .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+                .collect(),
+            action_output_schema(),
+        )
         .into_results())
 }

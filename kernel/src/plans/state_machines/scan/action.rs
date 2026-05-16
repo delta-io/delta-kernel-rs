@@ -1,31 +1,23 @@
-//! Schema helpers, action-column path constants, and predicate/projection builders shared
-//! by the FSR plan and replay-scan modules.
+//! Action-schema constructors, column-path constants, and the dedup / retention
+//! predicates shared by the FSR plan-builders and the replay-scan plans.
 //!
 //! Centralizes the column-path string constants (`ADD_PATH`, `REMOVE_PATH`, ...), the action
 //! schema builders (`action_schema`, `action_read_schema`, `action_output_schema` with
-//! `LazyLock` caches), the per-plan projection helpers, and the row-identity / retention
-//! predicates that the rest of the FSR pipeline composes.
+//! `LazyLock` caches), and the row-identity / retention predicates that the FSR pipeline
+//! composes.
 
-use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
+    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, ADD_NAME,
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
-    SIDECAR_NAME,
 };
-use crate::delta_error;
-use crate::expressions::{
-    BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate, Scalar,
-};
-use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
+use crate::expressions::{ColumnName, Expression, IntoColumnName, Predicate, Scalar};
+use crate::plans::errors::{DeltaError, KernelErrAsDelta};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
-use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::schema::{
-    ArrayType, DataType, MetadataColumnSpec, SchemaRef, StructField, StructType, ToSchema,
+    arc_schema, ArrayType, DataType, SchemaRef, StructField, StructType, ToSchema,
 };
-use crate::snapshot::Snapshot;
 
 /// Synthetic column carrying the materialized dedup key array so hash joins only need top-level
 /// column keys (`delta-kernel-datafusion-engine/src/compile/join.rs`).
@@ -46,6 +38,19 @@ pub(super) const DOMAIN_METADATA_DOMAIN: &[&str] = &["domainMetadata", "domain"]
 pub(super) const TXN_APP_ID: &[&str] = &["txn", "appId"];
 pub(super) const TXN_LAST_UPDATED: &[&str] = &["txn", "lastUpdated"];
 
+/// Top-level action fields in canonical order, used as the base of [`action_schema`] and
+/// [`augmented_action_schema`]. Each variant points at the typed `ToSchema` of its action.
+fn all_action_fields() -> Vec<StructField> {
+    vec![
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+    ]
+}
+
 /// Action schema for the action-replay stream.
 ///
 /// When `relaxed_nesting` is true (transport schema used while replaying / unioning action rows
@@ -53,21 +58,18 @@ pub(super) const TXN_LAST_UPDATED: &[&str] = &["txn", "lastUpdated"];
 /// failures during engine materialization. When false, the strict per-action `ToSchema` is used
 /// (kernel-visible output schema).
 fn action_schema(relaxed_nesting: bool) -> SchemaRef {
-    let relax = |s: StructType| {
-        if relaxed_nesting {
-            schema_with_all_fields_nullable(&s).unwrap_or(s)
-        } else {
-            s
+    let relax_field = |f: StructField| -> StructField {
+        if !relaxed_nesting {
+            return f;
         }
+        let DataType::Struct(inner) = f.data_type() else {
+            return f;
+        };
+        let relaxed = schema_with_all_fields_nullable(inner.as_ref())
+            .unwrap_or_else(|_| inner.as_ref().clone());
+        StructField::nullable(f.name().as_str(), relaxed)
     };
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, relax(Add::to_schema())),
-        StructField::nullable(REMOVE_NAME, relax(Remove::to_schema())),
-        StructField::nullable(PROTOCOL_NAME, relax(Protocol::to_schema())),
-        StructField::nullable(METADATA_NAME, relax(Metadata::to_schema())),
-        StructField::nullable(DOMAIN_METADATA_NAME, relax(DomainMetadata::to_schema())),
-        StructField::nullable(SET_TRANSACTION_NAME, relax(SetTransaction::to_schema())),
-    ]))
+    arc_schema(all_action_fields().into_iter().map(relax_field))
 }
 
 pub(super) fn action_read_schema() -> SchemaRef {
@@ -90,99 +92,12 @@ pub(super) fn path_size_schema(with_version: bool) -> SchemaRef {
     if with_version {
         fields.push(StructField::not_null("version", DataType::LONG));
     }
-    Arc::new(StructType::new_unchecked(fields))
+    arc_schema(fields)
 }
 
-pub(super) fn scan_partition_values_schema(
-    snapshot: &Snapshot,
-    logical_schema: &SchemaRef,
-) -> Option<SchemaRef> {
-    let partition_columns = snapshot.table_configuration().partition_columns();
-    if partition_columns.is_empty() {
-        return None;
-    }
-    let fields = logical_schema
-        .fields()
-        .filter(|f| partition_columns.contains(f.name()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if fields.is_empty() {
-        None
-    } else {
-        Some(Arc::new(StructType::new_unchecked(fields)))
-    }
-}
-
-pub(super) fn scan_partition_values_physical_schema(
-    snapshot: &Snapshot,
-    logical_schema: &SchemaRef,
-) -> Result<Option<SchemaRef>, DeltaError> {
-    let Some(logical_partition_schema) = scan_partition_values_schema(snapshot, logical_schema)
-    else {
-        return Ok(None);
-    };
-    let mode = snapshot.table_configuration().column_mapping_mode();
-    let physical_partition_schema = logical_partition_schema
-        .as_ref()
-        .make_physical(mode)
-        .map(Arc::new)
-        .map_err(|e| e.into_delta_default())?;
-    Ok(Some(physical_partition_schema))
-}
-
-pub(super) fn scan_live_actions_schema(
-    partition_values_parsed_schema: Option<&SchemaRef>,
-) -> SchemaRef {
-    let partition_values = crate::schema::MapType::new(DataType::STRING, DataType::STRING, true);
-    let tags = crate::schema::MapType::new(DataType::STRING, DataType::STRING, true);
-    let mut file_constant_fields = vec![
-        StructField::nullable("partitionValues", partition_values),
-        StructField::nullable("baseRowId", DataType::LONG),
-        StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-        StructField::nullable("tags", tags),
-        StructField::nullable("clusteringProvider", DataType::STRING),
-    ];
-    if let Some(schema) = partition_values_parsed_schema {
-        file_constant_fields.push(StructField::nullable(
-            "partitionValues_parsed",
-            schema.as_ref().clone(),
-        ));
-    }
-    Arc::new(StructType::new_unchecked([
-        StructField::not_null("path", DataType::STRING),
-        StructField::not_null("size", DataType::LONG),
-        StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-        StructField::nullable(
-            FILE_CONSTANT_VALUES_NAME,
-            StructType::new_unchecked(file_constant_fields),
-        ),
-    ]))
-}
-
-pub(super) fn scan_live_actions_projection(
-    with_partition_values_parsed: bool,
-) -> Vec<Arc<Expression>> {
-    let mut file_constant_exprs = vec![
-        Expression::column(["add", "partitionValues"]),
-        Expression::column(["add", "baseRowId"]),
-        Expression::column(["add", "defaultRowCommitVersion"]),
-        Expression::column(["add", "tags"]),
-        Expression::column(["add", "clusteringProvider"]),
-    ];
-    if with_partition_values_parsed {
-        file_constant_exprs.push(Expression::map_to_struct(Expression::column([
-            "add",
-            "partitionValues",
-        ])));
-    }
-    vec![
-        Arc::new(Expression::column(["add", "path"])),
-        Arc::new(Expression::column(["add", "size"])),
-        Arc::new(Expression::column(["add", "deletionVector"])),
-        Arc::new(Expression::struct_from(file_constant_exprs)),
-    ]
-}
-
+/// Action schema augmented with the [`Add`] slot replaced by an augmented struct that
+/// carries optionally-parsed `stats_parsed` / `partitionValues_parsed` sub-fields. Used by
+/// [`super::scan_replay`] when a predicate forces data-skipping projection.
 pub(super) fn action_schema_with_augmented_add(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
@@ -200,135 +115,27 @@ pub(super) fn action_schema_with_augmented_add(
             schema.as_ref().clone(),
         ));
     }
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, StructType::new_unchecked(add_fields)),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-    ]))
+    let mut fields = all_action_fields();
+    fields[0] = StructField::nullable(ADD_NAME, StructType::new_unchecked(add_fields));
+    arc_schema(fields)
 }
 
-pub(super) fn scan_actions_with_parsed_projection(
-    stats_parsed_schema: Option<&SchemaRef>,
-    partition_values_parsed_schema: Option<&SchemaRef>,
-) -> Vec<Arc<Expression>> {
-    let mut add_exprs = vec![
-        Arc::new(Expression::column(["add", "path"])),
-        Arc::new(Expression::column(["add", "partitionValues"])),
-        Arc::new(Expression::column(["add", "size"])),
-        Arc::new(Expression::column(["add", "modificationTime"])),
-        Arc::new(Expression::column(["add", "dataChange"])),
-        Arc::new(Expression::column(["add", "stats"])),
-        Arc::new(Expression::column(["add", "tags"])),
-        Arc::new(Expression::column(["add", "deletionVector"])),
-        Arc::new(Expression::column(["add", "baseRowId"])),
-        Arc::new(Expression::column(["add", "defaultRowCommitVersion"])),
-        Arc::new(Expression::column(["add", "clusteringProvider"])),
-    ];
-    if let Some(schema) = stats_parsed_schema {
-        add_exprs.push(Arc::new(Expression::parse_json(
-            Expression::column(["add", "stats"]),
-            schema.clone(),
-        )));
+/// Schema = [`action_read_schema`] plus the dedup-key column [`FSR_JOIN_KEY_COL`]. Used by
+/// the `FSR_COMMIT_DEDUP` relation handle and by the projection that materializes
+/// the dedup key on the checkpoint side of the LeftAnti.
+/// Action schema augmented with the FSR join key column (`__fsr_join_k: ARRAY<STRING>?`), and
+/// optionally a per-commit `version: LONG` column. The version column is required only by
+/// `build_commit_dedup_plan`'s row_number window (`ORDER BY version DESC`) and is dropped
+/// before the relation is persisted, so its presence in the schema is plan-internal.
+pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
+    let join_key_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, true)));
+    let mut b = action_read_schema()
+        .build_on()
+        .with_nullable(FSR_JOIN_KEY_COL, join_key_type);
+    if with_version {
+        b = b.with_not_null("version", DataType::LONG);
     }
-    if partition_values_parsed_schema.is_some() {
-        add_exprs.push(Arc::new(Expression::map_to_struct(Expression::column([
-            "add",
-            "partitionValues",
-        ]))));
-    }
-    vec![
-        Arc::new(Expression::struct_from(add_exprs)),
-        Arc::new(Expression::column([REMOVE_NAME])),
-        Arc::new(Expression::column([PROTOCOL_NAME])),
-        Arc::new(Expression::column([METADATA_NAME])),
-        Arc::new(Expression::column([DOMAIN_METADATA_NAME])),
-        Arc::new(Expression::column([SET_TRANSACTION_NAME])),
-    ]
-}
-
-pub(super) fn scan_data_file_schema(
-    physical_schema: &SchemaRef,
-    logical_schema: &SchemaRef,
-) -> Result<SchemaRef, DeltaError> {
-    if logical_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
-        && !physical_schema.contains_metadata_column(&MetadataColumnSpec::RowIndex)
-    {
-        let row_index_field = StructField::default_row_index_column().clone();
-        if physical_schema.contains(row_index_field.name.as_str()) {
-            return Err(delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "fsr::scan::scan_data_file_schema: row-id projection requires row-index metadata field `{}` but schema already contains a field with that name",
-                row_index_field.name,
-            ));
-        }
-        return physical_schema
-            .as_ref()
-            .add([row_index_field])
-            .map(Arc::new)
-            .map_err(|e| e.into_delta_default());
-    }
-    Ok(physical_schema.clone())
-}
-
-pub(super) fn scan_data_projection(
-    logical_schema: &SchemaRef,
-    physical_schema: &SchemaRef,
-    partition_columns: &HashSet<String>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
-) -> Result<Vec<Arc<Expression>>, DeltaError> {
-    let row_index_name = StructField::default_row_index_column().name.clone();
-    let mut physical_fields = physical_schema.fields();
-    logical_schema
-        .fields()
-        .map(|field| {
-            let expr = match field.get_metadata_column_spec() {
-                Some(MetadataColumnSpec::RowIndex) => Expression::column([row_index_name.as_str()]),
-                Some(MetadataColumnSpec::RowCommitVersion) => {
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
-                }
-                Some(MetadataColumnSpec::RowId) => Expression::binary(
-                    BinaryExpressionOp::Plus,
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
-                    Expression::column([row_index_name.as_str()]),
-                ),
-                Some(MetadataColumnSpec::FilePath) => Expression::column(["path"]),
-                None if partition_columns.contains(field.name()) => Expression::column([
-                    FILE_CONSTANT_VALUES_NAME,
-                    "partitionValues_parsed",
-                    field.physical_name(column_mapping_mode),
-                ]),
-                None => {
-                    let physical_field = physical_fields.next().ok_or_else(|| {
-                        delta_error!(
-                            DeltaErrorCode::DeltaCommandInvariantViolation,
-                            "fsr::scan_data_projection: missing physical field for logical field `{}`",
-                            field.name(),
-                        )
-                    })?;
-                    Expression::column([physical_field.name().as_str()])
-                }
-            };
-            Ok(Arc::new(expr))
-        })
-        .collect()
-}
-
-pub(super) fn sidecar_only_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        SIDECAR_NAME,
-        Sidecar::to_schema(),
-    )]))
-}
-
-pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
-    let mut fields: Vec<StructField> = action_read_schema().fields().cloned().collect();
-    if include_sidecar {
-        fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-    }
-    Arc::new(StructType::new_unchecked(fields))
+    b.build().map_err(|e| e.into_delta_default())
 }
 
 /// Tombstone / txn expiration predicate aligned with
@@ -353,13 +160,6 @@ pub(super) fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Pre
         ]),
     };
     Predicate::and(remove_ok, txn_ok)
-}
-
-pub(super) fn action_identity_projection() -> Vec<Arc<Expression>> {
-    action_read_schema()
-        .fields()
-        .map(|f| Arc::new(Expression::column([f.name().as_str()])))
-        .collect()
 }
 
 pub(super) fn fsr_dedup_key() -> Expression {
@@ -428,24 +228,6 @@ pub(super) fn fsr_dedup_key() -> Expression {
     )
 }
 
-/// Schema = [`action_read_schema`] plus the dedup-key column [`FSR_JOIN_KEY_COL`]. Used by
-/// the `FSR_COMMIT_DEDUP` relation handle and by the projection that materializes
-/// the dedup key on the checkpoint side of the LeftAnti.
-/// Action schema augmented with the FSR join key column (`__fsr_join_k: ARRAY<STRING>?`), and
-/// optionally a per-commit `version: LONG` column. The version column is required only by
-/// `build_commit_dedup_plan`'s row_number window (`ORDER BY version DESC`) and is dropped
-/// before the relation is persisted, so its presence in the schema is plan-internal.
-pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
-    let join_key_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, true)));
-    let mut b = action_read_schema()
-        .build_on()
-        .with_nullable(FSR_JOIN_KEY_COL, join_key_type);
-    if with_version {
-        b = b.with_not_null("version", DataType::LONG);
-    }
-    b.build().map_err(|e| e.into_delta_default())
-}
-
 pub(super) fn fsr_row_has_identity_predicate() -> Predicate {
     Predicate::or_from([
         Expression::Column(ADD_PATH.into_column_name()).is_not_null(),
@@ -459,7 +241,6 @@ pub(super) fn fsr_row_has_identity_predicate() -> Predicate {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     use super::*;
@@ -469,77 +250,8 @@ mod tests {
     use crate::engine::arrow_expression::evaluate_expression::evaluate_expression;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::UnaryExpressionOp;
-    use crate::schema::MetadataColumnSpec;
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::Engine;
-
-    #[test]
-    fn scan_data_projection_maps_metadata_columns() {
-        let logical = Arc::new(StructType::new_unchecked([
-            StructField::not_null("value", DataType::LONG),
-            StructField::create_metadata_column(
-                "_metadata.row_index",
-                MetadataColumnSpec::RowIndex,
-            ),
-            StructField::create_metadata_column("_metadata.row_id", MetadataColumnSpec::RowId),
-            StructField::create_metadata_column(
-                "_metadata.row_commit_version",
-                MetadataColumnSpec::RowCommitVersion,
-            ),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-        ]));
-        let projection = scan_data_projection(
-            &logical,
-            &logical,
-            &HashSet::new(),
-            crate::table_features::ColumnMappingMode::None,
-        )
-        .unwrap();
-        assert_eq!(projection.len(), 5);
-        assert!(matches!(
-            projection[0].as_ref(),
-            Expression::Column(c) if c == &ColumnName::new(["value"])
-        ));
-        assert!(matches!(
-            projection[1].as_ref(),
-            Expression::Column(c) if c == &ColumnName::new(["_metadata.row_index"])
-        ));
-        assert!(matches!(
-            projection[3].as_ref(),
-            Expression::Column(c) if c == &ColumnName::new([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
-        ));
-        assert!(matches!(
-            projection[4].as_ref(),
-            Expression::Column(c) if c == &ColumnName::new(["path"])
-        ));
-    }
-
-    #[rstest::rstest]
-    #[case::synthesizes_when_missing(false)]
-    #[case::dedups_when_already_present(true)]
-    fn scan_data_file_schema_emits_exactly_one_row_index_for_row_id(
-        #[case] row_index_already_present: bool,
-    ) {
-        let mut fields = vec![
-            StructField::not_null("value", DataType::LONG),
-            StructField::create_metadata_column("_metadata.row_id", MetadataColumnSpec::RowId),
-        ];
-        if row_index_already_present {
-            fields.push(StructField::create_metadata_column(
-                "_metadata.row_index",
-                MetadataColumnSpec::RowIndex,
-            ));
-        }
-        let logical = Arc::new(StructType::new_unchecked(fields));
-        let file_schema = scan_data_file_schema(&logical, &logical).unwrap();
-        assert_eq!(
-            file_schema
-                .fields()
-                .filter(|f| f.get_metadata_column_spec() == Some(MetadataColumnSpec::RowIndex))
-                .count(),
-            1
-        );
-    }
 
     #[test]
     fn fsr_dedup_key_eval_add_row_carries_path_and_dv_components() {

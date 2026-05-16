@@ -1,7 +1,7 @@
 //! Declarative full snapshot read (FSR) entry point on [`Snapshot`].
 //!
 //! Routes [`Snapshot::full_state`] to the canonical FSR coroutine
-//! ([`crate::plans::state_machines::fsr::full_state_sm`]) whose live, ordered scan-row
+//! ([`crate::plans::state_machines::scan::full_state_sm`]) whose live, ordered scan-row
 //! stream flows to the engine's [`SinkType::Results`](crate::plans::ir::nodes::SinkType::Results)
 //! consumer when the engine drives the returned `CoroutineSM`.
 
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::plans::errors::DeltaErrAsKernel;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
-use crate::plans::state_machines::fsr::{full_state_sm, FullStateBuilder};
+use crate::plans::state_machines::scan::{full_state_sm, FullStateBuilder};
 use crate::scan::ScanBuilder as KernelScanBuilder;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Snapshot};
@@ -26,7 +26,7 @@ impl Snapshot {
     /// [`PhaseOperation::SchemaQuery`](crate::plans::state_machines::framework::phase_operation::PhaseOperation::SchemaQuery)
     /// prelude when `_last_checkpoint` is absent but checkpoint files are present), bundling
     /// the full *window-on-commits + anti-join-on-checkpoint* algorithm in a single
-    /// engine-driven step. See [`crate::plans::state_machines::fsr::full_state`] for the
+    /// engine-driven step. See [`crate::plans::state_machines::scan::full_state`] for the
     /// per-plan breakdown and the dedup-key contract.
     ///
     /// The terminal plan is a `Results` sink; reconstructed action rows (add / remove /
@@ -44,7 +44,7 @@ impl Snapshot {
 
     /// Create a canonical FSR plan builder rooted at this snapshot.
     pub fn full_state_builder(self: &SnapshotRef) -> FullStateBuilder {
-        crate::plans::state_machines::fsr::FullState::for_table(Arc::clone(self))
+        crate::plans::state_machines::scan::FullState::for_table(Arc::clone(self))
     }
 
     /// Create a split-phase scan replay plan builder rooted at this snapshot.

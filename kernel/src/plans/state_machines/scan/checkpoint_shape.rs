@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use super::schemas::{action_read_schema, sidecar_only_schema};
+use super::action::action_read_schema;
 use crate::actions::{
-    ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::expressions::Expression;
@@ -23,7 +23,7 @@ use crate::plans::kdf::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::plans::state_machines::framework::phase_operation::{PhaseOperation, SchemaQueryNode};
 use crate::scan::Scan;
-use crate::schema::SchemaRef;
+use crate::schema::{arc_schema, SchemaRef, StructField, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::{delta_error, FileMeta};
 
@@ -113,6 +113,18 @@ fn checkpoint_actions_schema_projection(full: &SchemaRef) -> Result<SchemaRef, D
         full.project(names.as_slice())
             .map_err(|e| e.into_delta_default())
     }
+}
+
+fn sidecar_only_schema() -> SchemaRef {
+    arc_schema([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])
+}
+
+pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
+    let mut fields: Vec<StructField> = action_read_schema().fields().cloned().collect();
+    if include_sidecar {
+        fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+    }
+    arc_schema(fields)
 }
 
 pub(super) async fn resolve_checkpoint_shape_for_scan(

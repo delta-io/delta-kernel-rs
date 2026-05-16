@@ -27,8 +27,8 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::plans::ir::nodes::SinkType;
 use delta_kernel::plans::ir::{Plan, RelationHandle};
 use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
-use delta_kernel::plans::state_machines::fsr::full_state::FSR_COMMIT_DEDUP;
-use delta_kernel::plans::state_machines::fsr::{
+use delta_kernel::plans::state_machines::scan::full_state::FSR_COMMIT_DEDUP;
+use delta_kernel::plans::state_machines::scan::{
     build_fsr_plans, checkpoint_shape_from_last_checkpoint,
 };
 use delta_kernel::schema::DataType as KernelDataType;

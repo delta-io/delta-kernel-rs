@@ -14,4 +14,4 @@
 #![allow(dead_code)]
 
 pub mod framework;
-pub mod fsr;
+pub mod scan;

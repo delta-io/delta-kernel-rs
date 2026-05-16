@@ -8,18 +8,18 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::action::{action_output_schema, action_schema_with_augmented_add, ADD_PATH};
 use super::checkpoint_shape::{
     checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape_for_scan, CheckpointShape,
 };
 use super::plans::{build_fsr_plans, load_materialized_schema};
-use super::schemas::{
-    action_output_schema, action_schema_with_augmented_add, scan_actions_with_parsed_projection,
-    scan_data_file_schema, scan_data_projection, scan_live_actions_projection,
-    scan_live_actions_schema, scan_partition_values_physical_schema, ADD_PATH,
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::{
+    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::delta_error;
-use crate::expressions::{ColumnName, Expression, IntoColumnName, Predicate};
-use crate::plans::errors::{DeltaError, DeltaErrorCode};
+use crate::expressions::{BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate};
+use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
 use crate::plans::ir::{DeclarativePlanNode, Plan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
@@ -27,6 +27,8 @@ use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::scan::Scan;
+use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType, ToSchema};
+use crate::snapshot::Snapshot;
 
 fn replay_partition_columns(scan: &Scan) -> HashSet<String> {
     scan.snapshot()
@@ -264,6 +266,202 @@ fn scan_metadata_plans_with_shape(
     );
     plans.push(live_actions.into_relation(live_actions_relation.clone()));
     Ok((plans, live_actions_relation))
+}
+
+pub(super) fn scan_partition_values_schema(
+    snapshot: &Snapshot,
+    logical_schema: &SchemaRef,
+) -> Option<SchemaRef> {
+    let partition_columns = snapshot.table_configuration().partition_columns();
+    if partition_columns.is_empty() {
+        return None;
+    }
+    let fields = logical_schema
+        .fields()
+        .filter(|f| partition_columns.contains(f.name()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        None
+    } else {
+        Some(Arc::new(StructType::new_unchecked(fields)))
+    }
+}
+
+pub(super) fn scan_partition_values_physical_schema(
+    snapshot: &Snapshot,
+    logical_schema: &SchemaRef,
+) -> Result<Option<SchemaRef>, DeltaError> {
+    let Some(logical_partition_schema) = scan_partition_values_schema(snapshot, logical_schema)
+    else {
+        return Ok(None);
+    };
+    let mode = snapshot.table_configuration().column_mapping_mode();
+    let physical_partition_schema = logical_partition_schema
+        .as_ref()
+        .make_physical(mode)
+        .map(Arc::new)
+        .map_err(|e| e.into_delta_default())?;
+    Ok(Some(physical_partition_schema))
+}
+
+pub(super) fn scan_live_actions_schema(
+    partition_values_parsed_schema: Option<&SchemaRef>,
+) -> SchemaRef {
+    let partition_values = crate::schema::MapType::new(DataType::STRING, DataType::STRING, true);
+    let tags = crate::schema::MapType::new(DataType::STRING, DataType::STRING, true);
+    let mut file_constant_fields = vec![
+        StructField::nullable("partitionValues", partition_values),
+        StructField::nullable("baseRowId", DataType::LONG),
+        StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+        StructField::nullable("tags", tags),
+        StructField::nullable("clusteringProvider", DataType::STRING),
+    ];
+    if let Some(schema) = partition_values_parsed_schema {
+        file_constant_fields.push(StructField::nullable(
+            "partitionValues_parsed",
+            schema.as_ref().clone(),
+        ));
+    }
+    Arc::new(StructType::new_unchecked([
+        StructField::not_null("path", DataType::STRING),
+        StructField::not_null("size", DataType::LONG),
+        StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+        StructField::nullable(
+            FILE_CONSTANT_VALUES_NAME,
+            StructType::new_unchecked(file_constant_fields),
+        ),
+    ]))
+}
+
+pub(super) fn scan_live_actions_projection(
+    with_partition_values_parsed: bool,
+) -> Vec<Arc<Expression>> {
+    let mut file_constant_exprs = vec![
+        Expression::column(["add", "partitionValues"]),
+        Expression::column(["add", "baseRowId"]),
+        Expression::column(["add", "defaultRowCommitVersion"]),
+        Expression::column(["add", "tags"]),
+        Expression::column(["add", "clusteringProvider"]),
+    ];
+    if with_partition_values_parsed {
+        file_constant_exprs.push(Expression::map_to_struct(Expression::column([
+            "add",
+            "partitionValues",
+        ])));
+    }
+    vec![
+        Arc::new(Expression::column(["add", "path"])),
+        Arc::new(Expression::column(["add", "size"])),
+        Arc::new(Expression::column(["add", "deletionVector"])),
+        Arc::new(Expression::struct_from(file_constant_exprs)),
+    ]
+}
+
+pub(super) fn scan_actions_with_parsed_projection(
+    stats_parsed_schema: Option<&SchemaRef>,
+    partition_values_parsed_schema: Option<&SchemaRef>,
+) -> Vec<Arc<Expression>> {
+    let mut add_exprs = vec![
+        Arc::new(Expression::column(["add", "path"])),
+        Arc::new(Expression::column(["add", "partitionValues"])),
+        Arc::new(Expression::column(["add", "size"])),
+        Arc::new(Expression::column(["add", "modificationTime"])),
+        Arc::new(Expression::column(["add", "dataChange"])),
+        Arc::new(Expression::column(["add", "stats"])),
+        Arc::new(Expression::column(["add", "tags"])),
+        Arc::new(Expression::column(["add", "deletionVector"])),
+        Arc::new(Expression::column(["add", "baseRowId"])),
+        Arc::new(Expression::column(["add", "defaultRowCommitVersion"])),
+        Arc::new(Expression::column(["add", "clusteringProvider"])),
+    ];
+    if let Some(schema) = stats_parsed_schema {
+        add_exprs.push(Arc::new(Expression::parse_json(
+            Expression::column(["add", "stats"]),
+            schema.clone(),
+        )));
+    }
+    if partition_values_parsed_schema.is_some() {
+        add_exprs.push(Arc::new(Expression::map_to_struct(Expression::column([
+            "add",
+            "partitionValues",
+        ]))));
+    }
+    vec![
+        Arc::new(Expression::struct_from(add_exprs)),
+        Arc::new(Expression::column([REMOVE_NAME])),
+        Arc::new(Expression::column([PROTOCOL_NAME])),
+        Arc::new(Expression::column([METADATA_NAME])),
+        Arc::new(Expression::column([DOMAIN_METADATA_NAME])),
+        Arc::new(Expression::column([SET_TRANSACTION_NAME])),
+    ]
+}
+
+pub(super) fn scan_data_file_schema(
+    physical_schema: &SchemaRef,
+    logical_schema: &SchemaRef,
+) -> Result<SchemaRef, DeltaError> {
+    if logical_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
+        && !physical_schema.contains_metadata_column(&MetadataColumnSpec::RowIndex)
+    {
+        let row_index_field = StructField::default_row_index_column().clone();
+        if physical_schema.contains(row_index_field.name.as_str()) {
+            return Err(delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "fsr::scan::scan_data_file_schema: row-id projection requires row-index metadata field `{}` but schema already contains a field with that name",
+                row_index_field.name,
+            ));
+        }
+        return physical_schema
+            .as_ref()
+            .add([row_index_field])
+            .map(Arc::new)
+            .map_err(|e| e.into_delta_default());
+    }
+    Ok(physical_schema.clone())
+}
+
+pub(super) fn scan_data_projection(
+    logical_schema: &SchemaRef,
+    physical_schema: &SchemaRef,
+    partition_columns: &HashSet<String>,
+    column_mapping_mode: crate::table_features::ColumnMappingMode,
+) -> Result<Vec<Arc<Expression>>, DeltaError> {
+    let row_index_name = StructField::default_row_index_column().name.clone();
+    let mut physical_fields = physical_schema.fields();
+    logical_schema
+        .fields()
+        .map(|field| {
+            let expr = match field.get_metadata_column_spec() {
+                Some(MetadataColumnSpec::RowIndex) => Expression::column([row_index_name.as_str()]),
+                Some(MetadataColumnSpec::RowCommitVersion) => {
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
+                }
+                Some(MetadataColumnSpec::RowId) => Expression::binary(
+                    BinaryExpressionOp::Plus,
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
+                    Expression::column([row_index_name.as_str()]),
+                ),
+                Some(MetadataColumnSpec::FilePath) => Expression::column(["path"]),
+                None if partition_columns.contains(field.name()) => Expression::column([
+                    FILE_CONSTANT_VALUES_NAME,
+                    "partitionValues_parsed",
+                    field.physical_name(column_mapping_mode),
+                ]),
+                None => {
+                    let physical_field = physical_fields.next().ok_or_else(|| {
+                        delta_error!(
+                            DeltaErrorCode::DeltaCommandInvariantViolation,
+                            "fsr::scan_data_projection: missing physical field for logical field `{}`",
+                            field.name(),
+                        )
+                    })?;
+                    Expression::column([physical_field.name().as_str()])
+                }
+            };
+            Ok(Arc::new(expr))
+        })
+        .collect()
 }
 
 #[cfg(test)]

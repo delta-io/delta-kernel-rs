@@ -2,11 +2,11 @@
 //! [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM) used by
 //! [`Snapshot::full_state`](crate::snapshot::Snapshot::full_state).
 
+mod action;
 mod checkpoint_shape;
 pub mod full_state;
 mod plans;
 mod scan_replay;
-mod schemas;
 
 pub use checkpoint_shape::{
     checkpoint_shape_from_last_checkpoint, checkpoint_shape_from_schema, first_checkpoint_url,
