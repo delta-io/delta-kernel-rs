@@ -12,11 +12,10 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::action::{
-    action_read_schema, augmented_action_schema, fsr_dedup_key, fsr_row_has_identity_predicate,
-    path_size_schema, retention_filter, FSR_JOIN_KEY_COL,
-};
 use super::checkpoint_shape::{checkpoint_manifest_scan_schema, CheckpointShape};
+use super::dedup::{fsr_dedup_key, fsr_row_has_identity_predicate, FSR_JOIN_KEY_COL};
+use super::retention::retention_filter;
+use super::schemas::{action_read_schema, augmented_action_schema, path_size_schema};
 use crate::action_reconciliation::{
     calculate_transaction_expiration_timestamp, deleted_file_retention_timestamp_with_time,
 };
@@ -180,8 +179,8 @@ pub fn build_fsr_plans(
             .filter(Arc::new(col(SIDECAR_NAME).is_not_null().into()))
             .project(
                 vec![
-                    Arc::new(col([SIDECAR_NAME, "path"])),
-                    Arc::new(col([SIDECAR_NAME, "sizeInBytes"])),
+                    col([SIDECAR_NAME, "path"]).into(),
+                    col([SIDECAR_NAME, "sizeInBytes"]).into(),
                 ],
                 path_size_schema(false),
             );
@@ -357,7 +356,7 @@ fn build_results_plan(
         .project(
             action_read_schema()
                 .fields()
-                .map(|f| Arc::new(col(f.name().as_str())))
+                .map(|f| col(f.name().as_str()).into())
                 .chain(std::iter::once(Arc::clone(&dedup_expr)))
                 .collect(),
             augmented_schema.clone(),
@@ -370,12 +369,12 @@ fn build_results_plan(
         .build()
         .map_err(|e| e.into_delta_default())?;
     let commit_keys = plan::relation_ref(commit_dedup_handle)
-        .project(vec![Arc::new(col(FSR_JOIN_KEY_COL))], join_key_only_schema);
+        .project(vec![col(FSR_JOIN_KEY_COL).into()], join_key_only_schema);
 
     let survivors = checkpoint_keyed.left_anti_join_on(
         commit_keys,
-        vec![Arc::new(col(FSR_JOIN_KEY_COL))],
-        vec![Arc::new(col(FSR_JOIN_KEY_COL))],
+        vec![col(FSR_JOIN_KEY_COL).into()],
+        vec![col(FSR_JOIN_KEY_COL).into()],
     );
 
     // Union directly on augmented rows (action + join key); drop join key once at the end.
@@ -392,7 +391,7 @@ fn build_results_plan(
         .project(
             action_read_schema()
                 .fields()
-                .map(|f| Arc::new(col(f.name().as_str())))
+                .map(|f| col(f.name().as_str()).into())
                 .collect(),
             action_read_schema(),
         )

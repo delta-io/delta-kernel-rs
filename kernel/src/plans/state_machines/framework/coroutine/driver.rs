@@ -201,11 +201,11 @@ mod tests {
         let mut sm = CoroutineSM::<i64>::new(|mut co| async move {
             let mut phase = super::super::phase::Phase(&mut co);
             let _ = phase
-                .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_a")
+                .execute_raw(PhaseOperation::Plans(vec![toy_plan()]), "phase_a")
                 .await
                 .map_err(EngineError::into_delta_error_for_test)?;
             let _ = phase
-                .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_b")
+                .execute_raw(PhaseOperation::Plans(vec![toy_plan()]), "phase_b")
                 .await
                 .map_err(EngineError::into_delta_error_for_test)?;
             Ok(42)
@@ -240,7 +240,7 @@ mod tests {
         let mut sm = CoroutineSM::<()>::new(|mut co| async move {
             let mut phase = super::super::phase::Phase(&mut co);
             let _ = phase
-                .execute(PhaseOperation::Plans(vec![toy_plan(), toy_plan()]), "ab")
+                .execute_raw(PhaseOperation::Plans(vec![toy_plan(), toy_plan()]), "ab")
                 .await
                 .map_err(EngineError::into_delta_error_for_test)?;
             Ok(())
@@ -264,7 +264,7 @@ mod tests {
         let mut sm = CoroutineSM::<String>::new(|mut co| async move {
             let mut phase = super::super::phase::Phase(&mut co);
             match phase
-                .execute(PhaseOperation::Plans(vec![toy_plan()]), "p")
+                .execute_raw(PhaseOperation::Plans(vec![toy_plan()]), "p")
                 .await
             {
                 Err(e) => Ok(format!("got: {}", e.kind)),

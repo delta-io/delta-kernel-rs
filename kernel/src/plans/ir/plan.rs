@@ -15,10 +15,12 @@
 //! 2. **Top-down readability** — `plan::relation_ref(&h).filter(...).into_relation(out)` reads
 //!    cleaner than `DeclarativePlanNode::relation_ref(h.clone()).filter(...).into_relation(out)`.
 
+use std::sync::Arc;
+
 use super::declarative::DeclarativePlanNode;
 use super::nodes::{FileFormat, LoadSink, LoadSpec, RelationHandle, SinkNode, SinkType};
-use crate::expressions::Scalar;
-use crate::schema::SchemaRef;
+use crate::expressions::{col, Expression, Scalar};
+use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, FileMeta};
 
 /// Complete plan: a transforms-only [`DeclarativePlanNode`] tree terminated
@@ -96,6 +98,16 @@ pub fn values_row(schema: SchemaRef, values: Vec<Scalar>) -> DeltaResult<Declara
 /// reuse the same `&RelationHandle` across multiple plans without writing `.clone()`.
 pub fn relation_ref(handle: &RelationHandle) -> DeclarativePlanNode {
     DeclarativePlanNode::relation_ref(handle.clone())
+}
+
+/// Project every field of `parent`'s nested struct schema as a top-level column reference
+/// nested under `parent`. Equivalent to applying `Transform::identity()` to the nested struct
+/// and projecting each field individually.
+pub fn identity_project_struct(parent: &str, schema: &StructType) -> Vec<Arc<Expression>> {
+    schema
+        .fields()
+        .map(|f| col([parent, f.name().as_str()]).into())
+        .collect()
 }
 
 // ============================================================================

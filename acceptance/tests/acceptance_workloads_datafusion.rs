@@ -111,6 +111,7 @@ async fn execute_snapshot_workload_datafusion(
             .full_state_builder()
             .with_stats()
             .build()
+            .plans()
             .map_err(|e| Error::generic(format!("build full_state plans via builder: {e}")))?;
         let _ = executor.collect_result(rp).await.map_err(|e| {
             Error::generic(format!(

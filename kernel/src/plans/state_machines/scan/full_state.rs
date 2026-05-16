@@ -70,9 +70,16 @@ use crate::plans::ir::ResultPlan;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::snapshot::Snapshot;
 
-/// Builder namespace for canonical Full State Reconstruction planning.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FullState;
+/// Configured FSR plan source, mirroring [`crate::scan::Scan`]'s split between a builder that
+/// configures and a value that produces plans / state machines.
+///
+/// Construct via [`FullState::for_table`] then [`FullStateBuilder::build`]; consume via
+/// [`Self::plans`] (synchronous) or [`Self::state_machine`] (coroutine driver).
+#[derive(Debug, Clone)]
+pub struct FullState {
+    snapshot: Arc<Snapshot>,
+    checkpoint_shape: Option<CheckpointShape>,
+}
 
 /// Builder for canonical Full State Reconstruction plans.
 #[derive(Debug, Clone)]
@@ -89,6 +96,32 @@ impl FullState {
             checkpoint_shape: None,
         }
     }
+
+    /// Build the canonical FSR [`ResultPlan`] synchronously.
+    ///
+    /// Resolves checkpoint shape (preferring an explicit
+    /// [`FullStateBuilder::with_checkpoint_shape`] override) and composes the FSR plans
+    /// in one shot. Use this when the snapshot already has sufficient
+    /// `_last_checkpoint` hints and no SM driver is needed.
+    pub fn plans(&self) -> Result<ResultPlan, DeltaError> {
+        let shape = match &self.checkpoint_shape {
+            Some(shape) => shape.clone(),
+            None => checkpoint_shape_from_last_checkpoint(self.snapshot.as_ref())?,
+        };
+        build_fsr_plans(self.snapshot.as_ref(), shape)
+    }
+
+    /// Wrap [`Self::plans`] in a zero-yield [`CoroutineSM`].
+    ///
+    /// The returned SM terminates immediately with the canonical FSR
+    /// [`ResultPlan`]. Engines that drive everything through the SM surface
+    /// (scan replay, full-state reconstruction) can treat this as the
+    /// uniform entry point even though no intermediate engine yields are
+    /// required today.
+    pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
+        let this = self.clone();
+        CoroutineSM::new(move |_co| async move { this.plans() })
+    }
 }
 
 impl FullStateBuilder {
@@ -98,14 +131,16 @@ impl FullStateBuilder {
         self
     }
 
-    /// Build the canonical FSR [`ResultPlan`] for this snapshot.
-    pub fn build(self) -> Result<ResultPlan, DeltaError> {
-        let shape = self
-            .checkpoint_shape
-            .unwrap_or(checkpoint_shape_from_last_checkpoint(
-                self.snapshot.as_ref(),
-            )?);
-        build_fsr_plans(self.snapshot.as_ref(), shape)
+    /// Finalize the builder into a [`FullState`] value.
+    ///
+    /// The returned value carries every configuration knob set on the builder
+    /// (the snapshot, any explicit checkpoint shape) and exposes
+    /// [`FullState::plans`] / [`FullState::state_machine`] for consumption.
+    pub fn build(self) -> FullState {
+        FullState {
+            snapshot: self.snapshot,
+            checkpoint_shape: self.checkpoint_shape,
+        }
     }
 
     /// Enable stats-aware planning on this builder.
@@ -117,22 +152,6 @@ impl FullStateBuilder {
     pub fn with_stats(self) -> Self {
         self
     }
-}
-
-/// Public entry for full-state reconstruction.
-///
-/// The returned coroutine terminates with a [`ResultPlan`] naming the
-/// [`FSR_RESULTS`] relation. The caller drives the SM (executing any
-/// intermediate phase operations such as schema-query preludes), then executes
-/// every plan in [`ResultPlan::plans`] and reads
-/// [`ResultPlan::result_relation`] to obtain the reconstructed action stream.
-pub fn full_state_sm(snapshot: Arc<Snapshot>) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
-    CoroutineSM::new(move |_co| async move {
-        // No intermediate engine yields are needed today -- the FullState
-        // builder pulls checkpoint shape directly from the snapshot's log
-        // segment. The SM computes and returns the result plan immediately.
-        FullState::for_table(Arc::clone(&snapshot)).build()
-    })
 }
 
 #[cfg(test)]
@@ -160,6 +179,7 @@ mod tests {
             .with_stats()
             .with_checkpoint_shape(shape)
             .build()
+            .plans()
             .unwrap();
         assert_eq!(direct.plans.len(), built.plans.len());
         assert_eq!(direct.result_relation.name, FSR_RESULTS);
@@ -176,6 +196,7 @@ mod tests {
                 .with_stats()
                 .with_checkpoint_shape(shape)
                 .build()
+                .plans()
                 .unwrap();
             assert_eq!(
                 direct.plans.len(),

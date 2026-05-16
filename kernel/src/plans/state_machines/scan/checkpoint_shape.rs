@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::action::action_read_schema;
+use super::schemas::action_read_schema;
 use crate::actions::{
     Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -150,17 +150,9 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
             let checkpoint_state = phase
                 .execute(
                     PhaseOperation::SchemaQuery(SchemaQueryNode::new(checkpoint_url)),
-                    "scan.replay.checkpoint_schema_query",
+                    "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema",
                 )
-                .await
-                .map_err(|e| {
-                    let detail = e.display_with_source_chain();
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        source = e,
-                        "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema: {detail}",
-                    )
-                })?;
+                .await?;
             let checkpoint_schema = checkpoint_state.take_schema().ok_or_else(|| {
                 delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
@@ -177,17 +169,9 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
             let sidecar_state = phase
                 .execute(
                     PhaseOperation::Plans(vec![discover_sidecars]),
-                    "scan.replay.sidecar_discovery",
+                    "scan::resolve_checkpoint_shape_for_scan::sidecar_discovery",
                 )
-                .await
-                .map_err(|e| {
-                    let detail = e.display_with_source_chain();
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        source = e,
-                        "scan::resolve_checkpoint_shape_for_scan::sidecar_discovery: {detail}",
-                    )
-                })?;
+                .await?;
             let sidecar_files = extract_sidecars.extract(&sidecar_state).map_err(|e| {
                 let detail = e.display_with_source_chain();
                 delta_error!(
@@ -202,17 +186,9 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                         PhaseOperation::SchemaQuery(SchemaQueryNode::new(
                             first_sidecar.location.as_str(),
                         )),
-                        "scan.replay.sidecar_schema_query",
+                        "scan::resolve_checkpoint_shape_for_scan::sidecar_schema",
                     )
-                    .await
-                    .map_err(|e| {
-                        let detail = e.display_with_source_chain();
-                        delta_error!(
-                            DeltaErrorCode::DeltaCommandInvariantViolation,
-                            source = e,
-                            "scan::resolve_checkpoint_shape_for_scan::sidecar_schema: {detail}",
-                        )
-                    })?;
+                    .await?;
                 let sidecar_schema = sidecar_state.take_schema().ok_or_else(|| {
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,

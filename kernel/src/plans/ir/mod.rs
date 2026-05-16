@@ -13,4 +13,4 @@ pub mod plan;
 
 pub use declarative::{DeclarativePlanNode, Extractor};
 pub use nodes::{ConsumeByKdfSink, LoadSpec, RelationHandle};
-pub use plan::{Plan, PlanCollector, ResultPlan};
+pub use plan::{identity_project_struct, Plan, PlanCollector, ResultPlan};

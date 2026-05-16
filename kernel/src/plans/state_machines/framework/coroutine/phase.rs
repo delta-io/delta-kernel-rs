@@ -6,8 +6,11 @@
 //! - [`PhaseYield`] / [`PhaseResume`] / [`PhaseCo`] — the typed protocol flowing through the
 //!   coroutine. Each yield is a single [`PhaseOperation`] (wrapped in [`Arc`] for cheap clones)
 //!   plus a static phase name; each resume is a `Result<PhaseState, EngineError>`.
-//! - [`Phase`] — the async surface SM authors use. The single entry point is [`Phase::execute`],
-//!   which yields one operation and returns the resulting [`PhaseState`] (or an [`EngineError`]).
+//! - [`Phase`] — the async surface SM authors use. The primary entry point is [`Phase::execute`],
+//!   which yields one operation and returns the resulting [`PhaseState`] with engine errors already
+//!   wrapped into a [`DeltaError`] tagged [`DeltaErrorCode::DeltaCommandInvariantViolation`]. Call
+//!   sites that need a different error code use [`Phase::execute_raw`] and wrap the raw
+//!   [`EngineError`] themselves.
 //!
 //! ## 1:1 protocol
 //!
@@ -22,6 +25,8 @@
 use std::sync::Arc;
 
 use super::generator::Co;
+use crate::delta_error;
+use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::plans::state_machines::framework::engine_error::EngineError;
 use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
 use crate::plans::state_machines::framework::phase_state::PhaseState;
@@ -61,14 +66,38 @@ pub(crate) type PhaseCo = Co<PhaseYield, PhaseResume>;
 pub(crate) struct Phase<'a>(pub(crate) &'a mut PhaseCo);
 
 impl<'a> Phase<'a> {
-    /// Hand `operation` to the engine and await its outcome.
+    /// Hand `operation` to the engine and await its outcome, wrapping any
+    /// engine failure into a [`DeltaError`] tagged
+    /// [`DeltaErrorCode::DeltaCommandInvariantViolation`] with `name` as the
+    /// diagnostic prefix and the engine error attached as `source`.
+    ///
+    /// This is the SM-author entry point most call sites want. Use
+    /// [`Self::execute_raw`] when a specific error code or pattern-match on
+    /// [`EngineError::kind`](super::super::engine_error::EngineError::kind) is
+    /// required.
+    pub(crate) async fn execute(
+        &mut self,
+        operation: PhaseOperation,
+        name: &'static str,
+    ) -> Result<PhaseState, DeltaError> {
+        self.execute_raw(operation, name).await.map_err(|e| {
+            let detail = e.display_with_source_chain();
+            delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                source = e,
+                "{name}: {detail}",
+            )
+        })
+    }
+
+    /// Hand `operation` to the engine and await its raw outcome.
     ///
     /// Returns the populated [`PhaseState`] on success or the engine's
-    /// [`EngineError`] on failure. Errors are surfaced raw so SM bodies
-    /// can pattern-match on
-    /// [`EngineError::kind`](super::super::engine_error::EngineError::kind);
-    /// translation to [`DeltaError`] is the SM's responsibility.
-    pub(crate) async fn execute(
+    /// [`EngineError`] on failure. Callers that need a different error code
+    /// (or want to pattern-match on
+    /// [`EngineError::kind`](super::super::engine_error::EngineError::kind))
+    /// use this method and wrap the error themselves.
+    pub(crate) async fn execute_raw(
         &mut self,
         operation: PhaseOperation,
         name: &'static str,

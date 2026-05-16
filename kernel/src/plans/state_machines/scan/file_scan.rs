@@ -14,16 +14,17 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::action::{
-    action_output_schema, action_schema_with_augmented_add, load_materialized_schema, ADD_PATH,
-};
 use super::checkpoint_shape::{
     checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape_for_scan, CheckpointShape,
 };
+use super::dedup::ADD_PATH;
 use super::plans::build_fsr_plans;
+use super::schemas::{
+    action_output_schema, action_schema_with_augmented_add, load_materialized_schema,
+};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
-    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    Add, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::delta_error;
 use crate::expressions::{
@@ -31,7 +32,7 @@ use crate::expressions::{
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
-use crate::plans::ir::{plan, PlanCollector, ResultPlan};
+use crate::plans::ir::{identity_project_struct, plan, PlanCollector, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
@@ -250,7 +251,11 @@ fn scan_metadata_plans_with_shape(
         )
     })?;
     let fsr_results_relation = RelationHandle::fresh("scan.fsr_results", action_output_schema());
-    p.push_plan(terminal_plan.root.into_relation(fsr_results_relation.clone()));
+    p.push_plan(
+        terminal_plan
+            .root
+            .into_relation(fsr_results_relation.clone()),
+    );
 
     // === actions chain: filter live add paths, optionally augmenting with parsed stats /
     // partitionValues columns when a data-skipping predicate is in play ===
@@ -376,10 +381,10 @@ pub(super) fn scan_live_actions_projection(
         file_constant_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])));
     }
     vec![
-        Arc::new(col(["add", "path"])),
-        Arc::new(col(["add", "size"])),
-        Arc::new(col(["add", "deletionVector"])),
-        Arc::new(Expression::struct_from(file_constant_exprs)),
+        col(["add", "path"]).into(),
+        col(["add", "size"]).into(),
+        col(["add", "deletionVector"]).into(),
+        Expression::struct_from(file_constant_exprs).into(),
     ]
 }
 
@@ -387,38 +392,20 @@ pub(super) fn scan_actions_with_parsed_projection(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
 ) -> Vec<Arc<Expression>> {
-    let mut add_exprs = vec![
-        Arc::new(col(["add", "path"])),
-        Arc::new(col(["add", "partitionValues"])),
-        Arc::new(col(["add", "size"])),
-        Arc::new(col(["add", "modificationTime"])),
-        Arc::new(col(["add", "dataChange"])),
-        Arc::new(col(["add", "stats"])),
-        Arc::new(col(["add", "tags"])),
-        Arc::new(col(["add", "deletionVector"])),
-        Arc::new(col(["add", "baseRowId"])),
-        Arc::new(col(["add", "defaultRowCommitVersion"])),
-        Arc::new(col(["add", "clusteringProvider"])),
-    ];
+    let mut add_exprs = identity_project_struct("add", &Add::to_schema());
     if let Some(schema) = stats_parsed_schema {
-        add_exprs.push(Arc::new(Expression::parse_json(
-            col(["add", "stats"]),
-            schema.clone(),
-        )));
+        add_exprs.push(Expression::parse_json(col(["add", "stats"]), schema.clone()).into());
     }
     if partition_values_parsed_schema.is_some() {
-        add_exprs.push(Arc::new(Expression::map_to_struct(col([
-            "add",
-            "partitionValues",
-        ]))));
+        add_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])).into());
     }
     vec![
-        Arc::new(Expression::struct_from(add_exprs)),
-        Arc::new(col([REMOVE_NAME])),
-        Arc::new(col([PROTOCOL_NAME])),
-        Arc::new(col([METADATA_NAME])),
-        Arc::new(col([DOMAIN_METADATA_NAME])),
-        Arc::new(col([SET_TRANSACTION_NAME])),
+        Expression::struct_from(add_exprs).into(),
+        col([REMOVE_NAME]).into(),
+        col([PROTOCOL_NAME]).into(),
+        col([METADATA_NAME]).into(),
+        col([DOMAIN_METADATA_NAME]).into(),
+        col([SET_TRANSACTION_NAME]).into(),
     ]
 }
 
@@ -484,7 +471,7 @@ pub(super) fn scan_data_projection(
                     col([physical_field.name().as_str()])
                 }
             };
-            Ok(Arc::new(expr))
+            Ok(expr.into())
         })
         .collect()
 }

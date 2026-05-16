@@ -1,7 +1,7 @@
 //! Declarative full snapshot read (FSR) entry point on [`Snapshot`].
 //!
 //! Routes [`Snapshot::full_state`] to the canonical FSR coroutine
-//! ([`crate::plans::state_machines::scan::full_state_sm`]) whose terminal
+//! ([`crate::plans::state_machines::scan::FullState`]) whose terminal
 //! [`ResultPlan`] names the reconstructed-action relation the engine reads
 //! after running the plan's plans.
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::plans::errors::DeltaErrAsKernel;
 use crate::plans::ir::ResultPlan;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
-use crate::plans::state_machines::scan::{full_state_sm, FullStateBuilder};
+use crate::plans::state_machines::scan::{FullState, FullStateBuilder};
 use crate::scan::ScanBuilder as KernelScanBuilder;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Snapshot};
@@ -42,12 +42,15 @@ impl Snapshot {
     /// [`Snapshot::scan_builder`](crate::snapshot::Snapshot::scan_builder) and classic
     /// kernel replay instead.
     pub fn full_state(self: &SnapshotRef) -> DeltaResult<CoroutineSM<ResultPlan>> {
-        full_state_sm(Arc::clone(self)).map_err(|e| e.into_kernel_default())
+        FullState::for_table(Arc::clone(self))
+            .build()
+            .state_machine()
+            .map_err(|e| e.into_kernel_default())
     }
 
     /// Create a canonical FSR plan builder rooted at this snapshot.
     pub fn full_state_builder(self: &SnapshotRef) -> FullStateBuilder {
-        crate::plans::state_machines::scan::FullState::for_table(Arc::clone(self))
+        FullState::for_table(Arc::clone(self))
     }
 
     /// Create a split-phase scan replay plan builder rooted at this snapshot.
