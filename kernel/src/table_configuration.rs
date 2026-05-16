@@ -465,9 +465,10 @@ impl TableConfiguration {
     }
 
     /// Whether partition column values must be materialized into data files.
-    /// Returns true when either:
+    /// Returns true when any of the following hold:
     ///   * The [`MaterializePartitionColumns`] writer feature is enabled, or
-    ///   * [`IcebergCompatV3`] is enabled
+    ///   * [`IcebergCompatV3`] is enabled, or
+    ///   * The `delta.writePartitionColumnsToParquet` table property is unset or `true`
     ///
     /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
     /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
@@ -475,6 +476,10 @@ impl TableConfiguration {
         // TODO(#1125): add IcebergcompatV1/V2 here when they are supported.
         self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
             || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+            || self
+                .table_properties()
+                .write_partition_columns_to_parquet
+                .unwrap_or(true)
     }
 
     /// The physical schema for writing data files.
@@ -885,6 +890,7 @@ mod test {
     use crate::table_properties::{
         TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
         ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+        WRITE_PARTITION_COLUMNS_TO_PARQUET,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2320,15 +2326,19 @@ mod test {
         );
     }
 
-    // V3 supported + property set -> partition column materialized into the write schema;
-    // V3 supported but property unset -> partition column stripped from the write schema.
+    // V3 enabled + property set -> partition column materialized into the write schema;
+    // V3 not enabled + writePartitionColumnsToParquet=false -> partition column stripped.
     #[rstest]
     #[case::v3_enabled(
         &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true")],
         // pcol is included, meaning we expect the partition col to be materialized to disk.
         vec!["value", "pcol"],
     )]
-    #[case::v3_supported_but_property_unset(&[], vec!["value"])]
+    #[case::write_partition_cols_false_strips_pcol(&[(WRITE_PARTITION_COLUMNS_TO_PARQUET, "false")], vec!["value"])]
+    #[case::v3_enabled_overrides_property_false(
+        &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true"), (WRITE_PARTITION_COLUMNS_TO_PARQUET, "false")],
+        vec!["value", "pcol"],
+    )]
     fn test_physical_write_schema_materializes_pv_when_iceberg_compat_v3_enabled(
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_field_names: Vec<&str>,
@@ -2652,5 +2662,71 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    /// Helper to create a partitioned table configuration with optional writer features and
+    /// table properties. The schema has two columns: `value` (int) and `part` (string), where
+    /// `part` is the partition column. Only used in tests.
+    fn create_partitioned_table_config(
+        props: &[(&str, &str)],
+        writer_features: Option<&[TableFeature]>,
+    ) -> TableConfiguration {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("value", DataType::INTEGER),
+            StructField::nullable("part", DataType::STRING),
+        ]));
+        let configuration =
+            HashMap::from_iter(props.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part".to_string()],
+            0,
+            configuration,
+        )
+        .unwrap();
+        let protocol = if let Some(features) = writer_features {
+            Protocol::try_new(
+                TABLE_FEATURES_MIN_READER_VERSION,
+                TABLE_FEATURES_MIN_WRITER_VERSION,
+                Some(std::iter::empty::<TableFeature>()),
+                Some(features.iter().cloned()),
+            )
+            .unwrap()
+        } else {
+            Protocol::try_new_legacy(1, 2).unwrap()
+        };
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[rstest]
+    #[case::defaults_true_without_feature_or_property(&[], None, true)]
+    #[case::true_when_property_explicitly_true(
+        &[(WRITE_PARTITION_COLUMNS_TO_PARQUET, "true")], None, true
+    )]
+    #[case::false_when_property_false(
+        &[(WRITE_PARTITION_COLUMNS_TO_PARQUET, "false")], None, false
+    )]
+    #[case::materialize_feature_overrides_false_property(
+        &[(WRITE_PARTITION_COLUMNS_TO_PARQUET, "false")],
+        Some(&[TableFeature::MaterializePartitionColumns] as &[_]),
+        true,
+    )]
+    #[case::materialize_feature_without_property(
+        &[], Some(&[TableFeature::MaterializePartitionColumns] as &[_]), true
+    )]
+    fn test_should_materialize_partition_columns(
+        #[case] props: &[(&str, &str)],
+        #[case] writer_features: Option<&[TableFeature]>,
+        #[case] expected: bool,
+    ) {
+        let config = create_partitioned_table_config(props, writer_features);
+        assert_eq!(config.should_materialize_partition_columns(), expected);
+        assert_eq!(
+            config.physical_write_schema().field("part").is_some(),
+            expected
+        );
     }
 }

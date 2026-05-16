@@ -1742,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_physical_schema_includes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1764,10 +1764,11 @@ mod tests {
             "Logical schema should contain partition column 'letter'"
         );
 
-        // Physical schema should exclude the partition column
+        // Physical schema should include the partition column by default
+        // (writePartitionColumnsToParquet defaults to true when unset)
         assert!(
-            !physical_schema.contains("letter"),
-            "Physical schema should not contain partition column 'letter' (stored in path)"
+            physical_schema.contains("letter"),
+            "Physical schema should contain partition column 'letter' by default"
         );
 
         // Both should contain the non-partition columns
@@ -1840,7 +1841,8 @@ mod tests {
     #[test]
     fn test_materialize_partition_columns_in_write_context(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Without materializePartitionColumns, partition column should be dropped
+        // Without materializePartitionColumns but with default writePartitionColumnsToParquet
+        // (unset = true), partition columns should NOT be dropped
         let (snap_without, wc_without) =
             snapshot_and_partitioned_write_context("./tests/data/basic_partitioned/")?;
         let partition_cols = snap_without.table_configuration().partition_columns();
@@ -1855,8 +1857,9 @@ mod tests {
         );
         let expr_str = format!("{}", wc_without.logical_to_physical());
         assert!(
-            expr_str.contains("drop letter"),
-            "Partition column 'letter' should be dropped. Expression: {expr_str}"
+            !expr_str.contains("drop"),
+            "Partition columns should be kept by default (writePartitionColumnsToParquet unset \
+             = true). Expression: {expr_str}"
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
@@ -1872,6 +1875,14 @@ mod tests {
                 .protocol()
                 .has_table_feature(&TableFeature::MaterializePartitionColumns),
             "partitioned_with_materialize_feature should have materializePartitionColumns feature"
+        );
+        assert_eq!(
+            snap_with
+                .table_configuration()
+                .table_properties()
+                .write_partition_columns_to_parquet,
+            Some(false),
+            "writePartitionColumnsToParquet should be false"
         );
         let expr_str = format!("{}", wc_with.logical_to_physical());
         assert!(
@@ -2309,8 +2320,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::dropped("./tests/data/basic_partitioned/", 2, &[])]
-    #[case::kept("./tests/data/partitioned_with_materialize_feature/", 3, &["letter"])]
+    #[case::kept_by_default("./tests/data/basic_partitioned/", 3, &["letter"])]
+    #[case::kept_by_feature("./tests/data/partitioned_with_materialize_feature/", 3, &["letter"])]
     fn test_partition_column_in_eval_output(
         #[case] table_path: &str,
         #[case] expected_cols: usize,
