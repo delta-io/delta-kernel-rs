@@ -35,7 +35,9 @@ use delta_kernel::expressions::{
     ColumnName, Expression, MapToStructExpression, ParseJsonExpression,
 };
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{FileType, JoinHint, JoinType as KernelJoinType, ScanNode};
+use delta_kernel::plans::ir::nodes::{
+    FileListingNode, FileType, JoinHint, JoinType as KernelJoinType, ScanNode,
+};
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 use delta_kernel::transforms::ExpressionTransform;
@@ -43,7 +45,7 @@ use delta_kernel::transforms::ExpressionTransform;
 use super::CompileContext;
 use crate::compile::expr_translator::kernel_expr_to_df;
 use crate::error::plan_compilation;
-use crate::exec::NullabilityValidationExec;
+use crate::exec::{FileListingExec, NullabilityValidationExec};
 
 /// Walk every kernel projection expression and collect the set of unique top-level column
 /// roots (the first segment of any [`ColumnName`] reference). Used by the `Project` lowering
@@ -482,6 +484,59 @@ impl TableProvider for NullabilityEnforcingTableProvider {
     ) -> datafusion_common::Result<Vec<datafusion_expr::TableProviderFilterPushDown>> {
         self.inner.supports_filters_pushdown(filters)
     }
+}
+
+/// [`TableProvider`] for [`DeclarativePlanNode::FileListing`]: enumerates a storage prefix
+/// via the object store registered for the path's scheme/host and emits a `(path, size,
+/// modification_time)` row per object. The actual listing happens inside the returned
+/// [`ExecutionPlan`] at execute time; planning is fast.
+#[derive(Debug)]
+struct FileListingTableProvider {
+    path: url::Url,
+    schema: Arc<ArrowSchema>,
+}
+
+impl FileListingTableProvider {
+    fn new(path: url::Url) -> Self {
+        use datafusion_common::arrow::datatypes::{DataType, Field};
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("size", DataType::Int64, false),
+            Field::new("modification_time", DataType::Int64, false),
+        ]));
+        Self { path, schema }
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for FileListingTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> Arc<ArrowSchema> {
+        Arc::clone(&self.schema)
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(FileListingExec::new(self.path.clone())))
+    }
+}
+
+fn file_listing_to_logical_plan(node: &FileListingNode) -> Result<LogicalPlan, DeltaError> {
+    let provider: Arc<dyn TableProvider> =
+        Arc::new(FileListingTableProvider::new(node.path.clone()));
+    LogicalPlanBuilder::scan("file_listing", provider_as_source(provider), None)
+        .map_err(crate::error::datafusion_err_to_delta)?
+        .build()
+        .map_err(crate::error::datafusion_err_to_delta)
 }
 
 fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaError> {
@@ -1043,10 +1098,7 @@ fn compile_declarative_node_logical(
                 .map_err(crate::error::datafusion_err_to_delta)?;
             Ok(plan)
         }
-        DeclarativePlanNode::FileListing(node) => Err(plan_compilation(format!(
-            "FileListing leaves are not supported by the logical compile path (path: {})",
-            node.path
-        ))),
+        DeclarativePlanNode::FileListing(node) => file_listing_to_logical_plan(node),
     }
 }
 
