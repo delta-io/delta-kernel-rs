@@ -1921,6 +1921,7 @@ name = "delta-kernel-datafusion-engine"
 version = "0.21.0"
 dependencies = [
  "arrow-json 58.1.0",
+ "async-trait",
  "chrono",
  "datafusion",
  "datafusion-catalog-listing",

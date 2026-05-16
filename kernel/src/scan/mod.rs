@@ -998,7 +998,7 @@ impl Scan {
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
         let scan_files_iter = scan_metadata_iter
-            .map(|res| {
+            .map(|res: Result<ScanMetadata, Error>| {
                 let scan_metadata = res?;
                 let scan_files = vec![];
                 scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)

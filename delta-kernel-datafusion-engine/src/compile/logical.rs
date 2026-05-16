@@ -7,22 +7,29 @@
 //! [F6](https://example.invalid/cleanup#F6) / [B16](https://example.invalid/cleanup#B16) so
 //! engines can rely on a validated input.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::provider_as_source;
-use datafusion_common::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use datafusion_common::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use datafusion_common::{Column, DFSchema};
 use datafusion_datasource_json::file_format::JsonFormat;
 use datafusion_datasource_parquet::file_format::ParquetFormat;
 use datafusion_expr::expr_fn::cast;
 use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
-use datafusion_expr::{lit, Expr, ExprFunctionExt, JoinType as DfJoinType, LogicalPlanBuilder};
+use datafusion_expr::{
+    lit, Expr, ExprFunctionExt, JoinType as DfJoinType, LogicalPlanBuilder, TableType,
+};
 use datafusion_functions_window::row_number::row_number;
+use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     ColumnName, Expression, MapToStructExpression, ParseJsonExpression,
@@ -36,6 +43,7 @@ use delta_kernel::transforms::ExpressionTransform;
 use super::CompileContext;
 use crate::compile::expr_translator::kernel_expr_to_df;
 use crate::error::plan_compilation;
+use crate::exec::NullabilityValidationExec;
 
 /// Walk every kernel projection expression and collect the set of unique top-level column
 /// roots (the first segment of any [`ColumnName`] reference). Used by the `Project` lowering
@@ -346,6 +354,109 @@ fn relax_nested_nullability_for_scan(schema: &ArrowSchema) -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(fields))
 }
 
+/// Walk `field` recursively and emit `(parent_path, child_name)` pairs for every NOT NULL
+/// child sitting inside a nullable parent struct — the case neither DataFusion's
+/// `check_not_null_constraints` (top-level only) nor delta-rs's `DataValidationStream`
+/// (skips nested) handles. Spark Delta enforces this case; we match its semantics via
+/// [`NullabilityValidationExec`].
+fn collect_nested_non_null_validations(
+    path: String,
+    field: &ArrowField,
+    out: &mut Vec<(String, String)>,
+) {
+    if let ArrowDataType::Struct(fields) = field.data_type() {
+        if field.is_nullable() {
+            for child in fields {
+                if !child.is_nullable() {
+                    out.push((path.clone(), child.name().to_string()));
+                }
+            }
+        }
+        for child in fields {
+            collect_nested_non_null_validations(
+                format!("{path}.{}", child.name()),
+                child.as_ref(),
+                out,
+            );
+        }
+    }
+}
+
+fn nested_non_null_validations(schema: &ArrowSchema) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for field in schema.fields() {
+        collect_nested_non_null_validations(field.name().to_string(), field.as_ref(), &mut out);
+    }
+    out
+}
+
+/// [`TableProvider`] that wraps an inner provider (typically a [`ListingTable`] built with a
+/// nullability-relaxed schema so its file source's planner accepts it) and re-asserts the
+/// strict kernel schema on the scan's output. The wrapper declares the strict schema as its
+/// [`TableProvider::schema`], so logical plans built on top see the strict types; the runtime
+/// [`NullabilityValidationExec`] guarantees emitted batches conform.
+///
+/// Used for JSON scans where DataFusion's JSON decoder cannot accept Delta protocol NOT NULL
+/// constraints on nested fields. Parquet scans skip the wrapper — parquet's own decoder
+/// enforces declared nullability at decode time.
+struct NullabilityEnforcingTableProvider {
+    inner: Arc<dyn TableProvider>,
+    strict_schema: Arc<ArrowSchema>,
+    nested_validations: Vec<(String, String)>,
+}
+
+impl NullabilityEnforcingTableProvider {
+    fn new(inner: Arc<dyn TableProvider>, strict_schema: Arc<ArrowSchema>) -> Self {
+        let nested_validations = nested_non_null_validations(strict_schema.as_ref());
+        Self {
+            inner,
+            strict_schema,
+            nested_validations,
+        }
+    }
+}
+
+impl std::fmt::Debug for NullabilityEnforcingTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NullabilityEnforcingTableProvider")
+            .field("nested_validations", &self.nested_validations.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for NullabilityEnforcingTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> Arc<ArrowSchema> {
+        Arc::clone(&self.strict_schema)
+    }
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let inner = self.inner.scan(state, projection, filters, limit).await?;
+        Ok(Arc::new(NullabilityValidationExec::new(
+            inner,
+            self.nested_validations.clone(),
+            Arc::clone(&self.strict_schema),
+        )))
+    }
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion_common::Result<Vec<datafusion_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+}
+
 fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaError> {
     if node.files.is_empty() {
         let arrow_schema: ArrowSchema =
@@ -395,9 +506,21 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
             .collect::<Result<Vec<_>, DeltaError>>()?;
         let config = ListingTableConfig::new_with_multi_paths(paths)
             .with_listing_options(options)
-            .with_schema(file_schema);
-        let provider =
+            .with_schema(Arc::clone(&file_schema));
+        let listing: Arc<dyn TableProvider> =
             Arc::new(ListingTable::try_new(config).map_err(crate::error::datafusion_err_to_delta)?);
+        // JSON file sources don't enforce declared nullability and DataFusion's own
+        // `check_not_null_constraints` only covers top-level columns. Wrap JSON scans with a
+        // provider that re-asserts the strict kernel schema (top-level + nested) at the scan
+        // boundary. Parquet's decoder handles nullability natively, so it scans naked.
+        let provider: Arc<dyn TableProvider> = if node.file_type == FileType::Json {
+            Arc::new(NullabilityEnforcingTableProvider::new(
+                listing,
+                Arc::new(full_schema.clone()),
+            ))
+        } else {
+            listing
+        };
         LogicalPlanBuilder::scan("scan", provider_as_source(provider), None)
             .map_err(crate::error::datafusion_err_to_delta)?
             .build()

@@ -27,10 +27,6 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::LogicalPlan;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
-use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-    SchemaRef as ArrowSchemaRef,
-};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -50,11 +46,9 @@ use delta_kernel::{Engine, Error as KernelError};
 use futures::TryStreamExt;
 use url::Url;
 
-use crate::compile::{
-    compile_plan_logical, node_output_schema, physical_read_schema, CompileContext,
-};
+use crate::compile::{compile_plan_logical, physical_read_schema, CompileContext};
 use crate::error::{datafusion_err_to_delta, LiftDeltaErr};
-use crate::exec::{KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec};
+use crate::exec::{KernelConsumeByKdfExec, KernelLoadSinkExec};
 
 fn relation_table_name(handle_id: u64) -> String {
     format!("__dk_rel_{handle_id}")
@@ -79,55 +73,6 @@ fn map_kernel_err(err: KernelError) -> EngineError {
         KernelError::FileNotFound(path) => EngineError::new(EngineErrorKind::FileNotFound { path }),
         other => EngineError::internal(other),
     }
-}
-
-fn nested_non_null_validations_from_field(
-    path: String,
-    field: &ArrowField,
-    out: &mut Vec<(String, String)>,
-) {
-    if let ArrowDataType::Struct(fields) = field.data_type() {
-        if field.is_nullable() {
-            for child in fields {
-                if !child.is_nullable() {
-                    out.push((path.clone(), child.name().to_string()));
-                }
-            }
-        }
-        for child in fields {
-            nested_non_null_validations_from_field(
-                format!("{path}.{}", child.name()),
-                child.as_ref(),
-                out,
-            );
-        }
-    }
-}
-
-fn nullability_validations_for_target_schema(schema: &ArrowSchema) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for field in schema.fields() {
-        nested_non_null_validations_from_field(field.name().to_string(), field.as_ref(), &mut out);
-    }
-    out
-}
-
-/// Wrap `root` with a [`NullabilityValidationExec`] that asserts every non-nullable field in
-/// the kernel target schema stays non-null at runtime.
-fn wrap_with_nullability_validation(
-    root: Arc<dyn ExecutionPlan>,
-    target_kernel: &delta_kernel::schema::SchemaRef,
-) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    let target_arrow: ArrowSchemaRef =
-        Arc::new(target_kernel.as_ref().try_into_arrow().map_err(|e| {
-            crate::error::plan_compilation(format!("target schema conversion failed: {e}"))
-        })?);
-    let validations = nullability_validations_for_target_schema(target_arrow.as_ref());
-    Ok(Arc::new(NullabilityValidationExec::new(
-        root,
-        validations,
-        target_arrow,
-    )))
 }
 
 fn execute_schema_query_phase(
@@ -242,15 +187,7 @@ impl DataFusionExecutor {
         ctx: &CompileContext,
     ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
         match &plan.sink.sink_type {
-            SinkType::Results(result_schema_opt) => {
-                let target_kernel = result_schema_opt
-                    .clone()
-                    .unwrap_or(node_output_schema(&plan.root)?);
-                Ok(wrap_with_nullability_validation(root, &target_kernel)?)
-            }
-            SinkType::Relation(handle) => {
-                Ok(wrap_with_nullability_validation(root, &handle.schema)?)
-            }
+            SinkType::Results(_) | SinkType::Relation(_) => Ok(root),
             SinkType::ConsumeByKdf(sink) => Ok(Arc::new(KernelConsumeByKdfExec::try_new(
                 root,
                 sink.clone(),
