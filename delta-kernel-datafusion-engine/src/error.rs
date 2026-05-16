@@ -64,8 +64,8 @@ pub fn df_to_delta(e: DataFusionError) -> DeltaError {
 }
 
 /// Convert a `Result<T, DataFusionError>` into `Result<T, DeltaError>` via `.into_delta()?`.
-/// Concentrates the engine -> kernel error transition into a single fluent method, replacing
-/// the per-call `.map_err(df_to_delta)` pattern at engine API boundaries.
+/// Concentrates the engine -> kernel error transition at engine API boundaries into a single
+/// fluent method, so call sites don't repeat `.map_err(df_to_delta)`.
 pub(crate) trait DfResultIntoDelta<T> {
     fn into_delta(self) -> Result<T, DeltaError>;
 }

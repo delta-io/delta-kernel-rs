@@ -28,11 +28,9 @@
 //!
 //! # Adding a KDF
 //!
-//! See `kernel/docs/KDF_DESIGN.md` for the full end-to-end walkthrough.
-//! Short version: new file with four impl blocks (`Kdf`, `ConsumerKdf`,
-//! `KdfOutput`, `RowVisitor`), one line in the submodule mod.rs, one line
-//! re-exporting here. Row-ordering requirements live on the KDF trait
-//! itself — no separate factory.
+//! New file with four impl blocks (`Kdf`, `ConsumerKdf`, `KdfOutput`, `RowVisitor`), one
+//! line in the submodule mod.rs, one line re-exporting here. Row-ordering requirements
+//! live on the KDF trait itself — no separate factory.
 //!
 //! [`ConsumeByKdfSink`]: crate::plans::ir::nodes::ConsumeByKdfSink
 

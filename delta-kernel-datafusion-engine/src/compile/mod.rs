@@ -2,7 +2,7 @@
 //!
 //! Every kernel IR shape lowers to a [`LogicalPlan`] via [`compile_plan_logical`]; the executor
 //! optimizes + materializes physical execution and wraps sink-specific [`ExecutionPlan`]s on
-//! top of that. There is no parallel physical compile path.
+//! top of that.
 //!
 //! Sinks: [`SinkType::Relation`] / [`SinkType::Load`] (drain + the executor materializes the
 //! result as a [`datafusion::datasource::MemTable`] under
@@ -21,11 +21,10 @@ use datafusion::catalog::TableProvider;
 use datafusion_common::error::DataFusionError;
 use datafusion_expr::expr_fn::cast;
 use datafusion_expr::lit;
-use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_functions::core::expr_fn::{get_field, named_struct};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::ir::nodes::JoinType;
-use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
+use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::Engine;
@@ -33,6 +32,8 @@ use delta_kernel::Engine;
 pub mod expr_translator;
 mod json_parse;
 pub mod logical;
+
+pub use logical::compile_plan_logical;
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
 #[derive(Clone)]
@@ -54,8 +55,8 @@ pub struct CompileContext {
 }
 
 impl CompileContext {
-    /// Build a context without an active phase state. Useful for inspection-only paths like
-    /// `compile_plan_logical_for_inspection` where no plan is actually being executed.
+    /// Build a context without an active phase state. Useful for inspection-only paths (e.g.
+    /// benchmark plan printers) that do not execute a plan.
     pub fn new(
         relation_providers: Arc<HashMap<u64, Arc<dyn TableProvider>>>,
         engine: Arc<dyn Engine>,
@@ -66,15 +67,6 @@ impl CompileContext {
             engine,
         }
     }
-}
-
-/// Compile a complete [`Plan`] to a DataFusion [`LogicalPlan`]. Always succeeds for valid
-/// kernel IR or surfaces a typed [`DataFusionError`].
-pub fn compile_plan_logical(
-    plan: &Plan,
-    ctx: &CompileContext,
-) -> Result<LogicalPlan, DataFusionError> {
-    logical::compile_plan_logical(plan, ctx)
 }
 
 pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DataFusionError> {

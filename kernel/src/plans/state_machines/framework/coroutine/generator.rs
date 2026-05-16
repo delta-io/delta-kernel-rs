@@ -1,7 +1,7 @@
 //! Minimal hand-rolled stackless coroutine shim.
 //!
-//! Replaces the `genawaiter` crate with a narrow, no-deps implementation that
-//! covers exactly the shape the [`super::driver::CoroutineSM`] driver needs:
+//! A narrow, no-deps implementation that covers exactly the shape the
+//! [`super::driver::CoroutineSM`] driver needs:
 //!
 //! - [`Co<Y, R>`] -- the coroutine-side handle. An `async fn` given a `Co` calls [`Co::yield_`] to
 //!   surrender control with a value of type `Y`, and receives back a value of type `R` when the

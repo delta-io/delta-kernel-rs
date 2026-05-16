@@ -68,7 +68,7 @@ use url::Url;
 
 use crate::compile::{compile_plan_logical, CompileContext};
 use crate::error::DfResultIntoDelta;
-use crate::executor::load::{materialize_upstream_batch, physical_read_schema};
+use crate::executor::load::materialize_upstream_batch;
 
 fn relation_table_name(handle_id: u64) -> String {
     format!("__dk_rel_{handle_id}")
@@ -464,7 +464,7 @@ impl DataFusionExecutor {
         ctx: &CompileContext,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
         let mut stream = self.single_results_stream(physical)?;
-        let read_schema = physical_read_schema(sink)?;
+        let read_schema = sink.file_schema.clone();
         let engine = ctx.engine.as_ref();
         let mut out = Vec::new();
         while let Some(upstream_batch) = stream.try_next().await? {

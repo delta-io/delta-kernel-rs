@@ -2,9 +2,8 @@
 //! of kernel-internal readers.
 //!
 //! Each struct here describes a JSON or Parquet record shape the kernel
-//! parses. Deriving [`ToSchema`] lets
-//! [`scan_*_as::<T>`](crate::plans::ir::DeclarativePlanNode::scan_as) infer
-//! the scan schema at plan-build time. The same struct doubles as the
+//! parses. Deriving [`ToSchema`] lets callers derive the scan schema at
+//! plan-build time (`T::to_schema()`). The same struct doubles as the
 //! `KdfOutput::Output` for the consumer that parses it — callers receive a
 //! value of this type (or `Option`/`Vec`/`HashMap` of it) when the pipeline
 //! terminates via `.consume(state)`.

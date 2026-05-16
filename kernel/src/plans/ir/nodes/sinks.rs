@@ -149,9 +149,6 @@ impl std::hash::Hash for RelationHandle {
 ///
 /// Names are [`ColumnName`]s so they may reference nested fields (e.g.
 /// `add.path` on a Delta-checkpoint upstream).
-///
-/// Spec: `declarative_plan_docs/algebra/plan_nodes.md` §7.3
-/// (`ScanFileColumns`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanFileColumns {
     /// Column on the upstream relation holding the per-row file path /
@@ -195,9 +192,6 @@ impl DvRef {
 ///
 /// An optional [`Self::dv_ref`] column hint enables per-row deletion-vector
 /// masking against a descriptor column on the upstream relation.
-///
-/// Spec: `declarative_plan_docs/algebra/plan_nodes.md` §5
-/// (`Sink: Load (LoadSinkNode)`).
 #[derive(Debug, Clone)]
 pub struct LoadSink {
     /// Where Load's output is materialized. Downstream plans reference this

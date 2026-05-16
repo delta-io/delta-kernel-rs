@@ -11,7 +11,7 @@ use crate::expressions::{ColumnName, Expression, IntoColumnName, Predicate, Scal
 use crate::schema::{ArrayType, DataType};
 
 /// Synthetic column carrying the materialized dedup key array so hash joins only need top-level
-/// column keys (`delta-kernel-datafusion-engine/src/compile/join.rs`).
+/// column keys.
 pub(super) const FSR_JOIN_KEY_COL: &str = "__fsr_join_k";
 
 // === Action column paths ===

@@ -340,8 +340,6 @@ pub struct WindowFunction {
 /// (for example `ORDER BY version DESC` for newest-wins dedup). [`WindowNode::try_new`] and
 /// [`DeclarativePlanNode::window`](crate::plans::ir::DeclarativePlanNode::window) enforce this at
 /// construction time; the DataFusion executor also rejects empty `order_by` when compiling plans.
-///
-/// Spec: `declarative_plan_docs/algebra/plan_nodes.md` §3.2 (`WindowNode`).
 #[derive(Debug, Clone)]
 pub struct WindowNode {
     pub functions: Vec<WindowFunction>,

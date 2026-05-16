@@ -134,9 +134,6 @@ pub(super) fn action_schema_with_augmented_add(
     arc_schema(fields)
 }
 
-/// Schema = [`action_read_schema`] plus the dedup-key column [`FSR_JOIN_KEY_COL`]. Used by
-/// the `FSR_COMMIT_DEDUP` relation handle and by the projection that materializes
-/// the dedup key on the checkpoint side of the LeftAnti.
 /// Action schema augmented with the FSR join key column (`__fsr_join_k: ARRAY<STRING>?`), and
 /// optionally a per-commit `version: LONG` column. The version column is required only by
 /// `build_commit_dedup_plan`'s row_number window (`ORDER BY version DESC`) and is dropped

@@ -67,7 +67,7 @@ impl ResultPlan {
     }
 }
 
-// === Leaf constructors (F8) ===
+// === Leaf constructors ===
 
 /// Scan files with the given format. See [`DeclarativePlanNode::scan`].
 pub fn scan(format: FileFormat, files: Vec<FileMeta>, schema: SchemaRef) -> DeclarativePlanNode {

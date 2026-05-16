@@ -31,12 +31,6 @@ use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 use delta_kernel::{Engine, FileMeta};
 use url::Url;
 
-/// Per-file column projection that the parquet / json kernel handler should
-/// request when reading rows for a [`LoadSink`].
-pub(crate) fn physical_read_schema(load: &LoadSink) -> Result<KernelSchemaRef, DataFusionError> {
-    Ok(load.file_schema.clone())
-}
-
 fn kernel_err(e: delta_kernel::Error) -> DataFusionError {
     crate::error::internal_error(e.to_string())
 }

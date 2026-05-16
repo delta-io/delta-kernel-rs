@@ -1,11 +1,9 @@
 //! Declarative-plan -> DataFusion [`LogicalPlan`] lowering.
 //!
-//! Every kernel IR shape compiles to a [`LogicalPlan`] or surfaces a typed error — there is
-//! no soft `Ok(None)` "unsupported" signal anymore. Invariants the caller is responsible for
-//! (non-Hash join hints, empty Union, empty Window functions, ...) error here rather than
-//! silently bail; long-term those checks belong on the kernel IR constructors per
-//! [F6](https://example.invalid/cleanup#F6) / [B16](https://example.invalid/cleanup#B16) so
-//! engines can rely on a validated input.
+//! Every kernel IR shape compiles to a [`LogicalPlan`] or surfaces a typed error. Invariants
+//! the caller is responsible for (non-Hash join hints, empty Union, empty Window functions,
+//! ...) error here rather than silently bail; long-term those checks belong on the kernel IR
+//! constructors so engines can rely on a validated input.
 
 use std::sync::Arc;
 

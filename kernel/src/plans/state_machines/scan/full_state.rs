@@ -24,8 +24,8 @@
 //!    identity) → Project(action_cols + key) → LeftAntiJoin(probe=this,
 //!    build=RelationRef(commit_dedup).project(key))` materializes the *checkpoint survivors* (rows
 //!    the commit tail didn't touch). The plan completes with `Union(RelationRef(commit_dedup),
-//!    survivors) -> Filter(retention) -> Project(action_read_schema) -> into_results()` so the
-//!    engine's `Results` consumer sees the reconstructed action stream.
+//!    survivors) -> Filter(retention) -> Project(action_read_schema) -> into_relation(FSR_RESULTS)`
+//!    so the caller reads the reconstructed action stream from [`FSR_RESULTS`].
 //!
 //! The window applies only to the (typically-small) commit-tail stream; the (typically-large)
 //! checkpoint stream goes through a single hash anti-join keyed on the dedup column. Compared
@@ -145,10 +145,9 @@ impl FullStateBuilder {
 
     /// Enable stats-aware planning on this builder.
     ///
-    /// This is currently an API-level compatibility shim to align the FullState
-    /// builder surface with scan replay builders. Canonical FSR output plans
-    /// already preserve Add action stats columns, so there is no additional
-    /// rewrite needed at this layer.
+    /// API-level compatibility shim aligning the FullState builder surface with scan replay
+    /// builders. Canonical FSR output plans already preserve Add action stats columns, so no
+    /// additional rewrite is needed at this layer.
     pub fn with_stats(self) -> Self {
         self
     }

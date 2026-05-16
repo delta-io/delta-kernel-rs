@@ -22,8 +22,8 @@
 //! use delta_kernel::plans::ir::DeclarativePlanNode;
 //! use delta_kernel::plans::ir::nodes::RelationHandle;
 //!
-//! let handle = RelationHandle::fresh("results", output_schema.clone());
-//! let plan = DeclarativePlanNode::scan_json_as::<CheckpointHintRecord>(files)
+//! let handle = RelationHandle::fresh("results", schema.clone());
+//! let plan = DeclarativePlanNode::scan_json(files, schema.clone())
 //!     .filter(predicate)
 //!     .project(projection, output_schema)
 //!     .into_relation(handle);
@@ -33,5 +33,4 @@ pub mod errors;
 pub mod ir;
 pub mod kdf;
 pub mod record_schemas;
-pub mod schemas;
 pub mod state_machines;

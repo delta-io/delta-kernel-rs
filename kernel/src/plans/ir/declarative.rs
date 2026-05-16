@@ -298,7 +298,7 @@ impl DeclarativePlanNode {
         })
     }
 
-    // === Convenience combinators (F7) ===
+    // === Convenience combinators ===
     //
     // These wrap the lower-level `union`/`union_unordered`/`join`/`window` constructors with
     // common parameter sets seen across plan builders. Use them when they fit; drop down to the
