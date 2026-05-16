@@ -4,18 +4,17 @@
 //! `commit_dedup`, optional `sidecar_load`, `results`) used by
 //! [`FullState`](super::full_state::FullState). Plans are produced through a
 //! [`PlanCollector`], which mints fresh relation handles from each chain's
-//! output schema and binds chains to their sinks. The terminal results plan is
-//! still appended manually because it ends in [`SinkType::Results`] (which
-//! `PlanCollector` does not own); subsequent phases will fold it in once the
-//! results sink shape is unified.
+//! output schema and binds chains to their sinks. The terminal plan ends in a
+//! [`SinkType::Relation`] keyed by [`FSR_RESULTS`]; the caller reads the
+//! relation after executing every plan in [`ResultPlan::plans`].
 
 use std::sync::Arc;
 
 use url::Url;
 
 use super::action::{
-    action_output_schema, action_read_schema, augmented_action_schema, fsr_dedup_key,
-    fsr_row_has_identity_predicate, path_size_schema, retention_filter, FSR_JOIN_KEY_COL,
+    action_read_schema, augmented_action_schema, fsr_dedup_key, fsr_row_has_identity_predicate,
+    path_size_schema, retention_filter, FSR_JOIN_KEY_COL,
 };
 use super::checkpoint_shape::{checkpoint_manifest_scan_schema, CheckpointShape};
 use crate::action_reconciliation::{
@@ -25,8 +24,10 @@ use crate::actions::SIDECAR_NAME;
 use crate::expressions::{col, ColumnName, Scalar};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::nodes::{FileType, LoadSpec, OrderingSpec, RelationHandle, ScanFileColumns};
-use crate::plans::ir::{plan, DeclarativePlanNode, Plan, PlanCollector};
+use crate::plans::ir::nodes::{
+    FileType, LoadSpec, OrderingSpec, RelationHandle, ScanFileColumns, SinkType,
+};
+use crate::plans::ir::{plan, DeclarativePlanNode, Plan, PlanCollector, ResultPlan};
 use crate::schema::{ArrayType, DataType, SchemaBuilder, StructField};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
@@ -46,6 +47,10 @@ pub const FSR_CHECKPOINT_TOP: &str = "fsr.checkpoint_top";
 /// Sidecar action stream materialized for V2-multipart checkpoints; absent for
 /// V1 / V2-inline checkpoints. Schema = `action_read_schema`.
 pub const FSR_SIDECAR_ACTIONS: &str = "fsr.sidecar_actions";
+/// Terminal FSR relation: reconstructed live-action rows projected to
+/// `action_output_schema`. The result-plan caller reads this relation after
+/// executing every plan returned by [`build_fsr_plans`].
+pub const FSR_RESULTS: &str = "fsr.results";
 
 /// One literal row describing a Delta JSON commit file consumed by the
 /// commit-load Values upstream.
@@ -56,17 +61,17 @@ pub struct CommitFileMeta {
     pub version: Version,
 }
 
-/// Build the full FSR plan vector for `snapshot` in topological order:
+/// Build the canonical FSR [`ResultPlan`] for `snapshot` in topological order:
 ///
 /// `[commit_load, commit_dedup, (checkpoint_top, sidecar_load if has_sidecars), results]`.
 ///
 /// Each preceding plan publishes a [`RelationHandle`] consumed by its
-/// successors. The terminal results plan ends in
-/// [`crate::plans::ir::nodes::SinkType::Results`] and is appended manually.
+/// successors. The terminal plan binds to [`FSR_RESULTS`]; the caller reads
+/// that relation after executing every plan in [`ResultPlan::plans`].
 pub fn build_fsr_plans(
     snapshot: &Snapshot,
     shape: CheckpointShape,
-) -> Result<Vec<Plan>, DeltaError> {
+) -> Result<ResultPlan, DeltaError> {
     let log_root = snapshot.log_segment().log_root.clone();
     let segment = snapshot.log_segment();
 
@@ -196,16 +201,29 @@ pub fn build_fsr_plans(
         None
     };
 
-    let mut plans = p.into_vec();
-    plans.push(build_results_plan(
+    let results_plan = build_results_plan(
         &commit_dedup,
         sidecar.as_ref(),
         checkpoint_top.as_ref(),
         min_file_ts,
         txn_expiry,
-    )?);
-
-    Ok(plans)
+    )?;
+    // The terminal plan is built by `build_results_plan` with an explicit
+    // `FSR_RESULTS` Relation sink so that branches publishing different inner
+    // schemas (no-checkpoint `action_read_schema` vs. with-checkpoint
+    // `action_output_schema`) still expose the canonical strict shape to the
+    // caller.
+    let result_relation = match &results_plan.sink.sink_type {
+        SinkType::Relation(h) => h.clone(),
+        other => {
+            return Err(delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "fsr::build_fsr_plans: internal: terminal plan must end in a Relation sink, got {other:?}",
+            ));
+        }
+    };
+    p.push_plan(results_plan);
+    Ok(ResultPlan::new(p.into_vec(), result_relation))
 }
 
 /// Type of the synthetic [`FSR_JOIN_KEY_COL`] column: `ARRAY<STRING?>?`.
@@ -269,8 +287,9 @@ fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError>
 }
 
 /// Plan 4 (terminal): assemble the live snapshot rows from commit winners +
-/// checkpoint survivors and stream them to the
-/// [`SinkType::Results`](crate::plans::ir::nodes::SinkType::Results) consumer.
+/// checkpoint survivors and bind them to the [`FSR_RESULTS`] relation. The
+/// caller reads that relation after executing every plan in the result-plan
+/// vector.
 ///
 /// Inline shape:
 ///
@@ -287,13 +306,18 @@ fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError>
 /// Union(relation_ref(commit_dedup), survivors)
 ///     | Filter(retention)
 ///     | Project(action_read_schema)
-///     | into_results()
+///     | into_relation(FSR_RESULTS)
 /// ```
 ///
 /// The top-level checkpoint is read with the *full* action schema (missing
 /// fields resolve to NULL) so the union with the sidecar relation and the
 /// commit-dedup relation is schema-compatible without an explicit alignment
 /// project.
+///
+/// The terminal handle's published schema is [`action_read_schema`] (the
+/// all-nullable shape the chain actually emits). Callers that need the
+/// strict per-action shape -- notably `scan_metadata_plans_with_shape` --
+/// rebind to [`action_output_schema`] separately at their own boundary.
 fn build_results_plan(
     commit_dedup_handle: &RelationHandle,
     sidecar_handle: Option<&RelationHandle>,
@@ -301,15 +325,16 @@ fn build_results_plan(
     min_file_retention_timestamp: i64,
     txn_expiration_cutoff: Option<i64>,
 ) -> Result<Plan, DeltaError> {
+    let result_handle = RelationHandle::fresh(FSR_RESULTS, action_read_schema());
     // No checkpoint parts: there is no checkpoint side to anti-join. The full snapshot state is
     // entirely determined by commit winners.
     let Some(checkpoint_top_handle) = checkpoint_top_handle else {
-        return Ok(plan::relation_ref(commit_dedup_handle)
+        let chain = plan::relation_ref(commit_dedup_handle)
             .filter(Arc::new(
                 retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
             ))
-            .drop_column(FSR_JOIN_KEY_COL)
-            .into_results());
+            .drop_column(FSR_JOIN_KEY_COL);
+        return Ok(chain.into_relation(result_handle));
     };
 
     let dedup_expr = Arc::new(fsr_dedup_key());
@@ -369,7 +394,7 @@ fn build_results_plan(
                 .fields()
                 .map(|f| Arc::new(col(f.name().as_str())))
                 .collect(),
-            action_output_schema(),
+            action_read_schema(),
         )
-        .into_results())
+        .into_relation(result_handle))
 }

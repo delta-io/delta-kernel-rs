@@ -10,11 +10,13 @@
 //!
 //! ```ignore
 //! use delta_kernel::plans::ir::DeclarativePlanNode;
+//! use delta_kernel::plans::ir::nodes::RelationHandle;
 //!
-//! // Untyped pipeline: scan JSON, project to a sub-schema, stream results.
+//! // Untyped pipeline: scan JSON, project to a sub-schema, pipe into a relation.
+//! let handle = RelationHandle::fresh("scanned", schema.clone());
 //! let plan = DeclarativePlanNode::scan_json(files, schema)
 //!     .project(projection, output_schema)
-//!     .into_results();
+//!     .into_relation(handle.clone());
 //!
 //! // Typed pipeline: scan JSON, drain into a typed consumer KDF, recover
 //! // the typed output from the resulting PhaseState.
@@ -41,10 +43,10 @@
 //! ## Terminals
 //!
 //! - [`DeclarativePlanNode::into_plan`] — explicit sink.
-//! - [`DeclarativePlanNode::into_results`] — sugar for `into_plan(SinkType::Results(None))`.
 //! - [`DeclarativePlanNode::into_relation`] — pipe output into a named
-//!   [`RelationHandle`](super::nodes::RelationHandle) for another plan in the same
-//!   `PhaseOperation::Plans(...)` to consume.
+//!   [`RelationHandle`](super::nodes::RelationHandle); another plan in the same
+//!   `PhaseOperation::Plans(...)` consumes via `relation_ref`, or a
+//!   [`ResultPlan`](super::plan::ResultPlan) names it as the caller-facing output.
 //! - [`DeclarativePlanNode::into_load`] — file-reader sink: each upstream row describes a file to
 //!   open and read; optional DV masking via [`LoadSink::dv_ref`]. Materializes under a named
 //!   relation handle.
@@ -82,9 +84,9 @@ use crate::{DeltaResult, Error, FileMeta};
 /// A single node in the declarative plan tree.
 ///
 /// Trees are transforms-only: every complete pipeline terminates in a
-/// [`Plan`] via one of the terminal methods (`into_plan`, `into_results`,
-/// `into_relation`, `into_load`, `consume_by_kdf`) or in a
-/// `(Plan, Extractor<O>)` pair via [`DeclarativePlanNode::consume`].
+/// [`Plan`] via one of the terminal methods (`into_plan`, `into_relation`,
+/// `into_load`, `consume_by_kdf`) or in a `(Plan, Extractor<O>)` pair via
+/// [`DeclarativePlanNode::consume`].
 #[derive(Debug, Clone)]
 pub enum DeclarativePlanNode {
     // Leaves
@@ -560,22 +562,11 @@ impl DeclarativePlanNode {
         Plan::new(self, SinkNode { sink_type })
     }
 
-    /// Terminal: stream every output batch to the caller.
-    ///
-    /// Leaves result schema inference to the executor (`SinkType::Results(None)`).
-    pub fn into_results(self) -> Plan {
-        self.into_plan(SinkType::Results(None))
-    }
-
-    /// Terminal: stream every output batch to the caller with an explicit
-    /// output schema contract.
-    pub fn into_results_with_schema(self, schema: SchemaRef) -> Plan {
-        self.into_plan(SinkType::Results(Some(schema)))
-    }
-
     /// Terminal: stream every output batch to the named relation. Another
     /// plan in the same `PhaseOperation::Plans(...)` consumes the relation
-    /// via [`Self::relation_ref`].
+    /// via [`Self::relation_ref`], or a
+    /// [`ResultPlan`](super::plan::ResultPlan) names this relation as its
+    /// caller-facing output.
     pub fn into_relation(self, handle: RelationHandle) -> Plan {
         self.into_plan(SinkType::Relation(handle))
     }
@@ -824,13 +815,6 @@ mod tests {
             }
             other => panic!("expected Load sink, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn into_results_terminal() {
-        let base = DeclarativePlanNode::scan_json(vec![], simple_schema());
-        let results_plan = base.into_results();
-        assert_eq!(results_plan.sink.sink_type, SinkType::Results(None));
     }
 
     #[test]

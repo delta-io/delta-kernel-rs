@@ -2,12 +2,24 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::AsArray;
+use delta_kernel::arrow::array::{AsArray, RecordBatch};
 use delta_kernel::expressions::{Expression, Scalar};
-use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType};
+use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType, RelationHandle};
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
+
+/// Run `node` with a Relation sink and return its materialized batches.
+fn run_to_batches(node: DeclarativePlanNode) -> Vec<RecordBatch> {
+    let schema = node.output_schema();
+    let handle = RelationHandle::fresh("test_out", schema);
+    let plan = node.into_relation(handle.clone());
+    futures::executor::block_on(async {
+        let exec = DataFusionExecutor::try_new().unwrap();
+        exec.execute_plans(&[plan]).await.unwrap();
+        exec.collect_relation(&handle).await.unwrap()
+    })
+}
 
 #[test]
 fn hash_inner_join_literals_matching_keys_single_row() {
@@ -52,15 +64,7 @@ fn hash_inner_join_literals_matching_keys_single_row() {
     };
 
     let root = DeclarativePlanNode::join(join_node, build, probe);
-    let plan = root.into_results();
-
-    let batches = futures::executor::block_on(async {
-        DataFusionExecutor::try_new()
-            .unwrap()
-            .execute_plan_collect(plan)
-            .await
-            .unwrap()
-    });
+    let batches = run_to_batches(root);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1, "expected one matching inner-join row");
@@ -116,15 +120,7 @@ fn hash_left_anti_join_literals_keeps_non_matching_probe_rows() {
     };
 
     let root = DeclarativePlanNode::join(join_node, build, probe);
-    let plan = root.into_results();
-
-    let batches = futures::executor::block_on(async {
-        DataFusionExecutor::try_new()
-            .unwrap()
-            .execute_plan_collect(plan)
-            .await
-            .unwrap()
-    });
+    let batches = run_to_batches(root);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1);

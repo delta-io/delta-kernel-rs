@@ -234,19 +234,16 @@ impl Eq for LoadSink {}
 
 /// What the engine does with the terminal row stream.
 ///
-/// Sink shapes include: `Results` (stream batches to the caller), `Relation`
-/// (pipe into another plan), `ConsumeByKdf` (drain into a [`ConsumerKdf`]),
-/// and `Load` (per-row file read).
+/// Sink shapes: `Relation` (pipe into another plan or expose to the caller via
+/// a [`ResultPlan`](crate::plans::ir::ResultPlan)), `ConsumeByKdf` (drain into
+/// a [`ConsumerKdf`]), and `Load` (per-row file read).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkType {
-    /// Stream every output batch to the caller.
-    ///
-    /// `None` means "infer from root output schema". Newer plan builders should
-    /// prefer setting `Some(schema)` explicitly.
-    Results(Option<SchemaRef>),
     /// Stream every output batch to the named [`RelationHandle`]. Another
     /// plan in the same phase consumes via
-    /// [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
+    /// [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`],
+    /// or a [`ResultPlan`](crate::plans::ir::ResultPlan) names this relation
+    /// as its caller-facing output.
     Relation(RelationHandle),
     /// Drain every output batch through the wrapped consumer KDF. The KDF's
     /// finalized per-partition state is harvested by the engine into the

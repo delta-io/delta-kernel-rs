@@ -12,8 +12,8 @@
 //!
 //! 1. **Borrow, don't move** for handles — [`relation_ref`] takes `&RelationHandle` so callers can
 //!    reuse the same handle in multiple plans without manual `.clone()`.
-//! 2. **Top-down readability** — `plan::relation_ref(&h).filter(...).into_results()` reads cleaner
-//!    than `DeclarativePlanNode::relation_ref(h.clone()).filter(...).into_results()`.
+//! 2. **Top-down readability** — `plan::relation_ref(&h).filter(...).into_relation(out)` reads
+//!    cleaner than `DeclarativePlanNode::relation_ref(h.clone()).filter(...).into_relation(out)`.
 
 use super::declarative::DeclarativePlanNode;
 use super::nodes::{FileFormat, LoadSink, LoadSpec, RelationHandle, SinkNode, SinkType};
@@ -33,6 +33,35 @@ impl Plan {
     /// Assemble a plan from a root subtree and a sink.
     pub fn new(root: DeclarativePlanNode, sink: SinkNode) -> Self {
         Self { root, sink }
+    }
+}
+
+/// Terminal value of read-style state machines.
+///
+/// Names the relation the caller will read after executing [`Self::plans`]. The
+/// SM body returns this value; the engine first runs every plan in `plans`
+/// (each terminating in a [`SinkType::Relation`], [`SinkType::Load`], or
+/// [`SinkType::ConsumeByKdf`] sink) and then materializes the row stream
+/// referenced by `result_relation`.
+#[derive(Debug, Clone)]
+pub struct ResultPlan {
+    /// Plans that must execute before the result relation is readable. Each
+    /// plan publishes its output through its sink; downstream plans in the
+    /// same vector may reference earlier relations through
+    /// [`crate::plans::ir::DeclarativePlanNode::RelationRef`].
+    pub plans: Vec<Plan>,
+    /// Final relation the caller reads to obtain the SM's row stream.
+    pub result_relation: RelationHandle,
+}
+
+impl ResultPlan {
+    /// Build a result plan from its constituent plan vector and the handle the
+    /// caller reads at the end.
+    pub fn new(plans: Vec<Plan>, result_relation: RelationHandle) -> Self {
+        Self {
+            plans,
+            result_relation,
+        }
     }
 }
 

@@ -71,8 +71,17 @@ fn flatten_i64_col(batches: &[RecordBatch], name: &str) -> Vec<i64> {
         .collect()
 }
 
-fn root_plan(scan: DeclarativePlanNode) -> delta_kernel::plans::ir::Plan {
-    scan.into_results()
+/// Drive `scan` through the executor: terminate in a Relation sink, run the plan, and return
+/// the materialized batches.
+async fn run_scan(
+    ex: &DataFusionExecutor,
+    scan: DeclarativePlanNode,
+) -> Vec<delta_kernel::arrow::array::RecordBatch> {
+    let schema = scan.output_schema();
+    let handle = delta_kernel::plans::ir::nodes::RelationHandle::fresh("scan_out", schema);
+    let plan = scan.into_relation(handle.clone());
+    ex.execute_plans(&[plan]).await.unwrap();
+    ex.collect_relation(&handle).await.unwrap()
 }
 
 #[tokio::test]
@@ -110,12 +119,12 @@ async fn parquet_scan_matches_renamed_logical_columns_by_parquet_field_id() {
         .unwrap(),
     );
 
-    let plan = root_plan(DeclarativePlanNode::scan_parquet(
-        vec![file_meta(&path)],
-        kernel_schema,
-    ));
     let ex = DataFusionExecutor::try_new().unwrap();
-    let batches = ex.execute_plan_collect(plan).await.unwrap();
+    let batches = run_scan(
+        &ex,
+        DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
+    )
+    .await;
 
     assert_eq!(flatten_i64_col(&batches, "user_id"), vec![10, 20]);
     assert_eq!(
@@ -158,12 +167,12 @@ async fn parquet_scan_orders_output_by_logical_schema_when_physical_column_order
         .unwrap(),
     );
 
-    let plan = root_plan(DeclarativePlanNode::scan_parquet(
-        vec![file_meta(&path)],
-        kernel_schema,
-    ));
     let ex = DataFusionExecutor::try_new().unwrap();
-    let batches = ex.execute_plan_collect(plan).await.unwrap();
+    let batches = run_scan(
+        &ex,
+        DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
+    )
+    .await;
 
     assert_eq!(batches[0].schema().field(0).name(), "logical_a");
     assert_eq!(batches[0].schema().field(1).name(), "logical_b");
@@ -205,12 +214,12 @@ async fn parquet_scan_mixes_field_id_match_with_name_fallback_per_column() {
         .unwrap(),
     );
 
-    let plan = root_plan(DeclarativePlanNode::scan_parquet(
-        vec![file_meta(&path)],
-        kernel_schema,
-    ));
     let ex = DataFusionExecutor::try_new().unwrap();
-    let batches = ex.execute_plan_collect(plan).await.unwrap();
+    let batches = run_scan(
+        &ex,
+        DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
+    )
+    .await;
 
     assert_eq!(
         flatten_string_col(&batches, "plain_label"),

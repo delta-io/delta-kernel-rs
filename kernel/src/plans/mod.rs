@@ -20,11 +20,13 @@
 //!
 //! ```ignore
 //! use delta_kernel::plans::ir::DeclarativePlanNode;
+//! use delta_kernel::plans::ir::nodes::RelationHandle;
 //!
+//! let handle = RelationHandle::fresh("results", output_schema.clone());
 //! let plan = DeclarativePlanNode::scan_json_as::<CheckpointHintRecord>(files)
 //!     .filter(predicate)
 //!     .project(projection, output_schema)
-//!     .into_results();
+//!     .into_relation(handle);
 //! ```
 
 pub mod errors;

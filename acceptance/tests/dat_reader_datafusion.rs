@@ -103,12 +103,14 @@ async fn assert_fsr_add_only_matches_scan_files(
     let executor = DataFusionExecutor::try_new_with_engine(engine).map_err(|e| {
         delta_kernel::Error::generic(format!("create DataFusionExecutor for full_state: {e}"))
     })?;
-    let ((), fsr_batches) = executor
-        .drive_coroutine_sm_collecting_results(sm)
-        .await
-        .map_err(|e| {
-            delta_kernel::Error::generic(format!("execute full_state via DataFusionExecutor: {e}"))
-        })?;
+    let rp = executor.drive_to_completion(sm).await.map_err(|e| {
+        delta_kernel::Error::generic(format!("execute full_state via DataFusionExecutor: {e}"))
+    })?;
+    let fsr_batches = executor.collect_result(rp).await.map_err(|e| {
+        delta_kernel::Error::generic(format!(
+            "collect full_state result via DataFusionExecutor: {e}"
+        ))
+    })?;
     let fsr_paths = collect_fsr_add_paths(&fsr_batches);
 
     if fsr_paths != scan_paths {

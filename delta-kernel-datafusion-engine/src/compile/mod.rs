@@ -4,15 +4,18 @@
 //! optimizes + materializes physical execution and wraps sink-specific [`ExecutionPlan`]s on
 //! top of that. There is no parallel physical compile path.
 //!
-//! Sinks: [`SinkType::Results`] (stream batches), [`SinkType::Relation`] /
-//! [`SinkType::Load`] (drain + the executor materializes the result as a
-//! [`datafusion::datasource::MemTable`] under
+//! Sinks: [`SinkType::Relation`] / [`SinkType::Load`] (drain + the executor materializes the
+//! result as a [`datafusion::datasource::MemTable`] under
 //! [`crate::executor::DataFusionExecutor::session_ctx`] for downstream
 //! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::ConsumeByKdf`] (drained directly by
 //! the executor through a [`delta_kernel::plans::kdf::ConsumerKdf`] handle).
+//!
+//! [`SinkType::Relation`]: delta_kernel::plans::ir::nodes::SinkType::Relation
+//! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load
+//! [`SinkType::ConsumeByKdf`]: delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion_common::error::DataFusionError;
@@ -23,7 +26,6 @@ use datafusion_functions::core::expr_fn::{get_field, named_struct};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::ir::nodes::JoinType;
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
-use delta_kernel::plans::kdf::FinishedHandle;
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::Engine;
@@ -42,30 +44,24 @@ pub struct CompileContext {
     /// plan being compiled does not reference any relations (or for inspection-only paths
     /// like benchmark physical-plan dumps).
     pub relation_providers: Arc<HashMap<u64, Arc<dyn TableProvider>>>,
-    /// Latest finalized [`FinishedHandle`] from a [`SinkType::ConsumeByKdf`] plan run on this
-    /// executor.
-    pub kdf_harvest_slot: Arc<Mutex<Option<FinishedHandle>>>,
-    /// When [`Some`], [`SinkType::ConsumeByKdf`] pipelines submit finalized handles into this
-    /// [`PhaseState`] for
-    /// [`StateMachine`](delta_kernel::plans::state_machines::framework::state_machine::StateMachine)
-    /// phases instead of populating [`Self::kdf_harvest_slot`] only.
-    ///
-    /// [`None`] preserves single-plan harvesting via
-    /// [`crate::executor::DataFusionExecutor::take_last_kdf_finished`].
+    /// Active phase's [`PhaseState`] (`Some` while a phase is executing). `ConsumeByKdf`
+    /// drains submit their finalized handles here; `None` means the executor is not inside a
+    /// phase and any ConsumeByKdf sink encountered surfaces an internal error.
     pub phase_state: Option<PhaseState>,
-    /// Kernel [`Engine`] for sinks that delegate IO to parquet/json handlers ([`SinkType::Load`]).
+    /// Kernel [`Engine`] for sinks that delegate IO to parquet/json handlers
+    /// ([`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load)).
     pub engine: Arc<dyn Engine>,
 }
 
 impl CompileContext {
+    /// Build a context without an active phase state. Useful for inspection-only paths like
+    /// `compile_plan_logical_for_inspection` where no plan is actually being executed.
     pub fn new(
         relation_providers: Arc<HashMap<u64, Arc<dyn TableProvider>>>,
-        kdf_harvest_slot: Arc<Mutex<Option<FinishedHandle>>>,
         engine: Arc<dyn Engine>,
     ) -> Self {
         Self {
             relation_providers,
-            kdf_harvest_slot,
             phase_state: None,
             engine,
         }

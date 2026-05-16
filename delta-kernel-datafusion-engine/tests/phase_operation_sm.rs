@@ -19,7 +19,6 @@ use delta_kernel::plans::state_machines::framework::phase_operation::{
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::{DeltaResult, EngineData};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
-use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 use url::Url;
@@ -56,7 +55,7 @@ impl ConsumerKdf for SumRowsConsumer {
 }
 
 #[tokio::test]
-async fn phase_plans_runs_relation_producer_then_consumer_in_one_tick() {
+async fn phase_plans_runs_relation_producer_and_registers_relation() {
     let schema = long_schema();
     let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
     let handle = RelationHandle::fresh("pipe", schema.clone());
@@ -65,22 +64,17 @@ async fn phase_plans_runs_relation_producer_then_consumer_in_one_tick() {
         .expect("literal")
         .into_relation(handle.clone());
 
-    let consumer = DeclarativePlanNode::relation_ref(handle.clone()).into_results();
-
     let executor = DataFusionExecutor::try_new().unwrap();
     let accum = executor
-        .execute_phase_operation(PhaseOperation::Plans(vec![producer, consumer]))
+        .execute_phase_operation(PhaseOperation::Plans(vec![producer]))
         .await
         .expect("phase execution");
 
-    // Results sink does not submit KDF handles -- relation traffic stays in
-    // the registry. The accumulator should observe neither a KDF token nor a
-    // schema submission.
+    // Relation sinks don't submit KDF or schema state; the accumulator stays empty.
     assert!(accum.take_schema().is_none());
 
-    let read_back = DeclarativePlanNode::relation_ref(handle).into_results();
     let batches = executor
-        .execute_plan_collect(read_back)
+        .collect_relation(&handle)
         .await
         .expect("read relation");
     assert_eq!(batches.len(), 1);
@@ -88,7 +82,7 @@ async fn phase_plans_runs_relation_producer_then_consumer_in_one_tick() {
 }
 
 #[tokio::test]
-async fn phase_plans_submits_consume_by_kdf_into_phase_kdf_state_not_harvest_slot() {
+async fn phase_plans_submits_consume_by_kdf_into_phase_kdf_state() {
     let schema = long_schema();
     let rows = vec![vec![Scalar::Long(10)], vec![Scalar::Long(20)]];
     let sink = ConsumeByKdfSink::new_consumer(SumRowsConsumer(0));
@@ -102,11 +96,6 @@ async fn phase_plans_submits_consume_by_kdf_into_phase_kdf_state_not_harvest_slo
         .execute_phase_operation(PhaseOperation::Plans(vec![plan]))
         .await
         .expect("phase execution");
-
-    assert!(
-        executor.take_last_kdf_finished().is_none(),
-        "phase execution must not populate the legacy harvest slot"
-    );
 
     let payloads = accum.take_by_token(&token);
     assert_eq!(payloads.len(), 1);
@@ -145,22 +134,4 @@ async fn phase_schema_query_footer_round_trips_schema_via_take_schema() {
         schema.fields().any(|f| f.name() == "id"),
         "expected id column in footer schema: {schema:?}"
     );
-}
-
-#[tokio::test]
-async fn legacy_execute_plan_to_stream_still_harvests_via_slot_when_accumulator_disabled() {
-    let schema = long_schema();
-    let rows = vec![vec![Scalar::Long(7)]];
-    let sink = ConsumeByKdfSink::new_consumer(SumRowsConsumer(0));
-    let plan = DeclarativePlanNode::values(schema, rows)
-        .expect("literal")
-        .consume_by_kdf(sink);
-
-    let executor = DataFusionExecutor::try_new().unwrap();
-    let stream = executor.execute_plan_to_stream(plan).await.unwrap();
-    assert!(stream.try_collect::<Vec<_>>().await.unwrap().is_empty());
-
-    let fh = executor.take_last_kdf_finished().expect("harvest slot");
-    let total = *fh.erased.downcast_ref::<usize>().unwrap();
-    assert_eq!(total, 1);
 }

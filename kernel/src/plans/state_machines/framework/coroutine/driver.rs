@@ -12,9 +12,10 @@
 //! outputs from the resulting [`PhaseState`] using their respective
 //! extractors.
 //!
-//! **Invariant:** a successfully constructed [`CoroutineSM`] always has
-//! at least one concrete phase queued. Zero-phase coroutines are invalid;
-//! the builder must short-circuit before constructing an SM.
+//! Zero-yield coroutines are allowed: an SM body that has no intermediate
+//! engine work to do may simply compute and return its terminal value, in
+//! which case [`StateMachine::advance`] immediately reports
+//! [`AdvanceResult::Done`].
 //!
 //! ## Errors
 //!
@@ -46,46 +47,56 @@ type InnerGen<R> = Gen<PhaseYield, PhaseResume, Result<R, DeltaError>>;
 /// body with the matching [`PhaseResume`] on [`StateMachine::advance`].
 pub struct CoroutineSM<R: Send + 'static> {
     gen: InnerGen<R>,
-    /// The yield we're currently positioned at — `Some` between
-    /// `get_operation` (which reads it) and the next `advance` (which
-    /// consumes it). `None` once the coroutine has completed.
-    pending: Option<PhaseYield>,
+    /// Where the SM is positioned. `Yielded` while engine work is pending;
+    /// `Immediate` when the body completed without ever yielding (the next
+    /// `advance` hands the stored result back); `Done` once `advance` has
+    /// returned the terminal result.
+    state: SmPosition<R>,
+}
+
+/// Internal positioning of a [`CoroutineSM`]. Drives the [`StateMachine`]
+/// contract: a queued yield, an immediately-available result for zero-yield
+/// bodies, or a terminal `Done` marker for SMs that have already handed
+/// their result back.
+enum SmPosition<R> {
+    /// Awaiting engine work for the queued yield.
+    Yielded(PhaseYield),
+    /// Coroutine completed during construction without yielding; the next
+    /// `advance` hands the stored result back as `AdvanceResult::Done`.
+    Immediate(Result<R, DeltaError>),
+    /// Coroutine has fully terminated and the caller has consumed the result.
+    Done,
 }
 
 impl<R: Send + 'static> CoroutineSM<R> {
-    /// Construct a coroutine state machine and run the producer up to its
-    /// first yield.
+    /// Construct a coroutine state machine and run the producer to its first
+    /// yield (or to completion).
     ///
-    /// The first yield becomes the initial [`PhaseYield`] returned by
-    /// [`StateMachine::get_operation`]. If the producer completes without
-    /// ever yielding, construction fails — the caller is expected to
-    /// short-circuit that case in its builder rather than fake a plan.
+    /// If the producer yields, the first yield becomes the initial
+    /// [`PhaseYield`] returned by [`StateMachine::get_operation`]. If it
+    /// completes without yielding, the terminal result is stored and handed
+    /// back from the first [`StateMachine::advance`] call -- callers don't
+    /// need to special-case zero-yield SMs.
     pub(crate) fn new<F, Fut>(producer: F) -> Result<Self, DeltaError>
     where
         F: FnOnce(PhaseCo) -> Fut + Send + 'static,
         Fut: Future<Output = Result<R, DeltaError>> + Send + 'static,
     {
         let mut gen: InnerGen<R> = Gen::new(move |co: Co<PhaseYield, PhaseResume>| producer(co));
-        match gen
+        let state = match gen
             .start()
             .map_err(|e| lift_gen_error(e, "CoroutineSM::new"))?
         {
-            GeneratorState::Yielded(phase) => Ok(Self {
-                gen,
-                pending: Some(phase),
-            }),
-            GeneratorState::Complete(_) => bail_delta!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "CoroutineSM::new: coroutine completed during start without yielding any work; \
-                 the caller should short-circuit before constructing an SM",
-            ),
-        }
+            GeneratorState::Yielded(phase) => SmPosition::Yielded(phase),
+            GeneratorState::Complete(result) => SmPosition::Immediate(result),
+        };
+        Ok(Self { gen, state })
     }
 
     /// `true` once the coroutine has terminated and [`advance`](Self::advance)
     /// has handed out its final result.
     pub fn is_done(&self) -> bool {
-        self.pending.is_none()
+        matches!(self.state, SmPosition::Done)
     }
 }
 
@@ -93,9 +104,14 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
     type Result = R;
 
     fn get_operation(&mut self) -> Result<PhaseOperation, DeltaError> {
-        match &self.pending {
-            Some(phase) => Ok((*phase.operation).clone()),
-            None => bail_delta!(
+        match &self.state {
+            SmPosition::Yielded(phase) => Ok((*phase.operation).clone()),
+            SmPosition::Immediate(_) => bail_delta!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "CoroutineSM::get_operation: zero-yield SM has no pending operation; \
+                 call advance() to receive the terminal result",
+            ),
+            SmPosition::Done => bail_delta!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
                 "CoroutineSM::get_operation: state machine already completed",
             ),
@@ -106,33 +122,36 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
         &mut self,
         result: Result<PhaseState, EngineError>,
     ) -> Result<AdvanceResult<R>, DeltaError> {
-        if self.pending.is_none() {
-            bail_delta!(
+        match std::mem::replace(&mut self.state, SmPosition::Done) {
+            SmPosition::Immediate(value) => value.map(AdvanceResult::Done),
+            SmPosition::Done => bail_delta!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
                 "CoroutineSM::advance: cannot advance, already completed",
-            );
-        }
-
-        match self
-            .gen
-            .resume_with(PhaseResume(result))
-            .map_err(|e| lift_gen_error(e, "CoroutineSM::advance"))?
-        {
-            GeneratorState::Yielded(next) => {
-                self.pending = Some(next);
-                Ok(AdvanceResult::Continue)
-            }
-            GeneratorState::Complete(final_result) => {
-                self.pending = None;
-                final_result.map(AdvanceResult::Done)
+            ),
+            SmPosition::Yielded(_) => {
+                match self
+                    .gen
+                    .resume_with(PhaseResume(result))
+                    .map_err(|e| lift_gen_error(e, "CoroutineSM::advance"))?
+                {
+                    GeneratorState::Yielded(next) => {
+                        self.state = SmPosition::Yielded(next);
+                        Ok(AdvanceResult::Continue)
+                    }
+                    GeneratorState::Complete(final_result) => {
+                        // self.state already replaced with Done.
+                        final_result.map(AdvanceResult::Done)
+                    }
+                }
             }
         }
     }
 
     fn phase_name(&self) -> &'static str {
-        match &self.pending {
-            Some(phase) => phase.phase_name,
-            None => "complete",
+        match &self.state {
+            SmPosition::Yielded(phase) => phase.phase_name,
+            SmPosition::Immediate(_) => "immediate",
+            SmPosition::Done => "complete",
         }
     }
 }
@@ -154,7 +173,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::plans::ir::nodes::{ScanNode, SinkNode, SinkType};
+    use crate::plans::ir::nodes::{RelationHandle, ScanNode, SinkNode, SinkType};
     use crate::plans::ir::{DeclarativePlanNode, Plan};
     use crate::plans::state_machines::framework::engine_error::{EngineError, EngineErrorKind};
 
@@ -167,10 +186,10 @@ mod tests {
         let root = DeclarativePlanNode::Scan(ScanNode::new(
             crate::plans::ir::nodes::FileType::Parquet,
             Vec::new(),
-            schema,
+            schema.clone(),
         ));
         let sink = SinkNode {
-            sink_type: SinkType::Results(None),
+            sink_type: SinkType::Relation(RelationHandle::fresh("toy", schema)),
         };
         Plan::new(root, sink)
     }
@@ -263,12 +282,19 @@ mod tests {
         }
     }
 
-    /// Coroutines that complete without yielding a single operation should be
-    /// rejected at construction.
+    /// Zero-yield coroutines are allowed: the first `advance` call hands the
+    /// stored terminal value back. Useful for SMs that compute their plans
+    /// entirely up-front and have no intermediate engine work.
     #[test]
-    fn zero_phase_coroutine_is_rejected() {
-        let r = CoroutineSM::<i32>::new(|_co| async move { Ok(7) });
-        assert!(r.is_err(), "no-yield coroutine should fail at new()");
+    fn zero_phase_coroutine_returns_value_on_first_advance() {
+        let mut sm = CoroutineSM::<i32>::new(|_co| async move { Ok(7) }).unwrap();
+        assert!(sm.get_operation().is_err());
+        let r = sm.advance(Ok(PhaseState::empty())).unwrap();
+        match r {
+            AdvanceResult::Done(v) => assert_eq!(v, 7),
+            _ => panic!("expected Done"),
+        }
+        assert!(sm.is_done());
     }
 
     impl EngineError {

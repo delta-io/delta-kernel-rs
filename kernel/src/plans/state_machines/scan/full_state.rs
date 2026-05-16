@@ -62,14 +62,12 @@ use super::plans::build_fsr_plans;
 // Re-exports for the FSR relation handle name constants. External code references these via
 // `fsr::full_state::FSR_COMMIT_DEDUP`; the actual definitions live in `super::plans`.
 pub use super::plans::{
-    CommitFileMeta, FSR_CHECKPOINT_TOP, FSR_COMMIT_DEDUP, FSR_COMMIT_RAW, FSR_SIDECAR_ACTIONS,
+    CommitFileMeta, FSR_CHECKPOINT_TOP, FSR_COMMIT_DEDUP, FSR_COMMIT_RAW, FSR_RESULTS,
+    FSR_SIDECAR_ACTIONS,
 };
-use crate::delta_error;
-use crate::plans::errors::{DeltaError, DeltaErrorCode};
-use crate::plans::ir::Plan;
+use crate::plans::errors::DeltaError;
+use crate::plans::ir::ResultPlan;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
-use crate::plans::state_machines::framework::coroutine::phase::Phase;
-use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
 use crate::snapshot::Snapshot;
 
 /// Builder namespace for canonical Full State Reconstruction planning.
@@ -100,8 +98,8 @@ impl FullStateBuilder {
         self
     }
 
-    /// Build canonical FSR plans for this snapshot.
-    pub fn build(self) -> Result<Vec<Plan>, DeltaError> {
+    /// Build the canonical FSR [`ResultPlan`] for this snapshot.
+    pub fn build(self) -> Result<ResultPlan, DeltaError> {
         let shape = self
             .checkpoint_shape
             .unwrap_or(checkpoint_shape_from_last_checkpoint(
@@ -122,25 +120,18 @@ impl FullStateBuilder {
 }
 
 /// Public entry for full-state reconstruction.
-pub fn full_state_sm(snapshot: Arc<Snapshot>) -> Result<CoroutineSM<()>, DeltaError> {
-    CoroutineSM::new(move |mut co| async move {
-        let mut phase = Phase(&mut co);
-
-        // Derive shape from log-segment metadata (including checkpoint file format) so
-        // JSON-v2 checkpoints are lowered correctly.
-        let plans = FullState::for_table(Arc::clone(&snapshot)).build()?;
-        let _state = phase
-            .execute(PhaseOperation::Plans(plans), "fsr.full_state")
-            .await
-            .map_err(|e| {
-                let detail = e.display_with_source_chain();
-                delta_error!(
-                    DeltaErrorCode::DeltaCommandInvariantViolation,
-                    source = e,
-                    "fsr::full_state::execute: {detail}",
-                )
-            })?;
-        Ok(())
+///
+/// The returned coroutine terminates with a [`ResultPlan`] naming the
+/// [`FSR_RESULTS`] relation. The caller drives the SM (executing any
+/// intermediate phase operations such as schema-query preludes), then executes
+/// every plan in [`ResultPlan::plans`] and reads
+/// [`ResultPlan::result_relation`] to obtain the reconstructed action stream.
+pub fn full_state_sm(snapshot: Arc<Snapshot>) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
+    CoroutineSM::new(move |_co| async move {
+        // No intermediate engine yields are needed today -- the FullState
+        // builder pulls checkpoint shape directly from the snapshot's log
+        // segment. The SM computes and returns the result plan immediately.
+        FullState::for_table(Arc::clone(&snapshot)).build()
     })
 }
 
@@ -170,7 +161,9 @@ mod tests {
             .with_checkpoint_shape(shape)
             .build()
             .unwrap();
-        assert_eq!(direct.len(), built.len());
+        assert_eq!(direct.plans.len(), built.plans.len());
+        assert_eq!(direct.result_relation.name, FSR_RESULTS);
+        assert_eq!(direct.result_relation.name, built.result_relation.name);
     }
 
     #[test]
@@ -185,8 +178,8 @@ mod tests {
                 .build()
                 .unwrap();
             assert_eq!(
-                direct.len(),
-                built.len(),
+                direct.plans.len(),
+                built.plans.len(),
                 "FullState builder should match direct build for table {table}",
             );
         }

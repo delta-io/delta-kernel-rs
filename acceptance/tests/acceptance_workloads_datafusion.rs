@@ -15,7 +15,6 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
 use delta_kernel::expressions::Predicate;
-use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_benchmarks::predicate_parser::parse_predicate;
@@ -108,31 +107,31 @@ async fn execute_snapshot_workload_datafusion(
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
     if config.use_full_state_builder {
-        let plans = snapshot
+        let rp = snapshot
             .full_state_builder()
             .with_stats()
             .build()
             .map_err(|e| Error::generic(format!("build full_state plans via builder: {e}")))?;
-        let _state = executor
-            .execute_phase_operation(PhaseOperation::Plans(plans))
-            .await
-            .map_err(|e| {
-                Error::generic(format!(
-                    "execute full_state builder plans via DataFusionExecutor ({}): {e}",
-                    config.name
-                ))
-            })?;
+        let _ = executor.collect_result(rp).await.map_err(|e| {
+            Error::generic(format!(
+                "execute full_state builder plans via DataFusionExecutor ({}): {e}",
+                config.name
+            ))
+        })?;
     } else {
         let sm = snapshot.full_state()?;
-        let ((), _) = executor
-            .drive_coroutine_sm_collecting_results(sm)
-            .await
-            .map_err(|e| {
-                Error::generic(format!(
-                    "execute full_state via DataFusionExecutor ({}): {e}",
-                    config.name
-                ))
-            })?;
+        let rp = executor.drive_to_completion(sm).await.map_err(|e| {
+            Error::generic(format!(
+                "execute full_state via DataFusionExecutor ({}): {e}",
+                config.name
+            ))
+        })?;
+        let _ = executor.collect_result(rp).await.map_err(|e| {
+            Error::generic(format!(
+                "collect full_state result via DataFusionExecutor ({}): {e}",
+                config.name
+            ))
+        })?;
     }
     let table_configuration = snapshot.table_configuration();
     Ok(SnapshotResult {
@@ -203,8 +202,8 @@ async fn execute_read_workload_datafusion(
         let metadata_sm = replay_scan
             .scan_metadata_state_machine()
             .map_err(|e| Error::generic(format!("build metadata-only replay scan SM: {e}")))?;
-        let (live_actions, _) = executor
-            .drive_coroutine_sm_collecting_results(metadata_sm)
+        let metadata_rp = executor
+            .drive_to_completion(metadata_sm)
             .await
             .map_err(|e| {
                 Error::generic(format!(
@@ -212,33 +211,48 @@ async fn execute_read_workload_datafusion(
                     config.name
                 ))
             })?;
-        let data_sm = replay_scan
-            .scan_data_from_metadata_state_machine(live_actions)
-            .map_err(|e| Error::generic(format!("build data-only replay scan SM: {e}")))?;
-        let (_done, batches) = executor
-            .drive_coroutine_sm_collecting_results(data_sm)
+        // Execute metadata plans so the live-actions relation is registered, then hand the
+        // handle off to the data-phase SM.
+        executor
+            .execute_plans(&metadata_rp.plans)
             .await
             .map_err(|e| {
                 Error::generic(format!(
-                    "execute data-only replay scan SM via DataFusionExecutor ({}): {e:?}",
+                    "execute metadata-only replay scan plans via DataFusionExecutor ({}): {e:?}",
                     config.name
                 ))
             })?;
-        batches
+        let data_sm = replay_scan
+            .scan_data_from_metadata_state_machine(metadata_rp.result_relation)
+            .map_err(|e| Error::generic(format!("build data-only replay scan SM: {e}")))?;
+        let data_rp = executor.drive_to_completion(data_sm).await.map_err(|e| {
+            Error::generic(format!(
+                "execute data-only replay scan SM via DataFusionExecutor ({}): {e:?}",
+                config.name
+            ))
+        })?;
+        executor.collect_result(data_rp).await.map_err(|e| {
+            Error::generic(format!(
+                "collect data-only replay scan result via DataFusionExecutor ({}): {e:?}",
+                config.name
+            ))
+        })?
     } else {
         let replay_sm = replay_scan
             .scan_state_machine()
             .map_err(|e| Error::generic(format!("build replay scan SM: {e}")))?;
-        let (_done, batches) = executor
-            .drive_coroutine_sm_collecting_results(replay_sm)
-            .await
-            .map_err(|e| {
-                Error::generic(format!(
-                    "execute combined replay scan SM via DataFusionExecutor ({}): {e:?}",
-                    config.name
-                ))
-            })?;
-        batches
+        let rp = executor.drive_to_completion(replay_sm).await.map_err(|e| {
+            Error::generic(format!(
+                "execute combined replay scan SM via DataFusionExecutor ({}): {e:?}",
+                config.name
+            ))
+        })?;
+        executor.collect_result(rp).await.map_err(|e| {
+            Error::generic(format!(
+                "collect combined replay scan result via DataFusionExecutor ({}): {e:?}",
+                config.name
+            ))
+        })?
     };
     let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
     let row_count = batches.iter().map(|b| b.num_rows() as u64).sum();

@@ -119,19 +119,14 @@ async fn parity_phase_plans_relation_pipe_matches_kernel_literal_materialization
     let producer = DeclarativePlanNode::values(Arc::clone(&schema), rows.clone())
         .unwrap()
         .into_relation(handle.clone());
-    let consumer = DeclarativePlanNode::relation_ref(handle.clone()).into_results();
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor
-        .execute_phase_operation(PhaseOperation::Plans(vec![producer, consumer]))
+        .execute_phase_operation(PhaseOperation::Plans(vec![producer]))
         .await
         .expect("phase Plans");
 
-    let read_plan = DeclarativePlanNode::relation_ref(handle).into_results();
-    let df_batches = executor
-        .execute_plan_collect(read_plan)
-        .await
-        .expect("collect");
+    let df_batches = executor.collect_relation(&handle).await.expect("collect");
     let df_concat = concat_or_clone(&df_batches);
 
     assert_batch_column_data_equal(&schema, &kernel_reference_batch, &df_concat);

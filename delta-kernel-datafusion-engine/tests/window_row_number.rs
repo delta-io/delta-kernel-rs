@@ -5,10 +5,21 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{AsArray, RecordBatch};
 use delta_kernel::arrow::datatypes::Int64Type;
 use delta_kernel::expressions::{ColumnName, Expression, Scalar};
-use delta_kernel::plans::ir::nodes::{OrderingSpec, WindowFunction};
+use delta_kernel::plans::ir::nodes::{OrderingSpec, RelationHandle, WindowFunction};
 use delta_kernel::plans::ir::DeclarativePlanNode;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
+
+/// Run `node` with a Relation sink on `exec` and return the materialized batches.
+fn run_to_batches(exec: &DataFusionExecutor, node: DeclarativePlanNode) -> Vec<RecordBatch> {
+    let schema: SchemaRef = node.output_schema();
+    let handle = RelationHandle::fresh("test_out", schema);
+    let plan = node.into_relation(handle.clone());
+    futures::executor::block_on(async {
+        exec.execute_plans(&[plan]).await.expect("execute");
+        exec.collect_relation(&handle).await.expect("collect")
+    })
+}
 
 fn rn_column(batch: &RecordBatch, name: &str) -> Vec<i64> {
     let schema = batch.schema();
@@ -54,12 +65,10 @@ fn row_number_resets_on_partition_change_ordered_by_v() {
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::asc(ColumnName::new(["v"]))],
         )
-        .expect("window")
-        .into_results();
+        .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches =
-        futures::executor::block_on(async { exec.execute_plan_collect(plan).await }).expect("run");
+    let batches = run_to_batches(&exec, plan);
 
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
@@ -82,12 +91,10 @@ fn row_number_global_when_no_partition_keys() {
             vec![],
             vec![OrderingSpec::asc(ColumnName::new(["v"]))],
         )
-        .expect("window")
-        .into_results();
+        .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches =
-        futures::executor::block_on(async { exec.execute_plan_collect(plan).await }).expect("run");
+    let batches = run_to_batches(&exec, plan);
 
     assert_eq!(rn_column(&batches[0], "rn"), vec![1, 2]);
 }
@@ -113,12 +120,10 @@ fn multiple_row_number_functions_duplicate_rank_column() {
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::asc(ColumnName::new(["v"]))],
         )
-        .expect("window")
-        .into_results();
+        .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches =
-        futures::executor::block_on(async { exec.execute_plan_collect(plan).await }).expect("run");
+    let batches = run_to_batches(&exec, plan);
 
     assert_eq!(rn_column(&batches[0], "a"), vec![1, 2]);
     assert_eq!(rn_column(&batches[0], "b"), vec![1, 2]);
@@ -148,12 +153,10 @@ fn row_number_with_order_by_desc_assigns_rank_within_partition() {
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::desc(ColumnName::new(["v"]))],
         )
-        .expect("window")
-        .into_results();
+        .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches =
-        futures::executor::block_on(async { exec.execute_plan_collect(plan).await }).expect("run");
+    let batches = run_to_batches(&exec, plan);
 
     // Aggregate (part, v, rn) tuples across however many batches the engine emits, then verify
     // the per-partition rank assignment on the canonicalized rows.
@@ -198,12 +201,10 @@ fn row_number_with_order_by_asc_matches_inverted_desc() {
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::asc(ColumnName::new(["v"]))],
         )
-        .expect("window")
-        .into_results();
+        .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches =
-        futures::executor::block_on(async { exec.execute_plan_collect(plan).await }).expect("run");
+    let batches = run_to_batches(&exec, plan);
 
     let mut tuples: Vec<(i64, i64)> = Vec::new();
     for batch in &batches {

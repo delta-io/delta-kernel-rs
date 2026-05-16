@@ -26,7 +26,6 @@ use delta_kernel::expressions::{Expression, UnaryExpressionOp};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::plans::ir::nodes::SinkType;
 use delta_kernel::plans::ir::{Plan, RelationHandle};
-use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
 use delta_kernel::plans::state_machines::scan::full_state::FSR_COMMIT_DEDUP;
 use delta_kernel::plans::state_machines::scan::{
     build_fsr_plans, checkpoint_shape_from_last_checkpoint,
@@ -116,11 +115,10 @@ async fn run_full_state_results(table: &str) -> Vec<RecordBatch> {
         .expect("snapshot");
     let ex = DataFusionExecutor::try_new_with_engine(Arc::clone(&engine)).expect("executor");
     let sm = snapshot.full_state().expect("full_state SM");
-    let ((), fsr_batches) = ex
-        .drive_coroutine_sm_collecting_results(sm)
+    let rp = ex.drive_to_completion(sm).await.expect("drive full_state");
+    ex.collect_result(rp)
         .await
-        .expect("drive full_state");
-    fsr_batches
+        .expect("collect full_state result")
 }
 
 fn expected_live_file_count_from_scan_metadata(table: &str) -> usize {
@@ -194,12 +192,10 @@ async fn commit_dedup_batches_for_snapshot(
     engine: Arc<dyn KernelEngine>,
 ) -> Vec<RecordBatch> {
     let shape = checkpoint_shape_from_last_checkpoint(&snapshot).expect("shape");
-    let plans = build_fsr_plans(&snapshot, shape).expect("build fsr plans");
-    let commit_dedup_handle = commit_dedup_sink_handle(&plans);
+    let rp = build_fsr_plans(&snapshot, shape).expect("build fsr plans");
+    let commit_dedup_handle = commit_dedup_sink_handle(&rp.plans);
     let ex = DataFusionExecutor::try_new_with_engine(engine).expect("executor");
-    ex.execute_phase_operation(PhaseOperation::Plans(plans))
-        .await
-        .expect("run fsr plans");
+    ex.execute_plans(&rp.plans).await.expect("run fsr plans");
     ex.collect_relation(&commit_dedup_handle)
         .await
         .expect("commit_dedup relation batches")

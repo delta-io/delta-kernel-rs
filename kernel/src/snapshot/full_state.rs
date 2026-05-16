@@ -1,13 +1,14 @@
 //! Declarative full snapshot read (FSR) entry point on [`Snapshot`].
 //!
 //! Routes [`Snapshot::full_state`] to the canonical FSR coroutine
-//! ([`crate::plans::state_machines::scan::full_state_sm`]) whose live, ordered scan-row
-//! stream flows to the engine's [`SinkType::Results`](crate::plans::ir::nodes::SinkType::Results)
-//! consumer when the engine drives the returned `CoroutineSM`.
+//! ([`crate::plans::state_machines::scan::full_state_sm`]) whose terminal
+//! [`ResultPlan`] names the reconstructed-action relation the engine reads
+//! after running the plan's plans.
 
 use std::sync::Arc;
 
 use crate::plans::errors::DeltaErrAsKernel;
+use crate::plans::ir::ResultPlan;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::scan::{full_state_sm, FullStateBuilder};
 use crate::scan::ScanBuilder as KernelScanBuilder;
@@ -29,8 +30,10 @@ impl Snapshot {
     /// engine-driven step. See [`crate::plans::state_machines::scan::full_state`] for the
     /// per-plan breakdown and the dedup-key contract.
     ///
-    /// The terminal plan is a `Results` sink; reconstructed action rows (add / remove /
-    /// protocol / metaData / domainMetadata / txn) arrive in the engine's `Results` consumer.
+    /// The SM's terminal value is a [`ResultPlan`] naming the FSR result
+    /// relation. The engine drives the SM, executes the result plan's plans,
+    /// and reads the result relation to obtain reconstructed action rows
+    /// (add / remove / protocol / metaData / domainMetadata / txn).
     ///
     /// # Feature gate
     ///
@@ -38,7 +41,7 @@ impl Snapshot {
     /// if the feature is disabled at compile time, callers rely on
     /// [`Snapshot::scan_builder`](crate::snapshot::Snapshot::scan_builder) and classic
     /// kernel replay instead.
-    pub fn full_state(self: &SnapshotRef) -> DeltaResult<CoroutineSM<()>> {
+    pub fn full_state(self: &SnapshotRef) -> DeltaResult<CoroutineSM<ResultPlan>> {
         full_state_sm(Arc::clone(self)).map_err(|e| e.into_kernel_default())
     }
 

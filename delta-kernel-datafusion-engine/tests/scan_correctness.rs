@@ -14,12 +14,24 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::{column_expr, Expression, Predicate};
+use delta_kernel::plans::ir::nodes::RelationHandle;
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::{EvaluationHandler, FileMeta};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use url::Url;
+
+/// Run `scan` through the executor: terminate in a Relation sink, run the plan, and return
+/// the materialized batches.
+async fn scan_collect(scan: DeclarativePlanNode) -> Vec<RecordBatch> {
+    let schema = scan.output_schema();
+    let handle = RelationHandle::fresh("scan_out", schema);
+    let plan = scan.into_relation(handle.clone());
+    let executor = DataFusionExecutor::try_new().unwrap();
+    executor.execute_plans(&[plan]).await.unwrap();
+    executor.collect_relation(&handle).await.unwrap()
+}
 
 fn kernel_schema_one_i64() -> Arc<StructType> {
     Arc::new(StructType::try_new([StructField::new("x", KernelDataType::LONG, false)]).unwrap())
@@ -125,14 +137,9 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
         Arc::clone(&schema),
     )
     .with_row_index("rid")
-    .unwrap()
-    .into_results();
+    .unwrap();
 
-    let batches = DataFusionExecutor::try_new()
-        .unwrap()
-        .execute_plan_collect(plan)
-        .await
-        .unwrap();
+    let batches = scan_collect(plan).await;
 
     let mut by_x: HashMap<i64, i64> = HashMap::new();
     for b in &batches {
@@ -166,14 +173,9 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
         Arc::clone(&schema),
     )
     .with_row_index("rid")
-    .unwrap()
-    .into_results();
+    .unwrap();
 
-    let batches = DataFusionExecutor::try_new()
-        .unwrap()
-        .execute_plan_collect(plan)
-        .await
-        .unwrap();
+    let batches = scan_collect(plan).await;
 
     let mut rids = flatten_i64_named(&batches, "rid");
     rids.sort();
@@ -216,14 +218,9 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
 
     let plan = DeclarativePlanNode::scan_parquet(metas, Arc::clone(&kernel_schema))
         .with_predicate(Arc::clone(&pred))
-        .unwrap()
-        .into_results();
-
-    let df_batches = DataFusionExecutor::try_new()
-        .unwrap()
-        .execute_plan_collect(plan)
-        .await
         .unwrap();
+
+    let df_batches = scan_collect(plan).await;
 
     let mut df_x = flatten_i64_named(&df_batches, "x");
     let mut reference_sorted = reference_x;

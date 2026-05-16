@@ -452,10 +452,15 @@ async fn extract_snapshot_protocol_metadata_from_fsr(
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
     let sm = snapshot.full_state()?;
-    let ((), fsr_batches) = executor
-        .drive_coroutine_sm_collecting_results(sm)
+    let rp = executor
+        .drive_to_completion(sm)
         .await
         .map_err(|e| Error::generic(format!("execute full_state via DataFusionExecutor: {e}")))?;
+    let fsr_batches = executor.collect_result(rp).await.map_err(|e| {
+        Error::generic(format!(
+            "collect full_state results via DataFusionExecutor: {e}"
+        ))
+    })?;
 
     // Exercise FSR action stream extraction, but keep snapshot semantic validation at
     // Snapshot/TableConfiguration boundary.
@@ -532,12 +537,12 @@ impl WorkloadRunner for ReadDataPlansRunner {
         let replay_sm = replay_scan
             .scan_state_machine()
             .map_err(|e| format!("build replay scan SM failed: {e}"))?;
-        let (_done, batches) = self
+        let batches = self
             .runtime
-            .block_on(
-                self.executor
-                    .drive_coroutine_sm_collecting_results(replay_sm),
-            )
+            .block_on(async {
+                let rp = self.executor.drive_to_completion(replay_sm).await?;
+                self.executor.collect_result(rp).await
+            })
             .map_err(|e| format!("DataFusion read execution failed: {e}"))?;
         for batch in batches {
             black_box(batch);
@@ -634,11 +639,6 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
-
-    use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
-    use delta_kernel::plans::state_machines::framework::state_machine::{
-        AdvanceResult, StateMachine,
-    };
 
     use super::*;
     use crate::models::{
@@ -934,18 +934,21 @@ mod tests {
             .with_schema(schema)
             .build_replay()
             .expect("build replay scan should succeed");
-        let plans = replay_scan
+        let result_plan = replay_scan
             .scan_plans()
             .expect("replay scan plans should succeed");
-        let plan = plans
+        // The terminal plan is the one whose Relation sink names the scan-result handle.
+        let terminal_id = result_plan.result_relation.id;
+        let plan = result_plan
+            .plans
             .into_iter()
             .find(|p| {
                 matches!(
-                    p.sink.sink_type,
-                    delta_kernel::plans::ir::nodes::SinkType::Results(_)
+                    &p.sink.sink_type,
+                    delta_kernel::plans::ir::nodes::SinkType::Relation(h) if h.id == terminal_id
                 )
             })
-            .expect("expected replay plans to include a Results sink");
+            .expect("expected replay plans to include the scan-result Relation sink");
         let logical = runner
             .executor
             .compile_plan_logical_for_inspection(&plan)
@@ -981,32 +984,32 @@ mod tests {
         )
         .expect("setup should succeed");
 
-        let mut sm = runner.snapshot.full_state().expect("build full_state SM");
+        let sm = runner.snapshot.full_state().expect("build full_state SM");
         runner.runtime.block_on(async {
-            loop {
-                let op = sm.get_operation().expect("sm.get_operation");
-                if let PhaseOperation::Plans(plans) = &op {
-                    for (idx, plan) in plans.iter().enumerate() {
-                        match runner.executor.compile_plan_logical_for_inspection(plan) {
-                            Ok(logical) => println!(
-                                "=== FSR Phase Plan {} ({:?}) ===\n{}",
-                                idx,
-                                plan.sink.sink_type,
-                                logical.display_indent()
-                            ),
-                            Err(e) => println!(
-                                "=== FSR Phase Plan {} ({:?}) — compile skipped: {} ===",
-                                idx, plan.sink.sink_type, e
-                            ),
-                        }
-                    }
-                }
-                let phase_result = runner.executor.execute_phase_operation(op).await;
-                match sm.advance(phase_result).expect("sm.advance") {
-                    AdvanceResult::Continue => {}
-                    AdvanceResult::Done(_) => break,
+            let result_plan = runner
+                .executor
+                .drive_to_completion(sm)
+                .await
+                .expect("drive full_state SM to completion");
+            for (idx, plan) in result_plan.plans.iter().enumerate() {
+                match runner.executor.compile_plan_logical_for_inspection(plan) {
+                    Ok(logical) => println!(
+                        "=== FSR Phase Plan {} ({:?}) ===\n{}",
+                        idx,
+                        plan.sink.sink_type,
+                        logical.display_indent()
+                    ),
+                    Err(e) => println!(
+                        "=== FSR Phase Plan {} ({:?}) -- compile skipped: {} ===",
+                        idx, plan.sink.sink_type, e
+                    ),
                 }
             }
+            runner
+                .executor
+                .execute_plans(&result_plan.plans)
+                .await
+                .expect("execute FSR plans");
         });
     }
 }

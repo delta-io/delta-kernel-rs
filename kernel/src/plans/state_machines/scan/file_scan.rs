@@ -31,11 +31,9 @@ use crate::expressions::{
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
-use crate::plans::ir::{plan, Plan, PlanCollector};
+use crate::plans::ir::{plan, PlanCollector, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
-use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
-use crate::plans::state_machines::framework::phase_state::PhaseState;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::scan::Scan;
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType, ToSchema};
@@ -51,41 +49,25 @@ fn replay_partition_columns(scan: &Scan) -> HashSet<String> {
         .collect()
 }
 
-/// Run a single SM phase, wrapping any phase-execution error as a
-/// [`DeltaError`] with a stable `{label}` site tag. Used by every SM body
-/// in this module so the call sites stay one-liners.
-async fn run_phase(
-    phase: &mut Phase<'_>,
-    op: PhaseOperation,
-    label: &'static str,
-) -> Result<PhaseState, DeltaError> {
-    phase.execute(op, label).await.map_err(|e| {
-        let detail = e.display_with_source_chain();
-        delta_error!(
-            DeltaErrorCode::DeltaCommandInvariantViolation,
-            source = e,
-            "scan::{label}: {detail}",
-        )
-    })
-}
-
 impl Scan {
-    /// Build the metadata-phase plans plus the live-actions handle the
-    /// data-phase plan consumes.
+    /// Build the metadata-phase [`ResultPlan`].
     ///
-    /// Internal helper used by both the metadata-only SM and the combined SM;
-    /// not exposed on the public surface.
-    pub(super) fn scan_metadata_plans(&self) -> Result<(Vec<Plan>, RelationHandle), DeltaError> {
+    /// [`ResultPlan::result_relation`] is the materialized live-actions
+    /// relation that the data phase consumes.
+    pub(super) fn scan_metadata_plans(&self) -> Result<ResultPlan, DeltaError> {
         let checkpoint_shape = checkpoint_shape_from_last_checkpoint(self.snapshot().as_ref())?;
         scan_metadata_plans_with_shape(self, checkpoint_shape)
     }
 
-    /// Build the data-phase plans given the live-actions relation handle
-    /// materialized by the metadata phase.
+    /// Build the data-phase [`ResultPlan`] given the live-actions relation
+    /// handle materialized by the metadata phase.
+    ///
+    /// [`ResultPlan::result_relation`] publishes the final scan output rows in
+    /// the scan's logical schema.
     pub fn scan_data_from_metadata_plans(
         &self,
         live_actions_relation: RelationHandle,
-    ) -> Result<Vec<Plan>, DeltaError> {
+    ) -> Result<ResultPlan, DeltaError> {
         let snapshot = self.snapshot();
         let partition_columns = replay_partition_columns(self);
         let file_schema = scan_data_file_schema(self.physical_schema(), self.logical_schema())?;
@@ -112,7 +94,7 @@ impl Scan {
         // the row-id projection augments file_schema beyond the load's physical read
         // schema.
         let data_rows_raw_relation =
-            RelationHandle::fresh("scan.data_rows_raw", materialized_schema);
+            RelationHandle::fresh(FSR_SCAN_DATA_ROWS_RAW, materialized_schema);
         let load_sink = LoadSink {
             output_relation: data_rows_raw_relation.clone(),
             file_schema: self.physical_schema().clone(),
@@ -131,99 +113,107 @@ impl Scan {
         };
         let load_plan = plan::relation_ref(&live_actions_relation).into_load(load_sink);
 
-        // === final projection: physical -> logical schema, terminating in Results ===
-        let results_plan = plan::relation_ref(&data_rows_raw_relation)
-            .project(logical_projection, logical_schema.clone())
-            .into_results_with_schema(logical_schema);
+        // === final projection: physical -> logical schema, materialized into the result handle ===
+        // The handle publishes the scan's logical schema directly; the projection chain feeds
+        // matching rows.
+        let result_handle = RelationHandle::fresh(FSR_SCAN_DATA, logical_schema.clone());
+        let project_plan = plan::relation_ref(&data_rows_raw_relation)
+            .project(logical_projection, logical_schema)
+            .into_relation(result_handle.clone());
 
-        Ok(vec![load_plan, results_plan])
+        Ok(ResultPlan::new(
+            vec![load_plan, project_plan],
+            result_handle,
+        ))
     }
 
-    /// Build the full composed scan plan vector: metadata phase followed by
+    /// Build the full composed scan [`ResultPlan`]: metadata phase followed by
     /// data phase, sharing the live-actions relation handle.
-    pub fn scan_plans(&self) -> Result<Vec<Plan>, DeltaError> {
-        let (mut plans, live_actions_relation) = self.scan_metadata_plans()?;
-        plans.extend(self.scan_data_from_metadata_plans(live_actions_relation)?);
-        Ok(plans)
+    ///
+    /// [`ResultPlan::result_relation`] is the data-phase result relation
+    /// publishing the scan's logical schema.
+    pub fn scan_plans(&self) -> Result<ResultPlan, DeltaError> {
+        let metadata = self.scan_metadata_plans()?;
+        let live_actions_relation = metadata.result_relation;
+        let data = self.scan_data_from_metadata_plans(live_actions_relation)?;
+        let mut plans = metadata.plans;
+        plans.extend(data.plans);
+        Ok(ResultPlan::new(plans, data.result_relation))
     }
 
     /// Coroutine SM for metadata-only scan execution.
     ///
     /// Resolves checkpoint shape (running schema-query phases when the
-    /// `_last_checkpoint` hint is missing), executes the metadata replay
-    /// plans, and returns the materialized live-actions relation handle so
-    /// the caller can feed it into [`Self::scan_data_from_metadata_state_machine`].
-    pub fn scan_metadata_state_machine(&self) -> Result<CoroutineSM<RelationHandle>, DeltaError> {
+    /// `_last_checkpoint` hint is missing) and returns the metadata
+    /// [`ResultPlan`] whose result relation is the materialized live-actions
+    /// relation. The caller drives the SM, executes the result plan's plans,
+    /// and feeds [`ResultPlan::result_relation`] into
+    /// [`Self::scan_data_from_metadata_state_machine`].
+    pub fn scan_metadata_state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
         CoroutineSM::new(move |mut co| async move {
             let mut phase = Phase(&mut co);
             let shape = resolve_checkpoint_shape_for_scan(&mut phase, &scan).await?;
-            let (metadata, live_actions_relation) = scan_metadata_plans_with_shape(&scan, shape)?;
-            run_phase(
-                &mut phase,
-                PhaseOperation::Plans(metadata),
-                "scan.replay.metadata",
-            )
-            .await?;
-            Ok(live_actions_relation)
+            scan_metadata_plans_with_shape(&scan, shape)
         })
     }
 
     /// Coroutine SM for data-only scan execution.
     ///
     /// The caller provides the live-actions relation produced by metadata
-    /// replay. The SM executes only the data-phase plans.
+    /// replay. The SM returns the data-phase [`ResultPlan`]; the caller
+    /// executes its plans and reads its result relation to obtain the final
+    /// rows.
     pub fn scan_data_from_metadata_state_machine(
         &self,
         live_actions_relation: RelationHandle,
-    ) -> Result<CoroutineSM<()>, DeltaError> {
+    ) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
-        CoroutineSM::new(move |mut co| async move {
-            let mut phase = Phase(&mut co);
-            let data = scan.scan_data_from_metadata_plans(live_actions_relation)?;
-            run_phase(&mut phase, PhaseOperation::Plans(data), "scan.replay.data").await?;
-            Ok(())
+        CoroutineSM::new(move |_co| async move {
+            scan.scan_data_from_metadata_plans(live_actions_relation)
         })
     }
 
     /// Coroutine SM for combined metadata + data scan execution.
     ///
-    /// This is the canonical replay path when checkpoint shape is ambiguous:
-    /// if `_last_checkpoint` does not provide schema hints, the SM runs a
-    /// checkpoint-schema query first, and for V2 checkpoints with sidecars
-    /// it runs sidecar discovery (`ConsumeByKdf`) followed by a sidecar
-    /// schema query before building metadata/data plans.
-    pub fn scan_state_machine(&self) -> Result<CoroutineSM<()>, DeltaError> {
+    /// When `_last_checkpoint` does not provide schema hints, the SM runs a
+    /// checkpoint-schema query first, and for V2 checkpoints with sidecars it
+    /// runs sidecar discovery (`ConsumeByKdf`) followed by a sidecar schema
+    /// query before building plans. The returned [`ResultPlan`]'s result
+    /// relation is the data-phase output relation publishing the scan's
+    /// logical schema.
+    pub fn scan_state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
         CoroutineSM::new(move |mut co| async move {
             let mut phase = Phase(&mut co);
             let shape = resolve_checkpoint_shape_for_scan(&mut phase, &scan).await?;
-            let (metadata, live_actions_relation) =
-                scan_metadata_plans_with_shape(&scan, shape.clone())?;
-            run_phase(
-                &mut phase,
-                PhaseOperation::Plans(metadata),
-                "scan.replay.metadata",
-            )
-            .await?;
+            let metadata = scan_metadata_plans_with_shape(&scan, shape)?;
+            let live_actions_relation = metadata.result_relation;
             let data = scan.scan_data_from_metadata_plans(live_actions_relation)?;
-            run_phase(&mut phase, PhaseOperation::Plans(data), "scan.replay.data").await?;
-            Ok(())
+            let mut plans = metadata.plans;
+            plans.extend(data.plans);
+            Ok(ResultPlan::new(plans, data.result_relation))
         })
     }
 }
 
-/// Compose the metadata-phase plans for `scan` using the resolved checkpoint
-/// shape.
+/// Materialized live-actions relation name produced by metadata-phase replay.
+const FSR_SCAN_LIVE_ACTIONS: &str = "scan.live_actions";
+/// Raw per-file rows emitted by the data-phase Load sink before logical projection.
+const FSR_SCAN_DATA_ROWS_RAW: &str = "scan.data_rows_raw";
+/// Final scan-data relation in the scan's logical schema.
+const FSR_SCAN_DATA: &str = "scan.data";
+
+/// Compose the metadata-phase [`ResultPlan`] for `scan` using the resolved
+/// checkpoint shape.
 ///
-/// Builds on top of [`build_fsr_plans`] by rebinding the FSR-results plan to
-/// a fresh relation handle, layering on the actions-side projection /
-/// predicate / dedup chain, and finally materializing the `scan.live_actions`
-/// relation that the data phase consumes.
+/// Builds on top of [`build_fsr_plans`] by consuming the FSR result relation
+/// as the input of an actions-side projection / predicate / dedup chain, and
+/// materializes the live-actions relation that the data phase consumes.
 fn scan_metadata_plans_with_shape(
     scan: &Scan,
     checkpoint_shape: CheckpointShape,
-) -> Result<(Vec<Plan>, RelationHandle), DeltaError> {
+) -> Result<ResultPlan, DeltaError> {
     let snapshot = scan.snapshot();
     let partition_columns = replay_partition_columns(scan);
     let predicate_stats_schema = scan.physical_stats_schema();
@@ -231,31 +221,36 @@ fn scan_metadata_plans_with_shape(
     let partition_values_schema =
         scan_partition_values_physical_schema(snapshot.as_ref(), scan.logical_schema())?;
 
-    // === FSR plans: build, rebind the terminal Results plan to a fresh relation ===
-    // build_fsr_plans returns a vector ending in a Results sink. Inside the scan SM the
-    // terminal output is the actions-projected live-actions relation, so pop the FSR
-    // results plan and rebind its root to a named handle the actions chain can reference.
-    // The handle's published schema is action_output_schema() (strict per-action ToSchema)
-    // because the downstream actions chain references nested fields by name; some FSR
-    // results branches emit action_read_schema() (all-nullable nested), so we pin the
-    // handle to the strict schema to keep the actions chain's input shape stable.
+    // === FSR plans: build the FSR result plan, then layer the actions chain on top ===
+    // `build_fsr_plans` publishes its terminal relation with the all-nullable
+    // `action_read_schema()`. The downstream actions chain references nested fields by name and
+    // expects the strict `action_output_schema()` contract, so the FSR terminal plan is rebound
+    // to a fresh `scan.fsr_results` handle that publishes the strict schema. The chain's actual
+    // row data is still all-nullable; the strict handle is purely a name-binding for downstream
+    // projection consumers.
     let mut p = PlanCollector::new();
-    let mut fsr_plans = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
-    let fsr_results_plan = fsr_plans.pop().ok_or_else(|| {
+    let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
+    let fsr_terminal_id = fsr.result_relation.id;
+    let mut terminal_plan: Option<crate::plans::ir::Plan> = None;
+    for plan in fsr.plans {
+        let is_terminal = matches!(
+            &plan.sink.sink_type,
+            crate::plans::ir::nodes::SinkType::Relation(h) if h.id == fsr_terminal_id
+        );
+        if is_terminal {
+            terminal_plan = Some(plan);
+        } else {
+            p.push_plan(plan);
+        }
+    }
+    let terminal_plan = terminal_plan.ok_or_else(|| {
         delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
-            "fsr::scan::scan_metadata: expected at least one plan from build_fsr_plans",
+            "fsr::scan::scan_metadata: terminal FSR plan missing from plan vector",
         )
     })?;
-    for prior in fsr_plans {
-        p.push_plan(prior);
-    }
     let fsr_results_relation = RelationHandle::fresh("scan.fsr_results", action_output_schema());
-    p.push_plan(
-        fsr_results_plan
-            .root
-            .into_relation(fsr_results_relation.clone()),
-    );
+    p.push_plan(terminal_plan.root.into_relation(fsr_results_relation.clone()));
 
     // === actions chain: filter live add paths, optionally augmenting with parsed stats /
     // partitionValues columns when a data-skipping predicate is in play ===
@@ -297,8 +292,8 @@ fn scan_metadata_plans_with_shape(
         scan_live_actions_schema(partition_values_schema.as_ref()),
     );
 
-    let live_actions_relation = p.add_relation("scan.live_actions", live_actions_node);
-    Ok((p.into_vec(), live_actions_relation))
+    let live_actions_relation = p.add_relation(FSR_SCAN_LIVE_ACTIONS, live_actions_node);
+    Ok(ResultPlan::new(p.into_vec(), live_actions_relation))
 }
 
 pub(super) fn scan_partition_values_schema(
@@ -548,23 +543,25 @@ mod tests {
         for cfg in replay_coverage_configs() {
             let (_engine, snapshot, _tmp) = load_test_table(cfg.table).unwrap();
             let scan = build_scan_for_config(Arc::clone(&snapshot), cfg).unwrap();
-            let (metadata, live_actions) = scan.scan_metadata_plans().unwrap();
+            let metadata = scan.scan_metadata_plans().unwrap();
             assert!(
-                !metadata.is_empty(),
+                !metadata.plans.is_empty(),
                 "metadata plans must be non-empty for {}",
                 cfg.table
             );
-            let data = scan.scan_data_from_metadata_plans(live_actions).unwrap();
+            let data = scan
+                .scan_data_from_metadata_plans(metadata.result_relation.clone())
+                .unwrap();
             assert_eq!(
-                data.len(),
+                data.plans.len(),
                 2,
                 "data phase should remain two plans for {}",
                 cfg.table
             );
             let combined = scan.scan_plans().unwrap();
             assert_eq!(
-                combined.len(),
-                metadata.len() + data.len(),
+                combined.plans.len(),
+                metadata.plans.len() + data.plans.len(),
                 "combined replay should equal metadata + data for {}",
                 cfg.table
             );
@@ -583,8 +580,8 @@ mod tests {
             .with_stats()
             .build_replay()
             .unwrap();
-        let (metadata, _) = scan.scan_metadata_plans().unwrap();
-        let debug = format!("{metadata:#?}");
+        let metadata = scan.scan_metadata_plans().unwrap();
+        let debug = format!("{:#?}", metadata.plans);
         assert!(
             debug.contains("ParseJson"),
             "metadata replay should materialize ParseJson before predicate filtering:\n{debug}"
@@ -602,9 +599,11 @@ mod tests {
             .with_stats()
             .build_replay()
             .unwrap();
-        let (_, live_actions) = scan.scan_metadata_plans().unwrap();
-        let data = scan.scan_data_from_metadata_plans(live_actions).unwrap();
-        let load = match &data[0].sink.sink_type {
+        let metadata = scan.scan_metadata_plans().unwrap();
+        let data = scan
+            .scan_data_from_metadata_plans(metadata.result_relation)
+            .unwrap();
+        let load = match &data.plans[0].sink.sink_type {
             SinkType::Load(load) => load,
             other => panic!("expected load sink, got {other:?}"),
         };

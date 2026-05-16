@@ -73,12 +73,14 @@ fn kernel_project(
     RecordBatch::try_new(arrow_schema, arrays).expect("project batch")
 }
 
-async fn df_collect(plan: delta_kernel::plans::ir::Plan) -> Vec<RecordBatch> {
-    DataFusionExecutor::try_new()
-        .expect("executor")
-        .execute_plan_collect(plan)
-        .await
-        .expect("execute")
+async fn df_collect(node: delta_kernel::plans::ir::DeclarativePlanNode) -> Vec<RecordBatch> {
+    use delta_kernel::plans::ir::nodes::RelationHandle;
+    let schema = node.output_schema();
+    let handle = RelationHandle::fresh("parity_out", schema);
+    let plan = node.into_relation(handle.clone());
+    let executor = DataFusionExecutor::try_new().expect("executor");
+    executor.execute_plans(&[plan]).await.expect("execute");
+    executor.collect_relation(&handle).await.expect("collect")
 }
 
 fn concat_or_clone(batches: &[RecordBatch]) -> RecordBatch {
@@ -135,10 +137,7 @@ async fn parity_literal_matches_kernel_create_many() {
         vec![Scalar::Long(2), Scalar::Long(20)],
     ];
     let expected = kernel_literal_batch(Arc::clone(&schema), &rows);
-    let plan = DeclarativePlanNode::values(schema, rows)
-        .unwrap()
-        .into_results();
-    let got = df_collect(plan).await;
+    let got = df_collect(DeclarativePlanNode::values(schema, rows).unwrap()).await;
     assert_batches_equal(&expected, &got);
 }
 
@@ -158,11 +157,12 @@ async fn parity_filter_matches_kernel_semantics() {
     )));
     let expected = kernel_filter(&base, pred.as_ref());
 
-    let plan = DeclarativePlanNode::values(schema, rows)
-        .unwrap()
-        .filter(pred)
-        .into_results();
-    let got = df_collect(plan).await;
+    let got = df_collect(
+        DeclarativePlanNode::values(schema, rows)
+            .unwrap()
+            .filter(pred),
+    )
+    .await;
     assert_batches_equal(&expected, &got);
 }
 
@@ -191,11 +191,12 @@ async fn parity_project_matches_kernel_evaluation() {
     // doubled = x + 3
     let expected = kernel_project(&base, &columns, Arc::clone(&out_schema));
 
-    let plan = DeclarativePlanNode::values(in_schema, rows)
-        .unwrap()
-        .project(columns, out_schema)
-        .into_results();
-    let got = df_collect(plan).await;
+    let got = df_collect(
+        DeclarativePlanNode::values(in_schema, rows)
+            .unwrap()
+            .project(columns, out_schema),
+    )
+    .await;
     assert_batches_equal(&expected, &got);
 }
 
@@ -210,13 +211,14 @@ async fn parity_ordered_union_matches_kernel_concat() {
     let expected =
         concat_batches(&b_left.schema(), &[b_left, b_right]).expect("concat union reference");
 
-    let plan = DeclarativePlanNode::union(vec![
-        DeclarativePlanNode::values(Arc::clone(&schema), left_rows).unwrap(),
-        DeclarativePlanNode::values(Arc::clone(&schema), right_rows).unwrap(),
-    ])
-    .unwrap()
-    .into_results();
-    let got = df_collect(plan).await;
+    let got = df_collect(
+        DeclarativePlanNode::union(vec![
+            DeclarativePlanNode::values(Arc::clone(&schema), left_rows).unwrap(),
+            DeclarativePlanNode::values(Arc::clone(&schema), right_rows).unwrap(),
+        ])
+        .unwrap(),
+    )
+    .await;
     assert_batches_equal(&expected, &got);
 }
 
@@ -266,18 +268,19 @@ async fn parity_window_row_number_matches_ordered_partition_reference() {
         Arc::new(out_schema.as_ref().try_into_arrow().unwrap());
     let expected = RecordBatch::try_new(arrow_out, cols).unwrap();
 
-    let plan = DeclarativePlanNode::values(schema, rows)
-        .unwrap()
-        .window(
-            vec![WindowFunction {
-                output_col: "_rn".into(),
-            }],
-            vec![Arc::new(Expression::column(["part"]))],
-            vec![OrderingSpec::asc(ColumnName::new(["v"]))],
-        )
-        .unwrap()
-        .into_results();
-    let got = df_collect(plan).await;
+    let got = df_collect(
+        DeclarativePlanNode::values(schema, rows)
+            .unwrap()
+            .window(
+                vec![WindowFunction {
+                    output_col: "_rn".into(),
+                }],
+                vec![Arc::new(Expression::column(["part"]))],
+                vec![OrderingSpec::asc(ColumnName::new(["v"]))],
+            )
+            .unwrap(),
+    )
+    .await;
     assert_batches_equal(&expected, &got);
 }
 
@@ -362,7 +365,7 @@ async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
         DeclarativePlanNode::values(build_schema, build_rows).unwrap(),
         DeclarativePlanNode::values(probe_schema, probe_rows).unwrap(),
     );
-    let got = df_collect(root.into_results()).await;
+    let got = df_collect(root).await;
     let merged = concat_or_clone(&got);
     assert_eq!(
         batch_to_inner_join_tuples(&merged),
@@ -399,7 +402,7 @@ async fn parity_left_anti_join_matches_reference_probe_order() {
     };
 
     let root = DeclarativePlanNode::join(join_node, build, probe);
-    let got = df_collect(root.into_results()).await;
+    let got = df_collect(root).await;
     let batch = concat_or_clone(&got);
 
     let build_keys: HashSet<i64> = [1i64].into_iter().collect();
@@ -456,8 +459,10 @@ async fn parity_scan_single_parquet_matches_arrow_reader() {
     let expected = concat_or_clone(&expected_batches);
 
     let kernel_schema_clone = Arc::clone(&kernel_schema);
-    let plan =
-        DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema).into_results();
-    let got = df_collect(plan).await;
+    let got = df_collect(DeclarativePlanNode::scan_parquet(
+        vec![file_meta(&path)],
+        kernel_schema,
+    ))
+    .await;
     assert_batch_column_data_equal(&kernel_schema_clone, &expected, &concat_or_clone(&got));
 }

@@ -1,16 +1,19 @@
 //! DataFusion execution scaffold for Delta Kernel declarative [`Plan`] trees.
 //!
-//! Supported sinks include [`delta_kernel::plans::ir::nodes::SinkType::Results`] (stream batches to
-//! the caller), [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation) /
-//! [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) (materialize batches as a
-//! [`MemTable`](datafusion::datasource::MemTable) registered in the executor's
+//! Supported sinks: [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation)
+//! / [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) (materialize batches
+//! as a [`MemTable`](datafusion::datasource::MemTable) registered in the executor's
 //! [`SessionContext`](datafusion::execution::context::SessionContext) so downstream
 //! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
 //! it), and
 //! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) (observe
-//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Sinks are annotations on the kernel
-//! [`Plan`](delta_kernel::plans::ir::Plan), not envelopes on the DataFusion physical plan; the
-//! executor handles each sink type as a post-drain side effect. Unsupported constructs surface a
+//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Read-style state machines return
+//! a [`delta_kernel::plans::ir::ResultPlan`] naming the relation the caller reads after
+//! executing the result plan's plans.
+//!
+//! Sinks are annotations on the kernel [`Plan`](delta_kernel::plans::ir::Plan), not envelopes
+//! on the DataFusion physical plan; the executor handles each sink type as a post-drain side
+//! effect. Unsupported constructs surface a
 //! [`datafusion_common::error::DataFusionError::NotImplemented`] via [`error::unsupported`];
 //! the engine -> kernel boundary methods on [`DataFusionExecutor`] translate that into a
 //! [`delta_kernel::plans::errors::DeltaError`].
@@ -29,7 +32,6 @@ mod tests {
     use delta_kernel::expressions::{Expression, Scalar};
     use delta_kernel::plans::ir::nodes::RelationHandle;
     use delta_kernel::plans::ir::DeclarativePlanNode;
-    use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
     use delta_kernel::schema::{DataType, StructField, StructType};
 
     use crate::DataFusionExecutor;
@@ -39,28 +41,6 @@ mod tests {
             StructField::not_null("a", DataType::BOOLEAN),
             StructField::not_null("b", DataType::BOOLEAN),
         ]))
-    }
-
-    #[tokio::test]
-    async fn logical_results_sink_streams_batches() {
-        let ex = DataFusionExecutor::try_new().unwrap();
-        let plan = DeclarativePlanNode::values(
-            two_bool_schema(),
-            vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],
-        )
-        .unwrap()
-        .project(
-            vec![
-                Arc::new(Expression::column(["a"])),
-                Arc::new(Expression::column(["b"])),
-            ],
-            two_bool_schema(),
-        )
-        .into_results();
-        let batches = ex.execute_plan_collect(plan).await.unwrap();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
-        assert_eq!(batches[0].num_columns(), 2);
     }
 
     #[tokio::test]
@@ -82,9 +62,7 @@ mod tests {
         )
         .into_relation(handle.clone());
 
-        ex.execute_phase_operation(PhaseOperation::Plans(vec![plan]))
-            .await
-            .unwrap();
+        ex.execute_plans(&[plan]).await.unwrap();
         let relation_batches = ex
             .collect_relation(&handle)
             .await
