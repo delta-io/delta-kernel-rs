@@ -29,6 +29,24 @@ mod scalars;
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
 
+/// Build an [`Expression::Column`] reference from anything that converts into a
+/// [`ColumnName`].
+///
+/// Concise alternative to `Expression::column([name])` for plan builders.
+/// Accepts the same shapes as [`IntoColumnName`]: a bare `&str`
+/// (`col("path")`), a nested path (`col(["add", "path"])`), or a prebuilt
+/// [`ColumnName`]. The returned [`Expression`] composes directly with the
+/// `is_not_null` / `eq` / `le` / ... predicate constructors and auto-wraps to
+/// `Arc<Expression>` at IR boundaries via the blanket `From<T> for Arc<T>`.
+///
+/// ```ignore
+/// use delta_kernel::expressions::col;
+/// let p = col(["add", "path"]).is_not_null();
+/// ```
+pub fn col<N: IntoColumnName>(name: N) -> Expression {
+    Expression::Column(name.into_column_name())
+}
+
 ////////////////////////////////////////////////////////////////////////
 // Operators
 ////////////////////////////////////////////////////////////////////////

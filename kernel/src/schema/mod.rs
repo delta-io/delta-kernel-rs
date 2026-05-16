@@ -37,6 +37,25 @@ pub(crate) mod variant_utils;
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
+/// Build a [`SchemaRef`] from a sequence of [`StructField`]s without going through
+/// `Arc::new(StructType::new_unchecked(...))`.
+///
+/// Use when assembling a schema entirely from known-distinct field names; the
+/// underlying constructor is unchecked, so callers must guarantee the field set
+/// is unique (otherwise later entries silently overwrite earlier ones with the
+/// same name). For validating construction, prefer [`SchemaBuilder::build`].
+///
+/// ```ignore
+/// use delta_kernel::schema::{arc_schema, DataType, StructField};
+/// let schema = arc_schema([
+///     StructField::not_null("path", DataType::STRING),
+///     StructField::not_null("size", DataType::LONG),
+/// ]);
+/// ```
+pub fn arc_schema<I: IntoIterator<Item = StructField>>(fields: I) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(fields))
+}
+
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
 #[internal_api]
