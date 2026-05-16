@@ -1,26 +1,20 @@
-//! Stream [`LoadSink`] output batches produced by kernel parquet/json handlers (passthrough
-//! columns + optional DV masking). The executor collects the stream and registers the result
-//! in the [`SessionContext`](datafusion::execution::context::SessionContext) under
-//! `__dk_rel_{handle_id}` so downstream
-//! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
-//! it as a [`MemTable`](datafusion::datasource::MemTable).
+//! Helpers used by the executor to materialize a [`SinkType::Load`] sink.
+//!
+//! For each upstream row, [`materialize_upstream_batch`] resolves a file URL +
+//! optional deletion vector + per-row passthrough columns, hands the file URL to
+//! the kernel parquet/json handler via [`read_rows_for_location`], and merges
+//! the broadcast passthrough columns onto each emitted file row.
+//!
+//! These helpers are pure batch-in / batch-out; the executor's
+//! [`crate::executor::DataFusionExecutor::drain_load`] driver supplies the
+//! single-partition stream and the kernel [`Engine`] used for I/O.
+//!
+//! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load
 
-use std::any::Any;
-use std::fmt;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use datafusion_common::error::DataFusionError;
-use datafusion_common::Result as DfResult;
-use datafusion_execution::TaskContext;
-use datafusion_physical_expr::equivalence::EquivalenceProperties;
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
-};
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::types::{Int32Type, Int64Type};
 use delta_kernel::arrow::array::{
@@ -36,173 +30,16 @@ use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
 use delta_kernel::scan::selection_vector;
 use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 use delta_kernel::{Engine, FileMeta};
-use futures::{Stream, StreamExt};
 use url::Url;
+
+/// Per-file column projection that the parquet / json kernel handler should
+/// request when reading rows for a [`LoadSink`].
+pub(crate) fn physical_read_schema(load: &LoadSink) -> Result<KernelSchemaRef, DataFusionError> {
+    Ok(load.file_schema.clone())
+}
 
 fn kernel_err(e: delta_kernel::Error) -> DataFusionError {
     crate::error::internal_error(e.to_string())
-}
-
-pub struct KernelLoadSinkExec {
-    child: Arc<dyn ExecutionPlan>,
-    sink: LoadSink,
-    engine: Arc<dyn Engine>,
-    arrow_schema: delta_kernel::arrow::datatypes::SchemaRef,
-    physical_read_schema: KernelSchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl KernelLoadSinkExec {
-    pub fn try_new(
-        child: Arc<dyn ExecutionPlan>,
-        sink: LoadSink,
-        engine: Arc<dyn Engine>,
-        physical_read_schema: KernelSchemaRef,
-    ) -> Result<Self, DataFusionError> {
-        let arrow_schema: delta_kernel::arrow::datatypes::SchemaRef = Arc::new(
-            sink.output_relation
-                .schema
-                .as_ref()
-                .try_into_arrow()
-                .map_err(|e| {
-                    crate::error::plan_compilation(format!(
-                        "Load sink output schema conversion: {e}"
-                    ))
-                })?,
-        );
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(arrow_schema.clone()),
-            child.properties().output_partitioning().clone(),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
-        Ok(Self {
-            child,
-            sink,
-            engine,
-            arrow_schema,
-            physical_read_schema,
-            properties,
-        })
-    }
-}
-
-impl fmt::Debug for KernelLoadSinkExec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KernelLoadSinkExec")
-            .field("handle_id", &self.sink.output_relation.id)
-            .field("file_type", &self.sink.file_type)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DisplayAs for KernelLoadSinkExec {
-    fn fmt_as(&self, _: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "KernelLoadSinkExec(handle_id={}, format={:?})",
-            self.sink.output_relation.id, self.sink.file_type
-        )
-    }
-}
-
-impl ExecutionPlan for KernelLoadSinkExec {
-    fn name(&self) -> &str {
-        "KernelLoadSinkExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> delta_kernel::arrow::datatypes::SchemaRef {
-        self.arrow_schema.clone()
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.child]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let child = super::expect_single_child(children, "KernelLoadSinkExec")?;
-        Ok(Arc::new(Self::try_new(
-            child,
-            self.sink.clone(),
-            Arc::clone(&self.engine),
-            self.physical_read_schema.clone(),
-        )?))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DfResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "KernelLoadSinkExec supports partition 0 only, got {partition}",
-            )));
-        }
-        let inner = self.child.execute(partition, context)?;
-        Ok(Box::pin(KernelLoadSinkStream {
-            inner,
-            sink: self.sink.clone(),
-            engine: Arc::clone(&self.engine),
-            physical_read_schema: self.physical_read_schema.clone(),
-            output_arrow_schema: self.arrow_schema.clone(),
-            pending: Vec::new(),
-        }))
-    }
-}
-
-struct KernelLoadSinkStream {
-    inner: SendableRecordBatchStream,
-    sink: LoadSink,
-    engine: Arc<dyn Engine>,
-    physical_read_schema: KernelSchemaRef,
-    output_arrow_schema: delta_kernel::arrow::datatypes::SchemaRef,
-    pending: Vec<RecordBatch>,
-}
-
-impl Stream for KernelLoadSinkStream {
-    type Item = DfResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            if !self.pending.is_empty() {
-                return Poll::Ready(Some(Ok(self.pending.remove(0))));
-            }
-            match self.inner.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(batch))) => {
-                    match materialize_upstream_batch(
-                        &batch,
-                        &self.sink,
-                        self.engine.as_ref(),
-                        self.physical_read_schema.clone(),
-                    ) {
-                        Ok(outs) => self.pending = outs,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-impl RecordBatchStream for KernelLoadSinkStream {
-    fn schema(&self) -> delta_kernel::arrow::datatypes::SchemaRef {
-        self.output_arrow_schema.clone()
-    }
 }
 
 fn dv_table_root(load: &LoadSink, file_url: &Url) -> Url {
@@ -379,7 +216,7 @@ fn read_required_i64(arr: &ArrayRef, row: usize, label: &str) -> Result<i64, Dat
     }
 }
 
-fn optional_selection_vector_for_row(
+pub(crate) fn optional_selection_vector_for_row(
     batch: &RecordBatch,
     sink: &LoadSink,
     row: usize,
@@ -415,7 +252,7 @@ fn dv_mask_slice(mask: &[bool], start: usize, len: usize) -> Vec<bool> {
     out
 }
 
-fn apply_optional_dv(
+pub(crate) fn apply_optional_dv(
     rb: RecordBatch,
     mask: Option<&Vec<bool>>,
     row_offset: &mut usize,
@@ -480,7 +317,7 @@ fn broadcast_passthrough_for_batch(
     Ok((names, arrays))
 }
 
-fn read_rows_for_location(
+pub(crate) fn read_rows_for_location(
     sink: &LoadSink,
     engine: &dyn Engine,
     url: Url,
@@ -542,7 +379,12 @@ fn optional_i64(
     }
 }
 
-fn materialize_upstream_batch(
+/// Read one upstream batch's worth of file rows. For each upstream row, resolve
+/// the file URL + optional DV + size hint, ask the kernel handler for that
+/// file's row groups, broadcast the upstream row's passthrough columns onto
+/// every emitted file row, and align the resulting columns to the sink's
+/// declared output schema.
+pub(crate) fn materialize_upstream_batch(
     batch: &RecordBatch,
     sink: &LoadSink,
     engine: &dyn Engine,

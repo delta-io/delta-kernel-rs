@@ -1,7 +1,7 @@
 //! Custom physical operators for the DataFusion engine.
 
-mod shape;
-mod sources;
+mod file_listing;
+mod nullability_validation;
 
-pub use shape::{KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec};
-pub(crate) use sources::FileListingExec;
+pub(crate) use file_listing::FileListingExec;
+pub use nullability_validation::NullabilityValidationExec;

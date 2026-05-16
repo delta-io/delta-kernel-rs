@@ -8,8 +8,8 @@
 //! [`SinkType::Load`] (drain + the executor materializes the result as a
 //! [`datafusion::datasource::MemTable`] under
 //! [`crate::executor::DataFusionExecutor::session_ctx`] for downstream
-//! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::ConsumeByKdf`] (drain via
-//! [`KernelConsumeByKdfExec`](crate::exec::KernelConsumeByKdfExec)).
+//! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::ConsumeByKdf`] (drained directly by
+//! the executor through a [`delta_kernel::plans::kdf::ConsumerKdf`] handle).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,9 +30,7 @@ use delta_kernel::Engine;
 
 pub mod expr_translator;
 mod json_parse;
-mod load_sink;
 pub mod logical;
-pub(crate) use load_sink::physical_read_schema;
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
 #[derive(Clone)]

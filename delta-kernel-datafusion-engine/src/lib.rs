@@ -8,7 +8,9 @@
 //! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
 //! it), and
 //! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) (observe
-//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Unsupported constructs surface a
+//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Sinks are annotations on the kernel
+//! [`Plan`](delta_kernel::plans::ir::Plan), not envelopes on the DataFusion physical plan; the
+//! executor handles each sink type as a post-drain side effect. Unsupported constructs surface a
 //! [`datafusion_common::error::DataFusionError::NotImplemented`] via [`error::unsupported`];
 //! the engine -> kernel boundary methods on [`DataFusionExecutor`] translate that into a
 //! [`delta_kernel::plans::errors::DeltaError`].
