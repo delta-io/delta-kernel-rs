@@ -120,13 +120,10 @@ impl TableProvider for NullabilityEnforcingTableProvider {
         // NullabilityValidationExec zips this against the inner batches positionally and casts
         // each column to the matching field, so the column count and order must match the
         // inner plan's output.
-        let projected_schema: Arc<ArrowSchema> =
-            match projection {
-                Some(p) => Arc::new(self.strict_schema.project(p).map_err(|e| {
-                    datafusion_common::DataFusionError::ArrowError(Box::new(e), None)
-                })?),
-                None => Arc::clone(&self.strict_schema),
-            };
+        let projected_schema: Arc<ArrowSchema> = match projection {
+            Some(p) => Arc::new(self.strict_schema.project(p)?),
+            None => Arc::clone(&self.strict_schema),
+        };
         // Drop validations whose top-level root was projected out -- they reference columns
         // that don't exist in `projected_schema` and would fail by-name lookup at runtime.
         let kept_roots: HashSet<&str> = projected_schema

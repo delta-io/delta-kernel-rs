@@ -67,7 +67,7 @@ use futures::TryStreamExt;
 use url::Url;
 
 use crate::compile::{compile_plan_logical, CompileContext};
-use crate::error::df_to_delta;
+use crate::error::DfResultIntoDelta;
 use crate::executor::load::{materialize_upstream_batch, physical_read_schema};
 
 fn relation_table_name(handle_id: u64) -> String {
@@ -169,7 +169,7 @@ impl DataFusionExecutor {
             plan,
             &CompileContext::new(Arc::new(HashMap::new()), Arc::clone(&self.engine)),
         )
-        .map_err(df_to_delta)
+        .into_delta()
     }
 
     // ================================================================
@@ -208,7 +208,7 @@ impl DataFusionExecutor {
     /// active phase's [`PhaseState`] (for `ConsumeByKdf`).
     pub async fn execute_plans(&self, plans: &[Plan]) -> Result<(), DeltaError> {
         let state = PhaseState::empty();
-        self.run_plans(plans, &state).await.map_err(df_to_delta)
+        self.run_plans(plans, &state).await.into_delta()
     }
 
     /// Run [`ResultPlan::plans`] and then collect every batch in the result relation.
@@ -235,8 +235,8 @@ impl DataFusionExecutor {
         &self,
         handle: &RelationHandle,
     ) -> Result<Vec<RecordBatch>, DeltaError> {
-        let df = self.relation_dataframe(handle).await.map_err(df_to_delta)?;
-        df.collect().await.map_err(df_to_delta)
+        let df = self.relation_dataframe(handle).await.into_delta()?;
+        df.collect().await.into_delta()
     }
 
     /// Open a stream over a previously-materialized relation's batches.
@@ -244,8 +244,8 @@ impl DataFusionExecutor {
         &self,
         handle: &RelationHandle,
     ) -> Result<SendableRecordBatchStream, DeltaError> {
-        let df = self.relation_dataframe(handle).await.map_err(df_to_delta)?;
-        df.execute_stream().await.map_err(df_to_delta)
+        let df = self.relation_dataframe(handle).await.into_delta()?;
+        df.execute_stream().await.into_delta()
     }
 
     /// Register a pre-materialized batch set as a relation under `name`, returning a fresh
@@ -259,7 +259,7 @@ impl DataFusionExecutor {
     ) -> Result<RelationHandle, DeltaError> {
         let handle = RelationHandle::fresh(name, schema);
         self.register_relation_into_session(&handle, batches)
-            .map_err(df_to_delta)?;
+            .into_delta()?;
         Ok(handle)
     }
 

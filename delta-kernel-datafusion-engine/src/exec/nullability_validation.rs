@@ -129,7 +129,7 @@ impl Stream for NullabilityValidationStream {
                     .map(|(f, c)| cast_array_to_field(c, f.as_ref()))
                     .collect::<DfResult<Vec<_>>>()?;
                 let out = RecordBatch::try_new(self.target_schema.clone(), cols)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+                    .map_err(DataFusionError::from);
                 Poll::Ready(Some(out))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),

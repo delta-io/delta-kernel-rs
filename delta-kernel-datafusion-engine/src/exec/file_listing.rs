@@ -38,7 +38,7 @@ fn metas_to_batch(
         schema.clone(),
         vec![Arc::new(paths), Arc::new(sizes), Arc::new(mod_times)],
     )
-    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    .map_err(Into::into)
 }
 
 pub struct FileListingExec {
