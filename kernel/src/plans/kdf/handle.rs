@@ -7,8 +7,8 @@
 //!
 //! [`ConsumeSink`]: crate::plans::ir::nodes::ConsumeSink
 //!
-//! Generic over `K: Kdf + ?Sized`; executor code uses `Handle<dyn ConsumerKdf>`
-//! directly. KDFs ride on the
+//! Generic over `K: ConsumerKdf + ?Sized`; executor code uses
+//! `Handle<dyn ConsumerKdf>` directly. KDFs ride on the
 //! [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume)
 //! sink, which is dispatched in-process — handles never need to cross a
 //! serialization boundary.
@@ -18,7 +18,7 @@ use std::any::Any;
 use super::token::ConsumerKdfId;
 use super::token::KdfStateToken;
 use super::trace::TraceContext;
-use super::traits::{ConsumerKdf, Kdf, KdfControl};
+use super::traits::{ConsumerKdf, KdfControl};
 use crate::{DeltaResult, EngineData};
 
 /// Runtime state carrier. Generic over the KDF kind; executor code holds
@@ -28,13 +28,13 @@ use crate::{DeltaResult, EngineData};
 /// joins this handle's eventual finalized state back to the plan-tree node.
 /// `ctx` identifies the execution context for tracing and error attribution.
 #[derive(Debug)]
-pub struct Handle<K: Kdf + ?Sized> {
+pub struct Handle<K: ConsumerKdf + ?Sized> {
     token: KdfStateToken,
     ctx: TraceContext,
     inner: Box<K>,
 }
 
-impl<K: Kdf + ?Sized> Handle<K> {
+impl<K: ConsumerKdf + ?Sized> Handle<K> {
     /// Construct a handle.
     pub fn new(token: KdfStateToken, ctx: TraceContext, inner: Box<K>) -> Self {
         Self { token, ctx, inner }
@@ -49,14 +49,13 @@ impl<K: Kdf + ?Sized> Handle<K> {
     pub fn kdf_id(&self) -> ConsumerKdfId {
         self.inner.kdf_id()
     }
-}
 
-impl<K: ConsumerKdf + ?Sized> Handle<K> {
     /// Apply the consumer to a batch.
     #[tracing::instrument(
         level = "trace",
         name = "kdf.apply",
         skip(self, batch),
+        ret,
         fields(
             sm = self.ctx.sm,
             phase = self.ctx.phase,
@@ -65,13 +64,9 @@ impl<K: ConsumerKdf + ?Sized> Handle<K> {
         ),
     )]
     pub fn apply_consumer(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
-        let out = self.inner.apply(batch)?;
-        tracing::trace!(control = ?out, "consumer batch applied");
-        Ok(out)
+        self.inner.apply(batch)
     }
-}
 
-impl<K: Kdf + ?Sized> Handle<K> {
     /// Consume the handle, returning `(token, ctx, erased state)`.
     #[tracing::instrument(
         level = "debug",
@@ -105,10 +100,9 @@ pub struct FinishedHandle {
 }
 
 // `Clone` for `Handle<dyn ConsumerKdf>` comes from
-// `dyn_clone::clone_trait_object!` on the subtrait — `Box<K>: Clone` is
+// `dyn_clone::clone_trait_object!` on the trait — `Box<K>: Clone` is
 // automatic, so this is a single generic impl.
-
-impl<K: Kdf + ?Sized> Clone for Handle<K>
+impl<K: ConsumerKdf + ?Sized> Clone for Handle<K>
 where
     Box<K>: Clone,
 {

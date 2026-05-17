@@ -43,7 +43,6 @@ use super::plan::Plan;
 use super::relation_registry::RelationRegistry;
 use crate::expressions::{ColumnName, Expression, Scalar};
 use crate::plans::errors::DeltaError;
-use crate::plans::kdf::typed::make_extract;
 use crate::plans::kdf::{ConsumerKdf, Extractor, KdfOutput};
 use crate::schema::{arc_schema, DataType, SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Error, FileMeta};
@@ -413,9 +412,8 @@ impl PlanBuilder {
     {
         let node = ConsumeSink::new_consumer(state);
         let token = node.token.clone();
-        let extract = make_extract::<S>(token.clone());
         let plan = Plan::new(self.node, SinkType::Consume(node));
-        (plan, Extractor::new(token, extract))
+        (plan, Extractor::for_kdf::<S>(token))
     }
 }
 
@@ -452,7 +450,7 @@ mod tests {
     use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
     use crate::plans::ir::nodes::{OrderingSpec, WindowFunction};
-    use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, Kdf, KdfControl, KdfOutput};
+    use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput};
     use crate::schema::{DataType, StructField, StructType};
 
     fn simple_schema() -> SchemaRef {
@@ -546,23 +544,21 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct NoopConsumer;
-    impl Kdf for NoopConsumer {
+    impl ConsumerKdf for NoopConsumer {
         fn kdf_id(&self) -> ConsumerKdfId {
             ConsumerKdfId::CheckpointHint
         }
         fn finish(self: Box<Self>) -> Box<dyn Any + Send> {
             Box::new(*self)
         }
-    }
-    impl ConsumerKdf for NoopConsumer {
         fn apply(&mut self, _batch: &dyn crate::EngineData) -> DeltaResult<KdfControl> {
             Ok(KdfControl::Break)
         }
     }
     impl KdfOutput for NoopConsumer {
         type Output = bool;
-        fn into_output(parts: Vec<Self>) -> Result<bool, DeltaError> {
-            Ok(!parts.is_empty())
+        fn into_output(self) -> Result<bool, DeltaError> {
+            Ok(true)
         }
     }
 
@@ -577,11 +573,16 @@ mod tests {
         assert_eq!(extractor.token().kdf_id, ConsumerKdfId::CheckpointHint);
 
         let state = PhaseState::empty();
-        state.submit_kdf_handle(FinishedHandle {
-            token: extractor.token().clone(),
-            ctx: TraceContext::new("test", "consume"),
-            erased: Box::new(NoopConsumer),
-        });
+        state
+            .submit_kdf_handle(FinishedHandle {
+                token: extractor.token().clone(),
+                ctx: TraceContext {
+                    sm: "test".to_string(),
+                    phase: "consume".to_string(),
+                },
+                erased: Box::new(NoopConsumer),
+            })
+            .unwrap();
         assert!(extractor.extract(&state).unwrap());
     }
 

@@ -49,9 +49,10 @@ async fn consume_sink_drains_literal_and_harvests_finished_handle() {
         .await
         .expect("phase execution");
 
-    let payloads = state.take_by_token(&token);
-    assert_eq!(payloads.len(), 1);
-    let total = *payloads[0]
+    let payload = state
+        .take_by_token(&token)
+        .expect("SumRowsConsumer payload submitted");
+    let total = *payload
         .downcast_ref::<usize>()
         .expect("SumRowsConsumer finishes with usize");
     assert_eq!(total, 2);

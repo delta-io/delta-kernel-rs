@@ -6,20 +6,14 @@
 //! extraction — either a full valid action is returned or `None`. The
 //! reader stops once both have been seen.
 //!
-//! Required ordering is `version DESC`: the SM feeds newer commits first,
-//! so the first `Some(Protocol)` / `Some(Metadata)` the reader sees is the
-//! effective one. Classic checkpoint files that mix per-row P&M from
-//! multiple versions require the SM to partition + sort upstream; this
-//! consumer doesn't re-derive ordering itself.
+//! Newest commits must be fed first (the SM partitions + sorts upstream
+//! by `version DESC`), so the first `Some(Protocol)` / `Some(Metadata)`
+//! the reader captures is the effective one.
 
 use crate::actions::{Metadata, Protocol};
-use crate::plans::errors::DeltaError;
-use crate::plans::ir::nodes::OrderingSpec;
-use crate::plans::kdf::{
-    take_single, ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput, KdfStateToken,
-};
-use crate::schema::column_name;
-use crate::{DeltaResult, EngineData};
+use crate::plans::errors::{DeltaError, DeltaErrorCode};
+use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput};
+use crate::{delta_error, DeltaResult, EngineData};
 
 /// Captures the first `Some(Protocol)` / `Some(Metadata)` seen under the
 /// declared row ordering.
@@ -39,9 +33,15 @@ impl MetadataProtocolReader {
     }
 }
 
-impl_kdf!(MetadataProtocolReader, ConsumerKdfId::MetadataProtocol);
-
 impl ConsumerKdf for MetadataProtocolReader {
+    fn kdf_id(&self) -> ConsumerKdfId {
+        ConsumerKdfId::MetadataProtocol
+    }
+
+    fn finish(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        Box::new(*self)
+    }
+
     fn apply(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
         if self.protocol.is_none() {
             if let Some(p) = Protocol::try_new_from_data(batch)? {
@@ -53,36 +53,28 @@ impl ConsumerKdf for MetadataProtocolReader {
                 self.metadata = Some(m);
             }
         }
-        Ok(if self.is_complete() {
-            KdfControl::Break
+        if self.is_complete() {
+            Ok(KdfControl::Break)
         } else {
-            KdfControl::Continue
-        })
-    }
-
-    fn required_ordering(&self) -> Option<OrderingSpec> {
-        // Newest commits first so the first P&M captured is the effective one.
-        Some(OrderingSpec::desc(column_name!("version")))
+            Ok(KdfControl::Continue)
+        }
     }
 }
 
 impl KdfOutput for MetadataProtocolReader {
     type Output = (Protocol, Metadata);
 
-    fn into_output(parts: Vec<Self>) -> Result<Self::Output, DeltaError> {
-        let token = KdfStateToken::new(ConsumerKdfId::MetadataProtocol);
-        let single = take_single(parts, &token)?;
-        let protocol = single.protocol.ok_or_else(|| missing("protocol", &token))?;
-        let metadata = single.metadata.ok_or_else(|| missing("metadata", &token))?;
+    fn into_output(self) -> Result<Self::Output, DeltaError> {
+        let missing = |what: &str| {
+            delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "metadata_protocol.into_output: missing {what} after scan completed",
+            )
+        };
+        let protocol = self.protocol.ok_or_else(|| missing("protocol"))?;
+        let metadata = self.metadata.ok_or_else(|| missing("metadata"))?;
         Ok((protocol, metadata))
     }
-}
-
-fn missing(what: &str, token: &KdfStateToken) -> DeltaError {
-    crate::delta_error!(
-        crate::plans::errors::DeltaErrorCode::DeltaCommandInvariantViolation,
-        "metadata_protocol.into_output: token `{token}`: missing {what} after scan completed",
-    )
 }
 
 #[cfg(test)]
@@ -93,23 +85,15 @@ mod tests {
     fn kdf_id_is_stable() {
         let r = MetadataProtocolReader::new();
         assert_eq!(
-            crate::plans::kdf::Kdf::kdf_id(&r),
+            crate::plans::kdf::ConsumerKdf::kdf_id(&r),
             ConsumerKdfId::MetadataProtocol
         );
     }
 
     #[test]
-    fn required_ordering_is_version_desc() {
-        let r = MetadataProtocolReader::new();
-        let ord = r.required_ordering().expect("must declare an ordering");
-        assert_eq!(ord.column, column_name!("version"));
-        assert!(ord.descending);
-    }
-
-    #[test]
     fn missing_protocol_errors() {
         let r = MetadataProtocolReader::new();
-        let err = MetadataProtocolReader::into_output(vec![r]).unwrap_err();
+        let err = r.into_output().unwrap_err();
         assert!(format!("{err}").contains("missing protocol"), "got: {err}");
     }
 }

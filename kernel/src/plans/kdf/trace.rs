@@ -24,8 +24,7 @@
 /// Execution-time identity of a KDF's containing phase.
 ///
 /// Fields are `String`-backed (not `&'static str`) so the context survives
-/// across SM boundaries. SM-framework constructors take `&'static str`
-/// literals and copy into `String`.
+/// across SM boundaries.
 ///
 /// The `partition` field is NOT here — partitions vary per-handle within
 /// one phase. It lives directly on [`crate::plans::kdf::Handle`].
@@ -40,15 +39,6 @@ pub struct TraceContext {
     pub phase: String,
 }
 
-impl TraceContext {
-    pub fn new(sm: &'static str, phase: &'static str) -> Self {
-        Self {
-            sm: sm.to_string(),
-            phase: phase.to_string(),
-        }
-    }
-}
-
 impl std::fmt::Display for TraceContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}::{}", self.sm, self.phase)
@@ -59,17 +49,24 @@ impl std::fmt::Display for TraceContext {
 mod tests {
     use super::*;
 
+    fn ctx(sm: &str, phase: &str) -> TraceContext {
+        TraceContext {
+            sm: sm.to_string(),
+            phase: phase.to_string(),
+        }
+    }
+
     #[test]
     fn display_formats_as_sm_phase() {
-        let c = TraceContext::new("snapshot", "checkpoint_hint");
+        let c = ctx("snapshot", "checkpoint_hint");
         assert_eq!(c.to_string(), "snapshot::checkpoint_hint");
     }
 
     #[test]
     fn equality_distinguishes_sm_and_phase() {
-        let a = TraceContext::new("snapshot", "list_files");
-        let b = TraceContext::new("snapshot", "load_metadata");
-        let c = TraceContext::new("scan", "list_files");
+        let a = ctx("snapshot", "list_files");
+        let b = ctx("snapshot", "load_metadata");
+        let c = ctx("scan", "list_files");
         assert_ne!(a, b);
         assert_ne!(a, c);
     }

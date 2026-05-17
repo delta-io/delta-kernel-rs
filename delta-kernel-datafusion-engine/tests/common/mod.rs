@@ -21,7 +21,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::SinkType;
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
-use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, Kdf, KdfControl};
+use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl};
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, EngineData, EvaluationHandler};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
@@ -101,7 +101,7 @@ impl SumRowsConsumer {
     }
 }
 
-impl Kdf for SumRowsConsumer {
+impl ConsumerKdf for SumRowsConsumer {
     fn kdf_id(&self) -> ConsumerKdfId {
         ConsumerKdfId::CheckpointHint
     }
@@ -109,9 +109,7 @@ impl Kdf for SumRowsConsumer {
     fn finish(self: Box<Self>) -> Box<dyn Any + Send> {
         Box::new(self.total)
     }
-}
 
-impl ConsumerKdf for SumRowsConsumer {
     fn apply(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
         let arrow = batch
             .any_ref()

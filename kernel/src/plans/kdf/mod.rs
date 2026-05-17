@@ -10,9 +10,8 @@
 //!   consumer drains the terminal row stream, accumulating its own finalized state for the
 //!   engine to harvest after the plan completes.
 //!
-//! `ConsumerKdf` extends a small supertrait [`traits::Kdf`] carrying
-//! `kdf_id()` and `finish()`. KDFs are dispatched in-process and never cross
-//! a serialization boundary (the sink is an opaque pointer to the engine).
+//! KDFs are dispatched in-process and never cross a serialization boundary
+//! (the sink is an opaque pointer to the engine).
 //!
 //! # Identity
 //!
@@ -28,14 +27,10 @@
 //!
 //! # Adding a KDF
 //!
-//! New file with four impl blocks (`Kdf`, `ConsumerKdf`, `KdfOutput`, `RowVisitor`), one
-//! line in the submodule mod.rs, one line re-exporting here. Row-ordering requirements
-//! live on the KDF trait itself — no separate factory.
+//! New file with three impl blocks (`ConsumerKdf`, `KdfOutput`, `RowVisitor`), one
+//! line in the submodule mod.rs, one line re-exporting here.
 //!
 //! [`ConsumeSink`]: crate::plans::ir::nodes::ConsumeSink
-
-#[macro_use]
-mod macros;
 
 pub mod handle;
 pub mod state;
@@ -48,5 +43,5 @@ pub use handle::{FinishedHandle, Handle};
 pub use state::consumer::{CheckpointHintReader, MetadataProtocolReader, SidecarCollector};
 pub use token::{ConsumerKdfId, KdfStateToken};
 pub use trace::TraceContext;
-pub use traits::{ConsumerKdf, Kdf, KdfControl};
-pub use typed::{downcast_all, take_single, Extractor, KdfOutput};
+pub use traits::{ConsumerKdf, KdfControl};
+pub use typed::{Extractor, KdfOutput};

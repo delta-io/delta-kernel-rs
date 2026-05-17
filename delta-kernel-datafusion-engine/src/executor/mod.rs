@@ -430,7 +430,10 @@ impl DataFusionExecutor {
         sink: &ConsumeSink,
         ctx: &CompileContext,
     ) -> Result<(), DataFusionError> {
-        let mut handle = sink.new_handle(TraceContext::new("datafusion-engine", "execute"));
+        let mut handle = sink.new_handle(TraceContext {
+            sm: "datafusion-engine".to_string(),
+            phase: "execute".to_string(),
+        });
         let mut stream = self.root_partition0_stream(physical)?;
         while let Some(batch) = stream.try_next().await? {
             let arrow = ArrowEngineData::new(batch);
@@ -444,7 +447,9 @@ impl DataFusionExecutor {
         }
         let finished = handle.finish();
         if let Some(state) = ctx.phase_state.as_ref() {
-            state.submit_kdf_handle(finished);
+            state
+                .submit_kdf_handle(finished)
+                .map_err(crate::error::wrap_delta_err)?;
         } else {
             // Consume sink called outside of an active phase has nowhere to land its handle.
             // Drop the handle and surface a clear error so the caller can wire phase state.

@@ -13,8 +13,10 @@
 //! ## Lifecycle
 //!
 //! 1. Executor calls [`PhaseState::empty`] at the start of a phase.
-//! 2. Per-partition KDF iterators call [`Handle::finish`](crate::plans::kdf::Handle::finish) and
-//!    push the result into [`PhaseState::submit_kdf_handle`].
+//! 2. The drained KDF iterator calls [`Handle::finish`](crate::plans::kdf::Handle::finish)
+//!    and pushes the result into [`PhaseState::submit_kdf_handle`]. Each consume sink is
+//!    single-partition by construction, so exactly one submission per token is expected;
+//!    duplicates are an invariant violation.
 //! 3. Schema-query phases push the parsed footer schema into [`PhaseState::submit_schema`].
 //! 4. The driver hands the populated `PhaseState` back to the SM through `advance`.
 //! 5. Typed extractors built on top of `consume()` pull payloads via [`PhaseState::take_by_token`];
@@ -39,21 +41,21 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::delta_error;
+use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::plans::kdf::{FinishedHandle, KdfStateToken};
 use crate::schema::SchemaRef;
 
 /// Internal storage. All public methods take the outer [`Mutex`] briefly.
 #[derive(Debug, Default)]
 struct PhaseStateInner {
-    kdf_entries: HashMap<KdfStateToken, Vec<FinishedHandle>>,
+    kdf_entries: HashMap<KdfStateToken, Box<dyn Any + Send>>,
     schema: Option<SchemaRef>,
 }
 
 /// Thread-safe success-payload accumulator for one phase execution.
 ///
 /// Cheap to [`Clone`] -- inner state is shared through an `Arc<Mutex<_>>`.
-/// Cloning is expected: the executor clones the container into each KDF
-/// iterator's worker so partition finalization can happen concurrently.
 #[derive(Clone, Debug, Default)]
 pub struct PhaseState {
     inner: Arc<Mutex<PhaseStateInner>>,
@@ -65,15 +67,20 @@ impl PhaseState {
         Self::default()
     }
 
-    /// Submit a finalized consumer state. Thread-safe; callers typically hold a
-    /// cloned `PhaseState` inside their iterator.
-    pub fn submit_kdf_handle(&self, handle: FinishedHandle) {
+    /// Submit a finalized consumer state. Returns an error if a state has
+    /// already been submitted under the same [`KdfStateToken`] — each
+    /// consume sink is single-partition by construction, so a duplicate
+    /// submission indicates a routing bug or a re-fired handle.
+    pub fn submit_kdf_handle(&self, handle: FinishedHandle) -> Result<(), DeltaError> {
         let mut inner = self.lock();
-        inner
-            .kdf_entries
-            .entry(handle.token.clone())
-            .or_default()
-            .push(handle);
+        let token = handle.token;
+        if inner.kdf_entries.insert(token.clone(), handle.erased).is_some() {
+            return Err(delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "submit_kdf_handle: token `{token}` already submitted",
+            ));
+        }
+        Ok(())
     }
 
     /// Submit a schema-query result. Overwrites any prior schema (one
@@ -82,17 +89,10 @@ impl PhaseState {
         self.lock().schema = Some(schema);
     }
 
-    /// Remove and return all erased payloads for `token`.
-    ///
-    /// Returns an empty `Vec` if the token was never submitted to. The
-    /// typed extractor feeds this directly into
-    /// [`downcast_all`](crate::plans::kdf::downcast_all).
-    pub fn take_by_token(&self, token: &KdfStateToken) -> Vec<Box<dyn Any + Send>> {
-        self.lock()
-            .kdf_entries
-            .remove(token)
-            .map(|handles| handles.into_iter().map(|h| h.erased).collect())
-            .unwrap_or_default()
+    /// Remove and return the erased payload for `token`, if one was
+    /// submitted.
+    pub fn take_by_token(&self, token: &KdfStateToken) -> Option<Box<dyn Any + Send>> {
+        self.lock().kdf_entries.remove(token)
     }
 
     /// Remove and return the schema produced by a schema-query phase, if any.
@@ -116,7 +116,10 @@ mod tests {
     fn finished_handle(token: &KdfStateToken, payload: i64) -> FinishedHandle {
         FinishedHandle {
             token: token.clone(),
-            ctx: TraceContext::new("test", "phase"),
+            ctx: TraceContext {
+                sm: "test".to_string(),
+                phase: "phase".to_string(),
+            },
             erased: Box::new(payload),
         }
     }
@@ -125,33 +128,39 @@ mod tests {
     fn empty_accumulator_yields_no_payloads_for_any_token() {
         let s = PhaseState::empty();
         let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        assert!(s.take_by_token(&t).is_empty());
+        assert!(s.take_by_token(&t).is_none());
         assert!(s.take_schema().is_none());
     }
 
     #[test]
-    fn submit_and_take_kdf_roundtrips_payloads() {
+    fn submit_and_take_kdf_roundtrips_payload() {
         let s = PhaseState::empty();
         let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
 
-        s.submit_kdf_handle(finished_handle(&t, 10));
-        s.submit_kdf_handle(finished_handle(&t, 20));
+        s.submit_kdf_handle(finished_handle(&t, 42)).unwrap();
 
-        let payloads = s.take_by_token(&t);
-        assert_eq!(payloads.len(), 2);
-        let v0 = *payloads[0].downcast_ref::<i64>().unwrap();
-        let v1 = *payloads[1].downcast_ref::<i64>().unwrap();
-        assert_eq!(v0 + v1, 30);
+        let payload = s.take_by_token(&t).expect("payload present");
+        let v = *payload.downcast_ref::<i64>().unwrap();
+        assert_eq!(v, 42);
 
         // Second take drains -- nothing left under that token.
-        assert!(s.take_by_token(&t).is_empty());
+        assert!(s.take_by_token(&t).is_none());
     }
 
     #[test]
-    fn take_by_unknown_token_returns_empty() {
+    fn duplicate_submit_under_same_token_errors() {
         let s = PhaseState::empty();
         let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        assert!(s.take_by_token(&t).is_empty());
+        s.submit_kdf_handle(finished_handle(&t, 10)).unwrap();
+        let err = s.submit_kdf_handle(finished_handle(&t, 20)).unwrap_err();
+        assert!(format!("{err}").contains("already submitted"));
+    }
+
+    #[test]
+    fn take_by_unknown_token_returns_none() {
+        let s = PhaseState::empty();
+        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
+        assert!(s.take_by_token(&t).is_none());
     }
 
     #[test]
@@ -172,12 +181,12 @@ mod tests {
         let b = a.clone();
         let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
 
-        a.submit_kdf_handle(finished_handle(&t, 99));
+        a.submit_kdf_handle(finished_handle(&t, 99)).unwrap();
 
-        let via_b = b.take_by_token(&t);
-        assert_eq!(via_b.len(), 1);
+        let via_b = b.take_by_token(&t).expect("payload visible through clone");
+        assert_eq!(*via_b.downcast_ref::<i64>().unwrap(), 99);
         assert!(
-            a.take_by_token(&t).is_empty(),
+            a.take_by_token(&t).is_none(),
             "take through clone drained the shared state"
         );
     }
@@ -186,16 +195,16 @@ mod tests {
     fn schema_and_kdf_payloads_coexist() {
         let s = PhaseState::empty();
         let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        s.submit_kdf_handle(finished_handle(&t, 1));
+        s.submit_kdf_handle(finished_handle(&t, 1)).unwrap();
         let schema: SchemaRef = Arc::new(StructType::new_unchecked(Vec::<
             crate::schema::StructField,
         >::new()));
         s.submit_schema(schema.clone());
 
         assert!(s.take_schema().is_some());
-        assert_eq!(s.take_by_token(&t).len(), 1);
+        assert!(s.take_by_token(&t).is_some());
         // Both were drained by the takes above.
-        assert!(s.take_by_token(&t).is_empty());
+        assert!(s.take_by_token(&t).is_none());
         assert!(s.take_schema().is_none());
     }
 }

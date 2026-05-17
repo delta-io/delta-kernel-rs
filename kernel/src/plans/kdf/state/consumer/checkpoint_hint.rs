@@ -10,9 +10,7 @@ use std::sync::LazyLock;
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::plans::errors::DeltaError;
-use crate::plans::kdf::{
-    take_single, ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput, KdfStateToken,
-};
+use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput};
 use crate::plans::record_schemas::CheckpointHintRecord;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
 use crate::{DeltaResult, EngineData};
@@ -31,31 +29,33 @@ impl CheckpointHintReader {
     }
 }
 
-impl_kdf!(CheckpointHintReader, ConsumerKdfId::CheckpointHint);
-
 impl ConsumerKdf for CheckpointHintReader {
+    fn kdf_id(&self) -> ConsumerKdfId {
+        ConsumerKdfId::CheckpointHint
+    }
+
+    fn finish(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        Box::new(*self)
+    }
+
     fn apply(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
         if self.processed {
             return Ok(KdfControl::Break);
         }
         self.visit_rows_of(batch)?;
-        Ok(if self.processed {
-            KdfControl::Break
+        if self.processed {
+            Ok(KdfControl::Break)
         } else {
-            KdfControl::Continue
-        })
+            Ok(KdfControl::Continue)
+        }
     }
 }
 
 impl KdfOutput for CheckpointHintReader {
     type Output = Option<CheckpointHintRecord>;
 
-    fn into_output(parts: Vec<Self>) -> Result<Self::Output, DeltaError> {
-        // Global consumer: the executor produces exactly one partition.
-        // Empty `parts` happens only on internal misuse — bubble up.
-        let token = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        let mut single = take_single(parts, &token)?;
-        Ok(single.record.take())
+    fn into_output(mut self) -> Result<Self::Output, DeltaError> {
+        Ok(self.record.take())
     }
 }
 
@@ -95,8 +95,8 @@ mod tests {
 
     #[test]
     fn empty_partition_produces_none() {
-        let parts = vec![CheckpointHintReader::default()];
-        let out = CheckpointHintReader::into_output(parts).unwrap();
+        let reader = CheckpointHintReader::default();
+        let out = reader.into_output().unwrap();
         assert!(out.is_none());
     }
 
@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(reader.apply(&engine_data).unwrap(), KdfControl::Break);
         assert_eq!(reader.apply(&engine_data).unwrap(), KdfControl::Break);
 
-        let out = CheckpointHintReader::into_output(vec![reader]).unwrap();
+        let out = reader.into_output().unwrap();
         let rec = out.expect("record");
         assert_eq!(rec.version, 42);
         assert_eq!(rec.num_of_add_files, Some(7));
