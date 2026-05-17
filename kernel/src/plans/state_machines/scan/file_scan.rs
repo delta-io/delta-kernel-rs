@@ -465,6 +465,14 @@ pub(super) fn scan_data_projection(
                     field.physical_name(column_mapping_mode),
                 ]),
                 None => {
+                    // Emit a single `col([physical_root])` reference for the top-level field
+                    // regardless of nesting depth. For struct columns this preserves the source
+                    // struct's null bitmap (so an entirely-NULL struct stays NULL instead of
+                    // expanding into `{name: NULL, score: NULL}`). The physical-to-logical name
+                    // rename and per-field metadata application happen at relation registration
+                    // time via `arrow_columns_align_to_schema`, which rebuilds nested
+                    // struct/list/map arrays against the relation's declared logical schema
+                    // positionally.
                     let physical_field = physical_fields.next().ok_or_else(|| {
                         delta_error!(
                             DeltaErrorCode::DeltaCommandInvariantViolation,
@@ -550,6 +558,96 @@ mod tests {
             debug.contains("stats_parsed"),
             "metadata replay should project stats_parsed for predicate filtering:\n{debug}"
         );
+    }
+
+    /// Helper: build a logical schema from `fields`, then derive the physical schema via
+    /// `make_physical(Name)`. Returns `(logical, physical)`.
+    fn schemas_with_cm_name(
+        fields: Vec<StructField>,
+    ) -> (SchemaRef, SchemaRef) {
+        use crate::table_features::ColumnMappingMode;
+        let logical = Arc::new(StructType::try_new(fields).unwrap());
+        let physical = Arc::new(
+            logical
+                .make_physical(ColumnMappingMode::Name)
+                .unwrap(),
+        );
+        (logical, physical)
+    }
+
+    /// Helper: build a `StructField` annotated with the given physical name + a fresh column ID
+    /// suitable for `make_physical(Name)`.
+    fn annotated_field(
+        logical_name: &str,
+        physical_name: &str,
+        column_id: i64,
+        data_type: DataType,
+        nullable: bool,
+    ) -> StructField {
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+        StructField::new(logical_name, data_type, nullable)
+            .with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String(physical_name.to_string()),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(column_id),
+                ),
+            ])
+    }
+
+    /// Verifies that `scan_data_projection` always emits a single top-level `col([physical_root])`
+    /// reference for non-metadata, non-partition columns — independent of nesting depth or
+    /// container shape (primitive / struct / list / map). The physical-to-logical rename and
+    /// per-field metadata are applied at relation-registration time
+    /// (`arrow_columns_align_to_schema`), not in the kernel projection. Emitting the struct via
+    /// `Expression::Struct` instead would lose the source struct's null bitmap.
+    #[rstest]
+    #[case::primitive(DataType::LONG)]
+    #[case::nested_struct(DataType::Struct(Box::new(StructType::try_new(vec![
+        annotated_field("inner1", "phys-inner1", 91, DataType::STRING, true),
+        annotated_field("inner2", "phys-inner2", 92, DataType::INTEGER, true),
+    ]).unwrap())))]
+    #[case::deeply_nested_struct(DataType::Struct(Box::new(StructType::try_new(vec![
+        annotated_field("mid", "phys-mid", 93, DataType::Struct(Box::new(
+            StructType::try_new(vec![annotated_field(
+                "leaf", "phys-leaf", 94, DataType::LONG, true,
+            )]).unwrap()
+        )), true),
+    ]).unwrap())))]
+    #[case::list_of_struct(DataType::Array(Box::new(crate::schema::ArrayType::new(
+        DataType::Struct(Box::new(StructType::try_new(vec![annotated_field(
+            "x", "phys-x", 95, DataType::INTEGER, true,
+        )]).unwrap())),
+        true,
+    ))))]
+    #[case::map_of_struct(DataType::Map(Box::new(crate::schema::MapType::new(
+        DataType::STRING,
+        DataType::Struct(Box::new(StructType::try_new(vec![annotated_field(
+            "v", "phys-v", 96, DataType::STRING, true,
+        )]).unwrap())),
+        true,
+    ))))]
+    fn scan_data_projection_emits_physical_root_col_ref(#[case] data_type: DataType) {
+        use crate::table_features::ColumnMappingMode;
+        let (logical, physical) = schemas_with_cm_name(vec![annotated_field(
+            "field",
+            "col-phys",
+            1,
+            data_type,
+            true,
+        )]);
+        let exprs = scan_data_projection(
+            &logical,
+            &physical,
+            &HashSet::new(),
+            ColumnMappingMode::Name,
+        )
+        .unwrap();
+        assert_eq!(exprs.len(), 1);
+        assert_eq!(exprs[0].as_ref(), &col(["col-phys"]));
     }
 
     #[test]

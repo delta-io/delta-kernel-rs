@@ -348,6 +348,13 @@ pub(super) fn compile_project_node(
         .map(|(kernel_expr, (field, output_arrow_field))| {
             let base_logical =
                 crate::compile::translate_projection_expr(kernel_expr.as_ref(), field)?;
+            // Struct-shaped expressions whose target is also a struct are passed through
+            // without a logical-plan cast: the cast would surface nullability mismatches
+            // between kernel-built fields (always nullable) and the target schema's per-field
+            // nullability declarations, which DataFusion's `validate_struct_compatibility`
+            // rejects. Per-field metadata (e.g., column-mapping annotations) is applied at
+            // relation-registration time via `arrow_columns_align_to_schema`, which rebuilds
+            // nested struct/list/map arrays against the relation's declared schema positionally.
             let logical = if matches!(
                 (kernel_expr.as_ref(), field.data_type()),
                 (

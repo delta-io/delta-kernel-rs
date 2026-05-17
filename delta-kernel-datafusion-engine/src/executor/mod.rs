@@ -405,9 +405,20 @@ impl DataFusionExecutor {
             })?);
         if let Some(first) = batches.first() {
             if first.schema() != schema {
+                // The relation's declared schema may differ from the batch's runtime schema in
+                // ways that `RecordBatch::try_new` rejects (e.g., per-field metadata, nested
+                // struct/list/map field nullability). Recursively rebuild each column against
+                // the target schema, replacing field declarations without rewriting data.
                 batches = batches
                     .into_iter()
-                    .map(|batch| RecordBatch::try_new(schema.clone(), batch.columns().to_vec()))
+                    .map(|batch| {
+                        crate::executor::load::arrow_columns_align_to_schema(batch, schema.clone())
+                            .map_err(|e| {
+                                delta_kernel::arrow::error::ArrowError::SchemaError(format!(
+                                    "register_relation_into_session align: {e}"
+                                ))
+                            })
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
             }
         }

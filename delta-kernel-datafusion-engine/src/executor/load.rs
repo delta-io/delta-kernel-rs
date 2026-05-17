@@ -446,7 +446,7 @@ pub(crate) fn materialize_upstream_batch(
     Ok(merged)
 }
 
-fn arrow_columns_align_to_schema(
+pub(crate) fn arrow_columns_align_to_schema(
     batch: RecordBatch,
     wanted: delta_kernel::arrow::datatypes::SchemaRef,
 ) -> Result<RecordBatch, DataFusionError> {
