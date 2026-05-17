@@ -16,7 +16,8 @@ use std::sync::Arc;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::provider_as_source;
 use datafusion_common::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
+    Schema as ArrowSchema,
 };
 use datafusion_common::error::DataFusionError;
 use datafusion_expr::logical_plan::LogicalPlan;
@@ -25,6 +26,57 @@ use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::plans::ir::nodes::FileListingNode;
 
 use crate::exec::{FileListingExec, NullabilityValidationExec};
+
+/// Merge `source` and `strict` schemas: each output field takes its NAME, METADATA, and inner
+/// child structure from `source` (so PARQUET:field_id and other source-side metadata that
+/// downstream operators rely on survive the wrapper), but its NULLABILITY flag from `strict`
+/// (so the kernel-declared NOT NULL contract is what we promise downstream).
+///
+/// The schemas must have matching field counts at every level; if a struct's child counts differ,
+/// we fall back to `source`'s structure for that subtree.
+pub(super) fn merge_target_nullability(
+    source: &ArrowSchema,
+    strict: &ArrowSchema,
+) -> ArrowSchema {
+    let fields: Vec<Arc<ArrowField>> = if source.fields().len() == strict.fields().len() {
+        source
+            .fields()
+            .iter()
+            .zip(strict.fields().iter())
+            .map(|(s, t)| Arc::new(merge_field(s.as_ref(), t.as_ref())))
+            .collect()
+    } else {
+        source.fields().iter().cloned().collect()
+    };
+    ArrowSchema::new_with_metadata(fields, source.metadata().clone())
+}
+
+fn merge_field(source: &ArrowField, strict: &ArrowField) -> ArrowField {
+    let data_type = merge_data_type(source.data_type(), strict.data_type());
+    ArrowField::new(source.name(), data_type, strict.is_nullable())
+        .with_metadata(source.metadata().clone())
+}
+
+fn merge_data_type(source: &ArrowDataType, strict: &ArrowDataType) -> ArrowDataType {
+    use ArrowDataType::*;
+    match (source, strict) {
+        (Struct(src_fields), Struct(tgt_fields)) if src_fields.len() == tgt_fields.len() => {
+            let merged: ArrowFields = src_fields
+                .iter()
+                .zip(tgt_fields.iter())
+                .map(|(s, t)| Arc::new(merge_field(s.as_ref(), t.as_ref())))
+                .collect();
+            Struct(merged)
+        }
+        (List(s), List(t)) => List(Arc::new(merge_field(s, t))),
+        (LargeList(s), LargeList(t)) => LargeList(Arc::new(merge_field(s, t))),
+        (FixedSizeList(s, n), FixedSizeList(t, _)) => {
+            FixedSizeList(Arc::new(merge_field(s, t)), *n)
+        }
+        (Map(s, sorted), Map(t, _)) => Map(Arc::new(merge_field(s, t)), *sorted),
+        _ => source.clone(),
+    }
+}
 
 /// Walk `field` recursively and emit `(parent_path, child_name)` pairs for every NOT NULL
 /// child sitting inside a nullable parent struct -- the case neither DataFusion's
@@ -75,16 +127,13 @@ pub(super) fn nested_non_null_validations(schema: &ArrowSchema) -> Vec<(String, 
 pub(super) struct NullabilityEnforcingTableProvider {
     inner: Arc<dyn TableProvider>,
     strict_schema: Arc<ArrowSchema>,
-    nested_validations: Vec<(String, String)>,
 }
 
 impl NullabilityEnforcingTableProvider {
     pub(super) fn new(inner: Arc<dyn TableProvider>, strict_schema: Arc<ArrowSchema>) -> Self {
-        let nested_validations = nested_non_null_validations(strict_schema.as_ref());
         Self {
             inner,
             strict_schema,
-            nested_validations,
         }
     }
 }
@@ -92,7 +141,7 @@ impl NullabilityEnforcingTableProvider {
 impl std::fmt::Debug for NullabilityEnforcingTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NullabilityEnforcingTableProvider")
-            .field("nested_validations", &self.nested_validations.len())
+            .field("strict_root_fields", &self.strict_schema.fields().len())
             .finish_non_exhaustive()
     }
 }
@@ -116,34 +165,40 @@ impl TableProvider for NullabilityEnforcingTableProvider {
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let inner = self.inner.scan(state, projection, filters, limit).await?;
-        // Schema we promise to deliver after wrapping: strict schema, then projection.
-        // NullabilityValidationExec zips this against the inner batches positionally and casts
-        // each column to the matching field, so the column count and order must match the
-        // inner plan's output.
-        let projected_schema: Arc<ArrowSchema> = match projection {
+        // We compute the effective target schema from `inner.schema()` (preserving source-side
+        // names + metadata like PARQUET:field_id that downstream operators rely on) merged with
+        // the projected strict schema (taking only its nullability flags). The wrapper then
+        // promises this merged schema and re-asserts only the nullability contract; we never
+        // overwrite source field names or metadata while validating.
+        let projected_strict: Arc<ArrowSchema> = match projection {
             Some(p) => Arc::new(self.strict_schema.project(p)?),
             None => Arc::clone(&self.strict_schema),
         };
-        // Drop validations whose top-level root was projected out -- they reference columns
-        // that don't exist in `projected_schema` and would fail by-name lookup at runtime.
-        let kept_roots: HashSet<&str> = projected_schema
+        let inner_schema = inner.schema();
+        let merged_target = Arc::new(merge_target_nullability(
+            inner_schema.as_ref(),
+            projected_strict.as_ref(),
+        ));
+        // Derive validations against the merged schema so paths resolve against source-side
+        // names (e.g. physical names on nested column-mapping struct fields).
+        let validations = nested_non_null_validations(merged_target.as_ref());
+        // Defensive: drop validations whose top-level root was projected out.
+        let kept_roots: HashSet<&str> = merged_target
             .fields()
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        let validations: Vec<(String, String)> = self
-            .nested_validations
-            .iter()
+        let validations: Vec<(String, String)> = validations
+            .into_iter()
             .filter(|(parent_path, _)| {
                 let root = parent_path.split('.').next().unwrap_or(parent_path);
                 kept_roots.contains(root)
             })
-            .cloned()
             .collect();
         Ok(Arc::new(NullabilityValidationExec::new(
             inner,
             validations,
-            projected_schema,
+            merged_target,
         )))
     }
     fn supports_filters_pushdown(

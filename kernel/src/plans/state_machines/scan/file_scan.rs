@@ -19,9 +19,7 @@ use super::checkpoint_shape::{
 };
 use super::dedup::ADD_PATH;
 use super::plans::build_fsr_plans;
-use super::schemas::{
-    action_output_schema, action_schema_with_augmented_add,
-};
+use super::schemas::{action_schema, action_schema_with_augmented_add};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     Add, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
@@ -34,7 +32,7 @@ use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{
     DvRef, FileType, RelationHandle, ScanFileColumns, SinkType,
 };
-use crate::plans::ir::{identity_project_struct, Plan, RelationRegistry, ResultPlan};
+use crate::plans::ir::{Plan, PlanBuilder, RelationRegistry, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
@@ -72,7 +70,6 @@ impl Scan {
         live_actions_relation: RelationHandle,
     ) -> Result<ResultPlan, DeltaError> {
         let mut registry = RelationRegistry::new();
-        registry.register_existing(live_actions_relation)?;
         let snapshot = self.snapshot();
         let partition_columns = replay_partition_columns(self);
         let _file_schema = scan_data_file_schema(self.physical_schema(), self.logical_schema())?;
@@ -84,8 +81,7 @@ impl Scan {
             snapshot.table_configuration().column_mapping_mode(),
         )?;
         // === data load: per-file parquet read keyed by the live-actions relation ===
-        let load_plan = registry
-            .relation_ref(FSR_SCAN_LIVE_ACTIONS)?
+        let load_plan = PlanBuilder::from_relation_handle(live_actions_relation)
             .load(
                 FSR_SCAN_DATA_ROWS_RAW,
                 self.physical_schema().clone(),
@@ -223,12 +219,10 @@ fn scan_metadata_plans_with_shape(
         scan_partition_values_physical_schema(snapshot.as_ref(), scan.logical_schema())?;
 
     // === FSR plans: build the FSR result plan, then layer the actions chain on top ===
-    // `build_fsr_plans` publishes its terminal relation with the all-nullable
-    // `action_read_schema()`. The downstream actions chain references nested fields by name and
-    // expects the strict `action_output_schema()` contract, so the FSR terminal plan is rebound
-    // to a fresh `scan.fsr_results` handle that publishes the strict schema. The chain's actual
-    // row data is still all-nullable; the strict handle is purely a name-binding for downstream
-    // projection consumers.
+    // The terminal FSR plan is rebound under `scan.fsr_results` in this layer's registry so the
+    // downstream actions chain can `relation_ref` it. The rebind reuses the strict
+    // `action_schema()` -- the same contract `build_fsr_plans` publishes -- since the engine
+    // realigns the relaxed JSON/Parquet output to that schema at the scan boundary.
     let mut registry = RelationRegistry::new();
     let mut plans: Vec<Plan> = Vec::new();
     let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
@@ -251,33 +245,27 @@ fn scan_metadata_plans_with_shape(
             "fsr::scan::scan_metadata: terminal FSR plan missing from plan vector",
         )
     })?;
-    let fsr_results_relation = RelationHandle::fresh("scan.fsr_results", action_output_schema());
-    plans.push(crate::plans::ir::Plan::new(
-        terminal_plan.root,
-        SinkType::Relation(fsr_results_relation.clone()),
-    ));
-    registry.register_existing(fsr_results_relation.clone())?;
+    let fsr_results_handle =
+        registry.register_relation_sink("scan.fsr_results", action_schema())?;
+    let terminal_rebound_plan = Plan::new(terminal_plan.root, SinkType::Relation(fsr_results_handle));
+    plans.push(terminal_rebound_plan);
 
     // === actions chain: filter live add paths, optionally augmenting with parsed stats /
     // partitionValues columns when a data-skipping predicate is in play ===
     let actions_root = registry.relation_ref("scan.fsr_results")?;
     let live_actions_node = match scan.build_actions_meta_predicate() {
         Some(predicate) => {
-            let projected =
-                if predicate_stats_schema.is_some() || predicate_partition_schema.is_some() {
-                    actions_root.project(
-                        scan_actions_with_parsed_projection(
-                            predicate_stats_schema.as_ref(),
-                            predicate_partition_schema.as_ref(),
-                        ),
-                        action_schema_with_augmented_add(
-                            predicate_stats_schema.as_ref(),
-                            predicate_partition_schema.as_ref(),
-                        ),
-                    )
-                } else {
-                    actions_root
-                };
+            let needs_augmented_add =
+                predicate_stats_schema.is_some() || predicate_partition_schema.is_some();
+            let projected = if needs_augmented_add {
+                let (projection, schema) = scan_actions_with_parsed_projection_and_schema(
+                    predicate_stats_schema.as_ref(),
+                    predicate_partition_schema.as_ref(),
+                )?;
+                actions_root.project(projection, schema)
+            } else {
+                actions_root
+            };
             // Data-skipping predicates are best-effort: keep rows when the predicate evaluates to
             // NULL (unknown) to avoid over-pruning files with partial stats coverage.
             let add_path_present = Expression::Column(ADD_PATH.into_column_name()).is_not_null();
@@ -395,7 +383,10 @@ pub(super) fn scan_actions_with_parsed_projection(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
 ) -> Vec<Arc<Expression>> {
-    let mut add_exprs = identity_project_struct("add", &Add::to_schema());
+    let mut add_exprs: Vec<Arc<Expression>> = Add::to_schema()
+        .fields()
+        .map(|f| col(["add", f.name().as_str()]).into())
+        .collect();
     if let Some(schema) = stats_parsed_schema {
         add_exprs.push(Expression::parse_json(col(["add", "stats"]), schema.clone()).into());
     }
@@ -410,6 +401,16 @@ pub(super) fn scan_actions_with_parsed_projection(
         col([DOMAIN_METADATA_NAME]).into(),
         col([SET_TRANSACTION_NAME]).into(),
     ]
+}
+
+fn scan_actions_with_parsed_projection_and_schema(
+    stats_parsed_schema: Option<&SchemaRef>,
+    partition_values_parsed_schema: Option<&SchemaRef>,
+) -> Result<(Vec<Arc<Expression>>, SchemaRef), DeltaError> {
+    Ok((
+        scan_actions_with_parsed_projection(stats_parsed_schema, partition_values_parsed_schema),
+        action_schema_with_augmented_add(stats_parsed_schema, partition_values_parsed_schema),
+    ))
 }
 
 pub(super) fn scan_data_file_schema(
@@ -483,79 +484,48 @@ pub(super) fn scan_data_projection(
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::expressions::Scalar;
     use crate::plans::ir::nodes::SinkType;
     use crate::scan::ScanBuilder;
-    use crate::snapshot::Snapshot;
     use crate::utils::test_utils::load_test_table;
 
-    #[derive(Clone, Copy, Debug)]
-    struct ReplayCoverageConfig {
-        table: &'static str,
-        with_predicate: bool,
-    }
-
-    fn replay_coverage_configs() -> [ReplayCoverageConfig; 4] {
-        [
-            ReplayCoverageConfig {
-                table: "app-txn-no-checkpoint",
-                with_predicate: false,
-            },
-            ReplayCoverageConfig {
-                table: "app-txn-checkpoint",
-                with_predicate: false,
-            },
-            ReplayCoverageConfig {
-                table: "v2-checkpoints-parquet-without-sidecars",
-                with_predicate: true,
-            },
-            ReplayCoverageConfig {
-                table: "v2-checkpoints-parquet-with-sidecars",
-                with_predicate: true,
-            },
-        ]
-    }
-
-    fn build_scan_for_config(
-        snapshot: Arc<Snapshot>,
-        cfg: ReplayCoverageConfig,
-    ) -> Result<Scan, DeltaError> {
-        let mut builder = ScanBuilder::new(snapshot).with_stats();
-        if cfg.with_predicate {
+    #[rstest]
+    #[case::app_txn_no_checkpoint("app-txn-no-checkpoint", false)]
+    #[case::app_txn_checkpoint("app-txn-checkpoint", false)]
+    #[case::v2_without_sidecars("v2-checkpoints-parquet-without-sidecars", true)]
+    #[case::v2_with_sidecars("v2-checkpoints-parquet-with-sidecars", true)]
+    fn scan_builder_with_stats_supports_metadata_data_and_combined_modes(
+        #[case] table: &str,
+        #[case] with_predicate: bool,
+    ) {
+        let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
+        let mut builder = ScanBuilder::new(Arc::clone(&snapshot)).with_stats();
+        if with_predicate {
             builder = builder.with_predicate(Arc::new(Expression::column(["id"]).is_not_null()));
         }
-        builder.build_replay()
-    }
-
-    #[test]
-    fn scan_builder_with_stats_supports_metadata_data_and_combined_modes_across_configs() {
-        for cfg in replay_coverage_configs() {
-            let (_engine, snapshot, _tmp) = load_test_table(cfg.table).unwrap();
-            let scan = build_scan_for_config(Arc::clone(&snapshot), cfg).unwrap();
-            let metadata = scan.scan_metadata_plans().unwrap();
-            assert!(
-                !metadata.plans.is_empty(),
-                "metadata plans must be non-empty for {}",
-                cfg.table
-            );
-            let data = scan
-                .scan_data_from_metadata_plans(metadata.result_relation.clone())
-                .unwrap();
-            assert_eq!(
-                data.plans.len(),
-                2,
-                "data phase should remain two plans for {}",
-                cfg.table
-            );
-            let combined = scan.scan_plans().unwrap();
-            assert_eq!(
-                combined.plans.len(),
-                metadata.plans.len() + data.plans.len(),
-                "combined replay should equal metadata + data for {}",
-                cfg.table
-            );
-        }
+        let scan = builder.build_replay().unwrap();
+        let metadata = scan.scan_metadata_plans().unwrap();
+        assert!(
+            !metadata.plans.is_empty(),
+            "metadata plans must be non-empty for {table}"
+        );
+        let data = scan
+            .scan_data_from_metadata_plans(metadata.result_relation.clone())
+            .unwrap();
+        assert_eq!(
+            data.plans.len(),
+            2,
+            "data phase should remain two plans for {table}"
+        );
+        let combined = scan.scan_plans().unwrap();
+        assert_eq!(
+            combined.plans.len(),
+            metadata.plans.len() + data.plans.len(),
+            "combined replay should equal metadata + data for {table}"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ impl RelationRegistry {
                 "relation_ref: unknown relation `{name}`",
             )
         })?;
-        Ok(PlanBuilder::from_registered_relation(handle))
+        Ok(PlanBuilder::from_relation_handle(handle))
     }
 
     /// Remove a relation name from lookup.
@@ -43,22 +43,6 @@ impl RelationRegistry {
                 "drop_relation: unknown relation `{name}`",
             ))
         }
-    }
-
-    /// Register an already-minted handle under its diagnostic name.
-    ///
-    /// Useful when relation handles are produced by a previous build stage and
-    /// reused in the current coroutine step.
-    pub fn register_existing(&mut self, handle: RelationHandle) -> Result<(), DeltaError> {
-        let name = handle.name.clone();
-        if self.by_name.contains_key(&name) {
-            return Err(crate::delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "relation `{name}` is already registered",
-            ));
-        }
-        self.by_name.insert(name, handle);
-        Ok(())
     }
 
     pub(crate) fn register_relation_sink(

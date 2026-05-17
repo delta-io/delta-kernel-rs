@@ -16,7 +16,7 @@ use url::Url;
 use super::checkpoint_shape::{checkpoint_manifest_scan_schema, CheckpointShape};
 use super::dedup::{fsr_dedup_key, fsr_row_has_identity_predicate, FSR_JOIN_KEY_COL};
 use super::retention::retention_filter;
-use super::schemas::{action_read_schema, augmented_action_schema, path_size_schema};
+use super::schemas::{action_schema, augmented_action_schema, path_size_schema};
 use crate::action_reconciliation::{
     calculate_transaction_expiration_timestamp, deleted_file_retention_timestamp_with_time,
 };
@@ -35,21 +35,21 @@ use crate::utils::current_time_duration;
 use crate::{delta_error, FileMeta, Version};
 
 /// Raw per-commit action stream materialized via a Load sink so the downstream
-/// dedup chain can window over it. Schema = `action_read_schema` plus a
+/// dedup chain can window over it. Schema = `action_schema` plus a
 /// passthrough `version` column.
 pub const FSR_COMMIT_RAW: &str = "fsr.commit_raw";
 /// Commit winners: the single newest action per `__fsr_join_k` partition
-/// produced by the dedup chain. Schema = `action_read_schema` plus
+/// produced by the dedup chain. Schema = `action_schema` plus
 /// `FSR_JOIN_KEY_COL`.
 pub const FSR_COMMIT_DEDUP: &str = "fsr.commit_dedup";
 /// Top-level checkpoint rows scanned once and reused by sidecar extraction +
 /// checkpoint survivor replay via relation references.
 pub const FSR_CHECKPOINT_TOP: &str = "fsr.checkpoint_top";
 /// Sidecar action stream materialized for V2-multipart checkpoints; absent for
-/// V1 / V2-inline checkpoints. Schema = `action_read_schema`.
+/// V1 / V2-inline checkpoints. Schema = `action_schema`.
 pub const FSR_SIDECAR_ACTIONS: &str = "fsr.sidecar_actions";
 /// Terminal FSR relation: reconstructed live-action rows projected to
-/// `action_output_schema`. The result-plan caller reads this relation after
+/// `action_schema`. The result-plan caller reads this relation after
 /// executing every plan returned by [`build_fsr_plans`].
 pub const FSR_RESULTS: &str = "fsr.results";
 
@@ -113,7 +113,7 @@ pub fn build_fsr_plans(
         .map_err(|e| e.into_delta_default())?;
     let commit_raw_plan = commit_values.load(
         FSR_COMMIT_RAW,
-        action_read_schema(),
+        action_schema(),
         FileType::Json,
         Some(log_root.clone()),
         vec![ColumnName::new(["version"])],
@@ -137,11 +137,11 @@ pub fn build_fsr_plans(
         .relation_ref(FSR_COMMIT_RAW)?
         .filter(Arc::new(fsr_row_has_identity_predicate().into()))
         .project(
-            action_read_schema()
+            action_schema()
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
-                .chain(std::iter::once(col("version").into()))
                 .chain(std::iter::once(Arc::new(fsr_dedup_key())))
+                .chain(std::iter::once(col("version").into()))
                 .collect(),
             augmented_action_schema(true)?,
         )
@@ -159,7 +159,7 @@ pub fn build_fsr_plans(
                 .into(),
         ))
         .project(
-            action_read_schema()
+            action_schema()
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
                 .chain(std::iter::once(col(FSR_JOIN_KEY_COL).into()))
@@ -218,7 +218,7 @@ pub fn build_fsr_plans(
             );
         let sidecar_plan = sidecar_scan.load(
             FSR_SIDECAR_ACTIONS,
-            action_read_schema(),
+            action_schema(),
             FileType::Parquet,
             Some(sidecar_base),
             vec![],
@@ -241,10 +241,10 @@ pub fn build_fsr_plans(
         txn_expiry,
     )?;
     // The terminal plan is built by `build_results_plan` with an explicit
-    // `FSR_RESULTS` Relation sink so that branches publishing different inner
-    // schemas (no-checkpoint `action_read_schema` vs. with-checkpoint
-    // `action_output_schema`) still expose the canonical strict shape to the
-    // caller.
+    // `FSR_RESULTS` Relation sink exposing `action_schema`. Both the
+    // no-checkpoint and with-checkpoint branches publish the same all-nullable
+    // contract here -- the executor's per-batch validation enforces that the
+    // declared relation schema matches the materialized rows.
     let result_relation = match &results_plan.sink {
         SinkType::Relation(h) => h.clone(),
         other => {
@@ -357,7 +357,7 @@ fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError>
 ///
 /// Union(relation_ref(commit_dedup), survivors)
 ///     | Filter(retention)
-///     | Project(action_read_schema)
+///     | Project(action_schema)
 ///     | into_relation(FSR_RESULTS)
 /// ```
 ///
@@ -366,10 +366,8 @@ fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError>
 /// commit-dedup relation is schema-compatible without an explicit alignment
 /// project.
 ///
-/// The terminal handle's published schema is [`action_read_schema`] (the
-/// all-nullable shape the chain actually emits). Callers that need the
-/// strict per-action shape -- notably `scan_metadata_plans_with_shape` --
-/// rebind to [`action_output_schema`] separately at their own boundary.
+/// The terminal handle's published schema is [`action_schema`] (the
+/// all-nullable shape the chain actually emits).
 fn build_results_plan(
     registry: &mut RelationRegistry,
     sidecar_handle: Option<&RelationHandle>,
@@ -386,11 +384,11 @@ fn build_results_plan(
                 retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
             ))
             .project(
-                action_read_schema()
+                action_schema()
                     .fields()
                     .map(|f| col(f.name().as_str()).into())
                     .collect(),
-                action_read_schema(),
+                action_schema(),
             );
         return chain.into_relation(FSR_RESULTS, registry);
     };
@@ -403,11 +401,11 @@ fn build_results_plan(
     let top_scan = registry
         .relation_ref(FSR_CHECKPOINT_TOP)?
         .project(
-            action_read_schema()
+            action_schema()
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
                 .collect(),
-            action_read_schema(),
+            action_schema(),
         );
 
     let checkpoint_full = match sidecar_handle {
@@ -425,7 +423,7 @@ fn build_results_plan(
     let checkpoint_keyed = checkpoint_full
         .filter(Arc::new(fsr_row_has_identity_predicate().into()))
         .project(
-            action_read_schema()
+            action_schema()
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
                 .chain(std::iter::once(Arc::clone(&dedup_expr)))
@@ -443,8 +441,8 @@ fn build_results_plan(
         .relation_ref(FSR_COMMIT_DEDUP)?
         .project(vec![col(FSR_JOIN_KEY_COL).into()], join_key_only_schema);
 
-    let survivors = checkpoint_keyed
-        .join(commit_keys, JoinType::LeftAnti)
+    let survivors = commit_keys
+        .join(checkpoint_keyed, JoinType::LeftAnti)
         .map_err(|e| e.into_delta_default())?;
 
     // Union directly on augmented rows (action + join key); drop join key once at the end.
@@ -462,11 +460,11 @@ fn build_results_plan(
             retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
         ))
         .project(
-            action_read_schema()
+            action_schema()
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
                 .collect(),
-            action_read_schema(),
+            action_schema(),
         )
         .into_relation(FSR_RESULTS, registry)
 }

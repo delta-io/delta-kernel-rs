@@ -30,8 +30,8 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::expressions::{Expression, Scalar};
-    use delta_kernel::plans::ir::nodes::RelationHandle;
-    use delta_kernel::plans::ir::PlanBuilder;
+    use delta_kernel::plans::ir::nodes::SinkType;
+    use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
     use delta_kernel::schema::{DataType, StructField, StructType};
 
     use crate::DataFusionExecutor;
@@ -47,7 +47,7 @@ mod tests {
     async fn logical_relation_sink_materializes_into_session_ctx() {
         let ex = DataFusionExecutor::try_new().unwrap();
         let schema = two_bool_schema();
-        let handle = RelationHandle::fresh("logical_relation_test", Arc::clone(&schema));
+        let mut registry = RelationRegistry::new();
         let plan = PlanBuilder::values(
             Arc::clone(&schema),
             vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],
@@ -60,7 +60,11 @@ mod tests {
             ],
             Arc::clone(&schema),
         )
-        .into_relation(handle.clone());
+        .into_relation("logical_relation_test", &mut registry)
+        .expect("relation sink");
+        let SinkType::Relation(handle) = plan.sink.clone() else {
+            unreachable!("into_relation always produces SinkType::Relation");
+        };
 
         ex.execute_plans(&[plan]).await.unwrap();
         let relation_batches = ex

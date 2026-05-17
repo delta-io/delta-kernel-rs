@@ -107,7 +107,7 @@ pub(super) fn fsr_row_has_identity_predicate() -> Predicate {
 
 #[cfg(test)]
 mod tests {
-    use super::super::schemas::action_read_schema;
+    use super::super::schemas::action_schema;
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::{AsArray, StringArray};
@@ -122,7 +122,7 @@ mod tests {
         // path and DV identity components verbatim (any consumer that reduces over equality of
         // full JSON strings still dedups identical DVs).
         let line = r#"{"add":{"path":"p1.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dvpath","offset":7,"sizeInBytes":1,"cardinality":2}}}"#;
-        let batch = parse_json_to_record_batch(StringArray::from(vec![line]), action_read_schema());
+        let batch = parse_json_to_record_batch(StringArray::from(vec![line]), action_schema());
 
         let out = evaluate_expression(
             &Expression::unary(UnaryExpressionOp::ToJson, fsr_dedup_key()),
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn fsr_dedup_key_eval_various_action_types() {
-        let schema = action_read_schema();
+        let schema = action_schema();
         let check = |line: &str, subs: &[&str]| {
             let batch = parse_json_to_record_batch(StringArray::from(vec![line]), schema.clone());
             let out = evaluate_expression(
@@ -206,7 +206,7 @@ mod tests {
             // no action payload
             r#"{}"#,
         ]);
-        let batch = parse_json_to_record_batch(rows, action_read_schema());
+        let batch = parse_json_to_record_batch(rows, action_schema());
 
         let out = evaluate_expression(
             &fsr_row_has_identity_predicate().into(),

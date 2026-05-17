@@ -24,7 +24,7 @@
 //!    identity) → Project(action_cols + key) → LeftAntiJoin(probe=this,
 //!    build=RelationRef(commit_dedup).project(key))` materializes the *checkpoint survivors* (rows
 //!    the commit tail didn't touch). The plan completes with `Union(RelationRef(commit_dedup),
-//!    survivors) -> Filter(retention) -> Project(action_read_schema) -> into_relation(FSR_RESULTS)`
+//!    survivors) -> Filter(retention) -> Project(action_schema) -> into_relation(FSR_RESULTS)`
 //!    so the caller reads the reconstructed action stream from [`FSR_RESULTS`].
 //!
 //! The window applies only to the (typically-small) commit-tail stream; the (typically-large)
@@ -45,7 +45,7 @@
 //!   is intentionally omitted (UUID DVs have no offset; inline DVs with the same `pathOrInlineDv`
 //!   and distinct offsets would imply two distinct in-line DV byte payloads, which is not
 //!   representable). A follow-up can include `offset` once kernel grows an int-to-string cast.
-//! - **`action_read_schema`**: Full reconstructed action stream (add / remove / protocol / metaData
+//! - **`action_schema`**: Full reconstructed action stream (add / remove / protocol / metaData
 //!   / domainMetadata / txn).
 //! - **Retention thresholds**: Derived like checkpoint reconciliation via
 //!   [`crate::action_reconciliation::deleted_file_retention_timestamp_with_time`] and

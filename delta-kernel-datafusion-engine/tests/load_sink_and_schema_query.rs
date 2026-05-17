@@ -7,8 +7,8 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::arrow::array::AsArray;
 use delta_kernel::expressions::{ColumnName, Scalar, StructData};
-use delta_kernel::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
-use delta_kernel::plans::ir::PlanBuilder;
+use delta_kernel::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns, SinkType};
+use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::schema::{DataType, StructField, StructType, ToSchema};
 use delta_kernel::FileMeta;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
@@ -74,26 +74,6 @@ async fn load_sink_broadcasts_passthrough_columns() {
     let file_schema =
         Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap());
 
-    let merged_schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("x", DataType::LONG),
-            StructField::not_null("tag", DataType::STRING),
-        ])
-        .unwrap(),
-    );
-
-    let handle = RelationHandle::fresh("loaded", merged_schema.clone());
-
-    let sink = LoadSink {
-        output_relation: handle.clone(),
-        file_schema,
-        base_url: Some(base_url),
-        file_meta: scan_file_path_only(),
-        dv_ref: None,
-        passthrough_columns: vec![col("tag")],
-        file_type: FileType::Parquet,
-    };
-
     let lit = PlanBuilder::values(
         upstream_schema,
         vec![
@@ -106,7 +86,23 @@ async fn load_sink_broadcasts_passthrough_columns() {
     )
     .unwrap();
 
-    let producer_plan = lit.into_load(sink);
+    let mut registry = RelationRegistry::new();
+    let producer_plan = lit
+        .load(
+            "loaded",
+            file_schema,
+            FileType::Parquet,
+            Some(base_url),
+            vec![col("tag")],
+            scan_file_path_only(),
+            None,
+            &mut registry,
+        )
+        .expect("load sink");
+    let SinkType::Load(load_sink) = &producer_plan.sink else {
+        unreachable!("PlanBuilder::load always produces SinkType::Load");
+    };
+    let handle = load_sink.output_relation.clone();
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor.execute_plans(&[producer_plan]).await.unwrap();
@@ -154,25 +150,28 @@ async fn load_sink_without_dv_reads_full_parquet_row_group() {
     let file_schema =
         Arc::new(StructType::try_new([StructField::not_null("value", DataType::INTEGER)]).unwrap());
 
-    let handle = RelationHandle::fresh("dv_loaded", Arc::clone(&file_schema));
-
-    let sink = LoadSink {
-        output_relation: handle.clone(),
-        file_schema: Arc::clone(&file_schema),
-        base_url: Some(base_url),
-        file_meta: scan_file_path_only(),
-        dv_ref: None,
-        passthrough_columns: Vec::new(),
-        file_type: FileType::Parquet,
-    };
-
     let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(path_str)]]).unwrap();
 
+    let mut registry = RelationRegistry::new();
+    let producer_plan = lit
+        .load(
+            "dv_loaded",
+            Arc::clone(&file_schema),
+            FileType::Parquet,
+            Some(base_url),
+            Vec::new(),
+            scan_file_path_only(),
+            None,
+            &mut registry,
+        )
+        .expect("load sink");
+    let SinkType::Load(load_sink) = &producer_plan.sink else {
+        unreachable!("PlanBuilder::load always produces SinkType::Load");
+    };
+    let handle = load_sink.output_relation.clone();
+
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor
-        .execute_plans(&[lit.into_load(sink)])
-        .await
-        .unwrap();
+    executor.execute_plans(&[producer_plan]).await.unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, 10);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
@@ -222,29 +221,32 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
     let file_schema =
         Arc::new(StructType::try_new([StructField::not_null("value", DataType::INTEGER)]).unwrap());
 
-    let handle = RelationHandle::fresh("dv_masked", Arc::clone(&file_schema));
-
-    let sink = LoadSink {
-        output_relation: handle.clone(),
-        file_schema: Arc::clone(&file_schema),
-        base_url: Some(base_url),
-        file_meta: scan_file_path_only(),
-        dv_ref: Some(DvRef::skip(dv_cn)),
-        passthrough_columns: Vec::new(),
-        file_type: FileType::Parquet,
-    };
-
     let lit = PlanBuilder::values(
         upstream_schema,
         vec![vec![Scalar::String(path_str), dv_example_scalar()]],
     )
     .unwrap();
 
+    let mut registry = RelationRegistry::new();
+    let producer_plan = lit
+        .load(
+            "dv_masked",
+            Arc::clone(&file_schema),
+            FileType::Parquet,
+            Some(base_url),
+            Vec::new(),
+            scan_file_path_only(),
+            Some(DvRef::skip(dv_cn)),
+            &mut registry,
+        )
+        .expect("load sink");
+    let SinkType::Load(load_sink) = &producer_plan.sink else {
+        unreachable!("PlanBuilder::load always produces SinkType::Load");
+    };
+    let handle = load_sink.output_relation.clone();
+
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor
-        .execute_plans(&[lit.into_load(sink)])
-        .await
-        .unwrap();
+    executor.execute_plans(&[producer_plan]).await.unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, 8);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
@@ -267,25 +269,28 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
     let file_schema =
         Arc::new(StructType::try_new([StructField::not_null("y", DataType::LONG)]).unwrap());
 
-    let handle = RelationHandle::fresh("json_loaded", Arc::clone(&file_schema));
-
-    let sink = LoadSink {
-        output_relation: handle.clone(),
-        file_schema: Arc::clone(&file_schema),
-        base_url: Some(base_url),
-        file_meta: scan_file_path_only(),
-        dv_ref: None,
-        passthrough_columns: Vec::new(),
-        file_type: FileType::Json,
-    };
-
     let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
 
+    let mut registry = RelationRegistry::new();
+    let producer_plan = lit
+        .load(
+            "json_loaded",
+            Arc::clone(&file_schema),
+            FileType::Json,
+            Some(base_url),
+            Vec::new(),
+            scan_file_path_only(),
+            None,
+            &mut registry,
+        )
+        .expect("load sink");
+    let SinkType::Load(load_sink) = &producer_plan.sink else {
+        unreachable!("PlanBuilder::load always produces SinkType::Load");
+    };
+    let handle = load_sink.output_relation.clone();
+
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor
-        .execute_plans(&[lit.into_load(sink)])
-        .await
-        .unwrap();
+    executor.execute_plans(&[producer_plan]).await.unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, 2);
 
     let batches = executor.collect_relation(&handle).await.unwrap();

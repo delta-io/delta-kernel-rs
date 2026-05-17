@@ -149,8 +149,8 @@ impl PlanBuilder {
         })
     }
 
-    /// Internal constructor used by [`RelationRegistry`].
-    pub(crate) fn from_registered_relation(handle: RelationHandle) -> Self {
+    /// Internal constructor from a registered relation handle.
+    pub(crate) fn from_relation_handle(handle: RelationHandle) -> Self {
         let schema = Arc::clone(&handle.schema);
         Self {
             schema,
@@ -342,11 +342,6 @@ impl PlanBuilder {
     /// Borrow the underlying node tree (useful for tests / debug formatting).
     pub fn node(&self) -> &DeclarativePlanNode {
         &self.node
-    }
-
-    /// Decompose into `(node, schema)`. The schema mirrors what the plan emits.
-    pub fn into_parts(self) -> (DeclarativePlanNode, SchemaRef) {
-        (self.node, self.schema)
     }
 }
 
@@ -614,7 +609,7 @@ mod tests {
     #[test]
     fn relation_ref_initial_schema_matches_handle() {
         let h = fresh_handle("src");
-        let pb = PlanBuilder::from_registered_relation(h.clone());
+        let pb = PlanBuilder::from_relation_handle(h.clone());
         assert_eq!(pb.schema_ref(), h.schema);
     }
 

@@ -13,7 +13,7 @@ pub mod relation_registry;
 
 pub use declarative::{DeclarativePlanNode, PlanBuilder};
 pub use nodes::{ConsumeSink, RelationHandle};
-pub use plan::{identity_project_struct, Plan, ResultPlan};
+pub use plan::{Plan, ResultPlan};
 pub use relation_registry::RelationRegistry;
 
 pub use crate::plans::kdf::Extractor;

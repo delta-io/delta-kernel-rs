@@ -1,15 +1,11 @@
-//! The [`Plan`] envelope plus small shared plan helpers.
+//! The [`Plan`] envelope.
 //!
 //! A [`Plan`] pairs a transforms-only plan tree with the sink describing how
 //! its output is consumed. Every complete plan has exactly one sink, and the
 //! sink lives on the envelope — never inside the tree.
 
-use std::sync::Arc;
-
 use super::declarative::DeclarativePlanNode;
 use super::nodes::{RelationHandle, SinkType};
-use crate::expressions::{col, Expression};
-use crate::schema::StructType;
 
 /// Complete plan: a transforms-only [`DeclarativePlanNode`] tree terminated
 /// by a [`SinkType`].
@@ -53,14 +49,4 @@ impl ResultPlan {
             result_relation,
         }
     }
-}
-
-/// Project every field of `parent`'s nested struct schema as a top-level column reference
-/// nested under `parent`. Equivalent to applying `Transform::identity()` to the nested struct
-/// and projecting each field individually.
-pub fn identity_project_struct(parent: &str, schema: &StructType) -> Vec<Arc<Expression>> {
-    schema
-        .fields()
-        .map(|f| col([parent, f.name().as_str()]).into())
-        .collect()
 }

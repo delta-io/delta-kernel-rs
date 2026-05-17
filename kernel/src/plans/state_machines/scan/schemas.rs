@@ -1,7 +1,6 @@
 //! Action schema constructors used by the FSR plan-builders and the replay-scan plans.
 //!
-//! Centralizes the action-schema builders (`action_schema`, `action_read_schema`,
-//! `action_output_schema` with `LazyLock` caches) and the augmented-schema helpers
+//! Centralizes the action-schema builder (`action_schema`) and the augmented-schema helpers
 //! (`augmented_action_schema`, `action_schema_with_augmented_add`, `path_size_schema`)
 //! plus the [`load_materialized_schema`] helper used by Load-sink builders.
 
@@ -14,7 +13,6 @@ use crate::actions::{
 };
 use crate::delta_error;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::schema::{
     arc_schema, ArrayType, DataType, SchemaRef, StructField, StructType, ToSchema,
 };
@@ -32,34 +30,12 @@ pub(super) fn all_action_fields() -> Vec<StructField> {
     ]
 }
 
-/// Action schema for the action-replay stream.
-///
-/// When `relaxed_nesting` is true (transport schema used while replaying / unioning action rows
-/// from heterogeneous sources), nested fields are made all-nullable to avoid planner-time cast
-/// failures during engine materialization. When false, the strict per-action `ToSchema` is used
-/// (kernel-visible output schema).
-fn action_schema(relaxed_nesting: bool) -> SchemaRef {
-    let relax_field = |f: StructField| -> StructField {
-        if !relaxed_nesting {
-            return f;
-        }
-        let DataType::Struct(inner) = f.data_type() else {
-            return f;
-        };
-        let relaxed = schema_with_all_fields_nullable(inner.as_ref())
-            .unwrap_or_else(|_| inner.as_ref().clone());
-        StructField::nullable(f.name().as_str(), relaxed)
-    };
-    arc_schema(all_action_fields().into_iter().map(relax_field))
-}
-
-pub(super) fn action_read_schema() -> SchemaRef {
-    static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| action_schema(true));
-    SCHEMA.clone()
-}
-
-pub(super) fn action_output_schema() -> SchemaRef {
-    static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| action_schema(false));
+/// Strict action schema for the action-replay stream: each top-level action slot is nullable
+/// (a row carries one variant), but the inner per-action shape preserves the typed `ToSchema`
+/// nullability. The engine is responsible for realigning relaxed file-source output to this
+/// contract at the scan boundary (see `NullabilityEnforcingTableProvider`).
+pub(super) fn action_schema() -> SchemaRef {
+    static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| arc_schema(all_action_fields()));
     SCHEMA.clone()
 }
 
@@ -140,7 +116,7 @@ pub(super) fn action_schema_with_augmented_add(
 /// before the relation is persisted, so its presence in the schema is plan-internal.
 pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
     let join_key_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, true)));
-    let mut b = action_read_schema()
+    let mut b = action_schema()
         .build_on()
         .with_nullable(FSR_JOIN_KEY_COL, join_key_type);
     if with_version {

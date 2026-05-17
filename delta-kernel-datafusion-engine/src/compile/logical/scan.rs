@@ -106,12 +106,14 @@ pub(super) fn scan_to_listing_logical_plan(
     let full_schema = build_scan_arrow_schema(node)?;
     let build_listing_scan =
         |files: &[delta_kernel::FileMeta]| -> Result<LogicalPlan, DataFusionError> {
-            let file_schema = Arc::new(full_schema.clone());
-            let file_schema = if node.file_type == FileType::Json {
-                relax_nested_nullability_for_scan(file_schema.as_ref())
-            } else {
-                file_schema
-            };
+            // Both file formats reject planning when the declared schema is stricter than what
+            // the physical file produces (parquet checkpoints commonly write `add.path` as
+            // nullable; the JSON decoder silently drops declared NOT NULL on nested children).
+            // Relax before handing to the file source; `NullabilityEnforcingTableProvider` below
+            // re-asserts the strict nullability contract at the scan boundary while preserving
+            // source-side names and PARQUET:field_id metadata via `merge_target_nullability`.
+            let file_schema =
+                relax_nested_nullability_for_scan(Arc::new(full_schema.clone()).as_ref());
             let partition_cols: Vec<(String, ArrowDataType)> = Vec::new();
             let format: Arc<dyn datafusion_datasource::file_format::FileFormat> =
                 match node.file_type {
@@ -142,18 +144,13 @@ pub(super) fn scan_to_listing_logical_plan(
                 .with_listing_options(options)
                 .with_schema(Arc::clone(&file_schema));
             let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
-            // JSON file sources don't enforce declared nullability and DataFusion's own
-            // `check_not_null_constraints` only covers top-level columns. Wrap JSON scans with a
-            // provider that re-asserts the strict kernel schema (top-level + nested) at the scan
-            // boundary. Parquet's decoder handles nullability natively, so it scans naked.
-            let provider: Arc<dyn TableProvider> = if node.file_type == FileType::Json {
-                Arc::new(NullabilityEnforcingTableProvider::new(
-                    listing,
-                    Arc::new(full_schema.clone()),
-                ))
-            } else {
-                listing
-            };
+            // Wrapper re-asserts the strict nullability contract per batch via
+            // `NullabilityValidationExec`, computing its effective output schema from the inner
+            // scan's actual schema (preserving source-side names + `PARQUET:field_id` metadata
+            // that field-id projection plumbs through) merged with the kernel-strict nullability.
+            let provider: Arc<dyn TableProvider> = Arc::new(
+                NullabilityEnforcingTableProvider::new(listing, Arc::new(full_schema.clone())),
+            );
             LogicalPlanBuilder::scan("scan", provider_as_source(provider), None)?.build()
         };
     let mut scan_plan = build_listing_scan(&node.files)?;

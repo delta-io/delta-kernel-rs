@@ -19,8 +19,8 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _}
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::RelationHandle;
-use delta_kernel::plans::ir::PlanBuilder;
+use delta_kernel::plans::ir::nodes::SinkType;
+use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, Kdf, KdfControl};
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, EngineData, EvaluationHandler};
@@ -40,9 +40,11 @@ pub async fn run_to_batches_with(
     exec: &DataFusionExecutor,
     node: PlanBuilder,
 ) -> Result<Vec<RecordBatch>, DeltaError> {
-    let schema = node.schema_ref();
-    let handle = RelationHandle::fresh("test_out", schema);
-    let plan = node.into_relation(handle.clone());
+    let mut registry = RelationRegistry::new();
+    let plan = node.into_relation("test_out", &mut registry)?;
+    let SinkType::Relation(handle) = plan.sink.clone() else {
+        unreachable!("PlanBuilder::into_relation always produces SinkType::Relation");
+    };
     exec.execute_plans(&[plan]).await?;
     exec.collect_relation(&handle).await
 }

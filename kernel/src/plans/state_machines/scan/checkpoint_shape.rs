@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::schemas::action_read_schema;
+use super::schemas::action_schema;
 use crate::actions::{
     Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -80,7 +80,7 @@ pub fn checkpoint_shape_from_last_checkpoint(
         .map(checkpoint_format_from_path)
         .unwrap_or(FileFormat::Json);
 
-    let full_schema = seg.checkpoint_schema().unwrap_or_else(action_read_schema);
+    let full_schema = seg.checkpoint_schema().unwrap_or_else(action_schema);
     let subset = checkpoint_actions_schema_projection(&full_schema)?;
     Ok(CheckpointShape {
         file_format: fmt,
@@ -108,7 +108,7 @@ fn checkpoint_actions_schema_projection(full: &SchemaRef) -> Result<SchemaRef, D
     ];
     let names: Vec<_> = WANT.iter().copied().filter(|n| full.contains(*n)).collect();
     if names.is_empty() {
-        Ok(action_read_schema())
+        Ok(action_schema())
     } else {
         full.project(names.as_slice())
             .map_err(|e| e.into_delta_default())
@@ -120,7 +120,7 @@ fn sidecar_only_schema() -> SchemaRef {
 }
 
 pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
-    let mut fields: Vec<StructField> = action_read_schema().fields().cloned().collect();
+    let mut fields: Vec<StructField> = action_schema().fields().cloned().collect();
     if include_sidecar {
         fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
     }

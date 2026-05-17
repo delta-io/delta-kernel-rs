@@ -11,8 +11,8 @@ use delta_kernel::arrow::array::Int64Array;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch as ArrowRecordBatch;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::plans::ir::nodes::{ConsumeSink, RelationHandle};
-use delta_kernel::plans::ir::PlanBuilder;
+use delta_kernel::plans::ir::nodes::{ConsumeSink, SinkType};
+use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
 };
@@ -26,11 +26,15 @@ use url::Url;
 async fn phase_plans_runs_relation_producer_and_registers_relation() {
     let schema = single_long_schema();
     let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
-    let handle = RelationHandle::fresh("pipe", schema.clone());
 
-    let producer = PlanBuilder::values(schema.clone(), rows)
+    let mut registry = RelationRegistry::new();
+    let producer = PlanBuilder::values(schema, rows)
         .expect("literal")
-        .into_relation(handle.clone());
+        .into_relation("pipe", &mut registry)
+        .expect("relation sink");
+    let SinkType::Relation(handle) = producer.sink.clone() else {
+        unreachable!("into_relation always produces SinkType::Relation");
+    };
 
     let executor = DataFusionExecutor::try_new().unwrap();
     let accum = executor
