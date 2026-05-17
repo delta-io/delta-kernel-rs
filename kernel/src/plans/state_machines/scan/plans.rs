@@ -3,10 +3,11 @@
 //! [`build_fsr_plans`] composes the four canonical FSR plans (`commit_load`,
 //! `commit_dedup`, optional `sidecar_load`, `results`) used by
 //! [`FullState`](super::full_state::FullState). Plans are produced through a
-//! [`PlanCollector`], which mints fresh relation handles from each chain's
-//! output schema and binds chains to their sinks. The terminal plan ends in a
-//! [`SinkType::Relation`] keyed by [`FSR_RESULTS`]; the caller reads the
-//! relation after executing every plan in [`ResultPlan::plans`].
+//! a local plan vector plus a [`RelationRegistry`] that mints fresh relation
+//! handles from each chain's output schema and binds chains to their sinks.
+//! The terminal plan ends in a [`SinkType::Relation`] keyed by
+//! [`FSR_RESULTS`]; the caller reads the relation after executing every plan
+//! in [`ResultPlan::plans`].
 
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use crate::plans::ir::nodes::{
     FileFormat, FileType, JoinType, OrderingSpec, RelationHandle, ScanFileColumns, SinkType,
     WindowFunction,
 };
-use crate::plans::ir::{plan, Plan, PlanBuilder, PlanCollector, ResultPlan};
+use crate::plans::ir::{Plan, PlanBuilder, RelationRegistry, ResultPlan};
 use crate::schema::{ArrayType, DataType, SchemaBuilder};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
@@ -92,7 +93,8 @@ pub fn build_fsr_plans(
     let txn_expiry = calculate_transaction_expiration_timestamp(snapshot.table_properties())
         .map_err(|e| e.into_delta_default())?;
 
-    let mut p = PlanCollector::new();
+    let mut registry = RelationRegistry::new();
+    let mut plans: Vec<Plan> = Vec::new();
 
     // === commit_load: VALUES(commits) -> JSON load -> FSR_COMMIT_RAW ===
     // One literal row per commit file; the LoadSink opens each commit JSON and
@@ -109,16 +111,17 @@ pub fn build_fsr_plans(
         .collect();
     let commit_values = PlanBuilder::values(path_size_schema(true), commit_rows)
         .map_err(|e| e.into_delta_default())?;
-    let commit_raw = p.add_load(
+    let commit_raw_plan = commit_values.load(
         FSR_COMMIT_RAW,
-        commit_values,
         action_read_schema(),
         FileType::Json,
         Some(log_root.clone()),
         vec![ColumnName::new(["version"])],
         default_scan_file_columns(),
         None,
+        &mut registry,
     )?;
+    plans.push(commit_raw_plan);
 
     // === commit_dedup: filter -> project(+join-key) -> window(row_number) -> filter rn<=1 ->
     // project(action + join-key) ->
@@ -130,41 +133,41 @@ pub fn build_fsr_plans(
     //   4. Project away internal columns (`version`, row_number); persisted relation
     //      matches `augmented_action_schema(false)` for the union in the results plan.
     const COMMIT_DEDUP_RN_COL: &str = "__kernel_fsr_commit_dedup_rn";
-    let commit_dedup = p.add_relation(
-        FSR_COMMIT_DEDUP,
-        plan::relation_ref(&commit_raw)
-            .filter(Arc::new(fsr_row_has_identity_predicate().into()))
-            .project(
-                action_read_schema()
-                    .fields()
-                    .map(|f| col(f.name().as_str()).into())
-                    .chain(std::iter::once(col("version").into()))
-                    .chain(std::iter::once(Arc::new(fsr_dedup_key())))
-                    .collect(),
-                augmented_action_schema(true)?,
-            )
-            .window(
-                vec![WindowFunction {
-                    output_col: COMMIT_DEDUP_RN_COL.to_string(),
-                }],
-                vec![col(FSR_JOIN_KEY_COL).into()],
-                vec![OrderingSpec::desc(ColumnName::new(["version"]))],
-            )
-            .map_err(|e| e.into_delta_default())?
-            .filter(Arc::new(
-                Expression::column([COMMIT_DEDUP_RN_COL])
-                    .le(Expression::literal(1i64))
-                    .into(),
-            ))
-            .project(
-                action_read_schema()
-                    .fields()
-                    .map(|f| col(f.name().as_str()).into())
-                    .chain(std::iter::once(col(FSR_JOIN_KEY_COL).into()))
-                    .collect(),
-                augmented_action_schema(false)?,
-            ),
-    )?;
+    let commit_dedup_plan = registry
+        .relation_ref(FSR_COMMIT_RAW)?
+        .filter(Arc::new(fsr_row_has_identity_predicate().into()))
+        .project(
+            action_read_schema()
+                .fields()
+                .map(|f| col(f.name().as_str()).into())
+                .chain(std::iter::once(col("version").into()))
+                .chain(std::iter::once(Arc::new(fsr_dedup_key())))
+                .collect(),
+            augmented_action_schema(true)?,
+        )
+        .window(
+            vec![WindowFunction {
+                output_col: COMMIT_DEDUP_RN_COL.to_string(),
+            }],
+            vec![col(FSR_JOIN_KEY_COL).into()],
+            vec![OrderingSpec::desc(ColumnName::new(["version"]))],
+        )
+        .map_err(|e| e.into_delta_default())?
+        .filter(Arc::new(
+            Expression::column([COMMIT_DEDUP_RN_COL])
+                .le(Expression::literal(1i64))
+                .into(),
+        ))
+        .project(
+            action_read_schema()
+                .fields()
+                .map(|f| col(f.name().as_str()).into())
+                .chain(std::iter::once(col(FSR_JOIN_KEY_COL).into()))
+                .collect(),
+            augmented_action_schema(false)?,
+        )
+        .into_relation(FSR_COMMIT_DEDUP, &mut registry)?;
+    plans.push(commit_dedup_plan);
 
     // === checkpoint_top (optional): bare scan of top-level checkpoint parts ===
     let checkpoint_top = if checkpoint_files.is_empty() {
@@ -180,17 +183,18 @@ pub fn build_fsr_plans(
                 checkpoint_manifest_scan_schema(shape.has_sidecars),
             ),
         };
-        Some(p.add_relation(
-            FSR_CHECKPOINT_TOP,
-            checkpoint_scan,
-        )?)
+        let checkpoint_top_plan = checkpoint_scan
+            .into_relation(FSR_CHECKPOINT_TOP, &mut registry)?;
+        let checkpoint_top = relation_output_handle(&checkpoint_top_plan)?;
+        plans.push(checkpoint_top_plan);
+        Some(checkpoint_top)
     };
 
     // === sidecar_load (V2-multipart only): extract sidecar pointers and read each parquet ===
     // Filters top-level rows lacking a sidecar pointer, projects the sidecar
     // path/size, and reads the referenced parquet under `<log_root>/_sidecars/`.
     let sidecar = if shape.has_sidecars {
-        let checkpoint_top_handle = checkpoint_top.as_ref().ok_or_else(|| {
+        let _checkpoint_top_handle = checkpoint_top.as_ref().ok_or_else(|| {
             delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
                 "fsr::build_fsr_plans: has_sidecars=true but no checkpoint files were listed",
@@ -202,7 +206,8 @@ pub fn build_fsr_plans(
                 "fsr::build_fsr_plans::join_sidecar_base: join _sidecars base URL: {e}",
             )
         })?;
-        let sidecar_scan = plan::relation_ref(checkpoint_top_handle)
+        let sidecar_scan = registry
+            .relation_ref(FSR_CHECKPOINT_TOP)?
             .filter(Arc::new(col(SIDECAR_NAME).is_not_null().into()))
             .project(
                 vec![
@@ -211,22 +216,25 @@ pub fn build_fsr_plans(
                 ],
                 path_size_schema(false),
             );
-        Some(p.add_load(
+        let sidecar_plan = sidecar_scan.load(
             FSR_SIDECAR_ACTIONS,
-            sidecar_scan,
             action_read_schema(),
             FileType::Parquet,
             Some(sidecar_base),
             vec![],
             default_scan_file_columns(),
             None,
-        )?)
+            &mut registry,
+        )?;
+        let sidecar_handle = load_output_relation(&sidecar_plan)?;
+        plans.push(sidecar_plan);
+        Some(sidecar_handle)
     } else {
         None
     };
 
     let results_plan = build_results_plan(
-        &commit_dedup,
+        &mut registry,
         sidecar.as_ref(),
         checkpoint_top.as_ref(),
         min_file_ts,
@@ -246,8 +254,8 @@ pub fn build_fsr_plans(
             ));
         }
     };
-    p.push_plan(results_plan);
-    Ok(ResultPlan::new(p.into_vec(), result_relation))
+    plans.push(results_plan);
+    Ok(ResultPlan::new(plans, result_relation))
 }
 
 /// Type of the synthetic [`FSR_JOIN_KEY_COL`] column: `ARRAY<STRING?>?`.
@@ -262,6 +270,26 @@ fn default_scan_file_columns() -> ScanFileColumns {
         path: ColumnName::new(["path"]),
         size: Some(ColumnName::new(["size"])),
         record_count: None,
+    }
+}
+
+fn relation_output_handle(plan: &Plan) -> Result<RelationHandle, DeltaError> {
+    match &plan.sink {
+        SinkType::Relation(h) => Ok(h.clone()),
+        other => Err(delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            "internal: expected Relation sink, got {other:?}",
+        )),
+    }
+}
+
+fn load_output_relation(plan: &Plan) -> Result<RelationHandle, DeltaError> {
+    match &plan.sink {
+        SinkType::Load(load) => Ok(load.output_relation.clone()),
+        other => Err(delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            "internal: expected Load sink, got {other:?}",
+        )),
     }
 }
 
@@ -343,17 +371,17 @@ fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError>
 /// strict per-action shape -- notably `scan_metadata_plans_with_shape` --
 /// rebind to [`action_output_schema`] separately at their own boundary.
 fn build_results_plan(
-    commit_dedup_handle: &RelationHandle,
+    registry: &mut RelationRegistry,
     sidecar_handle: Option<&RelationHandle>,
     checkpoint_top_handle: Option<&RelationHandle>,
     min_file_retention_timestamp: i64,
     txn_expiration_cutoff: Option<i64>,
 ) -> Result<Plan, DeltaError> {
-    let result_handle = RelationHandle::fresh(FSR_RESULTS, action_read_schema());
     // No checkpoint parts: there is no checkpoint side to anti-join. The full snapshot state is
     // entirely determined by commit winners.
-    let Some(checkpoint_top_handle) = checkpoint_top_handle else {
-        let chain = plan::relation_ref(commit_dedup_handle)
+    let Some(_checkpoint_top_handle) = checkpoint_top_handle else {
+        let chain = registry
+            .relation_ref(FSR_COMMIT_DEDUP)?
             .filter(Arc::new(
                 retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
             ))
@@ -364,7 +392,7 @@ fn build_results_plan(
                     .collect(),
                 action_read_schema(),
             );
-        return Ok(chain.into_relation(result_handle));
+        return chain.into_relation(FSR_RESULTS, registry);
     };
 
     let dedup_expr = Arc::new(fsr_dedup_key());
@@ -372,7 +400,8 @@ fn build_results_plan(
 
     // Top-level checkpoint rows are preloaded once into `FSR_CHECKPOINT_TOP`; project to canonical
     // action columns so the schema aligns with sidecar/action relations.
-    let top_scan = plan::relation_ref(checkpoint_top_handle)
+    let top_scan = registry
+        .relation_ref(FSR_CHECKPOINT_TOP)?
         .project(
             action_read_schema()
                 .fields()
@@ -382,8 +411,14 @@ fn build_results_plan(
         );
 
     let checkpoint_full = match sidecar_handle {
-        Some(handle) => PlanBuilder::union(vec![top_scan, plan::relation_ref(handle)], false)
-            .map_err(|e| e.into_delta_default())?,
+        Some(_handle) => PlanBuilder::union(
+            vec![
+                top_scan,
+                registry.relation_ref(FSR_SIDECAR_ACTIONS)?,
+            ],
+            false,
+        )
+        .map_err(|e| e.into_delta_default())?,
         None => top_scan,
     };
 
@@ -404,7 +439,8 @@ fn build_results_plan(
         .with_nullable(FSR_JOIN_KEY_COL, dedup_key_type())
         .build()
         .map_err(|e| e.into_delta_default())?;
-    let commit_keys = plan::relation_ref(commit_dedup_handle)
+    let commit_keys = registry
+        .relation_ref(FSR_COMMIT_DEDUP)?
         .project(vec![col(FSR_JOIN_KEY_COL).into()], join_key_only_schema);
 
     let survivors = checkpoint_keyed
@@ -413,12 +449,15 @@ fn build_results_plan(
 
     // Union directly on augmented rows (action + join key); drop join key once at the end.
     let everything = PlanBuilder::union(
-        vec![plan::relation_ref(commit_dedup_handle), survivors],
+        vec![
+            registry.relation_ref(FSR_COMMIT_DEDUP)?,
+            survivors,
+        ],
         false,
     )
     .map_err(|e| e.into_delta_default())?;
 
-    Ok(everything
+    everything
         .filter(Arc::new(
             retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
         ))
@@ -429,5 +468,5 @@ fn build_results_plan(
                 .collect(),
             action_read_schema(),
         )
-        .into_relation(result_handle))
+        .into_relation(FSR_RESULTS, registry)
 }

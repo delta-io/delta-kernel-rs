@@ -20,7 +20,7 @@ use super::checkpoint_shape::{
 use super::dedup::ADD_PATH;
 use super::plans::build_fsr_plans;
 use super::schemas::{
-    action_output_schema, action_schema_with_augmented_add, load_materialized_schema,
+    action_output_schema, action_schema_with_augmented_add,
 };
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
@@ -32,9 +32,9 @@ use crate::expressions::{
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{
-    DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, SinkType,
+    DvRef, FileType, RelationHandle, ScanFileColumns, SinkType,
 };
-use crate::plans::ir::{identity_project_struct, plan, PlanCollector, ResultPlan};
+use crate::plans::ir::{identity_project_struct, Plan, RelationRegistry, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
@@ -71,9 +71,11 @@ impl Scan {
         &self,
         live_actions_relation: RelationHandle,
     ) -> Result<ResultPlan, DeltaError> {
+        let mut registry = RelationRegistry::new();
+        registry.register_existing(live_actions_relation)?;
         let snapshot = self.snapshot();
         let partition_columns = replay_partition_columns(self);
-        let file_schema = scan_data_file_schema(self.physical_schema(), self.logical_schema())?;
+        let _file_schema = scan_data_file_schema(self.physical_schema(), self.logical_schema())?;
         let logical_schema = self.logical_schema().clone();
         let logical_projection = scan_data_projection(
             &logical_schema,
@@ -81,46 +83,34 @@ impl Scan {
             &partition_columns,
             snapshot.table_configuration().column_mapping_mode(),
         )?;
-        let materialized_schema = load_materialized_schema(
-            &file_schema,
-            &scan_live_actions_schema(
-                scan_partition_values_physical_schema(snapshot.as_ref(), self.logical_schema())?
-                    .as_ref(),
-            ),
-            &[FILE_CONSTANT_VALUES_NAME, "path"],
-        )?;
-
         // === data load: per-file parquet read keyed by the live-actions relation ===
-        // The load sink is built directly because the materialized schema is computed by
-        // load_materialized_schema (file_schema + named passthroughs): the row-id projection
-        // augments file_schema beyond the load's physical read schema.
-        let data_rows_raw_relation =
-            RelationHandle::fresh(FSR_SCAN_DATA_ROWS_RAW, materialized_schema);
-        let load_sink = LoadSink {
-            output_relation: data_rows_raw_relation.clone(),
-            file_schema: self.physical_schema().clone(),
-            base_url: Some(snapshot.table_root().clone()),
-            file_meta: ScanFileColumns {
-                path: ColumnName::new(["path"]),
-                size: Some(ColumnName::new(["size"])),
-                record_count: None,
-            },
-            dv_ref: Some(DvRef::skip(ColumnName::new(["deletionVector"]))),
-            passthrough_columns: vec![
-                ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
-                ColumnName::new(["path"]),
-            ],
-            file_type: FileType::Parquet,
-        };
-        let load_plan = plan::relation_ref(&live_actions_relation).into_load(load_sink);
-
+        let load_plan = registry
+            .relation_ref(FSR_SCAN_LIVE_ACTIONS)?
+            .load(
+                FSR_SCAN_DATA_ROWS_RAW,
+                self.physical_schema().clone(),
+                FileType::Parquet,
+                Some(snapshot.table_root().clone()),
+                vec![
+                    ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
+                    ColumnName::new(["path"]),
+                ],
+                ScanFileColumns {
+                    path: ColumnName::new(["path"]),
+                    size: Some(ColumnName::new(["size"])),
+                    record_count: None,
+                },
+                Some(DvRef::skip(ColumnName::new(["deletionVector"]))),
+                &mut registry,
+            )?;
         // === final projection: physical -> logical schema, materialized into the result handle ===
         // The handle publishes the scan's logical schema directly; the projection chain feeds
         // matching rows.
-        let result_handle = RelationHandle::fresh(FSR_SCAN_DATA, logical_schema.clone());
-        let project_plan = plan::relation_ref(&data_rows_raw_relation)
+        let project_plan = registry
+            .relation_ref(FSR_SCAN_DATA_ROWS_RAW)?
             .project(logical_projection, logical_schema)
-            .into_relation(result_handle.clone());
+            .into_relation(FSR_SCAN_DATA, &mut registry)?;
+        let result_handle = relation_output_handle(&project_plan)?;
 
         Ok(ResultPlan::new(
             vec![load_plan, project_plan],
@@ -205,6 +195,16 @@ const FSR_SCAN_DATA_ROWS_RAW: &str = "scan.data_rows_raw";
 /// Final scan-data relation in the scan's logical schema.
 const FSR_SCAN_DATA: &str = "scan.data";
 
+fn relation_output_handle(plan: &Plan) -> Result<RelationHandle, DeltaError> {
+    match &plan.sink {
+        SinkType::Relation(h) => Ok(h.clone()),
+        other => Err(delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            "internal: expected Relation sink, got {other:?}",
+        )),
+    }
+}
+
 /// Compose the metadata-phase [`ResultPlan`] for `scan` using the resolved
 /// checkpoint shape.
 ///
@@ -229,7 +229,8 @@ fn scan_metadata_plans_with_shape(
     // to a fresh `scan.fsr_results` handle that publishes the strict schema. The chain's actual
     // row data is still all-nullable; the strict handle is purely a name-binding for downstream
     // projection consumers.
-    let mut p = PlanCollector::new();
+    let mut registry = RelationRegistry::new();
+    let mut plans: Vec<Plan> = Vec::new();
     let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
     let fsr_terminal_id = fsr.result_relation.id;
     let mut terminal_plan: Option<crate::plans::ir::Plan> = None;
@@ -241,7 +242,7 @@ fn scan_metadata_plans_with_shape(
         if is_terminal {
             terminal_plan = Some(plan);
         } else {
-            p.push_plan(plan);
+            plans.push(plan);
         }
     }
     let terminal_plan = terminal_plan.ok_or_else(|| {
@@ -251,14 +252,15 @@ fn scan_metadata_plans_with_shape(
         )
     })?;
     let fsr_results_relation = RelationHandle::fresh("scan.fsr_results", action_output_schema());
-    p.push_plan(crate::plans::ir::Plan::new(
+    plans.push(crate::plans::ir::Plan::new(
         terminal_plan.root,
         SinkType::Relation(fsr_results_relation.clone()),
     ));
+    registry.register_existing(fsr_results_relation.clone())?;
 
     // === actions chain: filter live add paths, optionally augmenting with parsed stats /
     // partitionValues columns when a data-skipping predicate is in play ===
-    let actions_root = plan::relation_ref(&fsr_results_relation);
+    let actions_root = registry.relation_ref("scan.fsr_results")?;
     let live_actions_node = match scan.build_actions_meta_predicate() {
         Some(predicate) => {
             let projected =
@@ -296,8 +298,10 @@ fn scan_metadata_plans_with_shape(
         scan_live_actions_schema(partition_values_schema.as_ref()),
     );
 
-    let live_actions_relation = p.add_relation(FSR_SCAN_LIVE_ACTIONS, live_actions_node)?;
-    Ok(ResultPlan::new(p.into_vec(), live_actions_relation))
+    let live_actions_plan = live_actions_node.into_relation(FSR_SCAN_LIVE_ACTIONS, &mut registry)?;
+    let live_actions_relation = relation_output_handle(&live_actions_plan)?;
+    plans.push(live_actions_plan);
+    Ok(ResultPlan::new(plans, live_actions_relation))
 }
 
 pub(super) fn scan_partition_values_schema(

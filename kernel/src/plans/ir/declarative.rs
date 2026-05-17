@@ -8,13 +8,13 @@
 //!
 //! ```ignore
 //! use delta_kernel::plans::ir::PlanBuilder;
-//! use delta_kernel::plans::ir::nodes::RelationHandle;
+//! use delta_kernel::plans::ir::RelationRegistry;
 //!
-//! // Untyped pipeline: scan JSON, project to a sub-schema, pipe into a relation.
-//! let handle = RelationHandle::fresh("scanned", schema.clone());
+//! // Untyped pipeline: scan JSON, project to a sub-schema, publish to a named relation.
+//! let mut registry = RelationRegistry::new();
 //! let plan = PlanBuilder::scan_json(files, schema)
 //!     .project(projection, output_schema)
-//!     .into_relation(handle.clone());
+//!     .into_relation("scanned", &mut registry)?;
 //!
 //! // Typed pipeline: scan JSON, drain into a typed consumer KDF, recover the typed output from
 //! // the resulting PhaseState.
@@ -27,11 +27,11 @@
 //! ## Core API
 //!
 //! - Constructors: [`PlanBuilder::scan_json`] / [`scan_parquet`](PlanBuilder::scan_parquet),
-//!   [`PlanBuilder::values`], [`PlanBuilder::relation_ref`], [`PlanBuilder::file_listing`],
+//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`],
 //!   [`PlanBuilder::union`].
 //! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`], [`PlanBuilder::window`],
 //!   [`PlanBuilder::join`], [`PlanBuilder::join_on`].
-//! - Terminals: [`PlanBuilder::into_relation`], [`PlanBuilder::into_load`],
+//! - Terminals: [`PlanBuilder::into_relation`], [`PlanBuilder::load`],
 //!   [`PlanBuilder::into_consume`], [`PlanBuilder::consume`].
 
 use std::sync::Arc;
@@ -40,7 +40,9 @@ use url::Url;
 
 use super::nodes::*;
 use super::plan::Plan;
-use crate::expressions::{Expression, Scalar};
+use super::relation_registry::RelationRegistry;
+use crate::expressions::{ColumnName, Expression, Scalar};
+use crate::plans::errors::DeltaError;
 use crate::plans::kdf::typed::make_extract;
 use crate::plans::kdf::{ConsumerKdf, Extractor, KdfOutput};
 use crate::schema::{arc_schema, DataType, SchemaRef, StructField, StructType};
@@ -147,10 +149,8 @@ impl PlanBuilder {
         })
     }
 
-    /// Read batches from a relation produced by another plan in the same
-    /// `PhaseOperation::Plans(...)`. The producing plan terminates in
-    /// [`SinkType::Relation`](super::nodes::SinkType::Relation) referencing the same handle.
-    pub fn relation_ref(handle: RelationHandle) -> Self {
+    /// Internal constructor used by [`RelationRegistry`].
+    pub(crate) fn from_registered_relation(handle: RelationHandle) -> Self {
         let schema = Arc::clone(&handle.schema);
         Self {
             schema,
@@ -354,19 +354,52 @@ impl PlanBuilder {
 
 impl PlanBuilder {
     /// Terminal: stream every output batch to the named relation. Another plan in the same
-    /// `PhaseOperation::Plans(...)` consumes the relation via [`PlanBuilder::relation_ref`], or
+    /// `PhaseOperation::Plans(...)` consumes the relation via
+    /// [`RelationRegistry::relation_ref`](super::relation_registry::RelationRegistry::relation_ref), or
     /// a [`ResultPlan`](super::plan::ResultPlan) names this relation as its caller-facing output.
-    pub fn into_relation(self, handle: RelationHandle) -> Plan {
-        Plan::new(self.node, SinkType::Relation(handle))
+    pub fn into_relation(
+        self,
+        name: &str,
+        registry: &mut RelationRegistry,
+    ) -> Result<Plan, DeltaError> {
+        let handle = registry.register_relation_sink(name, self.schema_ref())?;
+        Ok(Plan::new(self.node, SinkType::Relation(handle)))
     }
 
     /// Terminal: file-reader sink. For each upstream row, open the resolved file, read
     /// [`LoadSink::file_schema`] columns (with optional DV masking when [`LoadSink::dv_ref`]
     /// names an upstream descriptor column), and materialize the result under
-    /// [`LoadSink::output_relation`] for downstream [`PlanBuilder::relation_ref`] consumers in
-    /// the same phase. See [`LoadSink`].
-    pub fn into_load(self, sink: LoadSink) -> Plan {
-        Plan::new(self.node, SinkType::Load(sink))
+    /// [`LoadSink::output_relation`] for downstream
+    /// [`RelationRegistry::relation_ref`](super::relation_registry::RelationRegistry::relation_ref)
+    /// consumers in the same phase. See [`LoadSink`].
+    pub fn load(
+        self,
+        name: &str,
+        file_schema: SchemaRef,
+        file_type: FileType,
+        base_url: Option<Url>,
+        passthrough_columns: Vec<ColumnName>,
+        file_meta: ScanFileColumns,
+        dv_ref: Option<DvRef>,
+        registry: &mut RelationRegistry,
+    ) -> Result<Plan, DeltaError> {
+        let handle = registry.register_load_sink(
+            name,
+            &self.schema_ref(),
+            &file_schema,
+            &passthrough_columns,
+            file_type,
+        )?;
+        let mut sink = LoadSink::new(handle, file_schema, file_type)
+            .with_passthrough_columns(passthrough_columns)
+            .with_file_meta(file_meta);
+        if let Some(base_url) = base_url {
+            sink = sink.with_base_url(base_url);
+        }
+        if let Some(dv_ref) = dv_ref {
+            sink = sink.with_dv_ref(dv_ref);
+        }
+        Ok(Plan::new(self.node, SinkType::Load(sink)))
     }
 
     /// Terminal: explicit [`SinkType::Consume`] with a pre-built [`ConsumeSink`]. Use when the
@@ -562,7 +595,7 @@ mod tests {
         let node = ConsumeSink::new_consumer(NoopConsumer);
         assert_eq!(node.token.kdf_id, ConsumerKdfId::CheckpointHint);
         let s = node.token.to_string();
-        assert!(s.starts_with("consumer.checkpoint_hint#"), "got: {s}");
+        assert!(s.starts_with("checkpoint_hint#"), "got: {s}");
     }
 
     // === Chain-method tests (relation_ref + transforms on PlanBuilder) ===
@@ -581,7 +614,7 @@ mod tests {
     #[test]
     fn relation_ref_initial_schema_matches_handle() {
         let h = fresh_handle("src");
-        let pb = PlanBuilder::relation_ref(h.clone());
+        let pb = PlanBuilder::from_registered_relation(h.clone());
         assert_eq!(pb.schema_ref(), h.schema);
     }
 

@@ -20,13 +20,13 @@
 //!
 //! ```ignore
 //! use delta_kernel::plans::ir::PlanBuilder;
-//! use delta_kernel::plans::ir::nodes::RelationHandle;
+//! use delta_kernel::plans::ir::RelationRegistry;
 //!
-//! let handle = RelationHandle::fresh("results", schema.clone());
+//! let mut registry = RelationRegistry::new();
 //! let plan = PlanBuilder::scan_json(files, schema.clone())
 //!     .filter(predicate)
 //!     .project(projection, output_schema)
-//!     .into_relation(handle);
+//!     .into_relation("results", &mut registry)?;
 //! ```
 
 pub mod errors;
