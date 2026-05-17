@@ -613,7 +613,9 @@ fn scan_row_schema_with_parsed_columns(
 /// # Parameters
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
 ///   names), or None if stats should not be included in output.
-/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true,
+///   stats output uses COALESCE(add.stats, ToJson(add.stats_parsed)) so that ScanFile.stats
+///   is populated even when the checkpoint lacks JSON stats (writeStatsAsJson=false).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
