@@ -152,7 +152,8 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                     PhaseOperation::SchemaQuery(SchemaQueryNode::new(checkpoint_url)),
                     "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema",
                 )
-                .await?;
+                .await
+                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
             let checkpoint_schema = checkpoint_state.take_schema().ok_or_else(|| {
                 delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
@@ -171,7 +172,8 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                     PhaseOperation::Plans(vec![discover_sidecars]),
                     "scan::resolve_checkpoint_shape_for_scan::sidecar_discovery",
                 )
-                .await?;
+                .await
+                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
             let sidecar_files = extract_sidecars.extract(&sidecar_state).map_err(|e| {
                 let detail = e.display_with_source_chain();
                 delta_error!(
@@ -188,7 +190,8 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                         )),
                         "scan::resolve_checkpoint_shape_for_scan::sidecar_schema",
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
                 let sidecar_schema = sidecar_state.take_schema().ok_or_else(|| {
                     delta_error!(
                         DeltaErrorCode::DeltaCommandInvariantViolation,
@@ -219,9 +222,7 @@ pub(super) fn build_sidecar_discovery_plan(
         .map(|p| p.location.clone())
         .collect();
     let sidecar_scan = match checkpoint_format {
-        FileFormat::Parquet => {
-            PlanBuilder::scan_parquet(checkpoint_files, sidecar_only_schema())
-        }
+        FileFormat::Parquet => PlanBuilder::scan_parquet(checkpoint_files, sidecar_only_schema()),
         FileFormat::Json => PlanBuilder::scan_json(checkpoint_files, sidecar_only_schema()),
     }
     .filter(Arc::new(

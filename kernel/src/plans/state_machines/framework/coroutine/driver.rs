@@ -1,100 +1,102 @@
 //! The [`CoroutineSM`] driver: compiles [`PhaseYield`] sequences into the
 //! [`StateMachine`] contract.
 //!
-//! The protocol is strictly 1:1: each yield carries exactly one
-//! [`PhaseOperation`], the driver hands it to the engine via
-//! [`StateMachine::get_operation`], and on [`StateMachine::advance`] the
-//! engine outcome is fed back through the coroutine as a [`PhaseResume`].
+//! The protocol is strictly 1:1: each yield carries exactly one [`PhaseOperation`], the driver
+//! hands it to the engine via [`StateMachine::get_operation`], and on [`StateMachine::advance`]
+//! the engine outcome is fed back through the coroutine as a [`PhaseResume`].
 //!
-//! There is no batching, no task IDs, and no same-batch replay — SM bodies
-//! that need to run multiple plans in one engine call construct a
-//! [`PhaseOperation::Plans`] with multiple plans and recover per-plan
-//! outputs from the resulting [`PhaseState`] using their respective
+//! There is no batching, no task IDs, and no same-batch replay — SM bodies that need to run
+//! multiple plans in one engine call construct a [`PhaseOperation::Plans`] with multiple plans
+//! and recover per-plan outputs from the resulting [`PhaseState`] using their respective
 //! extractors.
 //!
-//! Zero-yield coroutines are allowed: an SM body that has no intermediate
-//! engine work to do may simply compute and return its terminal value, in
-//! which case [`StateMachine::advance`] immediately reports
-//! [`AdvanceResult::Done`].
+//! Zero-yield coroutines are allowed: an SM body that has no intermediate engine work to do may
+//! simply compute and return its terminal value, in which case [`StateMachine::advance`]
+//! immediately reports [`AdvanceResult::Done`].
+//!
+//! ## genawaiter2 panic policy
+//!
+//! This driver is built on [`genawaiter2`], which panics on protocol misuse (the body awaits a
+//! non-yield future, the body retains a `Co` after returning, etc.). The kernel's no-panic policy
+//! is preserved because the only path to `Co::yield_` is through [`Phase::execute`]; bodies
+//! awaiting that single API are correct by construction. Bodies are kernel-internal,
+//! `pub(crate)`-only, and FFI consumers see the SM only through `Box<dyn StateMachine>`, so the
+//! panic paths are unreachable in any externally-exposed code path.
 //!
 //! ## Errors
 //!
-//! Driver/body protocol bugs surface as
-//! [`GenError`](super::generator::GenError) from the underlying
-//! [`Gen`](super::generator::Gen); this module lifts them into
-//! [`DeltaError`] (`DeltaCommandInvariantViolation`). User-facing failures
-//! produced by the engine flow through [`PhaseResume`] as
-//! `Result<PhaseState, EngineError>` and are not handled here.
+//! User-facing failures produced by the engine flow through [`PhaseResume`] as
+//! `Result<PhaseState, EngineError>`; SM bodies translate to a typed kernel
+//! [`DeltaError`](crate::plans::errors::DeltaError) via
+//! [`EngineError::into_delta`](crate::plans::state_machines::framework::engine_error::EngineError::into_delta)
+//! at each call site.
 
 use std::future::Future;
+
+use genawaiter2::sync::GenBoxed;
+use genawaiter2::GeneratorState;
 
 use super::super::engine_error::EngineError;
 use super::super::phase_operation::PhaseOperation;
 use super::super::phase_state::PhaseState;
 use super::super::state_machine::{AdvanceResult, StateMachine};
-use super::generator::{Co, Gen, GenError, GeneratorState};
 use super::phase::{PhaseCo, PhaseResume, PhaseYield};
+use crate::bail_delta;
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
-use crate::{bail_delta, delta_error};
 
-type InnerGen<R> = Gen<PhaseYield, PhaseResume, Result<R, DeltaError>>;
+type InnerGen<R> = GenBoxed<PhaseYield, PhaseResume, Result<R, DeltaError>>;
 
-/// A state machine driven by a hand-rolled stackless coroutine.
+/// A state machine driven by a stackless coroutine (via [`genawaiter2`]).
 ///
-/// At each phase the body yields a single [`PhaseYield`] (operation +
-/// static phase name) and awaits the engine outcome. The driver simply
-/// shuttles operations to [`StateMachine::get_operation`] and resumes the
-/// body with the matching [`PhaseResume`] on [`StateMachine::advance`].
+/// At each phase the body yields a single [`PhaseYield`] (operation + static phase name) and
+/// awaits the engine outcome. The driver shuttles operations to [`StateMachine::get_operation`]
+/// and resumes the body with the matching [`PhaseResume`] on [`StateMachine::advance`].
 pub struct CoroutineSM<R: Send + 'static> {
     gen: InnerGen<R>,
-    /// Where the SM is positioned. `Yielded` while engine work is pending;
-    /// `Immediate` when the body completed without ever yielding (the next
-    /// `advance` hands the stored result back); `Done` once `advance` has
-    /// returned the terminal result.
+    /// Where the SM is positioned. `Yielded` while engine work is pending; `ResultReady` when the
+    /// body completed without ever yielding (the next `advance` hands the stored result back);
+    /// `Done` once `advance` has returned the terminal result.
     state: SmPosition<R>,
 }
 
-/// Internal positioning of a [`CoroutineSM`]. Drives the [`StateMachine`]
-/// contract: a queued yield, an immediately-available result for zero-yield
-/// bodies, or a terminal `Done` marker for SMs that have already handed
-/// their result back.
+/// Internal positioning of a [`CoroutineSM`]. Drives the [`StateMachine`] contract.
 enum SmPosition<R> {
-    /// Awaiting engine work for the queued yield.
+    /// A phase is queued; engine work pending.
     Yielded(PhaseYield),
-    /// Coroutine completed during construction without yielding; the next
-    /// `advance` hands the stored result back as `AdvanceResult::Done`.
-    Immediate(Result<R, DeltaError>),
-    /// Coroutine has fully terminated and the caller has consumed the result.
+    /// Body has produced its terminal result; awaiting `advance` to hand it back. Reached only by
+    /// zero-yield SMs (multi-yield SMs skip through this state inside `advance` and transition
+    /// straight to `Done`).
+    ResultReady(Result<R, DeltaError>),
+    /// Result has been consumed; terminal sink.
     Done,
 }
 
 impl<R: Send + 'static> CoroutineSM<R> {
-    /// Construct a coroutine state machine and run the producer to its first
-    /// yield (or to completion).
+    /// Construct a coroutine state machine and run the producer to its first yield (or to
+    /// completion).
     ///
-    /// If the producer yields, the first yield becomes the initial
-    /// [`PhaseYield`] returned by [`StateMachine::get_operation`]. If it
-    /// completes without yielding, the terminal result is stored and handed
-    /// back from the first [`StateMachine::advance`] call -- callers don't
-    /// need to special-case zero-yield SMs.
+    /// If the producer yields, the first yield becomes the initial [`PhaseYield`] returned by
+    /// [`StateMachine::get_operation`]. If it completes without yielding, the terminal result is
+    /// stored and handed back from the first [`StateMachine::advance`] call -- callers don't need
+    /// to special-case zero-yield SMs.
     pub(crate) fn new<F, Fut>(producer: F) -> Result<Self, DeltaError>
     where
         F: FnOnce(PhaseCo) -> Fut + Send + 'static,
         Fut: Future<Output = Result<R, DeltaError>> + Send + 'static,
     {
-        let mut gen: InnerGen<R> = Gen::new(move |co: Co<PhaseYield, PhaseResume>| producer(co));
-        let state = match gen
-            .start()
-            .map_err(|e| lift_gen_error(e, "CoroutineSM::new"))?
-        {
+        let mut gen: InnerGen<R> = GenBoxed::new_boxed(producer);
+        // genawaiter2's `Gen<Y, R, F>` exposes only `resume_with(R)`; the first resume arg is
+        // discarded because no future is yet awaiting it. We pass an inert
+        // `Ok(PhaseState::empty())` sentinel that the body would never observe.
+        let state = match gen.resume_with(PhaseResume(Ok(PhaseState::empty()))) {
             GeneratorState::Yielded(phase) => SmPosition::Yielded(phase),
-            GeneratorState::Complete(result) => SmPosition::Immediate(result),
+            GeneratorState::Complete(result) => SmPosition::ResultReady(result),
         };
         Ok(Self { gen, state })
     }
 
-    /// `true` once the coroutine has terminated and [`advance`](Self::advance)
-    /// has handed out its final result.
+    /// `true` once the coroutine has terminated and [`advance`](Self::advance) has handed out its
+    /// final result.
     pub fn is_done(&self) -> bool {
         matches!(self.state, SmPosition::Done)
     }
@@ -105,8 +107,8 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
 
     fn get_operation(&mut self) -> Result<PhaseOperation, DeltaError> {
         match &self.state {
-            SmPosition::Yielded(phase) => Ok((*phase.operation).clone()),
-            SmPosition::Immediate(_) => bail_delta!(
+            SmPosition::Yielded(phase) => Ok(phase.operation.clone()),
+            SmPosition::ResultReady(_) => bail_delta!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
                 "CoroutineSM::get_operation: zero-yield SM has no pending operation; \
                  call advance() to receive the terminal result",
@@ -123,49 +125,27 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
         result: Result<PhaseState, EngineError>,
     ) -> Result<AdvanceResult<R>, DeltaError> {
         match std::mem::replace(&mut self.state, SmPosition::Done) {
-            SmPosition::Immediate(value) => value.map(AdvanceResult::Done),
+            SmPosition::ResultReady(value) => value.map(AdvanceResult::Done),
             SmPosition::Done => bail_delta!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
                 "CoroutineSM::advance: cannot advance, already completed",
             ),
-            SmPosition::Yielded(_) => {
-                match self
-                    .gen
-                    .resume_with(PhaseResume(result))
-                    .map_err(|e| lift_gen_error(e, "CoroutineSM::advance"))?
-                {
-                    GeneratorState::Yielded(next) => {
-                        self.state = SmPosition::Yielded(next);
-                        Ok(AdvanceResult::Continue)
-                    }
-                    GeneratorState::Complete(final_result) => {
-                        // self.state already replaced with Done.
-                        final_result.map(AdvanceResult::Done)
-                    }
+            SmPosition::Yielded(_) => match self.gen.resume_with(PhaseResume(result)) {
+                GeneratorState::Yielded(next) => {
+                    self.state = SmPosition::Yielded(next);
+                    Ok(AdvanceResult::Continue)
                 }
-            }
+                GeneratorState::Complete(final_result) => final_result.map(AdvanceResult::Done),
+            },
         }
     }
 
     fn phase_name(&self) -> &'static str {
         match &self.state {
             SmPosition::Yielded(phase) => phase.phase_name,
-            SmPosition::Immediate(_) => "immediate",
-            SmPosition::Done => "complete",
+            SmPosition::ResultReady(_) | SmPosition::Done => "done",
         }
     }
-}
-
-/// Convert a coroutine-shim protocol bug into a kernel-level `DeltaError`.
-/// All [`GenError`] variants signal a kernel-internal contract violation;
-/// they should never be observed at runtime in correct code.
-fn lift_gen_error(e: GenError, operation: &'static str) -> DeltaError {
-    let detail = e.to_string();
-    delta_error!(
-        DeltaErrorCode::DeltaCommandInvariantViolation,
-        source = e,
-        "{operation}: {detail}",
-    )
 }
 
 #[cfg(test)]
@@ -192,20 +172,19 @@ mod tests {
         Plan::new(root, sink)
     }
 
-    /// Drive a two-phase SM: yield op A, observe empty PhaseState, yield op B,
-    /// complete.
+    /// Drive a two-phase SM: yield op A, observe empty PhaseState, yield op B, complete.
     #[test]
     fn two_phase_sm_executes_in_sequence() {
         let mut sm = CoroutineSM::<i64>::new(|mut co| async move {
             let mut phase = super::super::phase::Phase(&mut co);
             let _ = phase
-                .execute_raw(PhaseOperation::Plans(vec![toy_plan()]), "phase_a")
+                .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_a")
                 .await
-                .map_err(EngineError::into_delta_error_for_test)?;
+                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
             let _ = phase
-                .execute_raw(PhaseOperation::Plans(vec![toy_plan()]), "phase_b")
+                .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_b")
                 .await
-                .map_err(EngineError::into_delta_error_for_test)?;
+                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
             Ok(42)
         })
         .unwrap();
@@ -238,9 +217,9 @@ mod tests {
         let mut sm = CoroutineSM::<()>::new(|mut co| async move {
             let mut phase = super::super::phase::Phase(&mut co);
             let _ = phase
-                .execute_raw(PhaseOperation::Plans(vec![toy_plan(), toy_plan()]), "ab")
+                .execute(PhaseOperation::Plans(vec![toy_plan(), toy_plan()]), "ab")
                 .await
-                .map_err(EngineError::into_delta_error_for_test)?;
+                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
             Ok(())
         })
         .unwrap();
@@ -255,14 +234,14 @@ mod tests {
         assert!(matches!(r, AdvanceResult::Done(())));
     }
 
-    /// Engine errors flow through as `Err(EngineError)` on resume; the SM
-    /// body receives them and decides what to do.
+    /// Engine errors flow through as `Err(EngineError)` on resume; the SM body receives them and
+    /// decides what to do.
     #[test]
     fn engine_error_flows_to_body_as_resume_err() {
         let mut sm = CoroutineSM::<String>::new(|mut co| async move {
             let mut phase = super::super::phase::Phase(&mut co);
             match phase
-                .execute_raw(PhaseOperation::Plans(vec![toy_plan()]), "p")
+                .execute(PhaseOperation::Plans(vec![toy_plan()]), "p")
                 .await
             {
                 Err(e) => Ok(format!("got: {}", e.kind)),
@@ -280,9 +259,9 @@ mod tests {
         }
     }
 
-    /// Zero-yield coroutines are allowed: the first `advance` call hands the
-    /// stored terminal value back. Useful for SMs that compute their plans
-    /// entirely up-front and have no intermediate engine work.
+    /// Zero-yield coroutines are allowed: the first `advance` call hands the stored terminal
+    /// value back. Useful for SMs that compute their plans entirely up-front and have no
+    /// intermediate engine work.
     #[test]
     fn zero_phase_coroutine_returns_value_on_first_advance() {
         let mut sm = CoroutineSM::<i32>::new(|_co| async move { Ok(7) }).unwrap();
@@ -293,16 +272,5 @@ mod tests {
             _ => panic!("expected Done"),
         }
         assert!(sm.is_done());
-    }
-
-    impl EngineError {
-        fn into_delta_error_for_test(self) -> DeltaError {
-            let detail = self.display_with_source_chain();
-            crate::delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                source = self,
-                "test::lift_engine_error: {detail}",
-            )
-        }
     }
 }

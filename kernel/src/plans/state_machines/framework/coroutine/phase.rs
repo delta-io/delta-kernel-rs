@@ -4,48 +4,38 @@
 //! Three pieces, all kernel-internal:
 //!
 //! - [`PhaseYield`] / [`PhaseResume`] / [`PhaseCo`] — the typed protocol flowing through the
-//!   coroutine. Each yield is a single [`PhaseOperation`] (wrapped in [`Arc`] for cheap clones)
-//!   plus a static phase name; each resume is a `Result<PhaseState, EngineError>`.
-//! - [`Phase`] — the async surface SM authors use. The primary entry point is [`Phase::execute`],
-//!   which yields one operation and returns the resulting [`PhaseState`] with engine errors already
-//!   wrapped into a [`DeltaError`] tagged [`DeltaErrorCode::DeltaCommandInvariantViolation`]. Call
-//!   sites that need a different error code use [`Phase::execute_raw`] and wrap the raw
-//!   [`EngineError`] themselves.
+//!   coroutine. Each yield is a single [`PhaseOperation`] plus a static phase name; each resume is
+//!   a `Result<PhaseState, EngineError>`.
+//! - [`Phase`] — the async surface SM authors use. Single entry point [`Phase::execute`] yields one
+//!   operation and returns the resulting [`PhaseState`] or the raw [`EngineError`]; SM bodies
+//!   choose the appropriate [`DeltaErrorCode`] via [`EngineError::into_delta`] when lifting into a
+//!   typed kernel error. Engines emit [`EngineError`]; the kernel translates at SM level per the
+//!   layering contract documented in
+//!   [`engine_error`](crate::plans::state_machines::framework::engine_error).
 //!
 //! ## 1:1 protocol
 //!
-//! Each `Phase::execute(op, name)` corresponds to exactly one operation handed
-//! to the engine and exactly one resume. There is no batching, no separate
-//! dispatch step, and no in-driver same-batch replay: SM bodies that need to
-//! run multiple plans in a single engine call construct a
-//! [`PhaseOperation::Plans`] with multiple plans and extract per-plan outputs
-//! from the returned [`PhaseState`] using their respective
+//! Each `Phase::execute(op, name)` corresponds to exactly one operation handed to the engine and
+//! exactly one resume. There is no batching, no separate dispatch step, and no in-driver
+//! same-batch replay: SM bodies that need to run multiple plans in a single engine call construct
+//! a [`PhaseOperation::Plans`] with multiple plans and extract per-plan outputs from the
+//! returned [`PhaseState`] using their respective
 //! [`Extractor<O>`](crate::plans::ir::Extractor)s.
 
-use std::sync::Arc;
-
-use super::generator::Co;
-use crate::delta_error;
-use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::plans::state_machines::framework::engine_error::EngineError;
 use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
 use crate::plans::state_machines::framework::phase_state::PhaseState;
 
-/// Value yielded by a coroutine at each phase boundary. Carries the
-/// operation envelope plus a static phase name for diagnostics. The driver
-/// presents the operation to the engine and resumes the coroutine with a
-/// [`PhaseResume`] containing the engine outcome.
-///
-/// `Arc<PhaseOperation>` keeps the yield cheap to move through the
-/// generator and lets the driver hold a clone for `phase_name` introspection
-/// (`StateMachine::phase_name`) without cloning the entire operation.
+/// Value yielded by a coroutine at each phase boundary. Carries the operation envelope plus a
+/// static phase name for diagnostics. The driver presents the operation to the engine and resumes
+/// the coroutine with a [`PhaseResume`] containing the engine outcome.
 pub(crate) struct PhaseYield {
-    pub operation: Arc<PhaseOperation>,
+    pub operation: PhaseOperation,
     pub phase_name: &'static str,
 }
 
-/// Value the driver passes back to the coroutine on resume. Wraps the
-/// engine outcome for the most recent [`PhaseYield::operation`].
+/// Value the driver passes back to the coroutine on resume. Wraps the engine outcome for the most
+/// recent [`PhaseYield::operation`].
 pub(crate) struct PhaseResume(pub Result<PhaseState, EngineError>);
 
 impl std::fmt::Debug for PhaseResume {
@@ -57,58 +47,31 @@ impl std::fmt::Debug for PhaseResume {
     }
 }
 
-/// Coroutine handle used inside phase bodies. Thin alias over the generic
-/// [`Co`] from the [`generator`](super::generator) shim.
-pub(crate) type PhaseCo = Co<PhaseYield, PhaseResume>;
+/// Coroutine handle used inside phase bodies. Alias over [`genawaiter2::sync::Co`].
+pub(crate) type PhaseCo = genawaiter2::sync::Co<PhaseYield, PhaseResume>;
 
-/// Async surface SM authors call. Holds a mutable borrow of the coroutine
-/// handle; lives only for the duration of one phase body.
+/// Async surface SM authors call. Holds a mutable borrow of the coroutine handle; lives only for
+/// the duration of one phase body.
 pub(crate) struct Phase<'a>(pub(crate) &'a mut PhaseCo);
 
 impl<'a> Phase<'a> {
-    /// Hand `operation` to the engine and await its outcome, wrapping any
-    /// engine failure into a [`DeltaError`] tagged
-    /// [`DeltaErrorCode::DeltaCommandInvariantViolation`] with `name` as the
-    /// diagnostic prefix and the engine error attached as `source`.
-    ///
-    /// This is the SM-author entry point most call sites want. Use
-    /// [`Self::execute_raw`] when a specific error code or pattern-match on
-    /// [`EngineError::kind`](super::super::engine_error::EngineError::kind) is
-    /// required.
+    /// Hand `operation` to the engine and await its outcome. Returns the populated [`PhaseState`]
+    /// on success or the raw [`EngineError`] on failure; callers match on
+    /// [`EngineError::kind`](crate::plans::state_machines::framework::engine_error::EngineError::kind)
+    /// and lift into a kernel [`DeltaError`](crate::plans::errors::DeltaError) via
+    /// [`EngineError::into_delta`].
     pub(crate) async fn execute(
         &mut self,
         operation: PhaseOperation,
         name: &'static str,
-    ) -> Result<PhaseState, DeltaError> {
-        self.execute_raw(operation, name).await.map_err(|e| {
-            let detail = e.display_with_source_chain();
-            delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                source = e,
-                "{name}: {detail}",
-            )
-        })
-    }
-
-    /// Hand `operation` to the engine and await its raw outcome.
-    ///
-    /// Returns the populated [`PhaseState`] on success or the engine's
-    /// [`EngineError`] on failure. Callers that need a different error code
-    /// (or want to pattern-match on
-    /// [`EngineError::kind`](super::super::engine_error::EngineError::kind))
-    /// use this method and wrap the error themselves.
-    pub(crate) async fn execute_raw(
-        &mut self,
-        operation: PhaseOperation,
-        name: &'static str,
     ) -> Result<PhaseState, EngineError> {
-        let resume = self
+        let PhaseResume(result) = self
             .0
             .yield_(PhaseYield {
-                operation: Arc::new(operation),
+                operation,
                 phase_name: name,
             })
             .await;
-        resume.0
+        result
     }
 }

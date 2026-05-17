@@ -23,7 +23,7 @@
 //! drops the chain — the kind (and its rendered `Display`) is what
 //! travels over the wire.
 
-use crate::plans::errors::BoxedSource;
+use crate::plans::errors::{BoxedSource, DeltaError, DeltaErrorCode};
 use crate::Version;
 
 /// A structured, serializable error from executing a `Plan`.
@@ -227,6 +227,22 @@ impl EngineError {
             kind: EngineErrorKind::Internal,
             source: Some(Box::new(err)),
         }
+    }
+
+    /// Lift this engine error into a kernel [`DeltaError`] tagged with `code`.
+    ///
+    /// The full engine source chain is preserved via `source =` on the resulting `DeltaError`,
+    /// and the detail string is built with
+    /// [`display_with_source_chain`](Self::display_with_source_chain) rather than
+    /// [`to_string`](Self::to_string) — the latter would collapse [`EngineErrorKind::Internal`]
+    /// to the static string `"internal engine error"` and silently drop the underlying cause.
+    ///
+    /// SM bodies match on [`Self::kind`] and pick a semantically appropriate [`DeltaErrorCode`].
+    /// Bodies that don't (yet) discriminate by kind may pass
+    /// [`DeltaErrorCode::DeltaCommandInvariantViolation`] as a conservative default.
+    pub fn into_delta(self, code: DeltaErrorCode) -> DeltaError {
+        let detail = self.display_with_source_chain();
+        crate::delta_error!(code, source = self, "{detail}")
     }
 }
 
