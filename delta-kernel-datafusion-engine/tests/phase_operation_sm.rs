@@ -11,8 +11,8 @@ use delta_kernel::arrow::array::Int64Array;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch as ArrowRecordBatch;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::plans::ir::nodes::{ConsumeSink, RelationHandle, SinkType};
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::nodes::{ConsumeSink, RelationHandle};
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
 };
@@ -28,7 +28,7 @@ async fn phase_plans_runs_relation_producer_and_registers_relation() {
     let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
     let handle = RelationHandle::fresh("pipe", schema.clone());
 
-    let producer = DeclarativePlanNode::values(schema.clone(), rows)
+    let producer = PlanBuilder::values(schema.clone(), rows)
         .expect("literal")
         .into_relation(handle.clone());
 
@@ -55,9 +55,9 @@ async fn phase_plans_submits_consume_sink_into_phase_kdf_state() {
     let rows = vec![vec![Scalar::Long(10)], vec![Scalar::Long(20)]];
     let sink = ConsumeSink::new_consumer(SumRowsConsumer::new("consumer.sum_rows_phase_op"));
     let token = sink.token.clone();
-    let plan = DeclarativePlanNode::values(schema, rows)
+    let plan = PlanBuilder::values(schema, rows)
         .expect("literal")
-        .into_plan(SinkType::Consume(sink));
+        .into_consume(sink);
 
     let executor = DataFusionExecutor::try_new().unwrap();
     let accum = executor

@@ -17,7 +17,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::{column_expr, Expression, Predicate};
 use delta_kernel::plans::ir::nodes::{FileType, ScanNode};
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType as KernelDataType, MetadataColumnSpec, StructType};
 use delta_kernel::{EvaluationHandler, FileMeta};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -98,13 +98,11 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
             .add_metadata_column("rid", MetadataColumnSpec::RowIndex)
             .unwrap(),
     );
-    let plan = DeclarativePlanNode::Scan(
-        ScanNode::new(
-            FileType::Parquet,
-            vec![file_meta(&p1), file_meta(&p2)],
-            schema_with_row_index,
-        )
-    );
+    let plan = PlanBuilder::from_scan(ScanNode::new(
+        FileType::Parquet,
+        vec![file_meta(&p1), file_meta(&p2)],
+        schema_with_row_index,
+    ));
 
     let batches = scan_collect(plan).await.unwrap();
 
@@ -141,13 +139,11 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
             .add_metadata_column("rid", MetadataColumnSpec::RowIndex)
             .unwrap(),
     );
-    let plan = DeclarativePlanNode::Scan(
-        ScanNode::new(
-            FileType::Parquet,
-            vec![file_meta(&p1), file_meta(&p2)],
-            schema_with_row_index,
-        )
-    );
+    let plan = PlanBuilder::from_scan(ScanNode::new(
+        FileType::Parquet,
+        vec![file_meta(&p1), file_meta(&p2)],
+        schema_with_row_index,
+    ));
 
     let batches = scan_collect(plan).await.unwrap();
 
@@ -190,7 +186,7 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
     }
     let reference_x = flatten_i64_named(&reference_batches, "x");
 
-    let plan = DeclarativePlanNode::Scan(
+    let plan = PlanBuilder::from_scan(
         ScanNode::new(FileType::Parquet, metas, Arc::clone(&kernel_schema))
             .with_predicate(Arc::clone(&pred)),
     );

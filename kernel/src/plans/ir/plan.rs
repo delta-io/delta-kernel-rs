@@ -13,12 +13,10 @@
 use std::sync::Arc;
 use url::Url;
 
-use super::declarative::DeclarativePlanNode;
-use super::nodes::{
-    DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, SinkType,
-};
+use super::declarative::{DeclarativePlanNode, PlanBuilder};
+use super::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, SinkType};
 use crate::expressions::{col, ColumnName, Expression};
-use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
+use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::schema::{arc_schema, SchemaRef, StructType};
 
 /// Complete plan: a transforms-only [`DeclarativePlanNode`] tree terminated
@@ -67,8 +65,8 @@ impl ResultPlan {
 
 /// Reference a previously materialized relation. Clones the handle internally so callers can
 /// reuse the same `&RelationHandle` across multiple plans without writing `.clone()`.
-pub fn relation_ref(handle: &RelationHandle) -> DeclarativePlanNode {
-    DeclarativePlanNode::relation_ref(handle.clone())
+pub fn relation_ref(handle: &RelationHandle) -> PlanBuilder {
+    PlanBuilder::relation_ref(handle.clone())
 }
 
 /// Project every field of `parent`'s nested struct schema as a top-level column reference
@@ -103,31 +101,29 @@ impl PlanCollector {
         Self::default()
     }
 
-    /// Mint a fresh handle from `node.output_schema()`, terminate the chain in
-    /// a [`SinkType::Relation`] sink keyed by that handle, and return the
-    /// handle.
+    /// Mint a fresh handle from `node.schema_ref()`, terminate the chain in a
+    /// [`SinkType::Relation`] sink keyed by that handle, and return the handle.
     pub fn add_relation(
         &mut self,
         name: &str,
-        node: DeclarativePlanNode,
+        node: PlanBuilder,
     ) -> Result<RelationHandle, DeltaError> {
-        let output_schema = node.output_schema().map_err(|e| e.into_delta_default())?;
-        let handle = RelationHandle::fresh(name, output_schema);
-        let plan = node.into_plan(SinkType::Relation(handle.clone()));
+        let handle = RelationHandle::fresh(name, node.schema_ref());
+        let plan = node.into_relation(handle.clone());
         self.plans.push(plan);
         Ok(handle)
     }
 
     /// Mint a fresh handle whose schema is `sink.file_schema ++ resolved passthrough fields`,
-    /// terminate `scan_node` in the corresponding [`LoadSink`], push the resulting
-    /// plan, and return the handle.
+    /// terminate `scan_node` in the corresponding [`LoadSink`], push the resulting plan, and
+    /// return the handle.
     ///
-    /// Passthrough column types are resolved against the scan's published
-    /// schema and must exist there.
+    /// Passthrough column types are resolved against the scan's published schema and must
+    /// exist there.
     pub fn add_load(
         &mut self,
         name: &str,
-        scan_node: DeclarativePlanNode,
+        scan_node: PlanBuilder,
         file_schema: SchemaRef,
         file_type: FileType,
         base_url: Option<Url>,
@@ -135,7 +131,7 @@ impl PlanCollector {
         file_meta: ScanFileColumns,
         dv_ref: Option<DvRef>,
     ) -> Result<RelationHandle, DeltaError> {
-        let scan_schema = scan_node.output_schema().map_err(|e| e.into_delta_default())?;
+        let scan_schema = scan_node.schema_ref();
         let mut output_fields: Vec<_> = file_schema.fields().cloned().collect();
         for col in &passthrough_columns {
             let Some(leaf_name) = col.path().first() else {
@@ -232,11 +228,12 @@ mod tests {
     fn scan_publishes_scan_schema() {
         let read_schema = arc_schema([StructField::not_null("v", DataType::LONG)]);
         let mut p = PlanCollector::new();
-        let h = p.add_relation(
-            "scanned",
-            DeclarativePlanNode::scan_json(vec![], read_schema.clone()),
-        )
-        .unwrap();
+        let h = p
+            .add_relation(
+                "scanned",
+                PlanBuilder::scan_json(vec![], read_schema.clone()),
+            )
+            .unwrap();
         assert_eq!(h.schema, read_schema);
         let plans = p.into_vec();
         assert!(matches!(plans[0].root, DeclarativePlanNode::Scan(_)));
@@ -254,7 +251,7 @@ mod tests {
         let h = p
             .add_load(
                 "raw",
-                DeclarativePlanNode::scan_json(vec![], scan_schema),
+                PlanBuilder::scan_json(vec![], scan_schema),
                 file_schema.clone(),
                 FileType::Json,
                 Some(base),
@@ -288,7 +285,7 @@ mod tests {
         let err = p
             .add_load(
                 "raw",
-                DeclarativePlanNode::scan_json(vec![], scan_schema),
+                PlanBuilder::scan_json(vec![], scan_schema),
                 file_schema,
                 FileType::Json,
                 None,

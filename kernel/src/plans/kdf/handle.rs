@@ -15,6 +15,7 @@
 
 use std::any::Any;
 
+use super::token::ConsumerKdfId;
 use super::token::KdfStateToken;
 use super::trace::TraceContext;
 use super::traits::{ConsumerKdf, Kdf, KdfControl};
@@ -45,7 +46,7 @@ impl<K: Kdf + ?Sized> Handle<K> {
     pub fn ctx(&self) -> &TraceContext {
         &self.ctx
     }
-    pub fn kdf_id(&self) -> &'static str {
+    pub fn kdf_id(&self) -> ConsumerKdfId {
         self.inner.kdf_id()
     }
 }
@@ -59,7 +60,7 @@ impl<K: ConsumerKdf + ?Sized> Handle<K> {
         fields(
             sm = self.ctx.sm,
             phase = self.ctx.phase,
-            kdf_id = self.inner.kdf_id(),
+            kdf_id = %self.inner.kdf_id(),
             token_id = self.token.id,
         ),
     )]
@@ -79,7 +80,7 @@ impl<K: Kdf + ?Sized> Handle<K> {
         fields(
             sm = self.ctx.sm,
             phase = self.ctx.phase,
-            kdf_id = self.inner.kdf_id(),
+            kdf_id = %self.inner.kdf_id(),
             token_id = self.token.id,
         ),
     )]

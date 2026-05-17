@@ -15,7 +15,9 @@
 use crate::actions::{Metadata, Protocol};
 use crate::plans::errors::DeltaError;
 use crate::plans::ir::nodes::OrderingSpec;
-use crate::plans::kdf::{take_single, ConsumerKdf, KdfControl, KdfOutput, KdfStateToken};
+use crate::plans::kdf::{
+    take_single, ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput, KdfStateToken,
+};
 use crate::schema::column_name;
 use crate::{DeltaResult, EngineData};
 
@@ -37,7 +39,7 @@ impl MetadataProtocolReader {
     }
 }
 
-impl_kdf!(MetadataProtocolReader, "consumer.metadata_protocol");
+impl_kdf!(MetadataProtocolReader, ConsumerKdfId::MetadataProtocol);
 
 impl ConsumerKdf for MetadataProtocolReader {
     fn apply(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
@@ -68,7 +70,7 @@ impl KdfOutput for MetadataProtocolReader {
     type Output = (Protocol, Metadata);
 
     fn into_output(parts: Vec<Self>) -> Result<Self::Output, DeltaError> {
-        let token = KdfStateToken::new("consumer.metadata_protocol");
+        let token = KdfStateToken::new(ConsumerKdfId::MetadataProtocol);
         let single = take_single(parts, &token)?;
         let protocol = single.protocol.ok_or_else(|| missing("protocol", &token))?;
         let metadata = single.metadata.ok_or_else(|| missing("metadata", &token))?;
@@ -92,7 +94,7 @@ mod tests {
         let r = MetadataProtocolReader::new();
         assert_eq!(
             crate::plans::kdf::Kdf::kdf_id(&r),
-            "consumer.metadata_protocol"
+            ConsumerKdfId::MetadataProtocol
         );
     }
 

@@ -10,7 +10,8 @@ pub mod declarative;
 pub mod nodes;
 pub mod plan;
 
-pub use declarative::DeclarativePlanNode;
+pub use declarative::{DeclarativePlanNode, PlanBuilder};
 pub use nodes::{ConsumeSink, RelationHandle};
 pub use plan::{identity_project_struct, Plan, PlanCollector, ResultPlan};
+
 pub use crate::plans::kdf::Extractor;

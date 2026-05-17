@@ -4,8 +4,8 @@
 //! for the work an engine must perform on behalf of the kernel: scan files, apply
 //! filters, project columns, collect results. See [`ir::DeclarativePlanNode`] for
 //! the tree representation, [`ir::Plan`] for the envelope the kernel hands to the
-//! engine, and the construction methods on [`ir::DeclarativePlanNode`] for the
-//! fluent building API.
+//! engine, and [`ir::PlanBuilder`] for the fluent building API that produces these
+//! trees with their cumulative output schema.
 //!
 //! # Feature gate
 //!
@@ -19,11 +19,11 @@
 //! consume the row stream. Trees are built bottom-up with chain methods:
 //!
 //! ```ignore
-//! use delta_kernel::plans::ir::DeclarativePlanNode;
+//! use delta_kernel::plans::ir::PlanBuilder;
 //! use delta_kernel::plans::ir::nodes::RelationHandle;
 //!
 //! let handle = RelationHandle::fresh("results", schema.clone());
-//! let plan = DeclarativePlanNode::scan_json(files, schema.clone())
+//! let plan = PlanBuilder::scan_json(files, schema.clone())
 //!     .filter(predicate)
 //!     .project(projection, output_schema)
 //!     .into_relation(handle);

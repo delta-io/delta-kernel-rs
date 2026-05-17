@@ -15,7 +15,7 @@ use common::run_to_batches_with as run_scan;
 use delta_kernel::arrow::array::{Int64Array, StringArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType as KernelDataType, MetadataValue, StructField, StructType,
 };
@@ -103,7 +103,7 @@ async fn parquet_scan_matches_renamed_logical_columns_by_parquet_field_id() {
     let ex = DataFusionExecutor::try_new().unwrap();
     let batches = run_scan(
         &ex,
-        DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
+        PlanBuilder::scan_parquet(vec![file_meta(&path)], kernel_schema),
     )
     .await
     .unwrap();
@@ -152,7 +152,7 @@ async fn parquet_scan_orders_output_by_logical_schema_when_physical_column_order
     let ex = DataFusionExecutor::try_new().unwrap();
     let batches = run_scan(
         &ex,
-        DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
+        PlanBuilder::scan_parquet(vec![file_meta(&path)], kernel_schema),
     )
     .await
     .unwrap();
@@ -200,7 +200,7 @@ async fn parquet_scan_mixes_field_id_match_with_name_fallback_per_column() {
     let ex = DataFusionExecutor::try_new().unwrap();
     let batches = run_scan(
         &ex,
-        DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
+        PlanBuilder::scan_parquet(vec![file_meta(&path)], kernel_schema),
     )
     .await
     .unwrap();

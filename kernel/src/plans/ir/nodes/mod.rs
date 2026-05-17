@@ -84,7 +84,6 @@ impl ValuesNode {
 
         Ok(Self { schema, rows })
     }
-
 }
 
 // ============================================================================
@@ -142,6 +141,8 @@ pub struct JoinNode {
     pub right_keys: Vec<Arc<Expression>>,
     /// Join output semantics.
     pub join_type: JoinType,
+    /// Output schema of this join.
+    pub output_schema: SchemaRef,
 }
 
 // ============================================================================
@@ -214,6 +215,4 @@ impl WindowNode {
 
 mod sinks;
 
-pub use sinks::{
-    ConsumeSink, DvRef, LoadSink, RelationHandle, ScanFileColumns, SinkType,
-};
+pub use sinks::{ConsumeSink, DvRef, LoadSink, RelationHandle, ScanFileColumns, SinkType};

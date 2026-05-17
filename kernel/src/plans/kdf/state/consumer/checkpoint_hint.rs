@@ -10,7 +10,9 @@ use std::sync::LazyLock;
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::plans::errors::DeltaError;
-use crate::plans::kdf::{take_single, ConsumerKdf, KdfControl, KdfOutput, KdfStateToken};
+use crate::plans::kdf::{
+    take_single, ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput, KdfStateToken,
+};
 use crate::plans::record_schemas::CheckpointHintRecord;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
 use crate::{DeltaResult, EngineData};
@@ -29,7 +31,7 @@ impl CheckpointHintReader {
     }
 }
 
-impl_kdf!(CheckpointHintReader, "consumer.checkpoint_hint");
+impl_kdf!(CheckpointHintReader, ConsumerKdfId::CheckpointHint);
 
 impl ConsumerKdf for CheckpointHintReader {
     fn apply(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
@@ -51,7 +53,7 @@ impl KdfOutput for CheckpointHintReader {
     fn into_output(parts: Vec<Self>) -> Result<Self::Output, DeltaError> {
         // Global consumer: the executor produces exactly one partition.
         // Empty `parts` happens only on internal misuse — bubble up.
-        let token = KdfStateToken::new("consumer.checkpoint_hint");
+        let token = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
         let mut single = take_single(parts, &token)?;
         Ok(single.record.take())
     }
@@ -84,16 +86,12 @@ impl RowVisitor for CheckpointHintReader {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
 
-    #[test]
-    fn kdf_id_is_stable() {
-        let r = CheckpointHintReader::new();
-        assert_eq!(
-            crate::plans::kdf::Kdf::kdf_id(&r),
-            "consumer.checkpoint_hint"
-        );
-    }
+    use super::*;
+    use crate::arrow::array::{Int32Array, Int64Array, RecordBatch};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use crate::engine::arrow_data::ArrowEngineData;
 
     #[test]
     fn empty_partition_produces_none() {
@@ -103,18 +101,32 @@ mod tests {
     }
 
     #[test]
-    fn populated_state_produces_some_record() {
-        let r = CheckpointHintReader {
-            record: Some(CheckpointHintRecord {
-                version: 42,
-                size: Some(100),
-                parts: None,
-                size_in_bytes: Some(2048),
-                num_of_add_files: Some(7),
-            }),
-            processed: true,
-        };
-        let out = CheckpointHintReader::into_output(vec![r]).unwrap();
+    fn apply_reads_first_row_and_breaks() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("version", ArrowDataType::Int64, false),
+            ArrowField::new("size", ArrowDataType::Int64, true),
+            ArrowField::new("parts", ArrowDataType::Int32, true),
+            ArrowField::new("sizeInBytes", ArrowDataType::Int64, true),
+            ArrowField::new("numOfAddFiles", ArrowDataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Int64Array::from(vec![Some(100)])),
+                Arc::new(Int32Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![Some(2048)])),
+                Arc::new(Int64Array::from(vec![Some(7)])),
+            ],
+        )
+        .unwrap();
+        let engine_data = ArrowEngineData::new(batch);
+
+        let mut reader = CheckpointHintReader::default();
+        assert_eq!(reader.apply(&engine_data).unwrap(), KdfControl::Break);
+        assert_eq!(reader.apply(&engine_data).unwrap(), KdfControl::Break);
+
+        let out = CheckpointHintReader::into_output(vec![reader]).unwrap();
         let rec = out.expect("record");
         assert_eq!(rec.version, 42);
         assert_eq!(rec.num_of_add_files, Some(7));

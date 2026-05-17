@@ -22,7 +22,7 @@ use delta_kernel::expressions::{
     column_expr, BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar,
 };
 use delta_kernel::plans::ir::nodes::{JoinType, OrderingSpec, WindowFunction};
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::parquet::{file_meta, write_i64_parquet};
@@ -90,7 +90,7 @@ async fn parity_literal_matches_kernel_create_many() {
         vec![Scalar::Long(2), Scalar::Long(20)],
     ];
     let expected = kernel_literal_batch(Arc::clone(&schema), &rows);
-    let got = run_to_batches(DeclarativePlanNode::values(schema, rows).unwrap())
+    let got = run_to_batches(PlanBuilder::values(schema, rows).unwrap())
         .await
         .unwrap();
     assert_batches_equal(&expected, &got);
@@ -113,7 +113,7 @@ async fn parity_filter_matches_kernel_semantics() {
     let expected = kernel_filter(&base, pred.as_ref());
 
     let got = run_to_batches(
-        DeclarativePlanNode::values(schema, rows)
+        PlanBuilder::values(schema, rows)
             .unwrap()
             .filter(pred),
     )
@@ -148,7 +148,7 @@ async fn parity_project_matches_kernel_evaluation() {
     let expected = kernel_project(&base, &columns, Arc::clone(&out_schema));
 
     let got = run_to_batches(
-        DeclarativePlanNode::values(in_schema, rows)
+        PlanBuilder::values(in_schema, rows)
             .unwrap()
             .project(columns, out_schema),
     )
@@ -169,9 +169,9 @@ async fn parity_ordered_union_matches_kernel_concat() {
         concat_batches(&b_left.schema(), &[b_left, b_right]).expect("concat union reference");
 
     let got = run_to_batches(
-        DeclarativePlanNode::union(vec![
-            DeclarativePlanNode::values(Arc::clone(&schema), left_rows).unwrap(),
-            DeclarativePlanNode::values(Arc::clone(&schema), right_rows).unwrap(),
+        PlanBuilder::union(vec![
+            PlanBuilder::values(Arc::clone(&schema), left_rows).unwrap(),
+            PlanBuilder::values(Arc::clone(&schema), right_rows).unwrap(),
         ], true)
         .unwrap(),
     )
@@ -227,7 +227,7 @@ async fn parity_window_row_number_matches_ordered_partition_reference() {
     let expected = RecordBatch::try_new(arrow_out, cols).unwrap();
 
     let got = run_to_batches(
-        DeclarativePlanNode::values(schema, rows)
+        PlanBuilder::values(schema, rows)
             .unwrap()
             .window(
                 vec![WindowFunction {
@@ -312,10 +312,10 @@ async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
         .collect();
     let expected = inner_join_sorted_tuples(&build_tuples, &probe_tuples);
 
-    let root = DeclarativePlanNode::values(build_schema, build_rows)
+    let root = PlanBuilder::values(build_schema, build_rows)
         .unwrap()
         .join_on(
-            DeclarativePlanNode::values(probe_schema, probe_rows).unwrap(),
+            PlanBuilder::values(probe_schema, probe_rows).unwrap(),
             vec![Arc::new(Expression::column(["bk"]))],
             vec![Arc::new(Expression::column(["pk"]))],
             JoinType::Inner,
@@ -343,12 +343,12 @@ async fn parity_left_anti_join_matches_reference_probe_order() {
     );
 
     let build =
-        DeclarativePlanNode::values(build_schema.clone(), vec![vec![Scalar::Long(1)]]).unwrap();
+        PlanBuilder::values(build_schema.clone(), vec![vec![Scalar::Long(1)]]).unwrap();
     let probe_rows = vec![
         vec![Scalar::Long(2), Scalar::Long(20)],
         vec![Scalar::Long(1), Scalar::Long(10)],
     ];
-    let probe = DeclarativePlanNode::values(probe_schema.clone(), probe_rows.clone()).unwrap();
+    let probe = PlanBuilder::values(probe_schema.clone(), probe_rows.clone()).unwrap();
 
     let root = build
         .join_on(
@@ -391,7 +391,7 @@ async fn parity_scan_single_parquet_matches_arrow_reader() {
     let expected = concat_or_clone(&expected_batches);
 
     let kernel_schema_clone = Arc::clone(&kernel_schema);
-    let got = run_to_batches(DeclarativePlanNode::scan_parquet(
+    let got = run_to_batches(PlanBuilder::scan_parquet(
         vec![file_meta(&path)],
         kernel_schema,
     ))

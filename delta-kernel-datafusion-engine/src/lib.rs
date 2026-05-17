@@ -31,7 +31,7 @@ mod tests {
 
     use delta_kernel::expressions::{Expression, Scalar};
     use delta_kernel::plans::ir::nodes::RelationHandle;
-    use delta_kernel::plans::ir::DeclarativePlanNode;
+    use delta_kernel::plans::ir::PlanBuilder;
     use delta_kernel::schema::{DataType, StructField, StructType};
 
     use crate::DataFusionExecutor;
@@ -48,7 +48,7 @@ mod tests {
         let ex = DataFusionExecutor::try_new().unwrap();
         let schema = two_bool_schema();
         let handle = RelationHandle::fresh("logical_relation_test", Arc::clone(&schema));
-        let plan = DeclarativePlanNode::values(
+        let plan = PlanBuilder::values(
             Arc::clone(&schema),
             vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],
         )

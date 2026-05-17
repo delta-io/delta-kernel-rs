@@ -1,64 +1,62 @@
-//! The [`DeclarativePlanNode`] tree and its chain construction API.
+//! The [`DeclarativePlanNode`] tree plus the [`PlanBuilder`] fluent constructor.
 //!
 //! # Construction API
 //!
-//! The prototype uses a fluent-builder style directly on the enum — static
-//! constructors for leaves, chain methods for unary transforms and n-ary
-//! combinators, and terminal methods that produce a [`Plan`] (untyped) or a
-//! `(Plan, Extractor<O>)` pair (typed, via a consumer KDF that also impls
-//! [`crate::plans::kdf::KdfOutput`]).
+//! [`PlanBuilder`] is the only path that builds [`DeclarativePlanNode`] trees. Each constructor
+//! / transform carries the cumulative output schema alongside the node so downstream operators
+//! never have to re-derive it.
 //!
 //! ```ignore
-//! use delta_kernel::plans::ir::DeclarativePlanNode;
+//! use delta_kernel::plans::ir::PlanBuilder;
 //! use delta_kernel::plans::ir::nodes::RelationHandle;
 //!
 //! // Untyped pipeline: scan JSON, project to a sub-schema, pipe into a relation.
 //! let handle = RelationHandle::fresh("scanned", schema.clone());
-//! let plan = DeclarativePlanNode::scan_json(files, schema)
+//! let plan = PlanBuilder::scan_json(files, schema)
 //!     .project(projection, output_schema)
 //!     .into_relation(handle.clone());
 //!
-//! // Typed pipeline: scan JSON, drain into a typed consumer KDF, recover
-//! // the typed output from the resulting PhaseState.
-//! let (plan, extractor) = DeclarativePlanNode::scan_json(files, schema)
-//!     .consume(CheckpointHintReader::default());
+//! // Typed pipeline: scan JSON, drain into a typed consumer KDF, recover the typed output from
+//! // the resulting PhaseState.
+//! let (plan, extractor) =
+//!     PlanBuilder::scan_json(files, schema).consume(CheckpointHintReader::default());
 //! // ... after `phase.execute(PhaseOperation::Plans(vec![plan]), name).await?` ...
 //! // let hint = extractor.extract(&state)?;
 //! ```
 //!
 //! ## Core API
 //!
-//! - Constructors: [`DeclarativePlanNode::scan_json`] / [`scan_parquet`],
-//!   [`DeclarativePlanNode::values`], [`DeclarativePlanNode::relation_ref`].
-//! - Combinators: [`DeclarativePlanNode::union`].
-//! - Transforms: [`DeclarativePlanNode::filter`], [`DeclarativePlanNode::project`],
-//!   [`DeclarativePlanNode::window`].
-//! - Terminals: [`DeclarativePlanNode::into_plan`], [`DeclarativePlanNode::into_relation`],
-//!   [`DeclarativePlanNode::into_load`], [`DeclarativePlanNode::consume`],
-//!   explicit `into_plan(SinkType::Consume(...))`.
-//!
-//! [`scan_json`]: DeclarativePlanNode::scan_json
-//! [`scan_parquet`]: DeclarativePlanNode::scan_parquet
-//! [`window`]: DeclarativePlanNode::window
+//! - Constructors: [`PlanBuilder::scan_json`] / [`scan_parquet`](PlanBuilder::scan_parquet),
+//!   [`PlanBuilder::values`], [`PlanBuilder::relation_ref`], [`PlanBuilder::file_listing`],
+//!   [`PlanBuilder::union`].
+//! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`], [`PlanBuilder::window`],
+//!   [`PlanBuilder::join`], [`PlanBuilder::join_on`].
+//! - Terminals: [`PlanBuilder::into_relation`], [`PlanBuilder::into_load`],
+//!   [`PlanBuilder::into_consume`], [`PlanBuilder::consume`].
 
 use std::sync::Arc;
+
+use url::Url;
 
 use super::nodes::*;
 use super::plan::Plan;
 use crate::expressions::{Expression, Scalar};
 use crate::plans::kdf::typed::make_extract;
 use crate::plans::kdf::{ConsumerKdf, Extractor, KdfOutput};
-use crate::schema::{arc_schema, DataType, SchemaRef, StructField};
+use crate::schema::{arc_schema, DataType, SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Error, FileMeta};
 
 /// A single node in the declarative plan tree.
+///
+/// The enum carries node-local payloads only; the cumulative output schema is tracked alongside
+/// the tree by [`PlanBuilder`].
 #[derive(Debug, Clone)]
 pub enum DeclarativePlanNode {
     // Leaves
     Scan(ScanNode),
     FileListing(FileListingNode),
     Values(ValuesNode),
-    /// Read batches from a relation produced by another plan 
+    /// Read batches from a relation produced by another plan terminating in
     /// [`SinkType::Relation`](super::nodes::SinkType::Relation).
     RelationRef(RelationHandle),
 
@@ -92,40 +90,91 @@ pub enum DeclarativePlanNode {
 }
 
 // ============================================================================
-// Leaves — static constructors
+// PlanBuilder — fluent construction with eager schema derivation
 // ============================================================================
 
-impl DeclarativePlanNode {
+/// Cumulative builder for a [`DeclarativePlanNode`] tree.
+///
+/// Every constructor stamps the leaf's output schema; every transform recomputes the new
+/// cumulative output schema from `self.schema` plus the transform's local contribution. The
+/// terminal methods consume the builder and produce a [`Plan`].
+#[derive(Debug, Clone)]
+pub struct PlanBuilder {
+    schema: SchemaRef,
+    node: DeclarativePlanNode,
+}
+
+// --- Leaves -----------------------------------------------------------------
+
+impl PlanBuilder {
     /// Scan JSON files with an explicit schema.
     pub fn scan_json(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
-        Self::Scan(ScanNode::new(FileType::Json, files, schema))
+        let node = DeclarativePlanNode::Scan(ScanNode::new(
+            FileType::Json,
+            files,
+            Arc::clone(&schema),
+        ));
+        Self { schema, node }
     }
 
     /// Scan Parquet files with an explicit schema.
     pub fn scan_parquet(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
-        Self::Scan(ScanNode::new(FileType::Parquet, files, schema))
+        let node = DeclarativePlanNode::Scan(ScanNode::new(
+            FileType::Parquet,
+            files,
+            Arc::clone(&schema),
+        ));
+        Self { schema, node }
     }
 
-    /// Read batches from a relation produced by another plan in the same
-    /// `PhaseOperation::Plans(...)`. The producing plan terminates in
-    /// [`SinkType::Relation`](super::nodes::SinkType::Relation) referencing
-    /// the same handle.
-    pub fn relation_ref(handle: RelationHandle) -> Self {
-        Self::RelationRef(handle)
+    /// Wrap a pre-built [`ScanNode`] (used by callers that need to attach `with_predicate`
+    /// before sealing the builder).
+    pub fn from_scan(scan: ScanNode) -> Self {
+        let schema = Arc::clone(&scan.schema);
+        Self {
+            schema,
+            node: DeclarativePlanNode::Scan(scan),
+        }
     }
 
     /// Multi-row `VALUES`-style literal table. Rows × columns layout; see [`ValuesNode`]
     /// invariants.
     pub fn values(schema: SchemaRef, rows: Vec<Vec<Scalar>>) -> DeltaResult<Self> {
-        Ok(Self::Values(ValuesNode::try_new(schema, rows)?))
+        let values = ValuesNode::try_new(Arc::clone(&schema), rows)?;
+        Ok(Self {
+            schema,
+            node: DeclarativePlanNode::Values(values),
+        })
     }
 
-    /// Union of N child streams.
+    /// Read batches from a relation produced by another plan in the same
+    /// `PhaseOperation::Plans(...)`. The producing plan terminates in
+    /// [`SinkType::Relation`](super::nodes::SinkType::Relation) referencing the same handle.
+    pub fn relation_ref(handle: RelationHandle) -> Self {
+        let schema = Arc::clone(&handle.schema);
+        Self {
+            schema,
+            node: DeclarativePlanNode::RelationRef(handle),
+        }
+    }
+
+    /// One-row-per-object directory listing leaf. Output schema is the canonical
+    /// `(path, size, modification_time)` triple.
+    pub fn file_listing(path: Url) -> Self {
+        Self {
+            schema: file_listing_output_schema(),
+            node: DeclarativePlanNode::FileListing(FileListingNode { path }),
+        }
+    }
+
+    /// Union of N child streams. See [`UnionNode`] for ordered/unordered semantics.
     ///
     /// - `ordered = false`: the engine may interleave/reorder children.
     /// - `ordered = true`: children are consumed in declaration order.
     ///
-    /// For `ordered = true`, a single child is unwrapped.
+    /// For `ordered = true` with a single child, the child is unwrapped (returned directly).
+    /// The cumulative schema is the first child's schema (matching [`UnionNode`] semantics);
+    /// a zero-child union yields the empty struct.
     pub fn union<I>(children: I, ordered: bool) -> DeltaResult<Self>
     where
         I: IntoIterator<Item = Self>,
@@ -136,39 +185,51 @@ impl DeclarativePlanNode {
                 .pop()
                 .ok_or_else(|| Error::generic("internal: single-child union drained empty"));
         }
-        Ok(Self::Union {
-            children,
-            node: UnionNode { ordered },
+        let schema = children
+            .first()
+            .map(|c| Arc::clone(&c.schema))
+            .unwrap_or_else(empty_schema);
+        let nodes: Vec<DeclarativePlanNode> = children.into_iter().map(|c| c.node).collect();
+        Ok(Self {
+            schema,
+            node: DeclarativePlanNode::Union {
+                children: nodes,
+                node: UnionNode { ordered },
+            },
         })
     }
-
 }
 
-// ============================================================================
-// Transforms
-// ============================================================================
+// --- Transforms -------------------------------------------------------------
 
-impl DeclarativePlanNode {
-    /// Wrap `self` in a [`Filter`](Self::Filter).
+impl PlanBuilder {
+    /// Wrap `self` in a [`Filter`](DeclarativePlanNode::Filter). Schema unchanged.
     pub fn filter(self, predicate: Arc<Expression>) -> Self {
-        Self::Filter {
-            child: Box::new(self),
-            node: FilterNode { predicate },
-        }
-    }
-
-    /// Wrap `self` in a [`Project`](Self::Project).
-    pub fn project(self, columns: Vec<Arc<Expression>>, output_schema: SchemaRef) -> Self {
-        Self::Project {
-            child: Box::new(self),
-            node: ProjectNode {
-                columns,
-                output_schema,
+        Self {
+            schema: self.schema,
+            node: DeclarativePlanNode::Filter {
+                child: Box::new(self.node),
+                node: FilterNode { predicate },
             },
         }
     }
 
-    /// Wrap `self` in a [`Window`](Self::Window) with partition keys and ordering specs.
+    /// Wrap `self` in a [`Project`](DeclarativePlanNode::Project). New schema is `output_schema`.
+    pub fn project(self, columns: Vec<Arc<Expression>>, output_schema: SchemaRef) -> Self {
+        Self {
+            schema: Arc::clone(&output_schema),
+            node: DeclarativePlanNode::Project {
+                child: Box::new(self.node),
+                node: ProjectNode {
+                    columns,
+                    output_schema,
+                },
+            },
+        }
+    }
+
+    /// Wrap `self` in a [`Window`](DeclarativePlanNode::Window) with partition keys and ordering
+    /// specs. New schema is `self.schema` plus one `NOT NULL LONG` field per window function.
     pub fn window(
         self,
         functions: Vec<WindowFunction>,
@@ -176,9 +237,20 @@ impl DeclarativePlanNode {
         order_by: Vec<OrderingSpec>,
     ) -> DeltaResult<Self> {
         let node = WindowNode::try_new(functions, partition_by, order_by)?;
-        Ok(Self::Window {
-            child: Box::new(self),
-            node,
+        let mut fields: Vec<StructField> = self.schema.fields().cloned().collect();
+        for func in &node.functions {
+            fields.push(StructField::not_null(
+                func.output_col.clone(),
+                DataType::LONG,
+            ));
+        }
+        let new_schema = arc_schema(fields);
+        Ok(Self {
+            schema: new_schema,
+            node: DeclarativePlanNode::Window {
+                child: Box::new(self.node),
+                node,
+            },
         })
     }
 
@@ -187,13 +259,11 @@ impl DeclarativePlanNode {
     /// Key columns are inferred from same-name top-level fields in left/right schemas.
     /// Any same-name column with mismatched types is rejected.
     pub fn join(self, right: Self, join_type: JoinType) -> DeltaResult<Self> {
-        let left_schema = self.output_schema()?;
-        let right_schema = right.output_schema()?;
         let mut right_keys = Vec::new();
         let mut left_keys = Vec::new();
-        for left_field in left_schema.fields() {
+        for left_field in self.schema.fields() {
             let name = left_field.name();
-            if let Some(right_field) = right_schema.field(name) {
+            if let Some(right_field) = right.schema.field(name) {
                 if right_field.data_type() != left_field.data_type() {
                     return Err(Error::generic(format!(
                         "join key type mismatch for column `{name}`: left={:?}, right={:?}",
@@ -214,6 +284,10 @@ impl DeclarativePlanNode {
     }
 
     /// Join `self` (left side) with `right` using explicit key expressions.
+    ///
+    /// Schema follows [`JoinType`]:
+    /// - [`JoinType::Inner`]: left fields concatenated with right fields.
+    /// - [`JoinType::LeftAnti`]: right schema (probe rows that did NOT match).
     pub fn join_on(
         self,
         right: Self,
@@ -233,51 +307,78 @@ impl DeclarativePlanNode {
                 right_keys.len()
             )));
         }
-        Ok(Self::Join {
-            build: Box::new(self),
-            probe: Box::new(right),
-            node: JoinNode {
-                left_keys,
-                right_keys,
-                join_type,
+        let output_schema = match join_type {
+            JoinType::LeftAnti => Arc::clone(&right.schema),
+            JoinType::Inner => {
+                let mut fields: Vec<StructField> = self.schema.fields().cloned().collect();
+                fields.extend(right.schema.fields().cloned());
+                arc_schema(fields)
+            }
+        };
+        Ok(Self {
+            schema: Arc::clone(&output_schema),
+            node: DeclarativePlanNode::Join {
+                build: Box::new(self.node),
+                probe: Box::new(right.node),
+                node: JoinNode {
+                    left_keys,
+                    right_keys,
+                    join_type,
+                    output_schema,
+                },
             },
         })
     }
-
 }
 
-// ============================================================================
-// Terminals
-// ============================================================================
+// --- Accessors --------------------------------------------------------------
 
-impl DeclarativePlanNode {
-    /// Wrap this tree in a [`Plan`] with the given sink.
-    pub fn into_plan(self, sink_type: SinkType) -> Plan {
-        Plan::new(self, sink_type)
+impl PlanBuilder {
+    /// Cumulative output schema of the row stream this subtree produces.
+    pub fn schema_ref(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
     }
 
-    /// Terminal: stream every output batch to the named relation. Another
-    /// plan in the same `PhaseOperation::Plans(...)` consumes the relation
-    /// via [`Self::relation_ref`], or a
-    /// [`ResultPlan`](super::plan::ResultPlan) names this relation as its
-    /// caller-facing output.
+    /// Borrow the underlying node tree (useful for tests / debug formatting).
+    pub fn node(&self) -> &DeclarativePlanNode {
+        &self.node
+    }
+
+    /// Decompose into `(node, schema)`. The schema mirrors what the plan emits.
+    pub fn into_parts(self) -> (DeclarativePlanNode, SchemaRef) {
+        (self.node, self.schema)
+    }
+}
+
+// --- Terminals --------------------------------------------------------------
+
+impl PlanBuilder {
+    /// Terminal: stream every output batch to the named relation. Another plan in the same
+    /// `PhaseOperation::Plans(...)` consumes the relation via [`PlanBuilder::relation_ref`], or
+    /// a [`ResultPlan`](super::plan::ResultPlan) names this relation as its caller-facing output.
     pub fn into_relation(self, handle: RelationHandle) -> Plan {
-        self.into_plan(SinkType::Relation(handle))
+        Plan::new(self.node, SinkType::Relation(handle))
     }
 
-    /// Terminal: file-reader sink. For each upstream row, open the resolved
-    /// file, read [`LoadSink::file_schema`] columns (with optional DV masking
-    /// when [`LoadSink::dv_ref`] names an upstream descriptor column), and
-    /// materialize the result under [`LoadSink::output_relation`] for downstream
-    /// [`Self::relation_ref`] consumers in the same phase. See [`LoadSink`].
+    /// Terminal: file-reader sink. For each upstream row, open the resolved file, read
+    /// [`LoadSink::file_schema`] columns (with optional DV masking when [`LoadSink::dv_ref`]
+    /// names an upstream descriptor column), and materialize the result under
+    /// [`LoadSink::output_relation`] for downstream [`PlanBuilder::relation_ref`] consumers in
+    /// the same phase. See [`LoadSink`].
     pub fn into_load(self, sink: LoadSink) -> Plan {
-        self.into_plan(SinkType::Load(sink))
+        Plan::new(self.node, SinkType::Load(sink))
+    }
+
+    /// Terminal: explicit [`SinkType::Consume`] with a pre-built [`ConsumeSink`]. Use when the
+    /// caller already wired the sink (e.g. to share a token outside the builder), otherwise
+    /// prefer [`Self::consume`] which constructs the sink and returns a paired [`Extractor`].
+    pub fn into_consume(self, sink: ConsumeSink) -> Plan {
+        Plan::new(self.node, SinkType::Consume(sink))
     }
 
     /// Typed consumer terminal. Wraps `self` in a [`Plan`] terminating in
-    /// [`SinkType::Consume`] and returns the plan paired with an
-    /// [`Extractor<O>`] that pulls the typed output from the resulting
-    /// [`PhaseState`].
+    /// [`SinkType::Consume`] and returns the plan paired with an [`Extractor<O>`] that pulls
+    /// the typed output from the resulting [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
     pub fn consume<S>(self, state: S) -> (Plan, Extractor<S::Output>)
     where
         S: ConsumerKdf + KdfOutput + 'static,
@@ -285,90 +386,28 @@ impl DeclarativePlanNode {
         let node = ConsumeSink::new_consumer(state);
         let token = node.token.clone();
         let extract = make_extract::<S>(token.clone());
-        let plan = self.into_plan(SinkType::Consume(node));
+        let plan = Plan::new(self.node, SinkType::Consume(node));
         (plan, Extractor::new(token, extract))
     }
 }
 
 // ============================================================================
-// Introspection
+// Internal helpers
 // ============================================================================
 
-impl DeclarativePlanNode {
-    /// Schema of the row stream this subtree produces.
-    ///
-    /// Walks the tree, deriving each node's output from its children plus the
-    /// node-local schema metadata (project's output schema, window's appended
-    /// row-number columns, etc.). Schemas are returned via
-    /// [`crate::schema::arc_schema`] / [`crate::schema::SchemaBuilder::build_unchecked`].
-    ///
-    /// For `Union`, the canonical schema is the first child's (matching
-    /// [`UnionNode`] semantics); a zero-child union yields the empty struct.
-    /// For `Join::LeftAnti`, the output mirrors the right child; for
-    /// `Join::Inner` it concatenates left then right.
-    ///
-    /// Returns an error when any node-local schema contract is invalid.
-    pub fn output_schema(&self) -> DeltaResult<SchemaRef> {
-        match self {
-            Self::Scan(scan) => Ok(scan.schema.clone()),
-            Self::FileListing(_) => Ok(file_listing_output_schema()),
-            Self::Values(v) => Ok(v.schema.clone()),
-            Self::RelationRef(handle) => Ok(handle.schema.clone()),
-            Self::Filter { child, .. } => child.output_schema(),
-            Self::Project { node, .. } => Ok(node.output_schema.clone()),
-            Self::Window { child, node } => {
-                let mut fields: Vec<StructField> = child.output_schema()?.fields().cloned().collect();
-                for func in &node.functions {
-                    fields.push(StructField::not_null(
-                        func.output_col.clone(),
-                        DataType::LONG,
-                    ));
-                }
-                Ok(arc_schema(fields))
-            }
-            Self::Union { children, .. } => match children.first() {
-                Some(first) => first.output_schema(),
-                None => Ok(arc_schema(Vec::<StructField>::new())),
-            },
-            Self::Join {
-                build: left,
-                probe: right,
-                node,
-                ..
-            } => match node.join_type {
-                JoinType::LeftAnti => right.output_schema(),
-                JoinType::Inner => {
-                    let mut fields: Vec<StructField> = left.output_schema()?.fields().cloned().collect();
-                    fields.extend(right.output_schema()?.fields().cloned());
-                    Ok(arc_schema(fields))
-                }
-            },
-        }
-    }
-}
-
-// ============================================================================
-// Free-function entry points
-// ============================================================================
-
-/// Start a chain from an upstream relation handle.
-///
-/// Clones the handle internally so the same `&RelationHandle` can feed multiple
-/// plans without manual `.clone()` calls. The returned node's output schema
-/// matches the relation's published schema.
-pub fn relation_ref(handle: &RelationHandle) -> DeclarativePlanNode {
-    DeclarativePlanNode::relation_ref(handle.clone())
-}
-
-/// Canonical schema for [`DeclarativePlanNode::FileListing`]: one row per object
-/// with `path`, `size`, and `modification_time` columns. Mirrors the columns
-/// engines emit when they materialize a directory listing.
+/// Canonical schema for [`DeclarativePlanNode::FileListing`]: one row per object with `path`,
+/// `size`, and `modification_time` columns. Mirrors the columns engines emit when they
+/// materialize a directory listing.
 fn file_listing_output_schema() -> SchemaRef {
     arc_schema([
         StructField::not_null("path", DataType::STRING),
         StructField::not_null("size", DataType::LONG),
         StructField::not_null("modification_time", DataType::LONG),
     ])
+}
+
+fn empty_schema() -> SchemaRef {
+    Arc::new(StructType::new_unchecked(Vec::<StructField>::new()))
 }
 
 // ============================================================================
@@ -384,8 +423,8 @@ mod tests {
     use super::*;
     use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
-    use crate::plans::ir::nodes::{DvRef, OrderingSpec, WindowFunction};
-    use crate::plans::kdf::{ConsumerKdf, Kdf, KdfControl, KdfOutput};
+    use crate::plans::ir::nodes::{OrderingSpec, WindowFunction};
+    use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, Kdf, KdfControl, KdfOutput};
     use crate::schema::{DataType, StructField, StructType};
 
     fn simple_schema() -> SchemaRef {
@@ -405,8 +444,8 @@ mod tests {
             "k",
             DataType::STRING,
         )]));
-        let left = DeclarativePlanNode::scan_json(vec![], left_schema);
-        let right = DeclarativePlanNode::scan_json(vec![], right_schema);
+        let left = PlanBuilder::scan_json(vec![], left_schema);
+        let right = PlanBuilder::scan_json(vec![], right_schema);
         let err = left.join(right, JoinType::Inner).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -432,7 +471,7 @@ mod tests {
             StructField::not_null("a", DataType::LONG),
             StructField::not_null("b", DataType::LONG),
         ]));
-        let result = DeclarativePlanNode::values(schema, vec![row]);
+        let result = PlanBuilder::values(schema, vec![row]);
         if expect_ok {
             assert!(result.is_ok());
         } else {
@@ -448,39 +487,31 @@ mod tests {
         let wf = WindowFunction {
             output_col: "_rn".into(),
         };
-        let plan = DeclarativePlanNode::scan_json(vec![], simple_schema())
+        let plan = PlanBuilder::scan_json(vec![], simple_schema())
             .window(
                 vec![wf],
                 vec![Arc::new(Expression::column(["version"]))],
                 order_by,
             )
             .unwrap();
-        assert!(matches!(plan, DeclarativePlanNode::Window { .. }));
+        assert!(matches!(plan.node(), DeclarativePlanNode::Window { .. }));
     }
 
-    #[rstest]
-    #[case(
-        DeclarativePlanNode::union(Vec::<DeclarativePlanNode>::new(), false).unwrap(),
-        vec![]
-    )]
-    #[case(
-        DeclarativePlanNode::FileListing(FileListingNode {
-            path: url::Url::parse("file:///tmp").unwrap(),
-        }),
-        vec!["path", "size", "modification_time"]
-    )]
-    fn output_schema_cases_match_expected_fields(
-        #[case] node: DeclarativePlanNode,
-        #[case] expected_fields: Vec<&str>,
-    ) {
-        let names: Vec<String> = node
-            .output_schema()
-            .unwrap()
+    #[test]
+    fn empty_union_yields_empty_schema() {
+        let pb = PlanBuilder::union(Vec::<PlanBuilder>::new(), false).unwrap();
+        assert_eq!(pb.schema_ref().fields().count(), 0);
+    }
+
+    #[test]
+    fn file_listing_schema_is_canonical_triple() {
+        let pb = PlanBuilder::file_listing(url::Url::parse("file:///tmp").unwrap());
+        let names: Vec<String> = pb
+            .schema_ref()
             .fields()
             .map(|f| f.name().clone())
             .collect();
-        let expected: Vec<String> = expected_fields.iter().map(|s| s.to_string()).collect();
-        assert_eq!(names, expected);
+        assert_eq!(names, vec!["path", "size", "modification_time"]);
     }
 
     // === Consumer-KDF tests (validated via a test-local consumer state) ===
@@ -488,8 +519,8 @@ mod tests {
     #[derive(Debug, Clone)]
     struct NoopConsumer;
     impl Kdf for NoopConsumer {
-        fn kdf_id(&self) -> &'static str {
-            "consumer.noop"
+        fn kdf_id(&self) -> ConsumerKdfId {
+            ConsumerKdfId::CheckpointHint
         }
         fn finish(self: Box<Self>) -> Box<dyn Any + Send> {
             Box::new(*self)
@@ -513,12 +544,9 @@ mod tests {
         use crate::plans::state_machines::framework::phase_state::PhaseState;
 
         let (plan, extractor) =
-            DeclarativePlanNode::scan_json(vec![], simple_schema()).consume(NoopConsumer);
+            PlanBuilder::scan_json(vec![], simple_schema()).consume(NoopConsumer);
         let _ = plan;
-        assert_eq!(
-            extractor.token().kdf_type,
-            crate::plans::kdf::token::KdfType::Consumer("consumer.noop".to_string())
-        );
+        assert_eq!(extractor.token().kdf_id, ConsumerKdfId::CheckpointHint);
 
         let state = PhaseState::empty();
         state.submit_kdf_handle(FinishedHandle {
@@ -530,17 +558,14 @@ mod tests {
     }
 
     #[test]
-    fn token_embeds_kdf_type_name() {
+    fn token_embeds_kdf_id_name() {
         let node = ConsumeSink::new_consumer(NoopConsumer);
-        assert_eq!(
-            node.token.kdf_type,
-            crate::plans::kdf::token::KdfType::Consumer("consumer.noop".to_string())
-        );
+        assert_eq!(node.token.kdf_id, ConsumerKdfId::CheckpointHint);
         let s = node.token.to_string();
-        assert!(s.starts_with("consumer.noop#"), "got: {s}");
+        assert!(s.starts_with("consumer.checkpoint_hint#"), "got: {s}");
     }
 
-    // === Chain-method tests (free `relation_ref` + transforms on DeclarativePlanNode) ===
+    // === Chain-method tests (relation_ref + transforms on PlanBuilder) ===
 
     fn ints_schema() -> SchemaRef {
         arc_schema([
@@ -556,8 +581,44 @@ mod tests {
     #[test]
     fn relation_ref_initial_schema_matches_handle() {
         let h = fresh_handle("src");
-        let node = relation_ref(&h);
-        assert_eq!(node.output_schema().unwrap(), h.schema);
+        let pb = PlanBuilder::relation_ref(h.clone());
+        assert_eq!(pb.schema_ref(), h.schema);
     }
 
+    #[test]
+    fn join_inner_concats_schemas_join_left_anti_mirrors_right() {
+        let left = PlanBuilder::scan_json(
+            vec![],
+            arc_schema([StructField::not_null("k", DataType::LONG)]),
+        );
+        let right = PlanBuilder::scan_json(
+            vec![],
+            arc_schema([
+                StructField::not_null("k", DataType::LONG),
+                StructField::nullable("v", DataType::STRING),
+            ]),
+        );
+        let inner = left
+            .clone()
+            .join(right.clone(), JoinType::Inner)
+            .unwrap();
+        let inner_names: Vec<String> = inner
+            .schema_ref()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(inner_names, vec!["k", "k", "v"]);
+        let anti = left.join(right.clone(), JoinType::LeftAnti).unwrap();
+        let anti_names: Vec<String> = anti
+            .schema_ref()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        let right_names: Vec<String> = right
+            .schema_ref()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(anti_names, right_names);
+    }
 }

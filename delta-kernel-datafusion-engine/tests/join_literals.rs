@@ -8,7 +8,7 @@ use common::run_to_batches_blocking as run_to_batches;
 use delta_kernel::arrow::array::AsArray;
 use delta_kernel::expressions::{Expression, Scalar};
 use delta_kernel::plans::ir::nodes::JoinType;
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
 
 #[test]
@@ -28,7 +28,7 @@ fn hash_inner_join_literals_matching_keys_single_row() {
         .unwrap(),
     );
 
-    let build = DeclarativePlanNode::values(
+    let build = PlanBuilder::values(
         build_schema.clone(),
         vec![
             vec![Scalar::Long(10), Scalar::Long(100)],
@@ -37,7 +37,7 @@ fn hash_inner_join_literals_matching_keys_single_row() {
     )
     .unwrap();
 
-    let probe = DeclarativePlanNode::values(
+    let probe = PlanBuilder::values(
         probe_schema.clone(),
         vec![
             vec![Scalar::Long(10), Scalar::Long(1000)],
@@ -90,10 +90,9 @@ fn hash_left_anti_join_literals_keeps_non_matching_probe_rows() {
         .unwrap(),
     );
 
-    let build =
-        DeclarativePlanNode::values(build_schema.clone(), vec![vec![Scalar::Long(1)]]).unwrap();
+    let build = PlanBuilder::values(build_schema.clone(), vec![vec![Scalar::Long(1)]]).unwrap();
 
-    let probe = DeclarativePlanNode::values(
+    let probe = PlanBuilder::values(
         probe_schema.clone(),
         vec![
             vec![Scalar::Long(2), Scalar::Long(20)],

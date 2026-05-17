@@ -5,8 +5,8 @@ mod common;
 
 use common::SumRowsConsumer;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::plans::ir::nodes::{ConsumeSink, RelationHandle, SinkType};
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::nodes::{ConsumeSink, RelationHandle};
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use test_utils::schemas::single_long_schema;
@@ -17,7 +17,7 @@ async fn relation_sink_registers_batches_readable_via_relation_leaf() {
     let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
     let handle = RelationHandle::fresh("pipe", schema.clone());
 
-    let producer = DeclarativePlanNode::values(schema.clone(), rows)
+    let producer = PlanBuilder::values(schema.clone(), rows)
         .expect("literal")
         .into_relation(handle.clone());
 
@@ -35,9 +35,9 @@ async fn consume_sink_drains_literal_and_harvests_finished_handle() {
     let rows = vec![vec![Scalar::Long(10)], vec![Scalar::Long(20)]];
     let sink = ConsumeSink::new_consumer(SumRowsConsumer::new("consumer.sum_rows_test"));
     let token = sink.token.clone();
-    let plan = DeclarativePlanNode::values(schema, rows)
+    let plan = PlanBuilder::values(schema, rows)
         .expect("literal")
-        .into_plan(SinkType::Consume(sink));
+        .into_consume(sink);
 
     let executor = DataFusionExecutor::try_new().unwrap();
     let state = executor

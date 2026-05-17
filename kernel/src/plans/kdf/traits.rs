@@ -24,6 +24,7 @@ use std::any::Any;
 use dyn_clone::DynClone;
 
 use crate::plans::ir::nodes::OrderingSpec;
+use crate::plans::kdf::token::ConsumerKdfId;
 use crate::{DeltaResult, EngineData};
 
 /// Loop control returned by a consumer after each batch.
@@ -55,7 +56,7 @@ pub trait Kdf: Send + std::fmt::Debug {
     ///
     /// Convention: `consumer.<name>` with `<name>` = snake_case.
     /// Stable per-type.
-    fn kdf_id(&self) -> &'static str;
+    fn kdf_id(&self) -> ConsumerKdfId;
 
     /// Consume the finalized KDF, returning its state erased to
     /// `Box<dyn Any + Send>`. Typed factories downcast inside their extract

@@ -7,10 +7,8 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::arrow::array::AsArray;
 use delta_kernel::expressions::{ColumnName, Scalar, StructData};
-use delta_kernel::plans::ir::nodes::{
-    DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, ValuesNode,
-};
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType, ToSchema};
 use delta_kernel::FileMeta;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
@@ -96,16 +94,17 @@ async fn load_sink_broadcasts_passthrough_columns() {
         file_type: FileType::Parquet,
     };
 
-    let lit = DeclarativePlanNode::Values(ValuesNode {
-        schema: upstream_schema,
-        rows: vec![
+    let lit = PlanBuilder::values(
+        upstream_schema,
+        vec![
             vec![
                 Scalar::String(rel_path.clone()),
                 Scalar::String("alpha".into()),
             ],
             vec![Scalar::String(rel_path), Scalar::String("beta".into())],
         ],
-    });
+    )
+    .unwrap();
 
     let producer_plan = lit.into_load(sink);
 
@@ -167,10 +166,7 @@ async fn load_sink_without_dv_reads_full_parquet_row_group() {
         file_type: FileType::Parquet,
     };
 
-    let lit = DeclarativePlanNode::Values(ValuesNode {
-        schema: upstream_schema,
-        rows: vec![vec![Scalar::String(path_str)]],
-    });
+    let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(path_str)]]).unwrap();
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor
@@ -238,10 +234,11 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
         file_type: FileType::Parquet,
     };
 
-    let lit = DeclarativePlanNode::Values(ValuesNode {
-        schema: upstream_schema,
-        rows: vec![vec![Scalar::String(path_str), dv_example_scalar()]],
-    });
+    let lit = PlanBuilder::values(
+        upstream_schema,
+        vec![vec![Scalar::String(path_str), dv_example_scalar()]],
+    )
+    .unwrap();
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor
@@ -282,10 +279,7 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
         file_type: FileType::Json,
     };
 
-    let lit = DeclarativePlanNode::Values(ValuesNode {
-        schema: upstream_schema,
-        rows: vec![vec![Scalar::String(rel)]],
-    });
+    let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor

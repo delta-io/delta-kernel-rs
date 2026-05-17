@@ -110,7 +110,7 @@ impl PhaseState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plans::kdf::TraceContext;
+    use crate::plans::kdf::{ConsumerKdfId, TraceContext};
     use crate::schema::StructType;
 
     fn finished_handle(token: &KdfStateToken, payload: i64) -> FinishedHandle {
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn empty_accumulator_yields_no_payloads_for_any_token() {
         let s = PhaseState::empty();
-        let t = KdfStateToken::new("test.never");
+        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
         assert!(s.take_by_token(&t).is_empty());
         assert!(s.take_schema().is_none());
     }
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn submit_and_take_kdf_roundtrips_payloads() {
         let s = PhaseState::empty();
-        let t = KdfStateToken::new("test.one");
+        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
 
         s.submit_kdf_handle(finished_handle(&t, 10));
         s.submit_kdf_handle(finished_handle(&t, 20));
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn take_by_unknown_token_returns_empty() {
         let s = PhaseState::empty();
-        let t = KdfStateToken::new("test.never_submitted");
+        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
         assert!(s.take_by_token(&t).is_empty());
     }
 
@@ -170,7 +170,7 @@ mod tests {
     fn clone_shares_inner_state() {
         let a = PhaseState::empty();
         let b = a.clone();
-        let t = KdfStateToken::new("test.shared");
+        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
 
         a.submit_kdf_handle(finished_handle(&t, 99));
 
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn schema_and_kdf_payloads_coexist() {
         let s = PhaseState::empty();
-        let t = KdfStateToken::new("test.coexist");
+        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
         s.submit_kdf_handle(finished_handle(&t, 1));
         let schema: SchemaRef = Arc::new(StructType::new_unchecked(Vec::<
             crate::schema::StructField,

@@ -159,10 +159,7 @@ fn compile_declarative_node_logical(
             let plan = LogicalPlanBuilder::from(build_plan)
                 .join_with_expr_keys(probe_plan, join_type, (left_keys, right_keys), None)?
                 .build()?;
-            let target_schema = plan_node
-                .output_schema()
-                .map_err(|e| plan_compilation(format!("join output schema derivation failed: {e}")))?;
-            canonicalize_output_to_kernel_schema(plan, &target_schema)
+            canonicalize_output_to_kernel_schema(plan, &join_node.output_schema)
         }
         DeclarativePlanNode::Window { child, node } => {
             if node.functions.is_empty() {

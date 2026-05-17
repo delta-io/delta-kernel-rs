@@ -9,7 +9,7 @@ use delta_kernel::arrow::array::{AsArray, RecordBatch};
 use delta_kernel::arrow::datatypes::Int64Type;
 use delta_kernel::expressions::{ColumnName, Expression, Scalar};
 use delta_kernel::plans::ir::nodes::{OrderingSpec, WindowFunction};
-use delta_kernel::plans::ir::DeclarativePlanNode;
+use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 
@@ -48,7 +48,7 @@ fn row_number_resets_on_partition_change_ordered_by_v() {
         vec![Scalar::Long(2), Scalar::Long(30)],
         vec![Scalar::Long(2), Scalar::Long(40)],
     ];
-    let plan = DeclarativePlanNode::values(schema.clone(), rows)
+    let plan = PlanBuilder::values(schema.clone(), rows)
         .expect("literal")
         .window(
             vec![WindowFunction {
@@ -74,7 +74,7 @@ fn row_number_global_when_no_partition_keys() {
         vec![Scalar::Long(1), Scalar::Long(10)],
         vec![Scalar::Long(99), Scalar::Long(20)],
     ];
-    let plan = DeclarativePlanNode::values(schema, rows)
+    let plan = PlanBuilder::values(schema, rows)
         .expect("literal")
         .window(
             vec![WindowFunction {
@@ -98,7 +98,7 @@ fn multiple_row_number_functions_duplicate_rank_column() {
         vec![Scalar::Long(1), Scalar::Long(10)],
         vec![Scalar::Long(1), Scalar::Long(20)],
     ];
-    let plan = DeclarativePlanNode::values(schema, rows)
+    let plan = PlanBuilder::values(schema, rows)
         .expect("literal")
         .window(
             vec![
@@ -136,7 +136,7 @@ fn row_number_with_order_by_desc_assigns_rank_within_partition() {
         vec![Scalar::Long(2), Scalar::Long(40)],
         vec![Scalar::Long(1), Scalar::Long(20)],
     ];
-    let plan = DeclarativePlanNode::values(schema, rows)
+    let plan = PlanBuilder::values(schema, rows)
         .expect("literal")
         .window(
             vec![WindowFunction {
@@ -184,7 +184,7 @@ fn row_number_with_order_by_asc_matches_inverted_desc() {
         vec![Scalar::Long(1), Scalar::Long(10)],
         vec![Scalar::Long(1), Scalar::Long(20)],
     ];
-    let plan = DeclarativePlanNode::values(schema, rows)
+    let plan = PlanBuilder::values(schema, rows)
         .expect("literal")
         .window(
             vec![WindowFunction {

@@ -31,7 +31,9 @@ use crate::expressions::{
     col, BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate,
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::nodes::{DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns};
+use crate::plans::ir::nodes::{
+    DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, SinkType,
+};
 use crate::plans::ir::{identity_project_struct, plan, PlanCollector, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
@@ -234,7 +236,7 @@ fn scan_metadata_plans_with_shape(
     for plan in fsr.plans {
         let is_terminal = matches!(
             &plan.sink,
-            crate::plans::ir::nodes::SinkType::Relation(h) if h.id == fsr_terminal_id
+            SinkType::Relation(h) if h.id == fsr_terminal_id
         );
         if is_terminal {
             terminal_plan = Some(plan);
@@ -249,11 +251,10 @@ fn scan_metadata_plans_with_shape(
         )
     })?;
     let fsr_results_relation = RelationHandle::fresh("scan.fsr_results", action_output_schema());
-    p.push_plan(
-        terminal_plan
-            .root
-            .into_relation(fsr_results_relation.clone()),
-    );
+    p.push_plan(crate::plans::ir::Plan::new(
+        terminal_plan.root,
+        SinkType::Relation(fsr_results_relation.clone()),
+    ));
 
     // === actions chain: filter live add paths, optionally augmenting with parsed stats /
     // partitionValues columns when a data-skipping predicate is in play ===

@@ -13,7 +13,9 @@ use url::Url;
 use crate::actions::{Sidecar, SIDECAR_NAME};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::plans::errors::DeltaError;
-use crate::plans::kdf::{take_single, ConsumerKdf, KdfControl, KdfOutput, KdfStateToken};
+use crate::plans::kdf::{
+    take_single, ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput, KdfStateToken,
+};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
 use crate::{DeltaResult, EngineData, FileMeta};
 
@@ -41,7 +43,7 @@ impl SidecarCollector {
     }
 }
 
-impl_kdf!(SidecarCollector, "consumer.sidecar_collector");
+impl_kdf!(SidecarCollector, ConsumerKdfId::SidecarCollector);
 
 impl ConsumerKdf for SidecarCollector {
     fn apply(&mut self, batch: &dyn EngineData) -> DeltaResult<KdfControl> {
@@ -54,7 +56,7 @@ impl KdfOutput for SidecarCollector {
     type Output = Vec<FileMeta>;
 
     fn into_output(parts: Vec<Self>) -> Result<Self::Output, DeltaError> {
-        let token = KdfStateToken::new("consumer.sidecar_collector");
+        let token = KdfStateToken::new(ConsumerKdfId::SidecarCollector);
         let single = take_single(parts, &token)?;
         let log_root = single.log_root;
         single
@@ -116,7 +118,7 @@ mod tests {
         let s = SidecarCollector::new(log_root());
         assert_eq!(
             crate::plans::kdf::Kdf::kdf_id(&s),
-            "consumer.sidecar_collector"
+            ConsumerKdfId::SidecarCollector
         );
     }
 

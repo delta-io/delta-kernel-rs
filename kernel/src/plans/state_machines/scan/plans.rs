@@ -27,7 +27,7 @@ use crate::plans::ir::nodes::{
     FileFormat, FileType, JoinType, OrderingSpec, RelationHandle, ScanFileColumns, SinkType,
     WindowFunction,
 };
-use crate::plans::ir::{plan, DeclarativePlanNode, Plan, PlanCollector, ResultPlan};
+use crate::plans::ir::{plan, Plan, PlanBuilder, PlanCollector, ResultPlan};
 use crate::schema::{ArrayType, DataType, SchemaBuilder};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
@@ -107,7 +107,7 @@ pub fn build_fsr_plans(
             ]
         })
         .collect();
-    let commit_values = DeclarativePlanNode::values(path_size_schema(true), commit_rows)
+    let commit_values = PlanBuilder::values(path_size_schema(true), commit_rows)
         .map_err(|e| e.into_delta_default())?;
     let commit_raw = p.add_load(
         FSR_COMMIT_RAW,
@@ -171,11 +171,11 @@ pub fn build_fsr_plans(
         None
     } else {
         let checkpoint_scan = match shape.file_format {
-            FileFormat::Parquet => DeclarativePlanNode::scan_parquet(
+            FileFormat::Parquet => PlanBuilder::scan_parquet(
                 checkpoint_files.clone(),
                 checkpoint_manifest_scan_schema(shape.has_sidecars),
             ),
-            FileFormat::Json => DeclarativePlanNode::scan_json(
+            FileFormat::Json => PlanBuilder::scan_json(
                 checkpoint_files.clone(),
                 checkpoint_manifest_scan_schema(shape.has_sidecars),
             ),
@@ -382,10 +382,8 @@ fn build_results_plan(
         );
 
     let checkpoint_full = match sidecar_handle {
-        Some(handle) => {
-            DeclarativePlanNode::union(vec![top_scan, plan::relation_ref(handle)], false)
-                .map_err(|e| e.into_delta_default())?
-        }
+        Some(handle) => PlanBuilder::union(vec![top_scan, plan::relation_ref(handle)], false)
+            .map_err(|e| e.into_delta_default())?,
         None => top_scan,
     };
 
@@ -414,10 +412,10 @@ fn build_results_plan(
         .map_err(|e| e.into_delta_default())?;
 
     // Union directly on augmented rows (action + join key); drop join key once at the end.
-    let everything = DeclarativePlanNode::union(vec![
-        plan::relation_ref(commit_dedup_handle),
-        survivors,
-    ], false)
+    let everything = PlanBuilder::union(
+        vec![plan::relation_ref(commit_dedup_handle), survivors],
+        false,
+    )
     .map_err(|e| e.into_delta_default())?;
 
     Ok(everything

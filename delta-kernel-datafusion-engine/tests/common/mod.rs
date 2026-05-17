@@ -18,10 +18,10 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::plans::errors::{DeltaError, KernelErrAsDelta};
+use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::RelationHandle;
-use delta_kernel::plans::ir::DeclarativePlanNode;
-use delta_kernel::plans::kdf::{ConsumerKdf, Kdf, KdfControl};
+use delta_kernel::plans::ir::PlanBuilder;
+use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, Kdf, KdfControl};
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, EngineData, EvaluationHandler};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
@@ -29,7 +29,7 @@ use delta_kernel_datafusion_engine::DataFusionExecutor;
 /// Wrap `node` in a Relation sink, run it on a freshly created [`DataFusionExecutor`], and
 /// return the materialized batches. Helper name kept short because many test scenarios call it
 /// repeatedly.
-pub async fn run_to_batches(node: DeclarativePlanNode) -> Result<Vec<RecordBatch>, DeltaError> {
+pub async fn run_to_batches(node: PlanBuilder) -> Result<Vec<RecordBatch>, DeltaError> {
     let exec = DataFusionExecutor::try_new()?;
     run_to_batches_with(&exec, node).await
 }
@@ -38,9 +38,9 @@ pub async fn run_to_batches(node: DeclarativePlanNode) -> Result<Vec<RecordBatch
 /// its engine handle).
 pub async fn run_to_batches_with(
     exec: &DataFusionExecutor,
-    node: DeclarativePlanNode,
+    node: PlanBuilder,
 ) -> Result<Vec<RecordBatch>, DeltaError> {
-    let schema = node.output_schema().map_err(|e| e.into_delta_default())?;
+    let schema = node.schema_ref();
     let handle = RelationHandle::fresh("test_out", schema);
     let plan = node.into_relation(handle.clone());
     exec.execute_plans(&[plan]).await?;
@@ -48,16 +48,14 @@ pub async fn run_to_batches_with(
 }
 
 /// Synchronous wrapper around [`run_to_batches`] for `#[test]` (non-async) call sites.
-pub fn run_to_batches_blocking(
-    node: DeclarativePlanNode,
-) -> Result<Vec<RecordBatch>, DeltaError> {
+pub fn run_to_batches_blocking(node: PlanBuilder) -> Result<Vec<RecordBatch>, DeltaError> {
     futures::executor::block_on(run_to_batches(node))
 }
 
 /// Synchronous wrapper around [`run_to_batches_with`] for `#[test]` (non-async) call sites.
 pub fn run_to_batches_with_blocking(
     exec: &DataFusionExecutor,
-    node: DeclarativePlanNode,
+    node: PlanBuilder,
 ) -> Result<Vec<RecordBatch>, DeltaError> {
     futures::executor::block_on(run_to_batches_with(exec, node))
 }
@@ -87,21 +85,23 @@ pub fn kernel_literal_batch(schema: Arc<StructType>, rows: &[Vec<Scalar>]) -> Re
 
 /// Consumer KDF that accumulates the total number of rows seen across all batches and finishes
 /// with the count as a `usize`. Used by tests that verify KDF wiring end-to-end.
-#[derive(Debug, Clone)]
+///
+/// Token identity is by-UUID, so the [`ConsumerKdfId`] tag is incidental for test wiring; we
+/// reuse [`ConsumerKdfId::CheckpointHint`] as a stable placeholder.
+#[derive(Debug, Clone, Default)]
 pub struct SumRowsConsumer {
-    pub kdf_id: &'static str,
     pub total: usize,
 }
 
 impl SumRowsConsumer {
-    pub fn new(kdf_id: &'static str) -> Self {
-        Self { kdf_id, total: 0 }
+    pub fn new(_kdf_id_label: &'static str) -> Self {
+        Self::default()
     }
 }
 
 impl Kdf for SumRowsConsumer {
-    fn kdf_id(&self) -> &'static str {
-        self.kdf_id
+    fn kdf_id(&self) -> ConsumerKdfId {
+        ConsumerKdfId::CheckpointHint
     }
 
     fn finish(self: Box<Self>) -> Box<dyn Any + Send> {

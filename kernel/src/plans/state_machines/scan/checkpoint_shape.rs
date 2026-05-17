@@ -18,7 +18,7 @@ use crate::expressions::Expression;
 use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::FileFormat;
-use crate::plans::ir::{DeclarativePlanNode, Extractor, Plan};
+use crate::plans::ir::{Extractor, Plan, PlanBuilder};
 use crate::plans::kdf::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::plans::state_machines::framework::phase_operation::{PhaseOperation, SchemaQueryNode};
@@ -220,9 +220,9 @@ pub(super) fn build_sidecar_discovery_plan(
         .collect();
     let sidecar_scan = match checkpoint_format {
         FileFormat::Parquet => {
-            DeclarativePlanNode::scan_parquet(checkpoint_files, sidecar_only_schema())
+            PlanBuilder::scan_parquet(checkpoint_files, sidecar_only_schema())
         }
-        FileFormat::Json => DeclarativePlanNode::scan_json(checkpoint_files, sidecar_only_schema()),
+        FileFormat::Json => PlanBuilder::scan_json(checkpoint_files, sidecar_only_schema()),
     }
     .filter(Arc::new(
         Expression::column(["sidecar"]).is_not_null().into(),

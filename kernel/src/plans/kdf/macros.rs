@@ -6,17 +6,18 @@
 //! contain only the real per-KDF logic (the `apply` body, `KdfOutput`
 //! reducer, and `RowVisitor` column list + row loop).
 
-/// Generate `impl Kdf for $Type` with the given `$kdf_id` string and the
+/// Generate `impl Kdf for $Type` with the given `$kdf_id` enum value and the
 /// canonical `finish(self) = Box::new(*self)`.
 ///
 /// ```ignore
-/// impl_kdf!(CheckpointHintReader, "consumer.checkpoint_hint");
+/// use delta_kernel::plans::kdf::token::ConsumerKdfId;
+/// impl_kdf!(CheckpointHintReader, ConsumerKdfId::CheckpointHint);
 /// ```
 #[macro_export]
 macro_rules! impl_kdf {
-    ($ty:ty, $id:literal) => {
+    ($ty:ty, $id:expr) => {
         impl $crate::plans::kdf::Kdf for $ty {
-            fn kdf_id(&self) -> &'static str {
+            fn kdf_id(&self) -> $crate::plans::kdf::token::ConsumerKdfId {
                 $id
             }
             fn finish(self: Box<Self>) -> Box<dyn ::std::any::Any + ::std::marker::Send> {
