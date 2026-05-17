@@ -1510,6 +1510,7 @@ version = "53.1.0"
 source = "git+https://github.com/OussamaSaoudi/datafusion.git?rev=bf8dc9a7b#bf8dc9a7bb6ad42848b184394882e8cabbbf1132"
 dependencies = [
  "arrow 58.1.0",
+ "arrow-schema 58.1.0",
  "async-trait",
  "bytes",
  "datafusion-common",

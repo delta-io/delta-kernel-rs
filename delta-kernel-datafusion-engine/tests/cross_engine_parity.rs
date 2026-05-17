@@ -21,7 +21,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expres
 use delta_kernel::expressions::{
     column_expr, BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar,
 };
-use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType, OrderingSpec, WindowFunction};
+use delta_kernel::plans::ir::nodes::{JoinType, OrderingSpec, WindowFunction};
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -90,7 +90,9 @@ async fn parity_literal_matches_kernel_create_many() {
         vec![Scalar::Long(2), Scalar::Long(20)],
     ];
     let expected = kernel_literal_batch(Arc::clone(&schema), &rows);
-    let got = run_to_batches(DeclarativePlanNode::values(schema, rows).unwrap()).await;
+    let got = run_to_batches(DeclarativePlanNode::values(schema, rows).unwrap())
+        .await
+        .unwrap();
     assert_batches_equal(&expected, &got);
 }
 
@@ -115,7 +117,8 @@ async fn parity_filter_matches_kernel_semantics() {
             .unwrap()
             .filter(pred),
     )
-    .await;
+    .await
+    .unwrap();
     assert_batches_equal(&expected, &got);
 }
 
@@ -149,7 +152,8 @@ async fn parity_project_matches_kernel_evaluation() {
             .unwrap()
             .project(columns, out_schema),
     )
-    .await;
+    .await
+    .unwrap();
     assert_batches_equal(&expected, &got);
 }
 
@@ -168,10 +172,11 @@ async fn parity_ordered_union_matches_kernel_concat() {
         DeclarativePlanNode::union(vec![
             DeclarativePlanNode::values(Arc::clone(&schema), left_rows).unwrap(),
             DeclarativePlanNode::values(Arc::clone(&schema), right_rows).unwrap(),
-        ])
+        ], true)
         .unwrap(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_batches_equal(&expected, &got);
 }
 
@@ -233,7 +238,8 @@ async fn parity_window_row_number_matches_ordered_partition_reference() {
             )
             .unwrap(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_batches_equal(&expected, &got);
 }
 
@@ -306,19 +312,16 @@ async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
         .collect();
     let expected = inner_join_sorted_tuples(&build_tuples, &probe_tuples);
 
-    let join_node = JoinNode {
-        build_keys: vec![Arc::new(Expression::column(["bk"]))],
-        probe_keys: vec![Arc::new(Expression::column(["pk"]))],
-        join_type: JoinType::Inner,
-        hint: JoinHint::Hash,
-    };
-
-    let root = DeclarativePlanNode::join(
-        join_node,
-        DeclarativePlanNode::values(build_schema, build_rows).unwrap(),
-        DeclarativePlanNode::values(probe_schema, probe_rows).unwrap(),
-    );
-    let got = run_to_batches(root).await;
+    let root = DeclarativePlanNode::values(build_schema, build_rows)
+        .unwrap()
+        .join_on(
+            DeclarativePlanNode::values(probe_schema, probe_rows).unwrap(),
+            vec![Arc::new(Expression::column(["bk"]))],
+            vec![Arc::new(Expression::column(["pk"]))],
+            JoinType::Inner,
+        )
+        .unwrap();
+    let got = run_to_batches(root).await.unwrap();
     let merged = concat_or_clone(&got);
     assert_eq!(
         batch_to_inner_join_tuples(&merged),
@@ -347,15 +350,15 @@ async fn parity_left_anti_join_matches_reference_probe_order() {
     ];
     let probe = DeclarativePlanNode::values(probe_schema.clone(), probe_rows.clone()).unwrap();
 
-    let join_node = JoinNode {
-        build_keys: vec![Arc::new(Expression::column(["bk"]))],
-        probe_keys: vec![Arc::new(Expression::column(["pk"]))],
-        join_type: JoinType::LeftAnti,
-        hint: JoinHint::Hash,
-    };
-
-    let root = DeclarativePlanNode::join(join_node, build, probe);
-    let got = run_to_batches(root).await;
+    let root = build
+        .join_on(
+            probe,
+            vec![Arc::new(Expression::column(["bk"]))],
+            vec![Arc::new(Expression::column(["pk"]))],
+            JoinType::LeftAnti,
+        )
+        .unwrap();
+    let got = run_to_batches(root).await.unwrap();
     let batch = concat_or_clone(&got);
 
     let build_keys: HashSet<i64> = [1i64].into_iter().collect();
@@ -392,6 +395,7 @@ async fn parity_scan_single_parquet_matches_arrow_reader() {
         vec![file_meta(&path)],
         kernel_schema,
     ))
-    .await;
+    .await
+    .unwrap();
     assert_batch_column_data_equal(&kernel_schema_clone, &expected, &concat_or_clone(&got));
 }

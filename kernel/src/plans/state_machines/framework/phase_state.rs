@@ -5,7 +5,7 @@
 //! holds two kinds of payloads the executor produces:
 //!
 //! - **KDF outputs** -- [`FinishedHandle`]s submitted by drained
-//!   [`SinkType::ConsumeByKdf`](crate::plans::ir::nodes::SinkType::ConsumeByKdf) pipelines and
+//!   [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume) pipelines and
 //!   arbitrary executor-side telemetry (e.g. write row counts), keyed by [`KdfStateToken`].
 //! - **Schema** -- a single [`SchemaRef`] produced by a
 //!   [`PhaseOperation::SchemaQuery`](super::phase_operation::PhaseOperation::SchemaQuery) phase.
@@ -65,8 +65,8 @@ impl PhaseState {
         Self::default()
     }
 
-    /// Submit a finalized per-partition KDF state. Thread-safe; callers
-    /// typically hold a cloned `PhaseState` inside their iterator.
+    /// Submit a finalized consumer state. Thread-safe; callers typically hold a
+    /// cloned `PhaseState` inside their iterator.
     pub fn submit_kdf_handle(&self, handle: FinishedHandle) {
         let mut inner = self.lock();
         inner
@@ -82,7 +82,7 @@ impl PhaseState {
         self.lock().schema = Some(schema);
     }
 
-    /// Remove and return all erased per-partition payloads for `token`.
+    /// Remove and return all erased payloads for `token`.
     ///
     /// Returns an empty `Vec` if the token was never submitted to. The
     /// typed extractor feeds this directly into
@@ -113,11 +113,10 @@ mod tests {
     use crate::plans::kdf::TraceContext;
     use crate::schema::StructType;
 
-    fn finished_handle(token: &KdfStateToken, partition: u32, payload: i64) -> FinishedHandle {
+    fn finished_handle(token: &KdfStateToken, payload: i64) -> FinishedHandle {
         FinishedHandle {
             token: token.clone(),
             ctx: TraceContext::new("test", "phase"),
-            partition,
             erased: Box::new(payload),
         }
     }
@@ -135,8 +134,8 @@ mod tests {
         let s = PhaseState::empty();
         let t = KdfStateToken::new("test.one");
 
-        s.submit_kdf_handle(finished_handle(&t, 0, 10));
-        s.submit_kdf_handle(finished_handle(&t, 1, 20));
+        s.submit_kdf_handle(finished_handle(&t, 10));
+        s.submit_kdf_handle(finished_handle(&t, 20));
 
         let payloads = s.take_by_token(&t);
         assert_eq!(payloads.len(), 2);
@@ -173,7 +172,7 @@ mod tests {
         let b = a.clone();
         let t = KdfStateToken::new("test.shared");
 
-        a.submit_kdf_handle(finished_handle(&t, 0, 99));
+        a.submit_kdf_handle(finished_handle(&t, 99));
 
         let via_b = b.take_by_token(&t);
         assert_eq!(via_b.len(), 1);
@@ -187,7 +186,7 @@ mod tests {
     fn schema_and_kdf_payloads_coexist() {
         let s = PhaseState::empty();
         let t = KdfStateToken::new("test.coexist");
-        s.submit_kdf_handle(finished_handle(&t, 0, 1));
+        s.submit_kdf_handle(finished_handle(&t, 1));
         let schema: SchemaRef = Arc::new(StructType::new_unchecked(Vec::<
             crate::schema::StructField,
         >::new()));

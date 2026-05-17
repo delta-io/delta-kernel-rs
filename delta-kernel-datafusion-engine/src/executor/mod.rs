@@ -8,9 +8,9 @@
 //! [`load::materialize_upstream_batch`] over each upstream batch to translate file references
 //! into the per-file row batches that get registered.
 //!
-//! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) drains
+//! [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) drains
 //! the physical plan through a [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle
-//! inside [`Self::drain_consume_by_kdf`]; finalized handles submit into the active phase's
+//! inside [`Self::drain_consume_sink`]; finalized handles submit into the active phase's
 //! [`PhaseState`].
 //!
 //! Sinks are annotations on the kernel [`Plan`], not [`ExecutionPlan`] envelopes -- the executor
@@ -52,7 +52,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{ConsumeByKdfSink, LoadSink, RelationHandle, SinkType};
+use delta_kernel::plans::ir::nodes::{ConsumeSink, LoadSink, RelationHandle, SinkType};
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan, ResultPlan};
 use delta_kernel::plans::kdf::{FinishedHandle, KdfControl, TraceContext};
 use delta_kernel::plans::state_machines::framework::coroutine::driver::CoroutineSM;
@@ -70,7 +70,7 @@ use crate::compile::{compile_plan_logical, CompileContext};
 use crate::error::DfResultIntoDelta;
 use crate::executor::load::materialize_upstream_batch;
 
-fn relation_table_name(handle_id: u64) -> String {
+fn relation_table_name(handle_id: &str) -> String {
     format!("__dk_rel_{handle_id}")
 }
 
@@ -203,9 +203,9 @@ impl DataFusionExecutor {
     }
 
     /// Execute every plan in `plans` in order. Each plan terminates in [`SinkType::Relation`],
-    /// [`SinkType::Load`], or [`SinkType::ConsumeByKdf`]; the executor drains the physical plan
+    /// [`SinkType::Load`], or [`SinkType::Consume`]; the executor drains the physical plan
     /// and routes the result into the session catalog (for `Relation` / `Load`) or into the
-    /// active phase's [`PhaseState`] (for `ConsumeByKdf`).
+    /// active phase's [`PhaseState`] (for `Consume`).
     pub async fn execute_plans(&self, plans: &[Plan]) -> Result<(), DeltaError> {
         let state = PhaseState::empty();
         self.run_plans(plans, &state).await.into_delta()
@@ -271,7 +271,7 @@ impl DataFusionExecutor {
         &self,
         handle: &RelationHandle,
     ) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
-        let name = relation_table_name(handle.id);
+        let name = relation_table_name(handle.id.as_str());
         self.session_ctx
             .table(TableReference::bare(name.clone()))
             .await
@@ -286,7 +286,7 @@ impl DataFusionExecutor {
     /// Execute a single [`PhaseOperation`] against the executor and return the resulting
     /// [`PhaseState`]. Used internally by [`Self::drive_to_completion`] and exposed for
     /// callers (typically tests) that need to drive an individual phase op directly --
-    /// for example, draining a [`ConsumeByKdf`](SinkType::ConsumeByKdf) plan and inspecting
+    /// for example, draining a [`Consume`](SinkType::Consume) plan and inspecting
     /// the [`PhaseState`] for its finalized handle.
     pub async fn execute_phase_operation(
         &self,
@@ -326,7 +326,7 @@ impl DataFusionExecutor {
         physical: Arc<dyn ExecutionPlan>,
         ctx: &CompileContext,
     ) -> Result<(), DataFusionError> {
-        match &plan.sink.sink_type {
+        match &plan.sink {
             SinkType::Relation(handle) => {
                 let batches = self.collect_all_partitions(physical).await?;
                 self.register_relation_into_session(handle, batches)
@@ -335,13 +335,13 @@ impl DataFusionExecutor {
                 let batches = self.drain_load(physical, sink, ctx).await?;
                 self.register_relation_into_session(&sink.output_relation, batches)
             }
-            SinkType::ConsumeByKdf(sink) => self.drain_consume_by_kdf(physical, sink, ctx).await,
+            SinkType::Consume(sink) => self.drain_consume_sink(physical, sink, ctx).await,
         }
     }
 
     /// Compile a kernel [`Plan`] to a DataFusion [`ExecutionPlan`]. Sinks are not wrapped on the
     /// physical plan; per-sink side effects happen in the executor's drain helpers
-    /// ([`Self::drain_consume_by_kdf`], [`Self::drain_load`]).
+    /// ([`Self::drain_consume_sink`], [`Self::drain_load`]).
     async fn prepare_execution_plan(
         &self,
         plan: &Plan,
@@ -366,16 +366,16 @@ impl DataFusionExecutor {
     async fn prefetch_relation_providers(
         &self,
         plan: &Plan,
-    ) -> Result<Arc<HashMap<u64, Arc<dyn TableProvider>>>, DataFusionError> {
+    ) -> Result<Arc<HashMap<String, Arc<dyn TableProvider>>>, DataFusionError> {
         let mut handles: Vec<RelationHandle> = Vec::new();
         collect_relation_handles(&plan.root, &mut handles);
-        let mut providers: HashMap<u64, Arc<dyn TableProvider>> =
+        let mut providers: HashMap<String, Arc<dyn TableProvider>> =
             HashMap::with_capacity(handles.len());
         for handle in handles {
-            if providers.contains_key(&handle.id) {
+            if providers.contains_key(handle.id.as_str()) {
                 continue;
             }
-            let table_name = relation_table_name(handle.id);
+            let table_name = relation_table_name(handle.id.as_str());
             let provider = self
                 .session_ctx
                 .table_provider(TableReference::bare(table_name.clone()))
@@ -387,7 +387,7 @@ impl DataFusionExecutor {
                         handle.id, handle.name, table_name
                     ))
                 })?;
-            providers.insert(handle.id, provider);
+            providers.insert(handle.id.clone(), provider);
         }
         Ok(Arc::new(providers))
     }
@@ -397,14 +397,22 @@ impl DataFusionExecutor {
     fn register_relation_into_session(
         &self,
         handle: &RelationHandle,
-        batches: Vec<RecordBatch>,
+        mut batches: Vec<RecordBatch>,
     ) -> Result<(), DataFusionError> {
         let schema: delta_kernel::arrow::datatypes::SchemaRef =
             Arc::new(handle.schema.as_ref().try_into_arrow().map_err(|e| {
                 crate::error::plan_compilation(format!("relation schema conversion: {e}"))
             })?);
+        if let Some(first) = batches.first() {
+            if first.schema() != schema {
+                batches = batches
+                    .into_iter()
+                    .map(|batch| RecordBatch::try_new(schema.clone(), batch.columns().to_vec()))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+        }
         let mem = MemTable::try_new(schema, vec![batches])?;
-        let name = relation_table_name(handle.id);
+        let name = relation_table_name(handle.id.as_str());
         let _ = self
             .session_ctx
             .deregister_table(TableReference::bare(name.clone()));
@@ -416,19 +424,13 @@ impl DataFusionExecutor {
     /// Drain `physical` through a [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle
     /// minted from `sink`. The finalized handle submits into the active phase's
     /// [`PhaseState`].
-    async fn drain_consume_by_kdf(
+    async fn drain_consume_sink(
         &self,
         physical: Arc<dyn ExecutionPlan>,
-        sink: &ConsumeByKdfSink,
+        sink: &ConsumeSink,
         ctx: &CompileContext,
     ) -> Result<(), DataFusionError> {
-        if sink.requires_ordering.is_some() {
-            return Err(crate::error::unsupported(
-                "ConsumeByKdf with requires_ordering is not implemented for the DataFusion engine",
-            ));
-        }
-
-        let mut handle = sink.new_handle(TraceContext::new("datafusion-engine", "execute"), 0);
+        let mut handle = sink.new_handle(TraceContext::new("datafusion-engine", "execute"));
         let mut stream = self.root_partition0_stream(physical)?;
         while let Some(batch) = stream.try_next().await? {
             let arrow = ArrowEngineData::new(batch);
@@ -444,11 +446,11 @@ impl DataFusionExecutor {
         if let Some(state) = ctx.phase_state.as_ref() {
             state.submit_kdf_handle(finished);
         } else {
-            // ConsumeByKdf called outside of an active phase has nowhere to land its handle.
+            // Consume sink called outside of an active phase has nowhere to land its handle.
             // Drop the handle and surface a clear error so the caller can wire phase state.
             let _: FinishedHandle = finished;
             return Err(crate::error::internal_error(
-                "ConsumeByKdf sink drained without an active phase state to submit into",
+                "Consume sink drained without an active phase state to submit into",
             ));
         }
         Ok(())

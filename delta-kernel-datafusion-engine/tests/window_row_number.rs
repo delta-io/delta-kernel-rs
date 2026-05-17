@@ -60,7 +60,7 @@ fn row_number_resets_on_partition_change_ordered_by_v() {
         .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches = run_to_batches(&exec, plan);
+    let batches = run_to_batches(&exec, plan).unwrap();
 
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
@@ -86,7 +86,7 @@ fn row_number_global_when_no_partition_keys() {
         .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches = run_to_batches(&exec, plan);
+    let batches = run_to_batches(&exec, plan).unwrap();
 
     assert_eq!(rn_column(&batches[0], "rn"), vec![1, 2]);
 }
@@ -115,7 +115,7 @@ fn multiple_row_number_functions_duplicate_rank_column() {
         .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches = run_to_batches(&exec, plan);
+    let batches = run_to_batches(&exec, plan).unwrap();
 
     assert_eq!(rn_column(&batches[0], "a"), vec![1, 2]);
     assert_eq!(rn_column(&batches[0], "b"), vec![1, 2]);
@@ -148,7 +148,7 @@ fn row_number_with_order_by_desc_assigns_rank_within_partition() {
         .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches = run_to_batches(&exec, plan);
+    let batches = run_to_batches(&exec, plan).unwrap();
 
     // Aggregate (part, v, rn) tuples across however many batches the engine emits, then verify
     // the per-partition rank assignment on the canonicalized rows.
@@ -196,7 +196,7 @@ fn row_number_with_order_by_asc_matches_inverted_desc() {
         .expect("window");
 
     let exec = DataFusionExecutor::try_new().expect("executor");
-    let batches = run_to_batches(&exec, plan);
+    let batches = run_to_batches(&exec, plan).unwrap();
 
     let mut tuples: Vec<(i64, i64)> = Vec::new();
     for batch in &batches {

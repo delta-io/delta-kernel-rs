@@ -6,8 +6,8 @@
 //!
 //! - [`traits::ConsumerKdf`] — observer over batches; returns `Continue` / `Break` for early
 //!   termination. Wired into the plan via the
-//!   [`SinkType::ConsumeByKdf`](crate::plans::ir::nodes::SinkType::ConsumeByKdf) sink — the
-//!   consumer drains the terminal row stream, accumulating its own per-partition state for the
+//!   [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume) sink — the
+//!   consumer drains the terminal row stream, accumulating its own finalized state for the
 //!   engine to harvest after the plan completes.
 //!
 //! `ConsumerKdf` extends a small supertrait [`traits::Kdf`] carrying
@@ -16,14 +16,14 @@
 //!
 //! # Identity
 //!
-//! - [`token::KdfStateToken`] — `{ kdf_id, serial }` stamped at plan-build time. Keys the
+//! - [`token::KdfStateToken`] — `{ kdf_type, id }` stamped at plan-build time. Keys the
 //!   executor's state table.
 //! - [`trace::TraceContext`] — `{ sm, phase }` stamped at phase-execute time. Lives on handles;
 //!   used by tracing and cross-check validations.
 //!
 //! # Handles
 //!
-//! - [`handle::Handle<K>`] — generic per-partition runtime state. Executor code holds `Handle<dyn
+//! - [`handle::Handle<K>`] — generic runtime state. Executor code holds `Handle<dyn
 //!   ConsumerKdf>` directly.
 //!
 //! # Adding a KDF
@@ -32,7 +32,7 @@
 //! line in the submodule mod.rs, one line re-exporting here. Row-ordering requirements
 //! live on the KDF trait itself — no separate factory.
 //!
-//! [`ConsumeByKdfSink`]: crate::plans::ir::nodes::ConsumeByKdfSink
+//! [`ConsumeSink`]: crate::plans::ir::nodes::ConsumeSink
 
 #[macro_use]
 mod macros;
@@ -49,4 +49,4 @@ pub use state::consumer::{CheckpointHintReader, MetadataProtocolReader, SidecarC
 pub use token::KdfStateToken;
 pub use trace::TraceContext;
 pub use traits::{ConsumerKdf, Kdf, KdfControl};
-pub use typed::{downcast_all, take_single, KdfOutput};
+pub use typed::{downcast_all, take_single, Extractor, KdfOutput};

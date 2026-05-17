@@ -105,7 +105,8 @@ async fn parquet_scan_matches_renamed_logical_columns_by_parquet_field_id() {
         &ex,
         DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(flatten_i64_col(&batches, "user_id"), vec![10, 20]);
     assert_eq!(
@@ -153,7 +154,8 @@ async fn parquet_scan_orders_output_by_logical_schema_when_physical_column_order
         &ex,
         DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(batches[0].schema().field(0).name(), "logical_a");
     assert_eq!(batches[0].schema().field(1).name(), "logical_b");
@@ -200,7 +202,8 @@ async fn parquet_scan_mixes_field_id_match_with_name_fallback_per_column() {
         &ex,
         DeclarativePlanNode::scan_parquet(vec![file_meta(&path)], kernel_schema),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         flatten_string_col(&batches, "plain_label"),

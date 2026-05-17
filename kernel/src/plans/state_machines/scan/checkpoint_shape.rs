@@ -218,11 +218,15 @@ pub(super) fn build_sidecar_discovery_plan(
         .iter()
         .map(|p| p.location.clone())
         .collect();
-    let sidecar_scan =
-        DeclarativePlanNode::scan(checkpoint_format, checkpoint_files, sidecar_only_schema())
-            .filter(Arc::new(
-                Expression::column(["sidecar"]).is_not_null().into(),
-            ));
+    let sidecar_scan = match checkpoint_format {
+        FileFormat::Parquet => {
+            DeclarativePlanNode::scan_parquet(checkpoint_files, sidecar_only_schema())
+        }
+        FileFormat::Json => DeclarativePlanNode::scan_json(checkpoint_files, sidecar_only_schema()),
+    }
+    .filter(Arc::new(
+        Expression::column(["sidecar"]).is_not_null().into(),
+    ));
     Ok(sidecar_scan.consume(SidecarCollector::new(
         snapshot.log_segment().log_root.clone(),
     )))
@@ -235,13 +239,13 @@ mod tests {
     use crate::utils::test_utils::load_test_table;
 
     #[test]
-    fn sidecar_discovery_plan_uses_consume_by_kdf_sink() {
+    fn sidecar_discovery_plan_uses_consume_sink() {
         let (_engine, snapshot, _tmp) =
             load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
         let shape = checkpoint_shape_from_last_checkpoint(snapshot.as_ref()).unwrap();
         assert!(shape.has_sidecars);
         let (plan, _extract) =
             build_sidecar_discovery_plan(snapshot.as_ref(), shape.file_format).unwrap();
-        assert!(matches!(plan.sink.sink_type, SinkType::ConsumeByKdf(_)));
+        assert!(matches!(plan.sink, SinkType::Consume(_)));
     }
 }

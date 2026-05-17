@@ -8,18 +8,21 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::provider_as_source;
-use datafusion_common::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use datafusion_common::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use datafusion_common::error::DataFusionError;
 use datafusion_common::DFSchema;
 use datafusion_datasource_json::file_format::JsonFormat;
 use datafusion_datasource_parquet::file_format::ParquetFormat;
-use datafusion_expr::expr_fn::cast;
 use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
 use datafusion_expr::{lit, Expr, LogicalPlanBuilder};
-use datafusion_functions_window::row_number::row_number;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::ir::nodes::{FileType, ScanNode};
+use delta_kernel::schema::MetadataColumnSpec;
+use parquet::arrow::RowNumber;
 
+use super::canonicalize::canonicalize_output_to_kernel_schema;
 use super::providers::NullabilityEnforcingTableProvider;
 use crate::compile::expr_translator::kernel_expr_to_df;
 use crate::error::plan_compilation;
@@ -100,12 +103,7 @@ pub(super) fn scan_to_listing_logical_plan(
             schema: df_schema,
         }));
     }
-    let full_schema: ArrowSchema = node
-        .schema
-        .as_ref()
-        .try_into_arrow()
-        .map_err(|e| plan_compilation(format!("Logical Scan schema conversion failed: {e}")))?;
-    let row_index_name = node.row_index_column.clone();
+    let full_schema = build_scan_arrow_schema(node)?;
     let build_listing_scan =
         |files: &[delta_kernel::FileMeta]| -> Result<LogicalPlan, DataFusionError> {
             let file_schema = Arc::new(full_schema.clone());
@@ -150,29 +148,7 @@ pub(super) fn scan_to_listing_logical_plan(
             };
             LogicalPlanBuilder::scan("scan", provider_as_source(provider), None)?.build()
         };
-    // Row indexes are per-file (0-based position within the originating parquet/json file), so a
-    // scan with `row_index_column = Some(_)` must branch per file, append the row_number window
-    // to each branch, and Union them. Without a row index, a single multi-file ListingTable scan
-    // is enough.
-    let mut scan_plan = if let Some(name) = row_index_name.as_ref() {
-        let mut branches = node
-            .files
-            .iter()
-            .map(|f| {
-                let plan = build_listing_scan(std::slice::from_ref(f))?;
-                append_row_index_column(plan, name)
-            })
-            .collect::<Result<Vec<_>, DataFusionError>>()?
-            .into_iter();
-        let first = branches.next().ok_or_else(|| {
-            plan_compilation("logical scan with row index expected at least one file")
-        })?;
-        branches.try_fold(first, |acc, right| {
-            LogicalPlanBuilder::from(acc).union(right)?.build()
-        })?
-    } else {
-        build_listing_scan(&node.files)?
-    };
+    let mut scan_plan = build_listing_scan(&node.files)?;
     if let Some(predicate) = &node.predicate {
         let pred = kernel_expr_to_df(predicate.as_ref())?;
         // Kernel NULL semantics keep a row when the predicate references a NULL value (SQL
@@ -185,7 +161,41 @@ pub(super) fn scan_to_listing_logical_plan(
             .filter(null_preserving)?
             .build()?;
     }
-    Ok(scan_plan)
+    canonicalize_output_to_kernel_schema(scan_plan, &node.schema)
+}
+
+fn build_scan_arrow_schema(node: &ScanNode) -> Result<ArrowSchema, DataFusionError> {
+    let schema: ArrowSchema = node
+        .schema
+        .as_ref()
+        .try_into_arrow()
+        .map_err(|e| plan_compilation(format!("Logical Scan schema conversion failed: {e}")))?;
+    if node.file_type != FileType::Parquet {
+        return Ok(schema);
+    }
+    let Some(idx) = node
+        .schema
+        .index_of_metadata_column(&MetadataColumnSpec::RowIndex)
+    else {
+        return Ok(schema);
+    };
+    let fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            if i == *idx {
+                Arc::new(
+                    ArrowField::new(field.name(), ArrowDataType::Int64, false)
+                        .with_metadata(field.metadata().clone())
+                        .with_extension_type(RowNumber),
+                )
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(ArrowSchema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Build a projection that passes through every column of `pass_through_schema_src` and
@@ -206,28 +216,6 @@ fn project_pass_through_with(
         .collect::<Vec<_>>();
     projection.push(new_column.alias(new_column_name.to_string()));
     LogicalPlanBuilder::from(plan).project(projection)?.build()
-}
-
-pub(super) fn append_row_index_column(
-    plan: LogicalPlan,
-    row_index_name: &str,
-) -> Result<LogicalPlan, DataFusionError> {
-    let input_col_count = plan.schema().columns().len();
-    let window_plan = LogicalPlanBuilder::window_plan(plan.clone(), vec![row_number()])?;
-    let row_num_col = window_plan
-        .schema()
-        .columns()
-        .get(input_col_count)
-        .cloned()
-        .ok_or_else(|| {
-            plan_compilation(format!(
-                "logical scan row index: missing row_number output at index {input_col_count}"
-            ))
-        })?;
-    // 0-based row index within each scanned file: `row_number() - 1`, cast to i64 to match the
-    // Delta scan-row schema's expected type.
-    let row_index_expr = cast(Expr::Column(row_num_col), ArrowDataType::Int64) - lit(1_i64);
-    project_pass_through_with(window_plan, &plan, row_index_expr, row_index_name)
 }
 
 pub(super) fn append_constant_i64_column(

@@ -47,7 +47,7 @@ struct FixtureTable {
 fn commit_dedup_sink_handle(plans: &[Plan]) -> RelationHandle {
     plans
         .iter()
-        .find_map(|p| match &p.sink.sink_type {
+        .find_map(|p| match &p.sink {
             SinkType::Relation(h) if h.name == FSR_COMMIT_DEDUP => Some(h.clone()),
             _ => None,
         })
@@ -56,7 +56,7 @@ fn commit_dedup_sink_handle(plans: &[Plan]) -> RelationHandle {
                 "FSR plans must include a Relation sink named {FSR_COMMIT_DEDUP:?}; got plan sinks: {:?}",
                 plans
                     .iter()
-                    .map(|p| &p.sink.sink_type)
+                    .map(|p| &p.sink)
                     .collect::<Vec<_>>()
             )
         })

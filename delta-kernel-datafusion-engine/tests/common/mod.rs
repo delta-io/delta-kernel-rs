@@ -18,6 +18,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::Scalar;
+use delta_kernel::plans::errors::{DeltaError, KernelErrAsDelta};
 use delta_kernel::plans::ir::nodes::RelationHandle;
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::plans::kdf::{ConsumerKdf, Kdf, KdfControl};
@@ -28,8 +29,8 @@ use delta_kernel_datafusion_engine::DataFusionExecutor;
 /// Wrap `node` in a Relation sink, run it on a freshly created [`DataFusionExecutor`], and
 /// return the materialized batches. Helper name kept short because many test scenarios call it
 /// repeatedly.
-pub async fn run_to_batches(node: DeclarativePlanNode) -> Vec<RecordBatch> {
-    let exec = DataFusionExecutor::try_new().expect("executor");
+pub async fn run_to_batches(node: DeclarativePlanNode) -> Result<Vec<RecordBatch>, DeltaError> {
+    let exec = DataFusionExecutor::try_new()?;
     run_to_batches_with(&exec, node).await
 }
 
@@ -38,16 +39,18 @@ pub async fn run_to_batches(node: DeclarativePlanNode) -> Vec<RecordBatch> {
 pub async fn run_to_batches_with(
     exec: &DataFusionExecutor,
     node: DeclarativePlanNode,
-) -> Vec<RecordBatch> {
-    let schema = node.output_schema();
+) -> Result<Vec<RecordBatch>, DeltaError> {
+    let schema = node.output_schema().map_err(|e| e.into_delta_default())?;
     let handle = RelationHandle::fresh("test_out", schema);
     let plan = node.into_relation(handle.clone());
-    exec.execute_plans(&[plan]).await.expect("execute");
-    exec.collect_relation(&handle).await.expect("collect")
+    exec.execute_plans(&[plan]).await?;
+    exec.collect_relation(&handle).await
 }
 
 /// Synchronous wrapper around [`run_to_batches`] for `#[test]` (non-async) call sites.
-pub fn run_to_batches_blocking(node: DeclarativePlanNode) -> Vec<RecordBatch> {
+pub fn run_to_batches_blocking(
+    node: DeclarativePlanNode,
+) -> Result<Vec<RecordBatch>, DeltaError> {
     futures::executor::block_on(run_to_batches(node))
 }
 
@@ -55,7 +58,7 @@ pub fn run_to_batches_blocking(node: DeclarativePlanNode) -> Vec<RecordBatch> {
 pub fn run_to_batches_with_blocking(
     exec: &DataFusionExecutor,
     node: DeclarativePlanNode,
-) -> Vec<RecordBatch> {
+) -> Result<Vec<RecordBatch>, DeltaError> {
     futures::executor::block_on(run_to_batches_with(exec, node))
 }
 

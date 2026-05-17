@@ -89,11 +89,9 @@ impl Scan {
         )?;
 
         // === data load: per-file parquet read keyed by the live-actions relation ===
-        // PlanCollector::add_load does not accept a dv_ref, so the LoadSink is built
-        // directly. The materialized schema is computed by load_materialized_schema
-        // (file_schema + named passthroughs) rather than the spec's resolver because
-        // the row-id projection augments file_schema beyond the load's physical read
-        // schema.
+        // The load sink is built directly because the materialized schema is computed by
+        // load_materialized_schema (file_schema + named passthroughs): the row-id projection
+        // augments file_schema beyond the load's physical read schema.
         let data_rows_raw_relation =
             RelationHandle::fresh(FSR_SCAN_DATA_ROWS_RAW, materialized_schema);
         let load_sink = LoadSink {
@@ -235,7 +233,7 @@ fn scan_metadata_plans_with_shape(
     let mut terminal_plan: Option<crate::plans::ir::Plan> = None;
     for plan in fsr.plans {
         let is_terminal = matches!(
-            &plan.sink.sink_type,
+            &plan.sink,
             crate::plans::ir::nodes::SinkType::Relation(h) if h.id == fsr_terminal_id
         );
         if is_terminal {
@@ -297,7 +295,7 @@ fn scan_metadata_plans_with_shape(
         scan_live_actions_schema(partition_values_schema.as_ref()),
     );
 
-    let live_actions_relation = p.add_relation(FSR_SCAN_LIVE_ACTIONS, live_actions_node);
+    let live_actions_relation = p.add_relation(FSR_SCAN_LIVE_ACTIONS, live_actions_node)?;
     Ok(ResultPlan::new(p.into_vec(), live_actions_relation))
 }
 
@@ -590,7 +588,7 @@ mod tests {
         let data = scan
             .scan_data_from_metadata_plans(metadata.result_relation)
             .unwrap();
-        let load = match &data.plans[0].sink.sink_type {
+        let load = match &data.plans[0].sink {
             SinkType::Load(load) => load,
             other => panic!("expected load sink, got {other:?}"),
         };

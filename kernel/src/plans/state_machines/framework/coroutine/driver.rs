@@ -173,7 +173,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::plans::ir::nodes::{RelationHandle, ScanNode, SinkNode, SinkType};
+    use crate::plans::ir::nodes::{RelationHandle, ScanNode, SinkType};
     use crate::plans::ir::{DeclarativePlanNode, Plan};
     use crate::plans::state_machines::framework::engine_error::{EngineError, EngineErrorKind};
 
@@ -188,9 +188,7 @@ mod tests {
             Vec::new(),
             schema.clone(),
         ));
-        let sink = SinkNode {
-            sink_type: SinkType::Relation(RelationHandle::fresh("toy", schema)),
-        };
+        let sink = SinkType::Relation(RelationHandle::fresh("toy", schema));
         Plan::new(root, sink)
     }
 

@@ -7,7 +7,7 @@
 //! Adding a new KDF is a pure addition: declare the struct, derive `Clone`,
 //! write `impl Kdf` and `impl ConsumerKdf`. No enum to edit, no registry to
 //! update, no serde wiring — KDFs ride on the
-//! [`SinkType::ConsumeByKdf`](crate::plans::ir::nodes::SinkType::ConsumeByKdf)
+//! [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume)
 //! sink, which is dispatched in-process and never serialized.
 //!
 //! # Object-safety notes

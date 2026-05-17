@@ -6,7 +6,7 @@
 //! [`SessionContext`](datafusion::execution::context::SessionContext) so downstream
 //! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
 //! it), and
-//! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) (observe
+//! [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) (observe
 //! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]). Read-style state machines return
 //! a [`delta_kernel::plans::ir::ResultPlan`] naming the relation the caller reads after
 //! executing the result plan's plans.

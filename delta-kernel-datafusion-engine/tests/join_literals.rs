@@ -7,7 +7,7 @@ use std::sync::Arc;
 use common::run_to_batches_blocking as run_to_batches;
 use delta_kernel::arrow::array::AsArray;
 use delta_kernel::expressions::{Expression, Scalar};
-use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType};
+use delta_kernel::plans::ir::nodes::JoinType;
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType};
 
@@ -46,15 +46,15 @@ fn hash_inner_join_literals_matching_keys_single_row() {
     )
     .unwrap();
 
-    let join_node = JoinNode {
-        build_keys: vec![Arc::new(Expression::column(["bk"]))],
-        probe_keys: vec![Arc::new(Expression::column(["pk"]))],
-        join_type: JoinType::Inner,
-        hint: JoinHint::Hash,
-    };
-
-    let root = DeclarativePlanNode::join(join_node, build, probe);
-    let batches = run_to_batches(root);
+    let root = build
+        .join_on(
+            probe,
+            vec![Arc::new(Expression::column(["bk"]))],
+            vec![Arc::new(Expression::column(["pk"]))],
+            JoinType::Inner,
+        )
+        .unwrap();
+    let batches = run_to_batches(root).unwrap();
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1, "expected one matching inner-join row");
@@ -102,15 +102,15 @@ fn hash_left_anti_join_literals_keeps_non_matching_probe_rows() {
     )
     .unwrap();
 
-    let join_node = JoinNode {
-        build_keys: vec![Arc::new(Expression::column(["bk"]))],
-        probe_keys: vec![Arc::new(Expression::column(["pk"]))],
-        join_type: JoinType::LeftAnti,
-        hint: JoinHint::Hash,
-    };
-
-    let root = DeclarativePlanNode::join(join_node, build, probe);
-    let batches = run_to_batches(root);
+    let root = build
+        .join_on(
+            probe,
+            vec![Arc::new(Expression::column(["bk"]))],
+            vec![Arc::new(Expression::column(["pk"]))],
+            JoinType::LeftAnti,
+        )
+        .unwrap();
+    let batches = run_to_batches(root).unwrap();
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1);

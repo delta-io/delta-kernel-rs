@@ -16,8 +16,9 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::{column_expr, Expression, Predicate};
+use delta_kernel::plans::ir::nodes::{FileType, ScanNode};
 use delta_kernel::plans::ir::DeclarativePlanNode;
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, MetadataColumnSpec, StructType};
 use delta_kernel::{EvaluationHandler, FileMeta};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::parquet::{file_meta, write_i64_parquet};
@@ -91,14 +92,21 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
     write_i64_parquet(&p2, "x", &[200, 201]);
 
     let schema = single_long_schema();
-    let plan = DeclarativePlanNode::scan_parquet(
-        vec![file_meta(&p1), file_meta(&p2)],
-        Arc::clone(&schema),
-    )
-    .with_row_index("rid")
-    .unwrap();
+    let schema_with_row_index = Arc::new(
+        schema
+            .as_ref()
+            .add_metadata_column("rid", MetadataColumnSpec::RowIndex)
+            .unwrap(),
+    );
+    let plan = DeclarativePlanNode::Scan(
+        ScanNode::new(
+            FileType::Parquet,
+            vec![file_meta(&p1), file_meta(&p2)],
+            schema_with_row_index,
+        )
+    );
 
-    let batches = scan_collect(plan).await;
+    let batches = scan_collect(plan).await.unwrap();
 
     let mut by_x: HashMap<i64, i64> = HashMap::new();
     for b in &batches {
@@ -127,14 +135,21 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
     write_i64_parquet(&p2, "x", &[20]);
 
     let schema = single_long_schema();
-    let plan = DeclarativePlanNode::scan_parquet(
-        vec![file_meta(&p1), file_meta(&p2)],
-        Arc::clone(&schema),
-    )
-    .with_row_index("rid")
-    .unwrap();
+    let schema_with_row_index = Arc::new(
+        schema
+            .as_ref()
+            .add_metadata_column("rid", MetadataColumnSpec::RowIndex)
+            .unwrap(),
+    );
+    let plan = DeclarativePlanNode::Scan(
+        ScanNode::new(
+            FileType::Parquet,
+            vec![file_meta(&p1), file_meta(&p2)],
+            schema_with_row_index,
+        )
+    );
 
-    let batches = scan_collect(plan).await;
+    let batches = scan_collect(plan).await.unwrap();
 
     let mut rids = flatten_i64_named(&batches, "rid");
     rids.sort();
@@ -175,11 +190,12 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
     }
     let reference_x = flatten_i64_named(&reference_batches, "x");
 
-    let plan = DeclarativePlanNode::scan_parquet(metas, Arc::clone(&kernel_schema))
-        .with_predicate(Arc::clone(&pred))
-        .unwrap();
+    let plan = DeclarativePlanNode::Scan(
+        ScanNode::new(FileType::Parquet, metas, Arc::clone(&kernel_schema))
+            .with_predicate(Arc::clone(&pred)),
+    );
 
-    let df_batches = scan_collect(plan).await;
+    let df_batches = scan_collect(plan).await.unwrap();
 
     let mut df_x = flatten_i64_named(&df_batches, "x");
     let mut reference_sorted = reference_x;

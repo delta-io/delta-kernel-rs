@@ -14,7 +14,7 @@
 //!
 //! # Overview
 //!
-//! A [`ir::Plan`] is `{ root: DeclarativePlanNode, sink: SinkNode }`: a
+//! A [`ir::Plan`] is `{ root: DeclarativePlanNode, sink: SinkType }`: a
 //! transforms-only tree terminated by a sink describing how the engine should
 //! consume the row stream. Trees are built bottom-up with chain methods:
 //!

@@ -1,86 +1,51 @@
-//! Sink IR types — relation piping, [`ConsumeByKdf`], and file-reader [`LoadSink`].
-//!
-//! Also hosts [`LoadSpec`], a plain-data builder for [`LoadSink`] minus the
-//! output-relation handle (the handle is minted by
-//! [`PlanCollector::add_load`](crate::plans::ir::plan::PlanCollector::add_load)).
+//! Sink IR types — relation piping, consumer drains, and file-reader [`LoadSink`].
 
 use url::Url;
+use uuid::Uuid;
 
-use super::{FileFormat, FileType, OrderingSpec};
+use super::FileType;
 use crate::expressions::ColumnName;
-use crate::plans::ir::declarative::DeclarativePlanNode;
 use crate::plans::kdf::{ConsumerKdf, Handle, KdfStateToken, TraceContext};
-use crate::schema::{arc_schema, DataType, SchemaRef, StructField};
-use crate::FileMeta;
+use crate::schema::SchemaRef;
 
-/// Template for draining a row stream into a [`ConsumerKdf`] via
-/// [`SinkType::ConsumeByKdf`]. KDF lives exclusively under sinks in the IR.
+/// Template for draining a row stream into a [`ConsumerKdf`] via [`SinkType::Consume`].
 ///
 /// - `initial_state`: cloned per partition via [`DynClone`](dyn_clone::DynClone) into a
 ///   [`Handle`](crate::plans::kdf::Handle).
-/// - `requires_ordering`: stamped from [`ConsumerKdf::required_ordering`] at construction.
 /// - `token`: joins finalized state back to the phase's `PhaseState`.
-pub struct ConsumeByKdfSink {
+#[derive(Debug, Clone)]
+pub struct ConsumeSink {
     pub initial_state: Box<dyn ConsumerKdf>,
-    pub requires_ordering: Option<OrderingSpec>,
     pub token: KdfStateToken,
 }
 
-impl ConsumeByKdfSink {
-    /// Construct from a concrete consumer. Mints a fresh token from the KDF's
-    /// `kdf_id` and reads ordering from [`ConsumerKdf::required_ordering`].
+impl ConsumeSink {
+    /// Construct from a concrete consumer and mint a fresh token from `kdf_id`.
     pub fn new_consumer<C: ConsumerKdf + 'static>(state: C) -> Self {
-        let requires_ordering = state.required_ordering();
         let token = KdfStateToken::new(state.kdf_id());
         Self {
             initial_state: Box::new(state),
-            requires_ordering,
             token,
         }
     }
 
-    /// Mint a per-partition runtime [`Handle`] for this sink template.
-    pub fn new_handle(&self, ctx: TraceContext, partition: u32) -> Handle<dyn ConsumerKdf> {
-        Handle::new(
-            self.token.clone(),
-            ctx,
-            partition,
-            self.initial_state.clone(),
-        )
+    /// Mint a runtime [`Handle`] for this sink template.
+    pub fn new_handle(&self, ctx: TraceContext) -> Handle<dyn ConsumerKdf> {
+        Handle::new(self.token.clone(), ctx, self.initial_state.clone())
     }
 }
 
-impl Clone for ConsumeByKdfSink {
-    fn clone(&self) -> Self {
-        Self {
-            initial_state: self.initial_state.clone(),
-            requires_ordering: self.requires_ordering.clone(),
-            token: self.token.clone(),
-        }
-    }
-}
-
-impl std::fmt::Debug for ConsumeByKdfSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConsumeByKdfSink")
-            .field("kdf_id", &self.initial_state.kdf_id())
-            .field("requires_ordering", &self.requires_ordering)
-            .field("token", &self.token)
-            .finish()
-    }
-}
-
-// Token identity drives equality: tokens are process-unique by serial, and the
+// Token identity drives equality: tokens are process-unique by id, and the
 // `initial_state` trait object (`Box<dyn ConsumerKdf>`) is not `Eq`-able. Two
 // sinks sharing a token were constructed from the same plan node and therefore
 // describe the same consumer.
-impl PartialEq for ConsumeByKdfSink {
+impl PartialEq for ConsumeSink {
     fn eq(&self, other: &Self) -> bool {
         self.token == other.token
     }
 }
 
-impl Eq for ConsumeByKdfSink {}
+impl Eq for ConsumeSink {}
 
 /// Identifier for a relation produced by one plan and consumed by another in
 /// the same `PhaseOperation::Plans(...)`. Created via [`RelationHandle::fresh`];
@@ -104,9 +69,9 @@ pub struct RelationHandle {
     /// Diagnostic name (used in tracing spans, error messages); not part of
     /// equality / hashing.
     pub name: String,
-    /// Process-wide monotonic id. Drives equality and hashing so that two
-    /// freshly-minted handles with the same name are still distinct.
-    pub id: u64,
+    /// UUID identifier. Drives equality and hashing so that two freshly-minted
+    /// handles with the same name are still distinct.
+    pub id: String,
     /// Output schema of the producing plan. Carried alongside the handle so
     /// that consuming sources publish a static schema to downstream
     /// operators without an external lookup. Not part of equality / hashing.
@@ -115,14 +80,12 @@ pub struct RelationHandle {
 
 impl RelationHandle {
     /// Mint a fresh handle with the given diagnostic name and producer
-    /// output schema. Distinct ids regardless of `name` collisions, so names
+    /// output schema. Distinct UUID ids regardless of `name` collisions, so names
     /// are diagnostic-only — relations are identified by id.
     pub fn fresh(name: impl Into<String>, schema: SchemaRef) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
         Self {
             name: name.into(),
-            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            id: Uuid::new_v4().to_string(),
             schema,
         }
     }
@@ -175,11 +138,6 @@ impl DvRef {
     pub fn skip(column: ColumnName) -> Self {
         Self { column }
     }
-
-    /// Return the DV column reference.
-    pub fn primary_column(&self) -> &ColumnName {
-        &self.column
-    }
 }
 
 /// File-reader sink. For each upstream row, opens the resolved file in
@@ -192,7 +150,7 @@ impl DvRef {
 ///
 /// An optional [`Self::dv_ref`] column hint enables per-row deletion-vector
 /// masking against a descriptor column on the upstream relation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadSink {
     /// Where Load's output is materialized. Downstream plans reference this
     /// handle via [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
@@ -215,21 +173,50 @@ pub struct LoadSink {
     pub file_type: FileType,
 }
 
-impl PartialEq for LoadSink {
-    fn eq(&self, other: &Self) -> bool {
-        // Identity follows the materialized relation handle (process-wide
-        // unique). Two sinks that target the same handle are the same sink
-        // for plan-equality purposes.
-        self.output_relation == other.output_relation
+impl LoadSink {
+    /// Build a Load sink with default file-meta hints and no optional policies.
+    pub fn new(output_relation: RelationHandle, file_schema: SchemaRef, file_type: FileType) -> Self {
+        Self {
+            output_relation,
+            file_schema,
+            base_url: None,
+            file_meta: default_scan_file_columns(),
+            dv_ref: None,
+            passthrough_columns: vec![],
+            file_type,
+        }
     }
-}
 
-impl Eq for LoadSink {}
+    /// Set the base URL joined with each per-row file path.
+    pub fn with_base_url(mut self, base_url: Url) -> Self {
+        self.base_url = Some(base_url);
+        self
+    }
+
+    /// Set passthrough columns broadcast onto each emitted file row.
+    pub fn with_passthrough_columns(mut self, passthrough_columns: Vec<ColumnName>) -> Self {
+        self.passthrough_columns = passthrough_columns;
+        self
+    }
+
+    /// Set file-meta column hints read from each upstream row.
+    pub fn with_file_meta(mut self, file_meta: ScanFileColumns) -> Self {
+        self.file_meta = file_meta;
+        self
+    }
+
+    /// Attach a deletion-vector reference.
+    pub fn with_dv_ref(mut self, dv_ref: DvRef) -> Self {
+        self.dv_ref = Some(dv_ref);
+        self
+    }
+
+}
 
 /// What the engine does with the terminal row stream.
 ///
 /// Sink shapes: `Relation` (pipe into another plan or expose to the caller via
-/// a [`ResultPlan`](crate::plans::ir::ResultPlan)), `ConsumeByKdf` (drain into
+/// a [`ResultPlan`](crate::plans::ir::ResultPlan)), `Consume` (drain into
 /// a [`ConsumerKdf`]), and `Load` (per-row file read).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkType {
@@ -240,147 +227,17 @@ pub enum SinkType {
     /// as its caller-facing output.
     Relation(RelationHandle),
     /// Drain every output batch through the wrapped consumer KDF. The KDF's
-    /// finalized per-partition state is harvested by the engine into the
+    /// finalized state is harvested by the engine into the
     /// phase's `PhaseState` (and recovered by the typed
-    /// [`Extractor`](crate::plans::ir::declarative::Extractor) that yields
+    /// [`Extractor`](crate::plans::kdf::Extractor) that yields
     /// `O = ConsumerKdf::Output`).
-    ConsumeByKdf(ConsumeByKdfSink),
+    Consume(ConsumeSink),
     /// File-reader sink — for each upstream row, read a file and materialize
     /// the result under [`LoadSink::output_relation`]. See [`LoadSink`].
     Load(LoadSink),
 }
 
-/// Terminal node of a [`crate::plans::ir::plan::Plan`], carrying a [`SinkType`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SinkNode {
-    pub sink_type: SinkType,
-}
-
-// ============================================================================
-// LoadSpec — builder for LoadSink (output relation minted by PlanCollector)
-// ============================================================================
-
-/// Plain data describing a per-file [`LoadSink`] except for the output relation
-/// (minted by [`PlanCollector::add_load`](crate::plans::ir::plan::PlanCollector::add_load)).
-///
-/// Holds the upstream scan node plus the file-level read schema, base URL, and
-/// passthrough columns that the materialized Load will broadcast onto every
-/// emitted row. The file-meta column hints default to the FSR convention
-/// (`path: "path"`, `size: Some("size")`, `record_count: None`); callers that
-/// need other hints can build a [`LoadSink`] directly and use
-/// [`DeclarativePlanNode::into_load`].
-pub struct LoadSpec {
-    /// Upstream scan node producing one row per file to open.
-    pub scan_node: DeclarativePlanNode,
-    /// Per-file output schema read from each opened file.
-    pub file_schema: SchemaRef,
-    /// URL prefix joined with each per-row path on the scan.
-    pub base_url: Url,
-    /// Columns from the upstream relation broadcast alongside each file row.
-    pub passthrough_columns: Vec<ColumnName>,
-    /// Column-name hints used to read per-row file metadata from upstream.
-    pub file_meta: ScanFileColumns,
-    /// File format opened by the resulting [`LoadSink`].
-    pub file_type: FileType,
-    /// Optional upstream deletion-vector policy. When `None`, IR does not
-    /// request DV-based masking in load.
-    pub dv_ref: Option<DvRef>,
-}
-
-impl LoadSpec {
-    /// Build a [`LoadSpec`] for JSON files.
-    ///
-    /// `passthrough` lists top-level column names on `scan_schema` to broadcast
-    /// onto each emitted row. Names that resolve against `scan_schema` keep their
-    /// original type and nullability on the materialized relation; names that do
-    /// not resolve fall back to nullable STRING.
-    pub fn json(
-        files: Vec<FileMeta>,
-        scan_schema: SchemaRef,
-        file_schema: SchemaRef,
-        base_url: Url,
-        passthrough: &[&str],
-    ) -> Self {
-        Self::for_format(
-            FileType::Json,
-            files,
-            scan_schema,
-            file_schema,
-            base_url,
-            passthrough,
-        )
-    }
-
-    /// Build a [`LoadSpec`] for Parquet files. See [`LoadSpec::json`] for
-    /// `passthrough` semantics.
-    pub fn parquet(
-        files: Vec<FileMeta>,
-        scan_schema: SchemaRef,
-        file_schema: SchemaRef,
-        base_url: Url,
-        passthrough: &[&str],
-    ) -> Self {
-        Self::for_format(
-            FileType::Parquet,
-            files,
-            scan_schema,
-            file_schema,
-            base_url,
-            passthrough,
-        )
-    }
-
-    /// Format-parametric [`LoadSpec`] constructor. Used by call sites that pick
-    /// the file format at runtime (for example FSR checkpoint shape selection).
-    pub fn for_format(
-        format: FileFormat,
-        files: Vec<FileMeta>,
-        scan_schema: SchemaRef,
-        file_schema: SchemaRef,
-        base_url: Url,
-        passthrough: &[&str],
-    ) -> Self {
-        let passthrough_columns: Vec<ColumnName> =
-            passthrough.iter().map(|s| ColumnName::new([*s])).collect();
-        let scan_node = DeclarativePlanNode::scan(format, files, scan_schema);
-        Self {
-            scan_node,
-            file_schema,
-            base_url,
-            passthrough_columns,
-            file_meta: default_scan_file_columns(),
-            file_type: format,
-            dv_ref: None,
-        }
-    }
-
-    /// Attach a deletion-vector reference to the resulting [`LoadSink`].
-    pub fn with_dv_ref(mut self, dv_ref: DvRef) -> Self {
-        self.dv_ref = Some(dv_ref);
-        self
-    }
-
-    /// Materialized output schema for this spec: the file schema fields
-    /// followed by passthrough fields resolved against the scan's published
-    /// schema. Passthrough names that don't resolve fall back to nullable
-    /// STRING so the relation still publishes a usable shape.
-    pub(crate) fn compute_output_schema(&self) -> SchemaRef {
-        let scan_schema = self.scan_node.output_schema();
-        let mut fields: Vec<StructField> = self.file_schema.fields().cloned().collect();
-        for col in &self.passthrough_columns {
-            let leaf_name = col.path().first().cloned().unwrap_or_default();
-            let field = scan_schema
-                .field(leaf_name.as_str())
-                .cloned()
-                .unwrap_or_else(|| StructField::nullable(leaf_name, DataType::STRING));
-            fields.push(field);
-        }
-        arc_schema(fields)
-    }
-}
-
-/// Default file-meta column hints used by [`LoadSpec::for_format`] /
-/// [`LoadSpec::json`] / [`LoadSpec::parquet`]. Matches the convention used
+/// Default file-meta column hints used by [`LoadSink::new`]. Matches the convention used
 /// across FSR plan builders.
 fn default_scan_file_columns() -> ScanFileColumns {
     ScanFileColumns {
@@ -390,27 +247,3 @@ fn default_scan_file_columns() -> ScanFileColumns {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::schema::{arc_schema, DataType, StructField};
-
-    #[test]
-    fn load_passthrough_widens_relation_schema() {
-        let scan_schema = arc_schema([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("version", DataType::LONG),
-        ]);
-        let file_schema = arc_schema([StructField::nullable("payload", DataType::STRING)]);
-        let base = Url::parse("memory:///log/").unwrap();
-        let spec = LoadSpec::json(vec![], scan_schema, file_schema, base, &["version"]);
-        let output_schema = spec.compute_output_schema();
-        let names: Vec<String> = output_schema.fields().map(|f| f.name().clone()).collect();
-        assert_eq!(names, vec!["payload", "version"]);
-    }
-}

@@ -7,12 +7,12 @@
 //! Sinks: [`SinkType::Relation`] / [`SinkType::Load`] (drain + the executor materializes the
 //! result as a [`datafusion::datasource::MemTable`] under
 //! [`crate::executor::DataFusionExecutor::session_ctx`] for downstream
-//! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::ConsumeByKdf`] (drained directly by
+//! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::Consume`] (drained directly by
 //! the executor through a [`delta_kernel::plans::kdf::ConsumerKdf`] handle).
 //!
 //! [`SinkType::Relation`]: delta_kernel::plans::ir::nodes::SinkType::Relation
 //! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load
-//! [`SinkType::ConsumeByKdf`]: delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf
+//! [`SinkType::Consume`]: delta_kernel::plans::ir::nodes::SinkType::Consume
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,10 +23,7 @@ use datafusion_expr::expr_fn::cast;
 use datafusion_expr::lit;
 use datafusion_functions::core::expr_fn::{get_field, named_struct};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::plans::ir::nodes::JoinType;
-use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
-use delta_kernel::schema::SchemaRef;
 use delta_kernel::Engine;
 
 pub mod expr_translator;
@@ -44,10 +41,10 @@ pub struct CompileContext {
     /// compilation begins. Keyed by [`RelationHandle::id`]. An empty map is fine when the
     /// plan being compiled does not reference any relations (or for inspection-only paths
     /// like benchmark physical-plan dumps).
-    pub relation_providers: Arc<HashMap<u64, Arc<dyn TableProvider>>>,
-    /// Active phase's [`PhaseState`] (`Some` while a phase is executing). `ConsumeByKdf`
+    pub relation_providers: Arc<HashMap<String, Arc<dyn TableProvider>>>,
+    /// Active phase's [`PhaseState`] (`Some` while a phase is executing). `Consume`
     /// drains submit their finalized handles here; `None` means the executor is not inside a
-    /// phase and any ConsumeByKdf sink encountered surfaces an internal error.
+    /// phase and any consume sink encountered surfaces an internal error.
     pub phase_state: Option<PhaseState>,
     /// Kernel [`Engine`] for sinks that delegate IO to parquet/json handlers
     /// ([`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load)).
@@ -58,7 +55,7 @@ impl CompileContext {
     /// Build a context without an active phase state. Useful for inspection-only paths (e.g.
     /// benchmark plan printers) that do not execute a plan.
     pub fn new(
-        relation_providers: Arc<HashMap<u64, Arc<dyn TableProvider>>>,
+        relation_providers: Arc<HashMap<String, Arc<dyn TableProvider>>>,
         engine: Arc<dyn Engine>,
     ) -> Self {
         Self {
@@ -66,60 +63,6 @@ impl CompileContext {
             phase_state: None,
             engine,
         }
-    }
-}
-
-pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef, DataFusionError> {
-    match node {
-        DeclarativePlanNode::Scan(n) => n.effective_output_schema().map_err(|e| {
-            crate::error::plan_compilation(format!(
-                "scan output schema with row index is invalid: {e}"
-            ))
-        }),
-        DeclarativePlanNode::Values(n) => Ok(n.schema.clone()),
-        DeclarativePlanNode::RelationRef(h) => Ok(h.schema.clone()),
-        DeclarativePlanNode::Project { node, .. } => Ok(node.output_schema.clone()),
-        DeclarativePlanNode::Union { children, .. } => {
-            let Some(first) = children.first() else {
-                return Err(crate::error::unsupported("Union has no children"));
-            };
-            node_output_schema(first)
-        }
-        DeclarativePlanNode::Filter { child, .. } => node_output_schema(child),
-        DeclarativePlanNode::Window { child, node } => {
-            use delta_kernel::schema::{DataType, StructField, StructType};
-            let input_schema = node_output_schema(child)?;
-            let mut fields: Vec<StructField> = input_schema.fields().cloned().collect();
-            for wf in &node.functions {
-                fields.push(StructField::new(
-                    wf.output_col.clone(),
-                    DataType::LONG,
-                    false,
-                ));
-            }
-            StructType::try_new(fields)
-                .map(Arc::new)
-                .map_err(|e| crate::error::plan_compilation(format!("window output schema: {e}")))
-        }
-        DeclarativePlanNode::Join { build, probe, node } => match node.join_type {
-            JoinType::LeftAnti => node_output_schema(probe),
-            JoinType::Inner => {
-                let build_schema = node_output_schema(build)?;
-                let probe_schema = node_output_schema(probe)?;
-                build_schema
-                    .as_ref()
-                    .add(probe_schema.fields().cloned())
-                    .map(Arc::new)
-                    .map_err(|e| {
-                        crate::error::plan_compilation(format!(
-                            "inner join combined output schema is invalid: {e}"
-                        ))
-                    })
-            }
-        },
-        DeclarativePlanNode::FileListing(_) => Err(crate::error::unsupported(
-            "FileListing schema inference for Filter/Project is not wired yet",
-        )),
     }
 }
 

@@ -16,7 +16,7 @@ use datafusion_expr::{Expr, ExprFunctionExt, JoinType as DfJoinType, LogicalPlan
 use datafusion_functions_window::row_number::row_number;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::Expression;
-use delta_kernel::plans::ir::nodes::{JoinHint, JoinType as KernelJoinType};
+use delta_kernel::plans::ir::nodes::JoinType as KernelJoinType;
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 
 use super::CompileContext;
@@ -41,15 +41,15 @@ pub fn compile_plan_logical(
     plan: &Plan,
     ctx: &CompileContext,
 ) -> Result<LogicalPlan, DataFusionError> {
-    let _ = plan.sink.sink_type; // sink-type dispatch happens at the caller.
+    let _ = &plan.sink; // sink-type dispatch happens at the caller.
     compile_declarative_node_logical(&plan.root, ctx)
 }
 
 fn compile_declarative_node_logical(
-    node: &DeclarativePlanNode,
+    plan_node: &DeclarativePlanNode,
     ctx: &CompileContext,
 ) -> Result<LogicalPlan, DataFusionError> {
-    match node {
+    match plan_node {
         DeclarativePlanNode::Values(values) => {
             let arrow_schema: ArrowSchema =
                 values.schema.as_ref().try_into_arrow().map_err(|e| {
@@ -111,7 +111,7 @@ fn compile_declarative_node_logical(
             }
         }
         DeclarativePlanNode::RelationRef(handle) => {
-            let provider = ctx.relation_providers.get(&handle.id).ok_or_else(|| {
+            let provider = ctx.relation_providers.get(handle.id.as_str()).ok_or_else(|| {
                 plan_compilation(format!(
                     "RelationRef references unregistered handle id {} (name `{}`); the \
                      producing plan must run before any consumer compiles",
@@ -126,55 +126,42 @@ fn compile_declarative_node_logical(
             .build()
         }
         DeclarativePlanNode::Scan(node) => scan_to_listing_logical_plan(node),
-        DeclarativePlanNode::Join { build, probe, node } => {
-            if node.hint != JoinHint::Hash {
+        DeclarativePlanNode::Join {
+            build,
+            probe,
+            node: join_node,
+        } => {
+            if join_node.left_keys.is_empty()
+                || join_node.left_keys.len() != join_node.right_keys.len()
+            {
                 return Err(plan_compilation(format!(
-                    "Join hint {:?} is not supported; only Hash joins compile",
-                    node.hint
-                )));
-            }
-            if node.build_keys.is_empty() || node.build_keys.len() != node.probe_keys.len() {
-                return Err(plan_compilation(format!(
-                    "Join requires non-empty matched-arity keys; got build={} probe={}",
-                    node.build_keys.len(),
-                    node.probe_keys.len()
+                    "Join requires non-empty matched-arity keys; got left={} right={}",
+                    join_node.left_keys.len(),
+                    join_node.right_keys.len()
                 )));
             }
             let build_plan = compile_declarative_node_logical(build, ctx)?;
             let probe_plan = compile_declarative_node_logical(probe, ctx)?;
-            let left_keys = node
-                .build_keys
+            let left_keys = join_node
+                .left_keys
                 .iter()
                 .map(|e| kernel_expr_to_df(e.as_ref()))
                 .collect::<Result<Vec<_>, _>>()?;
-            let right_keys = node
-                .probe_keys
+            let right_keys = join_node
+                .right_keys
                 .iter()
                 .map(|e| kernel_expr_to_df(e.as_ref()))
                 .collect::<Result<Vec<_>, _>>()?;
-            let join_type = match node.join_type {
+            let join_type = match join_node.join_type {
                 KernelJoinType::Inner => DfJoinType::Inner,
                 KernelJoinType::LeftAnti => DfJoinType::RightAnti,
             };
             let plan = LogicalPlanBuilder::from(build_plan)
                 .join_with_expr_keys(probe_plan, join_type, (left_keys, right_keys), None)?
                 .build()?;
-            let target_schema = match node.join_type {
-                KernelJoinType::LeftAnti => super::node_output_schema(probe)?,
-                KernelJoinType::Inner => {
-                    let build_schema = super::node_output_schema(build)?;
-                    let probe_schema = super::node_output_schema(probe)?;
-                    build_schema
-                        .as_ref()
-                        .add(probe_schema.fields().cloned())
-                        .map(Arc::new)
-                        .map_err(|e| {
-                            plan_compilation(format!(
-                                "logical inner join combined output schema is invalid: {e}"
-                            ))
-                        })?
-                }
-            };
+            let target_schema = plan_node
+                .output_schema()
+                .map_err(|e| plan_compilation(format!("join output schema derivation failed: {e}")))?;
             canonicalize_output_to_kernel_schema(plan, &target_schema)
         }
         DeclarativePlanNode::Window { child, node } => {
@@ -199,7 +186,7 @@ fn compile_declarative_node_logical(
                 .iter()
                 .map(|spec| {
                     let expr = kernel_expr_to_df(&Expression::from(spec.column.clone()))?;
-                    Ok(expr.sort(!spec.descending, spec.nulls_first))
+                    Ok(expr.sort(!spec.descending, false))
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
             // Multiple identical row_number() PARTITION BY / ORDER BY exprs collide on

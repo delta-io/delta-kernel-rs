@@ -944,7 +944,7 @@ mod tests {
             .into_iter()
             .find(|p| {
                 matches!(
-                    &p.sink.sink_type,
+                    &p.sink,
                     delta_kernel::plans::ir::nodes::SinkType::Relation(h) if h.id == terminal_id
                 )
             })
@@ -996,12 +996,12 @@ mod tests {
                     Ok(logical) => println!(
                         "=== FSR Phase Plan {} ({:?}) ===\n{}",
                         idx,
-                        plan.sink.sink_type,
+                        plan.sink,
                         logical.display_indent()
                     ),
                     Err(e) => println!(
                         "=== FSR Phase Plan {} ({:?}) -- compile skipped: {} ===",
-                        idx, plan.sink.sink_type, e
+                        idx, plan.sink, e
                     ),
                 }
             }
