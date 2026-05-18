@@ -17,7 +17,7 @@ use crate::actions::{
 use crate::expressions::Expression;
 use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::nodes::FileFormat;
+use crate::plans::ir::nodes::{FileFormat, RelationHandle};
 use crate::plans::ir::{Extractor, Plan, PlanBuilder};
 use crate::plans::kdf::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::context::Context;
@@ -30,11 +30,22 @@ use crate::{delta_error, FileMeta};
 /// Resolved checkpoint encoding + schema hints. `actions_schema_subset` keys the top-level
 /// checkpoint scan in [`super::plans::build_fsr_plans`]; `has_sidecars` decides whether
 /// the FSR sidecar Load is appended to the plan vector.
+///
+/// `requested_stats_schema` carries the per-scan physical stats schema (the projection that
+/// `data_skipping` would consume); `has_stats_parsed` records whether the leaf parquet has a
+/// compatible native `add.stats_parsed` field, letting plan builders pick `col(["add",
+/// "stats_parsed"])` instead of `parse_json(col(["add", "stats"]))`. `manifest_relation` is
+/// the handle of the V2 multipart manifest scan published by
+/// [`resolve_checkpoint_shape`], so downstream plan builders can `RelationRef` it instead of
+/// re-scanning.
 #[derive(Clone, Debug)]
 pub struct CheckpointShape {
     pub file_format: FileFormat,
     pub has_sidecars: bool,
     pub actions_schema_subset: SchemaRef,
+    pub requested_stats_schema: Option<SchemaRef>,
+    pub has_stats_parsed: bool,
+    pub manifest_relation: Option<RelationHandle>,
 }
 
 pub fn snapshot_has_checkpoint_files(snapshot: &Snapshot) -> bool {
@@ -65,6 +76,9 @@ pub fn checkpoint_shape_from_schema(schema: &SchemaRef) -> Result<CheckpointShap
         file_format: FileFormat::Parquet,
         has_sidecars: schema.contains(SIDECAR_NAME),
         actions_schema_subset: subset,
+        requested_stats_schema: None,
+        has_stats_parsed: false,
+        manifest_relation: None,
     })
 }
 
@@ -87,6 +101,9 @@ pub fn checkpoint_shape_from_last_checkpoint(
         has_sidecars: full_schema.contains(SIDECAR_NAME)
             || (has_checkpoint_parts && matches!(fmt, FileFormat::Json)),
         actions_schema_subset: subset,
+        requested_stats_schema: None,
+        has_stats_parsed: false,
+        manifest_relation: None,
     })
 }
 
