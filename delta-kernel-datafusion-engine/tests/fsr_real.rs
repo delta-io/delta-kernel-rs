@@ -7,7 +7,7 @@
 //!   2. `snapshot.full_state()` -> SM
 //!   3. `executor.drive_to_completion(sm)` -> `ResultPlan`
 //!   4. `executor.collect_result(rp)` -> `Vec<RecordBatch>`
-//!   5. `pretty_format_batches(&batches)` and `assert_eq!` against the const.
+//!   5. `datafusion_common::assert_batches_sorted_eq!` against the expected lines.
 //!
 //! Each `EXPECTED_*` const was captured from this same path and then cross-checked against an
 //! independent source of truth before being frozen here: the FSR result's `add.path` set is
@@ -21,11 +21,11 @@ mod common;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
+use datafusion_common::assert_batches_sorted_eq;
 use rstest::rstest;
 use tempfile::TempDir;
 use url::Url;
@@ -227,30 +227,6 @@ async fn full_state_prints_expected_results(#[case] fixture: &str, #[case] expec
         .collect_result(result_plan)
         .await
         .expect("collect full_state result");
-    let pretty = pretty_format_batches(&batches)
-        .expect("pretty_format_batches")
-        .to_string();
-    assert_eq!(
-        sort_data_rows(&pretty),
-        sort_data_rows(expected),
-        "fixture: {fixture}"
-    );
-}
-
-/// Order-independent line comparison helper.
-///
-/// `pretty_format_batches` returns a table with deterministic header (line 0 = top border, line 1
-/// = column names, line 2 = header/body separator), deterministic footer (last line = bottom
-/// border), but a body whose row order reflects the engine's batch order. FSR's batch order is
-/// driven by tokio-multi-thread execution and varies run-to-run for fixtures with multiple
-/// sidecars (`v2-*`), so we normalize by sorting the body lines before comparing. Header and
-/// footer are left in place so column-width drift still trips the assertion.
-fn sort_data_rows(table: &str) -> String {
-    let mut lines: Vec<&str> = table.trim().lines().collect();
-    let n = lines.len();
-    if n > 4 {
-        // Header occupies lines [0, 1, 2]; footer is the last line.
-        lines[3..n - 1].sort_unstable();
-    }
-    lines.join("\n")
+    let expected_lines: Vec<&str> = expected.trim().lines().collect();
+    assert_batches_sorted_eq!(expected_lines, &batches);
 }
