@@ -949,10 +949,15 @@ mod tests {
                 )
             })
             .expect("expected replay plans to include the scan-result Relation sink");
-        let logical = runner
-            .executor
-            .compile_plan_logical_for_inspection(&plan)
-            .expect("compile_plan_logical should succeed");
+        use delta_kernel_datafusion_engine::compile::{compile_plan_logical, CompileContext};
+        let logical = compile_plan_logical(
+            &plan,
+            &CompileContext::new(
+                Arc::new(std::collections::HashMap::new()),
+                Arc::clone(runner.executor.engine()),
+            ),
+        )
+        .expect("compile_plan_logical should succeed");
 
         println!(
             "=== DataFusion Logical Plan ===\n{}",
@@ -991,8 +996,13 @@ mod tests {
                 .drive_to_completion(sm)
                 .await
                 .expect("drive full_state SM to completion");
+            use delta_kernel_datafusion_engine::compile::{compile_plan_logical, CompileContext};
             for (idx, plan) in result_plan.plans.iter().enumerate() {
-                match runner.executor.compile_plan_logical_for_inspection(plan) {
+                let ctx = CompileContext::new(
+                    Arc::new(std::collections::HashMap::new()),
+                    Arc::clone(runner.executor.engine()),
+                );
+                match compile_plan_logical(plan, &ctx) {
                     Ok(logical) => println!(
                         "=== FSR Phase Plan {} ({:?}) ===\n{}",
                         idx,

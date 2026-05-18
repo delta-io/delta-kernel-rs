@@ -12,12 +12,26 @@
 //! [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume)
 //! sink, which is dispatched in-process — handles never need to cross a
 //! serialization boundary.
+//!
+//! # Identity
+//!
+//! Every handle carries the owning state machine's identity tuple:
+//!
+//! - `sm_id: Uuid` — fresh per [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM)
+//!   instance.
+//! - `sm_kind: &'static str` — static label for the SM's logical kind (e.g. `"scan_metadata"`).
+//! - `phase_name: &'static str` — the phase that minted this handle, as supplied to
+//!   [`Context::execute`](crate::plans::state_machines::framework::coroutine::context::Context::execute).
+//!
+//! Together they form the `(sm_id, sm_kind, phase_name)` correlation triple used by tracing
+//! span fields and `PhaseState` cross-checks.
 
 use std::any::Any;
 
+use uuid::Uuid;
+
 use super::token::ConsumerKdfId;
 use super::token::KdfStateToken;
-use super::trace::TraceContext;
 use super::traits::{ConsumerKdf, KdfControl};
 use crate::{DeltaResult, EngineData};
 
@@ -26,25 +40,37 @@ use crate::{DeltaResult, EngineData};
 ///
 /// `inner` is the mutable working buffer (a `Box<dyn ConsumerKdf>`). `token`
 /// joins this handle's eventual finalized state back to the plan-tree node.
-/// `ctx` identifies the execution context for tracing and error attribution.
+/// `sm_id` / `sm_kind` / `phase_name` identify the owning SM/phase for tracing
+/// and error attribution.
 #[derive(Debug)]
 pub struct Handle<K: ConsumerKdf + ?Sized> {
     token: KdfStateToken,
-    ctx: TraceContext,
+    sm_id: Uuid,
+    sm_kind: &'static str,
+    phase_name: &'static str,
     inner: Box<K>,
 }
 
 impl<K: ConsumerKdf + ?Sized> Handle<K> {
-    /// Construct a handle.
-    pub fn new(token: KdfStateToken, ctx: TraceContext, inner: Box<K>) -> Self {
-        Self { token, ctx, inner }
+    /// Construct a handle stamped with the owning SM's identity tuple.
+    pub fn new(
+        token: KdfStateToken,
+        sm_id: Uuid,
+        sm_kind: &'static str,
+        phase_name: &'static str,
+        inner: Box<K>,
+    ) -> Self {
+        Self {
+            token,
+            sm_id,
+            sm_kind,
+            phase_name,
+            inner,
+        }
     }
 
     pub fn token(&self) -> &KdfStateToken {
         &self.token
-    }
-    pub fn ctx(&self) -> &TraceContext {
-        &self.ctx
     }
     pub fn kdf_id(&self) -> ConsumerKdfId {
         self.inner.kdf_id()
@@ -57,8 +83,9 @@ impl<K: ConsumerKdf + ?Sized> Handle<K> {
         skip(self, batch),
         ret,
         fields(
-            sm = self.ctx.sm,
-            phase = self.ctx.phase,
+            sm_id = %self.sm_id,
+            sm_kind = self.sm_kind,
+            phase_name = self.phase_name,
             kdf_id = %self.inner.kdf_id(),
             token_id = self.token.id,
         ),
@@ -67,14 +94,15 @@ impl<K: ConsumerKdf + ?Sized> Handle<K> {
         self.inner.apply(batch)
     }
 
-    /// Consume the handle, returning `(token, ctx, erased state)`.
+    /// Consume the handle, returning the finalized identity-stamped state.
     #[tracing::instrument(
         level = "debug",
         name = "kdf.finish",
         skip(self),
         fields(
-            sm = self.ctx.sm,
-            phase = self.ctx.phase,
+            sm_id = %self.sm_id,
+            sm_kind = self.sm_kind,
+            phase_name = self.phase_name,
             kdf_id = %self.inner.kdf_id(),
             token_id = self.token.id,
         ),
@@ -83,19 +111,22 @@ impl<K: ConsumerKdf + ?Sized> Handle<K> {
         tracing::debug!("kdf handle finished");
         FinishedHandle {
             token: self.token,
-            ctx: self.ctx,
+            sm_id: self.sm_id,
+            sm_kind: self.sm_kind,
+            phase_name: self.phase_name,
             erased: self.inner.finish(),
         }
     }
 }
 
-/// Output of [`Handle::finish`] — carries the token, execution context,
-/// and erased final state. Consumed by
-/// `PhaseState::submit_kdf_handle`.
+/// Output of [`Handle::finish`] — carries the token, the owning SM's identity
+/// tuple, and the erased final state. Consumed by `PhaseState::submit_kdf_handle`.
 #[derive(Debug)]
 pub struct FinishedHandle {
     pub token: KdfStateToken,
-    pub ctx: TraceContext,
+    pub sm_id: Uuid,
+    pub sm_kind: &'static str,
+    pub phase_name: &'static str,
     pub erased: Box<dyn Any + Send>,
 }
 
@@ -109,7 +140,9 @@ where
     fn clone(&self) -> Self {
         Self {
             token: self.token.clone(),
-            ctx: self.ctx.clone(),
+            sm_id: self.sm_id,
+            sm_kind: self.sm_kind,
+            phase_name: self.phase_name,
             inner: self.inner.clone(),
         }
     }

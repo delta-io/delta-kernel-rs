@@ -17,8 +17,9 @@
 //!
 //! - [`token::KdfStateToken`] — `{ kdf_id, id }` stamped at plan-build time. Keys the
 //!   executor's state table.
-//! - [`trace::TraceContext`] — `{ sm, phase }` stamped at phase-execute time. Lives on handles;
-//!   used by tracing and cross-check validations.
+//! - `(sm_id, sm_kind, phase_name)` — owning SM's identity tuple stamped at phase-execute time.
+//!   Lives directly as fields on [`handle::Handle`] and [`handle::FinishedHandle`]; used by
+//!   tracing and cross-check validations.
 //!
 //! # Handles
 //!
@@ -35,13 +36,11 @@
 pub mod handle;
 pub mod state;
 pub mod token;
-pub mod trace;
 pub mod traits;
 pub mod typed;
 
 pub use handle::{FinishedHandle, Handle};
 pub use state::consumer::{CheckpointHintReader, MetadataProtocolReader, SidecarCollector};
 pub use token::{ConsumerKdfId, KdfStateToken};
-pub use trace::TraceContext;
 pub use traits::{ConsumerKdf, KdfControl};
 pub use typed::{Extractor, KdfOutput};

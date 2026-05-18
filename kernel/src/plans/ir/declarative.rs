@@ -555,7 +555,9 @@ mod tests {
 
     #[test]
     fn consume_produces_plan_and_extractor_with_consume_sink() {
-        use crate::plans::kdf::{FinishedHandle, TraceContext};
+        use uuid::Uuid;
+
+        use crate::plans::kdf::FinishedHandle;
         use crate::plans::state_machines::framework::phase_state::PhaseState;
 
         let (plan, extractor) =
@@ -567,10 +569,9 @@ mod tests {
         state
             .submit_kdf_handle(FinishedHandle {
                 token: extractor.token().clone(),
-                ctx: TraceContext {
-                    sm: "test".to_string(),
-                    phase: "consume".to_string(),
-                },
+                sm_id: Uuid::new_v4(),
+                sm_kind: "test",
+                phase_name: "consume",
                 erased: Box::new(NoopConsumer),
             })
             .unwrap();

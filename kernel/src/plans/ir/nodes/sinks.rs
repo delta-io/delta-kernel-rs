@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::FileType;
 use crate::expressions::ColumnName;
-use crate::plans::kdf::{ConsumerKdf, Handle, KdfStateToken, TraceContext};
+use crate::plans::kdf::{ConsumerKdf, Handle, KdfStateToken};
 use crate::schema::SchemaRef;
 
 /// Template for draining a row stream into a [`ConsumerKdf`] via [`SinkType::Consume`].
@@ -29,9 +29,21 @@ impl ConsumeSink {
         }
     }
 
-    /// Mint a runtime [`Handle`] for this sink template.
-    pub fn new_handle(&self, ctx: TraceContext) -> Handle<dyn ConsumerKdf> {
-        Handle::new(self.token.clone(), ctx, self.initial_state.clone())
+    /// Mint a runtime [`Handle`] for this sink template, stamped with the owning state machine's
+    /// identity tuple.
+    pub fn new_handle(
+        &self,
+        sm_id: Uuid,
+        sm_kind: &'static str,
+        phase_name: &'static str,
+    ) -> Handle<dyn ConsumerKdf> {
+        Handle::new(
+            self.token.clone(),
+            sm_id,
+            sm_kind,
+            phase_name,
+            self.initial_state.clone(),
+        )
     }
 }
 

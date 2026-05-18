@@ -113,17 +113,18 @@ impl PhaseState {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
-    use crate::plans::kdf::{ConsumerKdfId, TraceContext};
+    use crate::plans::kdf::ConsumerKdfId;
     use crate::schema::StructType;
 
     fn finished_handle(token: &KdfStateToken, payload: i64) -> FinishedHandle {
         FinishedHandle {
             token: token.clone(),
-            ctx: TraceContext {
-                sm: "test".to_string(),
-                phase: "phase".to_string(),
-            },
+            sm_id: Uuid::new_v4(),
+            sm_kind: "test",
+            phase_name: "phase",
             erased: Box::new(payload),
         }
     }
