@@ -203,7 +203,8 @@ async fn commit_dedup_batches_for_snapshot(
     engine: Arc<dyn KernelEngine>,
 ) -> Vec<RecordBatch> {
     let shape = checkpoint_shape_from_last_checkpoint(&snapshot).expect("shape");
-    let rp = build_fsr_plans(&snapshot, shape).expect("build fsr plans");
+    let mut registry = delta_kernel::plans::ir::RelationRegistry::new(uuid::Uuid::new_v4());
+    let rp = build_fsr_plans(&snapshot, shape, &mut registry).expect("build fsr plans");
     let commit_dedup_handle = commit_dedup_sink_handle(&rp.plans);
     let ex = DataFusionExecutor::try_new_with_engine(engine).expect("executor");
     ex.execute_plans(&rp.plans).await.expect("run fsr plans");

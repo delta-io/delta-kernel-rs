@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use url::Url;
-use uuid::Uuid;
 
 use super::checkpoint_shape::{checkpoint_manifest_scan_schema, CheckpointShape};
 use super::dedup::{fsr_dedup_key, fsr_row_has_identity_predicate, FSR_JOIN_KEY_COL};
@@ -70,9 +69,14 @@ pub struct CommitFileMeta {
 /// Each preceding plan publishes a [`RelationHandle`] consumed by its
 /// successors. The terminal plan binds to [`FSR_RESULTS`]; the caller reads
 /// that relation after executing every plan in [`ResultPlan::plans`].
+///
+/// `registry` owns naming for every minted handle: callers thread their own
+/// (typically SM-identity-scoped) registry through so all FSR-produced
+/// relation IDs share the caller's `sm_id` prefix.
 pub fn build_fsr_plans(
     snapshot: &Snapshot,
     shape: CheckpointShape,
+    registry: &mut RelationRegistry,
 ) -> Result<ResultPlan, DeltaError> {
     let log_root = snapshot.log_segment().log_root.clone();
     let segment = snapshot.log_segment();
@@ -94,7 +98,6 @@ pub fn build_fsr_plans(
     let txn_expiry = calculate_transaction_expiration_timestamp(snapshot.table_properties())
         .map_err(|e| e.into_delta_default())?;
 
-    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let mut plans: Vec<Plan> = Vec::new();
 
     // === commit_load: VALUES(commits) -> JSON load -> FSR_COMMIT_RAW ===
@@ -120,7 +123,7 @@ pub fn build_fsr_plans(
         vec![ColumnName::new(["version"])],
         default_scan_file_columns(),
         None,
-        &mut registry,
+        registry,
     )?;
     plans.push(commit_raw_plan);
 
@@ -167,7 +170,7 @@ pub fn build_fsr_plans(
                 .collect(),
             augmented_action_schema(false)?,
         )
-        .into_relation(FSR_COMMIT_DEDUP, &mut registry)?;
+        .into_relation(FSR_COMMIT_DEDUP, registry)?;
     plans.push(commit_dedup_plan);
 
     // === checkpoint_top (optional): bare scan of top-level checkpoint parts ===
@@ -184,8 +187,7 @@ pub fn build_fsr_plans(
                 checkpoint_manifest_scan_schema(shape.has_sidecars),
             ),
         };
-        let checkpoint_top_plan =
-            checkpoint_scan.into_relation(FSR_CHECKPOINT_TOP, &mut registry)?;
+        let checkpoint_top_plan = checkpoint_scan.into_relation(FSR_CHECKPOINT_TOP, registry)?;
         let checkpoint_top = relation_output_handle(&checkpoint_top_plan)?;
         plans.push(checkpoint_top_plan);
         Some(checkpoint_top)
@@ -225,7 +227,7 @@ pub fn build_fsr_plans(
             vec![],
             default_scan_file_columns(),
             None,
-            &mut registry,
+            registry,
         )?;
         let sidecar_handle = load_output_relation(&sidecar_plan)?;
         plans.push(sidecar_plan);
@@ -235,7 +237,7 @@ pub fn build_fsr_plans(
     };
 
     let results_plan = build_results_plan(
-        &mut registry,
+        registry,
         sidecar.as_ref(),
         checkpoint_top.as_ref(),
         min_file_ts,

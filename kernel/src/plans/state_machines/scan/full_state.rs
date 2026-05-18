@@ -57,6 +57,8 @@
 
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use super::checkpoint_shape::{checkpoint_shape_from_last_checkpoint, CheckpointShape};
 use super::plans::build_fsr_plans;
 // Re-exports for the FSR relation handle name constants. External code references these via
@@ -66,7 +68,7 @@ pub use super::plans::{
     FSR_SIDECAR_ACTIONS,
 };
 use crate::plans::errors::DeltaError;
-use crate::plans::ir::ResultPlan;
+use crate::plans::ir::{RelationRegistry, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::snapshot::Snapshot;
 
@@ -104,11 +106,19 @@ impl FullState {
     /// in one shot. Use this when the snapshot already has sufficient
     /// `_last_checkpoint` hints and no SM driver is needed.
     pub fn plans(&self) -> Result<ResultPlan, DeltaError> {
+        let mut registry = RelationRegistry::new(Uuid::new_v4());
+        self.plans_with_registry(&mut registry)
+    }
+
+    fn plans_with_registry(
+        &self,
+        registry: &mut RelationRegistry,
+    ) -> Result<ResultPlan, DeltaError> {
         let shape = match &self.checkpoint_shape {
             Some(shape) => shape.clone(),
             None => checkpoint_shape_from_last_checkpoint(self.snapshot.as_ref())?,
         };
-        build_fsr_plans(self.snapshot.as_ref(), shape)
+        build_fsr_plans(self.snapshot.as_ref(), shape, registry)
     }
 
     /// Wrap [`Self::plans`] in a zero-yield [`CoroutineSM`].
@@ -120,7 +130,10 @@ impl FullState {
     /// required today.
     pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let this = self.clone();
-        CoroutineSM::new("full_state", move |_co, _sm_id| async move { this.plans() })
+        CoroutineSM::new("full_state", move |_co, sm_id| async move {
+            let mut registry = RelationRegistry::new(sm_id);
+            this.plans_with_registry(&mut registry)
+        })
     }
 }
 
@@ -173,7 +186,8 @@ mod tests {
     fn full_state_builder_matches_direct_fsr_build() {
         let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
         let shape = checkpoint_shape_from_last_checkpoint(&snapshot).unwrap();
-        let direct = build_fsr_plans(&snapshot, shape.clone()).unwrap();
+        let mut registry = RelationRegistry::new(Uuid::new_v4());
+        let direct = build_fsr_plans(&snapshot, shape.clone(), &mut registry).unwrap();
         let built = FullState::for_table(Arc::clone(&snapshot))
             .with_stats()
             .with_checkpoint_shape(shape)
@@ -190,7 +204,8 @@ mod tests {
         for table in REPLAY_COVERAGE_TABLES {
             let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
             let shape = checkpoint_shape_from_last_checkpoint(snapshot.as_ref()).unwrap();
-            let direct = build_fsr_plans(snapshot.as_ref(), shape.clone()).unwrap();
+            let mut registry = RelationRegistry::new(Uuid::new_v4());
+            let direct = build_fsr_plans(snapshot.as_ref(), shape.clone(), &mut registry).unwrap();
             let built = FullState::for_table(Arc::clone(&snapshot))
                 .with_stats()
                 .with_checkpoint_shape(shape)

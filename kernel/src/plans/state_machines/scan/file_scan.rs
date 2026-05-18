@@ -221,10 +221,11 @@ fn scan_metadata_plans_with_shape(
     // The terminal FSR plan is rebound under `scan.fsr_results` in this layer's registry so the
     // downstream actions chain can `relation_ref` it. The rebind reuses the strict
     // `action_schema()` -- the same contract `build_fsr_plans` publishes -- since the engine
-    // realigns the relaxed JSON/Parquet output to that schema at the scan boundary.
+    // realigns the relaxed JSON/Parquet output to that schema at the scan boundary. Both layers
+    // share one registry so every minted handle shares the same `sm_id` namespace.
     let mut registry = RelationRegistry::new(Uuid::new_v4());
     let mut plans: Vec<Plan> = Vec::new();
-    let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
+    let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape, &mut registry)?;
     let fsr_terminal_id = fsr.result_relation.id;
     let mut terminal_plan: Option<crate::plans::ir::Plan> = None;
     for plan in fsr.plans {
