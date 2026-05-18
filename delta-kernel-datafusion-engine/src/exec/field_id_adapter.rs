@@ -118,6 +118,16 @@ impl FieldIdPhysicalExprAdapter {
             }
         };
 
+        // Virtual columns (parquet `RowNumber` etc.) are materialized by the parquet
+        // decoder via [`ArrowReaderOptions::with_virtual_columns`]; they never appear in
+        // the on-disk physical schema, so field-id / name matching against the physical
+        // schema would always miss. Pass the column reference through and let the
+        // downstream column-rebinding (`reassign_expr_columns` in the opener) resolve it
+        // against the post-virtual-injection stream schema by name.
+        if is_virtual_column(logical_field) {
+            return Ok(Arc::new(column.clone()));
+        }
+
         let physical_idx = match find_physical_match(
             logical_field,
             self.physical_file_schema.fields(),
@@ -227,6 +237,21 @@ fn parse_parquet_field_id(field: &Field) -> Option<i64> {
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
         .and_then(|s| s.parse::<i64>().ok())
+}
+
+/// A field is a "virtual" parquet column when it carries an Arrow extension type prefixed
+/// with `parquet.virtual.` (e.g. [`parquet::arrow::RowNumber`] → `parquet.virtual.row_number`).
+/// Such columns are materialized at decode time by arrow-rs via
+/// [`ArrowReaderOptions::with_virtual_columns`] — they never appear in the on-disk parquet
+/// schema, so field-id / name matching against the physical schema would always miss.
+///
+/// We match on the prefix rather than enumerating each typed extension so we don't need to
+/// list `RowNumber`, `RowGroupId`, future virtual types, etc. one by one.
+fn is_virtual_column(field: &Field) -> bool {
+    field
+        .metadata()
+        .get("ARROW:extension:name")
+        .is_some_and(|name| name.starts_with("parquet.virtual."))
 }
 
 /// A [`PhysicalExpr`] that wraps an inner column-producing expression and renames its nested
