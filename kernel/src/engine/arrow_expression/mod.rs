@@ -18,6 +18,9 @@ use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
+#[cfg(feature = "internal-api")]
+pub mod apply_schema;
+#[cfg(not(feature = "internal-api"))]
 mod apply_schema;
 pub mod evaluate_expression;
 pub mod opaque;

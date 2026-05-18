@@ -15,6 +15,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
     "declarative-plans",
     "default-engine-rustls",
     "arrow",
+    "internal-api",
 ] }
 
 datafusion-common = { version = "53", default-features = false }
