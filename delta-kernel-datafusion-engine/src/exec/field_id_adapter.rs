@@ -35,9 +35,10 @@
 //!    array at evaluate time so its [`DataType`] matches the kernel-declared schema.
 //!
 //! This makes the parquet opener emit `RecordBatch`es whose schema (including all nested
-//! struct field names) matches what the kernel declared, end-to-end. Downstream alignment
-//! layers (`align_schema.rs`, `NullabilityValidationExec`'s struct rewrite, `LoadExec`'s
-//! per-batch realign) all become redundant.
+//! struct field names) matches what the kernel declared, end-to-end. The only remaining
+//! post-scan rewrite is [`super::NullabilityValidationExec`], which re-asserts strict NOT
+//! NULL on parent struct nodes whose decoded children carry nulls (a case neither this
+//! adapter nor the parquet decoder enforce on their own).
 
 use std::any::Any;
 use std::fmt;

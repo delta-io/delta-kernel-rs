@@ -37,6 +37,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use chrono::TimeZone;
 use datafusion_common::error::DataFusionError;
 use datafusion_common::Result as DfResult;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -94,9 +95,6 @@ struct ProjectionPlan {
     /// "logical" side and matches it against the physical parquet schema by field id /
     /// column-mapping physical name.
     narrow_file_schema: KernelSchemaRef,
-    /// Number of fields in `narrow_file_schema`. Cached because we need it during assembly
-    /// validation and the kernel SchemaRef accessor allocates an iterator each call.
-    narrow_file_field_count: usize,
     /// Subset of [`LoadSink::passthrough_columns`] referenced by projection, in original order.
     narrow_passthrough_columns: Vec<delta_kernel::expressions::ColumnName>,
     /// Per-output-column source descriptor in projection order.
@@ -125,7 +123,6 @@ impl ProjectionPlan {
                 .collect();
             return Ok(Self {
                 narrow_file_schema: sink.file_schema.clone(),
-                narrow_file_field_count: file_count,
                 narrow_passthrough_columns: sink.passthrough_columns.clone(),
                 assembly,
                 output_schema: Arc::clone(full_schema),
@@ -188,7 +185,6 @@ impl ProjectionPlan {
                 ))
             })?
         };
-        let narrow_file_field_count = narrow_file_schema.fields().len();
 
         let narrow_passthrough_columns: Vec<_> = pt_indices
             .iter()
@@ -226,7 +222,6 @@ impl ProjectionPlan {
         let output_schema = Arc::new(full_schema.project(proj)?);
         Ok(Self {
             narrow_file_schema,
-            narrow_file_field_count,
             narrow_passthrough_columns,
             assembly,
             output_schema,
@@ -336,7 +331,7 @@ impl fmt::Debug for LoadExec {
             .field("limit", &self.limit)
             .field(
                 "narrow_file_fields",
-                &self.projection_plan.narrow_file_field_count,
+                &self.projection_plan.narrow_file_schema.fields().len(),
             )
             .field(
                 "narrow_passthrough_fields",
@@ -356,7 +351,7 @@ impl DisplayAs for LoadExec {
             self.sink.file_type,
             self.projection,
             self.limit,
-            self.projection_plan.narrow_file_field_count,
+            self.projection_plan.narrow_file_schema.fields().len(),
             self.projection_plan.narrow_passthrough_columns.len(),
         )
     }
@@ -785,12 +780,14 @@ fn into_partitioned_file(
     let listing = ListingTableUrl::parse(url.as_str())?;
     let object_store_url = listing.object_store();
     let store_path = listing.prefix().clone();
-    let mut pf = PartitionedFile::new(store_path.as_ref().to_owned(), u64::try_from(size.max(0)).unwrap_or(0));
-    // `PartitionedFile::new` reparses the path as `object_store::path::Path` from a string. To
-    // preserve the exact `Path` instance ListingTableUrl produced (which already handled URL
-    // decoding), stamp it directly.
-    pf.object_meta.location = store_path;
-    Ok((object_store_url, pf))
+    let object_meta = delta_kernel::object_store::ObjectMeta {
+        location: store_path,
+        last_modified: chrono::Utc.timestamp_nanos(0),
+        size: u64::try_from(size.max(0)).unwrap_or(0),
+        e_tag: None,
+        version: None,
+    };
+    Ok((object_store_url, PartitionedFile::new_from_meta(object_meta)))
 }
 
 fn file_size_for_row(

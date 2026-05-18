@@ -117,9 +117,10 @@ pub(super) fn nested_non_null_validations(schema: &ArrowSchema) -> Vec<(String, 
 /// logical plans built on top see the strict types; the runtime [`NullabilityValidationExec`]
 /// guarantees emitted batches conform.
 ///
-/// Used for JSON scans where DataFusion's JSON decoder cannot accept Delta protocol NOT NULL
-/// constraints on nested fields. Parquet scans skip the wrapper -- parquet's own decoder
-/// enforces declared nullability at decode time.
+/// Used for both Parquet and JSON scans today; either decoder can hand back batches whose
+/// nullability is laxer than the kernel-declared schema (parquet checkpoints commonly write
+/// `add.path` as nullable; the JSON decoder silently drops declared NOT NULL on nested
+/// children). The wrapper re-asserts the strict contract at the scan boundary.
 pub(super) struct NullabilityEnforcingTableProvider {
     inner: Arc<dyn TableProvider>,
     strict_schema: Arc<ArrowSchema>,
