@@ -154,13 +154,7 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                 )
                 .await
                 .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
-            let checkpoint_schema = checkpoint_state.take_schema().ok_or_else(|| {
-                delta_error!(
-                    DeltaErrorCode::DeltaCommandInvariantViolation,
-                    "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema: schema query \
-                     phase returned no schema",
-                )
-            })?;
+            let checkpoint_schema = checkpoint_state.take_schema()?;
             shape = checkpoint_shape_from_schema(&checkpoint_schema)?;
         }
 
@@ -192,13 +186,7 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                     )
                     .await
                     .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
-                let sidecar_schema = sidecar_state.take_schema().ok_or_else(|| {
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        "scan::resolve_checkpoint_shape_for_scan::sidecar_schema: sidecar schema \
-                         query phase returned no schema",
-                    )
-                })?;
+                let sidecar_schema = sidecar_state.take_schema()?;
                 let mut sidecar_shape = checkpoint_shape_from_schema(&sidecar_schema)?;
                 // We are in the v2 sidecar branch by construction.
                 sidecar_shape.has_sidecars = true;
