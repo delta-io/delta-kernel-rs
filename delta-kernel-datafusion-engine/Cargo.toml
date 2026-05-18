@@ -48,6 +48,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 parquet = { version = "58", default-features = false, features = ["arrow"] }
+rstest = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

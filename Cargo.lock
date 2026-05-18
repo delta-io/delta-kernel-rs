@@ -1944,6 +1944,7 @@ dependencies = [
  "delta_kernel",
  "futures",
  "parquet 58.1.0",
+ "rstest",
  "serde",
  "serde_json",
  "tempfile",

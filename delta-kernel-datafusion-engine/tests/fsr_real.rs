@@ -1,65 +1,38 @@
-//! End-to-end FSR assertions with explicit expected rows.
+//! FSR golden tests: open a snapshot, drive its [`Snapshot::full_state`] state machine through
+//! the [`DataFusionExecutor`], pretty-print the reconstructed actions, and compare against a
+//! frozen expected string.
 //!
-//! We assert:
-//! 1) terminal `Snapshot::full_state` output rows (live add-file paths) against exact expected
-//!    pretty-table rows; and
-//! 2) intermediate commit-dedup action kinds contain protocol / metadata / domain metadata rows on
-//!    a synthetic log fixture; and
-//! 3) full `ToJson` payloads on real fixtures:
-//!    - `table-with-dv-small`: protocol, metadata, full add (with DV), full remove.
-//!    - `app-txn-no-checkpoint`: protocol, metadata, txn (two apps), multiple adds across commits.
+//! Per fixture the recipe is exactly five steps:
+//!   1. `open_snapshot_for_fixture(fixture)` -> `(engine, snapshot)`
+//!   2. `snapshot.full_state()` -> SM
+//!   3. `executor.drive_to_completion(sm)` -> `ResultPlan`
+//!   4. `executor.collect_result(rp)` -> `Vec<RecordBatch>`
+//!   5. `pretty_format_batches(&batches)` and `assert_eq!` against the const.
 //!
-//!    No JSON commit fixture under `kernel/tests/data` contains a top-level `domainMetadata`
-//!    action today (`crc-full` only lists `domainMetadata` in protocol writerFeatures); synthetic
-//!    rows still cover domain metadata payloads.
+//! Each `EXPECTED_*` const was captured from this same path and then cross-checked against an
+//! independent source of truth before being frozen here: the FSR result's `add.path` set is
+//! verified row-for-row against the kernel default-engine `scan_metadata` add-path set (the
+//! classic kernel reference replay through `DefaultEngineBuilder`). After that the golden is
+//! frozen: any future code change that perturbs the output forces an explicit re-validate-and-
+//! update cycle.
 
 mod common;
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::concat_or_clone;
-use delta_kernel::arrow::array::{Array, AsArray, RecordBatch, StringArray};
-use delta_kernel::arrow::util::display::array_value_to_string;
-use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::default::DefaultEngineBuilder;
-use delta_kernel::expressions::{Expression, UnaryExpressionOp};
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::plans::ir::nodes::SinkType;
-use delta_kernel::plans::ir::{Plan, RelationHandle};
-use delta_kernel::plans::state_machines::scan::full_state::FSR_COMMIT_DEDUP;
-use delta_kernel::plans::state_machines::scan::{
-    build_fsr_plans, checkpoint_shape_from_last_checkpoint,
-};
-use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
-use serde_json::Value as JsonValue;
+use rstest::rstest;
 use tempfile::TempDir;
 use url::Url;
 
 struct FixtureTable {
     _tmp: Option<TempDir>,
     url: Url,
-}
-
-fn commit_dedup_sink_handle(plans: &[Plan]) -> RelationHandle {
-    plans
-        .iter()
-        .find_map(|p| match &p.sink {
-            SinkType::Relation(h) if h.name == FSR_COMMIT_DEDUP => Some(h.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "FSR plans must include a Relation sink named {FSR_COMMIT_DEDUP:?}; got plan sinks: {:?}",
-                plans
-                    .iter()
-                    .map(|p| &p.sink)
-                    .collect::<Vec<_>>()
-            )
-        })
 }
 
 fn fixture_table(name: &str) -> FixtureTable {
@@ -92,578 +65,192 @@ fn default_engine() -> Arc<dyn KernelEngine> {
     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
 }
 
-/// Build a kernel `(engine, snapshot)` pair for the table at `table_url`. Common scaffolding for
-/// FSR tests that drive snapshots over either real fixtures or synthetic temp tables.
-fn open_snapshot(table_url: Url) -> (Arc<dyn KernelEngine>, Arc<Snapshot>) {
+fn open_snapshot_for_fixture(table: &str) -> (Arc<dyn KernelEngine>, Arc<Snapshot>) {
     let engine = default_engine();
-    let snapshot = Snapshot::builder_for(table_url)
+    let snapshot = Snapshot::builder_for(fixture_table(table).url)
         .build(engine.as_ref())
         .expect("snapshot");
     (engine, snapshot)
 }
 
-/// `open_snapshot` keyed by a fixture name resolved via [`fixture_table`].
-fn open_snapshot_for_fixture(table: &str) -> (Arc<dyn KernelEngine>, Arc<Snapshot>) {
-    open_snapshot(fixture_table(table).url)
-}
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_APP_TXN_NO_CHECKPOINT: &str = r#"
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+---------------------------------------------+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                       | remove | protocol                                                                       | metaData                                                                                                                                                                                                                                                                                                                                                                                                                           | domainMetadata | txn                                         |
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+---------------------------------------------+
+| {path: modified=2021-02-01/part-00001-80996595-a345-43b7-b213-e247d6f091f7-c000.snappy.parquet, partitionValues: {modified: 2021-02-01}, size: 810, modificationTime: 1713400714557, dataChange: true, stats: {"numRecords":8,"minValues":{"value":4,"id":"A"},"maxValues":{"id":"B","value":11},"nullCount":{"id":0,"value":0}}, tags: , deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+| {path: modified=2021-02-02/part-00001-9a16b9f6-c12a-4609-a9c4-828eacb9526a-c000.snappy.parquet, partitionValues: {modified: 2021-02-02}, size: 789, modificationTime: 1713400714564, dataChange: true, stats: {"numRecords":3,"minValues":{"value":1,"id":"A"},"maxValues":{"id":"B","value":3},"nullCount":{"id":0,"value":0}}, tags: , deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: }  |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+| {path: modified=2021-02-02/part-00001-bfac5c74-426e-410f-ab74-21a64e518e9c-c000.snappy.parquet, partitionValues: {modified: 2021-02-02}, size: 789, modificationTime: 1713400714557, dataChange: true, stats: {"numRecords":3,"minValues":{"id":"A","value":1},"maxValues":{"value":3,"id":"B"},"nullCount":{"value":0,"id":0}}, tags: , deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: }  |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+| {path: modified=2021-02-01/part-00001-8ebcaf8b-0f48-4213-98c9-5c2156d20a7e-c000.snappy.parquet, partitionValues: {modified: 2021-02-01}, size: 810, modificationTime: 1713400714564, dataChange: true, stats: {"numRecords":8,"minValues":{"value":4,"id":"A"},"maxValues":{"value":11,"id":"B"},"nullCount":{"id":0,"value":0}}, tags: , deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+|                                                                                                                                                                                                                                                                                                                                                                                                                           |        |                                                                                | {id: dc67687f-4462-4bc9-9070-b53a58e4780e, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"id","type":"string","nullable":true,"metadata":{}},{"name":"value","type":"integer","nullable":true,"metadata":{}},{"name":"modified","type":"string","nullable":true,"metadata":{}}]}, partitionColumns: [modified], createdTime: 1713400714555, configuration: {}} |                |                                             |
+|                                                                                                                                                                                                                                                                                                                                                                                                                           |        | {minReaderVersion: 1, minWriterVersion: 2, readerFeatures: , writerFeatures: } |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+|                                                                                                                                                                                                                                                                                                                                                                                                                           |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                | {appId: my-app2, version: 2, lastUpdated: } |
+|                                                                                                                                                                                                                                                                                                                                                                                                                           |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                | {appId: my-app, version: 3, lastUpdated: }  |
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+---------------------------------------------+
+"#;
 
-/// Canonicalize the path of an extracted/synthetic table directory into a `file://` URL.
-fn synthetic_table_url(dir: &TempDir) -> Url {
-    Url::from_directory_path(dir.path().canonicalize().expect("canon tmp table"))
-        .expect("table url")
-}
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_APP_TXN_CHECKPOINT: &str = r#"
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+---------------------------------------------+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                          | remove | protocol                                                                       | metaData                                                                                                                                                                                                                                                                                                                                                                                                                           | domainMetadata | txn                                         |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+---------------------------------------------+
+|                                                                                                                                                                                                                                                                                                                                                                                                                              |        | {minReaderVersion: 1, minWriterVersion: 2, readerFeatures: , writerFeatures: } |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+| {path: modified=2021-02-02/part-00001-f968feb7-7f54-40c5-8aea-6a3b7a406d9c-c000.snappy.parquet, partitionValues: {modified: 2021-02-02}, size: 789, modificationTime: 1713400874285, dataChange: false, stats: {"numRecords":3,"minValues":{"id":"A","value":1},"maxValues":{"id":"B","value":3},"nullCount":{"id":0,"value":0}}, tags: {}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: }  |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+| {path: modified=2021-02-01/part-00001-7e32952f-35ad-423c-8926-dbd3d264b1ee-c000.snappy.parquet, partitionValues: {modified: 2021-02-01}, size: 810, modificationTime: 1713400874277, dataChange: false, stats: {"numRecords":8,"minValues":{"id":"A","value":4},"maxValues":{"value":11,"id":"B"},"nullCount":{"id":0,"value":0}}, tags: {}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+| {path: modified=2021-02-02/part-00001-5113d412-8632-458b-a49a-f34db1069081-c000.snappy.parquet, partitionValues: {modified: 2021-02-02}, size: 789, modificationTime: 1713400874277, dataChange: false, stats: {"numRecords":3,"minValues":{"value":1,"id":"A"},"maxValues":{"value":3,"id":"B"},"nullCount":{"id":0,"value":0}}, tags: {}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: }  |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+|                                                                                                                                                                                                                                                                                                                                                                                                                              |        |                                                                                | {id: e7802058-f49c-4f0b-937f-82a3e42781a3, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"id","type":"string","nullable":true,"metadata":{}},{"name":"value","type":"integer","nullable":true,"metadata":{}},{"name":"modified","type":"string","nullable":true,"metadata":{}}]}, partitionColumns: [modified], createdTime: 1713400874275, configuration: {}} |                |                                             |
+| {path: modified=2021-02-01/part-00001-3b6e7f26-8140-4067-8504-47540a363758-c000.snappy.parquet, partitionValues: {modified: 2021-02-01}, size: 810, modificationTime: 1713400874285, dataChange: false, stats: {"numRecords":8,"minValues":{"value":4,"id":"A"},"maxValues":{"id":"B","value":11},"nullCount":{"id":0,"value":0}}, tags: {}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                |                                             |
+|                                                                                                                                                                                                                                                                                                                                                                                                                              |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                | {appId: my-app2, version: 2, lastUpdated: } |
+|                                                                                                                                                                                                                                                                                                                                                                                                                              |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                    |                | {appId: my-app, version: 3, lastUpdated: }  |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+---------------------------------------------+
+"#;
 
-fn extract_sorted_non_null_paths_from_results(batches: &[RecordBatch]) -> Vec<String> {
-    let merged = concat_or_clone(batches);
-    let add_idx = merged.schema().index_of("add").expect("add idx");
-    let add_col = merged.column(add_idx).as_struct_opt().expect("add struct");
-    let path_col = add_col.column_by_name("path").expect("add.path");
-    let mut out: Vec<String> = (0..path_col.len())
-        .filter(|&i| add_col.is_valid(i) && path_col.is_valid(i))
-        .map(|i| array_value_to_string(path_col.as_ref(), i).expect("stringify path"))
-        .collect();
-    out.sort();
-    out
-}
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_DV_SMALL: &str = r#"
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | remove | protocol                                                                                                         | metaData                                                                                                                                                                                                                                                                                                                        | domainMetadata | txn |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+|                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |        | {minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [deletionVectors], writerFeatures: [deletionVectors]} |                                                                                                                                                                                                                                                                                                                                 |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |        |                                                                                                                  | {id: testId, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}, partitionColumns: [], createdTime: 1677811175819, configuration: {delta.enableDeletionVectors: true, delta.columnMapping.mode: none}} |                |     |
+| {path: part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet, partitionValues: {}, size: 635, modificationTime: 1677811178336, dataChange: true, stats: {"numRecords":10,"minValues":{"value":0},"maxValues":{"value":9},"nullCount":{"value":0},"tightBounds":false}, tags: {INSERTION_TIME: 1677811178336000, MIN_INSERTION_TIME: 1677811178336000, MAX_INSERTION_TIME: 1677811178336000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: {storageType: u, pathOrInlineDv: vBn[lx{q8@P<9BNH/isA, offset: 1, sizeInBytes: 36, cardinality: 2}, baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                  |                                                                                                                                                                                                                                                                                                                                 |                |     |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+"#;
 
-async fn run_full_state_results(table: &str) -> Vec<RecordBatch> {
-    let (engine, snapshot) = open_snapshot_for_fixture(table);
-    let ex = DataFusionExecutor::try_new_with_engine(Arc::clone(&engine)).expect("executor");
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_NO_DV_SMALL: &str = r#"
++----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| add                                                                                                                                                                                                                                                                                                                                                      | remove | protocol                                                                       | metaData                                                                                                                                                                                                                                                                                  | domainMetadata | txn |
++----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+|                                                                                                                                                                                                                                                                                                                                                          |        |                                                                                | {id: 6524c99f-9a76-4ea1-8ad4-e428a7e065d7, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"value","type":"long","nullable":true,"metadata":{}}]}, partitionColumns: [], createdTime: 1678020184802, configuration: {}} |                |     |
+|                                                                                                                                                                                                                                                                                                                                                          |        | {minReaderVersion: 1, minWriterVersion: 2, readerFeatures: , writerFeatures: } |                                                                                                                                                                                                                                                                                           |                |     |
+| {path: part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet, partitionValues: {}, size: 548, modificationTime: 1678020185157, dataChange: true, stats: {"numRecords":10,"minValues":{"value":0},"maxValues":{"value":9},"nullCount":{"value":0}}, tags: , deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                |                                                                                                                                                                                                                                                                                           |                |     |
++----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+"#;
+
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_SHORT_DV: &str = r#"
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | remove | protocol                                                                                                         | metaData                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | domainMetadata | txn |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+|                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |        | {minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [deletionVectors], writerFeatures: [deletionVectors]} |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |                |     |
+| {path: part-00000-8029f411-746c-41c1-a0c1-c5eb867c5d05-c000.snappy.parquet, partitionValues: {}, size: 1423, modificationTime: 1685559514000, dataChange: true, stats: {"numRecords":5,"minValues":{"id":0,"value":"0","timestamp":"2023-05-31T18:58:33.633Z","rand":0.1001744351184638},"maxValues":{"id":4,"value":"4","timestamp":"2023-05-31T18:58:33.633Z","rand":0.9281049271981882},"nullCount":{"id":0,"value":0,"timestamp":0,"rand":0},"tightBounds":false}, tags: , deletionVector: {storageType: u, pathOrInlineDv: U5OWRz5k%CFT.Td}yCPW, offset: 1, sizeInBytes: 38, cardinality: 3}, baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |                |     |
+| {path: part-00001-24db34ab-bdfe-4814-aba8-c1f34d6d8923-c000.snappy.parquet, partitionValues: {}, size: 1428, modificationTime: 1685559514000, dataChange: true, stats: {"numRecords":5,"minValues":{"id":5,"value":"5","timestamp":"2023-05-31T18:58:33.633Z","rand":0.15263801464228832},"maxValues":{"id":9,"value":"9","timestamp":"2023-05-31T18:58:33.633Z","rand":0.5175919190815845},"nullCount":{"id":0,"value":0,"timestamp":0,"rand":0},"tightBounds":true}, tags: , deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: }                                                                                                   |        |                                                                                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |        |                                                                                                                  | {id: 7f10249f-e3ff-4fe4-967a-05637934a7e9, name: , description: Deletion vectors enabled table. The latest version has DVs turned on and DVs present in the table., format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"value","type":"string","nullable":true,"metadata":{}},{"name":"timestamp","type":"timestamp","nullable":true,"metadata":{}},{"name":"rand","type":"double","nullable":true,"metadata":{}}]}, partitionColumns: [], createdTime: 1685559511124, configuration: {delta.enableDeletionVectors: true, delta.checkpointInterval: 10000}} |                |     |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+"#;
+
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_CHECKPOINT_NO_LAST_CHECKPOINT: &str = r#"
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                                         | remove | protocol                                                                       | metaData                                                                                                                                                                                                                                                                                                                                                                                                                                       | domainMetadata | txn |
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| {path: part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet, partitionValues: {}, size: 1010, modificationTime: 1674611461541, dataChange: true, stats: {"numRecords":5,"minValues":{"letter":"a","int":93,"date":"1975-06-01"},"maxValues":{"letter":"c","int":753,"date":"2013-03-01"},"nullCount":{"letter":1,"int":0,"date":0}}, tags: , deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                |                                                                                                                                                                                                                                                                                                                                                                                                                                                |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                             |        | {minReaderVersion: 1, minWriterVersion: 2, readerFeatures: , writerFeatures: } |                                                                                                                                                                                                                                                                                                                                                                                                                                                |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                             |        |                                                                                | {id: 84b09beb-329c-4b5e-b493-f58c6c78b8fd, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"letter","type":"string","nullable":true,"metadata":{}},{"name":"int","type":"long","nullable":true,"metadata":{}},{"name":"date","type":"date","nullable":true,"metadata":{}}]}, partitionColumns: [], createdTime: 1674611455081, configuration: {delta.checkpointInterval: 2}} |                |     |
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+--------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+"#;
+
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_V2_CLASSIC_PARQUET: &str = r#"
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                                  | remove | protocol                                                                                                                                 | metaData                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | domainMetadata | txn |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| {path: test%25file%25prefix-part-00000-bb4858c3-3c9a-4325-ab3f-a0e07e6a94d4-c000.snappy.parquet, partitionValues: {}, size: 760, modificationTime: 1774385173080, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385173080000, MIN_INSERTION_TIME: 1774385173080000, MAX_INSERTION_TIME: 1774385173080000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                |     |
+| {path: test%25file%25prefix-part-00000-f91cd7b7-b47f-4f76-b052-971c4a313235-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385174928, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385174928000, MIN_INSERTION_TIME: 1774385174928000, MAX_INSERTION_TIME: 1774385174928000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                |     |
+| {path: test%25file%25prefix-part-00000-1f06e739-2467-49d8-bec1-dffa9c6ca027-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385174004, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385174004000, MIN_INSERTION_TIME: 1774385174004000, MAX_INSERTION_TIME: 1774385174004000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                      |        | {minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [deletionVectors], writerFeatures: [deletionVectors, appendOnly, invariants]} |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                |     |
+| {path: test%25file%25prefix-part-00000-981d116a-6a3c-4c09-b604-3695d0db5dc8-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385171192, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385171192000, MIN_INSERTION_TIME: 1774385171192000, MAX_INSERTION_TIME: 1774385171192000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                      |        |                                                                                                                                          | {id: 23b172f9-95c3-43d0-8c0c-423bb644526a, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"value","type":"string","nullable":true,"metadata":{}}]}, partitionColumns: [], createdTime: 1774385170349, configuration: {delta.enableDeletionVectors: true, delta.checkpoint.writeStatsAsStruct: true, delta.checkpointPolicy: classic, delta.checkpoint.writeStatsAsJson: false, delta.checkpointInterval: 10}} |                |     |
+| {path: test%25file%25prefix-part-00000-e2cba303-0dc3-4091-87cb-ce11d0447bda-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385172140, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385172140000, MIN_INSERTION_TIME: 1774385172140000, MAX_INSERTION_TIME: 1774385172140000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                |     |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+"#;
+
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_V2_JSON_SIDECARS: &str = r#"
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                                  | remove | protocol                                                                                                                                                             | metaData                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | domainMetadata | txn |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| {path: test%25file%25prefix-part-00000-68f487f2-d7f8-48d8-8b34-4a567dc046f4-c000.snappy.parquet, partitionValues: {}, size: 760, modificationTime: 1774385167032, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385167032000, MIN_INSERTION_TIME: 1774385167032000, MAX_INSERTION_TIME: 1774385167032000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+| {path: test%25file%25prefix-part-00000-c89fe644-eade-4db6-b00f-6c5e1f8343ea-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385168156, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385168156000, MIN_INSERTION_TIME: 1774385168156000, MAX_INSERTION_TIME: 1774385168156000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                      |        | {minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [deletionVectors, v2Checkpoint], writerFeatures: [deletionVectors, v2Checkpoint, appendOnly, invariants]} |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+| {path: test%25file%25prefix-part-00000-b93d3d1f-a7ec-42f2-ade5-27837538abcd-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385165060, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385165060000, MIN_INSERTION_TIME: 1774385165060000, MAX_INSERTION_TIME: 1774385165060000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                      |        |                                                                                                                                                                      | {id: aab52b7c-387a-4e1b-b804-4140a460bfd6, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"value","type":"string","nullable":true,"metadata":{}}]}, partitionColumns: [], createdTime: 1774385164156, configuration: {delta.enableDeletionVectors: true, delta.checkpoint.writeStatsAsStruct: true, delta.checkpointPolicy: v2, delta.checkpoint.writeStatsAsJson: false, delta.checkpointInterval: 10}} |                |     |
+| {path: test%25file%25prefix-part-00000-e4fcdaa7-dff0-4c20-b263-fc29f1cba12c-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385169176, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385169176000, MIN_INSERTION_TIME: 1774385169176000, MAX_INSERTION_TIME: 1774385169176000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+| {path: test%25file%25prefix-part-00000-4c7c7cd8-3a62-4e66-b3b9-e89f44612e30-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385166068, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385166068000, MIN_INSERTION_TIME: 1774385166068000, MAX_INSERTION_TIME: 1774385166068000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+"#;
+
+// validated against kernel default-engine `scan_metadata` add-path set.
+const EXPECTED_V2_PARQUET_SIDECARS: &str = r#"
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+| add                                                                                                                                                                                                                                                                                                                                                                                                                                  | remove | protocol                                                                                                                                                             | metaData                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | domainMetadata | txn |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+|                                                                                                                                                                                                                                                                                                                                                                                                                                      |        | {minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [deletionVectors, v2Checkpoint], writerFeatures: [deletionVectors, v2Checkpoint, appendOnly, invariants]} |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+|                                                                                                                                                                                                                                                                                                                                                                                                                                      |        |                                                                                                                                                                      | {id: 69f7cd6b-63b4-4e31-85b1-450ac0a9f70e, name: , description: , format: {provider: parquet, options: {}}, schemaString: {"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"value","type":"string","nullable":true,"metadata":{}}]}, partitionColumns: [], createdTime: 1774385157314, configuration: {delta.enableDeletionVectors: true, delta.checkpoint.writeStatsAsStruct: true, delta.checkpointPolicy: v2, delta.checkpoint.writeStatsAsJson: false, delta.checkpointInterval: 10}} |                |     |
+| {path: test%25file%25prefix-part-00000-2ce1aba3-6914-48d4-b2b3-9cc25d61b211-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385159272, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385159272000, MIN_INSERTION_TIME: 1774385159272000, MAX_INSERTION_TIME: 1774385159272000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+| {path: test%25file%25prefix-part-00000-7268d56a-7420-4691-8062-5b0c3dbdd803-c000.snappy.parquet, partitionValues: {}, size: 760, modificationTime: 1774385160264, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385160264000, MIN_INSERTION_TIME: 1774385160264000, MAX_INSERTION_TIME: 1774385160264000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+| {path: test%25file%25prefix-part-00000-ba9dae5e-b947-4940-961f-6cf6a3c2fbfe-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385158244, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385158244000, MIN_INSERTION_TIME: 1774385158244000, MAX_INSERTION_TIME: 1774385158244000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+| {path: test%25file%25prefix-part-00000-ea8ba2ac-45e6-497c-99e5-ad5b5e78920e-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385161268, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385161268000, MIN_INSERTION_TIME: 1774385161268000, MAX_INSERTION_TIME: 1774385161268000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
+| {path: test%25file%25prefix-part-00000-8a3d46e0-9431-4cbd-b97d-6b62a2be1dc8-c000.snappy.parquet, partitionValues: {}, size: 761, modificationTime: 1774385162256, dataChange: false, stats: , tags: {INSERTION_TIME: 1774385162256000, MIN_INSERTION_TIME: 1774385162256000, MAX_INSERTION_TIME: 1774385162256000, OPTIMIZE_TARGET_SIZE: 268435456}, deletionVector: , baseRowId: , defaultRowCommitVersion: , clusteringProvider: } |        |                                                                                                                                                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |                |     |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------+-----+
+"#;
+
+#[rstest]
+#[case::no_checkpoint("app-txn-no-checkpoint", EXPECTED_APP_TXN_NO_CHECKPOINT)]
+#[case::v1_checkpoint("app-txn-checkpoint", EXPECTED_APP_TXN_CHECKPOINT)]
+#[case::dv_small("table-with-dv-small", EXPECTED_DV_SMALL)]
+#[case::no_dv_small("table-without-dv-small", EXPECTED_NO_DV_SMALL)]
+#[case::short_dv("with-short-dv", EXPECTED_SHORT_DV)]
+#[case::checkpoint_no_last_checkpoint(
+    "with_checkpoint_no_last_checkpoint",
+    EXPECTED_CHECKPOINT_NO_LAST_CHECKPOINT
+)]
+#[case::v2_classic_parquet(
+    "v2-classic-parquet-struct-stats-only",
+    EXPECTED_V2_CLASSIC_PARQUET
+)]
+#[case::v2_json_sidecars("v2-json-sidecars-struct-stats-only", EXPECTED_V2_JSON_SIDECARS)]
+#[case::v2_parquet_sidecars(
+    "v2-parquet-sidecars-struct-stats-only",
+    EXPECTED_V2_PARQUET_SIDECARS
+)]
+#[tokio::test]
+async fn full_state_prints_expected_results(#[case] fixture: &str, #[case] expected: &str) {
+    let (engine, snapshot) = open_snapshot_for_fixture(fixture);
+    let executor = DataFusionExecutor::try_new_with_engine(engine).expect("executor");
     let sm = snapshot.full_state().expect("full_state SM");
-    let rp = ex.drive_to_completion(sm).await.expect("drive full_state");
-    ex.collect_result(rp)
+    let result_plan = executor
+        .drive_to_completion(sm)
         .await
-        .expect("collect full_state result")
-}
-
-fn expected_live_file_count_from_scan_metadata(table: &str) -> usize {
-    let (engine, snapshot) = open_snapshot_for_fixture(table);
-    let scan = snapshot.scan_builder().build().expect("build scan");
-    scan.scan_metadata(engine.as_ref())
-        .expect("scan metadata")
-        .map(|res| {
-            let sm = res.expect("scan metadata batch");
-            let sv = sm.scan_files.selection_vector();
-            let row_count = sm.scan_files.data().len();
-            if sv.len() < row_count {
-                sv.iter().filter(|selected| **selected).count() + (row_count - sv.len())
-            } else {
-                sv.iter().filter(|selected| **selected).count()
-            }
-        })
-        .sum()
-}
-
-fn write_json_commit(path: &Path) {
-    let rows = [
-        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-        r#"{"metaData":{"id":"mid-1","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":null}}"#,
-        r#"{"domainMetadata":{"domain":"d1","configuration":"c1","removed":false}}"#,
-        r#"{"txn":{"appId":"app-1","version":7,"lastUpdated":123}}"#,
-        r#"{"add":{"path":"x.parquet","partitionValues":{"p":"1"},"size":11,"modificationTime":22,"dataChange":true,"stats":"{\"numRecords\":1}","tags":{"t1":"v1","t2":null},"deletionVector":{"storageType":"u","pathOrInlineDv":"ab", "offset":3,"sizeInBytes":4,"cardinality":5},"baseRowId":6,"defaultRowCommitVersion":7,"clusteringProvider":"cp"}}"#,
-        r#"{"remove":{"path":"y.parquet","deletionTimestamp":33,"dataChange":false,"extendedFileMetadata":true,"partitionValues":{"p":"2"},"size":44,"stats":"{\"numRecords\":1}","tags":{"rt":"rv"},"deletionVector":{"storageType":"u","pathOrInlineDv":"cd","offset":8,"sizeInBytes":9,"cardinality":10},"baseRowId":11,"defaultRowCommitVersion":12}}"#,
-    ];
-    fs::write(path, format!("{}\n", rows.join("\n"))).expect("write commit json");
-}
-
-fn build_synthetic_protocol_metadata_domain_table() -> TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let log_dir = dir.path().join("_delta_log");
-    fs::create_dir_all(&log_dir).expect("mkdir _delta_log");
-    write_json_commit(&log_dir.join("00000000000000000000.json"));
-    dir
-}
-
-fn write_json_commit_lines(path: &Path, lines: &[&str]) {
-    fs::write(path, format!("{}\n", lines.join("\n"))).expect("write commit json");
-}
-
-fn build_synthetic_metadata_replace_table() -> TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let log_dir = dir.path().join("_delta_log");
-    fs::create_dir_all(&log_dir).expect("mkdir _delta_log");
-    write_json_commit_lines(
-        &log_dir.join("00000000000000000000.json"),
-        &[
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            r#"{"metaData":{"id":"mid-old","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1}}"#,
-        ],
-    );
-    write_json_commit_lines(
-        &log_dir.join("00000000000000000001.json"),
-        &[
-            r#"{"metaData":{"id":"mid-new","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":2}}"#,
-        ],
-    );
-    dir
-}
-
-async fn commit_dedup_batches_for_snapshot(
-    snapshot: Arc<Snapshot>,
-    engine: Arc<dyn KernelEngine>,
-) -> Vec<RecordBatch> {
-    let shape = checkpoint_shape_from_last_checkpoint(&snapshot).expect("shape");
-    let mut registry = delta_kernel::plans::ir::RelationRegistry::new(uuid::Uuid::new_v4());
-    let rp = build_fsr_plans(&snapshot, shape, &mut registry).expect("build fsr plans");
-    let commit_dedup_handle = commit_dedup_sink_handle(&rp.plans);
-    let ex = DataFusionExecutor::try_new_with_engine(engine).expect("executor");
-    ex.execute_plans(&rp.plans).await.expect("run fsr plans");
-    ex.collect_relation(&commit_dedup_handle)
+        .expect("drive full_state to completion");
+    let batches = executor
+        .collect_result(result_plan)
         .await
-        .expect("commit_dedup relation batches")
-}
-
-/// Action kind columns inspected to label commit-dedup rows by their non-null top-level field.
-const DEDUP_ACTION_KINDS: &[&str] = &[
-    "add",
-    "remove",
-    "protocol",
-    "metaData",
-    "domainMetadata",
-    "txn",
-];
-
-async fn dedup_action_kinds_for_synthetic_table() -> Vec<String> {
-    let batches = dedup_full_rows_for_synthetic_table().await;
-    let mut kinds = Vec::new();
-    for b in batches {
-        let schema = b.schema();
-        let columns: Vec<_> = DEDUP_ACTION_KINDS
-            .iter()
-            .map(|name| {
-                let idx = schema
-                    .index_of(name)
-                    .unwrap_or_else(|_| panic!("{name} idx"));
-                b.column(idx)
-                    .as_struct_opt()
-                    .unwrap_or_else(|| panic!("{name} struct"))
-            })
-            .collect();
-        for i in 0..b.num_rows() {
-            let kind = DEDUP_ACTION_KINDS
-                .iter()
-                .zip(&columns)
-                .find_map(|(name, arr)| arr.is_valid(i).then_some(*name))
-                .unwrap_or("none");
-            kinds.push(kind.to_string());
-        }
-    }
-    kinds.sort();
-    kinds
-}
-
-async fn dedup_full_rows_for_synthetic_table() -> Vec<RecordBatch> {
-    let dir = build_synthetic_protocol_metadata_domain_table();
-    let (engine, snapshot) = open_snapshot(synthetic_table_url(&dir));
-    commit_dedup_batches_for_snapshot(snapshot, engine).await
-}
-
-async fn commit_dedup_merged_for_real_fixture(table_name: &str) -> RecordBatch {
-    let (engine, snapshot) = open_snapshot_for_fixture(table_name);
-    let dedup_batches = commit_dedup_batches_for_snapshot(snapshot, engine).await;
-    concat_or_clone(&dedup_batches)
-}
-
-async fn assert_fsr_matches_scan_paths(table_name: &str) {
-    let fsr_batches = run_full_state_results(table_name).await;
-    let fsr_paths = extract_sorted_non_null_paths_from_results(&fsr_batches);
-    let expected_live_files = expected_live_file_count_from_scan_metadata(table_name);
+        .expect("collect full_state result");
+    let pretty = pretty_format_batches(&batches)
+        .expect("pretty_format_batches")
+        .to_string();
     assert_eq!(
-        fsr_paths.len(),
-        expected_live_files,
-        "FSR live-file rows must match scan_metadata live-file count for fixture {table_name}"
+        sort_data_rows(&pretty),
+        sort_data_rows(expected),
+        "fixture: {fixture}"
     );
 }
 
-fn payload_stable_sort_key(kind: &str, v: &JsonValue) -> (String, String) {
-    let tie = match kind {
-        "add" | "remove" => v
-            .get("path")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_string(),
-        "metaData" => v
-            .get("id")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_string(),
-        "domainMetadata" => format!(
-            "{}|{}",
-            v.get("domain").and_then(JsonValue::as_str).unwrap_or(""),
-            v.get("configuration")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-        ),
-        "txn" => v
-            .get("appId")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
-    };
-    (kind.to_string(), tie)
-}
-
-fn evaluate_to_json_column(batch: &RecordBatch, col: &'static str) -> StringArray {
-    let arr = evaluate_expression(
-        &Expression::unary(UnaryExpressionOp::ToJson, Expression::column([col])),
-        batch,
-        Some(&KernelDataType::STRING),
-    )
-    .expect("evaluate to_json");
-    arr.as_string::<i32>().clone()
-}
-
-fn full_action_payload_rows(batch: &RecordBatch) -> Vec<(String, JsonValue)> {
-    let json_columns: Vec<_> = DEDUP_ACTION_KINDS
-        .iter()
-        .map(|name| (*name, evaluate_to_json_column(batch, name)))
-        .collect();
-    let mut rows = Vec::new();
-    for i in 0..batch.num_rows() {
-        if let Some((kind, arr)) = json_columns.iter().find(|(_, arr)| arr.is_valid(i)) {
-            let payload = serde_json::from_str::<JsonValue>(arr.value(i)).expect("json payload");
-            rows.push((kind.to_string(), payload));
-        }
+/// Order-independent line comparison helper.
+///
+/// `pretty_format_batches` returns a table with deterministic header (line 0 = top border, line 1
+/// = column names, line 2 = header/body separator), deterministic footer (last line = bottom
+/// border), but a body whose row order reflects the engine's batch order. FSR's batch order is
+/// driven by tokio-multi-thread execution and varies run-to-run for fixtures with multiple
+/// sidecars (`v2-*`), so we normalize by sorting the body lines before comparing. Header and
+/// footer are left in place so column-width drift still trips the assertion.
+fn sort_data_rows(table: &str) -> String {
+    let mut lines: Vec<&str> = table.trim().lines().collect();
+    let n = lines.len();
+    if n > 4 {
+        // Header occupies lines [0, 1, 2]; footer is the last line.
+        lines[3..n - 1].sort_unstable();
     }
-    rows.sort_by(|(k1, v1), (k2, v2)| {
-        payload_stable_sort_key(k1, v1).cmp(&payload_stable_sort_key(k2, v2))
-    });
-    rows
-}
-
-fn assert_singleton_protocol_and_metadata(rows: &[(String, JsonValue)]) {
-    let protocol_count = rows.iter().filter(|(k, _)| k == "protocol").count();
-    let metadata_count = rows.iter().filter(|(k, _)| k == "metaData").count();
-    assert_eq!(
-        protocol_count, 1,
-        "FSR commit-dedup must contain exactly one protocol row"
-    );
-    assert_eq!(
-        metadata_count, 1,
-        "FSR commit-dedup must contain exactly one metadata row"
-    );
-}
-
-#[tokio::test]
-async fn fsr_results_no_checkpoint_expected_rows() {
-    let batches = run_full_state_results("app-txn-no-checkpoint").await;
-    let actual = extract_sorted_non_null_paths_from_results(&batches);
-    let expected = vec![
-        "modified=2021-02-01/part-00001-80996595-a345-43b7-b213-e247d6f091f7-c000.snappy.parquet"
-            .to_string(),
-        "modified=2021-02-01/part-00001-8ebcaf8b-0f48-4213-98c9-5c2156d20a7e-c000.snappy.parquet"
-            .to_string(),
-        "modified=2021-02-02/part-00001-9a16b9f6-c12a-4609-a9c4-828eacb9526a-c000.snappy.parquet"
-            .to_string(),
-        "modified=2021-02-02/part-00001-bfac5c74-426e-410f-ab74-21a64e518e9c-c000.snappy.parquet"
-            .to_string(),
-    ];
-    assert_eq!(actual, expected);
-}
-
-#[tokio::test]
-async fn fsr_results_v1_checkpoint_expected_rows() {
-    let batches = run_full_state_results("app-txn-checkpoint").await;
-    let actual = extract_sorted_non_null_paths_from_results(&batches);
-    let expected = vec![
-        "modified=2021-02-01/part-00001-3b6e7f26-8140-4067-8504-47540a363758-c000.snappy.parquet"
-            .to_string(),
-        "modified=2021-02-01/part-00001-7e32952f-35ad-423c-8926-dbd3d264b1ee-c000.snappy.parquet"
-            .to_string(),
-        "modified=2021-02-02/part-00001-5113d412-8632-458b-a49a-f34db1069081-c000.snappy.parquet"
-            .to_string(),
-        "modified=2021-02-02/part-00001-f968feb7-7f54-40c5-8aea-6a3b7a406d9c-c000.snappy.parquet"
-            .to_string(),
-    ];
-    assert_eq!(actual, expected);
-}
-
-#[tokio::test]
-async fn fsr_commit_dedup_includes_protocol_metadata_and_domain_metadata_rows() {
-    let actual_kinds = dedup_action_kinds_for_synthetic_table().await;
-    let expected_kinds = vec![
-        "add".to_string(),
-        "domainMetadata".to_string(),
-        "metaData".to_string(),
-        "protocol".to_string(),
-        "remove".to_string(),
-        "txn".to_string(),
-    ];
-    assert_eq!(actual_kinds, expected_kinds);
-}
-
-#[tokio::test]
-async fn fsr_commit_dedup_keeps_latest_metadata_singleton() {
-    let dir = build_synthetic_metadata_replace_table();
-    let (engine, snapshot) = open_snapshot(synthetic_table_url(&dir));
-    let dedup_batches = commit_dedup_batches_for_snapshot(snapshot, engine).await;
-    let merged = concat_or_clone(&dedup_batches);
-    let payloads = full_action_payload_rows(&merged);
-    let metadata_rows: Vec<_> = payloads
-        .iter()
-        .filter_map(|(kind, payload)| (kind == "metaData").then_some(payload))
-        .collect();
-    assert_eq!(
-        metadata_rows.len(),
-        1,
-        "FSR commit dedup must keep exactly one metadata row"
-    );
-    assert_eq!(
-        metadata_rows[0].get("id").and_then(JsonValue::as_str),
-        Some("mid-new"),
-        "FSR commit dedup must keep latest metadata row by commit version"
-    );
-}
-
-#[tokio::test]
-async fn fsr_commit_dedup_full_rows_expected_table_includes_protocol_metadata_domain() {
-    let dedup_batches = dedup_full_rows_for_synthetic_table().await;
-    let merged = concat_or_clone(&dedup_batches);
-    let actual = full_action_payload_rows(&merged);
-    let expected = vec![
-        (
-            "add".to_string(),
-            serde_json::json!({
-                "path":"x.parquet",
-                "partitionValues":{"p":"1"},
-                "size":11,
-                "modificationTime":22,
-                "dataChange":true,
-                "stats":"{\"numRecords\":1}",
-                "tags":{"t1":"v1"},
-                "deletionVector":{"storageType":"u","pathOrInlineDv":"ab","offset":3,"sizeInBytes":4,"cardinality":5},
-                "baseRowId":6,
-                "defaultRowCommitVersion":7,
-                "clusteringProvider":"cp"
-            }),
-        ),
-        (
-            "domainMetadata".to_string(),
-            serde_json::json!({"domain":"d1","configuration":"c1","removed":false}),
-        ),
-        (
-            "metaData".to_string(),
-            serde_json::json!({
-                "id":"mid-1",
-                "format":{"provider":"parquet","options":{}},
-                "schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns":[],
-                "configuration":{}
-            }),
-        ),
-        (
-            "protocol".to_string(),
-            serde_json::json!({"minReaderVersion":1,"minWriterVersion":2}),
-        ),
-        (
-            "remove".to_string(),
-            serde_json::json!({
-                "path":"y.parquet",
-                "deletionTimestamp":33,
-                "dataChange":false,
-                "extendedFileMetadata":true,
-                "partitionValues":{"p":"2"},
-                "size":44,
-                "stats":"{\"numRecords\":1}",
-                "tags":{"rt":"rv"},
-                "deletionVector":{"storageType":"u","pathOrInlineDv":"cd","offset":8,"sizeInBytes":9,"cardinality":10},
-                "baseRowId":11,
-                "defaultRowCommitVersion":12
-            }),
-        ),
-        (
-            "txn".to_string(),
-            serde_json::json!({"appId":"app-1","version":7,"lastUpdated":123}),
-        ),
-    ];
-    assert_eq!(actual, expected);
-}
-
-#[tokio::test]
-async fn fsr_commit_dedup_real_table_with_dv_small_full_to_json_payloads() {
-    let merged = commit_dedup_merged_for_real_fixture("table-with-dv-small").await;
-    let actual = full_action_payload_rows(&merged);
-    assert_singleton_protocol_and_metadata(&actual);
-
-    let expected: Vec<(String, JsonValue)> = vec![
-        (
-            "add".to_string(),
-            serde_json::json!({
-                "path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
-                "partitionValues":{},
-                "size":635,
-                "modificationTime":1677811178336_i64,
-                "dataChange":true,
-                "stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}",
-                "tags":{
-                    "INSERTION_TIME":"1677811178336000",
-                    "MIN_INSERTION_TIME":"1677811178336000",
-                    "MAX_INSERTION_TIME":"1677811178336000",
-                    "OPTIMIZE_TARGET_SIZE":"268435456"
-                },
-                "deletionVector":{
-                    "storageType":"u",
-                    "pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA",
-                    "offset":1,
-                    "sizeInBytes":36,
-                    "cardinality":2
-                }
-            }),
-        ),
-        (
-            "metaData".to_string(),
-            serde_json::json!({
-                "id":"testId",
-                "format":{"provider":"parquet","options":{}},
-                "schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns":[],
-                "configuration":{
-                    "delta.enableDeletionVectors":"true",
-                    "delta.columnMapping.mode":"none"
-                },
-                "createdTime":1677811175819_i64
-            }),
-        ),
-        (
-            "protocol".to_string(),
-            serde_json::json!({
-                "minReaderVersion":3,
-                "minWriterVersion":7,
-                "readerFeatures":["deletionVectors"],
-                "writerFeatures":["deletionVectors"]
-            }),
-        ),
-        (
-            "remove".to_string(),
-            serde_json::json!({
-                "path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
-                "deletionTimestamp":1677811194426_i64,
-                "dataChange":true,
-                "extendedFileMetadata":true,
-                "partitionValues":{},
-                "size":635,
-                "tags":{
-                    "INSERTION_TIME":"1677811178336000",
-                    "MIN_INSERTION_TIME":"1677811178336000",
-                    "MAX_INSERTION_TIME":"1677811178336000",
-                    "OPTIMIZE_TARGET_SIZE":"268435456"
-                }
-            }),
-        ),
-    ];
-
-    assert_eq!(actual, expected);
-}
-
-#[tokio::test]
-async fn fsr_commit_dedup_real_app_txn_no_checkpoint_full_to_json_payloads() {
-    let merged = commit_dedup_merged_for_real_fixture("app-txn-no-checkpoint").await;
-    let actual = full_action_payload_rows(&merged);
-    assert_singleton_protocol_and_metadata(&actual);
-
-    let expected: Vec<(String, JsonValue)> = vec![
-        (
-            "add".to_string(),
-            serde_json::json!({
-                "path":"modified=2021-02-01/part-00001-80996595-a345-43b7-b213-e247d6f091f7-c000.snappy.parquet",
-                "partitionValues":{"modified":"2021-02-01"},
-                "size":810,
-                "modificationTime":1713400714557_i64,
-                "dataChange":true,
-                "stats":"{\"numRecords\":8,\"minValues\":{\"value\":4,\"id\":\"A\"},\"maxValues\":{\"id\":\"B\",\"value\":11},\"nullCount\":{\"id\":0,\"value\":0}}"
-            }),
-        ),
-        (
-            "add".to_string(),
-            serde_json::json!({
-                "path":"modified=2021-02-01/part-00001-8ebcaf8b-0f48-4213-98c9-5c2156d20a7e-c000.snappy.parquet",
-                "partitionValues":{"modified":"2021-02-01"},
-                "size":810,
-                "modificationTime":1713400714564_i64,
-                "dataChange":true,
-                "stats":"{\"numRecords\":8,\"minValues\":{\"value\":4,\"id\":\"A\"},\"maxValues\":{\"value\":11,\"id\":\"B\"},\"nullCount\":{\"id\":0,\"value\":0}}"
-            }),
-        ),
-        (
-            "add".to_string(),
-            serde_json::json!({
-                "path":"modified=2021-02-02/part-00001-9a16b9f6-c12a-4609-a9c4-828eacb9526a-c000.snappy.parquet",
-                "partitionValues":{"modified":"2021-02-02"},
-                "size":789,
-                "modificationTime":1713400714564_i64,
-                "dataChange":true,
-                "stats":"{\"numRecords\":3,\"minValues\":{\"value\":1,\"id\":\"A\"},\"maxValues\":{\"id\":\"B\",\"value\":3},\"nullCount\":{\"id\":0,\"value\":0}}"
-            }),
-        ),
-        (
-            "add".to_string(),
-            serde_json::json!({
-                "path":"modified=2021-02-02/part-00001-bfac5c74-426e-410f-ab74-21a64e518e9c-c000.snappy.parquet",
-                "partitionValues":{"modified":"2021-02-02"},
-                "size":789,
-                "modificationTime":1713400714557_i64,
-                "dataChange":true,
-                "stats":"{\"numRecords\":3,\"minValues\":{\"id\":\"A\",\"value\":1},\"maxValues\":{\"value\":3,\"id\":\"B\"},\"nullCount\":{\"value\":0,\"id\":0}}"
-            }),
-        ),
-        (
-            "metaData".to_string(),
-            serde_json::json!({
-                "id":"dc67687f-4462-4bc9-9070-b53a58e4780e",
-                "format":{"provider":"parquet","options":{}},
-                "schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"modified\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns":["modified"],
-                "configuration":{},
-                "createdTime":1713400714555_i64
-            }),
-        ),
-        (
-            "protocol".to_string(),
-            serde_json::json!({"minReaderVersion":1,"minWriterVersion":2}),
-        ),
-        (
-            "txn".to_string(),
-            serde_json::json!({"appId":"my-app","version":3}),
-        ),
-        (
-            "txn".to_string(),
-            serde_json::json!({"appId":"my-app2","version":2}),
-        ),
-    ];
-
-    assert_eq!(actual, expected);
-}
-
-#[tokio::test]
-async fn fsr_matches_scan_for_all_v2_checkpoint_fixtures() {
-    // These fixtures are checked in as directories and cover each distinct v2 shape:
-    // - classic v2 parquet checkpoint
-    // - v2 parquet sidecars
-    // - v2 json sidecars
-    for table in [
-        "v2-classic-parquet-struct-stats-only",
-        "v2-json-sidecars-struct-stats-only",
-        "v2-parquet-sidecars-struct-stats-only",
-    ] {
-        assert_fsr_matches_scan_paths(table).await;
-    }
-}
-
-#[tokio::test]
-async fn fsr_matches_scan_for_dv_and_non_dv_fixtures() {
-    for table in [
-        "table-with-dv-small",
-        "table-without-dv-small",
-        "with-short-dv",
-    ] {
-        assert_fsr_matches_scan_paths(table).await;
-    }
-}
-
-#[tokio::test]
-async fn fsr_matches_scan_for_v1_and_checkpoint_discovery_shapes() {
-    for table in ["app-txn-checkpoint", "with_checkpoint_no_last_checkpoint"] {
-        assert_fsr_matches_scan_paths(table).await;
-    }
+    lines.join("\n")
 }
