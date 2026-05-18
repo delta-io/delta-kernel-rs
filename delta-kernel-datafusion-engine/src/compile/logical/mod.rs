@@ -262,32 +262,28 @@ mod tests {
         (strict, relaxed)
     }
 
+    /// Both the unprojected scan and any projected scan must return a schema equal to
+    /// `strict` (or `strict.project(...)`), so `NullabilityValidationExec`'s positional zip
+    /// stays aligned with the inner plan's columns. `projection = None` -> full strict;
+    /// `projection = Some(&[1])` (drop `meta`, keep `x`) -> single-column projected strict.
+    #[rstest::rstest]
+    #[case::unprojected(None)]
+    #[case::projected_keep_x(Some(vec![1]))]
     #[tokio::test]
-    async fn wrapper_unprojected_scan_returns_strict_schema() {
+    async fn wrapper_scan_returns_strict_schema(#[case] projection: Option<Vec<usize>>) {
         let (strict, relaxed) = schemas();
         let inner: Arc<dyn TableProvider> =
             Arc::new(MemTable::try_new(Arc::clone(&relaxed), vec![vec![]]).unwrap());
         let provider = NullabilityEnforcingTableProvider::new(inner, Arc::clone(&strict));
         let ctx = SessionContext::new();
-        let plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
-        assert_eq!(plan.schema().as_ref(), strict.as_ref());
-    }
-
-    #[tokio::test]
-    async fn wrapper_projected_scan_returns_projected_strict_schema() {
-        let (strict, relaxed) = schemas();
-        let inner: Arc<dyn TableProvider> =
-            Arc::new(MemTable::try_new(Arc::clone(&relaxed), vec![vec![]]).unwrap());
-        let provider = NullabilityEnforcingTableProvider::new(inner, Arc::clone(&strict));
-        let ctx = SessionContext::new();
-        // Drop `meta`, keep `x`. The wrapper must rebuild its target schema + validations to
-        // match the inner plan's projected output; otherwise NullabilityValidationExec's
-        // positional zip mismatches at runtime.
         let plan = provider
-            .scan(&ctx.state(), Some(&vec![1]), &[], None)
+            .scan(&ctx.state(), projection.as_ref(), &[], None)
             .await
             .unwrap();
-        let expected = Arc::new(strict.project(&[1]).unwrap());
+        let expected = match projection {
+            Some(p) => Arc::new(strict.project(&p).unwrap()),
+            None => Arc::clone(&strict),
+        };
         assert_eq!(plan.schema().as_ref(), expected.as_ref());
     }
 }
