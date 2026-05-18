@@ -565,11 +565,15 @@ impl WorkloadRunner for SnapshotConstructionRunner {
         )?;
         let executor = DataFusionExecutor::try_new_with_engine(Arc::clone(&self.engine))
             .map_err(|e| format!("create DataFusionExecutor: {e}"))?;
-        let rp = snapshot
+        let sm = snapshot
             .full_state_builder()
             .build()
-            .plans()
-            .map_err(|e| format!("build full_state plans: {e}"))?;
+            .and_then(|fs| fs.state_machine())
+            .map_err(|e| format!("build full_state SM: {e}"))?;
+        let rp = self
+            .runtime
+            .block_on(executor.drive_to_completion(sm))
+            .map_err(|e| format!("drive full_state SM via DataFusionExecutor: {e}"))?;
         self.runtime
             .block_on(executor.collect_result(rp))
             .map_err(|e| format!("collect full_state results via DataFusionExecutor: {e}"))?;

@@ -44,7 +44,7 @@ impl Snapshot {
     pub fn full_state(self: &SnapshotRef) -> DeltaResult<CoroutineSM<ResultPlan>> {
         FullState::for_table(Arc::clone(self))
             .build()
-            .state_machine()
+            .and_then(|fs| fs.state_machine())
             .map_err(|e| e.into_kernel_default())
     }
 
