@@ -17,7 +17,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::checkpoint_shape::{
-    checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape_for_scan, CheckpointShape,
+    checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape, CheckpointShape,
 };
 use super::dedup::ADD_PATH;
 use super::plans::build_fsr_plans;
@@ -57,7 +57,8 @@ impl Scan {
     /// relation that the data phase consumes.
     pub(super) fn scan_metadata_plans(&self) -> Result<ResultPlan, DeltaError> {
         let checkpoint_shape = checkpoint_shape_from_last_checkpoint(self.snapshot().as_ref())?;
-        scan_metadata_plans_with_shape(self, checkpoint_shape)
+        let mut registry = RelationRegistry::new(Uuid::new_v4());
+        scan_metadata_plans_with_shape(self, checkpoint_shape, &mut registry)
     }
 
     /// Build the data-phase [`ResultPlan`] given the live-actions relation
@@ -139,8 +140,13 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan_metadata", move |mut co, sm_id| async move {
             let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
-            let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
-            scan_metadata_plans_with_shape(&scan, shape)
+            let shape = resolve_checkpoint_shape(
+                &mut ctx,
+                scan.snapshot().as_ref(),
+                scan.physical_stats_schema().as_ref(),
+            )
+            .await?;
+            scan_metadata_plans_with_shape(&scan, shape, &mut *ctx)
         })
     }
 
@@ -172,8 +178,13 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan", move |mut co, sm_id| async move {
             let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
-            let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
-            let metadata = scan_metadata_plans_with_shape(&scan, shape)?;
+            let shape = resolve_checkpoint_shape(
+                &mut ctx,
+                scan.snapshot().as_ref(),
+                scan.physical_stats_schema().as_ref(),
+            )
+            .await?;
+            let metadata = scan_metadata_plans_with_shape(&scan, shape, &mut *ctx)?;
             let live_actions_relation = metadata.result_relation;
             let data = scan.scan_data_from_metadata_plans(live_actions_relation)?;
             let mut plans = metadata.plans;
@@ -209,6 +220,7 @@ fn relation_output_handle(plan: &Plan) -> Result<RelationHandle, DeltaError> {
 fn scan_metadata_plans_with_shape(
     scan: &Scan,
     checkpoint_shape: CheckpointShape,
+    registry: &mut RelationRegistry,
 ) -> Result<ResultPlan, DeltaError> {
     let snapshot = scan.snapshot();
     let partition_columns = replay_partition_columns(scan);
@@ -221,11 +233,12 @@ fn scan_metadata_plans_with_shape(
     // The terminal FSR plan is rebound under `scan.fsr_results` in this layer's registry so the
     // downstream actions chain can `relation_ref` it. The rebind reuses the strict
     // `action_schema()` -- the same contract `build_fsr_plans` publishes -- since the engine
-    // realigns the relaxed JSON/Parquet output to that schema at the scan boundary. Both layers
-    // share one registry so every minted handle shares the same `sm_id` namespace.
-    let mut registry = RelationRegistry::new(Uuid::new_v4());
+    // realigns the relaxed JSON/Parquet output to that schema at the scan boundary. The
+    // caller passes its own registry (typically the SM's, so any relations already published
+    // by `resolve_checkpoint_shape` -- e.g. the V2 manifest under `FSR_CHECKPOINT_TOP` -- are
+    // visible to `build_fsr_plans` and shared by every minted handle's `sm_id` prefix).
     let mut plans: Vec<Plan> = Vec::new();
-    let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape, &mut registry)?;
+    let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape, registry)?;
     let fsr_terminal_id = fsr.result_relation.id;
     let mut terminal_plan: Option<crate::plans::ir::Plan> = None;
     for plan in fsr.plans {
@@ -287,8 +300,7 @@ fn scan_metadata_plans_with_shape(
         scan_live_actions_schema(partition_values_schema.as_ref()),
     );
 
-    let live_actions_plan =
-        live_actions_node.into_relation(FSR_SCAN_LIVE_ACTIONS, &mut registry)?;
+    let live_actions_plan = live_actions_node.into_relation(FSR_SCAN_LIVE_ACTIONS, registry)?;
     let live_actions_relation = relation_output_handle(&live_actions_plan)?;
     plans.push(live_actions_plan);
     Ok(ResultPlan::new(plans, live_actions_relation))

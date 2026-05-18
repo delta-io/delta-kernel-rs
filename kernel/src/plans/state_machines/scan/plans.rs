@@ -174,7 +174,12 @@ pub fn build_fsr_plans(
     plans.push(commit_dedup_plan);
 
     // === checkpoint_top (optional): bare scan of top-level checkpoint parts ===
-    let checkpoint_top = if checkpoint_files.is_empty() {
+    // When the resolver already published the V2 manifest as `FSR_CHECKPOINT_TOP` (see
+    // [`super::checkpoint_shape::resolve_checkpoint_shape`]), reuse that handle instead of
+    // registering and scanning a second time.
+    let checkpoint_top = if let Some(manifest_handle) = shape.manifest_relation.as_ref() {
+        Some(manifest_handle.clone())
+    } else if checkpoint_files.is_empty() {
         None
     } else {
         let checkpoint_scan = match shape.file_format {

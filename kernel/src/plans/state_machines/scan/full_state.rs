@@ -57,7 +57,7 @@
 
 use std::sync::Arc;
 
-use super::checkpoint_shape::checkpoint_shape_from_last_checkpoint;
+use super::checkpoint_shape::resolve_checkpoint_shape;
 use super::plans::build_fsr_plans;
 // Re-exports for the FSR relation handle name constants. External code references these via
 // `fsr::full_state::FSR_COMMIT_DEDUP`; the actual definitions live in `super::plans`.
@@ -67,6 +67,7 @@ pub use super::plans::{
 };
 use crate::plans::errors::{DeltaError, KernelErrAsDelta};
 use crate::plans::ir::{RelationRegistry, ResultPlan};
+use crate::plans::state_machines::framework::coroutine::context::Context;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::scan::state_info::StateInfo;
 use crate::scan::StatsOutputMode;
@@ -107,21 +108,21 @@ impl FullState {
 
     /// Wrap FSR plan composition in a [`CoroutineSM`].
     ///
-    /// The returned SM resolves the [`CheckpointShape`] from the snapshot's
-    /// `_last_checkpoint` hint and composes the FSR plans. Future commits add
-    /// SchemaQuery yields when the hint is insufficient and a `Plans` yield to
-    /// publish the V2 multipart manifest as a reusable relation.
+    /// Yields to the engine for shape resolution (SchemaQuery / V2 manifest publication via
+    /// [`resolve_checkpoint_shape`]) when the snapshot's `_last_checkpoint` hint is
+    /// insufficient, then composes the FSR plans.
     pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let snapshot = self.snapshot.clone();
-        // TODO(parsed-stats-resolver): swap `checkpoint_shape_from_last_checkpoint` for the
-        // SM-driven `resolve_checkpoint_shape(ctx, snapshot, state_info.physical_stats_schema)`
-        // once that lands, threading `state_info` through here so V2 manifests are published
-        // and `has_stats_parsed` is populated.
-        let _state_info = self.state_info.clone();
-        CoroutineSM::new("full_state", move |_co, sm_id| async move {
-            let mut registry = RelationRegistry::new(sm_id);
-            let shape = checkpoint_shape_from_last_checkpoint(snapshot.as_ref())?;
-            build_fsr_plans(snapshot.as_ref(), shape, &mut registry)
+        let state_info = self.state_info.clone();
+        CoroutineSM::new("full_state", move |mut co, sm_id| async move {
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
+            let shape = resolve_checkpoint_shape(
+                &mut ctx,
+                snapshot.as_ref(),
+                state_info.as_ref().and_then(|si| si.physical_stats_schema.as_ref()),
+            )
+            .await?;
+            build_fsr_plans(snapshot.as_ref(), shape, &mut *ctx)
         })
     }
 }
