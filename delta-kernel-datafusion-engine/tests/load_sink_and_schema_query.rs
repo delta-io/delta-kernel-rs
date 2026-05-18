@@ -1,5 +1,5 @@
-//! Integration tests for [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load),
-//! DV masking via [`LoadSink::dv_ref`], and parquet footer reads (SchemaQuery-shaped API).
+//! Integration tests for [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load)
+//! and DV masking via [`LoadSink::dv_ref`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +10,6 @@ use delta_kernel::expressions::{ColumnName, Scalar, StructData};
 use delta_kernel::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns, SinkType};
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::schema::{DataType, StructField, StructType, ToSchema};
-use delta_kernel::FileMeta;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use test_utils::parquet::write_i64_parquet;
 use url::Url;
@@ -398,26 +397,3 @@ async fn load_exec_streams_one_parquet_row_group_per_batch() {
     );
 }
 
-#[tokio::test]
-async fn parquet_footer_schema_query_matches_file_footer() {
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("one.parquet");
-    write_i64_parquet(&p, "metric", &[42_i64]);
-
-    let url = Url::from_file_path(&p).unwrap();
-    let len = std::fs::metadata(&p).unwrap().len();
-    let meta = FileMeta::new(url, 0, len);
-
-    let executor = DataFusionExecutor::try_new().unwrap();
-    let footer_schema = executor
-        .engine()
-        .parquet_handler()
-        .read_parquet_footer(&meta)
-        .unwrap()
-        .schema;
-
-    assert!(
-        footer_schema.fields().any(|f| f.name() == "metric"),
-        "{footer_schema:?}"
-    );
-}

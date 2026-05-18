@@ -1,83 +1,23 @@
 //! [`delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation`]
 //! wiring for [`delta_kernel_datafusion_engine::DataFusionExecutor`] (`execute_phase_operation`).
-
-mod common;
+//!
+//! Only the SchemaQuery surface is unique here. The Plans (Relation + Consume) surface is
+//! covered by the user-facing `execute_plans` API in `tests/relation_and_kdf_sinks.rs`; the
+//! `execute_phase_operation` variants were strict duplicates of those tests and were dropped.
 
 use std::fs::File;
 use std::sync::Arc;
 
-use common::SumRowsConsumer;
 use delta_kernel::arrow::array::Int64Array;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch as ArrowRecordBatch;
-use delta_kernel::expressions::Scalar;
-use delta_kernel::plans::ir::nodes::{ConsumeSink, SinkType};
-use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
 };
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
-use test_utils::schemas::single_long_schema;
 use url::Url;
-use uuid::Uuid;
-
-#[tokio::test]
-async fn phase_plans_runs_relation_producer_and_registers_relation() {
-    let schema = single_long_schema();
-    let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
-
-    let mut registry = RelationRegistry::new(Uuid::new_v4());
-    let producer = PlanBuilder::values(schema, rows)
-        .expect("literal")
-        .into_relation("pipe", &mut registry)
-        .expect("relation sink");
-    let SinkType::Relation(handle) = producer.sink.clone() else {
-        unreachable!("into_relation always produces SinkType::Relation");
-    };
-
-    let executor = DataFusionExecutor::try_new().unwrap();
-    let accum = executor
-        .execute_phase_operation(PhaseOperation::Plans(vec![producer]))
-        .await
-        .expect("phase execution");
-
-    // Relation sinks don't submit KDF or schema state; the accumulator stays empty.
-    assert!(accum.take_schema().is_none());
-
-    let batches = executor
-        .collect_relation(&handle)
-        .await
-        .expect("read relation");
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].num_rows(), 2);
-}
-
-#[tokio::test]
-async fn phase_plans_submits_consume_sink_into_phase_kdf_state() {
-    let schema = single_long_schema();
-    let rows = vec![vec![Scalar::Long(10)], vec![Scalar::Long(20)]];
-    let sink = ConsumeSink::new_consumer(SumRowsConsumer::new("consumer.sum_rows_phase_op"));
-    let token = sink.token.clone();
-    let plan = PlanBuilder::values(schema, rows)
-        .expect("literal")
-        .into_consume(sink);
-
-    let executor = DataFusionExecutor::try_new().unwrap();
-    let accum = executor
-        .execute_phase_operation(PhaseOperation::Plans(vec![plan]))
-        .await
-        .expect("phase execution");
-
-    let payload = accum
-        .take_by_token(&token)
-        .expect("SumRowsConsumer payload submitted");
-    let total = *payload
-        .downcast_ref::<usize>()
-        .expect("SumRowsConsumer finishes with usize");
-    assert_eq!(total, 2);
-}
 
 #[tokio::test]
 async fn phase_schema_query_footer_round_trips_schema_via_take_schema() {
