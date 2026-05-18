@@ -1,23 +1,21 @@
 use std::any::Any;
 use std::fmt;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use datafusion_common::error::DataFusionError;
 use datafusion_common::Result as DfResult;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use delta_kernel::arrow::array::{
     Array, ArrayRef, ListArray, MapArray, NullBufferBuilder, RecordBatch, StructArray,
 };
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields};
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 
 pub type ValidationRule = (String, String);
 
@@ -98,50 +96,23 @@ impl ExecutionPlan for NullabilityValidationExec {
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         let input = self.child.execute(partition, context)?;
-        Ok(Box::pin(NullabilityValidationStream {
-            input,
-            target_schema: self.target_schema.clone(),
-            validations: self.validations.clone(),
-        }))
-    }
-}
-
-struct NullabilityValidationStream {
-    input: SendableRecordBatchStream,
-    target_schema: delta_kernel::arrow::datatypes::SchemaRef,
-    validations: Vec<ValidationRule>,
-}
-
-impl Stream for NullabilityValidationStream {
-    type Item = DfResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.input.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(batch))) => {
-                if let Err(e) = validate_batch(&batch, &self.validations) {
-                    return Poll::Ready(Some(Err(e)));
-                }
-                let cols = self
-                    .target_schema
-                    .fields()
-                    .iter()
-                    .zip(batch.columns())
-                    .map(|(f, c)| cast_array_to_field(c, f.as_ref()))
-                    .collect::<DfResult<Vec<_>>>()?;
-                let out = RecordBatch::try_new(self.target_schema.clone(), cols)
-                    .map_err(DataFusionError::from);
-                Poll::Ready(Some(out))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl RecordBatchStream for NullabilityValidationStream {
-    fn schema(&self) -> delta_kernel::arrow::datatypes::SchemaRef {
-        self.target_schema.clone()
+        let target_schema = self.target_schema.clone();
+        let validations = self.validations.clone();
+        let mapped = input.map(move |batch| {
+            let batch = batch?;
+            validate_batch(&batch, &validations)?;
+            let cols = target_schema
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .map(|(f, c)| cast_array_to_field(c, f.as_ref()))
+                .collect::<DfResult<Vec<_>>>()?;
+            RecordBatch::try_new(target_schema.clone(), cols).map_err(DataFusionError::from)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.target_schema.clone(),
+            mapped,
+        )))
     }
 }
 
