@@ -64,9 +64,11 @@ use url::Url;
 
 use crate::exec::field_id_adapter::FieldIdPhysicalExprAdapterFactory;
 use crate::exec::load_helpers::{
-    apply_optional_dv, extract_column_array, optional_i64, optional_selection_vector_for_row,
-    resolve_file_location, utf8_value_at,
+    apply_optional_dv, extract_column_array, optional_selection_vector_for_row,
+    resolve_file_location,
 };
+use delta_kernel::arrow::array::types::Int64Type;
+use delta_kernel::arrow::array::{Array, AsArray};
 
 /// Default opener batch size. DataFusion's parquet/json openers require a non-`None` batch size
 /// before `create_file_opener` is called. The session config's `batch_size` would be nicer but
@@ -402,13 +404,14 @@ impl LoadExecStream {
     ) -> Result<RowState, DataFusionError> {
         let path_cn = &self.sink.file_meta.path;
         let path_arr = extract_column_array(batch, path_cn)?;
-        let path_raw = utf8_value_at(&path_arr, row)?.ok_or_else(|| {
-            crate::error::plan_compilation(format!(
-                "Load sink path column `{}` was NULL at upstream row {row}",
-                path_cn
-            ))
-        })?;
-        let url = resolve_file_location(self.sink.as_ref(), &path_raw)?;
+        if path_arr.is_null(row) {
+            return Err(crate::error::plan_compilation(format!(
+                "Load sink path column `{path_cn}` was NULL at upstream row {row}"
+            )));
+        }
+        // Path columns are always Utf8 per kernel's scan_live_actions_schema (STRING).
+        let path_raw = path_arr.as_string::<i32>().value(row);
+        let url = resolve_file_location(self.sink.as_ref(), path_raw)?;
 
         let mask = optional_selection_vector_for_row(
             batch,
@@ -658,7 +661,13 @@ fn file_size_for_row(
     url: &Url,
 ) -> Result<i64, DataFusionError> {
     if let Some(sz_cn) = sink.file_meta.size.as_ref() {
-        return Ok(optional_i64(batch, sz_cn, row)?.unwrap_or(0));
+        // Size columns are always Int64 per kernel's scan_live_actions_schema (LONG).
+        let arr = extract_column_array(batch, sz_cn)?;
+        return Ok(if arr.is_null(row) {
+            0
+        } else {
+            arr.as_primitive::<Int64Type>().value(row)
+        });
     }
     if url.scheme() == "file" {
         let p = url.to_file_path().map_err(|()| {

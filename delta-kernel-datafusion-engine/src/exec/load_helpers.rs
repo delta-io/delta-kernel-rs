@@ -1,13 +1,16 @@
 //! Pure batch-in / batch-out helpers shared by [`super::LoadExec`].
 //!
-//! Each helper is a pure transformation: extract a column from a batch by [`ColumnName`] path,
-//! parse a [`DeletionVectorDescriptor`] out of a struct row and resolve its mask via kernel's
-//! [`selection_vector`], or apply a DV mask to one decoded file batch. None of them touch
-//! parquet/json decoding -- that's the DataFusion opener's job inside [`super::LoadExec`].
-//! Passthrough-column broadcast is delegated to DataFusion's `partition_values` plumbing
-//! (see [`super::LoadExec`] docs); there's no bespoke broadcast helper here.
-
-use std::str::FromStr;
+//! Two responsibilities:
+//!
+//! 1. Walk a nested struct path out of a metadata [`RecordBatch`] by [`ColumnName`]
+//!    ([`extract_column_array`]).
+//! 2. Resolve the optional per-row deletion-vector mask via kernel's [`selection_vector`]
+//!    ([`optional_selection_vector_for_row`]) and apply it to one decoded file batch
+//!    ([`apply_optional_dv`]).
+//!
+//! All other field reads use Arrow [`AsArray`] downcasts directly at the call site (the column
+//! types are fixed by kernel's `to_schema()` derives). Passthrough-column broadcast is delegated
+//! to DataFusion's `partition_values` plumbing -- see [`super::LoadExec`] docs.
 
 use datafusion_common::error::DataFusionError;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
@@ -16,16 +19,11 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, RecordBatch, StructArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::ir::nodes::LoadSink;
 use delta_kernel::scan::selection_vector;
 use delta_kernel::Engine;
 use url::Url;
-
-fn kernel_err(e: delta_kernel::Error) -> DataFusionError {
-    crate::error::internal_error(e.to_string())
-}
 
 /// Resolve a `LoadSink`'s `base_url`, returning a plan-compilation error if unset. Scan plans
 /// always populate `base_url` with the snapshot's table root; the kernel `LoadSink` API typing
@@ -43,105 +41,69 @@ fn sink_base_url(sink: &LoadSink) -> Result<&Url, DataFusionError> {
 /// matching how the kernel scan plan emits relative paths under `snapshot.table_root()`.
 pub(crate) fn resolve_file_location(sink: &LoadSink, path_str: &str) -> Result<Url, DataFusionError> {
     let base = sink_base_url(sink)?;
-    let path_str = path_str.trim();
-    base.join(path_str).map_err(|e| {
+    base.join(path_str.trim()).map_err(|e| {
         crate::error::plan_compilation(format!(
             "Load sink could not join base_url `{base}` with path `{path_str}`: {e}"
         ))
     })
 }
 
+/// Walk a nested struct path (`ColumnName`) out of `batch`, returning the array at the leaf.
+/// Each segment after the first is descended into via `as_struct_opt().column_by_name(...)`.
 pub(crate) fn extract_column_array(
     batch: &RecordBatch,
     cn: &ColumnName,
 ) -> Result<ArrayRef, DataFusionError> {
-    let parts = cn.path();
-    if parts.is_empty() {
-        return Err(crate::error::plan_compilation(format!(
-            "empty column path while extracting `{}`",
-            cn
-        )));
-    }
-    let mut current = batch
-        .column_by_name(&parts[0])
-        .ok_or_else(|| {
-            crate::error::plan_compilation(format!(
-                "batch schema {:?} missing top-level `{}` while extracting `{}`",
-                batch.schema(),
-                parts[0],
-                cn
-            ))
-        })?
-        .clone();
-    for seg in &parts[1..] {
+    let mut parts = cn.path().iter();
+    let head = parts.next().ok_or_else(|| {
+        crate::error::plan_compilation(format!("empty column path `{cn}`"))
+    })?;
+    let mut current = batch.column_by_name(head).cloned().ok_or_else(|| {
+        crate::error::plan_compilation(format!(
+            "batch schema {:?} missing top-level `{head}` while extracting `{cn}`",
+            batch.schema(),
+        ))
+    })?;
+    for seg in parts {
         let sa = current.as_struct_opt().ok_or_else(|| {
             crate::error::plan_compilation(format!(
-                "expected struct column while extracting `{}` segment `{}`",
-                cn, seg
+                "expected struct while extracting `{cn}` segment `{seg}`"
             ))
         })?;
-        current = sa
-            .column_by_name(seg)
-            .ok_or_else(|| {
-                crate::error::plan_compilation(format!(
-                    "struct missing `{}` while extracting `{}`",
-                    seg, cn
-                ))
-            })?
-            .clone();
+        current = sa.column_by_name(seg).cloned().ok_or_else(|| {
+            crate::error::plan_compilation(format!(
+                "struct missing `{seg}` while extracting `{cn}`"
+            ))
+        })?;
     }
     Ok(current)
 }
 
-pub(crate) fn utf8_value_at(arr: &ArrayRef, row: usize) -> Result<Option<String>, DataFusionError> {
-    if arr.is_null(row) {
-        return Ok(None);
-    }
-    match arr.data_type() {
-        ArrowDataType::Utf8 => Ok(Some(arr.as_string::<i32>().value(row).to_string())),
-        ArrowDataType::LargeUtf8 => Ok(Some(arr.as_string::<i64>().value(row).to_string())),
-        ArrowDataType::Utf8View => Ok(Some(arr.as_string_view().value(row).to_string())),
-        other => Err(crate::error::internal_error(format!(
-            "expected string column for Load path/size fragment, got {other:?}"
-        ))),
-    }
-}
-
-/// Look up a child column of a DV struct row by its kernel-emitted name.
-///
-/// Kernel emits DV columns via `DeletionVectorDescriptor::to_schema()` (see
-/// [`crate::plans::state_machines::scan::file_scan`]), which goes through the `ToSchema`
-/// derive macro -- the derive snake→camelCases field identifiers, so the columns are always
-/// `storageType`, `pathOrInlineDv`, `offset`, `sizeInBytes`, `cardinality`.
-fn dv_child(sa: &StructArray, camel: &str) -> Result<ArrayRef, DataFusionError> {
-    sa.column_by_name(camel).cloned().ok_or_else(|| {
-        crate::error::internal_error(format!(
-            "deletion vector struct missing `{camel}` column"
-        ))
-    })
-}
-
-fn dv_descriptor_from_struct_row(
+/// Read one [`DeletionVectorDescriptor`] row out of a struct array. Field types are fixed by
+/// kernel's [`DeletionVectorDescriptor::to_schema()`] (`Utf8 / Utf8 / Int32 / Int32 / Int64`)
+/// so we downcast directly via [`AsArray`] -- no defensive type dispatch.
+fn dv_from_row(
     sa: &StructArray,
     row: usize,
 ) -> Result<DeletionVectorDescriptor, DataFusionError> {
-    let storage_arr = dv_child(sa, "storageType")?;
-    let storage_raw = utf8_value_at(&storage_arr, row)?.ok_or_else(|| {
-        crate::error::internal_error("Load sink dv_ref.storageType was NULL".to_string())
-    })?;
-    let storage_type = DeletionVectorStorageType::from_str(storage_raw.trim()).map_err(|e| {
-        crate::error::internal_error(format!("invalid DV storageType `{storage_raw}`: {e}"))
-    })?;
-
-    let path_arr = dv_child(sa, "pathOrInlineDv")?;
-    let path_or_inline_dv = utf8_value_at(&path_arr, row)?.ok_or_else(|| {
-        crate::error::internal_error("Load sink dv_ref.pathOrInlineDv was NULL".to_string())
-    })?;
-
-    let offset = read_optional_i32(sa, row, "offset")?;
-    let size_in_bytes = read_required_i32(&dv_child(sa, "sizeInBytes")?, row, "sizeInBytes")?;
-    let cardinality = read_required_i64(&dv_child(sa, "cardinality")?, row, "cardinality")?;
-
+    let col = |name: &str| {
+        sa.column_by_name(name).ok_or_else(|| {
+            crate::error::internal_error(format!(
+                "deletion vector struct missing `{name}` column"
+            ))
+        })
+    };
+    let storage_type: DeletionVectorStorageType = col("storageType")?
+        .as_string::<i32>()
+        .value(row)
+        .trim()
+        .parse()
+        .map_err(|e: delta_kernel::Error| crate::error::internal_error(e.to_string()))?;
+    let path_or_inline_dv = col("pathOrInlineDv")?.as_string::<i32>().value(row).to_string();
+    let offset_arr = col("offset")?.as_primitive::<Int32Type>();
+    let offset = (!offset_arr.is_null(row)).then(|| offset_arr.value(row));
+    let size_in_bytes = col("sizeInBytes")?.as_primitive::<Int32Type>().value(row);
+    let cardinality = col("cardinality")?.as_primitive::<Int64Type>().value(row);
     Ok(DeletionVectorDescriptor {
         storage_type,
         path_or_inline_dv,
@@ -151,51 +113,11 @@ fn dv_descriptor_from_struct_row(
     })
 }
 
-fn read_optional_i32(
-    sa: &StructArray,
-    row: usize,
-    field: &str,
-) -> Result<Option<i32>, DataFusionError> {
-    let arr = sa.column_by_name(field).cloned().ok_or_else(|| {
-        crate::error::internal_error(format!(
-            "deletion vector struct missing `{field}` for optional integer field"
-        ))
-    })?;
-    if arr.is_null(row) {
-        return Ok(None);
-    }
-    Ok(Some(read_required_i32(&arr, row, field)?))
-}
-
-fn read_required_i32(arr: &ArrayRef, row: usize, label: &str) -> Result<i32, DataFusionError> {
-    match arr.data_type() {
-        ArrowDataType::Int32 => Ok(arr.as_primitive::<Int32Type>().value(row)),
-        ArrowDataType::Int64 => Ok(arr
-            .as_primitive::<Int64Type>()
-            .value(row)
-            .try_into()
-            .map_err(|_| crate::error::internal_error(format!("DV `{label}` does not fit i32")))?),
-        other => Err(crate::error::internal_error(format!(
-            "DV `{label}` expected INT32/INT64, got {other:?}"
-        ))),
-    }
-}
-
-fn read_required_i64(arr: &ArrayRef, row: usize, label: &str) -> Result<i64, DataFusionError> {
-    match arr.data_type() {
-        ArrowDataType::Int64 => Ok(arr.as_primitive::<Int64Type>().value(row)),
-        ArrowDataType::Int32 => Ok(i64::from(arr.as_primitive::<Int32Type>().value(row))),
-        other => Err(crate::error::internal_error(format!(
-            "DV `{label}` expected INT64/INT32, got {other:?}"
-        ))),
-    }
-}
-
 /// Read the optional per-row deletion-vector mask. Returns `None` when [`LoadSink::dv_ref`] is
 /// unset or the row's DV column is NULL. Otherwise materializes a row-aligned selection vector
-/// by calling [`selection_vector`] against the kernel engine, resolving the DV file paths
-/// against `sink.base_url` (the snapshot table root) -- the same base used by
-/// [`resolve_file_location`] for data files.
+/// by calling [`selection_vector`] against the kernel engine, resolving DV file paths against
+/// `sink.base_url` (the snapshot table root) -- the same base used by [`resolve_file_location`]
+/// for data files.
 pub(crate) fn optional_selection_vector_for_row(
     batch: &RecordBatch,
     sink: &LoadSink,
@@ -205,21 +127,20 @@ pub(crate) fn optional_selection_vector_for_row(
     let Some(ref dv_cn) = sink.dv_ref else {
         return Ok(None);
     };
-    let dv_column = &dv_cn.column;
-    let arr = extract_column_array(batch, dv_column)?;
+    let arr = extract_column_array(batch, &dv_cn.column)?;
     if arr.is_null(row) {
         return Ok(None);
     }
     let struct_arr = arr.as_struct_opt().ok_or_else(|| {
         crate::error::internal_error(format!(
             "Load sink dv_ref column `{}` must be a struct matching DeletionVectorDescriptor",
-            dv_column
+            dv_cn.column
         ))
     })?;
-    let descriptor = dv_descriptor_from_struct_row(struct_arr, row)?;
-    let table_root = sink_base_url(sink)?;
+    let descriptor = dv_from_row(struct_arr, row)?;
     Ok(Some(
-        selection_vector(engine, &descriptor, table_root).map_err(kernel_err)?,
+        selection_vector(engine, &descriptor, sink_base_url(sink)?)
+            .map_err(|e| crate::error::internal_error(e.to_string()))?,
     ))
 }
 
@@ -242,23 +163,3 @@ pub(crate) fn apply_optional_dv(
     filter_record_batch(&rb, &slice)
         .map_err(|e| crate::error::internal_error(format!("DV filter_record_batch failed: {e}")))
 }
-
-pub(crate) fn optional_i64(
-    batch: &RecordBatch,
-    cn: &ColumnName,
-    row: usize,
-) -> Result<Option<i64>, DataFusionError> {
-    let arr = extract_column_array(batch, cn)?;
-    if arr.is_null(row) {
-        return Ok(None);
-    }
-    match arr.data_type() {
-        ArrowDataType::Int64 => Ok(Some(arr.as_primitive::<Int64Type>().value(row))),
-        ArrowDataType::Int32 => Ok(Some(i64::from(arr.as_primitive::<Int32Type>().value(row)))),
-        other => Err(crate::error::internal_error(format!(
-            "expected LONG/INTEGER column `{}`, got {other:?}",
-            cn
-        ))),
-    }
-}
-
