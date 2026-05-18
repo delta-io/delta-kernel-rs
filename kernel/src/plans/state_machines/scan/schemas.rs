@@ -1,8 +1,6 @@
 //! Action schema constructors used by the FSR plan-builders and the replay-scan plans.
-//!
-//! Centralizes the action-schema builder (`action_schema`) and the augmented-schema helpers
-//! (`augmented_action_schema`, `action_schema_with_augmented_add`, `path_size_schema`)
-//! plus the [`load_materialized_schema`] helper used by Load-sink builders.
+//! Centralizes `action_schema`, `augmented_action_schema`, `action_schema_with_augmented_add`,
+//! `fsr_action_schema`, `path_size_schema`, and [`load_materialized_schema`].
 
 use std::sync::{Arc, LazyLock};
 
@@ -85,14 +83,24 @@ pub(super) fn load_materialized_schema(
         .map_err(|e| e.into_delta_default())
 }
 
-/// Action schema augmented with the [`Add`] slot replaced by an augmented struct that
-/// carries optionally-parsed `stats_parsed` / `partitionValues_parsed` sub-fields. Used by
-/// [`super::file_scan`] when a predicate forces data-skipping projection.
+/// Action schema with the `add` slot replaced by a struct carrying optional `stats_parsed` /
+/// `partitionValues_parsed` sub-fields. Used by FSR and replay-scan projections when stats /
+/// partition-values wiring is requested.
+///
+/// Add fields are forced **nullable** here. Downstream chains rebuild `add` via
+/// `Expression::struct_from(...)` from streams that include non-`add` rows; for those rows
+/// the children read as `NULL` regardless of `Add::to_schema()`'s strict declarations.
+/// Declaring strict here would force a `Cast(nullable -> non-null)` between project and
+/// union / anti-join / sink, which DataFusion rejects at planning time. Strict types are
+/// still enforced at the parquet/JSON file-scan boundary.
 pub(super) fn action_schema_with_augmented_add(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
 ) -> SchemaRef {
-    let mut add_fields: Vec<StructField> = Add::to_schema().fields().cloned().collect();
+    let mut add_fields: Vec<StructField> = Add::to_schema()
+        .fields()
+        .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+        .collect();
     if let Some(schema) = stats_parsed_schema {
         add_fields.push(StructField::nullable(
             "stats_parsed",
@@ -115,12 +123,30 @@ pub(super) fn action_schema_with_augmented_add(
 /// `build_commit_dedup_plan`'s row_number window (`ORDER BY version DESC`) and is dropped
 /// before the relation is persisted, so its presence in the schema is plan-internal.
 pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
+    augmented_action_schema_with_stats(with_version, None)
+}
+
+/// [`augmented_action_schema`] with `add` augmented to carry `stats_parsed` when
+/// `stats_parsed_schema` is `Some`. Drives FSR commit_dedup and the results-union sources.
+pub(super) fn augmented_action_schema_with_stats(
+    with_version: bool,
+    stats_parsed_schema: Option<&SchemaRef>,
+) -> Result<SchemaRef, DeltaError> {
     let join_key_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, true)));
-    let mut b = action_schema()
+    let mut b = fsr_action_schema(stats_parsed_schema)
         .build_on()
         .with_nullable(FSR_JOIN_KEY_COL, join_key_type);
     if with_version {
         b = b.with_not_null("version", DataType::LONG);
     }
     b.build().map_err(|e| e.into_delta_default())
+}
+
+/// FSR-side action schema: plain [`action_schema`] when `stats_parsed_schema` is `None`,
+/// else [`action_schema_with_augmented_add`] with stats.
+pub(super) fn fsr_action_schema(stats_parsed_schema: Option<&SchemaRef>) -> SchemaRef {
+    match stats_parsed_schema {
+        None => action_schema(),
+        Some(_) => action_schema_with_augmented_add(stats_parsed_schema, None),
+    }
 }

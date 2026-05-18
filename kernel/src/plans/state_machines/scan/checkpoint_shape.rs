@@ -1,40 +1,55 @@
-//! Checkpoint shape resolution helpers.
+//! Checkpoint shape resolution.
 //!
-//! Encapsulates the [`CheckpointShape`] descriptor and the discovery functions that turn a
-//! [`Snapshot`]'s log segment / `_last_checkpoint` hints into a concrete shape. The async
-//! [`resolve_checkpoint_shape_for_scan`] runs schema-query and sidecar-discovery phases
-//! when `_last_checkpoint` does not carry sufficient hints; the synchronous functions are
-//! the static counterparts used by
-//! [`FullStateBuilder::build`](super::full_state::FullStateBuilder).
+//! [`resolve_checkpoint_shape`] is the canonical entry: an SM-driven async coroutine that
+//! turns a [`Snapshot`]'s log segment + `_last_checkpoint` hint into a fully-populated
+//! [`CheckpointShape`] (including `requested_stats_schema`, `has_stats_parsed`, and
+//! `manifest_relation` for V2 multipart). The function prefers the `_last_checkpoint`
+//! hint and falls back to engine-yielded
+//! [`SchemaQuery`](crate::plans::state_machines::framework::phase_operation::PhaseOperation::SchemaQuery)
+//! / [`Plans`](crate::plans::state_machines::framework::phase_operation::PhaseOperation::Plans)
+//! phases only when the hint is insufficient.
+//!
+//! Sync helpers ([`checkpoint_shape_from_last_checkpoint`],
+//! [`checkpoint_shape_from_schema`]) populate the cheap shape fields and leave
+//! `(requested_stats_schema, has_stats_parsed, manifest_relation)` at their defaults; the
+//! resolver enriches them.
 
 use std::sync::Arc;
 
-use super::schemas::action_schema;
+use super::plans::FSR_CHECKPOINT_TOP;
+use super::schemas::{action_schema, fsr_action_schema};
 use crate::actions::{
     Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
-use crate::expressions::Expression;
+use crate::expressions::col;
+use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::nodes::FileFormat;
-use crate::plans::ir::{Extractor, Plan, PlanBuilder};
+use crate::plans::ir::nodes::{FileFormat, RelationHandle, SinkType};
+use crate::plans::ir::PlanBuilder;
 use crate::plans::kdf::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::context::Context;
 use crate::plans::state_machines::framework::phase_operation::{PhaseOperation, SchemaQueryNode};
-use crate::scan::Scan;
-use crate::schema::{arc_schema, SchemaRef, StructField, ToSchema};
+use crate::schema::{arc_schema, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::{delta_error, FileMeta};
 
-/// Resolved checkpoint encoding + schema hints. `actions_schema_subset` keys the top-level
-/// checkpoint scan in [`super::plans::build_fsr_plans`]; `has_sidecars` decides whether
-/// the FSR sidecar Load is appended to the plan vector.
+/// Resolved checkpoint encoding + schema hints. Drives FSR / Scan plan composition:
+/// - `file_format`, `has_sidecars`, `actions_schema_subset`: top-level scan / sidecar Load.
+/// - `requested_stats_schema`: per-scan physical stats schema for projection.
+/// - `has_stats_parsed`: leaf parquet has compatible native `add.stats_parsed` -> plan
+///   builders prefer `col(["add", "stats_parsed"])` over `parse_json(col(["add", "stats"]))`.
+/// - `manifest_relation`: V2 multipart manifest handle published by
+///   [`resolve_checkpoint_shape`]; downstream `RelationRef`s it instead of re-scanning.
 #[derive(Clone, Debug)]
 pub struct CheckpointShape {
     pub file_format: FileFormat,
     pub has_sidecars: bool,
     pub actions_schema_subset: SchemaRef,
+    pub requested_stats_schema: Option<SchemaRef>,
+    pub has_stats_parsed: bool,
+    pub manifest_relation: Option<RelationHandle>,
 }
 
 pub fn snapshot_has_checkpoint_files(snapshot: &Snapshot) -> bool {
@@ -65,6 +80,9 @@ pub fn checkpoint_shape_from_schema(schema: &SchemaRef) -> Result<CheckpointShap
         file_format: FileFormat::Parquet,
         has_sidecars: schema.contains(SIDECAR_NAME),
         actions_schema_subset: subset,
+        requested_stats_schema: None,
+        has_stats_parsed: false,
+        manifest_relation: None,
     })
 }
 
@@ -87,6 +105,9 @@ pub fn checkpoint_shape_from_last_checkpoint(
         has_sidecars: full_schema.contains(SIDECAR_NAME)
             || (has_checkpoint_parts && matches!(fmt, FileFormat::Json)),
         actions_schema_subset: subset,
+        requested_stats_schema: None,
+        has_stats_parsed: false,
+        manifest_relation: None,
     })
 }
 
@@ -120,100 +141,100 @@ fn sidecar_only_schema() -> SchemaRef {
 }
 
 pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
-    let mut fields: Vec<StructField> = action_schema().fields().cloned().collect();
+    checkpoint_manifest_scan_schema_with_stats(include_sidecar, None)
+}
+
+/// Like [`checkpoint_manifest_scan_schema`] but optionally augments `add` with a typed
+/// `stats_parsed` sub-field. Used when [`CheckpointShape::has_stats_parsed`] is `true` so the
+/// leaf parquet's native `add.stats_parsed` column is read directly into the relation rather
+/// than re-parsed from JSON downstream.
+pub(super) fn checkpoint_manifest_scan_schema_with_stats(
+    include_sidecar: bool,
+    stats_parsed_schema: Option<&SchemaRef>,
+) -> SchemaRef {
+    let base = fsr_action_schema(stats_parsed_schema);
+    let mut fields: Vec<StructField> = base.fields().cloned().collect();
     if include_sidecar {
         fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
     }
     arc_schema(fields)
 }
 
-pub(super) async fn resolve_checkpoint_shape_for_scan(
+/// Canonical SM-driven checkpoint shape resolver shared by FSR and Scan plan builders.
+///
+/// Yields at most one [`PhaseOperation::SchemaQuery`] (when `_last_checkpoint` lacks a
+/// schema) and at most one [`PhaseOperation::Plans`] (V2 multipart: publishes the manifest
+/// as `FSR_CHECKPOINT_TOP` and extracts sidecar URLs in the same phase, so
+/// [`super::plans::build_fsr_plans`] reuses the relation instead of re-scanning).
+pub(super) async fn resolve_checkpoint_shape(
     ctx: &mut Context<'_>,
-    scan: &Scan,
+    snapshot: &Snapshot,
+    physical_stats_schema: Option<&SchemaRef>,
 ) -> Result<CheckpointShape, DeltaError> {
-    let snapshot = scan.snapshot();
-    let mut shape = checkpoint_shape_from_last_checkpoint(snapshot.as_ref())?;
+    let mut shape = checkpoint_shape_from_last_checkpoint(snapshot)?;
+    shape.requested_stats_schema = physical_stats_schema.cloned();
 
-    // SchemaQuery is needed only when checkpoint files exist but `_last_checkpoint` did not
-    // include a schema hint.
-    let needs_schema_query = snapshot_has_checkpoint_files(snapshot.as_ref())
-        && snapshot.log_segment().checkpoint_schema().is_none();
-    if needs_schema_query {
+    let seg = snapshot.log_segment();
+    let hint_schema = seg.checkpoint_schema();
+
+    // Hint-first stats detection: zero engine round-trips when `_last_checkpoint` carries the
+    // schema. The hint reflects what the writer recorded for this checkpoint's actions, so a
+    // compatible `add.stats_parsed` here means the leaf parquet has it too.
+    if let (Some(hint), Some(reqd)) = (hint_schema.as_ref(), physical_stats_schema) {
+        shape.has_stats_parsed =
+            LogSegment::schema_has_compatible_stats_parsed(hint.as_ref(), reqd.as_ref());
+    }
+
+    // Fall back to a top-level SchemaQuery when the hint is missing but checkpoint files
+    // exist. JSON checkpoints have no parquet footer to probe, so we skip the query and
+    // conservatively assume sidecar-aware replay.
+    let needs_top_level_query = snapshot_has_checkpoint_files(snapshot) && hint_schema.is_none();
+    if needs_top_level_query {
         if shape.file_format == FileFormat::Json {
-            // JSON checkpoints are ambiguous without `_last_checkpoint` schema hints:
-            // they may be manifest rows that carry sidecar pointers. SchemaQuery reads
-            // parquet footers only, so for JSON we must conservatively treat this as
-            // possibly-manifest and proceed through sidecar-aware replay.
+            // JSON checkpoints are ambiguous; treat as possibly-manifest.
             shape.has_sidecars = true;
         } else {
-            let checkpoint_url = first_checkpoint_url(snapshot.as_ref())?;
+            let checkpoint_url = first_checkpoint_url(snapshot)?;
             let checkpoint_state = ctx
                 .execute(
                     PhaseOperation::SchemaQuery(SchemaQueryNode::new(checkpoint_url)),
-                    "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema",
+                    "fsr::resolve_checkpoint_shape::checkpoint_schema",
                 )
                 .await
                 .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
-            let checkpoint_schema = checkpoint_state.take_schema().ok_or_else(|| {
-                delta_error!(
-                    DeltaErrorCode::DeltaCommandInvariantViolation,
-                    "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema: schema query \
-                     phase returned no schema",
-                )
-            })?;
-            shape = checkpoint_shape_from_schema(&checkpoint_schema)?;
-        }
-
-        if shape.has_sidecars {
-            let (discover_sidecars, extract_sidecars) =
-                build_sidecar_discovery_plan(snapshot.as_ref(), shape.file_format)?;
-            let sidecar_state = ctx
-                .execute(
-                    PhaseOperation::Plans(vec![discover_sidecars]),
-                    "scan::resolve_checkpoint_shape_for_scan::sidecar_discovery",
-                )
-                .await
-                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
-            let sidecar_files = extract_sidecars.extract(&sidecar_state).map_err(|e| {
-                let detail = e.display_with_source_chain();
-                delta_error!(
-                    DeltaErrorCode::DeltaCommandInvariantViolation,
-                    source = e,
-                    "scan::resolve_checkpoint_shape_for_scan::extract_sidecars: {detail}",
-                )
-            })?;
-            if let Some(first_sidecar) = sidecar_files.first() {
-                let sidecar_state = ctx
-                    .execute(
-                        PhaseOperation::SchemaQuery(SchemaQueryNode::new(
-                            first_sidecar.location.as_str(),
-                        )),
-                        "scan::resolve_checkpoint_shape_for_scan::sidecar_schema",
-                    )
-                    .await
-                    .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
-                let sidecar_schema = sidecar_state.take_schema().ok_or_else(|| {
-                    delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
-                        "scan::resolve_checkpoint_shape_for_scan::sidecar_schema: sidecar schema \
-                         query phase returned no schema",
-                    )
-                })?;
-                let mut sidecar_shape = checkpoint_shape_from_schema(&sidecar_schema)?;
-                // We are in the v2 sidecar branch by construction.
-                sidecar_shape.has_sidecars = true;
-                shape = sidecar_shape;
+            let checkpoint_schema = checkpoint_state.take_schema()?;
+            shape.has_sidecars = checkpoint_schema.contains(SIDECAR_NAME);
+            shape.actions_schema_subset =
+                checkpoint_actions_schema_projection(&checkpoint_schema)?;
+            if let Some(reqd) = physical_stats_schema {
+                shape.has_stats_parsed = LogSegment::schema_has_compatible_stats_parsed(
+                    checkpoint_schema.as_ref(),
+                    reqd.as_ref(),
+                );
             }
         }
+    }
+
+    // V2 multipart: publish the manifest as a reusable relation, extract sidecar URLs in the
+    // same phase, then probe the first sidecar for `add.stats_parsed` when stats requested.
+    if shape.has_sidecars {
+        let manifest_handle =
+            publish_v2_manifest_and_probe_sidecar(ctx, snapshot, &mut shape, physical_stats_schema)
+                .await?;
+        shape.manifest_relation = Some(manifest_handle);
     }
 
     Ok(shape)
 }
 
-pub(super) fn build_sidecar_discovery_plan(
+/// V2 multipart: publish manifest scan + sidecar extraction in one `Plans` phase, then
+/// probe the first (always-parquet) sidecar via `SchemaQuery` when stats are requested.
+async fn publish_v2_manifest_and_probe_sidecar(
+    ctx: &mut Context<'_>,
     snapshot: &Snapshot,
-    checkpoint_format: FileFormat,
-) -> Result<(Plan, Extractor<Vec<FileMeta>>), DeltaError> {
+    shape: &mut CheckpointShape,
+    physical_stats_schema: Option<&SchemaRef>,
+) -> Result<RelationHandle, DeltaError> {
     let checkpoint_files: Vec<FileMeta> = snapshot
         .log_segment()
         .listed
@@ -221,14 +242,65 @@ pub(super) fn build_sidecar_discovery_plan(
         .iter()
         .map(|p| p.location.clone())
         .collect();
-    let sidecar_scan = match checkpoint_format {
-        FileFormat::Parquet => PlanBuilder::scan_parquet(checkpoint_files, sidecar_only_schema()),
-        FileFormat::Json => PlanBuilder::scan_json(checkpoint_files, sidecar_only_schema()),
+    let manifest_schema = checkpoint_manifest_scan_schema(true);
+    let manifest_scan = match shape.file_format {
+        FileFormat::Parquet => {
+            PlanBuilder::scan_parquet(checkpoint_files.clone(), manifest_schema.clone())
+        }
+        FileFormat::Json => {
+            PlanBuilder::scan_json(checkpoint_files.clone(), manifest_schema.clone())
+        }
+    };
+    let manifest_publish_plan = manifest_scan.into_relation(FSR_CHECKPOINT_TOP, &mut *ctx)?;
+    let manifest_handle = match &manifest_publish_plan.sink {
+        SinkType::Relation(h) => h.clone(),
+        other => {
+            return Err(delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "fsr::resolve_checkpoint_shape: manifest_publish_plan must end in Relation sink, got {other:?}",
+            ));
+        }
+    };
+
+    // Sidecar extraction reads from the just-registered manifest relation.
+    let (sidecar_extract_plan, extract_sidecars) = ctx
+        .relation_ref(FSR_CHECKPOINT_TOP)?
+        .filter(Arc::new(col([SIDECAR_NAME]).is_not_null().into()))
+        .consume(SidecarCollector::new(
+            snapshot.log_segment().log_root.clone(),
+        ));
+
+    let sidecar_state = ctx
+        .execute(
+            PhaseOperation::Plans(vec![manifest_publish_plan, sidecar_extract_plan]),
+            "fsr::resolve_checkpoint_shape::publish_manifest_and_extract",
+        )
+        .await
+        .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+    let sidecar_files = extract_sidecars.extract(&sidecar_state).map_err(|e| {
+        let detail = e.display_with_source_chain();
+        delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            source = e,
+            "fsr::resolve_checkpoint_shape::extract_sidecars: {detail}",
+        )
+    })?;
+
+    // Probe the first sidecar parquet for `add.stats_parsed` if stats requested. Sidecars
+    // override the manifest's stats-parsed assessment because the actual `add` rows live
+    // there for V2 multipart.
+    if let (Some(reqd), Some(first_sidecar)) = (physical_stats_schema, sidecar_files.first()) {
+        let sidecar_state = ctx
+            .execute(
+                PhaseOperation::SchemaQuery(SchemaQueryNode::new(first_sidecar.location.as_str())),
+                "fsr::resolve_checkpoint_shape::sidecar_schema",
+            )
+            .await
+            .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+        let sidecar_schema = sidecar_state.take_schema()?;
+        shape.has_stats_parsed =
+            LogSegment::schema_has_compatible_stats_parsed(sidecar_schema.as_ref(), reqd.as_ref());
     }
-    .filter(Arc::new(
-        Expression::column(["sidecar"]).is_not_null().into(),
-    ));
-    Ok(sidecar_scan.consume(SidecarCollector::new(
-        snapshot.log_segment().log_root.clone(),
-    )))
+
+    Ok(manifest_handle)
 }

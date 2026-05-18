@@ -436,18 +436,14 @@ impl DataFusionExecutor {
             }
         }
         let finished = handle.finish();
-        if let Some(state) = ctx.phase_state.as_ref() {
-            state
-                .submit_kdf_handle(finished)
-                .map_err(crate::error::wrap_delta_err)?;
-        } else {
+        let Some(state) = ctx.phase_state.as_ref() else {
             // Consume sink called outside of an active phase has nowhere to land its handle.
-            // Drop the handle and surface a clear error so the caller can wire phase state.
             let _: FinishedHandle = finished;
             return Err(crate::error::internal_error(
                 "Consume sink drained without an active phase state to submit into",
             ));
-        }
+        };
+        state.submit_kdf_handle(finished);
         Ok(())
     }
 }

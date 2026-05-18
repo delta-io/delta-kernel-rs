@@ -57,9 +57,7 @@
 
 use std::sync::Arc;
 
-use uuid::Uuid;
-
-use super::checkpoint_shape::{checkpoint_shape_from_last_checkpoint, CheckpointShape};
+use super::checkpoint_shape::resolve_checkpoint_shape;
 use super::plans::build_fsr_plans;
 // Re-exports for the FSR relation handle name constants. External code references these via
 // `fsr::full_state::FSR_COMMIT_DEDUP`; the actual definitions live in `super::plans`.
@@ -67,27 +65,31 @@ pub use super::plans::{
     CommitFileMeta, FSR_CHECKPOINT_TOP, FSR_COMMIT_DEDUP, FSR_COMMIT_RAW, FSR_RESULTS,
     FSR_SIDECAR_ACTIONS,
 };
-use crate::plans::errors::DeltaError;
+use crate::plans::errors::{DeltaError, KernelErrAsDelta};
 use crate::plans::ir::{RelationRegistry, ResultPlan};
+use crate::plans::state_machines::framework::coroutine::context::Context;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
+use crate::scan::state_info::StateInfo;
+use crate::scan::StatsOutputMode;
 use crate::snapshot::Snapshot;
 
-/// Configured FSR plan source, mirroring [`crate::scan::Scan`]'s split between a builder that
-/// configures and a value that produces plans / state machines.
-///
-/// Construct via [`FullState::for_table`] then [`FullStateBuilder::build`]; consume via
-/// [`Self::plans`] (synchronous) or [`Self::state_machine`] (coroutine driver).
+/// Configured FSR plan source. Construct via [`FullState::for_table`] (or
+/// [`Snapshot::full_state_builder`](crate::snapshot::Snapshot::full_state_builder)), call
+/// [`FullStateBuilder::build`], then drive [`Self::state_machine`] through an engine. The
+/// snapshot is the sole source of truth for the table's log segment and `_last_checkpoint`
+/// hint; the resolver derives shape from those, no override hook.
 #[derive(Debug, Clone)]
 pub struct FullState {
     snapshot: Arc<Snapshot>,
-    checkpoint_shape: Option<CheckpointShape>,
+    /// `Some` iff [`FullStateBuilder::with_stats`] was called. Derived at `build()` time.
+    state_info: Option<Arc<StateInfo>>,
 }
 
 /// Builder for canonical Full State Reconstruction plans.
 #[derive(Debug, Clone)]
 pub struct FullStateBuilder {
     snapshot: Arc<Snapshot>,
-    checkpoint_shape: Option<CheckpointShape>,
+    with_stats: bool,
 }
 
 impl FullState {
@@ -95,128 +97,58 @@ impl FullState {
     pub fn for_table(snapshot: Arc<Snapshot>) -> FullStateBuilder {
         FullStateBuilder {
             snapshot,
-            checkpoint_shape: None,
+            with_stats: false,
         }
     }
 
-    /// Build the canonical FSR [`ResultPlan`] synchronously.
-    ///
-    /// Resolves checkpoint shape (preferring an explicit
-    /// [`FullStateBuilder::with_checkpoint_shape`] override) and composes the FSR plans
-    /// in one shot. Use this when the snapshot already has sufficient
-    /// `_last_checkpoint` hints and no SM driver is needed.
-    pub fn plans(&self) -> Result<ResultPlan, DeltaError> {
-        let mut registry = RelationRegistry::new(Uuid::new_v4());
-        self.plans_with_registry(&mut registry)
-    }
-
-    fn plans_with_registry(
-        &self,
-        registry: &mut RelationRegistry,
-    ) -> Result<ResultPlan, DeltaError> {
-        let shape = match &self.checkpoint_shape {
-            Some(shape) => shape.clone(),
-            None => checkpoint_shape_from_last_checkpoint(self.snapshot.as_ref())?,
-        };
-        build_fsr_plans(self.snapshot.as_ref(), shape, registry)
-    }
-
-    /// Wrap [`Self::plans`] in a zero-yield [`CoroutineSM`].
-    ///
-    /// The returned SM terminates immediately with the canonical FSR
-    /// [`ResultPlan`]. Engines that drive everything through the SM surface
-    /// (scan replay, full-state reconstruction) can treat this as the
-    /// uniform entry point even though no intermediate engine yields are
-    /// required today.
+    /// Coroutine SM: [`resolve_checkpoint_shape`] then [`build_fsr_plans`].
     pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
-        let this = self.clone();
-        CoroutineSM::new("full_state", move |_co, sm_id| async move {
-            let mut registry = RelationRegistry::new(sm_id);
-            this.plans_with_registry(&mut registry)
+        let snapshot = self.snapshot.clone();
+        let state_info = self.state_info.clone();
+        CoroutineSM::new("full_state", move |mut co, sm_id| async move {
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
+            let shape = resolve_checkpoint_shape(
+                &mut ctx,
+                snapshot.as_ref(),
+                state_info.as_ref().and_then(|si| si.physical_stats_schema.as_ref()),
+            )
+            .await?;
+            build_fsr_plans(snapshot.as_ref(), shape, &mut *ctx)
         })
     }
 }
 
 impl FullStateBuilder {
-    /// Override checkpoint shape discovery used by [`Self::build`].
-    pub fn with_checkpoint_shape(mut self, shape: CheckpointShape) -> Self {
-        self.checkpoint_shape = Some(shape);
+    /// Surface `add.stats_parsed` in FSR output. `build()` then derives the
+    /// `physical_stats_schema` (used by the resolver to detect native
+    /// `add.stats_parsed` and by plan builders to project it).
+    pub fn with_stats(mut self) -> Self {
+        self.with_stats = true;
         self
     }
 
-    /// Finalize the builder into a [`FullState`] value.
-    ///
-    /// The returned value carries every configuration knob set on the builder
-    /// (the snapshot, any explicit checkpoint shape) and exposes
-    /// [`FullState::plans`] / [`FullState::state_machine`] for consumption.
-    pub fn build(self) -> FullState {
-        FullState {
+    /// Finalize into a [`FullState`]. When [`Self::with_stats`] was called, constructs a
+    /// [`StateInfo`] from the snapshot's logical schema with no predicate and
+    /// [`StatsOutputMode::AllColumns`]; otherwise no `StateInfo` is built.
+    pub fn build(self) -> Result<FullState, DeltaError> {
+        let state_info = if self.with_stats {
+            let logical_schema = self.snapshot.schema();
+            let table_configuration = self.snapshot.table_configuration();
+            let si = StateInfo::try_new(
+                logical_schema,
+                table_configuration,
+                None,
+                StatsOutputMode::AllColumns,
+                (),
+            )
+            .map_err(|e| e.into_delta_default())?;
+            Some(Arc::new(si))
+        } else {
+            None
+        };
+        Ok(FullState {
             snapshot: self.snapshot,
-            checkpoint_shape: self.checkpoint_shape,
-        }
-    }
-
-    /// Enable stats-aware planning on this builder.
-    ///
-    /// API-level compatibility shim aligning the FullState builder surface with scan replay
-    /// builders. Canonical FSR output plans already preserve Add action stats columns, so no
-    /// additional rewrite is needed at this layer.
-    pub fn with_stats(self) -> Self {
-        self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::super::checkpoint_shape::checkpoint_shape_from_last_checkpoint;
-    use super::super::plans::build_fsr_plans;
-    use super::*;
-    use crate::utils::test_utils::load_test_table;
-
-    const REPLAY_COVERAGE_TABLES: &[&str] = &[
-        "app-txn-no-checkpoint",
-        "app-txn-checkpoint",
-        "v2-checkpoints-parquet-without-sidecars",
-        "v2-checkpoints-parquet-with-sidecars",
-    ];
-
-    #[test]
-    fn full_state_builder_matches_direct_fsr_build() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
-        let shape = checkpoint_shape_from_last_checkpoint(&snapshot).unwrap();
-        let mut registry = RelationRegistry::new(Uuid::new_v4());
-        let direct = build_fsr_plans(&snapshot, shape.clone(), &mut registry).unwrap();
-        let built = FullState::for_table(Arc::clone(&snapshot))
-            .with_stats()
-            .with_checkpoint_shape(shape)
-            .build()
-            .plans()
-            .unwrap();
-        assert_eq!(direct.plans.len(), built.plans.len());
-        assert_eq!(direct.result_relation.name, FSR_RESULTS);
-        assert_eq!(direct.result_relation.name, built.result_relation.name);
-    }
-
-    #[test]
-    fn full_state_builder_with_stats_works_across_checkpoint_configs() {
-        for table in REPLAY_COVERAGE_TABLES {
-            let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
-            let shape = checkpoint_shape_from_last_checkpoint(snapshot.as_ref()).unwrap();
-            let mut registry = RelationRegistry::new(Uuid::new_v4());
-            let direct = build_fsr_plans(snapshot.as_ref(), shape.clone(), &mut registry).unwrap();
-            let built = FullState::for_table(Arc::clone(&snapshot))
-                .with_stats()
-                .with_checkpoint_shape(shape)
-                .build()
-                .plans()
-                .unwrap();
-            assert_eq!(
-                direct.plans.len(),
-                built.plans.len(),
-                "FullState builder should match direct build for table {table}",
-            );
-        }
+            state_info,
+        })
     }
 }

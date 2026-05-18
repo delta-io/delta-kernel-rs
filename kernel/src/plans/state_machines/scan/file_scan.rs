@@ -17,11 +17,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::checkpoint_shape::{
-    checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape_for_scan, CheckpointShape,
+    checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape, CheckpointShape,
 };
 use super::dedup::ADD_PATH;
 use super::plans::build_fsr_plans;
-use super::schemas::{action_schema, action_schema_with_augmented_add};
+use super::schemas::{action_schema_with_augmented_add, fsr_action_schema};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     Add, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
@@ -57,7 +57,8 @@ impl Scan {
     /// relation that the data phase consumes.
     pub(super) fn scan_metadata_plans(&self) -> Result<ResultPlan, DeltaError> {
         let checkpoint_shape = checkpoint_shape_from_last_checkpoint(self.snapshot().as_ref())?;
-        scan_metadata_plans_with_shape(self, checkpoint_shape)
+        let mut registry = RelationRegistry::new(Uuid::new_v4());
+        scan_metadata_plans_with_shape(self, checkpoint_shape, &mut registry)
     }
 
     /// Build the data-phase [`ResultPlan`] given the live-actions relation
@@ -139,8 +140,13 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan_metadata", move |mut co, sm_id| async move {
             let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
-            let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
-            scan_metadata_plans_with_shape(&scan, shape)
+            let shape = resolve_checkpoint_shape(
+                &mut ctx,
+                scan.snapshot().as_ref(),
+                scan.physical_stats_schema().as_ref(),
+            )
+            .await?;
+            scan_metadata_plans_with_shape(&scan, shape, &mut *ctx)
         })
     }
 
@@ -172,8 +178,13 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan", move |mut co, sm_id| async move {
             let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
-            let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
-            let metadata = scan_metadata_plans_with_shape(&scan, shape)?;
+            let shape = resolve_checkpoint_shape(
+                &mut ctx,
+                scan.snapshot().as_ref(),
+                scan.physical_stats_schema().as_ref(),
+            )
+            .await?;
+            let metadata = scan_metadata_plans_with_shape(&scan, shape, &mut *ctx)?;
             let live_actions_relation = metadata.result_relation;
             let data = scan.scan_data_from_metadata_plans(live_actions_relation)?;
             let mut plans = metadata.plans;
@@ -209,6 +220,7 @@ fn relation_output_handle(plan: &Plan) -> Result<RelationHandle, DeltaError> {
 fn scan_metadata_plans_with_shape(
     scan: &Scan,
     checkpoint_shape: CheckpointShape,
+    registry: &mut RelationRegistry,
 ) -> Result<ResultPlan, DeltaError> {
     let snapshot = scan.snapshot();
     let partition_columns = replay_partition_columns(scan);
@@ -217,15 +229,28 @@ fn scan_metadata_plans_with_shape(
     let partition_values_schema =
         scan_partition_values_physical_schema(snapshot.as_ref(), scan.logical_schema())?;
 
+    // The sync `scan_metadata_plans` path constructs `checkpoint_shape` via
+    // `checkpoint_shape_from_last_checkpoint`, which doesn't know about the scan's stats
+    // requirement. Stamp the scan's `physical_stats_schema` into the shape here so FSR
+    // emits `add.stats_parsed` consistently for both sync and SM-driven paths.
+    // `has_stats_parsed` stays at whatever the caller populated (the resolver sets it from
+    // the leaf parquet; the sync helper leaves it false, so FSR uses `parse_json` as a
+    // safe fallback).
+    let mut checkpoint_shape = checkpoint_shape;
+    if checkpoint_shape.requested_stats_schema.is_none() {
+        checkpoint_shape.requested_stats_schema = predicate_stats_schema.clone();
+    }
+
     // === FSR plans: build the FSR result plan, then layer the actions chain on top ===
     // The terminal FSR plan is rebound under `scan.fsr_results` in this layer's registry so the
     // downstream actions chain can `relation_ref` it. The rebind reuses the strict
     // `action_schema()` -- the same contract `build_fsr_plans` publishes -- since the engine
-    // realigns the relaxed JSON/Parquet output to that schema at the scan boundary. Both layers
-    // share one registry so every minted handle shares the same `sm_id` namespace.
-    let mut registry = RelationRegistry::new(Uuid::new_v4());
+    // realigns the relaxed JSON/Parquet output to that schema at the scan boundary. The
+    // caller passes its own registry (typically the SM's, so any relations already published
+    // by `resolve_checkpoint_shape` -- e.g. the V2 manifest under `FSR_CHECKPOINT_TOP` -- are
+    // visible to `build_fsr_plans` and shared by every minted handle's `sm_id` prefix).
     let mut plans: Vec<Plan> = Vec::new();
-    let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape, &mut registry)?;
+    let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape, registry)?;
     let fsr_terminal_id = fsr.result_relation.id;
     let mut terminal_plan: Option<crate::plans::ir::Plan> = None;
     for plan in fsr.plans {
@@ -245,8 +270,14 @@ fn scan_metadata_plans_with_shape(
             "fsr::scan::scan_metadata: terminal FSR plan missing from plan vector",
         )
     })?;
+    // Rebind the FSR terminal under `scan.fsr_results` with the FSR-side schema. When stats
+    // were requested, this preserves the native `add.stats_parsed` column the FSR plans
+    // already produced, so the actions chain below can pick `col(["add", "stats_parsed"])`
+    // instead of re-parsing the JSON.
+    let fsr_results_schema = fsr_action_schema(predicate_stats_schema.as_ref());
+    let source_has_native_stats_parsed = predicate_stats_schema.is_some();
     let fsr_results_handle =
-        registry.register_relation_sink("scan.fsr_results", action_schema())?;
+        registry.register_relation_sink("scan.fsr_results", fsr_results_schema)?;
     let terminal_rebound_plan =
         Plan::new(terminal_plan.root, SinkType::Relation(fsr_results_handle));
     plans.push(terminal_rebound_plan);
@@ -262,6 +293,7 @@ fn scan_metadata_plans_with_shape(
                 let (projection, schema) = scan_actions_with_parsed_projection_and_schema(
                     predicate_stats_schema.as_ref(),
                     predicate_partition_schema.as_ref(),
+                    source_has_native_stats_parsed,
                 )?;
                 actions_root.project(projection, schema)
             } else {
@@ -287,8 +319,7 @@ fn scan_metadata_plans_with_shape(
         scan_live_actions_schema(partition_values_schema.as_ref()),
     );
 
-    let live_actions_plan =
-        live_actions_node.into_relation(FSR_SCAN_LIVE_ACTIONS, &mut registry)?;
+    let live_actions_plan = live_actions_node.into_relation(FSR_SCAN_LIVE_ACTIONS, registry)?;
     let live_actions_relation = relation_output_handle(&live_actions_plan)?;
     plans.push(live_actions_plan);
     Ok(ResultPlan::new(plans, live_actions_relation))
@@ -384,13 +415,22 @@ pub(super) fn scan_live_actions_projection(
 pub(super) fn scan_actions_with_parsed_projection(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
+    source_has_native_stats_parsed: bool,
 ) -> Vec<Arc<Expression>> {
     let mut add_exprs: Vec<Arc<Expression>> = Add::to_schema()
         .fields()
         .map(|f| col(["add", f.name().as_str()]).into())
         .collect();
     if let Some(schema) = stats_parsed_schema {
-        add_exprs.push(Expression::parse_json(col(["add", "stats"]), schema.clone()).into());
+        // Source rows already carry a typed `add.stats_parsed` when FSR was driven with
+        // stats requested -- in that case we reference the native column directly instead of
+        // re-parsing `add.stats` JSON.
+        let stats_expr = if source_has_native_stats_parsed {
+            col(["add", "stats_parsed"])
+        } else {
+            Expression::parse_json(col(["add", "stats"]), schema.clone())
+        };
+        add_exprs.push(stats_expr.into());
     }
     if partition_values_parsed_schema.is_some() {
         add_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])).into());
@@ -408,9 +448,14 @@ pub(super) fn scan_actions_with_parsed_projection(
 fn scan_actions_with_parsed_projection_and_schema(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
+    source_has_native_stats_parsed: bool,
 ) -> Result<(Vec<Arc<Expression>>, SchemaRef), DeltaError> {
     Ok((
-        scan_actions_with_parsed_projection(stats_parsed_schema, partition_values_parsed_schema),
+        scan_actions_with_parsed_projection(
+            stats_parsed_schema,
+            partition_values_parsed_schema,
+            source_has_native_stats_parsed,
+        ),
         action_schema_with_augmented_add(stats_parsed_schema, partition_values_parsed_schema),
     ))
 }

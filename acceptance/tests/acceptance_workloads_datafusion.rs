@@ -72,15 +72,19 @@ async fn execute_snapshot_workload_datafusion(
     let snapshot = build_snapshot(engine.as_ref(), table_root, snapshot_spec.time_travel.as_ref())?;
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let rp = snapshot
+    let sm = snapshot
         .full_state_builder()
         .build()
-        .plans()
-        .map_err(|e| Error::generic(format!("build full_state plans: {e}")))?;
+        .and_then(|fs| fs.state_machine())
+        .map_err(|e| Error::generic(format!("build full_state SM: {e}")))?;
+    let rp = executor
+        .drive_to_completion(sm)
+        .await
+        .map_err(|e| Error::generic(format!("drive full_state SM: {e}")))?;
     executor
         .collect_result(rp)
         .await
-        .map_err(|e| Error::generic(format!("execute full_state via DataFusionExecutor: {e}")))?;
+        .map_err(|e| Error::generic(format!("collect full_state result: {e}")))?;
     let table_configuration = snapshot.table_configuration();
     Ok(SnapshotResult {
         version: snapshot.version(),

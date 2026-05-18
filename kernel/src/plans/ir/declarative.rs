@@ -534,15 +534,13 @@ mod tests {
         assert_eq!(extractor.token().kdf_id, ConsumerKdfId::CheckpointHint);
 
         let state = PhaseState::empty();
-        state
-            .submit_kdf_handle(FinishedHandle {
-                token: extractor.token().clone(),
-                sm_id: Uuid::new_v4(),
-                sm_kind: "test",
-                phase_name: "consume",
-                erased: Box::new(NoopConsumer),
-            })
-            .unwrap();
+        state.submit_kdf_handle(FinishedHandle {
+            token: extractor.token().clone(),
+            sm_id: Uuid::new_v4(),
+            sm_kind: "test",
+            phase_name: "consume",
+            erased: Box::new(NoopConsumer),
+        });
         assert!(extractor.extract(&state).unwrap());
     }
 
