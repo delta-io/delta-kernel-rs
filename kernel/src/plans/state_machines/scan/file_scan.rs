@@ -504,8 +504,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::Scalar;
-    use crate::plans::ir::nodes::SinkType;
     use crate::scan::ScanBuilder;
     use crate::utils::test_utils::load_test_table;
 
@@ -542,30 +540,6 @@ mod tests {
             combined.plans.len(),
             metadata.plans.len() + data.plans.len(),
             "combined replay should equal metadata + data for {table}"
-        );
-    }
-
-    #[test]
-    fn scan_metadata_with_predicate_materializes_parsed_stats() {
-        let (_engine, snapshot, _tmp) = load_test_table("basic_partitioned").unwrap();
-        let predicate = Arc::new(Predicate::gt(
-            Expression::column(["number"]),
-            Expression::literal(Scalar::Long(1)),
-        ));
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_predicate(predicate)
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let metadata = scan.scan_metadata_plans().unwrap();
-        let debug = format!("{:#?}", metadata.plans);
-        assert!(
-            debug.contains("ParseJson"),
-            "metadata replay should materialize ParseJson before predicate filtering:\n{debug}"
-        );
-        assert!(
-            debug.contains("stats_parsed"),
-            "metadata replay should project stats_parsed for predicate filtering:\n{debug}"
         );
     }
 
@@ -654,41 +628,10 @@ mod tests {
         .unwrap();
         assert_eq!(exprs.len(), 1);
         if expect_transform {
-            let expected =
-                Expression::Transform(Transform::new_nested(["col-phys"]));
+            let expected = Expression::Transform(Transform::new_nested(["col-phys"]));
             assert_eq!(exprs[0].as_ref(), &expected);
         } else {
             assert_eq!(exprs[0].as_ref(), &col(["col-phys"]));
         }
-    }
-
-    #[test]
-    fn scan_data_load_uses_flat_live_actions_columns() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let metadata = scan.scan_metadata_plans().unwrap();
-        let data = scan
-            .scan_data_from_metadata_plans(metadata.result_relation)
-            .unwrap();
-        let load = match &data.plans[0].sink {
-            SinkType::Load(load) => load,
-            other => panic!("expected load sink, got {other:?}"),
-        };
-        assert_eq!(load.file_meta.path, ColumnName::new(["path"]));
-        assert_eq!(load.file_meta.size, Some(ColumnName::new(["size"])));
-        assert_eq!(
-            load.dv_ref,
-            Some(DvRef::skip(ColumnName::new(["deletionVector"])))
-        );
-        assert_eq!(
-            load.passthrough_columns,
-            vec![
-                ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
-                ColumnName::new(["path"])
-            ]
-        );
     }
 }

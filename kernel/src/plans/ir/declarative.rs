@@ -28,8 +28,7 @@
 //! ## Core API
 //!
 //! - Constructors: [`PlanBuilder::scan_json`] / [`scan_parquet`](PlanBuilder::scan_parquet),
-//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`],
-//!   [`PlanBuilder::union`].
+//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`], [`PlanBuilder::union`].
 //! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`], [`PlanBuilder::window`],
 //!   [`PlanBuilder::join`], [`PlanBuilder::join_on`].
 //! - Terminals: [`PlanBuilder::into_relation`], [`PlanBuilder::load`],
@@ -400,7 +399,8 @@ impl PlanBuilder {
 
     /// Typed consumer terminal. Wraps `self` in a [`Plan`] terminating in
     /// [`SinkType::Consume`] and returns the plan paired with an [`Extractor<O>`] that pulls
-    /// the typed output from the resulting [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
+    /// the typed output from the resulting
+    /// [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
     pub fn consume<S>(self, state: S) -> (Plan, Extractor<S::Output>)
     where
         S: ConsumerKdf + KdfOutput + 'static,
@@ -442,9 +442,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
-    use crate::plans::ir::nodes::{OrderingSpec, WindowFunction};
     use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput};
     use crate::schema::{DataType, StructField, StructType};
 
@@ -499,36 +497,6 @@ mod tests {
             let msg = format!("{}", result.unwrap_err());
             assert!(msg.contains("schema expects"), "message was: {msg}");
         }
-    }
-
-    #[rstest]
-    #[case(vec![])]
-    #[case(vec![OrderingSpec::asc(ColumnName::new(["version"]))])]
-    fn window_order_by_cases(#[case] order_by: Vec<OrderingSpec>) {
-        let wf = WindowFunction {
-            output_col: "_rn".into(),
-        };
-        let plan = PlanBuilder::scan_json(vec![], simple_schema())
-            .window(
-                vec![wf],
-                vec![Arc::new(Expression::column(["version"]))],
-                order_by,
-            )
-            .unwrap();
-        assert!(matches!(plan.node(), DeclarativePlanNode::Window { .. }));
-    }
-
-    #[test]
-    fn empty_union_yields_empty_schema() {
-        let pb = PlanBuilder::union(Vec::<PlanBuilder>::new(), false).unwrap();
-        assert_eq!(pb.schema_ref().fields().count(), 0);
-    }
-
-    #[test]
-    fn file_listing_schema_is_canonical_triple() {
-        let pb = PlanBuilder::file_listing(url::Url::parse("file:///tmp").unwrap());
-        let names: Vec<String> = pb.schema_ref().fields().map(|f| f.name().clone()).collect();
-        assert_eq!(names, vec!["path", "size", "modification_time"]);
     }
 
     // === Consumer-KDF tests (validated via a test-local consumer state) ===

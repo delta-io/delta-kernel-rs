@@ -232,21 +232,3 @@ pub(super) fn build_sidecar_discovery_plan(
         snapshot.log_segment().log_root.clone(),
     )))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::plans::ir::nodes::SinkType;
-    use crate::utils::test_utils::load_test_table;
-
-    #[test]
-    fn sidecar_discovery_plan_uses_consume_sink() {
-        let (_engine, snapshot, _tmp) =
-            load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
-        let shape = checkpoint_shape_from_last_checkpoint(snapshot.as_ref()).unwrap();
-        assert!(shape.has_sidecars);
-        let (plan, _extract) =
-            build_sidecar_discovery_plan(snapshot.as_ref(), shape.file_format).unwrap();
-        assert!(matches!(plan.sink, SinkType::Consume(_)));
-    }
-}

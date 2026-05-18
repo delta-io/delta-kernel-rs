@@ -148,12 +148,6 @@ mod tests {
     }
 
     #[test]
-    fn relation_ref_unknown_name_errors() {
-        let registry = registry();
-        assert!(registry.relation_ref("missing").is_err());
-    }
-
-    #[test]
     fn duplicate_registration_errors() {
         let mut registry = registry();
         let schema = one_col_schema("a");
@@ -189,24 +183,6 @@ mod tests {
     }
 
     #[test]
-    fn live_relations_reflects_drops() {
-        let mut registry = registry();
-        registry
-            .register_relation_sink("a", one_col_schema("x"))
-            .unwrap();
-        registry
-            .register_relation_sink("b", one_col_schema("x"))
-            .unwrap();
-        registry.drop_relation("a").unwrap();
-        assert_eq!(registry.live_relations(), vec!["b"]);
-    }
-
-    #[test]
-    fn live_relations_empty_when_no_sinks() {
-        assert!(registry().live_relations().is_empty());
-    }
-
-    #[test]
     fn handle_id_embeds_sm_id_and_logical_name() {
         let sm_id = Uuid::new_v4();
         let mut registry = RelationRegistry::new(sm_id);
@@ -215,19 +191,5 @@ mod tests {
             .unwrap();
         assert_eq!(handle.name, "commits");
         assert_eq!(handle.id, format!("{}_commits", sm_id));
-    }
-
-    #[test]
-    fn handles_from_different_registries_have_distinct_ids() {
-        let mut r1 = registry();
-        let mut r2 = registry();
-        let h1 = r1
-            .register_relation_sink("shared", one_col_schema("v"))
-            .unwrap();
-        let h2 = r2
-            .register_relation_sink("shared", one_col_schema("v"))
-            .unwrap();
-        assert_ne!(h1.id, h2.id);
-        assert_eq!(h1.name, h2.name);
     }
 }

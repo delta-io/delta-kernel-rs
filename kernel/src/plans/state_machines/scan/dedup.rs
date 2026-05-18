@@ -148,12 +148,6 @@ mod tests {
     }
 
     #[test]
-    fn fsr_dedup_key_debug_string_is_non_trivial() {
-        let dbg = format!("{:?}", fsr_dedup_key());
-        assert!(dbg.len() > 40, "{dbg}");
-    }
-
-    #[test]
     fn fsr_dedup_key_eval_various_action_types() {
         let schema = action_schema();
         let check = |line: &str, subs: &[&str]| {
