@@ -13,15 +13,20 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::checkpoint_shape::{checkpoint_manifest_scan_schema, CheckpointShape};
+use super::checkpoint_shape::{
+    checkpoint_manifest_scan_schema, checkpoint_manifest_scan_schema_with_stats, CheckpointShape,
+};
 use super::dedup::{fsr_dedup_key, fsr_row_has_identity_predicate, FSR_JOIN_KEY_COL};
 use super::retention::retention_filter;
-use super::schemas::{action_schema, augmented_action_schema, path_size_schema};
+use super::schemas::{
+    action_schema, augmented_action_schema_with_stats, fsr_action_schema, path_size_schema,
+};
 use crate::action_reconciliation::{
     calculate_transaction_expiration_timestamp, deleted_file_retention_timestamp_with_time,
 };
-use crate::actions::SIDECAR_NAME;
+use crate::actions::{Add, ADD_NAME, SIDECAR_NAME};
 use crate::expressions::{col, ColumnName, Expression, Scalar};
+use crate::schema::{SchemaRef, ToSchema};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{
@@ -81,6 +86,12 @@ pub fn build_fsr_plans(
     let log_root = snapshot.log_segment().log_root.clone();
     let segment = snapshot.log_segment();
 
+    let stats_schema = shape.requested_stats_schema.clone();
+    let stats_ref = stats_schema.as_ref();
+    let has_native_top_stats =
+        shape.has_stats_parsed && stats_schema.is_some() && shape.manifest_relation.is_none();
+    let has_native_sidecar_stats = shape.has_stats_parsed && stats_schema.is_some();
+
     let commits = commit_cover_rows(segment)?;
     let checkpoint_files: Vec<FileMeta> = segment
         .listed
@@ -137,17 +148,19 @@ pub fn build_fsr_plans(
     //   4. Project away internal columns (`version`, row_number); persisted relation
     //      matches `augmented_action_schema(false)` for the union in the results plan.
     const COMMIT_DEDUP_RN_COL: &str = "__kernel_fsr_commit_dedup_rn";
+    // The first project augments `add` with `stats_parsed` via `parse_json(add.stats)` when
+    // stats are requested (commits are always JSON, never native parsed); the post-window
+    // project rebinds the existing augmented columns by name.
     let commit_dedup_plan = registry
         .relation_ref(FSR_COMMIT_RAW)?
         .filter(Arc::new(fsr_row_has_identity_predicate().into()))
         .project(
-            action_schema()
-                .fields()
-                .map(|f| col(f.name().as_str()).into())
+            fsr_action_projection(stats_ref, /*source_has_native_stats_parsed=*/ false)
+                .into_iter()
                 .chain(std::iter::once(Arc::new(fsr_dedup_key())))
                 .chain(std::iter::once(col("version").into()))
                 .collect(),
-            augmented_action_schema(true)?,
+            augmented_action_schema_with_stats(true, stats_ref)?,
         )
         .window(
             vec![WindowFunction {
@@ -163,12 +176,12 @@ pub fn build_fsr_plans(
                 .into(),
         ))
         .project(
-            action_schema()
+            fsr_action_schema(stats_ref)
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
                 .chain(std::iter::once(col(FSR_JOIN_KEY_COL).into()))
                 .collect(),
-            augmented_action_schema(false)?,
+            augmented_action_schema_with_stats(false, stats_ref)?,
         )
         .into_relation(FSR_COMMIT_DEDUP, registry)?;
     plans.push(commit_dedup_plan);
@@ -176,21 +189,24 @@ pub fn build_fsr_plans(
     // === checkpoint_top (optional): bare scan of top-level checkpoint parts ===
     // When the resolver already published the V2 manifest as `FSR_CHECKPOINT_TOP` (see
     // [`super::checkpoint_shape::resolve_checkpoint_shape`]), reuse that handle instead of
-    // registering and scanning a second time.
+    // registering and scanning a second time. Otherwise, when `has_stats_parsed` is `true`
+    // and stats were requested, scan with the augmented schema so `add.stats_parsed` is read
+    // natively from the parquet footer.
     let checkpoint_top = if let Some(manifest_handle) = shape.manifest_relation.as_ref() {
         Some(manifest_handle.clone())
     } else if checkpoint_files.is_empty() {
         None
     } else {
+        let scan_schema = if has_native_top_stats {
+            checkpoint_manifest_scan_schema_with_stats(shape.has_sidecars, stats_ref)
+        } else {
+            checkpoint_manifest_scan_schema(shape.has_sidecars)
+        };
         let checkpoint_scan = match shape.file_format {
-            FileFormat::Parquet => PlanBuilder::scan_parquet(
-                checkpoint_files.clone(),
-                checkpoint_manifest_scan_schema(shape.has_sidecars),
-            ),
-            FileFormat::Json => PlanBuilder::scan_json(
-                checkpoint_files.clone(),
-                checkpoint_manifest_scan_schema(shape.has_sidecars),
-            ),
+            FileFormat::Parquet => {
+                PlanBuilder::scan_parquet(checkpoint_files.clone(), scan_schema)
+            }
+            FileFormat::Json => PlanBuilder::scan_json(checkpoint_files.clone(), scan_schema),
         };
         let checkpoint_top_plan = checkpoint_scan.into_relation(FSR_CHECKPOINT_TOP, registry)?;
         let checkpoint_top = relation_output_handle(&checkpoint_top_plan)?;
@@ -224,9 +240,16 @@ pub fn build_fsr_plans(
                 ],
                 path_size_schema(false),
             );
+        // Sidecars are always parquet; when `has_stats_parsed` is `true`, declare the
+        // augmented load schema so the parquet reader pulls `add.stats_parsed` natively.
+        let sidecar_load_schema = if has_native_sidecar_stats {
+            fsr_action_schema(stats_ref)
+        } else {
+            action_schema()
+        };
         let sidecar_plan = sidecar_scan.load(
             FSR_SIDECAR_ACTIONS,
-            action_schema(),
+            sidecar_load_schema,
             FileType::Parquet,
             Some(sidecar_base),
             vec![],
@@ -247,6 +270,9 @@ pub fn build_fsr_plans(
         checkpoint_top.as_ref(),
         min_file_ts,
         txn_expiry,
+        stats_ref,
+        has_native_top_stats,
+        has_native_sidecar_stats,
     )?;
     // The terminal plan is built by `build_results_plan` with an explicit
     // `FSR_RESULTS` Relation sink exposing `action_schema`. Both the
@@ -382,9 +408,14 @@ fn build_results_plan(
     checkpoint_top_handle: Option<&RelationHandle>,
     min_file_retention_timestamp: i64,
     txn_expiration_cutoff: Option<i64>,
+    stats_parsed_schema: Option<&SchemaRef>,
+    top_has_native_stats: bool,
+    sidecar_has_native_stats: bool,
 ) -> Result<Plan, DeltaError> {
+    let result_schema = fsr_action_schema(stats_parsed_schema);
+
     // No checkpoint parts: there is no checkpoint side to anti-join. The full snapshot state is
-    // entirely determined by commit winners.
+    // entirely determined by commit winners (which already carry `add.stats_parsed`).
     let Some(_checkpoint_top_handle) = checkpoint_top_handle else {
         let chain = registry
             .relation_ref(FSR_COMMIT_DEDUP)?
@@ -392,41 +423,43 @@ fn build_results_plan(
                 retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
             ))
             .project(
-                action_schema()
+                result_schema
                     .fields()
                     .map(|f| col(f.name().as_str()).into())
                     .collect(),
-                action_schema(),
+                result_schema.clone(),
             );
         return chain.into_relation(FSR_RESULTS, registry);
     };
 
     let dedup_expr = Arc::new(fsr_dedup_key());
-    let augmented_schema = augmented_action_schema(false)?;
+    let augmented_schema = augmented_action_schema_with_stats(false, stats_parsed_schema)?;
 
-    // Top-level checkpoint rows are preloaded once into `FSR_CHECKPOINT_TOP`; project to canonical
-    // action columns so the schema aligns with sidecar/action relations.
+    // Project top-level checkpoint and sidecar streams to the canonical FSR action schema. Use
+    // native `col(["add", "stats_parsed"])` when the leaf parquet exposes it; otherwise
+    // `parse_json(add.stats, stats_parsed_schema)`. The two branches must end up at the same
+    // schema so the union is well-formed.
     let top_scan = registry.relation_ref(FSR_CHECKPOINT_TOP)?.project(
-        action_schema()
-            .fields()
-            .map(|f| col(f.name().as_str()).into())
-            .collect(),
-        action_schema(),
+        fsr_action_projection(stats_parsed_schema, top_has_native_stats),
+        result_schema.clone(),
     );
 
     let checkpoint_full = match sidecar_handle {
-        Some(_handle) => PlanBuilder::union(
-            vec![top_scan, registry.relation_ref(FSR_SIDECAR_ACTIONS)?],
-            false,
-        )
-        .map_err(|e| e.into_delta_default())?,
+        Some(_handle) => {
+            let sidecar_aligned = registry.relation_ref(FSR_SIDECAR_ACTIONS)?.project(
+                fsr_action_projection(stats_parsed_schema, sidecar_has_native_stats),
+                result_schema.clone(),
+            );
+            PlanBuilder::union(vec![top_scan, sidecar_aligned], false)
+                .map_err(|e| e.into_delta_default())?
+        }
         None => top_scan,
     };
 
     let checkpoint_keyed = checkpoint_full
         .filter(Arc::new(fsr_row_has_identity_predicate().into()))
         .project(
-            action_schema()
+            result_schema
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
                 .chain(std::iter::once(Arc::clone(&dedup_expr)))
@@ -460,11 +493,46 @@ fn build_results_plan(
             retention_filter(min_file_retention_timestamp, txn_expiration_cutoff).into(),
         ))
         .project(
-            action_schema()
+            result_schema
                 .fields()
                 .map(|f| col(f.name().as_str()).into())
                 .collect(),
-            action_schema(),
+            result_schema.clone(),
         )
         .into_relation(FSR_RESULTS, registry)
+}
+
+/// Project an upstream FSR row (with `action_schema` shape) to the canonical
+/// `fsr_action_schema` shape. When `stats_parsed_schema` is `Some` the `add` slot is rebuilt
+/// to carry an extra `stats_parsed` sub-field, sourced from `col(["add", "stats_parsed"])`
+/// when `source_has_native_stats_parsed` is `true`, otherwise from
+/// `parse_json(col(["add", "stats"]), stats_parsed_schema)`. Non-`add` slots are bound by
+/// name (`col(["add"])`, `col(["remove"])`, ...).
+fn fsr_action_projection(
+    stats_parsed_schema: Option<&SchemaRef>,
+    source_has_native_stats_parsed: bool,
+) -> Vec<Arc<Expression>> {
+    action_schema()
+        .fields()
+        .map(|f| -> Arc<Expression> {
+            if f.name() == ADD_NAME && stats_parsed_schema.is_some() {
+                let mut add_exprs: Vec<Arc<Expression>> = Add::to_schema()
+                    .fields()
+                    .map(|af| col([ADD_NAME, af.name().as_str()]).into())
+                    .collect();
+                let stats_expr = if source_has_native_stats_parsed {
+                    col([ADD_NAME, "stats_parsed"])
+                } else {
+                    Expression::parse_json(
+                        col([ADD_NAME, "stats"]),
+                        stats_parsed_schema.unwrap().clone(),
+                    )
+                };
+                add_exprs.push(stats_expr.into());
+                Expression::struct_from(add_exprs).into()
+            } else {
+                col([f.name().as_str()]).into()
+            }
+        })
+        .collect()
 }

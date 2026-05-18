@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use super::plans::FSR_CHECKPOINT_TOP;
-use super::schemas::action_schema;
+use super::schemas::{action_schema, fsr_action_schema};
 use crate::actions::{
     Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -145,7 +145,19 @@ fn sidecar_only_schema() -> SchemaRef {
 }
 
 pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
-    let mut fields: Vec<StructField> = action_schema().fields().cloned().collect();
+    checkpoint_manifest_scan_schema_with_stats(include_sidecar, None)
+}
+
+/// Like [`checkpoint_manifest_scan_schema`] but optionally augments `add` with a typed
+/// `stats_parsed` sub-field. Used when [`CheckpointShape::has_stats_parsed`] is `true` so the
+/// leaf parquet's native `add.stats_parsed` column is read directly into the relation rather
+/// than re-parsed from JSON downstream.
+pub(super) fn checkpoint_manifest_scan_schema_with_stats(
+    include_sidecar: bool,
+    stats_parsed_schema: Option<&SchemaRef>,
+) -> SchemaRef {
+    let base = fsr_action_schema(stats_parsed_schema);
+    let mut fields: Vec<StructField> = base.fields().cloned().collect();
     if include_sidecar {
         fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
     }

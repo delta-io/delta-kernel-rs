@@ -115,12 +115,31 @@ pub(super) fn action_schema_with_augmented_add(
 /// `build_commit_dedup_plan`'s row_number window (`ORDER BY version DESC`) and is dropped
 /// before the relation is persisted, so its presence in the schema is plan-internal.
 pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
+    augmented_action_schema_with_stats(with_version, None)
+}
+
+/// Like [`augmented_action_schema`] but with the `add` slot replaced by an augmented struct
+/// carrying `add.stats_parsed` when `stats_parsed_schema` is `Some`. Used by FSR commit_dedup
+/// and the FSR results union sources when `with_stats` is requested.
+pub(super) fn augmented_action_schema_with_stats(
+    with_version: bool,
+    stats_parsed_schema: Option<&SchemaRef>,
+) -> Result<SchemaRef, DeltaError> {
     let join_key_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, true)));
-    let mut b = action_schema()
+    let mut b = fsr_action_schema(stats_parsed_schema)
         .build_on()
         .with_nullable(FSR_JOIN_KEY_COL, join_key_type);
     if with_version {
         b = b.with_not_null("version", DataType::LONG);
     }
     b.build().map_err(|e| e.into_delta_default())
+}
+
+/// FSR-side action schema: [`action_schema`] when `stats_parsed_schema` is `None`, or
+/// [`action_schema_with_augmented_add(stats, None)`] when stats are requested.
+pub(super) fn fsr_action_schema(stats_parsed_schema: Option<&SchemaRef>) -> SchemaRef {
+    match stats_parsed_schema {
+        None => action_schema(),
+        Some(_) => action_schema_with_augmented_add(stats_parsed_schema, None),
+    }
 }
