@@ -6,16 +6,15 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::sync::Arc;
 
 use common::{
     assert_batch_column_data_equal, concat_or_clone, kernel_literal_batch, run_to_batches,
 };
-use delta_kernel::arrow::array::{AsArray, BooleanArray, Int64Array, RecordBatch};
+use datafusion_common::assert_batches_sorted_eq;
+use delta_kernel::arrow::array::{BooleanArray, Int64Array, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::Int64Type;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::expressions::{
@@ -242,38 +241,6 @@ async fn parity_window_row_number_matches_ordered_partition_reference() {
     assert_batches_equal(&expected, &got);
 }
 
-fn inner_join_sorted_tuples(
-    build: &[(i64, i64)],
-    probe: &[(i64, i64)],
-) -> Vec<(i64, i64, i64, i64)> {
-    let mut m: HashMap<i64, Vec<i64>> = HashMap::new();
-    for &(bk, bv) in build {
-        m.entry(bk).or_default().push(bv);
-    }
-    let mut out = Vec::new();
-    for &(pk, pv) in probe {
-        if let Some(bvs) = m.get(&pk) {
-            for &bv in bvs {
-                out.push((pk, bv, pk, pv));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-fn batch_to_inner_join_tuples(batch: &RecordBatch) -> Vec<(i64, i64, i64, i64)> {
-    let bk = batch.column(0).as_primitive::<Int64Type>();
-    let bv = batch.column(1).as_primitive::<Int64Type>();
-    let pk = batch.column(2).as_primitive::<Int64Type>();
-    let pv = batch.column(3).as_primitive::<Int64Type>();
-    let mut v: Vec<_> = (0..batch.num_rows())
-        .map(|i| (bk.value(i), bv.value(i), pk.value(i), pv.value(i)))
-        .collect();
-    v.sort();
-    v
-}
-
 #[tokio::test]
 async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
     let build_schema = Arc::new(
@@ -290,7 +257,6 @@ async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
         ])
         .unwrap(),
     );
-
     let build_rows = vec![
         vec![Scalar::Long(10), Scalar::Long(100)],
         vec![Scalar::Long(10), Scalar::Long(101)],
@@ -300,16 +266,6 @@ async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
         vec![Scalar::Long(10), Scalar::Long(1000)],
         vec![Scalar::Long(99), Scalar::Long(9999)],
     ];
-
-    let build_tuples: Vec<(i64, i64)> = build_rows
-        .iter()
-        .map(|r| (scalar_long(&r[0]), scalar_long(&r[1])))
-        .collect();
-    let probe_tuples: Vec<(i64, i64)> = probe_rows
-        .iter()
-        .map(|r| (scalar_long(&r[0]), scalar_long(&r[1])))
-        .collect();
-    let expected = inner_join_sorted_tuples(&build_tuples, &probe_tuples);
 
     let root = PlanBuilder::values(build_schema, build_rows)
         .unwrap()
@@ -321,11 +277,18 @@ async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
         )
         .unwrap();
     let got = run_to_batches(root).await.unwrap();
-    let merged = concat_or_clone(&got);
-    assert_eq!(
-        batch_to_inner_join_tuples(&merged),
-        expected,
-        "inner join multiset parity"
+    // Two probe rows match build_key 10; the duplicate bv=100 and bv=101 build rows must both
+    // surface (multiset preserved). The probe row with pk=99 has no match and must be dropped.
+    assert_batches_sorted_eq!(
+        &[
+            "+----+-----+----+------+",
+            "| bk | bv  | pk | pv   |",
+            "+----+-----+----+------+",
+            "| 10 | 100 | 10 | 1000 |",
+            "| 10 | 101 | 10 | 1000 |",
+            "+----+-----+----+------+",
+        ],
+        &got
     );
 }
 
@@ -341,31 +304,34 @@ async fn parity_left_anti_join_matches_reference_probe_order() {
         .unwrap(),
     );
 
-    let build = PlanBuilder::values(build_schema.clone(), vec![vec![Scalar::Long(1)]]).unwrap();
-    let probe_rows = vec![
-        vec![Scalar::Long(2), Scalar::Long(20)],
-        vec![Scalar::Long(1), Scalar::Long(10)],
-    ];
-    let probe = PlanBuilder::values(probe_schema.clone(), probe_rows.clone()).unwrap();
-
-    let root = build
+    let root = PlanBuilder::values(build_schema, vec![vec![Scalar::Long(1)]])
+        .unwrap()
         .join_on(
-            probe,
+            PlanBuilder::values(
+                probe_schema,
+                vec![
+                    vec![Scalar::Long(2), Scalar::Long(20)],
+                    vec![Scalar::Long(1), Scalar::Long(10)],
+                ],
+            )
+            .unwrap(),
             vec![Arc::new(Expression::column(["bk"]))],
             vec![Arc::new(Expression::column(["pk"]))],
             JoinType::LeftAnti,
         )
         .unwrap();
     let got = run_to_batches(root).await.unwrap();
-    let batch = concat_or_clone(&got);
-
-    let build_keys: HashSet<i64> = [1i64].into_iter().collect();
-    let expected_probe_rows: Vec<_> = probe_rows
-        .into_iter()
-        .filter(|r| !build_keys.contains(&scalar_long(&r[0])))
-        .collect();
-    let expected_batch = kernel_literal_batch(probe_schema, &expected_probe_rows);
-    assert_batches_equal(&expected_batch, std::slice::from_ref(&batch));
+    // build_key {1} drops the pk=1 probe row; pk=2 has no matching build_key -> kept.
+    assert_batches_sorted_eq!(
+        &[
+            "+----+----+",
+            "| pk | pv |",
+            "+----+----+",
+            "| 2  | 20 |",
+            "+----+----+",
+        ],
+        &got
+    );
 }
 
 #[tokio::test]

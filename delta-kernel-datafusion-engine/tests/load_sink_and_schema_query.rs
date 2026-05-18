@@ -138,47 +138,6 @@ async fn load_sink_broadcasts_passthrough_columns() {
     );
 }
 
-#[tokio::test]
-async fn load_sink_without_dv_reads_full_parquet_row_group() {
-    let base_url = dv_small_fixture_base_url();
-    let path_str =
-        "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string();
-
-    let upstream_schema =
-        Arc::new(StructType::try_new([StructField::not_null("path", DataType::STRING)]).unwrap());
-
-    let file_schema =
-        Arc::new(StructType::try_new([StructField::not_null("value", DataType::INTEGER)]).unwrap());
-
-    let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(path_str)]]).unwrap();
-
-    let mut registry = RelationRegistry::new(Uuid::new_v4());
-    let producer_plan = lit
-        .load(
-            "dv_loaded",
-            Arc::clone(&file_schema),
-            FileType::Parquet,
-            Some(base_url),
-            Vec::new(),
-            scan_file_path_only(),
-            None,
-            &mut registry,
-        )
-        .expect("load sink");
-    let SinkType::Load(load_sink) = &producer_plan.sink else {
-        unreachable!("PlanBuilder::load always produces SinkType::Load");
-    };
-    let handle = load_sink.output_relation.clone();
-
-    let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&[producer_plan]).await.unwrap();
-    assert_eq!(relation_row_count(&executor, &handle).await, 10);
-
-    let batches = executor.collect_relation(&handle).await.unwrap();
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 10);
-}
-
 fn dv_example_scalar() -> Scalar {
     let fields: Vec<_> = DeletionVectorDescriptor::to_schema()
         .fields()
@@ -199,44 +158,46 @@ fn dv_example_scalar() -> Scalar {
     )
 }
 
+/// Parquet-load over `table-with-dv-small`, optionally applying the bundled DV. With no
+/// `dv_ref` the underlying parquet's 10 rows pass through; with a `dv_ref` over a
+/// descriptor column wired into the upstream literal, the file's persisted deletion vector
+/// drops the 2 marked rows -> 8 rows remain.
+#[rstest::rstest]
+#[case::without_dv(None, 10)]
+#[case::with_dv(Some(()), 8)]
 #[tokio::test]
-async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
+async fn load_sink_dv_masking(#[case] with_dv: Option<()>, #[case] expected_rows: usize) {
     let base_url = dv_small_fixture_base_url();
     let path_str =
         "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string();
-
     let dv_cn = col("dv");
 
-    let upstream_schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null(
-                dv_cn.to_string(),
-                DataType::Struct(Box::new(DeletionVectorDescriptor::to_schema())),
-            ),
-        ])
-        .unwrap(),
-    );
-
+    let mut upstream_fields = vec![StructField::not_null("path", DataType::STRING)];
+    let mut row = vec![Scalar::String(path_str)];
+    let mut dv_ref = None;
+    if with_dv.is_some() {
+        upstream_fields.push(StructField::not_null(
+            dv_cn.to_string(),
+            DataType::Struct(Box::new(DeletionVectorDescriptor::to_schema())),
+        ));
+        row.push(dv_example_scalar());
+        dv_ref = Some(DvRef::skip(dv_cn.clone()));
+    }
+    let upstream_schema = Arc::new(StructType::try_new(upstream_fields).unwrap());
     let file_schema =
         Arc::new(StructType::try_new([StructField::not_null("value", DataType::INTEGER)]).unwrap());
 
-    let lit = PlanBuilder::values(
-        upstream_schema,
-        vec![vec![Scalar::String(path_str), dv_example_scalar()]],
-    )
-    .unwrap();
-
+    let lit = PlanBuilder::values(upstream_schema, vec![row]).unwrap();
     let mut registry = RelationRegistry::new(Uuid::new_v4());
     let producer_plan = lit
         .load(
-            "dv_masked",
-            Arc::clone(&file_schema),
+            "dv_loaded",
+            file_schema,
             FileType::Parquet,
             Some(base_url),
             Vec::new(),
             scan_file_path_only(),
-            Some(DvRef::skip(dv_cn)),
+            dv_ref,
             &mut registry,
         )
         .expect("load sink");
@@ -247,11 +208,7 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor.execute_plans(&[producer_plan]).await.unwrap();
-    assert_eq!(relation_row_count(&executor, &handle).await, 8);
-
-    let batches = executor.collect_relation(&handle).await.unwrap();
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 8);
+    assert_eq!(relation_row_count(&executor, &handle).await, expected_rows);
 }
 
 #[tokio::test]
