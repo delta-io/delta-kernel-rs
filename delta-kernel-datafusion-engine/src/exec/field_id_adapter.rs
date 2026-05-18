@@ -56,7 +56,7 @@ use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, LargeListArray, ListArray, MapArray, RecordBatch, StructArray,
 };
-use delta_kernel::arrow::compute::{can_cast_types, cast_with_options, CastOptions};
+use delta_kernel::arrow::compute::{cast_with_options, CastOptions};
 use delta_kernel::arrow::datatypes::{
     DataType, Field, FieldRef, Schema, SchemaRef,
 };
@@ -165,70 +165,15 @@ impl FieldIdPhysicalExprAdapter {
             return Ok(Arc::new(resolved_column));
         }
 
-        // Validate the recursive shape matches by field-id at every level (or name fallback).
-        // If matching fails, we surface a planning error instead of silently emitting wrong
-        // data. The reshape will then be exercised by `evaluate` later.
-        validate_reshape_compatible(physical_field, logical_field)?;
-
+        // Defer structural validation to evaluate-time `reshape_array`: it walks the same
+        // tree by field-id/name/physicalName and surfaces precise per-leaf errors (missing
+        // non-nullable child, uncastable leaf, etc.) where they actually fire. A separate
+        // pre-pass would just replicate the walk and double the maintenance surface.
         Ok(Arc::new(FieldIdReshapeColumnExpr {
             inner: Arc::new(resolved_column),
             input_field: Arc::new(physical_field.clone()),
             target_field: Arc::new(logical_field.clone()),
         }))
-    }
-}
-
-/// Recursively validates that a `physical_field` can be reshaped into `target_field` by
-/// field-id-aware (with name fallback) child matching. Returns a planning error if any
-/// nested level lacks a viable matching strategy.
-fn validate_reshape_compatible(
-    physical_field: &Field,
-    target_field: &Field,
-) -> DfResult<()> {
-    match (physical_field.data_type(), target_field.data_type()) {
-        (DataType::Struct(p), DataType::Struct(t)) => {
-            // Every non-nullable target child must resolve to a physical child.
-            for t_child in t.iter() {
-                match find_physical_match(t_child.as_ref(), p) {
-                    Some(idx) => {
-                        let p_child = &p[idx];
-                        validate_reshape_compatible(p_child.as_ref(), t_child.as_ref())?;
-                    }
-                    None if !t_child.is_nullable() => {
-                        return Err(DataFusionError::Plan(format!(
-                            "FieldIdPhysicalExprAdapter: target struct field `{}` is NOT NULL \
-                             but has no physical counterpart by field-id or name in source struct",
-                            t_child.name()
-                        )));
-                    }
-                    None => {}
-                }
-            }
-            Ok(())
-        }
-        (DataType::List(p), DataType::List(t))
-        | (DataType::LargeList(p), DataType::LargeList(t)) => {
-            validate_reshape_compatible(p.as_ref(), t.as_ref())
-        }
-        (DataType::Map(p, _), DataType::Map(t, _)) => {
-            validate_reshape_compatible(p.as_ref(), t.as_ref())
-        }
-        (p, t) if p == t => Ok(()),
-        // Delta's type-widening table feature lets a file's physical leaf type be a *narrower*
-        // version of the logical target type (e.g. parquet INT16 against logical INT32 after a
-        // BYTE -> INT widening). The kernel only declares the logical schema after validating
-        // that the widening is Delta-spec-legal, so the runtime job here is just to cast each
-        // leaf to the target type at evaluate time. We gate on `can_cast_types` so a true
-        // structural mismatch still surfaces as a planning error instead of crashing at
-        // evaluate.
-        (p, t) if can_cast_types(p, t) => Ok(()),
-        (p, t) => Err(DataFusionError::Plan(format!(
-            "FieldIdPhysicalExprAdapter: leaf type mismatch between physical `{}` and target \
-             `{}` for field `{}`; arrow refuses to cast between these types",
-            p,
-            t,
-            target_field.name()
-        ))),
     }
 }
 
@@ -503,12 +448,12 @@ fn reshape_array(array: &ArrayRef, target_field: &Field) -> DfResult<ArrayRef> {
                 Ok(Arc::clone(array))
             } else {
                 // Delta type-widening path: physical leaf is a narrower type than the logical
-                // target (validated in `validate_reshape_compatible` via `can_cast_types`).
-                // Arrow's cast is the right primitive here -- it handles all numeric widenings
+                // target (e.g. parquet INT16 against logical INT32 after a BYTE -> INT
+                // widening). Arrow's cast handles all Delta-spec-legal numeric widenings
                 // (BYTE -> SHORT -> INT -> LONG, FLOAT -> DOUBLE), decimal precision changes,
-                // and other Delta-spec-legal widenings. Use safe casting so a value that
-                // unexpectedly doesn't fit the target type surfaces as an error rather than
-                // silently overflowing.
+                // and friends. Use safe casting so a value that unexpectedly doesn't fit the
+                // target type surfaces as an error rather than silently overflowing -- and
+                // doubles as the structural-mismatch guard (no pre-validation pass).
                 cast_with_options(
                     array.as_ref(),
                     target_field.data_type(),

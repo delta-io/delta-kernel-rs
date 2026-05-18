@@ -106,41 +106,40 @@ pub(crate) fn utf8_value_at(arr: &ArrayRef, row: usize) -> Result<Option<String>
     }
 }
 
-fn column_pref(sa: &StructArray, snake: &str, camel: &str) -> Result<ArrayRef, DataFusionError> {
-    sa.column_by_name(snake)
-        .or_else(|| sa.column_by_name(camel))
-        .cloned()
-        .ok_or_else(|| {
-            crate::error::internal_error(format!(
-                "deletion vector struct missing `{snake}` / `{camel}` columns"
-            ))
-        })
+/// Look up a child column of a DV struct row by its kernel-emitted name.
+///
+/// Kernel emits DV columns via `DeletionVectorDescriptor::to_schema()` (see
+/// [`crate::plans::state_machines::scan::file_scan`]), which goes through the `ToSchema`
+/// derive macro -- the derive snake→camelCases field identifiers, so the columns are always
+/// `storageType`, `pathOrInlineDv`, `offset`, `sizeInBytes`, `cardinality`.
+fn dv_child(sa: &StructArray, camel: &str) -> Result<ArrayRef, DataFusionError> {
+    sa.column_by_name(camel).cloned().ok_or_else(|| {
+        crate::error::internal_error(format!(
+            "deletion vector struct missing `{camel}` column"
+        ))
+    })
 }
 
 fn dv_descriptor_from_struct_row(
     sa: &StructArray,
     row: usize,
 ) -> Result<DeletionVectorDescriptor, DataFusionError> {
-    let storage_arr = column_pref(sa, "storage_type", "storageType")?;
+    let storage_arr = dv_child(sa, "storageType")?;
     let storage_raw = utf8_value_at(&storage_arr, row)?.ok_or_else(|| {
-        crate::error::internal_error("Load sink dv_ref.storage_type was NULL".to_string())
+        crate::error::internal_error("Load sink dv_ref.storageType was NULL".to_string())
     })?;
     let storage_type = DeletionVectorStorageType::from_str(storage_raw.trim()).map_err(|e| {
-        crate::error::internal_error(format!("invalid DV storage_type `{storage_raw}`: {e}"))
+        crate::error::internal_error(format!("invalid DV storageType `{storage_raw}`: {e}"))
     })?;
 
-    let path_arr = column_pref(sa, "path_or_inline_dv", "pathOrInlineDv")?;
+    let path_arr = dv_child(sa, "pathOrInlineDv")?;
     let path_or_inline_dv = utf8_value_at(&path_arr, row)?.ok_or_else(|| {
-        crate::error::internal_error("Load sink dv_ref.path_or_inline_dv was NULL".to_string())
+        crate::error::internal_error("Load sink dv_ref.pathOrInlineDv was NULL".to_string())
     })?;
 
     let offset = read_optional_i32(sa, row, "offset")?;
-
-    let size_arr = column_pref(sa, "size_in_bytes", "sizeInBytes")?;
-    let size_in_bytes = read_required_i32(&size_arr, row, "size_in_bytes")?;
-
-    let card_arr = column_pref(sa, "cardinality", "cardinality")?;
-    let cardinality = read_required_i64(&card_arr, row, "cardinality")?;
+    let size_in_bytes = read_required_i32(&dv_child(sa, "sizeInBytes")?, row, "sizeInBytes")?;
+    let cardinality = read_required_i64(&dv_child(sa, "cardinality")?, row, "cardinality")?;
 
     Ok(DeletionVectorDescriptor {
         storage_type,
