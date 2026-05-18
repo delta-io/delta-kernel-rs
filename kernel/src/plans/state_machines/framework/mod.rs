@@ -11,7 +11,10 @@
 //!   surfaces to the SM (distinct from [`DeltaError`](crate::plans::errors::DeltaError), which is
 //!   the kernel-to-caller error).
 //! - [`coroutine`] — [`CoroutineSM`](coroutine::driver::CoroutineSM), the async-fn-backed
-//!   `StateMachine` impl + its hand-rolled `Gen`/`Co` generator shim.
+//!   `StateMachine` impl. Wraps `genawaiter2::sync::GenBoxed` to translate the typed
+//!   [`PhaseYield`](coroutine::context::PhaseYield) /
+//!   [`PhaseResume`](coroutine::context::PhaseResume) protocol into the
+//!   [`StateMachine`](state_machine::StateMachine) trait the executor drives.
 
 pub mod coroutine;
 pub mod engine_error;

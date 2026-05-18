@@ -2,8 +2,8 @@
 //!
 //! Supported sinks: [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation)
 //! / [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) (materialize batches
-//! as a [`MemTable`](datafusion::datasource::MemTable) registered in the executor's
-//! [`SessionContext`](datafusion::execution::context::SessionContext) so downstream
+//! as a [`MemTable`](datafusion::datasource::MemTable) inserted into the executor's
+//! own relation registry so downstream
 //! [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves can scan
 //! it), and
 //! [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) (observe

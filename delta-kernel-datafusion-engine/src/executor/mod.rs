@@ -188,8 +188,8 @@ impl DataFusionExecutor {
 
     /// Execute every plan in `plans` in order. Each plan terminates in [`SinkType::Relation`],
     /// [`SinkType::Load`], or [`SinkType::Consume`]; the executor drains the physical plan
-    /// and routes the result into the session catalog (for `Relation` / `Load`) or into the
-    /// active phase's [`PhaseState`] (for `Consume`).
+    /// and routes the result into [`Self::relation_providers`] (for `Relation` / `Load`) or into
+    /// the active phase's [`PhaseState`] (for `Consume`).
     pub async fn execute_plans(&self, plans: &[Plan]) -> Result<(), DeltaError> {
         let state = PhaseState::empty();
         self.run_plans(plans, &state, Uuid::new_v4(), "standalone", "execute")

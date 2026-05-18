@@ -5,8 +5,8 @@
 //! top of that.
 //!
 //! Sinks: [`SinkType::Relation`] / [`SinkType::Load`] (drain + the executor materializes the
-//! result as a [`datafusion::datasource::MemTable`] under
-//! [`crate::executor::DataFusionExecutor::session_ctx`] for downstream
+//! result as a [`datafusion::datasource::MemTable`] inserted into the executor's
+//! `relation_providers` map for downstream
 //! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::Consume`] (drained directly by
 //! the executor through a [`delta_kernel::plans::kdf::ConsumerKdf`] handle).
 //!
