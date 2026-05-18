@@ -63,8 +63,8 @@ use url::Url;
 
 use crate::exec::field_id_adapter::FieldIdPhysicalExprAdapterFactory;
 use crate::exec::load_helpers::{
-    apply_optional_dv, dv_table_root, extract_column_array, optional_i64,
-    optional_selection_vector_for_row, replicate_row, resolve_file_location, utf8_value_at,
+    apply_optional_dv, extract_column_array, optional_i64, optional_selection_vector_for_row,
+    replicate_row, resolve_file_location, utf8_value_at,
 };
 
 /// Default opener batch size. DataFusion's parquet/json openers require a non-`None` batch size
@@ -528,15 +528,13 @@ impl LoadExecStream {
                 path_cn
             ))
         })?;
-        let url = resolve_file_location(&self.sink.base_url, &path_raw)?;
-        let table_root = dv_table_root(self.sink.as_ref(), &url);
+        let url = resolve_file_location(self.sink.as_ref(), &path_raw)?;
 
         let mask = optional_selection_vector_for_row(
             batch,
             self.sink.as_ref(),
             row,
             self.engine.as_ref(),
-            &table_root,
         )?;
         let size = file_size_for_row(batch, self.sink.as_ref(), row, &url)?;
 

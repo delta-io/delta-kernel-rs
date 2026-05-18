@@ -26,40 +26,28 @@ fn kernel_err(e: delta_kernel::Error) -> DataFusionError {
     crate::error::internal_error(e.to_string())
 }
 
-pub(crate) fn dv_table_root(load: &LoadSink, file_url: &Url) -> Url {
-    load.base_url
-        .clone()
-        .unwrap_or_else(|| parent_directory_url(file_url))
+/// Resolve a `LoadSink`'s `base_url`, returning a plan-compilation error if unset. Scan plans
+/// always populate `base_url` with the snapshot's table root; the kernel `LoadSink` API typing
+/// (`Option<Url>`) is the only reason we re-check at runtime.
+fn sink_base_url(sink: &LoadSink) -> Result<&Url, DataFusionError> {
+    sink.base_url.as_ref().ok_or_else(|| {
+        crate::error::plan_compilation(
+            "LoadSink.base_url must be set: scan-emitted plans always populate it with the \
+             snapshot's table root, which is also the deletion-vector resolution root.",
+        )
+    })
 }
 
-fn parent_directory_url(url: &Url) -> Url {
-    let mut out = url.clone();
-    let path = url.path();
-    if let Some(pos) = path.rfind('/') {
-        let prefix = if pos == 0 { "/" } else { &path[..pos] };
-        out.set_path(prefix);
-    }
-    out
-}
-
-pub(crate) fn resolve_file_location(
-    base: &Option<Url>,
-    path_str: &str,
-) -> Result<Url, DataFusionError> {
+/// Resolve a per-row path against `sink.base_url`. The path is `Url::join`-ed onto the base,
+/// matching how the kernel scan plan emits relative paths under `snapshot.table_root()`.
+pub(crate) fn resolve_file_location(sink: &LoadSink, path_str: &str) -> Result<Url, DataFusionError> {
+    let base = sink_base_url(sink)?;
     let path_str = path_str.trim();
-    if let Some(base) = base {
-        base.join(path_str).map_err(|e| {
-            crate::error::plan_compilation(format!(
-                "Load sink could not join base_url `{base}` with path `{path_str}`: {e}"
-            ))
-        })
-    } else {
-        Url::parse(path_str).map_err(|e| {
-            crate::error::plan_compilation(format!(
-                "Load sink expected absolute file URL in path column, got `{path_str}`: {e}"
-            ))
-        })
-    }
+    base.join(path_str).map_err(|e| {
+        crate::error::plan_compilation(format!(
+            "Load sink could not join base_url `{base}` with path `{path_str}`: {e}"
+        ))
+    })
 }
 
 pub(crate) fn extract_column_array(
@@ -205,13 +193,14 @@ fn read_required_i64(arr: &ArrayRef, row: usize, label: &str) -> Result<i64, Dat
 
 /// Read the optional per-row deletion-vector mask. Returns `None` when [`LoadSink::dv_ref`] is
 /// unset or the row's DV column is NULL. Otherwise materializes a row-aligned selection vector
-/// by calling [`selection_vector`] against the kernel engine.
+/// by calling [`selection_vector`] against the kernel engine, resolving the DV file paths
+/// against `sink.base_url` (the snapshot table root) -- the same base used by
+/// [`resolve_file_location`] for data files.
 pub(crate) fn optional_selection_vector_for_row(
     batch: &RecordBatch,
     sink: &LoadSink,
     row: usize,
     engine: &dyn Engine,
-    table_root: &Url,
 ) -> Result<Option<Vec<bool>>, DataFusionError> {
     let Some(ref dv_cn) = sink.dv_ref else {
         return Ok(None);
@@ -228,6 +217,7 @@ pub(crate) fn optional_selection_vector_for_row(
         ))
     })?;
     let descriptor = dv_descriptor_from_struct_row(struct_arr, row)?;
+    let table_root = sink_base_url(sink)?;
     Ok(Some(
         selection_vector(engine, &descriptor, table_root).map_err(kernel_err)?,
     ))
