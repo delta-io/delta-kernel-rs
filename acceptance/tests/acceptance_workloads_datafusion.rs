@@ -8,15 +8,12 @@ use std::sync::Arc;
 
 use acceptance::acceptance_workloads::validation::{validate_read_result, validate_snapshot};
 use acceptance::acceptance_workloads::workload::{
-    execute_and_validate_workload, ReadResult, SnapshotResult,
+    build_snapshot, execute_and_validate_workload, filter_batches_with_predicate, ReadResult,
+    SnapshotResult,
 };
 use acceptance::acceptance_workloads::TestCase;
-use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-use delta_kernel::expressions::Predicate;
-use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
-use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
+use delta_kernel::{DeltaResult, Engine, Error};
+use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec};
 use delta_kernel_benchmarks::predicate_parser::parse_predicate;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 
@@ -67,89 +64,23 @@ fn should_skip_datafusion_spec_type(spec_type: Option<&str>) -> Option<&'static 
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ReadReplayConfig {
-    name: &'static str,
-    split_phases: bool,
-}
-
-const READ_REPLAY_CONFIGS: &[ReadReplayConfig] = &[
-    ReadReplayConfig {
-        name: "combined_scan_sm",
-        split_phases: false,
-    },
-    ReadReplayConfig {
-        name: "split_scan_sm",
-        split_phases: true,
-    },
-];
-
-#[derive(Clone, Copy, Debug)]
-struct SnapshotReplayConfig {
-    name: &'static str,
-    use_full_state_builder: bool,
-}
-
-const SNAPSHOT_REPLAY_CONFIGS: &[SnapshotReplayConfig] = &[
-    SnapshotReplayConfig {
-        name: "snapshot_full_state_sm",
-        use_full_state_builder: false,
-    },
-    SnapshotReplayConfig {
-        name: "snapshot_full_state_builder",
-        use_full_state_builder: true,
-    },
-];
-
 async fn execute_snapshot_workload_datafusion(
     engine: Arc<dyn Engine>,
     table_root: &url::Url,
     snapshot_spec: &SnapshotConstructionSpec,
-    config: SnapshotReplayConfig,
 ) -> DeltaResult<SnapshotResult> {
-    let version = snapshot_spec
-        .time_travel
-        .as_ref()
-        .map(TimeTravel::as_version)
-        .transpose()
-        .map_err(Error::generic)?;
-
-    let mut builder = Snapshot::builder_for(table_root.clone());
-    if let Some(version) = version {
-        builder = builder.at_version(version);
-    }
-    let snapshot = builder.build(engine.as_ref())?;
-
+    let snapshot = build_snapshot(engine.as_ref(), table_root, snapshot_spec.time_travel.as_ref())?;
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    if config.use_full_state_builder {
-        let rp = snapshot
-            .full_state_builder()
-            .with_stats()
-            .build()
-            .plans()
-            .map_err(|e| Error::generic(format!("build full_state plans via builder: {e}")))?;
-        let _ = executor.collect_result(rp).await.map_err(|e| {
-            Error::generic(format!(
-                "execute full_state builder plans via DataFusionExecutor ({}): {e}",
-                config.name
-            ))
-        })?;
-    } else {
-        let sm = snapshot.full_state()?;
-        let rp = executor.drive_to_completion(sm).await.map_err(|e| {
-            Error::generic(format!(
-                "execute full_state via DataFusionExecutor ({}): {e}",
-                config.name
-            ))
-        })?;
-        let _ = executor.collect_result(rp).await.map_err(|e| {
-            Error::generic(format!(
-                "collect full_state result via DataFusionExecutor ({}): {e}",
-                config.name
-            ))
-        })?;
-    }
+    let rp = snapshot
+        .full_state_builder()
+        .build()
+        .plans()
+        .map_err(|e| Error::generic(format!("build full_state plans: {e}")))?;
+    executor
+        .collect_result(rp)
+        .await
+        .map_err(|e| Error::generic(format!("execute full_state via DataFusionExecutor: {e}")))?;
     let table_configuration = snapshot.table_configuration();
     Ok(SnapshotResult {
         version: snapshot.version(),
@@ -158,48 +89,20 @@ async fn execute_snapshot_workload_datafusion(
     })
 }
 
-fn filter_batches_with_predicate(
-    batches: Vec<RecordBatch>,
-    predicate: Option<&Predicate>,
-) -> DeltaResult<Vec<RecordBatch>> {
-    let Some(predicate) = predicate else {
-        return Ok(batches);
-    };
-    batches
-        .into_iter()
-        .map(|batch| {
-            let selection = evaluate_predicate(predicate, &batch, false)?;
-            let filtered = filter_record_batch(&batch, &selection)?;
-            Ok(filtered)
-        })
-        .collect()
-}
-
 async fn execute_read_workload_datafusion(
     engine: Arc<dyn Engine>,
     table_root: &url::Url,
     read_spec: &ReadSpec,
-    config: ReadReplayConfig,
 ) -> DeltaResult<ReadResult> {
-    let version = read_spec
-        .time_travel
-        .as_ref()
-        .map(TimeTravel::as_version)
-        .transpose()
-        .map_err(Error::generic)?;
-    let mut builder = Snapshot::builder_for(table_root.clone());
-    if let Some(version) = version {
-        builder = builder.at_version(version);
-    }
-    let snapshot = builder.build(engine.as_ref())?;
+    let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
     let table_schema = snapshot.schema();
-    let predicate = if let Some(predicate_string) = read_spec.predicate.as_ref() {
-        let predicate = parse_predicate(predicate_string, &table_schema).map_err(Error::generic)?;
-        Some(Arc::new(predicate))
-    } else {
-        None
-    };
-
+    let predicate = read_spec
+        .predicate
+        .as_deref()
+        .map(|sql| parse_predicate(sql, &table_schema))
+        .transpose()
+        .map_err(Error::generic)?
+        .map(Arc::new);
     let schema = if let Some(cols) = read_spec.columns.as_ref() {
         table_schema.project(cols)?
     } else {
@@ -212,59 +115,15 @@ async fn execute_read_workload_datafusion(
     if let Some(predicate_ref) = predicate.clone() {
         scan_builder = scan_builder.with_predicate(predicate_ref);
     }
-    let replay_scan = scan_builder
+    let rp = scan_builder
         .build_replay()
-        .map_err(|e| Error::generic(format!("build replay scan: {e}")))?;
-    let batches = if config.split_phases {
-        let metadata_sm = replay_scan
-            .scan_metadata_state_machine()
-            .map_err(|e| Error::generic(format!("build metadata-only replay scan SM: {e}")))?;
-        let metadata_rp = executor
-            .drive_to_completion(metadata_sm)
-            .await
-            .map_err(|e| {
-                Error::generic(format!(
-                    "execute metadata-only replay scan SM via DataFusionExecutor ({}): {e:?}",
-                    config.name
-                ))
-            })?;
-        // Execute metadata plans so the live-actions relation is registered, then hand the
-        // handle off to the data-phase SM.
-        executor
-            .execute_plans(&metadata_rp.plans)
-            .await
-            .map_err(|e| {
-                Error::generic(format!(
-                    "execute metadata-only replay scan plans via DataFusionExecutor ({}): {e:?}",
-                    config.name
-                ))
-            })?;
-        let data_sm = replay_scan
-            .scan_data_from_metadata_state_machine(metadata_rp.result_relation)
-            .map_err(|e| Error::generic(format!("build data-only replay scan SM: {e}")))?;
-        let data_rp = executor.drive_to_completion(data_sm).await.map_err(|e| {
-            Error::generic(format!(
-                "execute data-only replay scan SM via DataFusionExecutor ({}): {e:?}",
-                config.name
-            ))
-        })?;
-        executor.collect_result(data_rp).await.map_err(|e| {
-            Error::generic(format!(
-                "collect data-only replay scan result via DataFusionExecutor ({}): {e:?}",
-                config.name
-            ))
-        })?
-    } else {
-        let rp = replay_scan
-            .scan_plans()
-            .map_err(|e| Error::generic(format!("build replay scan plans: {e}")))?;
-        executor.collect_result(rp).await.map_err(|e| {
-            Error::generic(format!(
-                "collect combined replay scan result via DataFusionExecutor ({}): {e:?}",
-                config.name
-            ))
-        })?
-    };
+        .map_err(|e| Error::generic(format!("build replay scan: {e}")))?
+        .scan_plans()
+        .map_err(|e| Error::generic(format!("build replay scan plans: {e}")))?;
+    let batches = executor
+        .collect_result(rp)
+        .await
+        .map_err(|e| Error::generic(format!("execute replay scan via DataFusionExecutor: {e}")))?;
     let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
     let row_count = batches.iter().map(|b| b.num_rows() as u64).sum();
 
@@ -321,23 +180,19 @@ fn acceptance_workloads_datafusion_test(spec_path: &Path) -> datatest_stable::Re
                 Some(expected) => expected,
                 None => return Ok(()),
             };
-            for config in READ_REPLAY_CONFIGS {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(execute_read_workload_datafusion(
-                        Arc::clone(&engine),
-                        &table_root,
-                        read_spec,
-                        *config,
-                    ));
-                if let Err(e) = validate_read_result(result, &test_case.expected_dir(), expected) {
-                    let rendered = e.to_string();
-                    return Err(Box::new(std::io::Error::other(format!(
-                        "DataFusion workload '{}' failed for read replay config '{}': {rendered}",
-                        test_case.workload_name, config.name
-                    ))));
-                }
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(execute_read_workload_datafusion(
+                    Arc::clone(&engine),
+                    &table_root,
+                    read_spec,
+                ));
+            if let Err(e) = validate_read_result(result, &test_case.expected_dir(), expected) {
+                return Err(Box::new(std::io::Error::other(format!(
+                    "DataFusion workload '{}' failed: {e}",
+                    test_case.workload_name
+                ))));
             }
         }
         Spec::SnapshotConstruction(snapshot_spec) => {
@@ -345,22 +200,19 @@ fn acceptance_workloads_datafusion_test(spec_path: &Path) -> datatest_stable::Re
                 Some(expected) => expected,
                 None => return Ok(()),
             };
-            for config in SNAPSHOT_REPLAY_CONFIGS {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(execute_snapshot_workload_datafusion(
-                        Arc::clone(&engine),
-                        &table_root,
-                        snapshot_spec.as_ref(),
-                        *config,
-                    ));
-                if let Err(rendered) = validate_snapshot(result, expected) {
-                    return Err(Box::new(std::io::Error::other(format!(
-                        "DataFusion snapshot workload '{}' failed for snapshot replay config '{}': {rendered}",
-                        test_case.workload_name, config.name
-                    ))));
-                }
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(execute_snapshot_workload_datafusion(
+                    Arc::clone(&engine),
+                    &table_root,
+                    snapshot_spec.as_ref(),
+                ));
+            if let Err(rendered) = validate_snapshot(result, expected) {
+                return Err(Box::new(std::io::Error::other(format!(
+                    "DataFusion snapshot workload '{}' failed: {rendered}",
+                    test_case.workload_name
+                ))));
             }
         }
     }

@@ -41,7 +41,7 @@ pub struct SnapshotResult {
 }
 
 /// Build a snapshot with optional time travel.
-fn build_snapshot(
+pub fn build_snapshot(
     engine: &dyn Engine,
     table_root: &Url,
     time_travel: Option<&TimeTravel>,
@@ -107,7 +107,7 @@ pub fn execute_read_workload(
 }
 
 /// Filter record batches using a predicate expression.
-fn filter_batches_with_predicate(
+pub fn filter_batches_with_predicate(
     batches: Vec<RecordBatch>,
     predicate: Option<&Predicate>,
 ) -> DeltaResult<Vec<RecordBatch>> {
