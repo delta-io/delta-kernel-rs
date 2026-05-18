@@ -230,3 +230,64 @@ async fn full_state_prints_expected_results(#[case] fixture: &str, #[case] expec
     let expected_lines: Vec<&str> = expected.trim().lines().collect();
     assert_batches_sorted_eq!(expected_lines, &batches);
 }
+
+/// Smoke check that `FullStateBuilder::with_stats()` end-to-end produces an `add.stats_parsed`
+/// column in the FSR result schema -- the column must exist and be populated for at least one
+/// add row in every checkpoint shape we exercise (commit-only, V1 checkpoint, V2 classic /
+/// parquet sidecars / JSON sidecars).
+#[rstest]
+#[case::commit_only("app-txn-no-checkpoint")]
+#[case::v1_checkpoint("app-txn-checkpoint")]
+#[case::v2_classic_parquet("v2-classic-parquet-struct-stats-only")]
+#[case::v2_json_sidecars("v2-json-sidecars-struct-stats-only")]
+#[case::v2_parquet_sidecars("v2-parquet-sidecars-struct-stats-only")]
+#[tokio::test]
+async fn full_state_with_stats_populates_add_stats_parsed(#[case] fixture: &str) {
+    use delta_kernel::arrow::array::{Array, StructArray};
+
+    let (engine, snapshot) = open_snapshot_for_fixture(fixture);
+    let executor = DataFusionExecutor::try_new_with_engine(engine).expect("executor");
+    let sm = snapshot
+        .full_state_builder()
+        .with_stats()
+        .build()
+        .and_then(|fs| fs.state_machine())
+        .expect("build full_state SM with stats");
+    let result_plan = executor
+        .drive_to_completion(sm)
+        .await
+        .expect("drive full_state SM");
+    let batches = executor
+        .collect_result(result_plan)
+        .await
+        .expect("collect full_state result");
+
+    let mut stats_parsed_seen = false;
+    for batch in &batches {
+        let add_idx = batch.schema().index_of("add").expect("schema has add");
+        let add = batch
+            .column(add_idx)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("add is struct");
+        let stats_parsed_idx = add
+            .fields()
+            .iter()
+            .position(|f| f.name() == "stats_parsed")
+            .expect("add struct has stats_parsed");
+        let stats_parsed = add.column(stats_parsed_idx);
+        for row in 0..add.len() {
+            if !add.is_null(row) && !stats_parsed.is_null(row) {
+                stats_parsed_seen = true;
+                break;
+            }
+        }
+        if stats_parsed_seen {
+            break;
+        }
+    }
+    assert!(
+        stats_parsed_seen,
+        "expected at least one populated `add.stats_parsed` row in fixture `{fixture}`",
+    );
+}

@@ -87,12 +87,26 @@ pub(super) fn load_materialized_schema(
 
 /// Action schema augmented with the [`Add`] slot replaced by an augmented struct that
 /// carries optionally-parsed `stats_parsed` / `partitionValues_parsed` sub-fields. Used by
-/// [`super::file_scan`] when a predicate forces data-skipping projection.
+/// [`super::file_scan`] and the FSR results union when stats wiring is requested.
+///
+/// Every original [`Add`] field is forced **nullable** in the augmented variant. Downstream
+/// projection chains rebuild the `add` struct via `Expression::struct_from(...)` from an
+/// action stream that includes non-`add` rows; for those rows every `add.*` child is `NULL`,
+/// and the resulting `StructArray` carries `NULL`s in the children regardless of the
+/// original (strict) declarations in `Add::to_schema()`. Declaring the fields strict here
+/// would force DataFusion to insert a `Cast(nullable -> non-null)` between the project and
+/// any downstream operator (union, anti-join, sink) and that cast rejects nullable -> non-null
+/// at planning time. The strict types are still enforced by the parquet/JSON file readers
+/// (via [`NullabilityValidationExec`](`crate::engine`)) at the original scan boundary; here
+/// we acknowledge that intermediate projections lose that guarantee.
 pub(super) fn action_schema_with_augmented_add(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
 ) -> SchemaRef {
-    let mut add_fields: Vec<StructField> = Add::to_schema().fields().cloned().collect();
+    let mut add_fields: Vec<StructField> = Add::to_schema()
+        .fields()
+        .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+        .collect();
     if let Some(schema) = stats_parsed_schema {
         add_fields.push(StructField::nullable(
             "stats_parsed",

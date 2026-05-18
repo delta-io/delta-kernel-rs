@@ -21,7 +21,7 @@ use super::checkpoint_shape::{
 };
 use super::dedup::ADD_PATH;
 use super::plans::build_fsr_plans;
-use super::schemas::{action_schema, action_schema_with_augmented_add};
+use super::schemas::{action_schema_with_augmented_add, fsr_action_schema};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     Add, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
@@ -229,6 +229,18 @@ fn scan_metadata_plans_with_shape(
     let partition_values_schema =
         scan_partition_values_physical_schema(snapshot.as_ref(), scan.logical_schema())?;
 
+    // The sync `scan_metadata_plans` path constructs `checkpoint_shape` via
+    // `checkpoint_shape_from_last_checkpoint`, which doesn't know about the scan's stats
+    // requirement. Stamp the scan's `physical_stats_schema` into the shape here so FSR
+    // emits `add.stats_parsed` consistently for both sync and SM-driven paths.
+    // `has_stats_parsed` stays at whatever the caller populated (the resolver sets it from
+    // the leaf parquet; the sync helper leaves it false, so FSR uses `parse_json` as a
+    // safe fallback).
+    let mut checkpoint_shape = checkpoint_shape;
+    if checkpoint_shape.requested_stats_schema.is_none() {
+        checkpoint_shape.requested_stats_schema = predicate_stats_schema.clone();
+    }
+
     // === FSR plans: build the FSR result plan, then layer the actions chain on top ===
     // The terminal FSR plan is rebound under `scan.fsr_results` in this layer's registry so the
     // downstream actions chain can `relation_ref` it. The rebind reuses the strict
@@ -258,8 +270,14 @@ fn scan_metadata_plans_with_shape(
             "fsr::scan::scan_metadata: terminal FSR plan missing from plan vector",
         )
     })?;
+    // Rebind the FSR terminal under `scan.fsr_results` with the FSR-side schema. When stats
+    // were requested, this preserves the native `add.stats_parsed` column the FSR plans
+    // already produced, so the actions chain below can pick `col(["add", "stats_parsed"])`
+    // instead of re-parsing the JSON.
+    let fsr_results_schema = fsr_action_schema(predicate_stats_schema.as_ref());
+    let source_has_native_stats_parsed = predicate_stats_schema.is_some();
     let fsr_results_handle =
-        registry.register_relation_sink("scan.fsr_results", action_schema())?;
+        registry.register_relation_sink("scan.fsr_results", fsr_results_schema)?;
     let terminal_rebound_plan =
         Plan::new(terminal_plan.root, SinkType::Relation(fsr_results_handle));
     plans.push(terminal_rebound_plan);
@@ -275,6 +293,7 @@ fn scan_metadata_plans_with_shape(
                 let (projection, schema) = scan_actions_with_parsed_projection_and_schema(
                     predicate_stats_schema.as_ref(),
                     predicate_partition_schema.as_ref(),
+                    source_has_native_stats_parsed,
                 )?;
                 actions_root.project(projection, schema)
             } else {
@@ -396,13 +415,22 @@ pub(super) fn scan_live_actions_projection(
 pub(super) fn scan_actions_with_parsed_projection(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
+    source_has_native_stats_parsed: bool,
 ) -> Vec<Arc<Expression>> {
     let mut add_exprs: Vec<Arc<Expression>> = Add::to_schema()
         .fields()
         .map(|f| col(["add", f.name().as_str()]).into())
         .collect();
     if let Some(schema) = stats_parsed_schema {
-        add_exprs.push(Expression::parse_json(col(["add", "stats"]), schema.clone()).into());
+        // Source rows already carry a typed `add.stats_parsed` when FSR was driven with
+        // stats requested -- in that case we reference the native column directly instead of
+        // re-parsing `add.stats` JSON.
+        let stats_expr = if source_has_native_stats_parsed {
+            col(["add", "stats_parsed"])
+        } else {
+            Expression::parse_json(col(["add", "stats"]), schema.clone())
+        };
+        add_exprs.push(stats_expr.into());
     }
     if partition_values_parsed_schema.is_some() {
         add_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])).into());
@@ -420,9 +448,14 @@ pub(super) fn scan_actions_with_parsed_projection(
 fn scan_actions_with_parsed_projection_and_schema(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
+    source_has_native_stats_parsed: bool,
 ) -> Result<(Vec<Arc<Expression>>, SchemaRef), DeltaError> {
     Ok((
-        scan_actions_with_parsed_projection(stats_parsed_schema, partition_values_parsed_schema),
+        scan_actions_with_parsed_projection(
+            stats_parsed_schema,
+            partition_values_parsed_schema,
+            source_has_native_stats_parsed,
+        ),
         action_schema_with_augmented_add(stats_parsed_schema, partition_values_parsed_schema),
     ))
 }
