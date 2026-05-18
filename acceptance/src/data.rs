@@ -1,9 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::array::{Array, AsArray, RecordBatch};
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use delta_kernel::arrow::util::display::array_value_to_string;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -147,4 +148,69 @@ pub async fn assert_scan_metadata(
     assert_data_matches(batches, &schema.unwrap(), golden)?;
 
     Ok(())
+}
+
+/// Collect the sorted set of selected file paths emitted by `Snapshot::scan_metadata`.
+/// Honors the selection vector (missing entries mean selected) and respects null `path` rows.
+pub fn collect_selected_scan_file_paths(
+    snapshot: &Arc<Snapshot>,
+    engine: Arc<dyn Engine>,
+) -> DeltaResult<Vec<String>> {
+    let scan = Arc::clone(snapshot).scan_builder().build()?;
+    let mut out = Vec::new();
+    for metadata in scan.scan_metadata(engine.as_ref())? {
+        let metadata = metadata?;
+        let (data, sv) = metadata.scan_files.into_parts();
+        let batch = data.try_into_record_batch()?;
+        let path_idx = batch.schema().index_of("path").map_err(|e| {
+            Error::generic(format!(
+                "scan metadata path column missing in schema {:?}: {e}",
+                batch.schema()
+            ))
+        })?;
+        let path_col = batch.column(path_idx);
+        for i in 0..batch.num_rows() {
+            let selected = i >= sv.len() || sv[i];
+            if selected && path_col.is_valid(i) {
+                out.push(
+                    array_value_to_string(path_col.as_ref(), i)
+                        .map_err(|e| Error::generic(format!("stringify scan path row {i}: {e}")))?,
+                );
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Collect the sorted set of `add.path` values from FSR full-state batches.
+///
+/// Panics on schema violations (missing `add` column, non-Struct `add`, missing `add.path`) since
+/// the caller drives the canonical FSR plan whose schema is fixed.
+pub fn collect_fsr_add_paths(batches: &[RecordBatch]) -> Vec<String> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let add_idx = batch
+            .schema()
+            .index_of("add")
+            .unwrap_or_else(|e| panic!("full_state add column missing: {e}"));
+        let add_col = batch
+            .column(add_idx)
+            .as_struct_opt()
+            .unwrap_or_else(|| panic!("full_state add column must be Struct"));
+        let path_col = add_col
+            .column_by_name("path")
+            .cloned()
+            .unwrap_or_else(|| panic!("full_state add.path missing"));
+        for i in 0..batch.num_rows() {
+            if add_col.is_valid(i) && path_col.is_valid(i) {
+                out.push(
+                    array_value_to_string(path_col.as_ref(), i)
+                        .unwrap_or_else(|e| panic!("stringify fsr path row {i}: {e}")),
+                );
+            }
+        }
+    }
+    out.sort();
+    out
 }

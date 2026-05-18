@@ -1,10 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use acceptance::{read_dat_case, DatReadMode};
-use delta_kernel::arrow::array::{Array, AsArray};
-use delta_kernel::arrow::util::display::array_value_to_string;
-use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use acceptance::data::{collect_fsr_add_paths, collect_selected_scan_file_paths};
+use acceptance::{read_dat_case, AssertionError, DatReadMode, TestCaseInfo, TestResult};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 
@@ -31,74 +29,12 @@ fn ci_selected_case(root_dir: &str) -> bool {
         .any(|suffix| root_dir.ends_with(suffix))
 }
 
-fn collect_selected_scan_file_paths(
-    snapshot: &Arc<Snapshot>,
-    engine: Arc<dyn Engine>,
-) -> delta_kernel::DeltaResult<Vec<String>> {
-    let scan = Arc::clone(snapshot).scan_builder().build()?;
-    let mut out = Vec::new();
-    for metadata in scan.scan_metadata(engine.as_ref())? {
-        let metadata = metadata?;
-        let (data, sv) = metadata.scan_files.into_parts();
-        let batch = data.try_into_record_batch()?;
-        let path_idx = batch.schema().index_of("path").map_err(|e| {
-            delta_kernel::Error::generic(format!(
-                "scan metadata path column missing in schema {:?}: {e}",
-                batch.schema()
-            ))
-        })?;
-        let path_col = batch.column(path_idx);
-        for i in 0..batch.num_rows() {
-            // Selection-vector semantics: missing entries mean selected.
-            let selected = i >= sv.len() || sv[i];
-            if selected && path_col.is_valid(i) {
-                out.push(array_value_to_string(path_col.as_ref(), i).map_err(|e| {
-                    delta_kernel::Error::generic(format!("stringify scan path row {i}: {e}"))
-                })?);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-fn collect_fsr_add_paths(batches: &[delta_kernel::arrow::array::RecordBatch]) -> Vec<String> {
-    let mut out = Vec::new();
-    for batch in batches {
-        let add_idx = batch
-            .schema()
-            .index_of("add")
-            .unwrap_or_else(|e| panic!("full_state add column missing: {e}"));
-        let add_col = batch
-            .column(add_idx)
-            .as_struct_opt()
-            .unwrap_or_else(|| panic!("full_state add column must be Struct"));
-        let path_col = add_col
-            .column_by_name("path")
-            .cloned()
-            .unwrap_or_else(|| panic!("full_state add.path missing"));
-        for i in 0..batch.num_rows() {
-            if add_col.is_valid(i) && path_col.is_valid(i) {
-                out.push(
-                    array_value_to_string(path_col.as_ref(), i)
-                        .unwrap_or_else(|e| panic!("stringify fsr path row {i}: {e}")),
-                );
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 async fn assert_fsr_add_only_matches_scan_files(
     engine: Arc<dyn Engine>,
-    case: &acceptance::TestCaseInfo,
-) -> acceptance::TestResult<()> {
-    let table_root = case.table_root()?;
-    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
-
+    case: &TestCaseInfo,
+) -> TestResult<()> {
+    let snapshot = Snapshot::builder_for(case.table_root()?).build(engine.as_ref())?;
     let scan_paths = collect_selected_scan_file_paths(&snapshot, Arc::clone(&engine))?;
-
     let executor = DataFusionExecutor::try_new_with_engine(engine).map_err(|e| {
         delta_kernel::Error::generic(format!("create DataFusionExecutor for full_state: {e}"))
     })?;
@@ -115,12 +51,11 @@ async fn assert_fsr_add_only_matches_scan_files(
     let fsr_paths = collect_fsr_add_paths(&fsr_batches);
 
     if fsr_paths != scan_paths {
-        return Err(acceptance::AssertionError::KernelError(
-            delta_kernel::Error::generic(format!(
-                "FSR add-only path set mismatch\nscan paths: {:?}\nfsr paths: {:?}",
-                scan_paths, fsr_paths
-            )),
-        ));
+        return Err(AssertionError::KernelError(delta_kernel::Error::generic(
+            format!(
+                "FSR add-only path set mismatch\nscan paths: {scan_paths:?}\nfsr paths: {fsr_paths:?}"
+            ),
+        )));
     }
     Ok(())
 }
