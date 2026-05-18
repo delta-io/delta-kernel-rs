@@ -2,9 +2,10 @@
 //!
 //! Each helper is a pure transformation: extract a column from a batch by [`ColumnName`] path,
 //! parse a [`DeletionVectorDescriptor`] out of a struct row and resolve its mask via kernel's
-//! [`selection_vector`], apply a DV mask to one decoded file batch, or broadcast a single
-//! upstream row's passthrough value to `len` output rows. None of them touch parquet/json
-//! decoding -- that's the DataFusion opener's job inside [`super::LoadExec`].
+//! [`selection_vector`], or apply a DV mask to one decoded file batch. None of them touch
+//! parquet/json decoding -- that's the DataFusion opener's job inside [`super::LoadExec`].
+//! Passthrough-column broadcast is delegated to DataFusion's `partition_values` plumbing
+//! (see [`super::LoadExec`] docs); there's no bespoke broadcast helper here.
 
 use std::str::FromStr;
 
@@ -12,9 +13,9 @@ use datafusion_common::error::DataFusionError;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::types::{Int32Type, Int64Type};
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, StructArray, UInt32Array,
+    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, StructArray,
 };
-use delta_kernel::arrow::compute::{filter_record_batch, take};
+use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::ir::nodes::LoadSink;
@@ -240,16 +241,6 @@ pub(crate) fn apply_optional_dv(
         .collect();
     filter_record_batch(&rb, &slice)
         .map_err(|e| crate::error::internal_error(format!("DV filter_record_batch failed: {e}")))
-}
-
-pub(crate) fn replicate_row(
-    arr: &ArrayRef,
-    row: usize,
-    len: usize,
-) -> Result<ArrayRef, DataFusionError> {
-    let idx = UInt32Array::from(vec![row as u32; len]);
-    take(arr.as_ref(), &idx, None)
-        .map_err(|e| crate::error::internal_error(format!("broadcast take failed: {e}")))
 }
 
 pub(crate) fn optional_i64(

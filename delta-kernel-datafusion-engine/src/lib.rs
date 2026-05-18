@@ -308,22 +308,18 @@ mod tests {
             .downcast_ref::<LoadExec>()
             .expect("scan must produce a LoadExec");
 
-        let narrow_file: Vec<&str> = load_exec
-            .narrow_file_schema()
-            .fields()
-            .map(|f| f.name().as_str())
-            .collect();
+        // Projection pushdown narrowed both the parquet read schema and the partition-value
+        // (passthrough) broadcast set. Both are reachable through `LoadExec`'s test-only
+        // accessors, which read directly off the projected `FileSource::table_schema()` /
+        // `projection()` -- the canonical post-pushdown state.
+        let narrow_file = load_exec.projected_file_fields();
         assert_eq!(
             narrow_file,
-            vec!["b"],
-            "kernel handler read schema must be narrowed to projected file columns",
+            vec!["b".to_string()],
+            "file source read schema must be narrowed to projected file columns",
         );
 
-        let narrow_pt: Vec<String> = load_exec
-            .narrow_passthrough_columns()
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
+        let narrow_pt = load_exec.projected_passthrough_fields();
         assert_eq!(
             narrow_pt,
             vec!["p1".to_string()],

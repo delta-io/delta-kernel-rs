@@ -2,11 +2,10 @@
 //! [`super::LoadTableProvider`].
 //!
 //! For each upstream metadata batch, [`LoadExecStream`] walks rows one at a time. For each row
-//! it resolves a file URL + optional DV mask + (narrowed) per-row passthrough column values,
-//! then opens the file via DataFusion's [`FileSource::create_file_opener`] +
-//! [`FileOpener::open`] -- the *same* parquet/json opener `ListingTable` uses. Each opener-
-//! produced batch is yielded downstream as soon as it's ready; there is no per-batch or
-//! per-file accumulation.
+//! it resolves a file URL + optional DV mask + per-row passthrough column values, then opens
+//! the file via DataFusion's [`FileSource::create_file_opener`] + [`FileOpener::open`] -- the
+//! *same* parquet/json opener `ListingTable` uses. Each opener-produced batch is yielded
+//! downstream as soon as it's ready; there is no per-batch / per-file accumulation.
 //!
 //! # Why a DataFusion opener and not kernel's parquet handler
 //!
@@ -19,11 +18,14 @@
 //!
 //! # Pushdown
 //!
-//! * `projection: Option<Vec<usize>>` is split into (a) which file-schema columns to ask the
-//!   opener for (via a narrowed [`KernelSchemaRef`] used as the [`ParquetSource`] /
-//!   [`JsonSource`] table schema) and (b) which passthrough columns to broadcast. Both
-//!   narrowings flow all the way through; the output batch is assembled in projection order.
-//!   See [`ProjectionPlan`].
+//! * Passthrough columns (kernel metadata-side values like `_metadata`, `path`) are handed to
+//!   the opener as [`TableSchema::with_table_partition_cols`]. Per upstream row we extract the
+//!   corresponding [`ScalarValue`]s and stamp them onto [`PartitionedFile::partition_values`];
+//!   the [`ProjectionOpener`] (parquet) / opener wrapper (json) substitutes them as literal
+//!   columns when materializing the file's batches. No bespoke per-batch broadcast.
+//! * `projection: Option<Vec<usize>>` is pushed straight into the [`FileSource`] via
+//!   [`FileScanConfigBuilder::with_projection_indices`]; the source then narrows both the
+//!   parquet read schema and which partition columns it materializes.
 //! * `limit: Option<usize>` caps total emitted rows. Once a batch would overshoot the budget it
 //!   is sliced; the next `poll_next` returns end-of-stream without opening any further files.
 //!
@@ -31,7 +33,6 @@
 //! [`super::LoadTableProvider::supports_filters_pushdown`]).
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -40,9 +41,10 @@ use std::task::{Context, Poll};
 use chrono::TimeZone;
 use datafusion_common::error::DataFusionError;
 use datafusion_common::Result as DfResult;
+use datafusion_common::ScalarValue;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_stream::FileOpenFuture;
-use datafusion_datasource::{ListingTableUrl, PartitionedFile};
+use datafusion_datasource::{ListingTableUrl, PartitionedFile, TableSchema};
 use datafusion_datasource_json::source::JsonSource;
 use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::object_store::ObjectStoreUrl;
@@ -53,11 +55,9 @@ use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
 };
-use delta_kernel::arrow::array::{ArrayRef, RecordBatch};
-use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::datatypes::{FieldRef, SchemaRef as ArrowSchemaRef};
 use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
-use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 use delta_kernel::Engine;
 use futures::stream::{BoxStream, Stream};
 use url::Url;
@@ -65,7 +65,7 @@ use url::Url;
 use crate::exec::field_id_adapter::FieldIdPhysicalExprAdapterFactory;
 use crate::exec::load_helpers::{
     apply_optional_dv, extract_column_array, optional_i64, optional_selection_vector_for_row,
-    replicate_row, resolve_file_location, utf8_value_at,
+    resolve_file_location, utf8_value_at,
 };
 
 /// Default opener batch size. DataFusion's parquet/json openers require a non-`None` batch size
@@ -73,161 +73,6 @@ use crate::exec::load_helpers::{
 /// it's only available at `execute()` time and the source is built at construction time -- we
 /// pre-populate this default and let the per-execute path override if desired.
 const DEFAULT_OPENER_BATCH_SIZE: usize = 8192;
-
-/// One slot in [`ProjectionPlan::assembly`]: where to source an output column from.
-#[derive(Debug, Clone, Copy)]
-enum AssemblyCol {
-    /// Output column = column at `narrow_file_pos` in the opener's batch.
-    File { narrow_file_pos: usize },
-    /// Output column = broadcast of the upstream row's value of the passthrough column at
-    /// `narrow_passthrough_pos`.
-    Passthrough { narrow_passthrough_pos: usize },
-}
-
-/// Pre-computed projection state for [`LoadExec`].
-///
-/// Splits an `Option<Vec<usize>>` projection into the narrow file-schema, the narrow passthrough
-/// column list, and an `assembly` plan that maps each output column to its source. Built once
-/// at [`LoadExec::new`]; cloned cheaply (`Arc`) into each [`LoadExecStream`].
-struct ProjectionPlan {
-    /// File-schema subset handed to the [`ParquetSource`] / [`JsonSource`] as its table schema.
-    /// The [`FieldIdPhysicalExprAdapterFactory`] in the opener config sees this as the
-    /// "logical" side and matches it against the physical parquet schema by field id /
-    /// column-mapping physical name.
-    narrow_file_schema: KernelSchemaRef,
-    /// Subset of [`LoadSink::passthrough_columns`] referenced by projection, in original order.
-    narrow_passthrough_columns: Vec<delta_kernel::expressions::ColumnName>,
-    /// Per-output-column source descriptor in projection order.
-    assembly: Vec<AssemblyCol>,
-    /// Final output Arrow schema (projection applied).
-    output_schema: ArrowSchemaRef,
-}
-
-impl ProjectionPlan {
-    fn new(
-        sink: &LoadSink,
-        full_schema: &ArrowSchemaRef,
-        projection: Option<&Vec<usize>>,
-    ) -> Result<Self, DataFusionError> {
-        let file_count = sink.file_schema.fields().len();
-        let passthrough_count = sink.passthrough_columns.len();
-        debug_assert_eq!(full_schema.fields().len(), file_count + passthrough_count);
-
-        // No projection: identity passthrough.
-        let Some(proj) = projection else {
-            let assembly = (0..file_count)
-                .map(|i| AssemblyCol::File { narrow_file_pos: i })
-                .chain((0..passthrough_count).map(|p| AssemblyCol::Passthrough {
-                    narrow_passthrough_pos: p,
-                }))
-                .collect();
-            return Ok(Self {
-                narrow_file_schema: sink.file_schema.clone(),
-                narrow_passthrough_columns: sink.passthrough_columns.clone(),
-                assembly,
-                output_schema: Arc::clone(full_schema),
-            });
-        };
-
-        // Walk projection once, recording each referenced source column the first time we see
-        // it. `*_pos` maps original-source-index -> position in the narrowed list (which is
-        // also the index used by `AssemblyCol::{File,Passthrough}`).
-        let mut file_indices: Vec<usize> = Vec::with_capacity(proj.len().min(file_count));
-        let mut file_pos: HashMap<usize, usize> = HashMap::with_capacity(file_count);
-        let mut pt_indices: Vec<usize> = Vec::with_capacity(proj.len().min(passthrough_count));
-        let mut pt_pos: HashMap<usize, usize> = HashMap::with_capacity(passthrough_count);
-        for &full_idx in proj {
-            if full_idx < file_count {
-                if let std::collections::hash_map::Entry::Vacant(entry) = file_pos.entry(full_idx)
-                {
-                    entry.insert(file_indices.len());
-                    file_indices.push(full_idx);
-                }
-            } else {
-                let p = full_idx - file_count;
-                if p >= passthrough_count {
-                    return Err(crate::error::plan_compilation(format!(
-                        "LoadExec projection index {full_idx} out of range for output schema of \
-                         {file_count} file fields + {passthrough_count} passthrough fields",
-                    )));
-                }
-                if let std::collections::hash_map::Entry::Vacant(entry) = pt_pos.entry(p) {
-                    entry.insert(pt_indices.len());
-                    pt_indices.push(p);
-                }
-            }
-        }
-
-        // Build narrow_file_schema. We use `project_as_struct` (kernel) which preserves the
-        // requested field order *and* per-field metadata (column-mapping IDs, parquet field
-        // IDs). When the projection touches zero file fields we still need a non-empty read
-        // schema so the opener reports per-file row counts -- fall back to the full
-        // file_schema in that pathological case. DataFusion's projection pushdown rarely
-        // generates a passthrough-only projection in practice but we guard against it for
-        // correctness.
-        let narrow_file_schema: KernelSchemaRef = if file_indices.is_empty() {
-            sink.file_schema.clone()
-        } else {
-            let field_names: Vec<&str> = file_indices
-                .iter()
-                .map(|&i| {
-                    sink.file_schema
-                        .fields()
-                        .nth(i)
-                        .expect("file_indices bounded by file_count")
-                        .name()
-                        .as_str()
-                })
-                .collect();
-            sink.file_schema.project(&field_names).map_err(|e| {
-                crate::error::internal_error(format!(
-                    "LoadExec narrow file_schema projection failed: {e}"
-                ))
-            })?
-        };
-
-        let narrow_passthrough_columns: Vec<_> = pt_indices
-            .iter()
-            .map(|&p| sink.passthrough_columns[p].clone())
-            .collect();
-
-        let assembly = proj
-            .iter()
-            .map(|&full_idx| {
-                if full_idx < file_count {
-                    if file_indices.is_empty() {
-                        // Pathological projection-only-passthrough fallback: we read the entire
-                        // file_schema above, so the assembly position equals the original index.
-                        AssemblyCol::File {
-                            narrow_file_pos: full_idx,
-                        }
-                    } else {
-                        AssemblyCol::File {
-                            narrow_file_pos: *file_pos
-                                .get(&full_idx)
-                                .expect("file_pos populated for every projected file index"),
-                        }
-                    }
-                } else {
-                    let p = full_idx - file_count;
-                    AssemblyCol::Passthrough {
-                        narrow_passthrough_pos: *pt_pos
-                            .get(&p)
-                            .expect("pt_pos populated for every projected passthrough index"),
-                    }
-                }
-            })
-            .collect();
-
-        let output_schema = Arc::new(full_schema.project(proj)?);
-        Ok(Self {
-            narrow_file_schema,
-            narrow_passthrough_columns,
-            assembly,
-            output_schema,
-        })
-    }
-}
 
 /// Custom physical plan for [`super::LoadTableProvider`] sinks: stream upstream metadata rows
 /// through the configured DataFusion [`FileOpener`] one file at a time, yielding each
@@ -241,17 +86,19 @@ pub struct LoadExec {
     engine: Arc<dyn Engine>,
     upstream: Arc<dyn ExecutionPlan>,
     /// Full pre-projection output schema (= file_schema fields ++ passthrough fields). Kept on
-    /// the struct only so that [`ExecutionPlan::with_new_children`] can recompute the same
-    /// projection plan with the same input shape.
+    /// the struct only so that [`ExecutionPlan::with_new_children`] can rebuild the file source
+    /// against the same shape.
     full_schema: ArrowSchemaRef,
     /// Original projection (kept verbatim for replay through `with_new_children`).
     projection: Option<Vec<usize>>,
-    /// Pre-computed projection split. Shared by reference into each [`LoadExecStream`].
-    projection_plan: Arc<ProjectionPlan>,
+    /// Final output schema (projection applied to `full_schema`). What downstream operators see
+    /// via [`ExecutionPlan::schema`].
+    output_schema: ArrowSchemaRef,
     /// Optional row-count cap from `TableProvider::scan(limit)`. `None` = read to upstream end.
     limit: Option<usize>,
-    /// Pre-built file source (Parquet/Json) configured with the narrow file schema (Arrow) +
-    /// batch size. Cloned per-execute into the per-file `FileScanConfig`.
+    /// File source with [`TableSchema`] = file fields ++ passthrough fields, projection applied
+    /// once via [`FileScanConfigBuilder::with_projection_indices`]. Cloned per-execute into the
+    /// per-file [`FileScanConfig`].
     file_source: Arc<dyn datafusion_datasource::file::FileSource>,
     properties: Arc<PlanProperties>,
 }
@@ -265,14 +112,24 @@ impl LoadExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> DfResult<Self> {
-        let projection_plan = Arc::new(ProjectionPlan::new(
-            sink.as_ref(),
+        let file_count = sink.file_schema.fields().len();
+        let passthrough_count = sink.passthrough_columns.len();
+        debug_assert_eq!(full_schema.fields().len(), file_count + passthrough_count);
+        let file_source = build_file_source(
+            sink.file_type,
             &full_schema,
-            projection.as_ref(),
-        )?);
-        let file_source = build_file_source(sink.as_ref(), &projection_plan.narrow_file_schema)?;
+            file_count,
+            projection.as_deref(),
+        )?;
+        // The output schema is derived from the projected file source's table_schema, which
+        // carries the kernel-stamped per-field metadata end-to-end (set on the TableSchema in
+        // build_file_source, narrowed by `with_projection_indices`).
+        let output_schema = match projection.as_ref() {
+            Some(proj) => Arc::new(full_schema.project(proj)?),
+            None => Arc::clone(&full_schema),
+        };
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&projection_plan.output_schema)),
+            EquivalenceProperties::new(Arc::clone(&output_schema)),
             // File openers are single-stream; emit on a single partition to match pre-refactor
             // `drain_load` semantics.
             Partitioning::UnknownPartitioning(1),
@@ -285,7 +142,7 @@ impl LoadExec {
             upstream,
             full_schema,
             projection,
-            projection_plan,
+            output_schema,
             limit,
             file_source,
             properties,
@@ -293,33 +150,60 @@ impl LoadExec {
     }
 }
 
-/// Build a [`FileSource`] for the load's file type, configured with the narrow kernel file
-/// schema (converted to Arrow with `PARQUET:field_id` / `delta.columnMapping.physicalName`
-/// metadata preserved by [`TryIntoArrow`]) and a default batch size. The
-/// [`FieldIdPhysicalExprAdapterFactory`] wired into the per-execute [`FileScanConfig`] uses
-/// that metadata to match logical fields against the physical parquet schema.
+/// Build a [`FileSource`] for the load's file type whose [`TableSchema`] = file fields ++
+/// passthrough fields. Passthrough fields are registered as DataFusion *partition columns*
+/// so the opener broadcasts their per-file values from `PartitionedFile.partition_values`
+/// (parquet via `replace_columns_with_literals`, json via `ProjectionOpener`). Projection,
+/// when present, is pushed straight into the source via [`with_projection_indices`] -- which
+/// narrows both the parquet read schema and the partition column materialization.
 fn build_file_source(
-    sink: &LoadSink,
-    narrow_file_schema: &KernelSchemaRef,
+    file_type: FileType,
+    full_schema: &ArrowSchemaRef,
+    file_field_count: usize,
+    projection: Option<&[usize]>,
 ) -> DfResult<Arc<dyn datafusion_datasource::file::FileSource>> {
-    let arrow_schema: ArrowSchemaRef = Arc::new(
-        narrow_file_schema
-            .as_ref()
-            .try_into_arrow()
-            .map_err(|e| {
-                crate::error::internal_error(format!(
-                    "LoadExec narrow file_schema arrow conversion failed: {e}"
-                ))
-            })?,
+    let (file_fields, passthrough_fields) = full_schema.fields().split_at(file_field_count);
+    let file_arrow_schema: ArrowSchemaRef = Arc::new(
+        datafusion_common::arrow::datatypes::Schema::new(file_fields.to_vec())
+            .with_metadata(full_schema.metadata().clone()),
     );
-    let source: Arc<dyn datafusion_datasource::file::FileSource> = match sink.file_type {
-        FileType::Parquet => Arc::new(ParquetSource::new(arrow_schema)),
+    // Strip per-field metadata from passthrough fields before handing them to `TableSchema`.
+    // DataFusion's partition-col broadcast (`replace_columns_with_literals` / `ProjectionOpener`)
+    // synthesizes the output array's `data_type` from the upstream-extracted `ScalarValue`, which
+    // never carries the kernel's `delta.columnMapping.*` / `PARQUET:field_id` per-field metadata.
+    // Declaring the partition cols with metadata would make the opener's projection output
+    // schema disagree with the broadcast array (which DataFusion compares structurally,
+    // including nested field metadata), and the opener would fail before producing a batch.
+    // The kernel-declared metadata is reapplied per-batch in `assemble_output` via
+    // [`stamp_batch_metadata`].
+    let stripped_passthrough_fields: Vec<FieldRef> = passthrough_fields
+        .iter()
+        .map(|f| Arc::new(strip_field_metadata_recursive(f.as_ref())))
+        .collect();
+    let table_schema = TableSchema::new(file_arrow_schema, stripped_passthrough_fields);
+    let source: Arc<dyn datafusion_datasource::file::FileSource> = match file_type {
+        FileType::Parquet => Arc::new(ParquetSource::new(table_schema)),
         FileType::Json => {
             // NDJSON; matches the kernel default for delta JSON sidecars/logs.
-            Arc::new(JsonSource::new(arrow_schema))
+            Arc::new(JsonSource::new(table_schema))
         }
     };
-    Ok(source.with_batch_size(DEFAULT_OPENER_BATCH_SIZE))
+    let source = source.with_batch_size(DEFAULT_OPENER_BATCH_SIZE);
+    // Push projection into the source. `with_projection_indices` calls
+    // `FileSource::try_pushdown_projection` which (for both parquet and json) narrows the
+    // read + adjusts the partition-column materialization to match.
+    let Some(proj) = projection else {
+        return Ok(source);
+    };
+    let projected_config = FileScanConfigBuilder::new(
+        // Placeholder URL; `with_projection_indices` only mutates the file_source, not the
+        // object_store_url -- we'll set the real URL per file in `start_open_row`.
+        ObjectStoreUrl::local_filesystem(),
+        source,
+    )
+    .with_projection_indices(Some(proj.to_vec()))?
+    .build();
+    Ok(Arc::clone(projected_config.file_source()))
 }
 
 impl fmt::Debug for LoadExec {
@@ -329,14 +213,7 @@ impl fmt::Debug for LoadExec {
             .field("file_type", &self.sink.file_type)
             .field("projection", &self.projection)
             .field("limit", &self.limit)
-            .field(
-                "narrow_file_fields",
-                &self.projection_plan.narrow_file_schema.fields().len(),
-            )
-            .field(
-                "narrow_passthrough_fields",
-                &self.projection_plan.narrow_passthrough_columns.len(),
-            )
+            .field("output_fields", &self.output_schema.fields().len())
             .finish_non_exhaustive()
     }
 }
@@ -346,13 +223,12 @@ impl DisplayAs for LoadExec {
         write!(
             f,
             "LoadExec(output_relation={}, file_type={:?}, projection={:?}, limit={:?}, \
-             narrow_file_fields={}, narrow_passthrough_fields={})",
+             output_fields={})",
             self.sink.output_relation.name,
             self.sink.file_type,
             self.projection,
             self.limit,
-            self.projection_plan.narrow_file_schema.fields().len(),
-            self.projection_plan.narrow_passthrough_columns.len(),
+            self.output_schema.fields().len(),
         )
     }
 }
@@ -367,7 +243,7 @@ impl ExecutionPlan for LoadExec {
     }
 
     fn schema(&self) -> ArrowSchemaRef {
-        Arc::clone(&self.projection_plan.output_schema)
+        Arc::clone(&self.output_schema)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -414,29 +290,65 @@ impl ExecutionPlan for LoadExec {
             Arc::clone(&self.upstream),
             Arc::clone(&context),
         )?;
-        Ok(Box::pin(LoadExecStream::new(
+        Ok(Box::pin(LoadExecStream {
             upstream,
-            Arc::clone(&self.sink),
-            Arc::clone(&self.engine),
-            Arc::clone(&self.file_source),
-            Arc::clone(&self.projection_plan),
-            self.limit,
-            context,
-        )))
+            sink: Arc::clone(&self.sink),
+            engine: Arc::clone(&self.engine),
+            file_source: Arc::clone(&self.file_source),
+            output_schema: Arc::clone(&self.output_schema),
+            task_context: context,
+            remaining: self.limit,
+            current_batch: None,
+            next_row: 0,
+            row_state: RowState::Idle,
+        }))
     }
 }
 
 #[cfg(test)]
 impl LoadExec {
-    /// Narrow file-schema actually handed to the [`ParquetSource`] / [`JsonSource`] after
-    /// projection pushdown. Exposed for tests that assert pushdown shrunk the read request.
-    pub(crate) fn narrow_file_schema(&self) -> &KernelSchemaRef {
-        &self.projection_plan.narrow_file_schema
+    /// File-schema fields actually retained after projection pushdown -- the subset of
+    /// `sink.file_schema` referenced by `self.projection`, in original order. Exposed for
+    /// tests asserting pushdown shrunk the read request.
+    pub(crate) fn projected_file_fields(&self) -> Vec<String> {
+        let file_count = self.sink.file_schema.fields().len();
+        let file_names: Vec<String> = self
+            .sink
+            .file_schema
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        match &self.projection {
+            Some(proj) => proj
+                .iter()
+                .copied()
+                .filter(|&i| i < file_count)
+                .map(|i| file_names[i].clone())
+                .collect(),
+            None => file_names,
+        }
     }
 
-    /// Narrow passthrough columns actually broadcast after projection pushdown.
-    pub(crate) fn narrow_passthrough_columns(&self) -> &[delta_kernel::expressions::ColumnName] {
-        &self.projection_plan.narrow_passthrough_columns
+    /// Passthrough fields actually broadcast after projection pushdown -- the subset of
+    /// `sink.passthrough_columns` referenced by `self.projection`, in original order. Exposed
+    /// for tests.
+    pub(crate) fn projected_passthrough_fields(&self) -> Vec<String> {
+        let file_count = self.sink.file_schema.fields().len();
+        let pt_names: Vec<String> = self
+            .sink
+            .passthrough_columns
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        match &self.projection {
+            Some(proj) => proj
+                .iter()
+                .copied()
+                .filter(|&i| i >= file_count)
+                .map(|i| pt_names[i - file_count].clone())
+                .collect(),
+            None => pt_names,
+        }
     }
 }
 
@@ -446,15 +358,11 @@ enum RowState {
     Idle,
     /// Awaiting the [`FileOpenFuture`] for a row's file.
     Opening {
-        upstream_row: usize,
-        passthrough_raw: Vec<ArrayRef>,
         mask: Option<Vec<bool>>,
         future: FileOpenFuture,
     },
     /// Streaming opener-produced batches for a row's file.
     Scanning {
-        upstream_row: usize,
-        passthrough_raw: Vec<ArrayRef>,
         mask: Option<Vec<bool>>,
         stream: BoxStream<'static, DfResult<RecordBatch>>,
         /// File-local row cursor, advanced by each opener batch we apply DV to.
@@ -468,7 +376,7 @@ struct LoadExecStream {
     sink: Arc<LoadSink>,
     engine: Arc<dyn Engine>,
     file_source: Arc<dyn datafusion_datasource::file::FileSource>,
-    projection_plan: Arc<ProjectionPlan>,
+    output_schema: ArrowSchemaRef,
     task_context: Arc<TaskContext>,
     /// Remaining row budget. `None` = unbounded. When `Some(0)` the stream is finished.
     remaining: Option<usize>,
@@ -482,34 +390,11 @@ struct LoadExecStream {
 }
 
 impl LoadExecStream {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        upstream: SendableRecordBatchStream,
-        sink: Arc<LoadSink>,
-        engine: Arc<dyn Engine>,
-        file_source: Arc<dyn datafusion_datasource::file::FileSource>,
-        projection_plan: Arc<ProjectionPlan>,
-        limit: Option<usize>,
-        task_context: Arc<TaskContext>,
-    ) -> Self {
-        Self {
-            upstream,
-            sink,
-            engine,
-            file_source,
-            projection_plan,
-            task_context,
-            remaining: limit,
-            current_batch: None,
-            next_row: 0,
-            row_state: RowState::Idle,
-        }
-    }
-
-    /// Resolve the next upstream row into an `Opening` row state: parses file URL + size,
-    /// resolves an optional DV mask via kernel, pre-extracts narrow passthrough arrays, then
-    /// constructs the DataFusion file opener (with [`FieldIdPhysicalExprAdapterFactory`] for
-    /// parquet) and starts the file-open future.
+    /// Resolve the next upstream row into an `Opening` row state: parse file URL + size,
+    /// resolve an optional DV mask via kernel, extract per-row [`ScalarValue`]s for every
+    /// passthrough column (stamped onto [`PartitionedFile::partition_values`] for the opener
+    /// to broadcast), then construct the DataFusion file opener (with
+    /// [`FieldIdPhysicalExprAdapterFactory`] for parquet) and start the file-open future.
     fn start_open_row(
         &self,
         batch: &RecordBatch,
@@ -533,24 +418,23 @@ impl LoadExecStream {
         )?;
         let size = file_size_for_row(batch, self.sink.as_ref(), row, &url)?;
 
-        // Pre-extract only the NARROW passthrough columns (projection pushdown).
-        let mut passthrough_raw =
-            Vec::with_capacity(self.projection_plan.narrow_passthrough_columns.len());
-        for cn in &self.projection_plan.narrow_passthrough_columns {
-            passthrough_raw.push(extract_column_array(batch, cn)?);
-        }
+        // Per-row partition_values: one `ScalarValue` per passthrough field declared on
+        // `file_source.table_schema().table_partition_cols()`. The opener's
+        // `replace_columns_with_literals` (parquet) / `ProjectionOpener` (json) sees these as
+        // file-constant literal columns and broadcasts them to every emitted batch. No bespoke
+        // per-batch `take` broadcast on our side.
+        let partition_values = self.extract_partition_values(batch, row)?;
 
-        let (object_store_url, partitioned_file) = into_partitioned_file(&url, size)?;
+        let (object_store_url, mut partitioned_file) = into_partitioned_file(&url, size)?;
+        partitioned_file.partition_values = partition_values;
         let object_store = self
             .task_context
             .runtime_env()
             .object_store(&object_store_url)?;
 
-        // Per-row FileScanConfig: identical template (file_source + adapter factory) with the
-        // per-file object_store_url stamped in. `create_file_opener` only consults
-        // `object_store`, `expr_adapter_factory`, `limit`, `preserve_order` -- not the file
-        // groups -- so leaving them empty is fine; we feed the actual file directly into
-        // `opener.open(...)`.
+        // `create_file_opener` only consults `object_store`, `expr_adapter_factory`, `limit`,
+        // `preserve_order` -- not the file groups -- so leaving them empty is fine; we feed
+        // the actual file directly into `opener.open(...)`.
         let base_config = FileScanConfigBuilder::new(object_store_url, Arc::clone(&self.file_source))
             .with_expr_adapter(adapter_factory_for(self.sink.file_type))
             .build();
@@ -559,24 +443,33 @@ impl LoadExecStream {
             .create_file_opener(object_store, &base_config, 0)?;
         let future = opener.open(partitioned_file)?;
 
-        Ok(RowState::Opening {
-            upstream_row: row,
-            passthrough_raw,
-            mask,
-            future,
-        })
+        Ok(RowState::Opening { mask, future })
     }
 
-    /// Take one opener batch and assemble the projected output batch (DV-filtered + passthrough
-    /// broadcast in projection order). The opener-produced batch is already in the kernel
-    /// logical schema thanks to [`FieldIdPhysicalExprAdapterFactory`], so no further
-    /// realignment is needed -- output columns flow straight into [`RecordBatch::try_new`]
-    /// against the strict declared output schema.
+    /// Pre-extract one [`ScalarValue`] per passthrough column declared on the file source's
+    /// `table_partition_cols`. Indices line up positionally with the source's partition col
+    /// declarations because both came from `sink.passthrough_columns` in original order.
+    fn extract_partition_values(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+    ) -> Result<Vec<ScalarValue>, DataFusionError> {
+        let pt_fields: &[FieldRef] = self.file_source.table_schema().table_partition_cols();
+        let mut out = Vec::with_capacity(pt_fields.len());
+        for (cn, _field) in self.sink.passthrough_columns.iter().zip(pt_fields.iter()) {
+            let arr = extract_column_array(batch, cn)?;
+            out.push(ScalarValue::try_from_array(arr.as_ref(), row)?);
+        }
+        Ok(out)
+    }
+
+    /// Take one opener batch, apply DV mask if present, then re-stamp the kernel-declared
+    /// schema metadata onto the result. The opener already broadcast partition values into the
+    /// batch and ran logical-name reshape via [`FieldIdPhysicalExprAdapterFactory`], so
+    /// nothing else needs to be assembled here.
     fn assemble_output(
         &self,
         rb: RecordBatch,
-        upstream_row: usize,
-        passthrough_raw: &[ArrayRef],
         mask: Option<&[bool]>,
         file_row_cursor: &mut usize,
     ) -> Result<RecordBatch, DataFusionError> {
@@ -584,45 +477,7 @@ impl LoadExecStream {
         let cursor = *file_row_cursor;
         *file_row_cursor += pre_dv_rows;
         let masked = apply_optional_dv(rb, mask, cursor)?;
-        let target_len = masked.num_rows();
-
-        let mut out_cols: Vec<ArrayRef> =
-            Vec::with_capacity(self.projection_plan.assembly.len());
-        for slot in &self.projection_plan.assembly {
-            match *slot {
-                AssemblyCol::File { narrow_file_pos } => {
-                    out_cols.push(masked.column(narrow_file_pos).clone());
-                }
-                AssemblyCol::Passthrough {
-                    narrow_passthrough_pos,
-                } => {
-                    out_cols.push(replicate_row(
-                        &passthrough_raw[narrow_passthrough_pos],
-                        upstream_row,
-                        target_len,
-                    )?);
-                }
-            }
-        }
-
-        // Build the intermediate batch under a schema derived from the actual arrays (which is
-        // shape-correct but lacks the kernel's Delta-protocol per-field metadata), then re-stamp
-        // it to the kernel-declared output schema in one zero-copy `cast`. See
-        // `metadata_stamper::stamp_batch_metadata`.
-        use datafusion_common::arrow::datatypes::{Field, Schema};
-        let intermediate_schema = Arc::new(Schema::new(
-            out_cols
-                .iter()
-                .zip(self.projection_plan.output_schema.fields().iter())
-                .map(|(arr, target)| {
-                    Field::new(target.name(), arr.data_type().clone(), target.is_nullable())
-                })
-                .collect::<Vec<_>>(),
-        ));
-        let intermediate = RecordBatch::try_new(intermediate_schema, out_cols).map_err(|e| {
-            crate::error::internal_error(format!("LoadExec assembled batch failed: {e}"))
-        })?;
-        crate::exec::stamp_batch_metadata(&intermediate, &self.projection_plan.output_schema)
+        crate::exec::stamp_batch_metadata(&masked, &self.output_schema)
     }
 }
 
@@ -641,16 +496,12 @@ impl Stream for LoadExecStream {
             // 1) Drive whichever per-row state is active.
             match std::mem::replace(&mut self.row_state, RowState::Idle) {
                 RowState::Scanning {
-                    upstream_row,
-                    passthrough_raw,
                     mask,
                     mut stream,
                     mut file_row_cursor,
                 } => match stream.as_mut().poll_next(cx) {
                     Poll::Pending => {
                         self.row_state = RowState::Scanning {
-                            upstream_row,
-                            passthrough_raw,
                             mask,
                             stream,
                             file_row_cursor,
@@ -659,16 +510,11 @@ impl Stream for LoadExecStream {
                     }
                     Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                     Poll::Ready(Some(Ok(rb))) => {
-                        let assembled = match self.assemble_output(
-                            rb,
-                            upstream_row,
-                            &passthrough_raw,
-                            mask.as_deref(),
-                            &mut file_row_cursor,
-                        ) {
-                            Ok(batch) => batch,
-                            Err(e) => return Poll::Ready(Some(Err(e))),
-                        };
+                        let assembled =
+                            match self.assemble_output(rb, mask.as_deref(), &mut file_row_cursor) {
+                                Ok(batch) => batch,
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                            };
                         let mut out = assembled;
                         if let Some(rem) = self.remaining.as_mut() {
                             if out.num_rows() > *rem {
@@ -679,8 +525,6 @@ impl Stream for LoadExecStream {
                         // Reinstate the scanning state so the next poll continues from this
                         // same file iterator (subject to the budget check at step 0).
                         self.row_state = RowState::Scanning {
-                            upstream_row,
-                            passthrough_raw,
                             mask,
                             stream,
                             file_row_cursor,
@@ -691,26 +535,14 @@ impl Stream for LoadExecStream {
                         // File exhausted; fall through to advance to next upstream row.
                     }
                 },
-                RowState::Opening {
-                    upstream_row,
-                    passthrough_raw,
-                    mask,
-                    mut future,
-                } => match future.as_mut().poll(cx) {
+                RowState::Opening { mask, mut future } => match future.as_mut().poll(cx) {
                     Poll::Pending => {
-                        self.row_state = RowState::Opening {
-                            upstream_row,
-                            passthrough_raw,
-                            mask,
-                            future,
-                        };
+                        self.row_state = RowState::Opening { mask, future };
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
                     Poll::Ready(Ok(stream)) => {
                         self.row_state = RowState::Scanning {
-                            upstream_row,
-                            passthrough_raw,
                             mask,
                             stream,
                             file_row_cursor: 0,
@@ -752,8 +584,37 @@ impl Stream for LoadExecStream {
 
 impl RecordBatchStream for LoadExecStream {
     fn schema(&self) -> ArrowSchemaRef {
-        Arc::clone(&self.projection_plan.output_schema)
+        Arc::clone(&self.output_schema)
     }
+}
+
+/// Recursively strip per-field metadata from `field` so the resulting field's `data_type`
+/// matches structurally what DataFusion's partition-col broadcast (literal-substituted via
+/// `ScalarValue`) produces at runtime. Used only for declaring `TableSchema.table_partition_cols`;
+/// the kernel's metadata is reapplied per-batch in `assemble_output` via [`stamp_batch_metadata`].
+fn strip_field_metadata_recursive(
+    field: &delta_kernel::arrow::datatypes::Field,
+) -> delta_kernel::arrow::datatypes::Field {
+    use delta_kernel::arrow::datatypes::{DataType, Field, Fields};
+    let stripped_dt = match field.data_type() {
+        DataType::Struct(fs) => DataType::Struct(Fields::from(
+            fs.iter()
+                .map(|f| strip_field_metadata_recursive(f.as_ref()))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::List(inner) => DataType::List(Arc::new(strip_field_metadata_recursive(inner))),
+        DataType::LargeList(inner) => {
+            DataType::LargeList(Arc::new(strip_field_metadata_recursive(inner)))
+        }
+        DataType::FixedSizeList(inner, n) => {
+            DataType::FixedSizeList(Arc::new(strip_field_metadata_recursive(inner)), *n)
+        }
+        DataType::Map(entry, sorted) => {
+            DataType::Map(Arc::new(strip_field_metadata_recursive(entry)), *sorted)
+        }
+        other => other.clone(),
+    };
+    Field::new(field.name(), stripped_dt, field.is_nullable())
 }
 
 /// Select the [`PhysicalExprAdapterFactory`](datafusion_physical_expr_adapter::PhysicalExprAdapterFactory)
