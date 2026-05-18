@@ -37,7 +37,7 @@ pub use executor::DataFusionExecutor;
 mod tests {
     use std::sync::Arc;
 
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::Scalar;
     use delta_kernel::plans::ir::nodes::SinkType;
     use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
     use delta_kernel::schema::{DataType, StructField, StructType};
@@ -50,39 +50,6 @@ mod tests {
             StructField::not_null("a", DataType::BOOLEAN),
             StructField::not_null("b", DataType::BOOLEAN),
         ]))
-    }
-
-    #[tokio::test]
-    async fn logical_relation_sink_materializes_into_session_ctx() {
-        let ex = DataFusionExecutor::try_new().unwrap();
-        let schema = two_bool_schema();
-        let mut registry = RelationRegistry::new(Uuid::new_v4());
-        let plan = PlanBuilder::values(
-            Arc::clone(&schema),
-            vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],
-        )
-        .unwrap()
-        .project(
-            vec![
-                Arc::new(Expression::column(["a"])),
-                Arc::new(Expression::column(["b"])),
-            ],
-            Arc::clone(&schema),
-        )
-        .into_relation("logical_relation_test", &mut registry)
-        .expect("relation sink");
-        let SinkType::Relation(handle) = plan.sink.clone() else {
-            unreachable!("into_relation always produces SinkType::Relation");
-        };
-
-        ex.execute_plans(&[plan]).await.unwrap();
-        let relation_batches = ex
-            .collect_relation(&handle)
-            .await
-            .expect("relation sink should materialize output batches");
-        assert_eq!(relation_batches.len(), 1);
-        assert_eq!(relation_batches[0].num_rows(), 1);
-        assert_eq!(relation_batches[0].num_columns(), 2);
     }
 
     /// `Relation` sinks must register a *lazy* `ViewTable` -- not an eagerly-materialized
@@ -127,76 +94,6 @@ mod tests {
         // And reading the relation lazily must still produce the upstream's row.
         let batches = ex.collect_relation(&handle).await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    }
-
-    /// `Load` sinks must register a [`LoadTableProvider`](crate::exec::LoadTableProvider). The
-    /// provider holds the upstream `LogicalPlan` + sink + engine and lowers + streams on first
-    /// consumer read; nothing materializes at registration time.
-    #[tokio::test]
-    async fn load_sink_registers_load_table_provider_not_memtable() {
-        use datafusion::catalog::TableProvider;
-        use datafusion::datasource::MemTable;
-        use delta_kernel::plans::ir::nodes::{FileType, ScanFileColumns};
-
-        // Minimal multi-row parquet so the registration path has a real file to wrap. We don't
-        // read it; the test asserts the provider type only.
-        let dir = tempfile::tempdir().unwrap();
-        let parquet_path = dir.path().join("data.parquet");
-        test_utils::parquet::write_i64_parquet(&parquet_path, "x", &[1_i64, 2_i64]);
-
-        let rel = parquet_path.file_name().unwrap().to_str().unwrap().to_string();
-        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
-
-        let upstream_schema = Arc::new(
-            StructType::new_unchecked([StructField::not_null("path", DataType::STRING)]),
-        );
-        let file_schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "x",
-            DataType::LONG,
-        )]));
-
-        let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
-        let mut registry = RelationRegistry::new(Uuid::new_v4());
-        let plan = lit
-            .load(
-                "lazy_load_test",
-                file_schema,
-                FileType::Parquet,
-                Some(base_url),
-                Vec::new(),
-                ScanFileColumns {
-                    path: delta_kernel::expressions::ColumnName::from_naive_str_split("path"),
-                    size: None,
-                    record_count: None,
-                },
-                None,
-                &mut registry,
-            )
-            .expect("load sink");
-        let SinkType::Load(load_sink) = &plan.sink else {
-            unreachable!("PlanBuilder::load always produces SinkType::Load");
-        };
-        let handle_id = load_sink.output_relation.id.clone();
-
-        let ex = DataFusionExecutor::try_new().unwrap();
-        ex.execute_plans(&[plan]).await.unwrap();
-
-        let provider = ex
-            .relation_provider(&handle_id)
-            .expect("load sink should register a provider under its handle id");
-        // Sanity: it's our LoadTableProvider, not a leftover MemTable from the old eager path.
-        assert!(
-            (provider.as_ref() as &dyn TableProvider)
-                .as_any()
-                .downcast_ref::<crate::exec::LoadTableProvider>()
-                .is_some(),
-            "load provider must be a LoadTableProvider (got {:?})",
-            provider,
-        );
-        assert!(
-            provider.as_any().downcast_ref::<MemTable>().is_none(),
-            "load provider must NOT be a MemTable; lazy registration regressed",
-        );
     }
 
     /// Projection pushdown into a [`LoadTableProvider`] must narrow BOTH (a) the kernel

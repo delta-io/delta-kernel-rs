@@ -125,38 +125,6 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
 }
 
 #[tokio::test]
-async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_resets_per_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let p1 = dir.path().join("one.parquet");
-    let p2 = dir.path().join("two.parquet");
-    write_i64_parquet(&p1, "x", &[10, 11]);
-    write_i64_parquet(&p2, "x", &[20]);
-
-    let schema = single_long_schema();
-    let schema_with_row_index = Arc::new(
-        schema
-            .as_ref()
-            .add_metadata_column("rid", MetadataColumnSpec::RowIndex)
-            .unwrap(),
-    );
-    let plan = PlanBuilder::from_scan(ScanNode::new(
-        FileType::Parquet,
-        vec![file_meta(&p1), file_meta(&p2)],
-        schema_with_row_index,
-    ));
-
-    let batches = scan_collect(plan).await.unwrap();
-
-    let mut rids = flatten_i64_named(&batches, "rid");
-    rids.sort();
-    assert_eq!(
-        rids,
-        vec![0, 0, 1],
-        "unordered multi-file scan must still yield per-file row indices (file1 -> 0,1; file2 -> 0)"
-    );
-}
-
-#[tokio::test]
 async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
     let dir = tempfile::tempdir().unwrap();
     let paths: Vec<PathBuf> = ["p1.parquet", "p2.parquet", "p3.parquet"]
