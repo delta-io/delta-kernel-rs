@@ -1,8 +1,6 @@
 //! Action schema constructors used by the FSR plan-builders and the replay-scan plans.
-//!
-//! Centralizes the action-schema builder (`action_schema`) and the augmented-schema helpers
-//! (`augmented_action_schema`, `action_schema_with_augmented_add`, `path_size_schema`)
-//! plus the [`load_materialized_schema`] helper used by Load-sink builders.
+//! Centralizes `action_schema`, `augmented_action_schema`, `action_schema_with_augmented_add`,
+//! `fsr_action_schema`, `path_size_schema`, and [`load_materialized_schema`].
 
 use std::sync::{Arc, LazyLock};
 
@@ -85,20 +83,16 @@ pub(super) fn load_materialized_schema(
         .map_err(|e| e.into_delta_default())
 }
 
-/// Action schema augmented with the [`Add`] slot replaced by an augmented struct that
-/// carries optionally-parsed `stats_parsed` / `partitionValues_parsed` sub-fields. Used by
-/// [`super::file_scan`] and the FSR results union when stats wiring is requested.
+/// Action schema with the `add` slot replaced by a struct carrying optional `stats_parsed` /
+/// `partitionValues_parsed` sub-fields. Used by FSR and replay-scan projections when stats /
+/// partition-values wiring is requested.
 ///
-/// Every original [`Add`] field is forced **nullable** in the augmented variant. Downstream
-/// projection chains rebuild the `add` struct via `Expression::struct_from(...)` from an
-/// action stream that includes non-`add` rows; for those rows every `add.*` child is `NULL`,
-/// and the resulting `StructArray` carries `NULL`s in the children regardless of the
-/// original (strict) declarations in `Add::to_schema()`. Declaring the fields strict here
-/// would force DataFusion to insert a `Cast(nullable -> non-null)` between the project and
-/// any downstream operator (union, anti-join, sink) and that cast rejects nullable -> non-null
-/// at planning time. The strict types are still enforced by the parquet/JSON file readers
-/// (via [`NullabilityValidationExec`](`crate::engine`)) at the original scan boundary; here
-/// we acknowledge that intermediate projections lose that guarantee.
+/// Add fields are forced **nullable** here. Downstream chains rebuild `add` via
+/// `Expression::struct_from(...)` from streams that include non-`add` rows; for those rows
+/// the children read as `NULL` regardless of `Add::to_schema()`'s strict declarations.
+/// Declaring strict here would force a `Cast(nullable -> non-null)` between project and
+/// union / anti-join / sink, which DataFusion rejects at planning time. Strict types are
+/// still enforced at the parquet/JSON file-scan boundary.
 pub(super) fn action_schema_with_augmented_add(
     stats_parsed_schema: Option<&SchemaRef>,
     partition_values_parsed_schema: Option<&SchemaRef>,
@@ -132,9 +126,8 @@ pub(super) fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, D
     augmented_action_schema_with_stats(with_version, None)
 }
 
-/// Like [`augmented_action_schema`] but with the `add` slot replaced by an augmented struct
-/// carrying `add.stats_parsed` when `stats_parsed_schema` is `Some`. Used by FSR commit_dedup
-/// and the FSR results union sources when `with_stats` is requested.
+/// [`augmented_action_schema`] with `add` augmented to carry `stats_parsed` when
+/// `stats_parsed_schema` is `Some`. Drives FSR commit_dedup and the results-union sources.
 pub(super) fn augmented_action_schema_with_stats(
     with_version: bool,
     stats_parsed_schema: Option<&SchemaRef>,
@@ -149,8 +142,8 @@ pub(super) fn augmented_action_schema_with_stats(
     b.build().map_err(|e| e.into_delta_default())
 }
 
-/// FSR-side action schema: [`action_schema`] when `stats_parsed_schema` is `None`, or
-/// [`action_schema_with_augmented_add(stats, None)`] when stats are requested.
+/// FSR-side action schema: plain [`action_schema`] when `stats_parsed_schema` is `None`,
+/// else [`action_schema_with_augmented_add`] with stats.
 pub(super) fn fsr_action_schema(stats_parsed_schema: Option<&SchemaRef>) -> SchemaRef {
     match stats_parsed_schema {
         None => action_schema(),

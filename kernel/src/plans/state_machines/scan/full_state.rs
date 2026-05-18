@@ -74,19 +74,14 @@ use crate::scan::StatsOutputMode;
 use crate::snapshot::Snapshot;
 
 /// Configured FSR plan source. Construct via [`FullState::for_table`] (or
-/// [`Snapshot::full_state_builder`](crate::snapshot::Snapshot::full_state_builder)), then
-/// [`FullStateBuilder::build`] to validate the configuration, then [`Self::state_machine`]
-/// to drive plans through an engine.
-///
-/// The snapshot is the single source of truth for the table's log segment and
-/// `_last_checkpoint` hint; there is no escape hatch for overriding the resolved
-/// [`CheckpointShape`].
+/// [`Snapshot::full_state_builder`](crate::snapshot::Snapshot::full_state_builder)), call
+/// [`FullStateBuilder::build`], then drive [`Self::state_machine`] through an engine. The
+/// snapshot is the sole source of truth for the table's log segment and `_last_checkpoint`
+/// hint; the resolver derives shape from those, no override hook.
 #[derive(Debug, Clone)]
 pub struct FullState {
     snapshot: Arc<Snapshot>,
-    /// `Some` iff the caller asked for parsed stats via
-    /// [`FullStateBuilder::with_stats`]. Derived once at `build()` time so the SM body
-    /// stays cheap.
+    /// `Some` iff [`FullStateBuilder::with_stats`] was called. Derived at `build()` time.
     state_info: Option<Arc<StateInfo>>,
 }
 
@@ -106,11 +101,7 @@ impl FullState {
         }
     }
 
-    /// Wrap FSR plan composition in a [`CoroutineSM`].
-    ///
-    /// Yields to the engine for shape resolution (SchemaQuery / V2 manifest publication via
-    /// [`resolve_checkpoint_shape`]) when the snapshot's `_last_checkpoint` hint is
-    /// insufficient, then composes the FSR plans.
+    /// Coroutine SM: [`resolve_checkpoint_shape`] then [`build_fsr_plans`].
     pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let snapshot = self.snapshot.clone();
         let state_info = self.state_info.clone();
@@ -128,23 +119,17 @@ impl FullState {
 }
 
 impl FullStateBuilder {
-    /// Request that FSR plans surface parsed `add.stats_parsed` rows.
-    ///
-    /// Sets `with_stats = true`; `build()` then constructs the [`StateInfo`]
-    /// whose `physical_stats_schema` is used by the SM resolver to detect
-    /// native `add.stats_parsed` columns and by plan builders to project them.
+    /// Surface `add.stats_parsed` in FSR output. `build()` then derives the
+    /// `physical_stats_schema` (used by the resolver to detect native
+    /// `add.stats_parsed` and by plan builders to project it).
     pub fn with_stats(mut self) -> Self {
         self.with_stats = true;
         self
     }
 
-    /// Finalize the builder into a [`FullState`] value.
-    ///
-    /// When `with_stats` is set, derives the `physical_stats_schema` for the
-    /// snapshot's full data schema by constructing a
-    /// [`StateInfo`](crate::scan::state_info::StateInfo) with no predicate and
-    /// [`StatsOutputMode::AllColumns`]. Without `with_stats`, no `StateInfo`
-    /// is constructed and plan composition has no stats wiring.
+    /// Finalize into a [`FullState`]. When [`Self::with_stats`] was called, constructs a
+    /// [`StateInfo`] from the snapshot's logical schema with no predicate and
+    /// [`StatsOutputMode::AllColumns`]; otherwise no `StateInfo` is built.
     pub fn build(self) -> Result<FullState, DeltaError> {
         let state_info = if self.with_stats {
             let logical_schema = self.snapshot.schema();

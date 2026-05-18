@@ -35,17 +35,13 @@ use crate::schema::{arc_schema, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::{delta_error, FileMeta};
 
-/// Resolved checkpoint encoding + schema hints. `actions_schema_subset` keys the top-level
-/// checkpoint scan in [`super::plans::build_fsr_plans`]; `has_sidecars` decides whether
-/// the FSR sidecar Load is appended to the plan vector.
-///
-/// `requested_stats_schema` carries the per-scan physical stats schema (the projection that
-/// `data_skipping` would consume); `has_stats_parsed` records whether the leaf parquet has a
-/// compatible native `add.stats_parsed` field, letting plan builders pick `col(["add",
-/// "stats_parsed"])` instead of `parse_json(col(["add", "stats"]))`. `manifest_relation` is
-/// the handle of the V2 multipart manifest scan published by
-/// [`resolve_checkpoint_shape`], so downstream plan builders can `RelationRef` it instead of
-/// re-scanning.
+/// Resolved checkpoint encoding + schema hints. Drives FSR / Scan plan composition:
+/// - `file_format`, `has_sidecars`, `actions_schema_subset`: top-level scan / sidecar Load.
+/// - `requested_stats_schema`: per-scan physical stats schema for projection.
+/// - `has_stats_parsed`: leaf parquet has compatible native `add.stats_parsed` -> plan
+///   builders prefer `col(["add", "stats_parsed"])` over `parse_json(col(["add", "stats"]))`.
+/// - `manifest_relation`: V2 multipart manifest handle published by
+///   [`resolve_checkpoint_shape`]; downstream `RelationRef`s it instead of re-scanning.
 #[derive(Clone, Debug)]
 pub struct CheckpointShape {
     pub file_format: FileFormat,
@@ -164,19 +160,12 @@ pub(super) fn checkpoint_manifest_scan_schema_with_stats(
     arc_schema(fields)
 }
 
-/// Canonical SM-driven checkpoint shape resolver. Used by both FSR and Scan plan builders.
+/// Canonical SM-driven checkpoint shape resolver shared by FSR and Scan plan builders.
 ///
-/// Always derives the cheap fields from the snapshot's `_last_checkpoint` hint first; yields
-/// at most one [`PhaseOperation::SchemaQuery`] (when the hint lacks a schema) and at most one
-/// [`PhaseOperation::Plans`] (V2 multipart, to publish the manifest as a relation and extract
-/// sidecar URLs in a single phase). Sets `requested_stats_schema = physical_stats_schema`
-/// and populates `has_stats_parsed` from the most authoritative schema we observe (hint,
-/// probed top-level parquet, or probed first sidecar parquet).
-///
-/// For V2 multipart, registers the manifest scan as the [`FSR_CHECKPOINT_TOP`] relation in
-/// the context's registry so [`super::plans::build_fsr_plans`] reuses it (via
-/// [`crate::plans::ir::relation_registry::RelationRegistry::relation_ref`]) instead of
-/// scanning the manifest a second time.
+/// Yields at most one [`PhaseOperation::SchemaQuery`] (when `_last_checkpoint` lacks a
+/// schema) and at most one [`PhaseOperation::Plans`] (V2 multipart: publishes the manifest
+/// as `FSR_CHECKPOINT_TOP` and extracts sidecar URLs in the same phase, so
+/// [`super::plans::build_fsr_plans`] reuses the relation instead of re-scanning).
 pub(super) async fn resolve_checkpoint_shape(
     ctx: &mut Context<'_>,
     snapshot: &Snapshot,
@@ -192,7 +181,8 @@ pub(super) async fn resolve_checkpoint_shape(
     // schema. The hint reflects what the writer recorded for this checkpoint's actions, so a
     // compatible `add.stats_parsed` here means the leaf parquet has it too.
     if let (Some(hint), Some(reqd)) = (hint_schema.as_ref(), physical_stats_schema) {
-        shape.has_stats_parsed = check_stats_parsed_compat(hint.as_ref(), reqd.as_ref());
+        shape.has_stats_parsed =
+            LogSegment::schema_has_compatible_stats_parsed(hint.as_ref(), reqd.as_ref());
     }
 
     // Fall back to a top-level SchemaQuery when the hint is missing but checkpoint files
@@ -217,8 +207,10 @@ pub(super) async fn resolve_checkpoint_shape(
             shape.actions_schema_subset =
                 checkpoint_actions_schema_projection(&checkpoint_schema)?;
             if let Some(reqd) = physical_stats_schema {
-                shape.has_stats_parsed =
-                    check_stats_parsed_compat(checkpoint_schema.as_ref(), reqd.as_ref());
+                shape.has_stats_parsed = LogSegment::schema_has_compatible_stats_parsed(
+                    checkpoint_schema.as_ref(),
+                    reqd.as_ref(),
+                );
             }
         }
     }
@@ -235,18 +227,8 @@ pub(super) async fn resolve_checkpoint_shape(
     Ok(shape)
 }
 
-/// Returns `true` iff the leaf parquet `add.stats_parsed` is type-compatible with the
-/// requested stats schema. The compatibility check accepts widening (int→long,
-/// long→timestamp, etc.) and missing/extra columns.
-fn check_stats_parsed_compat(checkpoint_schema: &StructType, requested: &StructType) -> bool {
-    LogSegment::schema_has_compatible_stats_parsed(checkpoint_schema, requested)
-}
-
-/// Yield a single [`PhaseOperation::Plans`] that (a) scans the V2 manifest into a registered
-/// relation under [`FSR_CHECKPOINT_TOP`] and (b) extracts sidecar URLs via
-/// [`SidecarCollector`]. Optionally yields a follow-up [`PhaseOperation::SchemaQuery`] on
-/// the first sidecar to refresh `has_stats_parsed` from the actual sidecar parquet (sidecars
-/// are always parquet, even when the manifest is JSON).
+/// V2 multipart: publish manifest scan + sidecar extraction in one `Plans` phase, then
+/// probe the first (always-parquet) sidecar via `SchemaQuery` when stats are requested.
 async fn publish_v2_manifest_and_probe_sidecar(
     ctx: &mut Context<'_>,
     snapshot: &Snapshot,
@@ -316,7 +298,8 @@ async fn publish_v2_manifest_and_probe_sidecar(
             .await
             .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
         let sidecar_schema = sidecar_state.take_schema()?;
-        shape.has_stats_parsed = check_stats_parsed_compat(sidecar_schema.as_ref(), reqd.as_ref());
+        shape.has_stats_parsed =
+            LogSegment::schema_has_compatible_stats_parsed(sidecar_schema.as_ref(), reqd.as_ref());
     }
 
     Ok(manifest_handle)
