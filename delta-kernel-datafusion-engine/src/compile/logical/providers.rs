@@ -16,8 +16,7 @@ use std::sync::Arc;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::provider_as_source;
 use datafusion_common::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
-    Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
 };
 use datafusion_common::error::DataFusionError;
 use datafusion_expr::logical_plan::LogicalPlan;
@@ -34,10 +33,7 @@ use crate::exec::{FileListingExec, NullabilityValidationExec};
 ///
 /// The schemas must have matching field counts at every level; if a struct's child counts differ,
 /// we fall back to `source`'s structure for that subtree.
-pub(super) fn merge_target_nullability(
-    source: &ArrowSchema,
-    strict: &ArrowSchema,
-) -> ArrowSchema {
+pub(super) fn merge_target_nullability(source: &ArrowSchema, strict: &ArrowSchema) -> ArrowSchema {
     let fields: Vec<Arc<ArrowField>> = if source.fields().len() == strict.fields().len() {
         source
             .fields()

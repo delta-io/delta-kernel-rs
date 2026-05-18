@@ -111,13 +111,16 @@ fn compile_declarative_node_logical(
             }
         }
         DeclarativePlanNode::RelationRef(handle) => {
-            let provider = ctx.relation_providers.get(handle.id.as_str()).ok_or_else(|| {
-                plan_compilation(format!(
-                    "RelationRef references unregistered handle id {} (name `{}`); the \
+            let provider = ctx
+                .relation_providers
+                .get(handle.id.as_str())
+                .ok_or_else(|| {
+                    plan_compilation(format!(
+                        "RelationRef references unregistered handle id {} (name `{}`); the \
                      producing plan must run before any consumer compiles",
-                    handle.id, handle.name
-                ))
-            })?;
+                        handle.id, handle.name
+                    ))
+                })?;
             LogicalPlanBuilder::scan(
                 format!("relation_{}", handle.id),
                 datafusion::datasource::provider_as_source(Arc::clone(provider)),

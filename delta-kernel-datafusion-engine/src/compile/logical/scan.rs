@@ -200,7 +200,10 @@ fn build_scan_arrow_schema(node: &ScanNode) -> Result<ArrowSchema, DataFusionErr
             }
         })
         .collect::<Vec<_>>();
-    Ok(ArrowSchema::new_with_metadata(fields, schema.metadata().clone()))
+    Ok(ArrowSchema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Build a projection that passes through every column of `pass_through_schema_src` and

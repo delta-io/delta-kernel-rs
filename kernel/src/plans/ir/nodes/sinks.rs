@@ -175,7 +175,11 @@ pub struct LoadSink {
 
 impl LoadSink {
     /// Build a Load sink with default file-meta hints and no optional policies.
-    pub fn new(output_relation: RelationHandle, file_schema: SchemaRef, file_type: FileType) -> Self {
+    pub fn new(
+        output_relation: RelationHandle,
+        file_schema: SchemaRef,
+        file_type: FileType,
+    ) -> Self {
         Self {
             output_relation,
             file_schema,
@@ -210,7 +214,6 @@ impl LoadSink {
         self.dv_ref = Some(dv_ref);
         self
     }
-
 }
 
 /// What the engine does with the terminal row stream.
@@ -246,4 +249,3 @@ fn default_scan_file_columns() -> ScanFileColumns {
         record_count: None,
     }
 }
-

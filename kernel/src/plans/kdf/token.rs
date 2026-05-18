@@ -7,8 +7,8 @@
 //!
 //! [`SinkType::Consume`]: crate::plans::ir::nodes::SinkType::Consume
 
-use uuid::Uuid;
 use strum::Display as StrumDisplay;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StrumDisplay)]
 #[strum(serialize_all = "snake_case")]

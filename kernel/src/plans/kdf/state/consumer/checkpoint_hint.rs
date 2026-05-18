@@ -90,7 +90,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{Int32Array, Int64Array, RecordBatch};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
     use crate::engine::arrow_data::ArrowEngineData;
 
     #[test]

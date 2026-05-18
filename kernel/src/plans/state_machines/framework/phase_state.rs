@@ -74,7 +74,11 @@ impl PhaseState {
     pub fn submit_kdf_handle(&self, handle: FinishedHandle) -> Result<(), DeltaError> {
         let mut inner = self.lock();
         let token = handle.token;
-        if inner.kdf_entries.insert(token.clone(), handle.erased).is_some() {
+        if inner
+            .kdf_entries
+            .insert(token.clone(), handle.erased)
+            .is_some()
+        {
             return Err(delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
                 "submit_kdf_handle: token `{token}` already submitted",

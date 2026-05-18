@@ -112,13 +112,9 @@ async fn parity_filter_matches_kernel_semantics() {
     )));
     let expected = kernel_filter(&base, pred.as_ref());
 
-    let got = run_to_batches(
-        PlanBuilder::values(schema, rows)
-            .unwrap()
-            .filter(pred),
-    )
-    .await
-    .unwrap();
+    let got = run_to_batches(PlanBuilder::values(schema, rows).unwrap().filter(pred))
+        .await
+        .unwrap();
     assert_batches_equal(&expected, &got);
 }
 
@@ -169,10 +165,13 @@ async fn parity_ordered_union_matches_kernel_concat() {
         concat_batches(&b_left.schema(), &[b_left, b_right]).expect("concat union reference");
 
     let got = run_to_batches(
-        PlanBuilder::union(vec![
-            PlanBuilder::values(Arc::clone(&schema), left_rows).unwrap(),
-            PlanBuilder::values(Arc::clone(&schema), right_rows).unwrap(),
-        ], true)
+        PlanBuilder::union(
+            vec![
+                PlanBuilder::values(Arc::clone(&schema), left_rows).unwrap(),
+                PlanBuilder::values(Arc::clone(&schema), right_rows).unwrap(),
+            ],
+            true,
+        )
         .unwrap(),
     )
     .await
@@ -342,8 +341,7 @@ async fn parity_left_anti_join_matches_reference_probe_order() {
         .unwrap(),
     );
 
-    let build =
-        PlanBuilder::values(build_schema.clone(), vec![vec![Scalar::Long(1)]]).unwrap();
+    let build = PlanBuilder::values(build_schema.clone(), vec![vec![Scalar::Long(1)]]).unwrap();
     let probe_rows = vec![
         vec![Scalar::Long(2), Scalar::Long(20)],
         vec![Scalar::Long(1), Scalar::Long(10)],
