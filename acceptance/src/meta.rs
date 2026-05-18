@@ -27,25 +27,14 @@ struct TestCaseInfoJson {
     name: String,
     description: String,
     #[serde(default)]
-    read_mode: DatReadMode,
-}
-
-/// Read execution mode for DAT reader harnesses.
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum DatReadMode {
-    /// Standard scan path (`Snapshot::scan_builder().build().execute(...)`).
-    #[default]
-    Scan,
-    /// DataFusion full-state path; read only live add actions from `Snapshot::full_state`.
-    FsrAddOnly,
+    read_mode: Option<String>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct TestCaseInfo {
     name: String,
     description: String,
-    read_mode: DatReadMode,
+    read_mode: Option<String>,
     root_dir: PathBuf,
 }
 
@@ -60,9 +49,10 @@ impl TestCaseInfo {
         &self.root_dir
     }
 
-    /// Read execution mode for DAT reader harnesses.
-    pub fn read_mode(&self) -> DatReadMode {
-        self.read_mode
+    /// Read execution mode declared in `test_case_info.json` (e.g. `"fsr_add_only"`).
+    /// `None` means the default scan-based reader.
+    pub fn read_mode(&self) -> Option<&str> {
+        self.read_mode.as_deref()
     }
 
     async fn versions(&self) -> TestResult<(TableVersionMetaData, Vec<TableVersionMetaData>)> {
@@ -159,20 +149,6 @@ pub fn read_dat_case(case_root: impl AsRef<Path>) -> TestResult<TestCaseInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dat_read_mode_defaults_to_scan() {
-        let raw = r#"{"name":"n","description":"d"}"#;
-        let info: TestCaseInfoJson = serde_json::from_str(raw).expect("parse");
-        assert_eq!(info.read_mode, DatReadMode::Scan);
-    }
-
-    #[test]
-    fn dat_read_mode_parses_fsr_add_only() {
-        let raw = r#"{"name":"n","description":"d","read_mode":"fsr_add_only"}"#;
-        let info: TestCaseInfoJson = serde_json::from_str(raw).expect("parse");
-        assert_eq!(info.read_mode, DatReadMode::FsrAddOnly);
-    }
 
     #[tokio::test]
     async fn test_read_test_case() {

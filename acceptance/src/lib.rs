@@ -1,15 +1,5 @@
-//! Helpers to validate Engine implementations.
-//!
-//! ## DAT read harness modes
-//!
-//! DAT reader test cases can optionally declare `"read_mode"` in
-//! `test_case_info.json`:
-//!
-//! - `"scan"` (default): validate via `Snapshot::scan`.
-//! - `"fsr_add_only"`: validate DataFusion-driven `Snapshot::full_state` by comparing its terminal
-//!   add-action path set against selected scan files.
-//!
-//! Missing `read_mode` is treated as `"scan"` for backward compatibility.
+//! Helpers to validate Engine implementations. DAT reader cases may set `read_mode`
+//! on `TestCaseInfo`; the DataFusion harness honors `"fsr_add_only"`.
 
 pub mod acceptance_workloads;
 pub mod data;

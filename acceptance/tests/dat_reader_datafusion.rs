@@ -2,21 +2,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 use acceptance::data::{collect_fsr_add_paths, collect_selected_scan_file_paths};
-use acceptance::{read_dat_case, AssertionError, DatReadMode, TestCaseInfo, TestResult};
+use acceptance::{read_dat_case, AssertionError, TestCaseInfo, TestResult};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
+
+const FSR_ADD_ONLY: &str = "fsr_add_only";
 
 // TODO(zach): skip iceberg_compat_v1 test until DAT is fixed
 static SKIPPED_TESTS: &[&str; 1] = &["iceberg_compat_v1"];
 
-fn ci_forced_read_mode(root_dir: &str) -> Option<DatReadMode> {
+fn ci_forced_read_mode(root_dir: &str) -> Option<&'static str> {
     let raw = std::env::var("DAT_DF_FSR_CASES").ok()?;
     let wanted = raw
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .any(|suffix| root_dir.ends_with(suffix));
-    wanted.then_some(DatReadMode::FsrAddOnly)
+    wanted.then_some(FSR_ADD_ONLY)
 }
 
 fn ci_selected_case(root_dir: &str) -> bool {
@@ -84,17 +86,17 @@ fn reader_datafusion_test(path: &Path) -> datatest_stable::Result<()> {
             let table_root = case.table_root().unwrap();
             let engine = test_utils::create_default_engine(&table_root).unwrap();
             let read_mode = ci_forced_read_mode(case.root_dir().to_string_lossy().as_ref())
-                .unwrap_or_else(|| case.read_mode());
+                .or_else(|| case.read_mode());
 
             case.assert_metadata(engine.clone()).await.unwrap();
             match read_mode {
-                DatReadMode::Scan => {
-                    acceptance::data::assert_scan_metadata(engine.clone(), &case)
+                Some(FSR_ADD_ONLY) => {
+                    assert_fsr_add_only_matches_scan_files(engine.clone(), &case)
                         .await
                         .unwrap();
                 }
-                DatReadMode::FsrAddOnly => {
-                    assert_fsr_add_only_matches_scan_files(engine.clone(), &case)
+                _ => {
+                    acceptance::data::assert_scan_metadata(engine.clone(), &case)
                         .await
                         .unwrap();
                 }
