@@ -31,29 +31,6 @@ pub enum AdvanceResult<R> {
     Done(R),
 }
 
-impl<R> AdvanceResult<R> {
-    pub fn is_done(&self) -> bool {
-        matches!(self, Self::Done(_))
-    }
-
-    /// Extract the terminal result. Panics on `Continue` — test-only.
-    #[cfg(test)]
-    pub fn unwrap(self) -> R {
-        match self {
-            Self::Done(r) => r,
-            Self::Continue => panic!("called unwrap on AdvanceResult::Continue"),
-        }
-    }
-
-    /// Convert to `Option<R>` — `Some` iff `Done`, `None` for `Continue`.
-    pub fn into_result(self) -> Option<R> {
-        match self {
-            Self::Done(r) => Some(r),
-            Self::Continue => None,
-        }
-    }
-}
-
 /// The contract kernel state machines implement and engine-side executors
 /// drive.
 ///
