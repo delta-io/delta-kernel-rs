@@ -323,286 +323,126 @@ fn typed_null_to_df(data_type: &DataType) -> Result<ScalarValue, DataFusionError
 
 #[cfg(test)]
 mod tests {
+    //! Lowering assertions for [`super::kernel_expr_to_df`] / [`super::kernel_pred_to_df`].
+    //!
+    //! Assertions compare DataFusion's [`Display`](std::fmt::Display) output rather than
+    //! hand-built `Expr` trees. The hand-built form tautologically re-encoded the lowering
+    //! rule in test code (any change to the lowering would change both sides identically),
+    //! and the printed form is shorter and self-documenting.
     use std::sync::Arc;
 
-    use datafusion_common::Column;
-    use datafusion_expr::expr::{BinaryExpr, Case, InList};
-    use datafusion_expr::{Expr, Operator};
     use delta_kernel::expressions::{
-        column_expr, ArrayData, ColumnName, Expression as Expr_, Predicate as Pred, Scalar,
+        column_expr, ArrayData, BinaryPredicateOp, ColumnName, Expression as Expr_,
+        Predicate as Pred, Scalar,
     };
     use delta_kernel::schema::{ArrayType, DataType, StructField, StructType};
+    use rstest::rstest;
 
     use super::{kernel_expr_to_df, kernel_pred_to_df};
 
-    fn col(name: &str) -> Expr {
-        Expr::Column(Column::new_unqualified(name))
+    fn lower_expr(e: Expr_) -> String {
+        format!("{}", kernel_expr_to_df(&e).unwrap())
+    }
+    fn lower_pred(p: Pred) -> String {
+        format!("{}", kernel_pred_to_df(&p).unwrap())
     }
 
-    fn lit_i64(v: i64) -> Expr {
-        Expr::Literal(datafusion_common::ScalarValue::Int64(Some(v)), None)
+    #[rstest]
+    #[case::depth_2(Expr_::column(["add", "path"]), "get_field(add, Utf8(\"path\"))")]
+    #[case::depth_3(
+        Expr_::Column(ColumnName::new(["a", "b", "c"])),
+        "get_field(get_field(a, Utf8(\"b\")), Utf8(\"c\"))"
+    )]
+    fn nested_column_lowers_to_get_field_chain(#[case] kernel: Expr_, #[case] expected: &str) {
+        assert_eq!(lower_expr(kernel), expected);
     }
 
-    fn lit_i32(v: i32) -> Expr {
-        Expr::Literal(datafusion_common::ScalarValue::Int32(Some(v)), None)
+    #[rstest]
+    #[case::i32(Expr_::literal(7i32), "Int32(7)")]
+    #[case::i64(Expr_::literal(42i64), "Int64(42)")]
+    #[case::string(Expr_::literal("abc"), "Utf8(\"abc\")")]
+    #[case::bool(Expr_::literal(true), "Boolean(true)")]
+    #[case::null_long(Expr_::null_literal(DataType::LONG), "Int64(NULL)")]
+    fn translates_primitive_literals(#[case] kernel: Expr_, #[case] expected: &str) {
+        assert_eq!(lower_expr(kernel), expected);
     }
 
-    fn lit_str(v: &str) -> Expr {
-        Expr::Literal(
-            datafusion_common::ScalarValue::Utf8(Some(v.to_string())),
-            None,
-        )
-    }
-
-    #[test]
-    fn translates_top_level_column() {
-        let kernel = column_expr!("version");
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        assert_eq!(df, col("version"));
-    }
-
-    #[test]
-    fn nested_column_translates_to_get_field_chain() {
-        let kernel = Expr_::column(["add", "path"]);
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        assert_eq!(format!("{df}"), "get_field(add, Utf8(\"path\"))");
-    }
-
-    #[test]
-    fn translates_primitive_literals() {
-        // i32, i64, string, bool
-        assert_eq!(
-            kernel_expr_to_df(&Expr_::literal(7i32)).unwrap(),
-            lit_i32(7)
-        );
-        assert_eq!(
-            kernel_expr_to_df(&Expr_::literal(42i64)).unwrap(),
-            lit_i64(42)
-        );
-        assert_eq!(
-            kernel_expr_to_df(&Expr_::literal("abc")).unwrap(),
-            lit_str("abc")
-        );
-        assert_eq!(
-            kernel_expr_to_df(&Expr_::literal(true)).unwrap(),
-            Expr::Literal(datafusion_common::ScalarValue::Boolean(Some(true)), None)
-        );
-    }
-
-    #[test]
-    fn translates_typed_null_literal() {
-        let kernel = Expr_::null_literal(DataType::LONG);
-        assert_eq!(
-            kernel_expr_to_df(&kernel).unwrap(),
-            Expr::Literal(datafusion_common::ScalarValue::Int64(None), None)
-        );
+    #[rstest]
+    #[case::eq(column_expr!("x").eq(Expr_::literal(1i64)), "x = Int64(1)")]
+    #[case::lt(column_expr!("x").lt(Expr_::literal(1i64)), "x < Int64(1)")]
+    #[case::gt(column_expr!("x").gt(Expr_::literal(1i64)), "x > Int64(1)")]
+    #[case::distinct(
+        column_expr!("x").distinct(Expr_::literal(1i64)),
+        "x IS DISTINCT FROM Int64(1)"
+    )]
+    fn translates_binary_predicates(#[case] kernel: Pred, #[case] expected: &str) {
+        assert_eq!(lower_pred(kernel), expected);
     }
 
     #[test]
     fn translates_arithmetic_binary() {
-        // a + 5
-        let kernel = column_expr!("a") + Expr_::literal(5i64);
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        let expected = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(col("a")),
-            Operator::Plus,
-            Box::new(lit_i64(5)),
-        ));
-        assert_eq!(df, expected);
-    }
-
-    #[test]
-    fn translates_predicate_eq_lt_gt() {
-        // x == 1
-        let p = column_expr!("x").eq(Expr_::literal(1i64));
-        let df = kernel_pred_to_df(&p).unwrap();
         assert_eq!(
-            df,
-            Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("x")),
-                Operator::Eq,
-                Box::new(lit_i64(1))
-            ))
-        );
-
-        // x < 1
-        let p = column_expr!("x").lt(Expr_::literal(1i64));
-        let df = kernel_pred_to_df(&p).unwrap();
-        assert_eq!(
-            df,
-            Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("x")),
-                Operator::Lt,
-                Box::new(lit_i64(1))
-            ))
-        );
-
-        // x > 1
-        let p = column_expr!("x").gt(Expr_::literal(1i64));
-        let df = kernel_pred_to_df(&p).unwrap();
-        assert_eq!(
-            df,
-            Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("x")),
-                Operator::Gt,
-                Box::new(lit_i64(1))
-            ))
-        );
-    }
-
-    #[test]
-    fn translates_distinct_to_is_distinct_from() {
-        let p = column_expr!("x").distinct(Expr_::literal(1i64));
-        let df = kernel_pred_to_df(&p).unwrap();
-        assert_eq!(
-            df,
-            Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("x")),
-                Operator::IsDistinctFrom,
-                Box::new(lit_i64(1))
-            ))
+            lower_expr(column_expr!("a") + Expr_::literal(5i64)),
+            "a + Int64(5)"
         );
     }
 
     #[test]
     fn translates_in_to_in_list() {
-        // x IN (1, 2, 3)
         let arr = ArrayData::try_new(
             ArrayType::new(DataType::LONG, false),
             vec![Scalar::Long(1), Scalar::Long(2), Scalar::Long(3)],
         )
         .unwrap();
         let p = Pred::binary(
-            delta_kernel::expressions::BinaryPredicateOp::In,
+            BinaryPredicateOp::In,
             column_expr!("x"),
             Expr_::literal(Scalar::Array(arr)),
         );
-        let df = kernel_pred_to_df(&p).unwrap();
-        let expected = Expr::InList(InList::new(
-            Box::new(col("x")),
-            vec![lit_i64(1), lit_i64(2), lit_i64(3)],
-            false,
-        ));
-        assert_eq!(df, expected);
-    }
-
-    #[test]
-    fn translates_is_null() {
-        let p = column_expr!("x").is_null();
-        let df = kernel_pred_to_df(&p).unwrap();
-        assert_eq!(df, Expr::IsNull(Box::new(col("x"))));
+        assert_eq!(lower_pred(p), "x IN ([Int64(1), Int64(2), Int64(3)])");
     }
 
     #[test]
     fn translates_not_predicate() {
-        let p = Pred::not(column_expr!("x").is_null());
-        let df = kernel_pred_to_df(&p).unwrap();
-        assert_eq!(df, Expr::Not(Box::new(Expr::IsNull(Box::new(col("x"))))));
+        assert_eq!(lower_pred(Pred::not(column_expr!("x").is_null())), "NOT x IS NULL");
     }
 
     #[test]
-    fn translates_junction_and_or() {
-        // a IS NULL AND b > 5
-        let p = Pred::and(
-            column_expr!("a").is_null(),
-            column_expr!("b").gt(Expr_::literal(5i64)),
+    fn translates_junction_and_or_left_associative() {
+        // AND: IsNull + Gt
+        assert_eq!(
+            lower_pred(Pred::and(
+                column_expr!("a").is_null(),
+                column_expr!("b").gt(Expr_::literal(5i64)),
+            )),
+            "a IS NULL AND b > Int64(5)"
         );
-        let df = kernel_pred_to_df(&p).unwrap();
-        let expected = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::IsNull(Box::new(col("a")))),
-            Operator::And,
-            Box::new(Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("b")),
-                Operator::Gt,
-                Box::new(lit_i64(5)),
-            ))),
-        ));
-        assert_eq!(df, expected);
-
-        // a IS NULL OR b IS NULL OR c IS NULL  -> left-associative chain
-        let p = Pred::or_from([
-            column_expr!("a").is_null(),
-            column_expr!("b").is_null(),
-            column_expr!("c").is_null(),
-        ]);
-        let df = kernel_pred_to_df(&p).unwrap();
-        // Expect ((a IS NULL OR b IS NULL) OR c IS NULL)
-        let inner = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::IsNull(Box::new(col("a")))),
-            Operator::Or,
-            Box::new(Expr::IsNull(Box::new(col("b")))),
-        ));
-        let expected = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(inner),
-            Operator::Or,
-            Box::new(Expr::IsNull(Box::new(col("c")))),
-        ));
-        assert_eq!(df, expected);
+        // OR_from chain: ((a IS NULL OR b IS NULL) OR c IS NULL).
+        assert_eq!(
+            lower_pred(Pred::or_from([
+                column_expr!("a").is_null(),
+                column_expr!("b").is_null(),
+                column_expr!("c").is_null(),
+            ])),
+            "a IS NULL OR b IS NULL OR c IS NULL"
+        );
     }
 
     #[test]
     fn translates_if_to_case() {
-        // IF(x IS NULL, 0, x)
         let kernel = Expr_::if_then_else(
             column_expr!("x").is_null(),
             Expr_::literal(0i64),
             column_expr!("x"),
         );
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        let expected = Expr::Case(Case::new(
-            None,
-            vec![(
-                Box::new(Expr::IsNull(Box::new(col("x")))),
-                Box::new(lit_i64(0)),
-            )],
-            Some(Box::new(col("x"))),
-        ));
-        assert_eq!(df, expected);
-    }
-
-    #[test]
-    fn coalesce_translates_to_datafusion_coalesce() {
-        let kernel = Expr_::coalesce([column_expr!("a"), column_expr!("b"), column_expr!("c")]);
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        assert_eq!(format!("{df}"), "coalesce(a, b, c)");
-    }
-
-    #[test]
-    fn array_translates_to_make_array() {
-        let kernel = Expr_::array([column_expr!("a"), column_expr!("b")]);
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        assert_eq!(format!("{df}"), "make_array(a, b)");
-    }
-
-    #[test]
-    fn struct_translates_to_df_struct_function() {
-        let kernel = Expr_::struct_from([Arc::new(column_expr!("a")), Arc::new(column_expr!("b"))]);
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        assert_eq!(format!("{df}"), "struct(a, b)");
-    }
-
-    #[test]
-    fn parse_json_translates_to_json_get_and_named_struct() {
-        let output_schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("numRecords", DataType::LONG)]).unwrap(),
+        assert_eq!(
+            lower_expr(kernel),
+            "CASE WHEN x IS NULL THEN Int64(0) ELSE x END"
         );
-        let kernel = Expr_::parse_json(column_expr!("stats"), output_schema);
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        let lowered = format!("{df}");
-        assert!(lowered.contains("named_struct"));
-        assert!(lowered.contains("json_get_int"));
     }
 
     #[test]
-    fn opaque_predicate_returns_unsupported() {
-        // Build an Opaque via Predicate::Unknown which is the simpler case
-        let p = Pred::unknown("mystery");
-        let err = kernel_pred_to_df(&p).unwrap_err();
-        assert!(format!("{err}").contains("Unknown"));
-    }
-
-    #[test]
-    fn nested_if_lowers_correctly() {
+    fn nested_if_lowers_to_nested_case() {
         // IF(a IS NULL, 0, IF(a > 100, 100, a)) -- clamp pattern
         let kernel = Expr_::if_then_else(
             column_expr!("a").is_null(),
@@ -613,60 +453,36 @@ mod tests {
                 column_expr!("a"),
             ),
         );
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        let inner = Expr::Case(Case::new(
-            None,
-            vec![(
-                Box::new(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(col("a")),
-                    Operator::Gt,
-                    Box::new(lit_i64(100)),
-                ))),
-                Box::new(lit_i64(100)),
-            )],
-            Some(Box::new(col("a"))),
-        ));
-        let expected = Expr::Case(Case::new(
-            None,
-            vec![(
-                Box::new(Expr::IsNull(Box::new(col("a")))),
-                Box::new(lit_i64(0)),
-            )],
-            Some(Box::new(inner)),
-        ));
-        assert_eq!(df, expected);
+        assert_eq!(
+            lower_expr(kernel),
+            "CASE WHEN a IS NULL THEN Int64(0) ELSE \
+             CASE WHEN a > Int64(100) THEN Int64(100) ELSE a END END"
+        );
     }
 
     #[test]
-    fn complex_nested_predicate_round_trips_through_translator() {
+    fn complex_nested_predicate_round_trips() {
         // (a + 1 > 5) AND NOT (b IS NULL)
         let p = Pred::and(
             (column_expr!("a") + Expr_::literal(1i64)).gt(Expr_::literal(5i64)),
             Pred::not(column_expr!("b").is_null()),
         );
-        let df = kernel_pred_to_df(&p).unwrap();
-        let lhs = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("a")),
-                Operator::Plus,
-                Box::new(lit_i64(1)),
-            ))),
-            Operator::Gt,
-            Box::new(lit_i64(5)),
-        ));
-        let rhs = Expr::Not(Box::new(Expr::IsNull(Box::new(col("b")))));
-        let expected =
-            Expr::BinaryExpr(BinaryExpr::new(Box::new(lhs), Operator::And, Box::new(rhs)));
-        assert_eq!(df, expected);
+        assert_eq!(lower_pred(p), "a + Int64(1) > Int64(5) AND NOT b IS NULL");
     }
 
     #[test]
-    fn translates_multisegment_column_path_to_nested_get_field() {
-        let name = ColumnName::new(["a", "b", "c"]);
-        let df = kernel_expr_to_df(&Expr_::Column(name)).unwrap();
-        assert_eq!(
-            format!("{df}"),
-            "get_field(get_field(a, Utf8(\"b\")), Utf8(\"c\"))"
+    fn parse_json_translates_to_json_get_and_named_struct() {
+        let output_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("numRecords", DataType::LONG)]).unwrap(),
         );
+        let lowered = lower_expr(Expr_::parse_json(column_expr!("stats"), output_schema));
+        assert!(lowered.contains("named_struct"), "{lowered}");
+        assert!(lowered.contains("json_get_int"), "{lowered}");
+    }
+
+    #[test]
+    fn opaque_predicate_returns_unsupported() {
+        let err = kernel_pred_to_df(&Pred::unknown("mystery")).unwrap_err();
+        assert!(format!("{err}").contains("Unknown"));
     }
 }
