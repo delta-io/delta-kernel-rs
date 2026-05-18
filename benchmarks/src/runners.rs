@@ -451,11 +451,11 @@ async fn extract_snapshot_protocol_metadata_from_fsr(
     let validated_metadata = snapshot.metadata().clone();
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let sm = snapshot.full_state()?;
-    let rp = executor
-        .drive_to_completion(sm)
-        .await
-        .map_err(|e| Error::generic(format!("execute full_state via DataFusionExecutor: {e}")))?;
+    let rp = snapshot
+        .full_state_builder()
+        .build()
+        .plans()
+        .map_err(|e| Error::generic(format!("build full_state plans: {e}")))?;
     let fsr_batches = executor.collect_result(rp).await.map_err(|e| {
         Error::generic(format!(
             "collect full_state results via DataFusionExecutor: {e}"
@@ -531,18 +531,14 @@ impl WorkloadRunner for ReadDataPlansRunner {
         if let Some(predicate) = &self.predicate {
             builder = builder.with_predicate(predicate.clone());
         }
-        let replay_scan = builder
+        let rp = builder
             .build_replay()
-            .map_err(|e| format!("build replay scan failed: {e}"))?;
-        let replay_sm = replay_scan
-            .scan_state_machine()
-            .map_err(|e| format!("build replay scan SM failed: {e}"))?;
+            .map_err(|e| format!("build replay scan failed: {e}"))?
+            .scan_plans()
+            .map_err(|e| format!("build replay scan plans failed: {e}"))?;
         let batches = self
             .runtime
-            .block_on(async {
-                let rp = self.executor.drive_to_completion(replay_sm).await?;
-                self.executor.collect_result(rp).await
-            })
+            .block_on(self.executor.collect_result(rp))
             .map_err(|e| format!("DataFusion read execution failed: {e}"))?;
         for batch in batches {
             black_box(batch);

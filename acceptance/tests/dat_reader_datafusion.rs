@@ -99,13 +99,14 @@ async fn assert_fsr_add_only_matches_scan_files(
 
     let scan_paths = collect_selected_scan_file_paths(&snapshot, Arc::clone(&engine))?;
 
-    let sm = snapshot.full_state()?;
     let executor = DataFusionExecutor::try_new_with_engine(engine).map_err(|e| {
         delta_kernel::Error::generic(format!("create DataFusionExecutor for full_state: {e}"))
     })?;
-    let rp = executor.drive_to_completion(sm).await.map_err(|e| {
-        delta_kernel::Error::generic(format!("execute full_state via DataFusionExecutor: {e}"))
-    })?;
+    let rp = snapshot
+        .full_state_builder()
+        .build()
+        .plans()
+        .map_err(|e| delta_kernel::Error::generic(format!("build full_state plans: {e}")))?;
     let fsr_batches = executor.collect_result(rp).await.map_err(|e| {
         delta_kernel::Error::generic(format!(
             "collect full_state result via DataFusionExecutor: {e}"

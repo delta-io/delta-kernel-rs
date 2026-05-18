@@ -255,15 +255,9 @@ async fn execute_read_workload_datafusion(
             ))
         })?
     } else {
-        let replay_sm = replay_scan
-            .scan_state_machine()
-            .map_err(|e| Error::generic(format!("build replay scan SM: {e}")))?;
-        let rp = executor.drive_to_completion(replay_sm).await.map_err(|e| {
-            Error::generic(format!(
-                "execute combined replay scan SM via DataFusionExecutor ({}): {e:?}",
-                config.name
-            ))
-        })?;
+        let rp = replay_scan
+            .scan_plans()
+            .map_err(|e| Error::generic(format!("build replay scan plans: {e}")))?;
         executor.collect_result(rp).await.map_err(|e| {
             Error::generic(format!(
                 "collect combined replay scan result via DataFusionExecutor ({}): {e:?}",
