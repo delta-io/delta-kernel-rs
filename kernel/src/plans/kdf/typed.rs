@@ -91,13 +91,9 @@ impl<O: Send + 'static> Extractor<O> {
     /// reduction. Decoding failures are wrapped in [`EngineError::internal`]
     /// so SM bodies can uniformly handle them on the engine-error path.
     pub fn extract(self, state: &PhaseState) -> Result<O, EngineError> {
-        let erased = state.take_by_token(&self.token).ok_or_else(|| {
-            EngineError::internal(delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "kdf::extract: no entry for token `{}`",
-                self.token,
-            ))
-        })?;
+        let erased = state
+            .take_by_token(&self.token)
+            .map_err(EngineError::internal)?;
         (self.extract)(erased).map_err(EngineError::internal)
     }
 }
