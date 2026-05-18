@@ -185,7 +185,7 @@ impl EngineError {
     /// `"internal engine error"` when a wire-reconstructed `Internal`
     /// comes back from the engine across the FFI. SM bodies that lift an
     /// `EngineError` returned by
-    /// [`Phase::execute`](crate::plans::state_machines::framework::coroutine::phase::Phase::execute)
+    /// [`Context::execute`](crate::plans::state_machines::framework::coroutine::context::Context::execute)
     /// into a [`DeltaError`](crate::plans::errors::DeltaError) `detail`
     /// must use this method instead of `to_string`, or the underlying
     /// cause is silently swallowed and the log line reads just

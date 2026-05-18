@@ -18,6 +18,7 @@ use delta_kernel_datafusion_engine::DataFusionExecutor;
 use tempfile::tempdir;
 use test_utils::schemas::single_long_schema;
 use url::Url;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn parity_phase_schema_query_matches_kernel_parquet_footer_read() {
@@ -69,7 +70,7 @@ async fn parity_phase_plans_relation_pipe_matches_kernel_literal_materialization
     let rows = vec![vec![Scalar::Long(100)], vec![Scalar::Long(200)]];
     let kernel_reference_batch = kernel_literal_batch(Arc::clone(&schema), &rows);
 
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let producer = PlanBuilder::values(Arc::clone(&schema), rows.clone())
         .unwrap()
         .into_relation("parity_pipe", &mut registry)

@@ -18,7 +18,7 @@
 //!
 //! This driver is built on [`genawaiter2`], which panics on protocol misuse (the body awaits a
 //! non-yield future, the body retains a `Co` after returning, etc.). The kernel's no-panic policy
-//! is preserved because the only path to `Co::yield_` is through [`Phase::execute`]; bodies
+//! is preserved because the only path to `Co::yield_` is through [`Context::execute`]; bodies
 //! awaiting that single API are correct by construction. Bodies are kernel-internal,
 //! `pub(crate)`-only, and FFI consumers see the SM only through `Box<dyn StateMachine>`, so the
 //! panic paths are unreachable in any externally-exposed code path.
@@ -40,7 +40,7 @@ use super::super::engine_error::EngineError;
 use super::super::phase_operation::PhaseOperation;
 use super::super::phase_state::PhaseState;
 use super::super::state_machine::{AdvanceResult, StateMachine};
-use super::phase::{PhaseCo, PhaseResume, PhaseYield};
+use super::context::{PhaseCo, PhaseResume, PhaseYield};
 use crate::bail_delta;
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
 
@@ -152,9 +152,12 @@ impl<R: Send + 'static> StateMachine for CoroutineSM<R> {
 mod tests {
     use std::sync::Arc;
 
+    use uuid::Uuid;
+
     use super::*;
     use crate::plans::ir::nodes::{RelationHandle, ScanNode, SinkType};
-    use crate::plans::ir::{DeclarativePlanNode, Plan};
+    use crate::plans::ir::{DeclarativePlanNode, Plan, RelationRegistry};
+    use crate::plans::state_machines::framework::coroutine::context::Context;
     use crate::plans::state_machines::framework::engine_error::{EngineError, EngineErrorKind};
 
     // A throwaway plan whose identity we don't care about — the SM tests
@@ -176,12 +179,12 @@ mod tests {
     #[test]
     fn two_phase_sm_executes_in_sequence() {
         let mut sm = CoroutineSM::<i64>::new(|mut co| async move {
-            let mut phase = super::super::phase::Phase(&mut co);
-            let _ = phase
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(Uuid::new_v4()));
+            let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_a")
                 .await
                 .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
-            let _ = phase
+            let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_b")
                 .await
                 .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
@@ -215,8 +218,8 @@ mod tests {
     #[test]
     fn multi_plan_phase_executes_in_one_engine_call() {
         let mut sm = CoroutineSM::<()>::new(|mut co| async move {
-            let mut phase = super::super::phase::Phase(&mut co);
-            let _ = phase
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(Uuid::new_v4()));
+            let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan(), toy_plan()]), "ab")
                 .await
                 .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
@@ -239,8 +242,8 @@ mod tests {
     #[test]
     fn engine_error_flows_to_body_as_resume_err() {
         let mut sm = CoroutineSM::<String>::new(|mut co| async move {
-            let mut phase = super::super::phase::Phase(&mut co);
-            match phase
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(Uuid::new_v4()));
+            match ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "p")
                 .await
             {

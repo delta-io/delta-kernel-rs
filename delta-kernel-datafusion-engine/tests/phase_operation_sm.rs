@@ -21,13 +21,14 @@ use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 use test_utils::schemas::single_long_schema;
 use url::Url;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn phase_plans_runs_relation_producer_and_registers_relation() {
     let schema = single_long_schema();
     let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
 
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let producer = PlanBuilder::values(schema, rows)
         .expect("literal")
         .into_relation("pipe", &mut registry)

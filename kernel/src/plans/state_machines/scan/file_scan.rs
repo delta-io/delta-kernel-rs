@@ -14,6 +14,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use super::checkpoint_shape::{
     checkpoint_shape_from_last_checkpoint, resolve_checkpoint_shape_for_scan, CheckpointShape,
 };
@@ -29,12 +31,10 @@ use crate::expressions::{
     col, BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate,
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::nodes::{
-    DvRef, FileType, RelationHandle, ScanFileColumns, SinkType,
-};
+use crate::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns, SinkType};
 use crate::plans::ir::{Plan, PlanBuilder, RelationRegistry, ResultPlan};
+use crate::plans::state_machines::framework::coroutine::context::Context;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
-use crate::plans::state_machines::framework::coroutine::phase::Phase;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::scan::Scan;
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType, ToSchema};
@@ -69,7 +69,7 @@ impl Scan {
         &self,
         live_actions_relation: RelationHandle,
     ) -> Result<ResultPlan, DeltaError> {
-        let mut registry = RelationRegistry::new();
+        let mut registry = RelationRegistry::new(Uuid::new_v4());
         let snapshot = self.snapshot();
         let partition_columns = replay_partition_columns(self);
         let _file_schema = scan_data_file_schema(self.physical_schema(), self.logical_schema())?;
@@ -81,24 +81,23 @@ impl Scan {
             snapshot.table_configuration().column_mapping_mode(),
         )?;
         // === data load: per-file parquet read keyed by the live-actions relation ===
-        let load_plan = PlanBuilder::from_relation_handle(live_actions_relation)
-            .load(
-                FSR_SCAN_DATA_ROWS_RAW,
-                self.physical_schema().clone(),
-                FileType::Parquet,
-                Some(snapshot.table_root().clone()),
-                vec![
-                    ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
-                    ColumnName::new(["path"]),
-                ],
-                ScanFileColumns {
-                    path: ColumnName::new(["path"]),
-                    size: Some(ColumnName::new(["size"])),
-                    record_count: None,
-                },
-                Some(DvRef::skip(ColumnName::new(["deletionVector"]))),
-                &mut registry,
-            )?;
+        let load_plan = PlanBuilder::from_relation_handle(live_actions_relation).load(
+            FSR_SCAN_DATA_ROWS_RAW,
+            self.physical_schema().clone(),
+            FileType::Parquet,
+            Some(snapshot.table_root().clone()),
+            vec![
+                ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
+                ColumnName::new(["path"]),
+            ],
+            ScanFileColumns {
+                path: ColumnName::new(["path"]),
+                size: Some(ColumnName::new(["size"])),
+                record_count: None,
+            },
+            Some(DvRef::skip(ColumnName::new(["deletionVector"]))),
+            &mut registry,
+        )?;
         // === final projection: physical -> logical schema, materialized into the result handle ===
         // The handle publishes the scan's logical schema directly; the projection chain feeds
         // matching rows.
@@ -139,8 +138,8 @@ impl Scan {
     pub fn scan_metadata_state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
         CoroutineSM::new(move |mut co| async move {
-            let mut phase = Phase(&mut co);
-            let shape = resolve_checkpoint_shape_for_scan(&mut phase, &scan).await?;
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(Uuid::new_v4()));
+            let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
             scan_metadata_plans_with_shape(&scan, shape)
         })
     }
@@ -172,8 +171,8 @@ impl Scan {
     pub fn scan_state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
         CoroutineSM::new(move |mut co| async move {
-            let mut phase = Phase(&mut co);
-            let shape = resolve_checkpoint_shape_for_scan(&mut phase, &scan).await?;
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(Uuid::new_v4()));
+            let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
             let metadata = scan_metadata_plans_with_shape(&scan, shape)?;
             let live_actions_relation = metadata.result_relation;
             let data = scan.scan_data_from_metadata_plans(live_actions_relation)?;
@@ -223,7 +222,7 @@ fn scan_metadata_plans_with_shape(
     // downstream actions chain can `relation_ref` it. The rebind reuses the strict
     // `action_schema()` -- the same contract `build_fsr_plans` publishes -- since the engine
     // realigns the relaxed JSON/Parquet output to that schema at the scan boundary.
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let mut plans: Vec<Plan> = Vec::new();
     let fsr = build_fsr_plans(snapshot.as_ref(), checkpoint_shape)?;
     let fsr_terminal_id = fsr.result_relation.id;
@@ -247,7 +246,8 @@ fn scan_metadata_plans_with_shape(
     })?;
     let fsr_results_handle =
         registry.register_relation_sink("scan.fsr_results", action_schema())?;
-    let terminal_rebound_plan = Plan::new(terminal_plan.root, SinkType::Relation(fsr_results_handle));
+    let terminal_rebound_plan =
+        Plan::new(terminal_plan.root, SinkType::Relation(fsr_results_handle));
     plans.push(terminal_rebound_plan);
 
     // === actions chain: filter live add paths, optionally augmenting with parsed stats /
@@ -286,7 +286,8 @@ fn scan_metadata_plans_with_shape(
         scan_live_actions_schema(partition_values_schema.as_ref()),
     );
 
-    let live_actions_plan = live_actions_node.into_relation(FSR_SCAN_LIVE_ACTIONS, &mut registry)?;
+    let live_actions_plan =
+        live_actions_node.into_relation(FSR_SCAN_LIVE_ACTIONS, &mut registry)?;
     let live_actions_relation = relation_output_handle(&live_actions_plan)?;
     plans.push(live_actions_plan);
     Ok(ResultPlan::new(plans, live_actions_relation))
@@ -562,16 +563,10 @@ mod tests {
 
     /// Helper: build a logical schema from `fields`, then derive the physical schema via
     /// `make_physical(Name)`. Returns `(logical, physical)`.
-    fn schemas_with_cm_name(
-        fields: Vec<StructField>,
-    ) -> (SchemaRef, SchemaRef) {
+    fn schemas_with_cm_name(fields: Vec<StructField>) -> (SchemaRef, SchemaRef) {
         use crate::table_features::ColumnMappingMode;
         let logical = Arc::new(StructType::try_new(fields).unwrap());
-        let physical = Arc::new(
-            logical
-                .make_physical(ColumnMappingMode::Name)
-                .unwrap(),
-        );
+        let physical = Arc::new(logical.make_physical(ColumnMappingMode::Name).unwrap());
         (logical, physical)
     }
 
@@ -585,17 +580,16 @@ mod tests {
         nullable: bool,
     ) -> StructField {
         use crate::schema::{ColumnMetadataKey, MetadataValue};
-        StructField::new(logical_name, data_type, nullable)
-            .with_metadata([
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String(physical_name.to_string()),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(column_id),
-                ),
-            ])
+        StructField::new(logical_name, data_type, nullable).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(physical_name.to_string()),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(column_id),
+            ),
+        ])
     }
 
     /// Verifies that `scan_data_projection` always emits a single top-level `col([physical_root])`
@@ -633,11 +627,7 @@ mod tests {
     fn scan_data_projection_emits_physical_root_col_ref(#[case] data_type: DataType) {
         use crate::table_features::ColumnMappingMode;
         let (logical, physical) = schemas_with_cm_name(vec![annotated_field(
-            "field",
-            "col-phys",
-            1,
-            data_type,
-            true,
+            "field", "col-phys", 1, data_type, true,
         )]);
         let exprs = scan_data_projection(
             &logical,

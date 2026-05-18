@@ -1948,6 +1948,7 @@ dependencies = [
  "test_utils",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

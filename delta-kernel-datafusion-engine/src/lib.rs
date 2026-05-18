@@ -33,6 +33,7 @@ mod tests {
     use delta_kernel::plans::ir::nodes::SinkType;
     use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
     use delta_kernel::schema::{DataType, StructField, StructType};
+    use uuid::Uuid;
 
     use crate::DataFusionExecutor;
 
@@ -47,7 +48,7 @@ mod tests {
     async fn logical_relation_sink_materializes_into_session_ctx() {
         let ex = DataFusionExecutor::try_new().unwrap();
         let schema = two_bool_schema();
-        let mut registry = RelationRegistry::new();
+        let mut registry = RelationRegistry::new(Uuid::new_v4());
         let plan = PlanBuilder::values(
             Arc::clone(&schema),
             vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],

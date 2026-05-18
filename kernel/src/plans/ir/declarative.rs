@@ -9,9 +9,10 @@
 //! ```ignore
 //! use delta_kernel::plans::ir::PlanBuilder;
 //! use delta_kernel::plans::ir::RelationRegistry;
+//! use uuid::Uuid;
 //!
 //! // Untyped pipeline: scan JSON, project to a sub-schema, publish to a named relation.
-//! let mut registry = RelationRegistry::new();
+//! let mut registry = RelationRegistry::new(Uuid::new_v4());
 //! let plan = PlanBuilder::scan_json(files, schema)
 //!     .project(projection, output_schema)
 //!     .into_relation("scanned", &mut registry)?;
@@ -110,21 +111,15 @@ pub struct PlanBuilder {
 impl PlanBuilder {
     /// Scan JSON files with an explicit schema.
     pub fn scan_json(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
-        let node = DeclarativePlanNode::Scan(ScanNode::new(
-            FileType::Json,
-            files,
-            Arc::clone(&schema),
-        ));
+        let node =
+            DeclarativePlanNode::Scan(ScanNode::new(FileType::Json, files, Arc::clone(&schema)));
         Self { schema, node }
     }
 
     /// Scan Parquet files with an explicit schema.
     pub fn scan_parquet(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
-        let node = DeclarativePlanNode::Scan(ScanNode::new(
-            FileType::Parquet,
-            files,
-            Arc::clone(&schema),
-        ));
+        let node =
+            DeclarativePlanNode::Scan(ScanNode::new(FileType::Parquet, files, Arc::clone(&schema)));
         Self { schema, node }
     }
 
@@ -532,11 +527,7 @@ mod tests {
     #[test]
     fn file_listing_schema_is_canonical_triple() {
         let pb = PlanBuilder::file_listing(url::Url::parse("file:///tmp").unwrap());
-        let names: Vec<String> = pb
-            .schema_ref()
-            .fields()
-            .map(|f| f.name().clone())
-            .collect();
+        let names: Vec<String> = pb.schema_ref().fields().map(|f| f.name().clone()).collect();
         assert_eq!(names, vec!["path", "size", "modification_time"]);
     }
 
@@ -627,10 +618,7 @@ mod tests {
                 StructField::nullable("v", DataType::STRING),
             ]),
         );
-        let inner = left
-            .clone()
-            .join(right.clone(), JoinType::Inner)
-            .unwrap();
+        let inner = left.clone().join(right.clone(), JoinType::Inner).unwrap();
         let inner_names: Vec<String> = inner
             .schema_ref()
             .fields()

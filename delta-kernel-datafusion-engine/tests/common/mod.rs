@@ -25,6 +25,7 @@ use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl};
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, EngineData, EvaluationHandler};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
+use uuid::Uuid;
 
 /// Wrap `node` in a Relation sink, run it on a freshly created [`DataFusionExecutor`], and
 /// return the materialized batches. Helper name kept short because many test scenarios call it
@@ -40,7 +41,7 @@ pub async fn run_to_batches_with(
     exec: &DataFusionExecutor,
     node: PlanBuilder,
 ) -> Result<Vec<RecordBatch>, DeltaError> {
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let plan = node.into_relation("test_out", &mut registry)?;
     let SinkType::Relation(handle) = plan.sink.clone() else {
         unreachable!("PlanBuilder::into_relation always produces SinkType::Relation");

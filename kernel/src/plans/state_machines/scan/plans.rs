@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use url::Url;
+use uuid::Uuid;
 
 use super::checkpoint_shape::{checkpoint_manifest_scan_schema, CheckpointShape};
 use super::dedup::{fsr_dedup_key, fsr_row_has_identity_predicate, FSR_JOIN_KEY_COL};
@@ -93,7 +94,7 @@ pub fn build_fsr_plans(
     let txn_expiry = calculate_transaction_expiration_timestamp(snapshot.table_properties())
         .map_err(|e| e.into_delta_default())?;
 
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let mut plans: Vec<Plan> = Vec::new();
 
     // === commit_load: VALUES(commits) -> JSON load -> FSR_COMMIT_RAW ===
@@ -183,8 +184,8 @@ pub fn build_fsr_plans(
                 checkpoint_manifest_scan_schema(shape.has_sidecars),
             ),
         };
-        let checkpoint_top_plan = checkpoint_scan
-            .into_relation(FSR_CHECKPOINT_TOP, &mut registry)?;
+        let checkpoint_top_plan =
+            checkpoint_scan.into_relation(FSR_CHECKPOINT_TOP, &mut registry)?;
         let checkpoint_top = relation_output_handle(&checkpoint_top_plan)?;
         plans.push(checkpoint_top_plan);
         Some(checkpoint_top)
@@ -398,22 +399,17 @@ fn build_results_plan(
 
     // Top-level checkpoint rows are preloaded once into `FSR_CHECKPOINT_TOP`; project to canonical
     // action columns so the schema aligns with sidecar/action relations.
-    let top_scan = registry
-        .relation_ref(FSR_CHECKPOINT_TOP)?
-        .project(
-            action_schema()
-                .fields()
-                .map(|f| col(f.name().as_str()).into())
-                .collect(),
-            action_schema(),
-        );
+    let top_scan = registry.relation_ref(FSR_CHECKPOINT_TOP)?.project(
+        action_schema()
+            .fields()
+            .map(|f| col(f.name().as_str()).into())
+            .collect(),
+        action_schema(),
+    );
 
     let checkpoint_full = match sidecar_handle {
         Some(_handle) => PlanBuilder::union(
-            vec![
-                top_scan,
-                registry.relation_ref(FSR_SIDECAR_ACTIONS)?,
-            ],
+            vec![top_scan, registry.relation_ref(FSR_SIDECAR_ACTIONS)?],
             false,
         )
         .map_err(|e| e.into_delta_default())?,
@@ -447,10 +443,7 @@ fn build_results_plan(
 
     // Union directly on augmented rows (action + join key); drop join key once at the end.
     let everything = PlanBuilder::union(
-        vec![
-            registry.relation_ref(FSR_COMMIT_DEDUP)?,
-            survivors,
-        ],
+        vec![registry.relation_ref(FSR_COMMIT_DEDUP)?, survivors],
         false,
     )
     .map_err(|e| e.into_delta_default())?;

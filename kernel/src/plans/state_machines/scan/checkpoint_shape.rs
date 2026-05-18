@@ -20,7 +20,7 @@ use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::FileFormat;
 use crate::plans::ir::{Extractor, Plan, PlanBuilder};
 use crate::plans::kdf::SidecarCollector;
-use crate::plans::state_machines::framework::coroutine::phase::Phase;
+use crate::plans::state_machines::framework::coroutine::context::Context;
 use crate::plans::state_machines::framework::phase_operation::{PhaseOperation, SchemaQueryNode};
 use crate::scan::Scan;
 use crate::schema::{arc_schema, SchemaRef, StructField, ToSchema};
@@ -128,7 +128,7 @@ pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRe
 }
 
 pub(super) async fn resolve_checkpoint_shape_for_scan(
-    phase: &mut Phase<'_>,
+    ctx: &mut Context<'_>,
     scan: &Scan,
 ) -> Result<CheckpointShape, DeltaError> {
     let snapshot = scan.snapshot();
@@ -147,7 +147,7 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
             shape.has_sidecars = true;
         } else {
             let checkpoint_url = first_checkpoint_url(snapshot.as_ref())?;
-            let checkpoint_state = phase
+            let checkpoint_state = ctx
                 .execute(
                     PhaseOperation::SchemaQuery(SchemaQueryNode::new(checkpoint_url)),
                     "scan::resolve_checkpoint_shape_for_scan::checkpoint_schema",
@@ -167,7 +167,7 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
         if shape.has_sidecars {
             let (discover_sidecars, extract_sidecars) =
                 build_sidecar_discovery_plan(snapshot.as_ref(), shape.file_format)?;
-            let sidecar_state = phase
+            let sidecar_state = ctx
                 .execute(
                     PhaseOperation::Plans(vec![discover_sidecars]),
                     "scan::resolve_checkpoint_shape_for_scan::sidecar_discovery",
@@ -183,7 +183,7 @@ pub(super) async fn resolve_checkpoint_shape_for_scan(
                 )
             })?;
             if let Some(first_sidecar) = sidecar_files.first() {
-                let sidecar_state = phase
+                let sidecar_state = ctx
                     .execute(
                         PhaseOperation::SchemaQuery(SchemaQueryNode::new(
                             first_sidecar.location.as_str(),

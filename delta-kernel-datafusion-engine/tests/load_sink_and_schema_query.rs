@@ -14,6 +14,7 @@ use delta_kernel::FileMeta;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use test_utils::parquet::write_i64_parquet;
 use url::Url;
+use uuid::Uuid;
 
 fn col(name: &str) -> ColumnName {
     ColumnName::from_naive_str_split(name)
@@ -86,7 +87,7 @@ async fn load_sink_broadcasts_passthrough_columns() {
     )
     .unwrap();
 
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let producer_plan = lit
         .load(
             "loaded",
@@ -152,7 +153,7 @@ async fn load_sink_without_dv_reads_full_parquet_row_group() {
 
     let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(path_str)]]).unwrap();
 
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let producer_plan = lit
         .load(
             "dv_loaded",
@@ -227,7 +228,7 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
     )
     .unwrap();
 
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let producer_plan = lit
         .load(
             "dv_masked",
@@ -271,7 +272,7 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
 
     let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
 
-    let mut registry = RelationRegistry::new();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
     let producer_plan = lit
         .load(
             "json_loaded",

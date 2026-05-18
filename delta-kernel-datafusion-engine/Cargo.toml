@@ -41,6 +41,7 @@ async-trait = "0.1"
 futures = "0.3"
 chrono = "0.4"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 parquet = { version = "58", default-features = false, features = ["arrow"] }
