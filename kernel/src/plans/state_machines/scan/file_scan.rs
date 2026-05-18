@@ -137,8 +137,8 @@ impl Scan {
     /// [`Self::scan_data_from_metadata_state_machine`].
     pub fn scan_metadata_state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
-        CoroutineSM::new(move |mut co| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(Uuid::new_v4()));
+        CoroutineSM::new("scan_metadata", move |mut co, sm_id| async move {
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
             let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
             scan_metadata_plans_with_shape(&scan, shape)
         })
@@ -155,7 +155,7 @@ impl Scan {
         live_actions_relation: RelationHandle,
     ) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
-        CoroutineSM::new(move |_co| async move {
+        CoroutineSM::new("scan_data", move |_co, _sm_id| async move {
             scan.scan_data_from_metadata_plans(live_actions_relation)
         })
     }
@@ -170,8 +170,8 @@ impl Scan {
     /// logical schema.
     pub fn scan_state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let scan = self.clone();
-        CoroutineSM::new(move |mut co| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(Uuid::new_v4()));
+        CoroutineSM::new("scan", move |mut co, sm_id| async move {
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
             let shape = resolve_checkpoint_shape_for_scan(&mut ctx, &scan).await?;
             let metadata = scan_metadata_plans_with_shape(&scan, shape)?;
             let live_actions_relation = metadata.result_relation;

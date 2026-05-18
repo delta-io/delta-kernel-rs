@@ -120,7 +120,7 @@ impl FullState {
     /// required today.
     pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let this = self.clone();
-        CoroutineSM::new(move |_co| async move { this.plans() })
+        CoroutineSM::new("full_state", move |_co, _sm_id| async move { this.plans() })
     }
 }
 

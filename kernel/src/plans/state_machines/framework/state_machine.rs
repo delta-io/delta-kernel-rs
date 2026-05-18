@@ -101,4 +101,14 @@ pub trait StateMachine {
     /// currently-active phase name (or a fallback like `"complete"` once
     /// the SM has finished).
     fn phase_name(&self) -> &'static str;
+
+    /// Sorted snapshot of logical relation names currently registered with the SM at the boundary
+    /// of the most recent yield.
+    ///
+    /// Used by engine-side executors for diagnostics / span context, parallel scheduling, and
+    /// cross-phase relation tracking. Returns the empty vector for SMs that do not surface
+    /// relations, and for terminal states (after the SM completes).
+    fn live_relations(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
