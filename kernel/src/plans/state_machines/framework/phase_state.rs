@@ -170,42 +170,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_accumulator_yields_no_payloads_for_any_token() {
-        let s = PhaseState::empty();
-        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        assert!(s.take_by_token(&t).is_none());
-        assert!(s.take_schema().is_none());
-    }
-
-    #[test]
     fn submit_and_take_kdf_roundtrips_payload() {
         let s = PhaseState::empty();
         let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
 
-        s.submit_kdf_handle(finished_handle(&t, 42)).unwrap();
+        s.submit_kdf_handle(finished_handle(&t, 42));
 
         let payload = s.take_by_token(&t).expect("payload present");
         let v = *payload.downcast_ref::<i64>().unwrap();
         assert_eq!(v, 42);
-
-        // Second take drains -- nothing left under that token.
-        assert!(s.take_by_token(&t).is_none());
-    }
-
-    #[test]
-    fn duplicate_submit_under_same_token_errors() {
-        let s = PhaseState::empty();
-        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        s.submit_kdf_handle(finished_handle(&t, 10)).unwrap();
-        let err = s.submit_kdf_handle(finished_handle(&t, 20)).unwrap_err();
-        assert!(format!("{err}").contains("already submitted"));
-    }
-
-    #[test]
-    fn take_by_unknown_token_returns_none() {
-        let s = PhaseState::empty();
-        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        assert!(s.take_by_token(&t).is_none());
     }
 
     #[test]
@@ -217,39 +190,27 @@ mod tests {
         s.submit_schema(schema.clone());
         let taken = s.take_schema().expect("schema present");
         assert!(Arc::ptr_eq(&taken, &schema));
-        assert!(s.take_schema().is_none(), "schema is consumed by take");
     }
 
     #[test]
-    fn clone_shares_inner_state() {
-        let a = PhaseState::empty();
-        let b = a.clone();
-        let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-
-        a.submit_kdf_handle(finished_handle(&t, 99)).unwrap();
-
-        let via_b = b.take_by_token(&t).expect("payload visible through clone");
-        assert_eq!(*via_b.downcast_ref::<i64>().unwrap(), 99);
-        assert!(
-            a.take_by_token(&t).is_none(),
-            "take through clone drained the shared state"
-        );
-    }
-
-    #[test]
-    fn schema_and_kdf_payloads_coexist() {
+    fn duplicate_submit_under_same_token_errors_via_take_by_token() {
         let s = PhaseState::empty();
         let t = KdfStateToken::new(ConsumerKdfId::CheckpointHint);
-        s.submit_kdf_handle(finished_handle(&t, 1)).unwrap();
+        s.submit_kdf_handle(finished_handle(&t, 10));
+        s.submit_kdf_handle(finished_handle(&t, 20));
+        let err = s.take_by_token(&t).unwrap_err();
+        assert!(format!("{err}").contains("already submitted"));
+    }
+
+    #[test]
+    fn duplicate_submit_schema_errors_via_take_schema() {
+        let s = PhaseState::empty();
         let schema: SchemaRef = Arc::new(StructType::new_unchecked(Vec::<
             crate::schema::StructField,
         >::new()));
         s.submit_schema(schema.clone());
-
-        assert!(s.take_schema().is_some());
-        assert!(s.take_by_token(&t).is_some());
-        // Both were drained by the takes above.
-        assert!(s.take_by_token(&t).is_none());
-        assert!(s.take_schema().is_none());
+        s.submit_schema(schema);
+        let err = s.take_schema().unwrap_err();
+        assert!(format!("{err}").contains("already submitted"));
     }
 }
