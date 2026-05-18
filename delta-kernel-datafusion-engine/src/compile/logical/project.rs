@@ -338,6 +338,7 @@ pub(super) fn compile_project_node(
     let (working_plan, rewritten_columns) =
         hoist_repeated_column_paths(working_plan, rewritten_columns)?;
 
+    let working_arrow_schema: ArrowSchema = working_plan.schema().as_arrow().clone();
     let projection: Vec<Expr> = rewritten_columns
         .iter()
         .zip(
@@ -346,19 +347,25 @@ pub(super) fn compile_project_node(
                 .zip(output_arrow_schema.fields()),
         )
         .map(|(kernel_expr, (field, output_arrow_field))| {
-            let base_logical =
-                crate::compile::translate_projection_expr(kernel_expr.as_ref(), field)?;
+            let base_logical = crate::compile::translate_projection_expr(
+                kernel_expr.as_ref(),
+                field,
+                &working_arrow_schema,
+            )?;
             // Struct-shaped expressions whose target is also a struct are passed through
-            // without a logical-plan cast: the cast would surface nullability mismatches
-            // between kernel-built fields (always nullable) and the target schema's per-field
-            // nullability declarations, which DataFusion's `validate_struct_compatibility`
-            // rejects. Per-field metadata (e.g., column-mapping annotations) is applied at
-            // relation-registration time via `arrow_columns_align_to_schema`, which rebuilds
-            // nested struct/list/map arrays against the relation's declared schema positionally.
+            // without a logical-plan cast: DataFusion's `validate_struct_compatibility` matches
+            // fields by name, so the cast cannot perform the physical->logical rename that
+            // column-mapped scans require. For these arms, `translate_projection_expr` already
+            // emits a `named_struct(...)` that constructs the target shape directly:
+            //   - `Expression::Transform` (identity, struct target): per-batch column-mapping
+            //     rename for struct columns (mirrors kernel's `apply_schema` reshape).
+            //   - `Expression::Struct`: ordinal recursion into kernel-built children.
+            //   - `Expression::MapToStruct`: per-target-field `get_field` against the map.
+            //   - `Expression::ParseJson`: JSON-extraction chain per leaf of the target struct.
             let logical = if matches!(
                 (kernel_expr.as_ref(), field.data_type()),
                 (
-                    delta_kernel::expressions::Expression::Column(_),
+                    delta_kernel::expressions::Expression::Transform(_),
                     delta_kernel::schema::DataType::Struct(_)
                 )
             ) || matches!(

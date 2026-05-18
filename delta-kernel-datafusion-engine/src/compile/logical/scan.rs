@@ -26,6 +26,7 @@ use super::canonicalize::canonicalize_output_to_kernel_schema;
 use super::providers::NullabilityEnforcingTableProvider;
 use crate::compile::expr_translator::kernel_expr_to_df;
 use crate::error::plan_compilation;
+use crate::exec::FieldIdPhysicalExprAdapterFactory;
 
 /// DataFusion file sources fail planning when decoded nested field nullability is wider than
 /// the declared scan schema (for example nullable parquet/json children flowing into kernel
@@ -140,9 +141,14 @@ pub(super) fn scan_to_listing_logical_plan(
                 .iter()
                 .map(|f| ListingTableUrl::parse(f.location.as_str()))
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
+            // Wire `FieldIdPhysicalExprAdapterFactory` so the parquet/json opener does
+            // column-mapping-aware decode reshape (logical name + nested rename via
+            // `PARQUET:field_id` / `delta.columnMapping.physicalName`). Eliminates the need for
+            // any post-scan structural realignment.
             let config = ListingTableConfig::new_with_multi_paths(paths)
                 .with_listing_options(options)
-                .with_schema(Arc::clone(&file_schema));
+                .with_schema(Arc::clone(&file_schema))
+                .with_expr_adapter_factory(Arc::new(FieldIdPhysicalExprAdapterFactory));
             let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
             // Wrapper re-asserts the strict nullability contract per batch via
             // `NullabilityValidationExec`, computing its effective output schema from the inner

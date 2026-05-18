@@ -312,6 +312,92 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
     assert_eq!(ys, vec![10_i64, 20_i64]);
 }
 
+/// [`crate::exec::LoadExec`] must yield each kernel-handler parquet batch as soon as it is
+/// produced -- no per-file batching, no full-file materialization. Drive a single-upstream-row
+/// load over a parquet file that contains multiple row groups, then assert that the output
+/// stream yielded strictly more batches than the upstream had rows. The pre-refactor `drain_load`
+/// path would have concatenated everything into a single output `RecordBatch` per upstream row,
+/// so this check directly proves the new streaming shape.
+#[tokio::test]
+async fn load_exec_streams_one_parquet_row_group_per_batch() {
+    use std::fs::File;
+
+    use delta_kernel::arrow::array::{Int64Array, RecordBatch as ArrowRecordBatch};
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+    use delta_kernel::parquet::file::properties::WriterProperties;
+
+    // Write 4 row groups of 16 rows each (64 rows total) into one parquet file. Default
+    // `read_parquet_files` semantics surface one Arrow batch per row group.
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("multi_rg.parquet");
+    {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let batch = ArrowRecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..64_i64))],
+        )
+        .unwrap();
+        let file = File::create(&parquet_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(16))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let rel = parquet_path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let base_url = Url::from_directory_path(dir.path()).unwrap();
+
+    let upstream_schema =
+        Arc::new(StructType::try_new([StructField::not_null("path", DataType::STRING)]).unwrap());
+    let file_schema =
+        Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap());
+
+    // Single upstream row: only one file, but it has 4 row groups -> we expect 4 streamed batches.
+    let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
+    let mut registry = RelationRegistry::new(Uuid::new_v4());
+    let producer_plan = lit
+        .load(
+            "multi_rg_loaded",
+            Arc::clone(&file_schema),
+            FileType::Parquet,
+            Some(base_url),
+            Vec::new(),
+            scan_file_path_only(),
+            None,
+            &mut registry,
+        )
+        .expect("load sink");
+    let SinkType::Load(load_sink) = &producer_plan.sink else {
+        unreachable!("PlanBuilder::load always produces SinkType::Load");
+    };
+    let handle = load_sink.output_relation.clone();
+
+    let executor = DataFusionExecutor::try_new().unwrap();
+    executor.execute_plans(&[producer_plan]).await.unwrap();
+
+    let batches = executor.collect_relation(&handle).await.unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 64, "row count must match the file's row count");
+    assert!(
+        batches.len() > 1,
+        "LoadExec must yield one batch per parquet row group (got {} batch(es) from a 4-RG file); \
+         a single batch here means LoadExec eagerly concatenates per file",
+        batches.len(),
+    );
+}
+
 #[tokio::test]
 async fn parquet_footer_schema_query_matches_file_footer() {
     let dir = tempfile::tempdir().unwrap();

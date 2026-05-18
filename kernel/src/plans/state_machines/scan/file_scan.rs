@@ -28,7 +28,7 @@ use crate::actions::{
 };
 use crate::delta_error;
 use crate::expressions::{
-    col, BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate,
+    col, BinaryExpressionOp, ColumnName, Expression, IntoColumnName, Predicate, Transform,
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns, SinkType};
@@ -467,14 +467,6 @@ pub(super) fn scan_data_projection(
                     field.physical_name(column_mapping_mode),
                 ]),
                 None => {
-                    // Emit a single `col([physical_root])` reference for the top-level field
-                    // regardless of nesting depth. For struct columns this preserves the source
-                    // struct's null bitmap (so an entirely-NULL struct stays NULL instead of
-                    // expanding into `{name: NULL, score: NULL}`). The physical-to-logical name
-                    // rename and per-field metadata application happen at relation registration
-                    // time via `arrow_columns_align_to_schema`, which rebuilds nested
-                    // struct/list/map arrays against the relation's declared logical schema
-                    // positionally.
                     let physical_field = physical_fields.next().ok_or_else(|| {
                         delta_error!(
                             DeltaErrorCode::DeltaCommandInvariantViolation,
@@ -482,7 +474,22 @@ pub(super) fn scan_data_projection(
                             field.name(),
                         )
                     })?;
-                    col([physical_field.name().as_str()])
+                    // For struct-shaped logical fields, emit an identity `Transform` rooted at the
+                    // physical column. This is the kernel IR primitive for "give me this struct,
+                    // then reshape to the projection's declared output schema" -- it is exactly the
+                    // case `Expression::Transform(t) if t.is_identity()` that
+                    // `engine/arrow_expression::evaluate` already handles via `apply_schema`. Engines
+                    // that lower to other runtimes (e.g. DataFusion) translate this identity
+                    // transform into their native struct-construction primitive against the
+                    // projection's output schema. Non-struct fields keep the bare `col(...)` form
+                    // because their top-level rename is handled by the engine's per-field cast.
+                    if matches!(field.data_type(), DataType::Struct(_)) {
+                        Expression::Transform(Transform::new_nested([physical_field
+                            .name()
+                            .as_str()]))
+                    } else {
+                        col([physical_field.name().as_str()])
+                    }
                 }
             };
             Ok(expr.into())
@@ -593,39 +600,47 @@ mod tests {
         ])
     }
 
-    /// Verifies that `scan_data_projection` always emits a single top-level `col([physical_root])`
-    /// reference for non-metadata, non-partition columns — independent of nesting depth or
-    /// container shape (primitive / struct / list / map). The physical-to-logical rename and
-    /// per-field metadata are applied at relation-registration time
-    /// (`arrow_columns_align_to_schema`), not in the kernel projection. Emitting the struct via
-    /// `Expression::Struct` instead would lose the source struct's null bitmap.
+    /// Verifies the per-shape projection emitted by `scan_data_projection` for non-metadata,
+    /// non-partition columns:
+    ///
+    /// - Primitive / list / map fields: a single top-level `col([physical_root])` reference. The
+    ///   physical-to-logical name rename and per-field metadata are then applied by the engine via
+    ///   its per-field cast (which uses the projection's declared output schema).
+    /// - Struct fields: an identity [`Expression::Transform`] rooted at the physical column. This
+    ///   IR primitive carries the "reshape to the projection's output schema" intent that
+    ///   [`crate::engine::arrow_expression`] handles natively via `apply_schema`, and that other
+    ///   engines (e.g. DataFusion) lower into their native struct-construction primitive. Emitting
+    ///   `Expression::Struct` here would lose the source struct's null bitmap.
     #[rstest]
-    #[case::primitive(DataType::LONG)]
+    #[case::primitive(DataType::LONG, false)]
     #[case::nested_struct(DataType::Struct(Box::new(StructType::try_new(vec![
         annotated_field("inner1", "phys-inner1", 91, DataType::STRING, true),
         annotated_field("inner2", "phys-inner2", 92, DataType::INTEGER, true),
-    ]).unwrap())))]
+    ]).unwrap())), true)]
     #[case::deeply_nested_struct(DataType::Struct(Box::new(StructType::try_new(vec![
         annotated_field("mid", "phys-mid", 93, DataType::Struct(Box::new(
             StructType::try_new(vec![annotated_field(
                 "leaf", "phys-leaf", 94, DataType::LONG, true,
             )]).unwrap()
         )), true),
-    ]).unwrap())))]
+    ]).unwrap())), true)]
     #[case::list_of_struct(DataType::Array(Box::new(crate::schema::ArrayType::new(
         DataType::Struct(Box::new(StructType::try_new(vec![annotated_field(
             "x", "phys-x", 95, DataType::INTEGER, true,
         )]).unwrap())),
         true,
-    ))))]
+    ))), false)]
     #[case::map_of_struct(DataType::Map(Box::new(crate::schema::MapType::new(
         DataType::STRING,
         DataType::Struct(Box::new(StructType::try_new(vec![annotated_field(
             "v", "phys-v", 96, DataType::STRING, true,
         )]).unwrap())),
         true,
-    ))))]
-    fn scan_data_projection_emits_physical_root_col_ref(#[case] data_type: DataType) {
+    ))), false)]
+    fn scan_data_projection_emits_expected_shape(
+        #[case] data_type: DataType,
+        #[case] expect_transform: bool,
+    ) {
         use crate::table_features::ColumnMappingMode;
         let (logical, physical) = schemas_with_cm_name(vec![annotated_field(
             "field", "col-phys", 1, data_type, true,
@@ -638,7 +653,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
-        assert_eq!(exprs[0].as_ref(), &col(["col-phys"]));
+        if expect_transform {
+            let expected =
+                Expression::Transform(Transform::new_nested(["col-phys"]));
+            assert_eq!(exprs[0].as_ref(), &expected);
+        } else {
+            assert_eq!(exprs[0].as_ref(), &col(["col-phys"]));
+        }
     }
 
     #[test]

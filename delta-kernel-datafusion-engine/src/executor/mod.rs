@@ -1,49 +1,54 @@
 //! DataFusion-backed [`DataFusionExecutor`] for compiling kernel [`Plan`] values.
 //!
-//! [`SinkType::Relation`] and [`SinkType::Load`] materialize their drained batches as a
-//! [`MemTable`] inserted into the executor's own
-//! [`Self::relation_providers`] map keyed by [`RelationHandle::id`]; downstream
+//! [`SinkType::Relation`] and [`SinkType::Load`] register a *lazy* [`TableProvider`] into the
+//! executor's [`Self::relation_providers`] map keyed by [`RelationHandle::id`]; the upstream
+//! pipeline is never run at registration time. Downstream
 //! [`DeclarativePlanNode::RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef)
-//! leaves resolve to that provider during compile via the same map (passed in through
-//! [`CompileContext::relation_providers`]). For [`SinkType::Load`] the executor first runs
-//! [`load::materialize_upstream_batch`] over each upstream batch to translate file references
-//! into the per-file row batches that get registered.
+//! leaves resolve to that provider during compile, and DataFusion's analyzer/optimizer drives
+//! execution lazily when the consumer reads the relation. Concretely:
 //!
-//! [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) drains
-//! the physical plan through a [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle
-//! inside [`Self::drain_consume_sink`]; finalized handles submit into the active phase's
+//! - `Relation` -> [`datafusion::datasource::ViewTable`] wrapping the upstream `LogicalPlan`.
+//!   DataFusion's `InlineTableScan` analyzer rule inlines the wrapped plan into the consumer's
+//!   tree so predicate / projection pushdown and CSE flow across the boundary.
+//! - `Load`     -> [`crate::exec::LoadTableProvider`] capturing the upstream `LogicalPlan` +
+//!   [`LoadSink`] + kernel [`Engine`]. Its `scan()` builds the upstream physical plan and wraps
+//!   it in [`crate::exec::LoadExec`], which streams per-row file batches incrementally via
+//!   kernel's parquet/json handler.
+//!
+//! [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) is the only sink
+//! that drains eagerly: the physical plan runs and feeds a
+//! [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle inside
+//! [`Self::drain_consume_sink`]; finalized handles submit into the active phase's
 //! [`PhaseState`].
-//!
-//! Sinks are annotations on the kernel [`Plan`], not [`ExecutionPlan`] envelopes -- the executor
-//! handles each sink type as a post-drain side effect on top of the lowered physical plan.
 //!
 //! # API surface
 //!
 //! - [`DataFusionExecutor::drive_to_completion`] drives a [`CoroutineSM`] until it terminates,
 //!   handling any intermediate phase operations the SM yields (kernel-side decision plans, schema
 //!   queries). Returns the SM's terminal value.
-//! - [`DataFusionExecutor::execute_plans`] runs every plan in a slice in order, draining sinks and
-//!   registering relations as it goes.
+//! - [`DataFusionExecutor::execute_plans`] runs every plan in a slice in order, registering
+//!   `Relation` / `Load` providers and draining `Consume` sinks as it goes.
 //! - [`DataFusionExecutor::stream_relation`] / [`DataFusionExecutor::collect_relation`] read a
-//!   previously-materialized relation as a stream or a buffered `Vec`.
+//!   previously-registered relation as a stream or a buffered `Vec`. The actual upstream
+//!   execution happens here on demand.
 //! - [`DataFusionExecutor::collect_result`] composes the above: execute the [`ResultPlan`]'s
 //!   plans, then collect its result relation.
 //!
 //! [`SinkType::Relation`]: delta_kernel::plans::ir::nodes::SinkType::Relation
 //! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load
 
-mod load;
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datafusion::catalog::TableProvider;
-use datafusion::datasource::MemTable;
+use datafusion::datasource::ViewTable;
 use datafusion::execution::context::SessionContext;
 use datafusion_common::error::DataFusionError;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_plan::ExecutionPlan;
+use delta_kernel::arrow::datatypes::SchemaRef;
+use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -67,7 +72,7 @@ use uuid::Uuid;
 
 use crate::compile::{compile_plan_logical, CompileContext};
 use crate::error::DfResultIntoDelta;
-use crate::executor::load::materialize_upstream_batch;
+use crate::exec::LoadTableProvider;
 
 fn default_kernel_engine() -> Arc<dyn Engine> {
     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
@@ -107,7 +112,7 @@ fn execute_schema_query_phase(
 
 /// Minimal executor: a [`TaskContext`] for [`ExecutionPlan::execute`] calls, a [`SessionContext`]
 /// for DataFusion compile/optimize/lower, a kernel [`Engine`] for IO helpers, and a
-/// [`Mutex`]-guarded map of materialized relations the compiler resolves
+/// [`Mutex`]-guarded map of lazily-registered relations the compiler resolves
 /// [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves against.
 pub struct DataFusionExecutor {
     task_ctx: Arc<TaskContext>,
@@ -154,6 +159,26 @@ impl DataFusionExecutor {
         &self.engine
     }
 
+    /// Snapshot the provider registered under `handle_id`, if any. Used by tests to assert
+    /// lazy-registration shape (e.g. that the provider is a [`ViewTable`] and not a materialized
+    /// `MemTable`).
+    #[cfg(test)]
+    pub(crate) fn relation_provider(&self, handle_id: &str) -> Option<Arc<dyn TableProvider>> {
+        self.relation_providers
+            .lock()
+            .expect("relation_providers mutex poisoned")
+            .get(handle_id)
+            .cloned()
+    }
+
+    /// Snapshot of the underlying [`SessionContext`]'s state. Used by tests to invoke
+    /// [`datafusion::catalog::TableProvider::scan`] directly so they can assert what projection /
+    /// limit a provider actually pushed down.
+    #[cfg(test)]
+    pub(crate) fn session_state(&self) -> datafusion::execution::SessionState {
+        self.session_ctx.state()
+    }
+
     // ================================================================
     // High-level SM and result-plan driving
     // ================================================================
@@ -186,10 +211,9 @@ impl DataFusionExecutor {
         }
     }
 
-    /// Execute every plan in `plans` in order. Each plan terminates in [`SinkType::Relation`],
-    /// [`SinkType::Load`], or [`SinkType::Consume`]; the executor drains the physical plan
-    /// and routes the result into [`Self::relation_providers`] (for `Relation` / `Load`) or into
-    /// the active phase's [`PhaseState`] (for `Consume`).
+    /// Execute every plan in `plans` in order. `Relation` / `Load` plans register lazy table
+    /// providers (no I/O); `Consume` plans drain physically and feed the active phase's
+    /// [`PhaseState`].
     pub async fn execute_plans(&self, plans: &[Plan]) -> Result<(), DeltaError> {
         let state = PhaseState::empty();
         self.run_plans(plans, &state, Uuid::new_v4(), "standalone", "execute")
@@ -203,7 +227,7 @@ impl DataFusionExecutor {
         self.collect_relation(&rp.result_relation).await
     }
 
-    /// Stream every batch of a previously-materialized relation by handle. Returns a single
+    /// Stream every batch of a previously-registered relation by handle. Returns a single
     /// coalesced [`SendableRecordBatchStream`]; callers that want a buffered `Vec` should use
     /// [`Self::collect_relation`].
     pub async fn stream_relation(
@@ -228,16 +252,36 @@ impl DataFusionExecutor {
         df.execute_stream().await.into_delta()
     }
 
-    /// Collect every batch of a previously-materialized relation. Thin wrapper over
-    /// [`Self::stream_relation`] that drains the stream into a `Vec`.
+    /// Collect every batch of a previously-registered relation. Thin wrapper over
+    /// [`Self::stream_relation`] that drains the stream into a `Vec` and re-stamps each
+    /// batch's nested field-declaration metadata to match the relation handle's declared
+    /// schema (see [`crate::exec::stamp_batch_metadata`] for why).
     pub async fn collect_relation(
         &self,
         handle: &RelationHandle,
     ) -> Result<Vec<RecordBatch>, DeltaError> {
-        self.stream_relation(handle)
+        let target_schema: SchemaRef = Arc::new(
+            handle
+                .schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(|e: ArrowError| {
+                    crate::error::internal_error(format!(
+                        "collect_relation: failed to convert handle schema to arrow: {e}"
+                    ))
+                })
+                .into_delta()?,
+        );
+        let batches: Vec<RecordBatch> = self
+            .stream_relation(handle)
             .await?
             .try_collect()
             .await
+            .into_delta()?;
+        batches
+            .iter()
+            .map(|b| crate::exec::stamp_batch_metadata(b, &target_schema))
+            .collect::<Result<_, _>>()
             .into_delta()
     }
 
@@ -276,6 +320,14 @@ impl DataFusionExecutor {
         }
     }
 
+    /// Walk each plan in order, dispatching on its [`SinkType`]:
+    /// - `Relation` -> compile the upstream to a `LogicalPlan`, wrap in a [`ViewTable`], and
+    ///   register under the handle id. No physical plan or execution.
+    /// - `Load`     -> compile the upstream to a `LogicalPlan`, wrap in a [`LoadTableProvider`]
+    ///   (which captures sink + engine), and register under the sink's output handle id. No
+    ///   physical plan or execution; the provider's `scan()` lowers + streams on first read.
+    /// - `Consume`  -> compile, optimize, lower to a physical plan, and drain through
+    ///   [`Self::drain_consume_sink`] (the only sink with eager side effects).
     async fn run_plans(
         &self,
         plans: &[Plan],
@@ -302,75 +354,61 @@ impl DataFusionExecutor {
                 phase_name,
             };
             let logical = compile_plan_logical(plan, &ctx)?;
-            let df_state = self.session_ctx.state();
-            let physical = df_state
-                .create_physical_plan(&df_state.optimize(&logical)?)
-                .await?;
-            self.drain_to_sink(plan, physical, &ctx).await?;
+            match &plan.sink {
+                SinkType::Relation(handle) => self.register_view_relation(handle, logical)?,
+                SinkType::Load(sink) => self.register_load_relation(sink, logical, &ctx)?,
+                SinkType::Consume(sink) => {
+                    let df_state = self.session_ctx.state();
+                    let physical = df_state
+                        .create_physical_plan(&df_state.optimize(&logical)?)
+                        .await?;
+                    self.drain_consume_sink(physical, sink, &ctx).await?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// Drain `physical` according to `plan`'s sink type, registering any materialized rows into
-    /// [`Self::relation_providers`] or routing them into the active phase's KDF state. Sinks are
-    /// annotations only -- per-sink side effects live in the drain helpers, not on the
-    /// `ExecutionPlan` itself.
-    async fn drain_to_sink(
-        &self,
-        plan: &Plan,
-        physical: Arc<dyn ExecutionPlan>,
-        ctx: &CompileContext,
-    ) -> Result<(), DataFusionError> {
-        match &plan.sink {
-            SinkType::Relation(handle) => {
-                let batches =
-                    datafusion::physical_plan::collect(physical, Arc::clone(&self.task_ctx))
-                        .await?;
-                self.register_relation(handle, batches)
-            }
-            SinkType::Load(sink) => {
-                let batches = self.drain_load(physical, sink, ctx).await?;
-                self.register_relation(&sink.output_relation, batches)
-            }
-            SinkType::Consume(sink) => self.drain_consume_sink(physical, sink, ctx).await,
-        }
-    }
-
-    /// Materialize `batches` as a [`MemTable`] and insert it into [`Self::relation_providers`]
-    /// keyed by `handle.id`, replacing any prior provider for that handle.
-    fn register_relation(
+    /// Wrap `logical` in a [`ViewTable`] and register it under `handle.id`. The view is opaque
+    /// to plan-level execution: DataFusion's `InlineTableScan` analyzer inlines it into the
+    /// consumer's tree when the consumer reads the relation, exposing every upstream node for
+    /// predicate / projection pushdown + CSE.
+    ///
+    /// The upstream plan's runtime output is expected to match the kernel-declared relation
+    /// schema field-for-field at every nesting level. Parquet scans get there via
+    /// [`crate::exec::FieldIdPhysicalExprAdapterFactory`] (column-mapping-aware decode
+    /// reshape); `LoadSink` outputs get there by handing kernel's parquet handler the
+    /// kernel-declared logical schema so its built-in field-id matching + nested coerce step
+    /// produces logically-shaped batches.
+    fn register_view_relation(
         &self,
         handle: &RelationHandle,
-        mut batches: Vec<RecordBatch>,
+        logical: datafusion_expr::LogicalPlan,
     ) -> Result<(), DataFusionError> {
-        let schema: delta_kernel::arrow::datatypes::SchemaRef =
-            Arc::new(handle.schema.as_ref().try_into_arrow().map_err(|e| {
-                crate::error::plan_compilation(format!("relation schema conversion: {e}"))
-            })?);
-        if let Some(first) = batches.first() {
-            if first.schema() != schema {
-                // The relation's declared schema may differ from the batch's runtime schema in
-                // ways that `RecordBatch::try_new` rejects (e.g., per-field metadata, nested
-                // struct/list/map field nullability). Recursively rebuild each column against
-                // the target schema, replacing field declarations without rewriting data.
-                batches = batches
-                    .into_iter()
-                    .map(|batch| {
-                        crate::executor::load::arrow_columns_align_to_schema(batch, schema.clone())
-                            .map_err(|e| {
-                                delta_kernel::arrow::error::ArrowError::SchemaError(format!(
-                                    "register_relation align: {e}"
-                                ))
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-            }
-        }
-        let mem: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
+        let provider: Arc<dyn TableProvider> = Arc::new(ViewTable::new(logical, None));
         self.relation_providers
             .lock()
             .expect("relation_providers mutex poisoned")
-            .insert(handle.id.clone(), mem);
+            .insert(handle.id.clone(), provider);
+        Ok(())
+    }
+
+    /// Capture `(upstream_logical, sink, engine)` in a [`LoadTableProvider`] and register it
+    /// under the sink's output handle id. The provider streams file rows lazily on
+    /// [`TableProvider::scan`] via [`crate::exec::LoadExec`]; no I/O happens at registration.
+    fn register_load_relation(
+        &self,
+        sink: &LoadSink,
+        logical: datafusion_expr::LogicalPlan,
+        ctx: &CompileContext,
+    ) -> Result<(), DataFusionError> {
+        let provider =
+            LoadTableProvider::try_new(logical, Arc::new(sink.clone()), ctx.engine.clone())?;
+        let provider: Arc<dyn TableProvider> = Arc::new(provider);
+        self.relation_providers
+            .lock()
+            .expect("relation_providers mutex poisoned")
+            .insert(sink.output_relation.id.clone(), provider);
         Ok(())
     }
 
@@ -411,27 +449,5 @@ impl DataFusionExecutor {
             ));
         }
         Ok(())
-    }
-
-    /// Drain `physical` and run each upstream batch through
-    /// [`materialize_upstream_batch`], returning the per-file row batches the caller registers
-    /// under the sink's output [`RelationHandle`].
-    async fn drain_load(
-        &self,
-        physical: Arc<dyn ExecutionPlan>,
-        sink: &LoadSink,
-        ctx: &CompileContext,
-    ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let mut stream =
-            datafusion::physical_plan::execute_stream(physical, Arc::clone(&self.task_ctx))?;
-        let read_schema = sink.file_schema.clone();
-        let engine = ctx.engine.as_ref();
-        let mut out = Vec::new();
-        while let Some(upstream_batch) = stream.try_next().await? {
-            let materialized =
-                materialize_upstream_batch(&upstream_batch, sink, engine, read_schema.clone())?;
-            out.extend(materialized);
-        }
-        Ok(out)
     }
 }

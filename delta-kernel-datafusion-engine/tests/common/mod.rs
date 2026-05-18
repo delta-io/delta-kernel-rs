@@ -51,8 +51,14 @@ pub async fn run_to_batches_with(
 }
 
 /// Synchronous wrapper around [`run_to_batches`] for `#[test]` (non-async) call sites.
+///
+/// Uses a fresh single-threaded Tokio runtime rather than `futures::executor::block_on` so
+/// async DataFusion operators that spawn tasks (e.g. `HashJoinExec`) have a reactor to run on.
+/// Lazy relation registration shifted some of those executions out of `execute_plans` (which is
+/// always called inside an `async fn` runtime) into `collect_relation`, where the surrounding
+/// `block_on` flavor matters.
 pub fn run_to_batches_blocking(node: PlanBuilder) -> Result<Vec<RecordBatch>, DeltaError> {
-    futures::executor::block_on(run_to_batches(node))
+    tokio_runtime().block_on(run_to_batches(node))
 }
 
 /// Synchronous wrapper around [`run_to_batches_with`] for `#[test]` (non-async) call sites.
@@ -60,7 +66,14 @@ pub fn run_to_batches_with_blocking(
     exec: &DataFusionExecutor,
     node: PlanBuilder,
 ) -> Result<Vec<RecordBatch>, DeltaError> {
-    futures::executor::block_on(run_to_batches_with(exec, node))
+    tokio_runtime().block_on(run_to_batches_with(exec, node))
+}
+
+fn tokio_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
 }
 
 /// Merge a slice of [`RecordBatch`] values into a single batch via `concat_batches`, or return

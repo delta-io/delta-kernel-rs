@@ -23,6 +23,8 @@ datafusion-catalog-listing = { version = "53", default-features = false }
 datafusion-expr = { version = "53", default-features = false }
 datafusion-execution = { version = "53", default-features = false }
 datafusion-physical-expr = { version = "53", default-features = false }
+datafusion-physical-expr-adapter = { version = "53", default-features = false }
+datafusion-physical-expr-common = { version = "53", default-features = false }
 datafusion-physical-plan = { version = "53", default-features = false }
 datafusion-physical-optimizer = { version = "53", default-features = false }
 datafusion-functions-window = { version = "53", default-features = false }
