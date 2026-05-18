@@ -129,80 +129,48 @@ impl ExecutionPlan for FileListingExec {
         let object_store = context.runtime_env().object_store(&object_store_url)?;
         let prefix = object_store::path::Path::from(self.path.path());
         let list_stream = object_store.list(Some(&prefix));
-        let schema = self.schema.clone();
-        let base_url = self.path.clone();
-        if self.path.scheme() == "file" {
-            Ok(Box::pin(SortedFileListingStream::new(
-                list_stream,
-                schema,
-                base_url,
-            )))
+        // `object_store::ObjectStore::list` does not promise lexicographic order. Local-fs
+        // backends are particularly inconsistent (directory-walk order from the OS), so we
+        // collect+sort there to keep `LogStore` segmentation deterministic across hosts. For
+        // remote stores DataFusion's downstream order-aware operators handle re-ordering.
+        let state = if self.path.scheme() == "file" {
+            ListingState::Collecting {
+                inner: list_stream,
+                collected: Vec::new(),
+            }
         } else {
-            Ok(Box::pin(FileListingStream::new(
-                list_stream,
-                schema,
-                base_url,
-            )))
-        }
+            ListingState::Chunked {
+                inner: Box::pin(list_stream.chunks(BATCH_SIZE)),
+            }
+        };
+        Ok(Box::pin(FileListingStream {
+            state,
+            schema: self.schema.clone(),
+            base_url: self.path.clone(),
+        }))
     }
 }
 
 type ObjectMetaChunkStream =
-    dyn Stream<Item = Vec<Result<ObjectMeta, delta_kernel::object_store::Error>>> + Send;
+    dyn Stream<Item = Vec<Result<ObjectMeta, object_store::Error>>> + Send;
 
+/// Streams [`ObjectMeta`] batches converted to [`RecordBatch`]es. Two modes:
+///
+/// * [`ListingState::Chunked`]: passthrough -- groups the underlying `list_stream` into
+///   `BATCH_SIZE` chunks and emits one batch per chunk. The first error in a chunk surfaces
+///   immediately and ends the stream.
+/// * [`ListingState::Collecting`] -> [`ListingState::Emitting`]: collect-then-sort -- drains
+///   the full listing into memory, sorts by `location`, then emits in `BATCH_SIZE` chunks.
 struct FileListingStream {
-    inner: Pin<Box<ObjectMetaChunkStream>>,
+    state: ListingState,
     schema: delta_kernel::arrow::datatypes::SchemaRef,
     base_url: url::Url,
 }
 
-impl FileListingStream {
-    fn new(
-        list_stream: futures::stream::BoxStream<
-            'static,
-            Result<ObjectMeta, delta_kernel::object_store::Error>,
-        >,
-        schema: delta_kernel::arrow::datatypes::SchemaRef,
-        base_url: url::Url,
-    ) -> Self {
-        Self {
-            inner: Box::pin(list_stream.chunks(BATCH_SIZE)),
-            schema,
-            base_url,
-        }
-    }
-}
-
-impl Stream for FileListingStream {
-    type Item = DfResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.inner.as_mut().poll_next(cx)) {
-            Some(chunk) => {
-                let metas = chunk
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(crate::error::wrap_delta_err)?;
-                Poll::Ready(Some(metas_to_batch(&metas, &self.schema, &self.base_url)))
-            }
-            None => Poll::Ready(None),
-        }
-    }
-}
-
-impl RecordBatchStream for FileListingStream {
-    fn schema(&self) -> delta_kernel::arrow::datatypes::SchemaRef {
-        self.schema.clone()
-    }
-}
-
-struct SortedFileListingStream {
-    state: SortedStreamState,
-    schema: delta_kernel::arrow::datatypes::SchemaRef,
-    base_url: url::Url,
-}
-
-enum SortedStreamState {
+enum ListingState {
+    Chunked {
+        inner: Pin<Box<ObjectMetaChunkStream>>,
+    },
     Collecting {
         inner: Pin<Box<dyn Stream<Item = Result<ObjectMeta, object_store::Error>> + Send>>,
         collected: Vec<ObjectMeta>,
@@ -213,37 +181,28 @@ enum SortedStreamState {
     Done,
 }
 
-impl SortedFileListingStream {
-    fn new(
-        list_stream: futures::stream::BoxStream<
-            'static,
-            Result<ObjectMeta, delta_kernel::object_store::Error>,
-        >,
-        schema: delta_kernel::arrow::datatypes::SchemaRef,
-        base_url: url::Url,
-    ) -> Self {
-        Self {
-            state: SortedStreamState::Collecting {
-                inner: list_stream,
-                collected: Vec::new(),
-            },
-            schema,
-            base_url,
-        }
-    }
-}
-
-impl Stream for SortedFileListingStream {
+impl Stream for FileListingStream {
     type Item = DfResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match &mut self.state {
-                SortedStreamState::Collecting { inner, collected } => {
+                ListingState::Chunked { inner } => {
+                    let next = ready!(inner.as_mut().poll_next(cx));
+                    let Some(chunk) = next else {
+                        return Poll::Ready(None);
+                    };
+                    let metas = chunk
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(crate::error::wrap_delta_err)?;
+                    return Poll::Ready(Some(metas_to_batch(&metas, &self.schema, &self.base_url)));
+                }
+                ListingState::Collecting { inner, collected } => {
                     match ready!(inner.as_mut().poll_next(cx)) {
                         Some(Ok(meta)) => collected.push(meta),
                         Some(Err(e)) => {
-                            self.state = SortedStreamState::Done;
+                            self.state = ListingState::Done;
                             return Poll::Ready(Some(Err(crate::error::wrap_delta_err(e))));
                         }
                         None => {
@@ -251,14 +210,13 @@ impl Stream for SortedFileListingStream {
                             sorted.sort_by(|a, b| a.location.cmp(&b.location));
                             let chunks: Vec<Vec<ObjectMeta>> =
                                 sorted.chunks(BATCH_SIZE).map(|c| c.to_vec()).collect();
-                            self.state = SortedStreamState::Emitting {
+                            self.state = ListingState::Emitting {
                                 inner: Box::pin(stream::iter(chunks)),
                             };
                         }
                     }
                 }
-                SortedStreamState::Emitting { inner } => match ready!(inner.as_mut().poll_next(cx))
-                {
+                ListingState::Emitting { inner } => match ready!(inner.as_mut().poll_next(cx)) {
                     Some(chunk) => {
                         return Poll::Ready(Some(metas_to_batch(
                             &chunk,
@@ -267,17 +225,17 @@ impl Stream for SortedFileListingStream {
                         )));
                     }
                     None => {
-                        self.state = SortedStreamState::Done;
+                        self.state = ListingState::Done;
                         return Poll::Ready(None);
                     }
                 },
-                SortedStreamState::Done => return Poll::Ready(None),
+                ListingState::Done => return Poll::Ready(None),
             }
         }
     }
 }
 
-impl RecordBatchStream for SortedFileListingStream {
+impl RecordBatchStream for FileListingStream {
     fn schema(&self) -> delta_kernel::arrow::datatypes::SchemaRef {
         self.schema.clone()
     }
