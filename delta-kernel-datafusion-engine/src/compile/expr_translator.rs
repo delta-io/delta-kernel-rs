@@ -61,6 +61,19 @@ pub fn kernel_exprs_to_df(
     exprs.iter().map(|e| kernel_expr_to_df(e, cx)).collect()
 }
 
+/// Shorthand for translating a kernel `Expression` without a target context. The vast majority
+/// of internal call sites do not have an output field on hand (only the outer projection arm
+/// in `compile_project_node` does); collapsing the `&TranslationContext::untyped()` boilerplate
+/// into one name keeps the natural-type arms readable.
+pub fn kernel_expr_to_df_untyped(expr: &Expression) -> Result<Expr, DataFusionError> {
+    kernel_expr_to_df(expr, &TranslationContext::untyped())
+}
+
+/// Slice form of [`kernel_expr_to_df_untyped`].
+pub fn kernel_exprs_to_df_untyped(exprs: &[Arc<Expression>]) -> Result<Vec<Expr>, DataFusionError> {
+    kernel_exprs_to_df(exprs, &TranslationContext::untyped())
+}
+
 /// Translate a kernel [`Expression`] to a DataFusion [`Expr`].
 pub fn kernel_expr_to_df(
     expr: &Expression,
@@ -116,9 +129,7 @@ pub fn kernel_expr_to_df(
 /// Translate a kernel [`Predicate`] to a boolean-typed DataFusion [`Expr`].
 pub fn kernel_pred_to_df(pred: &Predicate) -> Result<Expr, DataFusionError> {
     match pred {
-        Predicate::BooleanExpression(expr) => {
-            kernel_expr_to_df(expr, &TranslationContext::untyped())
-        }
+        Predicate::BooleanExpression(expr) => kernel_expr_to_df_untyped(expr),
         Predicate::Not(inner) => Ok(Expr::Not(Box::new(kernel_pred_to_df(inner)?))),
         Predicate::Unary(UnaryPredicate { op, expr }) => unary_pred_to_df(*op, expr),
         Predicate::Binary(BinaryPredicate { op, left, right }) => {
@@ -138,10 +149,7 @@ pub fn kernel_pred_to_df(pred: &Predicate) -> Result<Expr, DataFusionError> {
 
 /// `ParseJson` carries its own `output_schema`; works in any context (typed or untyped).
 fn parse_json_to_df(parse_json: &ParseJsonExpression) -> Result<Expr, DataFusionError> {
-    let json_expr = kernel_expr_to_df(
-        parse_json.json_expr.as_ref(),
-        &TranslationContext::untyped(),
-    )?;
+    let json_expr = kernel_expr_to_df_untyped(parse_json.json_expr.as_ref())?;
     let extracted = json_parse::generate_schema_extractions(&json_expr, &parse_json.output_schema)?;
     let mut args = Vec::with_capacity(extracted.len() * 2);
     for (field_expr, field_name) in extracted {
@@ -169,10 +177,7 @@ fn map_to_struct_to_df(
             target_field.data_type()
         )));
     };
-    let map_expr = kernel_expr_to_df(
-        map_to_struct.map_expr.as_ref(),
-        &TranslationContext::untyped(),
-    )?;
+    let map_expr = kernel_expr_to_df_untyped(map_to_struct.map_expr.as_ref())?;
     let mut args = Vec::with_capacity(target_struct.fields().count() * 2);
     for child in target_struct.fields() {
         let arrow_ty: ArrowDataType = child.data_type().try_into_arrow().map_err(|e| {
@@ -217,10 +222,7 @@ fn transform_to_df(
         .input_schema
         .ok_or_else(|| unsupported("identity Transform requires an input schema in context"))?;
     let source_fields = lookup_struct_fields_via_path(input_schema, input_path)?;
-    let input_expr = kernel_expr_to_df(
-        &Expression::Column(input_path.clone()),
-        &TranslationContext::untyped(),
-    )?;
+    let input_expr = kernel_expr_to_df_untyped(&Expression::Column(input_path.clone()))?;
     rebuild_struct_with_target_names(input_expr, &source_fields, target_struct)
 }
 
@@ -250,7 +252,7 @@ fn struct_to_df(
         _ => {
             let positional = children
                 .iter()
-                .map(|e| kernel_expr_to_df(e.as_ref(), &TranslationContext::untyped()))
+                .map(|e| kernel_expr_to_df_untyped(e.as_ref()))
                 .collect::<Result<Vec<_>, _>>()?;
             make_struct(positional)
         }
@@ -259,7 +261,7 @@ fn struct_to_df(
         None => Ok(body),
         // Kernel semantics: predicate false/null -> struct null. Same as DataFusion CASE.
         Some(predicate) => {
-            let pred_expr = kernel_expr_to_df(predicate.as_ref(), &TranslationContext::untyped())?;
+            let pred_expr = kernel_expr_to_df_untyped(predicate.as_ref())?;
             Ok(Expr::Case(Case::new(
                 None,
                 vec![(Box::new(pred_expr), Box::new(body))],
@@ -294,14 +296,14 @@ fn binary_expr_to_df(
         BinaryExpressionOp::Divide => Operator::Divide,
     };
     Ok(binary(
-        kernel_expr_to_df(left, &TranslationContext::untyped())?,
+        kernel_expr_to_df_untyped(left)?,
         df_op,
-        kernel_expr_to_df(right, &TranslationContext::untyped())?,
+        kernel_expr_to_df_untyped(right)?,
     ))
 }
 
 fn unary_pred_to_df(op: UnaryPredicateOp, expr: &Expression) -> Result<Expr, DataFusionError> {
-    let inner = kernel_expr_to_df(expr, &TranslationContext::untyped())?;
+    let inner = kernel_expr_to_df_untyped(expr)?;
     match op {
         UnaryPredicateOp::IsNull => Ok(Expr::IsNull(Box::new(inner))),
     }
@@ -323,9 +325,9 @@ fn binary_pred_to_df(
         BinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
     };
     Ok(binary(
-        kernel_expr_to_df(left, &TranslationContext::untyped())?,
+        kernel_expr_to_df_untyped(left)?,
         df_op,
-        kernel_expr_to_df(right, &TranslationContext::untyped())?,
+        kernel_expr_to_df_untyped(right)?,
     ))
 }
 
@@ -341,7 +343,7 @@ fn in_pred_to_df(value: &Expression, list: &Expression) -> Result<Expr, DataFusi
         .map(|s| scalar_value_to_df(s).map(|v| Expr::Literal(v, None)))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Expr::InList(InList::new(
-        Box::new(kernel_expr_to_df(value, &TranslationContext::untyped())?),
+        Box::new(kernel_expr_to_df_untyped(value)?),
         elements,
         false,
     )))
@@ -380,7 +382,7 @@ fn variadic_to_df(
         VariadicExpressionOp::Array => {
             let args: Vec<Expr> = exprs
                 .iter()
-                .map(|e| kernel_expr_to_df(e, &TranslationContext::untyped()))
+                .map(kernel_expr_to_df_untyped)
                 .collect::<Result<_, _>>()?;
             Ok(make_array(args))
         }
@@ -612,13 +614,10 @@ mod tests {
     use delta_kernel::schema::{ArrayType, DataType, StructField, StructType};
     use rstest::rstest;
 
-    use super::{kernel_expr_to_df, kernel_pred_to_df, TranslationContext};
+    use super::{kernel_expr_to_df_untyped, kernel_pred_to_df};
 
     fn lower_expr(e: Expr_) -> String {
-        format!(
-            "{}",
-            kernel_expr_to_df(&e, &TranslationContext::untyped()).unwrap()
-        )
+        format!("{}", kernel_expr_to_df_untyped(&e).unwrap())
     }
     fn lower_pred(p: Pred) -> String {
         format!("{}", kernel_pred_to_df(&p).unwrap())

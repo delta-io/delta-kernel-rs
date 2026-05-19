@@ -24,7 +24,7 @@ use parquet::arrow::RowNumber;
 
 use super::canonicalize::canonicalize_output_to_kernel_schema;
 use super::providers::NullabilityEnforcingTableProvider;
-use crate::compile::expr_translator::{kernel_expr_to_df, TranslationContext};
+use crate::compile::expr_translator::kernel_expr_to_df_untyped;
 use crate::error::plan_compilation;
 use crate::exec::FieldIdPhysicalExprAdapterFactory;
 
@@ -158,7 +158,7 @@ pub(super) fn scan_to_listing_logical_plan(
         };
     let mut scan_plan = build_listing_scan(&node.files)?;
     if let Some(predicate) = &node.predicate {
-        let pred = kernel_expr_to_df(predicate.as_ref(), &TranslationContext::untyped())?;
+        let pred = kernel_expr_to_df_untyped(predicate.as_ref())?;
         // Kernel NULL semantics keep a row when the predicate references a NULL value (SQL
         // three-valued logic would drop it). We wrap the predicate with `pred OR pred IS NULL` so
         // the downstream Filter behaves like kernel scan-skipping. Do NOT swap this for parquet

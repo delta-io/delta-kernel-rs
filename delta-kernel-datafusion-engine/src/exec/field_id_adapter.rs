@@ -317,17 +317,19 @@ fn build_renamed_physical_field(physical: &Field, logical: &Field) -> Field {
             let renamed: Vec<FieldRef> = phys_children
                 .iter()
                 .map(|pc| match find_physical_match(pc.as_ref(), log_children) {
-                    Some(li) => Arc::new(build_renamed_physical_field(pc.as_ref(), &log_children[li])),
+                    Some(li) => {
+                        Arc::new(build_renamed_physical_field(pc.as_ref(), &log_children[li]))
+                    }
                     None => Arc::clone(pc),
                 })
                 .collect();
             DataType::Struct(renamed.into())
         }
         (DataType::List(p), DataType::List(l)) => DataType::List(rename_child(p, l)),
-        (DataType::LargeList(p), DataType::LargeList(l)) => {
-            DataType::LargeList(rename_child(p, l))
+        (DataType::LargeList(p), DataType::LargeList(l)) => DataType::LargeList(rename_child(p, l)),
+        (DataType::Map(p, sorted), DataType::Map(l, _)) => {
+            DataType::Map(rename_child(p, l), *sorted)
         }
-        (DataType::Map(p, sorted), DataType::Map(l, _)) => DataType::Map(rename_child(p, l), *sorted),
         _ => physical.data_type().clone(),
     };
     Field::new(logical.name(), renamed_type, logical.is_nullable())

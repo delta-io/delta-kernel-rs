@@ -490,22 +490,13 @@ fn strip_field_metadata_recursive(
     field: &delta_kernel::arrow::datatypes::Field,
 ) -> delta_kernel::arrow::datatypes::Field {
     use delta_kernel::arrow::datatypes::{DataType, Field, Fields};
+    let strip_inner = |f: &Arc<Field>| Arc::new(strip_field_metadata_recursive(f.as_ref()));
     let stripped_dt = match field.data_type() {
-        DataType::Struct(fs) => DataType::Struct(Fields::from(
-            fs.iter()
-                .map(|f| strip_field_metadata_recursive(f.as_ref()))
-                .collect::<Vec<_>>(),
-        )),
-        DataType::List(inner) => DataType::List(Arc::new(strip_field_metadata_recursive(inner))),
-        DataType::LargeList(inner) => {
-            DataType::LargeList(Arc::new(strip_field_metadata_recursive(inner)))
-        }
-        DataType::FixedSizeList(inner, n) => {
-            DataType::FixedSizeList(Arc::new(strip_field_metadata_recursive(inner)), *n)
-        }
-        DataType::Map(entry, sorted) => {
-            DataType::Map(Arc::new(strip_field_metadata_recursive(entry)), *sorted)
-        }
+        DataType::Struct(fs) => DataType::Struct(Fields::from_iter(fs.iter().map(strip_inner))),
+        DataType::List(inner) => DataType::List(strip_inner(inner)),
+        DataType::LargeList(inner) => DataType::LargeList(strip_inner(inner)),
+        DataType::FixedSizeList(inner, n) => DataType::FixedSizeList(strip_inner(inner), *n),
+        DataType::Map(entry, sorted) => DataType::Map(strip_inner(entry), *sorted),
         other => other.clone(),
     };
     Field::new(field.name(), stripped_dt, field.is_nullable())

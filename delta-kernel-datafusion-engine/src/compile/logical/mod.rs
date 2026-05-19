@@ -20,7 +20,7 @@ use delta_kernel::plans::ir::nodes::JoinType as KernelJoinType;
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 
 use super::CompileContext;
-use crate::compile::expr_translator::{kernel_expr_to_df, kernel_exprs_to_df, TranslationContext};
+use crate::compile::expr_translator::{kernel_expr_to_df_untyped, kernel_exprs_to_df_untyped};
 use crate::error::plan_compilation;
 
 mod canonicalize;
@@ -64,12 +64,7 @@ fn compile_declarative_node_logical(
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|s| {
-                            kernel_expr_to_df(
-                                &Expression::literal(s.clone()),
-                                &TranslationContext::untyped(),
-                            )
-                        })
+                        .map(|s| kernel_expr_to_df_untyped(&Expression::literal(s.clone())))
                         .collect::<Result<Vec<_>, DataFusionError>>()
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
@@ -87,8 +82,7 @@ fn compile_declarative_node_logical(
         }
         DeclarativePlanNode::Filter { child, node } => {
             let child_plan = compile_declarative_node_logical(child, ctx)?;
-            let predicate =
-                kernel_expr_to_df(node.predicate.as_ref(), &TranslationContext::untyped())?;
+            let predicate = kernel_expr_to_df_untyped(node.predicate.as_ref())?;
             LogicalPlanBuilder::from(child_plan)
                 .filter(predicate)?
                 .build()
@@ -154,10 +148,8 @@ fn compile_declarative_node_logical(
             }
             let build_plan = compile_declarative_node_logical(build, ctx)?;
             let probe_plan = compile_declarative_node_logical(probe, ctx)?;
-            let left_keys =
-                kernel_exprs_to_df(&join_node.left_keys, &TranslationContext::untyped())?;
-            let right_keys =
-                kernel_exprs_to_df(&join_node.right_keys, &TranslationContext::untyped())?;
+            let left_keys = kernel_exprs_to_df_untyped(&join_node.left_keys)?;
+            let right_keys = kernel_exprs_to_df_untyped(&join_node.right_keys)?;
             let join_type = match join_node.join_type {
                 KernelJoinType::Inner => DfJoinType::Inner,
                 KernelJoinType::LeftAnti => DfJoinType::RightAnti,
@@ -179,16 +171,12 @@ fn compile_declarative_node_logical(
                 ));
             }
             let child_plan = compile_declarative_node_logical(child, ctx)?;
-            let partition_by =
-                kernel_exprs_to_df(&node.partition_by, &TranslationContext::untyped())?;
+            let partition_by = kernel_exprs_to_df_untyped(&node.partition_by)?;
             let order_by = node
                 .order_by
                 .iter()
                 .map(|spec| {
-                    let expr = kernel_expr_to_df(
-                        &Expression::from(spec.column.clone()),
-                        &TranslationContext::untyped(),
-                    )?;
+                    let expr = kernel_expr_to_df_untyped(&Expression::from(spec.column.clone()))?;
                     Ok(expr.sort(!spec.descending, false))
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
