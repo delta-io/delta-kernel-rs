@@ -8,10 +8,6 @@ use crate::{
     SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
 
-/// The Delta protocol domain name that holds the clustering-columns configuration. The
-/// `get_clustering_domain_metadata` FFI reads this domain via the unguarded internal path.
-const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
-
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
 /// domain in this snapshot
 ///
@@ -40,21 +36,18 @@ fn get_domain_metadata_impl(
 ) -> DeltaResult<NullableCvoid> {
     Ok(snapshot
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
-        .and_then(|config: String| allocate_fn(kernel_string_slice!(config))))
+        .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
 
-/// Get the JSON configuration of the table's `delta.clustering` domain metadata, allocated via
-/// `allocate_fn`. Returns `NULL` (a null `NullableCvoid`) if the snapshot has no clustering
-/// domain entry.
+/// Read the JSON configuration of the table's `delta.clustering` domain, allocated via
+/// `allocate_fn`. Returns NULL when clustering is not enabled on the table or no
+/// configuration is present.
 ///
-/// Unlike [`get_domain_metadata`], this function permits reading the system-controlled
-/// `delta.clustering` domain that the user-facing API rejects with
-/// `"User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"`.
-/// Use this to surface clustering configuration to external engines that compose their own
-/// resolved descriptors on top.
-///
-/// The returned JSON has the form `{"clusteringColumns":[["col1"],["addr","city"], ...]}`.
-/// Each inner array is the physical column path (multi-part for nested-field clustering).
+/// Unlike [`get_domain_metadata`], this bypasses the `delta.*`-prefix guard so external
+/// engines can read the clustering descriptor that an FFI writer emits. The JSON has
+/// the shape `{"clusteringColumns":[["col1"],["addr","city"], ...]}` (additional fields
+/// may be present). Column names are physical identifiers -- callers must resolve to
+/// logical names when column mapping is enabled.
 ///
 /// # Safety
 ///
@@ -76,8 +69,8 @@ fn get_clustering_domain_metadata_impl(
     allocate_fn: AllocateStringFn,
 ) -> DeltaResult<NullableCvoid> {
     Ok(snapshot
-        .get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, extern_engine.engine().as_ref())?
-        .and_then(|config: String| allocate_fn(kernel_string_slice!(config))))
+        .get_clustering_domain_metadata(extern_engine.engine().as_ref())?
+        .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
 
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
@@ -137,6 +130,7 @@ mod tests {
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
+    use rstest::rstest;
     use serde_json::json;
     use test_utils::add_commit;
 
@@ -307,45 +301,79 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_get_clustering_domain_metadata() -> DeltaResult<()> {
-        let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let table_root = "memory:///test_clustered_table/";
+    // ============================================================
+    // === get_clustering_domain_metadata tests ===
+    // ============================================================
 
-        // commit0: a clustered table with a `delta.clustering` domain entry. The user-facing
-        // `get_domain_metadata` rejects reads on `delta.*` domains;
-        // `get_clustering_domain_metadata` is the read path that goes through
-        // `get_domain_metadata_internal` and returns the JSON.
-        let commit = [
+    /// Build a JSON protocol action. If `clustering` is true, advertise the ClusteredTable
+    /// writer feature so `Snapshot::get_clustering_domain_metadata` will read the domain.
+    fn protocol_action(clustering: bool) -> serde_json::Value {
+        if clustering {
             json!({
                 "protocol": {
                     "minReaderVersion": 1,
                     "minWriterVersion": 7,
                     "writerFeatures": ["domainMetadata", "clustering"]
                 }
-            }),
+            })
+        } else {
             json!({
-                "metaData": {
-                    "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
-                    "format": { "provider": "parquet", "options": {} },
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 1
                 }
-            }),
-            json!({
-                "domainMetadata": {
-                    "domain": "delta.clustering",
-                    "configuration": "{\"clusteringColumns\":[[\"id\"]]}",
-                    "removed": false
-                }
-            }),
-        ]
-        .map(|json| json.to_string())
-        .join("\n");
+            })
+        }
+    }
+
+    fn metadata_action(schema_json: &str) -> serde_json::Value {
+        json!({
+            "metaData": {
+                "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": schema_json,
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        })
+    }
+
+    fn flat_schema_json() -> &'static str {
+        "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"
+    }
+
+    fn clustering_domain_action(config: &str) -> serde_json::Value {
+        json!({
+            "domainMetadata": {
+                "domain": "delta.clustering",
+                "configuration": config,
+                "removed": false
+            }
+        })
+    }
+
+    fn join_actions(actions: &[serde_json::Value]) -> String {
+        actions
+            .iter()
+            .map(|j| j.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn test_get_clustering_domain_metadata_user_facing_path_still_rejects() -> DeltaResult<()>
+    {
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let table_root = "memory:///test_clustering_user_facing_rejected/";
+
+        let commit = join_actions(&[
+            protocol_action(true),
+            metadata_action(flat_schema_json()),
+            clustering_domain_action(r#"{"clusteringColumns":[["id"]]}"#),
+        ]);
         add_commit(table_root, storage.clone().as_ref(), 0, commit)
             .await
             .unwrap();
@@ -353,7 +381,6 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
-        // The user-facing FFI rejects `delta.clustering` reads.
         let domain = "delta.clustering";
         let rejected = unsafe {
             get_domain_metadata(
@@ -372,52 +399,63 @@ mod tests {
             ),
         );
 
-        // The new FFI succeeds and returns the JSON.
-        let res = ok_or_panic(unsafe {
-            get_clustering_domain_metadata(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-                allocate_str,
-            )
-        });
-        assert_eq!(
-            recover_string(res.unwrap()),
-            "{\"clusteringColumns\":[[\"id\"]]}"
-        );
-
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
 
         Ok(())
     }
 
+    #[rstest]
+    #[case::clustered_single_column(
+        true,
+        Some(r#"{"clusteringColumns":[["id"]]}"#),
+        Some(r#"{"clusteringColumns":[["id"]]}"#),
+        "memory:///test_clustering_single/"
+    )]
+    #[case::clustered_multi_column(
+        true,
+        Some(r#"{"clusteringColumns":[["id"],["val"]]}"#),
+        Some(r#"{"clusteringColumns":[["id"],["val"]]}"#),
+        "memory:///test_clustering_multi/"
+    )]
+    #[case::clustered_nested_path(
+        true,
+        Some(r#"{"clusteringColumns":[["addr","city"]]}"#),
+        Some(r#"{"clusteringColumns":[["addr","city"]]}"#),
+        "memory:///test_clustering_nested/"
+    )]
+    #[case::unclustered_returns_null(false, None, None, "memory:///test_clustering_unclustered/")]
+    #[case::clustered_feature_with_no_domain_entry(
+        true,
+        None,
+        None,
+        "memory:///test_clustering_feature_no_entry/"
+    )]
+    #[case::no_clustering_feature_but_domain_present(
+        false,
+        Some(r#"{"clusteringColumns":[["id"]]}"#),
+        None,
+        "memory:///test_clustering_no_feature_domain_present/"
+    )]
     #[tokio::test]
-    async fn test_get_clustering_domain_metadata_absent() -> DeltaResult<()> {
-        // A table with no clustering domain entry must return NULL (Optional.empty).
+    async fn test_get_clustering_domain_metadata(
+        #[case] clustering_feature: bool,
+        #[case] domain_config: Option<&str>,
+        #[case] expected: Option<&str>,
+        #[case] table_root: &str,
+    ) -> DeltaResult<()> {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let table_root = "memory:///test_unclustered_table/";
-        let commit = [
-            json!({
-                "protocol": {
-                    "minReaderVersion": 1,
-                    "minWriterVersion": 1
-                }
-            }),
-            json!({
-                "metaData": {
-                    "id": "11111111-1111-1111-1111-111111111111",
-                    "format": { "provider": "parquet", "options": {} },
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
-        ]
-        .map(|json| json.to_string())
-        .join("\n");
+
+        let mut actions = vec![
+            protocol_action(clustering_feature),
+            metadata_action(flat_schema_json()),
+        ];
+        if let Some(config) = domain_config {
+            actions.push(clustering_domain_action(config));
+        }
+        let commit = join_actions(&actions);
         add_commit(table_root, storage.clone().as_ref(), 0, commit)
             .await
             .unwrap();
@@ -432,10 +470,100 @@ mod tests {
                 allocate_str,
             )
         });
-        assert!(
-            res.is_none(),
-            "absent clustering domain must surface as NULL"
-        );
+
+        match expected {
+            Some(want) => {
+                let got = recover_string(res.expect("clustering domain JSON should be present"));
+                assert_eq!(got, want);
+            }
+            None => assert!(res.is_none()),
+        }
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_clustering_domain_metadata_tombstoned_returns_null() -> DeltaResult<()> {
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let table_root = "memory:///test_clustering_tombstoned/";
+
+        let commit0 = join_actions(&[
+            protocol_action(true),
+            metadata_action(flat_schema_json()),
+            clustering_domain_action(r#"{"clusteringColumns":[["id"]]}"#),
+        ]);
+        add_commit(table_root, storage.clone().as_ref(), 0, commit0)
+            .await
+            .unwrap();
+
+        let commit1 = json!({
+            "domainMetadata": {
+                "domain": "delta.clustering",
+                "configuration": r#"{"clusteringColumns":[["id"]]}"#,
+                "removed": true
+            }
+        })
+        .to_string();
+        add_commit(table_root, storage.as_ref(), 1, commit1)
+            .await
+            .unwrap();
+
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let res = ok_or_panic(unsafe {
+            get_clustering_domain_metadata(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        });
+        assert!(res.is_none());
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_clustering_domain_metadata_latest_write_wins() -> DeltaResult<()> {
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let table_root = "memory:///test_clustering_latest_wins/";
+
+        let commit0 = join_actions(&[
+            protocol_action(true),
+            metadata_action(flat_schema_json()),
+            clustering_domain_action(r#"{"clusteringColumns":[["id"]]}"#),
+        ]);
+        add_commit(table_root, storage.clone().as_ref(), 0, commit0)
+            .await
+            .unwrap();
+
+        let commit1 = clustering_domain_action(r#"{"clusteringColumns":[["val"]]}"#).to_string();
+        add_commit(table_root, storage.as_ref(), 1, commit1)
+            .await
+            .unwrap();
+
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let res = ok_or_panic(unsafe {
+            get_clustering_domain_metadata(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        });
+        let got = recover_string(res.expect("clustering domain JSON should be present"));
+        assert_eq!(got, r#"{"clusteringColumns":[["val"]]}"#);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
