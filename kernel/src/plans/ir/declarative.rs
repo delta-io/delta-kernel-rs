@@ -694,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn join_inner_concats_schemas_join_left_anti_mirrors_right() {
+    fn join_inner_dedups_same_name_columns_join_left_anti_mirrors_right() {
         let left = PlanBuilder::scan_json(
             vec![],
             arc_schema([StructField::not_null("k", DataType::LONG)]),
@@ -712,7 +712,9 @@ mod tests {
             .fields()
             .map(|f| f.name().clone())
             .collect();
-        assert_eq!(inner_names, vec!["k", "k", "v"]);
+        // Inner join collapses the duplicate `k` to a single column: `k` appears once even
+        // though both inputs carry it.
+        assert_eq!(inner_names, vec!["k", "v"]);
         let anti = left.join(right.clone(), JoinType::LeftAnti).unwrap();
         let anti_names: Vec<String> = anti
             .schema_ref()
