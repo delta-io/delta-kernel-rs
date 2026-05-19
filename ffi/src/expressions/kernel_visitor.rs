@@ -596,19 +596,20 @@ pub extern "C" fn visit_predicate_in(
 /// Build an opaque predicate `Predicate::Opaque(NamedOpaquePredicateOp(name), exprs)` from a
 /// name and a list of child expression IDs. Allows engines to push engine-defined predicates
 /// (e.g. `STARTS_WITH`, `LIKE`) through the kernel without registering a native Rust-side
-/// evaluator. The resulting opaque op reports "no support" for scalar evaluation and data
-/// skipping, so the kernel will not use the predicate for partition pruning or stats-based
-/// pruning; the engine remains responsible for row-level filtering.
+/// evaluator.
+///
+/// Kernel-side pruning behavior depends on the name. Names recognized by the internal
+/// `skipping` shim (`STARTS_WITH`) participate in partition pruning, stats-based file
+/// pruning, and parquet row-group skipping under Delta's default binary collation;
+/// engines using non-default collations must not push the predicate through this op.
+/// Unrecognized names opt out of every pruning pass, and the engine is responsible for
+/// filtering them at row time.
 ///
 /// Each child ID is consumed from the visitor state (an ID can only be used once). Predicate
 /// IDs are auto-promoted into expressions, mirroring `Expression::from_pred`. Returns 0 if
 /// any child ID is invalid (already consumed, never created, or zero), matching the invariant
 /// of the binary `visit_predicate_*` builders. Remaining valid IDs are still drained from
 /// state in that case.
-///
-/// Note: kernel evaluators that encounter this op during partition pruning will emit a
-/// `warn!` log per call, because `eval_pred_scalar` returns `Err` to signal "no support".
-/// This follows the documented contract of `OpaquePredicateOp::eval_pred_scalar`.
 ///
 /// # Safety
 /// The string slice must be valid for the duration of the call.

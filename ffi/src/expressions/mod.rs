@@ -15,6 +15,7 @@ use crate::{kernel_string_slice, KernelStringSlice};
 
 pub mod engine_visitor;
 pub mod kernel_visitor;
+mod skipping;
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
 pub struct SharedExpression;
@@ -98,9 +99,15 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 
 /// An [`OpaquePredicateOp`] that carries only a name, intended for FFI consumers that need
 /// to push an engine-defined predicate through the kernel without registering a Rust-side
-/// evaluator. All evaluation methods report "no support", so the kernel will not use such a
-/// predicate for partition pruning or data skipping; the engine remains responsible for
-/// row-level filtering.
+/// evaluator.
+///
+/// Engine-side row-level evaluation is always required: kernel has no way to evaluate the op
+/// itself. For kernel-side pruning, the internal `skipping` shim recognizes a curated list
+/// of op names (`STARTS_WITH`) and supplies the appropriate rewrites and scalar evaluators.
+/// Skipping for recognized ops assumes Delta's default binary string collation; engines
+/// using non-default collations must not push the affected predicates through this op.
+/// Ops outside the recognized list opt out of every pruning pass; the engine is
+/// responsible for filtering them at row time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedOpaquePredicateOp {
     name: String,
@@ -119,13 +126,19 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
 
     fn eval_pred_scalar(
         &self,
-        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        eval_expr: &ScalarExpressionEvaluator<'_>,
         _eval_pred: &DirectPredicateEvaluator<'_>,
-        _exprs: &[Expression],
-        _inverted: bool,
+        exprs: &[Expression],
+        inverted: bool,
     ) -> DeltaResult<Option<bool>> {
-        // Disqualify this op from partition pruning. See `OpaquePredicateOp::eval_pred_scalar`:
-        // returning `Err` is the documented "no scalar eval" signal.
+        if let Some(result) =
+            skipping::evaluate_on_partition_value(&self.name, eval_expr, exprs, inverted)
+        {
+            return result;
+        }
+        // Unrecognized op -- emit the documented "no scalar eval" signal.
+        // See `OpaquePredicateOp::eval_pred_scalar`: returning `Err` opts the
+        // op out of partition pruning.
         Err(delta_kernel::Error::generic(format!(
             "NamedOpaquePredicateOp({}) does not support scalar evaluation",
             self.name
@@ -134,20 +147,20 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
 
     fn eval_as_data_skipping_predicate(
         &self,
-        _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
-        _exprs: &[Expression],
-        _inverted: bool,
+        evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
     ) -> Option<bool> {
-        None
+        skipping::evaluate_for_row_group_skipping(&self.name, evaluator, exprs, inverted)
     }
 
     fn as_data_skipping_predicate(
         &self,
-        _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
-        _exprs: &[Expression],
-        _inverted: bool,
+        evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
     ) -> Option<Predicate> {
-        None
+        skipping::rewrite_for_file_pruning(&self.name, evaluator, exprs, inverted)
     }
 }
 
