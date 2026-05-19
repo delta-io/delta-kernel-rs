@@ -21,7 +21,7 @@ use datafusion_common::assert_batches_sorted_eq;
 use delta_kernel::arrow::array::{Int64Array, ListArray, RecordBatch, StringArray, StructArray};
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field, FieldRef, Fields, Schema as ArrowSchema,
 };
 use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{
@@ -41,6 +41,28 @@ fn kernel_id_meta(id: i64) -> Vec<(&'static str, MetadataValue)> {
         ColumnMetadataKey::ParquetFieldId.as_ref(),
         MetadataValue::Number(id),
     )]
+}
+
+/// Arrow `Field` carrying a `PARQUET:field_id`. Used for building physical schemas in tests.
+fn aid(name: &str, ty: ArrowDataType, nullable: bool, id: i64) -> Field {
+    Field::new(name, ty, nullable).with_metadata(arrow_id_meta(id))
+}
+
+/// Arrow `Field` of `Struct(inner_fields)` carrying a `PARQUET:field_id`. Used for the nested
+/// physical schemas (the struct-wrap pattern repeats 2-3 times across the nested tests).
+fn aid_struct(name: &str, inner_fields: Vec<FieldRef>, nullable: bool, id: i64) -> Field {
+    aid(
+        name,
+        ArrowDataType::Struct(Fields::from(inner_fields)),
+        nullable,
+        id,
+    )
+}
+
+/// Kernel `StructField` carrying a `parquet.field.id`. Used for building logical schemas
+/// in tests.
+fn kid(name: &str, ty: KernelDataType, nullable: bool, id: i64) -> StructField {
+    StructField::new(name, ty, nullable).with_metadata(kernel_id_meta(id))
 }
 
 fn write_parquet(path: &std::path::Path, schema: Arc<ArrowSchema>, batch: RecordBatch) {
@@ -81,8 +103,8 @@ struct FlatFixture {
 
 fn renamed_logical_columns_fixture() -> FlatFixture {
     let arrow_schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("legacy_id", ArrowDataType::Int64, false).with_metadata(arrow_id_meta(1)),
-        Field::new("legacy_name", ArrowDataType::Utf8, false).with_metadata(arrow_id_meta(2)),
+        aid("legacy_id", ArrowDataType::Int64, false, 1),
+        aid("legacy_name", ArrowDataType::Utf8, false, 2),
     ]));
     let batch = RecordBatch::try_new(
         arrow_schema.clone(),
@@ -94,9 +116,8 @@ fn renamed_logical_columns_fixture() -> FlatFixture {
     .unwrap();
     let kernel_schema = Arc::new(
         StructType::try_new(vec![
-            StructField::new("user_id", KernelDataType::LONG, false).with_metadata(kernel_id_meta(1)),
-            StructField::new("user_name", KernelDataType::STRING, false)
-                .with_metadata(kernel_id_meta(2)),
+            kid("user_id", KernelDataType::LONG, false, 1),
+            kid("user_name", KernelDataType::STRING, false, 2),
         ])
         .unwrap(),
     );
@@ -119,8 +140,8 @@ fn renamed_logical_columns_fixture() -> FlatFixture {
 fn reordered_logical_columns_fixture() -> FlatFixture {
     // Physical column order B then A (legacy names); logical scan lists A then B.
     let arrow_schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("phys_b", ArrowDataType::Utf8, false).with_metadata(arrow_id_meta(2)),
-        Field::new("phys_a", ArrowDataType::Int64, false).with_metadata(arrow_id_meta(1)),
+        aid("phys_b", ArrowDataType::Utf8, false, 2),
+        aid("phys_a", ArrowDataType::Int64, false, 1),
     ]));
     let batch = RecordBatch::try_new(
         arrow_schema.clone(),
@@ -132,9 +153,8 @@ fn reordered_logical_columns_fixture() -> FlatFixture {
     .unwrap();
     let kernel_schema = Arc::new(
         StructType::try_new(vec![
-            StructField::new("logical_a", KernelDataType::LONG, false).with_metadata(kernel_id_meta(1)),
-            StructField::new("logical_b", KernelDataType::STRING, false)
-                .with_metadata(kernel_id_meta(2)),
+            kid("logical_a", KernelDataType::LONG, false, 1),
+            kid("logical_b", KernelDataType::STRING, false, 2),
         ])
         .unwrap(),
     );
@@ -156,7 +176,7 @@ fn reordered_logical_columns_fixture() -> FlatFixture {
 fn mixed_field_id_and_name_fallback_fixture() -> FlatFixture {
     // Physical order: renamed typed column first, plain column second (logical order inverts).
     let arrow_schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("phys_metric", ArrowDataType::Int64, false).with_metadata(arrow_id_meta(42)),
+        aid("phys_metric", ArrowDataType::Int64, false, 42),
         Field::new("plain_label", ArrowDataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -172,8 +192,7 @@ fn mixed_field_id_and_name_fallback_fixture() -> FlatFixture {
     let kernel_schema = Arc::new(
         StructType::try_new(vec![
             StructField::new("plain_label", KernelDataType::STRING, false),
-            StructField::new("logical_metric", KernelDataType::LONG, false)
-                .with_metadata(kernel_id_meta(42)),
+            kid("logical_metric", KernelDataType::LONG, false, 42),
         ])
         .unwrap(),
     );
@@ -220,15 +239,8 @@ async fn parquet_scan_renames_nested_struct_fields_by_field_id() {
     let dir = tempfile::tempdir().unwrap();
 
     // Physical: Struct{phys_outer: Struct{phys_inner: Int64}} with field-ids 1, 2.
-    let phys_inner_field = Arc::new(
-        Field::new("phys_inner", ArrowDataType::Int64, false).with_metadata(arrow_id_meta(2)),
-    );
-    let phys_outer_field = Field::new(
-        "phys_outer",
-        ArrowDataType::Struct(Fields::from(vec![phys_inner_field.clone()])),
-        true,
-    )
-    .with_metadata(arrow_id_meta(1));
+    let phys_inner_field = Arc::new(aid("phys_inner", ArrowDataType::Int64, false, 2));
+    let phys_outer_field = aid_struct("phys_outer", vec![phys_inner_field.clone()], true, 1);
     let arrow_schema = Arc::new(ArrowSchema::new(vec![phys_outer_field]));
 
     let inner_values = Arc::new(Int64Array::from(vec![Some(7), Some(11), Some(13)]));
@@ -237,27 +249,28 @@ async fn parquet_scan_renames_nested_struct_fields_by_field_id() {
         vec![inner_values as _],
         None,
     );
-    let batch = RecordBatch::try_new(
-        Arc::clone(&arrow_schema),
-        vec![Arc::new(outer_struct) as _],
-    )
-    .unwrap();
-    write_parquet(&dir.path().join("nested_struct.parquet"), arrow_schema, batch);
+    let batch =
+        RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::new(outer_struct) as _]).unwrap();
+    write_parquet(
+        &dir.path().join("nested_struct.parquet"),
+        arrow_schema,
+        batch,
+    );
 
     // Logical: Struct{logical_outer: Struct{logical_inner: Long}} with the same field-ids.
     let kernel_schema = Arc::new(
-        StructType::try_new(vec![StructField::new(
+        StructType::try_new(vec![kid(
             "logical_outer",
-            KernelDataType::try_struct_type(vec![StructField::new(
+            KernelDataType::try_struct_type(vec![kid(
                 "logical_inner",
                 KernelDataType::LONG,
                 false,
-            )
-            .with_metadata(kernel_id_meta(2))])
+                2,
+            )])
             .unwrap(),
             true,
-        )
-        .with_metadata(kernel_id_meta(1))])
+            1,
+        )])
         .unwrap(),
     );
 
@@ -285,23 +298,19 @@ async fn parquet_scan_renames_list_of_struct_element_fields_by_field_id() {
     let dir = tempfile::tempdir().unwrap();
 
     // Physical: List<Struct{phys_x: Int64}>; element=field-id 2, inner=field-id 3.
-    let phys_inner_field = Arc::new(
-        Field::new("phys_x", ArrowDataType::Int64, false).with_metadata(arrow_id_meta(3)),
-    );
-    let phys_element_field = Arc::new(
-        Field::new(
-            "element",
-            ArrowDataType::Struct(Fields::from(vec![phys_inner_field.clone()])),
-            true,
-        )
-        .with_metadata(arrow_id_meta(2)),
-    );
-    let phys_root_field = Field::new(
+    let phys_inner_field = Arc::new(aid("phys_x", ArrowDataType::Int64, false, 3));
+    let phys_element_field = Arc::new(aid_struct(
+        "element",
+        vec![phys_inner_field.clone()],
+        true,
+        2,
+    ));
+    let phys_root_field = aid(
         "phys_arr",
         ArrowDataType::List(Arc::clone(&phys_element_field)),
         true,
-    )
-    .with_metadata(arrow_id_meta(1));
+        1,
+    );
     let arrow_schema = Arc::new(ArrowSchema::new(vec![phys_root_field]));
 
     // Two rows: [{x:1},{x:2}], [{x:3}]
@@ -315,30 +324,30 @@ async fn parquet_scan_renames_list_of_struct_element_fields_by_field_id() {
         Arc::new(element_struct) as _,
         None,
     );
-    let batch = RecordBatch::try_new(
-        Arc::clone(&arrow_schema),
-        vec![Arc::new(list) as _],
-    )
-    .unwrap();
-    write_parquet(&dir.path().join("list_of_struct.parquet"), arrow_schema, batch);
+    let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::new(list) as _]).unwrap();
+    write_parquet(
+        &dir.path().join("list_of_struct.parquet"),
+        arrow_schema,
+        batch,
+    );
 
     // Logical: List<Struct{logical_x: Long}> with matching field-ids.
     let kernel_schema = Arc::new(
-        StructType::try_new(vec![StructField::new(
+        StructType::try_new(vec![kid(
             "logical_arr",
             KernelDataType::Array(Box::new(ArrayType::new(
-                KernelDataType::try_struct_type(vec![StructField::new(
+                KernelDataType::try_struct_type(vec![kid(
                     "logical_x",
                     KernelDataType::LONG,
                     false,
-                )
-                .with_metadata(kernel_id_meta(3))])
+                    3,
+                )])
                 .unwrap(),
                 true,
             ))),
             true,
-        )
-        .with_metadata(kernel_id_meta(1))])
+            1,
+        )])
         .unwrap(),
     );
 
