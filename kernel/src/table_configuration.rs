@@ -864,6 +864,25 @@ impl TableConfiguration {
         // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
         self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
+
+    /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
+    /// See `crate::table_features::ROW_TRACKING_INFO` for more details.
+    pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
+        // RowTracking is a prerequisite for IcebergCompatV3, so the IcebergCompatV3 arm is
+        // technically redundant. Just be conservative here to check both.
+        if self.should_write_row_tracking() {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with rowTracking supported \
+                 and not suspended",
+            ));
+        }
+        if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +904,7 @@ mod test {
     use crate::table_properties::{
         TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
         ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+        ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2608,6 +2628,24 @@ mod test {
             config.validate_feature_requirements(&feature_to_enable),
             expected_error_substring,
         );
+    }
+
+    /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_
+    /// and not _suspended_, which is broader than _enabled_.
+    #[rstest]
+    #[case::supported_only(&[], Some("rowTracking"))]
+    #[case::supported_and_enabled(&[(ENABLE_ROW_TRACKING, "true")], Some("rowTracking"))]
+    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None /*expected_error_substring */)]
+    fn test_validate_feature_support_for_remove_row_tracking(
+        #[case] props: &[(&str, &str)],
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = create_mock_table_config(props, &[TableFeature::RowTracking]);
+        let result = config.validate_feature_support_for_remove();
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
     }
 
     /// Test helper: variant of `create_mock_table_config` that also takes an optional
