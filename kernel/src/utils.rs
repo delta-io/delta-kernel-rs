@@ -1206,7 +1206,7 @@ pub(crate) mod test_utils {
         };
 
         /// Two fields with the same physical name at different physical paths should be accepted.
-        pub(crate) fn same_phy_name_diffrent_paths() -> StructType {
+        pub(crate) fn same_phy_name_different_paths() -> StructType {
             let nested = StructType::new_unchecked([cm_field("id", 3, "id", DataType::INTEGER)]);
             StructType::new_unchecked([
                 cm_field("id", 1, "id", DataType::INTEGER),

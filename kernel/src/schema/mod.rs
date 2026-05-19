@@ -2647,7 +2647,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::accepted_same_phy_name_diffrent_paths(fixtures::same_phy_name_diffrent_paths(), /*expected_error_substring*/None)]
+    #[case::accepted_same_phy_name_different_paths(fixtures::same_phy_name_different_paths(), /*expected_error_substring*/None)]
     #[case::rejected_deeply_nested_repeat_physical_paths(
         fixtures::deeply_nested_repeat_physical_paths(),
         Some({
