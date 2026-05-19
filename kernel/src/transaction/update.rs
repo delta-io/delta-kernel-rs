@@ -27,7 +27,6 @@ use crate::error::Error;
 use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
-use crate::scan::state::Stats;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
@@ -596,12 +595,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 continue;
             };
             if let Some(dv_result) = self.dv_updates.get(&path) {
-                // The Delta protocol's "Deletion Vectors" section requires that files with a DV
-                // carry an accurate `numRecords` statistic, so we reject scan metadata that has
-                // dropped or never had it. We parse the raw `stats` JSON string here because
-                // scan rows carry stats as a string per `SCAN_ROW_SCHEMA`; the parallel check on
-                // unparsed add-action batches lives in
-                // `stats_verifier::verify_num_records_present`.
+                // DVs require an accurate numRecords stat per the Delta protocol.
                 let stats: Option<String> =
                     getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
                 let stats = stats.ok_or_else(|| {
@@ -610,12 +604,21 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                          deletion vectors require an accurate numRecords"
                     ))
                 })?;
-                serde_json::from_str::<Stats>(&stats).map_err(|e| {
+                let parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
                     Error::generic(format!(
-                        "update_deletion_vectors: stats for {path} are missing or invalid \
-                         numRecords ({e})"
+                        "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
                     ))
                 })?;
+                if parsed
+                    .get("numRecords")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+                {
+                    return Err(Error::generic(format!(
+                        "update_deletion_vectors: stats for {path} is missing numRecords \
+                         or it is not a non-negative integer"
+                    )));
+                }
                 self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
                     DV_SCHEMA_FIELDS.clone(),
                     vec![
