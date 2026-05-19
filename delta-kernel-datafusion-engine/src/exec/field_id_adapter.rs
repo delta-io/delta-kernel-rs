@@ -14,9 +14,6 @@
 //!    - outer [`CastColumnExpr`] -- drops parquet-only extras, fills missing-but-nullable targets
 //!      with NULL, errors on missing-and-non-nullable, applies type-widening casts.
 //!
-//! The downstream [`super::NullabilityValidationExec`] re-asserts strict NOT NULL on parent
-//! struct nodes whose decoded children carry nulls.
-//!
 //! [`apply_schema_to`]: delta_kernel::engine::arrow_expression::apply_schema::apply_schema_to
 
 use std::any::Any;
@@ -306,9 +303,8 @@ impl PhysicalExpr for RenameNestedFieldsByIdExpr {
 /// *nullability* of `logical` wherever a field-id (or name) match exists. Recurses into
 /// structs, lists, and map entries. The result mirrors parquet 1:1 so `apply_schema_to`
 /// can rename in lockstep without rebuilding arrays. Logical nullability is stamped on
-/// matched children to satisfy `CastColumnExpr::validate_struct_compatibility` (actual
-/// not-null enforcement happens downstream in [`super::NullabilityValidationExec`]).
-/// Parquet-only children pass through unchanged; the outer cast drops them.
+/// matched children to satisfy `CastColumnExpr::validate_struct_compatibility`. Parquet-only
+/// children pass through unchanged; the outer cast drops them.
 fn build_renamed_physical_field(physical: &Field, logical: &Field) -> Field {
     let rename_child =
         |p: &FieldRef, l: &FieldRef| Arc::new(build_renamed_physical_field(p.as_ref(), l.as_ref()));

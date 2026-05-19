@@ -23,67 +23,9 @@ use delta_kernel::schema::MetadataColumnSpec;
 use parquet::arrow::RowNumber;
 
 use super::canonicalize::canonicalize_output_to_kernel_schema;
-use super::providers::NullabilityEnforcingTableProvider;
 use crate::compile::expr_translator::kernel_expr_to_df_untyped;
 use crate::error::plan_compilation;
 use crate::exec::FieldIdPhysicalExprAdapterFactory;
-
-/// DataFusion file sources fail planning when decoded nested field nullability is wider than
-/// the declared scan schema (for example nullable parquet/json children flowing into kernel
-/// protocol NOT NULL children). Relax nested nullability before handing the schema to a file
-/// source so planning succeeds; downstream operators carry the relaxed nullability.
-pub(super) fn relax_nested_nullability_for_scan(schema: &ArrowSchema) -> Arc<ArrowSchema> {
-    use datafusion_common::arrow::datatypes::{DataType, Field};
-    fn relax_field(field: &Arc<Field>, force_nullable: bool) -> Arc<Field> {
-        let relaxed_dt = relax_data_type(field.data_type());
-        Arc::new(
-            Field::new(
-                field.name(),
-                relaxed_dt,
-                if force_nullable {
-                    true
-                } else {
-                    field.is_nullable()
-                },
-            )
-            .with_metadata(field.metadata().clone()),
-        )
-    }
-    fn relax_data_type(dt: &DataType) -> DataType {
-        let relax_inner = |inner: &Arc<Field>| relax_field(inner, true);
-        match dt {
-            DataType::Struct(fields) => DataType::Struct(fields.iter().map(relax_inner).collect()),
-            DataType::List(inner) => DataType::List(relax_inner(inner)),
-            DataType::LargeList(inner) => DataType::LargeList(relax_inner(inner)),
-            DataType::FixedSizeList(inner, n) => DataType::FixedSizeList(relax_inner(inner), *n),
-            DataType::Map(entries, sorted) => {
-                let relaxed_entries = match entries.data_type() {
-                    DataType::Struct(entry_fields) if entry_fields.len() == 2 => {
-                        let key = relax_field(&entry_fields[0], false);
-                        let val = relax_field(&entry_fields[1], true);
-                        Arc::new(
-                            Field::new(
-                                entries.name(),
-                                DataType::Struct(vec![key, val].into()),
-                                entries.is_nullable(),
-                            )
-                            .with_metadata(entries.metadata().clone()),
-                        )
-                    }
-                    _ => relax_inner(entries),
-                };
-                DataType::Map(relaxed_entries, *sorted)
-            }
-            other => other.clone(),
-        }
-    }
-    let fields: Vec<Arc<Field>> = schema
-        .fields()
-        .iter()
-        .map(|f| relax_field(f, false))
-        .collect();
-    Arc::new(ArrowSchema::new(fields))
-}
 
 pub(super) fn scan_to_listing_logical_plan(
     node: &ScanNode,
@@ -108,8 +50,7 @@ pub(super) fn scan_to_listing_logical_plan(
             // checkpoints commonly write `add.path` as nullable; JSON drops declared NOT NULL
             // on nested children). Relax before passing in; `NullabilityEnforcingTableProvider`
             // re-asserts the strict contract per-batch.
-            let file_schema =
-                relax_nested_nullability_for_scan(Arc::new(full_schema.clone()).as_ref());
+            let file_schema = Arc::new(full_schema.clone());
             let partition_cols: Vec<(String, ArrowDataType)> = Vec::new();
             let format: Arc<dyn datafusion_datasource::file_format::FileFormat> =
                 match node.file_type {
@@ -147,14 +88,7 @@ pub(super) fn scan_to_listing_logical_plan(
                 .with_schema(Arc::clone(&file_schema))
                 .with_expr_adapter_factory(Arc::new(FieldIdPhysicalExprAdapterFactory));
             let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
-            // Wrapper re-asserts the strict nullability contract per batch via
-            // `NullabilityValidationExec`, computing its effective output schema from the inner
-            // scan's actual schema (preserving source-side names + `PARQUET:field_id` metadata
-            // that field-id projection plumbs through) merged with the kernel-strict nullability.
-            let provider: Arc<dyn TableProvider> = Arc::new(
-                NullabilityEnforcingTableProvider::new(listing, Arc::new(full_schema.clone())),
-            );
-            LogicalPlanBuilder::scan("scan", provider_as_source(provider), None)?.build()
+            LogicalPlanBuilder::scan("scan", provider_as_source(listing), None)?.build()
         };
     let mut scan_plan = build_listing_scan(&node.files)?;
     if let Some(predicate) = &node.predicate {

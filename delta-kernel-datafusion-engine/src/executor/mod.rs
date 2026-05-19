@@ -149,11 +149,7 @@ impl DataFusionExecutor {
     /// `MemTable`).
     #[cfg(test)]
     pub(crate) fn relation_provider(&self, handle_id: &str) -> Option<Arc<dyn TableProvider>> {
-        self.relation_providers
-            .lock()
-            .expect("relation_providers mutex poisoned")
-            .get(handle_id)
-            .cloned()
+        self.providers_lock().ok()?.get(handle_id).cloned()
     }
 
     /// Snapshot of the underlying [`SessionContext`]'s state. Exposes the
