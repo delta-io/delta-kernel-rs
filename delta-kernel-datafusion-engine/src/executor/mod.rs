@@ -1,44 +1,22 @@
 //! DataFusion-backed [`DataFusionExecutor`] for compiling kernel [`Plan`] values.
 //!
-//! [`SinkType::Relation`] and [`SinkType::Load`] register a *lazy* [`TableProvider`] into the
-//! executor's [`Self::relation_providers`] map keyed by [`RelationHandle::id`]; the upstream
-//! pipeline is never run at registration time. Downstream
-//! [`DeclarativePlanNode::RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef)
-//! leaves resolve to that provider during compile, and DataFusion's analyzer/optimizer drives
-//! execution lazily when the consumer reads the relation. Concretely:
+//! `Relation` and `Load` sinks register a *lazy* [`TableProvider`] into
+//! [`Self::relation_providers`] keyed by [`RelationHandle::id`]; the upstream pipeline never
+//! runs at registration time. Downstream `RelationRef` leaves resolve to that provider during
+//! compile, and DataFusion drives execution lazily when the consumer reads the relation.
 //!
-//! - `Relation` -> [`datafusion::datasource::ViewTable`] wrapping the upstream `LogicalPlan`.
-//!   DataFusion's `InlineTableScan` analyzer rule inlines the wrapped plan into the consumer's tree
-//!   so predicate / projection pushdown and CSE flow across the boundary.
-//! - `Load`     -> [`crate::exec::LoadTableProvider`] capturing the upstream `LogicalPlan` +
-//!   [`LoadSink`] + kernel [`Engine`]. Its `scan()` builds the upstream physical plan and wraps it
-//!   in [`crate::exec::LoadExec`], which streams per-row file batches incrementally via kernel's
-//!   parquet/json handler.
+//! - `Relation` -> [`datafusion::datasource::ViewTable`] over the upstream `LogicalPlan`;
+//!   DataFusion's `InlineTableScan` rule inlines it so pushdown and CSE cross the boundary.
+//! - `Load`     -> [`crate::exec::LoadTableProvider`] wrapping the upstream `LogicalPlan` +
+//!   [`LoadSink`] + [`Engine`]; `scan()` produces a [`crate::exec::LoadExec`] that streams per-row
+//!   file batches via kernel's parquet/json handler.
 //!
-//! [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) is the only sink
-//! that drains eagerly: the physical plan runs and feeds a
-//! [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle inside
-//! [`Self::drain_consume_sink`]; finalized handles submit into the active phase's
-//! [`PhaseState`].
-//!
-//! # API surface
-//!
-//! - [`DataFusionExecutor::drive_to_completion`] drives a [`CoroutineSM`] until it terminates,
-//!   handling any intermediate phase operations the SM yields (kernel-side decision plans, schema
-//!   queries). Returns the SM's terminal value.
-//! - [`DataFusionExecutor::execute_plans`] runs every plan in a slice in order, registering
-//!   `Relation` / `Load` providers and draining `Consume` sinks as it goes.
-//! - [`DataFusionExecutor::stream_relation`] / [`DataFusionExecutor::collect_relation`] read a
-//!   previously-registered relation as a stream or a buffered `Vec`. The actual upstream execution
-//!   happens here on demand.
-//! - [`DataFusionExecutor::collect_result`] composes the above: execute the [`ResultPlan`]'s plans,
-//!   then collect its result relation.
-//!
-//! [`SinkType::Relation`]: delta_kernel::plans::ir::nodes::SinkType::Relation
-//! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load
+//! `Consume` is the only sink that drains eagerly: the physical plan runs and feeds a
+//! [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle whose finalized state
+//! submits into the active phase's [`PhaseState`].
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::ViewTable;
@@ -114,11 +92,13 @@ fn execute_schema_query_phase(
 /// for DataFusion compile/optimize/lower, a kernel [`Engine`] for IO helpers, and a
 /// [`Mutex`]-guarded map of lazily-registered relations the compiler resolves
 /// [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves against.
+type RelationProviders = HashMap<String, Arc<dyn TableProvider>>;
+
 pub struct DataFusionExecutor {
     task_ctx: Arc<TaskContext>,
     session_ctx: SessionContext,
     engine: Arc<dyn Engine>,
-    relation_providers: Mutex<HashMap<String, Arc<dyn TableProvider>>>,
+    relation_providers: Mutex<RelationProviders>,
 }
 
 impl DataFusionExecutor {
@@ -159,8 +139,16 @@ impl DataFusionExecutor {
         &self.engine
     }
 
-    /// Snapshot the provider registered under `handle_id`, if any. Used by tests to assert
-    /// lazy-registration shape (e.g. that the provider is a [`ViewTable`] and not a materialized
+    /// Locked view of the lazy-relation map. Maps mutex poison (only possible if a previous
+    /// holder panicked) to a [`DataFusionError::Internal`] so the no-panic rule holds.
+    fn providers_lock(&self) -> Result<MutexGuard<'_, RelationProviders>, DataFusionError> {
+        self.relation_providers
+            .lock()
+            .map_err(|_| crate::error::internal_error("relation_providers mutex poisoned"))
+    }
+
+    /// Snapshot the provider registered under `handle_id`, if any. Lets callers inspect the
+    /// provider's concrete type (e.g. distinguish a [`ViewTable`] from a materialized
     /// `MemTable`).
     #[cfg(test)]
     pub(crate) fn relation_provider(&self, handle_id: &str) -> Option<Arc<dyn TableProvider>> {
@@ -171,9 +159,9 @@ impl DataFusionExecutor {
             .cloned()
     }
 
-    /// Snapshot of the underlying [`SessionContext`]'s state. Used by tests to invoke
-    /// [`datafusion::catalog::TableProvider::scan`] directly so they can assert what projection /
-    /// limit a provider actually pushed down.
+    /// Snapshot of the underlying [`SessionContext`]'s state. Exposes the
+    /// [`datafusion::execution::SessionState`] for direct
+    /// [`datafusion::catalog::TableProvider::scan`] invocation to observe pushdown.
     #[cfg(test)]
     pub(crate) fn session_state(&self) -> datafusion::execution::SessionState {
         self.session_ctx.state()
@@ -227,7 +215,7 @@ impl DataFusionExecutor {
         self.collect_relation(&rp.result_relation).await
     }
 
-    /// Stream every batch of a previously-registered relation by handle. Returns a single
+    /// Stream every batch of a registered relation by handle. Returns a single
     /// coalesced [`SendableRecordBatchStream`]; callers that want a buffered `Vec` should use
     /// [`Self::collect_relation`].
     pub async fn stream_relation(
@@ -235,24 +223,22 @@ impl DataFusionExecutor {
         handle: &RelationHandle,
     ) -> Result<SendableRecordBatchStream, DeltaError> {
         let provider = self
-            .relation_providers
-            .lock()
-            .expect("relation_providers mutex poisoned")
-            .get(handle.id.as_str())
-            .cloned()
-            .ok_or_else(|| {
-                crate::error::plan_compilation(format!(
-                    "no relation registered for handle id {} (name `{}`); the producing plan \
-                     must run before any consumer reads",
-                    handle.id, handle.name
-                ))
+            .providers_lock()
+            .and_then(|g| {
+                g.get(handle.id.as_str()).cloned().ok_or_else(|| {
+                    crate::error::plan_compilation(format!(
+                        "no relation registered for handle id {} (name `{}`); the producing \
+                         plan must run before any consumer reads",
+                        handle.id, handle.name
+                    ))
+                })
             })
             .into_delta()?;
         let df = self.session_ctx.read_table(provider).into_delta()?;
         df.execute_stream().await.into_delta()
     }
 
-    /// Collect every batch of a previously-registered relation. Thin wrapper over
+    /// Collect every batch of a registered relation. Thin wrapper over
     /// [`Self::stream_relation`] that drains the stream into a `Vec` and re-stamps each
     /// batch's nested field-declaration metadata to match the relation handle's declared
     /// schema (see [`crate::exec::stamp_batch_metadata`] for why).
@@ -298,9 +284,8 @@ impl DataFusionExecutor {
             .await
     }
 
-    /// Execute one [`PhaseOperation`] stamping any `Consume` handles minted during the run with
-    /// `(sm_id, sm_kind, phase_name)`. Shared by [`Self::drive_to_completion`] (real SM identity)
-    /// and [`Self::execute_phase_operation`] (standalone fallback).
+    /// Execute one [`PhaseOperation`], stamping any `Consume` handles minted during the run
+    /// with `(sm_id, sm_kind, phase_name)`.
     async fn run_phase(
         &self,
         op: PhaseOperation,
@@ -339,12 +324,7 @@ impl DataFusionExecutor {
         for plan in plans {
             // Snapshot the live relation registry into the compile context. The map is built
             // incrementally as plans run, so plan N sees every relation produced by plans 0..N.
-            let providers = Arc::new(
-                self.relation_providers
-                    .lock()
-                    .expect("relation_providers mutex poisoned")
-                    .clone(),
-            );
+            let providers = Arc::new(self.providers_lock()?.clone());
             let ctx = CompileContext {
                 relation_providers: providers,
                 phase_state: Some(state.clone()),
@@ -386,10 +366,7 @@ impl DataFusionExecutor {
         logical: datafusion_expr::LogicalPlan,
     ) -> Result<(), DataFusionError> {
         let provider: Arc<dyn TableProvider> = Arc::new(ViewTable::new(logical, None));
-        self.relation_providers
-            .lock()
-            .expect("relation_providers mutex poisoned")
-            .insert(handle.id.clone(), provider);
+        self.providers_lock()?.insert(handle.id.clone(), provider);
         Ok(())
     }
 
@@ -405,9 +382,7 @@ impl DataFusionExecutor {
         let provider =
             LoadTableProvider::try_new(logical, Arc::new(sink.clone()), ctx.engine.clone())?;
         let provider: Arc<dyn TableProvider> = Arc::new(provider);
-        self.relation_providers
-            .lock()
-            .expect("relation_providers mutex poisoned")
+        self.providers_lock()?
             .insert(sink.output_relation.id.clone(), provider);
         Ok(())
     }

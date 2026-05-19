@@ -53,8 +53,7 @@ fn build_engine(
     )
 }
 
-/// Determines how a snapshot is loaded. Built once at setup via [`resolve_snapshot_strategy`],
-/// then used by runners to construct snapshots.
+/// Determines how a snapshot is loaded. Built once at setup via [`resolve_snapshot_strategy`].
 enum SnapshotStrategy {
     /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
     Standard { url: Url },

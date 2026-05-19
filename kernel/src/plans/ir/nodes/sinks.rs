@@ -173,7 +173,7 @@ pub struct LoadSink {
     /// Optional URL prefix joined with each per-row path. When `None`, the
     /// path column is treated as an absolute URL.
     pub base_url: Option<url::Url>,
-    /// Column-name hints used to read per-row file metadata from upstream.
+    /// Column-name hints for per-row file metadata on the upstream relation.
     pub file_meta: ScanFileColumns,
     /// Optional upstream deletion-vector policy. When `None`, IR does not request
     /// DV-based masking in load.
@@ -257,8 +257,7 @@ pub enum SinkType {
     Load(Box<LoadSink>),
 }
 
-/// Default file-meta column hints used by [`LoadSink::new`]. Matches the convention used
-/// across FSR plan builders.
+/// Default file-meta column hints: `path` + `size`, matching the FSR plan-builder convention.
 fn default_scan_file_columns() -> ScanFileColumns {
     ScanFileColumns {
         path: ColumnName::new(["path"]),

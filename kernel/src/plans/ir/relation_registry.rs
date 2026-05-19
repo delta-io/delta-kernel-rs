@@ -108,7 +108,7 @@ impl RelationRegistry {
     }
 
     /// Drain the registry's accumulated plans into a [`ResultPlan`] whose terminal relation
-    /// is the one previously registered under `terminal_name`.
+    /// is the one registered under `terminal_name`.
     ///
     /// Side effect: empties the internal plan accumulator. Registered names persist (in case
     /// the same registry is reused for a follow-up phase, though that's atypical).
@@ -133,9 +133,7 @@ impl RelationRegistry {
     }
 
     /// Drain the registry's accumulated plans, returning the vector. Names persist; the
-    /// accumulator is emptied. Used by [`PlanBuilder::consume_phase`] to build the
-    /// `PhaseOperation::Plans(...)` payload for a mid-coroutine phase yield, and by tests
-    /// / advanced external callers that need to feed plans directly into an executor.
+    /// accumulator is emptied.
     pub fn take_plans(&mut self) -> Vec<Plan> {
         std::mem::take(&mut self.plans)
     }

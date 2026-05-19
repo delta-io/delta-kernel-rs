@@ -1,7 +1,4 @@
 //! Helpers for writing toy parquet files and producing [`FileMeta`] for them.
-//!
-//! Used by engine integration tests that need to materialize a tiny on-disk parquet file as a
-//! scan source.
 
 use std::fs::File;
 use std::path::Path;
@@ -27,8 +24,7 @@ pub fn file_meta(path: &Path) -> FileMeta {
 
 /// Write a single-row-group parquet file with one non-null `Int64` column named `field`.
 ///
-/// The schema is `(field: Int64, NOT NULL)`. Used by scan/parity tests to seed a tiny on-disk
-/// parquet input.
+/// The schema is `(field: Int64, NOT NULL)`.
 pub fn write_i64_parquet(path: &Path, field: &str, values: &[i64]) {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
         field,

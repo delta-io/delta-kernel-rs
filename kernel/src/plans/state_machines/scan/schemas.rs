@@ -1,4 +1,4 @@
-//! Action schema constructors used by the FSR plan-builders and the replay-scan plans.
+//! Action schema constructors for the FSR plan-builders and the replay-scan plans.
 //! Centralizes `action_schema`, `augmented_action_schema`, `action_schema_with_augmented_add`,
 //! `fsr_action_schema`, `path_size_schema`, and [`load_materialized_schema`].
 
@@ -84,8 +84,8 @@ pub(super) fn load_materialized_schema(
 }
 
 /// Action schema with the `add` slot replaced by a struct carrying optional `stats_parsed` /
-/// `partitionValues_parsed` sub-fields. Used by FSR and replay-scan projections when stats /
-/// partition-values wiring is requested.
+/// `partitionValues_parsed` sub-fields. Produced when FSR and replay-scan projections need
+/// stats / partition-values wiring.
 ///
 /// Add fields are forced **nullable** here. Downstream chains rebuild `add` via
 /// `Expression::struct_from(...)` from streams that include non-`add` rows; for those rows

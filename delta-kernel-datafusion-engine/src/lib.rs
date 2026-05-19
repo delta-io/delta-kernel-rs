@@ -1,29 +1,16 @@
 //! DataFusion execution scaffold for Delta Kernel declarative [`Plan`] trees.
 //!
-//! Supported sinks:
-//! - [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation) -- registers a lazy
-//!   [`ViewTable`](datafusion::datasource::ViewTable) wrapping the upstream `LogicalPlan`.
-//!   DataFusion's `InlineTableScan` analyzer rule inlines the wrapped plan into the consumer's tree
-//!   when the relation is read, so predicate / projection pushdown and CSE flow across plan
+//! Supported sinks (registration is lazy; no I/O until the consumer reads):
+//! - `Relation` -- registers a [`ViewTable`](datafusion::datasource::ViewTable) over the upstream
+//!   `LogicalPlan`; DataFusion's `InlineTableScan` rule inlines it so pushdown and CSE cross plan
 //!   boundaries.
-//! - [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) -- registers a lazy
-//!   [`LoadTableProvider`](exec::LoadTableProvider) capturing the upstream `LogicalPlan` + load
-//!   config + kernel [`Engine`](delta_kernel::Engine). Its `scan()` streams per-row file batches
-//!   via [`LoadExec`](exec::LoadExec); no I/O happens until the consumer reads.
-//! - [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) -- the only sink with
-//!   eager side effects: drains the physical plan into a [`delta_kernel::plans::kdf::ConsumerKdf`]
-//!   handle at execute-plan time.
+//! - `Load` -- registers a [`LoadTableProvider`](exec::LoadTableProvider) whose `scan()` yields a
+//!   [`LoadExec`](exec::LoadExec) streaming per-row file batches.
+//! - `Consume` -- the only sink with eager side effects: drains the physical plan into a
+//!   [`delta_kernel::plans::kdf::ConsumerKdf`] handle at execute-plan time.
 //!
-//! Read-style state machines return a [`delta_kernel::plans::ir::ResultPlan`] naming the
-//! relation the caller reads after executing the result plan's plans. Because `Relation` /
-//! `Load` provider registration is lazy, the producing-plan ordering still matters (later plans
-//! can see earlier plans' relation handles in their compile context) but the upstream
-//! pipelines are not run until the result is collected.
-//!
-//! Sinks are annotations on the kernel [`Plan`](delta_kernel::plans::ir::Plan), not envelopes
-//! on the DataFusion physical plan. Unsupported constructs surface a
-//! [`datafusion_common::error::DataFusionError::NotImplemented`] via [`error::unsupported`];
-//! the engine -> kernel boundary methods on [`DataFusionExecutor`] translate that into a
+//! Unsupported constructs surface via [`error::unsupported`]; the engine -> kernel boundary
+//! methods on [`DataFusionExecutor`] translate that into a
 //! [`delta_kernel::plans::errors::DeltaError`].
 
 pub mod compile;

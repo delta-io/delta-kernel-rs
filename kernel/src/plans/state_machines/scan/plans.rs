@@ -1,8 +1,5 @@
-//! Shared reconciliation pipeline.
-//!
-//! [`register_reconciliation`] is the single source of truth for the multi-stage Delta
-//! reconciliation DAG that both scan ([`super::file_scan`]) and FSR ([`super::full_state`])
-//! build on top of:
+//! Shared reconciliation pipeline used by scan ([`super::file_scan`]) and FSR
+//! ([`super::full_state`]):
 //!
 //! ```text
 //! commit_load(Values -> Load) -> commit_dedup(filter -> project -> window -> filter -> project)
@@ -14,20 +11,12 @@
 //!     -> RECONCILED
 //! ```
 //!
-//! The pipeline terminates at [`RECONCILED`] with the `action_pair` shape (the FSR_JOIN_KEY
-//! has been dropped). Callers (scan / FSR) then layer their own terminal projection (and
-//! optional data phase) on top.
+//! Terminates at [`RECONCILED`] with the `action_pair` shape (FSR_JOIN_KEY dropped). Callers
+//! layer their own terminal projection (and optional data phase) on top.
 //!
-//! ## Sync vs async surfaces
-//!
-//! - [`register_reconciliation`] is **sync**: it builds all the plans into the registry but does
-//!   not yield phases. Callers must supply a pre-resolved [`CheckpointShape`].
-//! - [`execute_reconciliation`] is **async**: it first calls
-//!   [`resolve_checkpoint_shape`](super::checkpoint_shape::resolve_checkpoint_shape) (which may
-//!   yield `SchemaQuery` / `Plans` phases via `ctx`) and then delegates to
-//!   [`register_reconciliation`].
-//!
-//! Both scan and FSR entry points use the async surface in their state machines.
+//! [`register_reconciliation`] is sync (caller supplies [`CheckpointShape`]);
+//! [`execute_reconciliation`] is async and resolves the shape itself via
+//! [`resolve_checkpoint_shape`](super::checkpoint_shape::resolve_checkpoint_shape).
 
 use std::sync::Arc;
 
@@ -68,8 +57,7 @@ pub(super) const SIDECAR_ACTIONS: &str = "sidecar_actions";
 /// Each caller (scan / FSR) projects from this into its own terminal.
 pub(super) const RECONCILED: &str = "reconciled";
 
-/// One literal row describing a Delta JSON commit file consumed by the commit-load Values
-/// upstream.
+/// One literal row describing a Delta JSON commit file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitFileMeta {
     pub path: String,

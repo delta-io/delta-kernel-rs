@@ -73,8 +73,8 @@ macro_rules! delta_codes {
 delta_codes! {
     /// `DELTA_COMMAND_INVARIANT_VIOLATION` — internal-error catch-all for SMs detecting an
     /// impossible state. Discriminant `0` is deliberate: a zero-initialized wire value decodes
-    /// to "invariant violation", the safest fallback for engines that haven't populated the
-    /// code slot.
+    /// to "invariant violation" so engines that fail to populate the code slot still surface
+    /// a meaningful error.
     DeltaCommandInvariantViolation = 0, "DELTA_COMMAND_INVARIANT_VIOLATION", "XXKDS",
     /// Delta table does not exist.
     DeltaTableNotFound = 1, "DELTA_TABLE_NOT_FOUND", "42P01",

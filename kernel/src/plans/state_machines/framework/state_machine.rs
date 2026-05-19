@@ -74,17 +74,16 @@ pub trait StateMachine {
     ) -> Result<AdvanceResult<Self::Result>, DeltaError>;
 
     /// Static label for logging / diagnostics. Drivers use this in span
-    /// names and error contexts; implementations should return the
-    /// currently-active phase name (or a fallback like `"complete"` once
-    /// the SM has finished).
+    /// names and error contexts; implementations return the currently-active
+    /// phase name, or `"complete"` once the SM has finished.
     fn phase_name(&self) -> &'static str;
 
     /// Sorted snapshot of logical relation names currently registered with the SM at the boundary
     /// of the most recent yield.
     ///
-    /// Used by engine-side executors for diagnostics / span context, parallel scheduling, and
-    /// cross-phase relation tracking. Returns the empty vector for SMs that do not surface
-    /// relations, and for terminal states (after the SM completes).
+    /// Surfaces diagnostics / span context, parallel scheduling info, and cross-phase relation
+    /// tracking. Returns the empty vector for SMs that do not surface relations, and for
+    /// terminal states (after the SM completes).
     fn live_relations(&self) -> Vec<String> {
         Vec::new()
     }

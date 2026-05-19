@@ -1,59 +1,27 @@
 //! Canonical Full Snapshot Read (FSR) declarative plans — *window-on-commits +
 //! anti-join-on-checkpoint*.
 //!
-//! Mirrors Delta log-replay semantics (`kernel/src/action_reconciliation/log_replay.rs`,
-//! `kernel/src/log_replay/deduplicator.rs`) by composing three or four declarative plans
-//! that flow as one [`PhaseOperation::Plans`] step:
+//! Mirrors Delta log-replay semantics by composing three or four declarative plans:
 //!
-//! 1. **commit_load** — `Values(commit metadata) → LoadSink(JSON, action schema,
-//!    passthrough=[version])` materializes the raw per-commit action stream into `fsr.commit_raw`.
-//!    The kernel cover over `ascending_commit_files ∪ ascending_compaction_files` is materialized
-//!    verbatim so that downstream steps can `ORDER BY version DESC` to recover Delta's "newest
-//!    action wins" semantics inside the commit tail.
-//! 2. **commit_dedup** — `RelationRef(commit_raw) → Filter(has identity) → Project(action_cols +
-//!    key) → Window(row_number PARTITION BY key ORDER BY version DESC) → Filter(__rn <= k) →
-//!    Project(action_cols + key)` yields the *commit winners*, materialized into
-//!    `fsr.commit_dedup`. Commits supersede (and remove-tombstone) checkpoint state for any
-//!    `(action_kind, identity)` pair they touch.
-//! 3. **(only when `has_sidecars`) sidecar_load** — `Scan(top-level checkpoint, sidecar-only
-//!    schema) → Filter(sidecar IS NOT NULL) → Project(sidecar.path, sidecar.sizeInBytes) →
-//!    LoadSink(Parquet, action schema)` materializes each V2-multipart sidecar parquet's action
-//!    rows into `fsr.sidecar_actions`. V1 / V2-inline checkpoints carry no sidecars; this plan is
-//!    omitted entirely so the executor never opens them.
-//! 4. **results** — `(Scan(top-level checkpoint) [∪ RelationRef(sidecar_actions)]) → Filter(has
-//!    identity) → Project(action_cols + key) → LeftAntiJoin(probe=this,
-//!    build=RelationRef(commit_dedup).project(key))` materializes the *checkpoint survivors* (rows
-//!    the commit tail didn't touch). The plan completes with `Union(RelationRef(commit_dedup),
-//!    survivors) -> Filter(retention) -> Project(action_schema) -> into_relation("results")` so the
-//!    caller reads the reconstructed action stream from `fsr.results`.
+//! 1. **commit_load** materializes the raw per-commit action stream into `fsr.commit_raw`, covering
+//!    `ascending_commit_files ∪ ascending_compaction_files` so downstream steps can `ORDER BY
+//!    version DESC` to recover "newest action wins" semantics.
+//! 2. **commit_dedup** runs a `row_number PARTITION BY key ORDER BY version DESC` window over the
+//!    commit tail to pick the winners, materialized into `fsr.commit_dedup`.
+//! 3. **sidecar_load** (only when `has_sidecars`) materializes V2-multipart sidecar parquet actions
+//!    into `fsr.sidecar_actions`.
+//! 4. **results** anti-joins the (top-level checkpoint ∪ sidecar_actions) stream against
+//!    `commit_dedup`, unions in the winners, applies retention, and binds the final reconciled
+//!    action stream to `fsr.results`.
 //!
-//! The window applies only to the (typically-small) commit-tail stream; the (typically-large)
-//! checkpoint stream goes through a single hash anti-join keyed on the dedup column. Compared
-//! with windowing the union of commits and checkpoint, this avoids materializing per-key
-//! orderings over the entire snapshot.
+//! The window applies only to the (small) commit tail; the (large) checkpoint stream
+//! goes through a single hash anti-join, avoiding per-key orderings over the full snapshot.
 //!
-//! ## Decision notes
-//!
-//! - **`dv_unique_id`**: Per-row deletion-vector identity, used only as a `partition_by` / join-key
-//!   contribution to the dedup key. Implemented as `If(storageType IS NULL, NULL,
-//!   ToJson(Array(storageType, pathOrInlineDv)))` — semantics-equivalent to
-//!   [`crate::actions::deletion_vector::DeletionVectorDescriptor::unique_id_from_parts`] (matches
-//!   [`crate::log_replay::deduplicator::Deduplicator::extract_dv_unique_id`]) for equality /
-//!   non-equality but not byte-for-byte. The exact byte form is not protocol-stable, so the
-//!   difference does not affect correctness; it only avoids overloading
-//!   [`crate::expressions::BinaryExpressionOp::Plus`] with UTF-8 concat semantics. Note: `offset`
-//!   is intentionally omitted (UUID DVs have no offset; inline DVs with the same `pathOrInlineDv`
-//!   and distinct offsets would imply two distinct in-line DV byte payloads, which is not
-//!   representable). A follow-up can include `offset` once kernel grows an int-to-string cast.
-//! - **`action_schema`**: Full reconstructed action stream (add / remove / protocol / metaData /
-//!   domainMetadata / txn).
-//! - **Retention thresholds**: Derived like checkpoint reconciliation via
-//!   [`crate::action_reconciliation::deleted_file_retention_timestamp_with_time`] and
-//!   [`crate::action_reconciliation::calculate_transaction_expiration_timestamp`] against
-//!   [`crate::snapshot::Snapshot::table_properties`] (`kernel/src/table_properties/mod.rs`).
-//! - **`CheckpointShape.file_format`**: Taken from the first checkpoint part's filename extension
-//!   in the snapshot listing (`crate::path::ParsedLogPath::extension`), with `_last_checkpoint`
-//!   schema falling back through [`crate::log_segment::LogSegment::checkpoint_schema`].
+//! `dv_unique_id` is computed as `If(storageType IS NULL, NULL,
+//! ToJson(Array(storageType, pathOrInlineDv)))` — equality-equivalent (not byte-equivalent)
+//! to [`crate::actions::deletion_vector::DeletionVectorDescriptor::unique_id_from_parts`].
+//! `offset` is omitted because kernel lacks an int-to-string cast; inline DVs sharing
+//! `pathOrInlineDv` would already imply identical byte payloads.
 
 use std::sync::Arc;
 
@@ -133,8 +101,7 @@ impl FullState {
 
 impl FullStateBuilder {
     /// Surface `add.stats_parsed` in FSR output. `build()` then derives the
-    /// `physical_stats_schema` (used by the resolver to detect native
-    /// `add.stats_parsed` and by plan builders to project it).
+    /// `physical_stats_schema` driving native-stats detection and projection.
     pub fn with_stats(mut self) -> Self {
         self.with_stats = true;
         self

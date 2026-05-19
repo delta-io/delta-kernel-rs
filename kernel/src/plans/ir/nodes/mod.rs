@@ -1,4 +1,4 @@
-//! Node payload types used by the declarative plan IR.
+//! Node payload types for the declarative plan IR.
 //!
 //! The recursive tree shape lives in [`super::declarative::DeclarativePlanNode`].
 
@@ -19,7 +19,7 @@ pub enum FileType {
     Json,
 }
 
-/// Alias used by APIs that choose file format at runtime.
+/// Alias for APIs that pick file format at runtime.
 pub type FileFormat = FileType;
 
 /// Read rows from an explicit file list.
@@ -148,7 +148,7 @@ pub struct JoinNode {
 // ============================================================================
 
 // ============================================================================
-// Ordering (used by window ORDER BY)
+// Ordering
 // ============================================================================
 
 /// Single-column sort specification.

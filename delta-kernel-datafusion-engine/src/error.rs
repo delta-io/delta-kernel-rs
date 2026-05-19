@@ -12,7 +12,7 @@ use delta_kernel::plans::errors::{DeltaError, DeltaErrorCode};
 
 /// Wrap an arbitrary error chain into a [`DataFusionError::External`].
 ///
-/// Used to bridge kernel-side errors (e.g. [`DeltaError`], [`delta_kernel::Error`]) into the
+/// Bridges kernel-side errors (e.g. [`DeltaError`], [`delta_kernel::Error`]) into the
 /// engine's native [`DataFusionError`] flow.
 pub fn wrap_delta_err<E>(err: E) -> DataFusionError
 where

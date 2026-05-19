@@ -1,4 +1,4 @@
-//! Action-stream (schema, projection) pair builders used by `execute_reconciliation`.
+//! Action-stream (schema, projection) pair builders for `execute_reconciliation`.
 //!
 //! This module exposes a small toolkit for assembling the
 //! `Pair = (SchemaRef, Vec<Arc<Expression>>)` values that the reconciliation pipeline projects
@@ -152,7 +152,7 @@ fn rewrite_add(
         .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
         .collect();
     // Two shapes: a fresh base passes `add` through as `col([add])` — bootstrap by
-    // re-projecting every inner field explicitly. A previously-augmented pair already has
+    // re-projecting every inner field explicitly. An already-augmented pair carries
     // `struct_from([...])` here — reuse its children.
     let mut inner_exprs: Vec<Arc<Expression>> = match projection[0].as_ref() {
         Expression::Struct(children, _) => children.clone(),

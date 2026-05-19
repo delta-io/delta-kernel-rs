@@ -1,35 +1,19 @@
 //! The [`CoroutineSM`] driver: compiles [`PhaseYield`] sequences into the
 //! [`StateMachine`] contract.
 //!
-//! The protocol is strictly 1:1: each yield carries exactly one [`PhaseOperation`], the driver
-//! hands it to the engine via [`StateMachine::get_operation`], and on [`StateMachine::advance`]
-//! the engine outcome is fed back through the coroutine as a [`PhaseResume`].
+//! Protocol is strictly 1:1: each yield carries one [`PhaseOperation`], the driver hands it
+//! to the engine via [`StateMachine::get_operation`], and the engine outcome flows back as a
+//! [`PhaseResume`] on [`StateMachine::advance`]. Zero-yield coroutines are allowed; they
+//! return [`AdvanceResult::Done`] on the first advance.
 //!
-//! There is no batching, no task IDs, and no same-batch replay — SM bodies that need to run
-//! multiple plans in one engine call construct a [`PhaseOperation::Plans`] with multiple plans
-//! and recover per-plan outputs from the resulting [`PhaseState`] using their respective
-//! extractors.
+//! Multi-plan phases use one [`PhaseOperation::Plans`] with several plans and recover
+//! per-plan outputs from the resulting [`PhaseState`] via the respective extractors.
 //!
-//! Zero-yield coroutines are allowed: an SM body that has no intermediate engine work to do may
-//! simply compute and return its terminal value, in which case [`StateMachine::advance`]
-//! immediately reports [`AdvanceResult::Done`].
-//!
-//! ## genawaiter2 panic policy
-//!
-//! This driver is built on [`genawaiter2`], which panics on protocol misuse (the body awaits a
-//! non-yield future, the body retains a `Co` after returning, etc.). The kernel's no-panic policy
-//! is preserved because the only path to `Co::yield_` is through [`Context::execute`]; bodies
-//! awaiting that single API are correct by construction. Bodies are kernel-internal,
-//! `pub(crate)`-only, and FFI consumers see the SM only through `Box<dyn StateMachine>`, so the
-//! panic paths are unreachable in any externally-exposed code path.
-//!
-//! ## Errors
-//!
-//! User-facing failures produced by the engine flow through [`PhaseResume`] as
-//! `Result<PhaseState, EngineError>`; SM bodies translate to a typed kernel
-//! [`DeltaError`](crate::plans::errors::DeltaError) via
-//! [`EngineError::into_delta`](crate::plans::state_machines::framework::engine_error::EngineError::into_delta)
-//! at each call site.
+//! Built on [`genawaiter2`], which panics on coroutine protocol misuse (awaiting a non-yield
+//! future, retaining a `Co` after return). The no-panic rule is preserved because the only
+//! path to `Co::yield_` is through [`Context::execute`]; SM bodies are `pub(crate)`-only and
+//! FFI sees them through `Box<dyn StateMachine>`, so the panic paths are unreachable
+//! externally.
 
 use std::future::Future;
 

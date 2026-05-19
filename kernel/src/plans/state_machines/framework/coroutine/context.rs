@@ -1,34 +1,15 @@
 //! [`Context`] — the body-facing surface of a coroutine state machine.
 //!
 //! Combines the yield channel ([`PhaseCo`]) with a [`RelationRegistry`] so SM bodies see one
-//! object for both dispatching engine operations and managing named relations. Body code reaches
-//! the full `RelationRegistry` API (relation_ref, register_relation_sink, drop_relation,
-//! live_relations, ...) via `Deref` / `DerefMut`; the dispatch surface is [`Context::execute`].
+//! object for both dispatching engine operations and managing named relations. The full
+//! `RelationRegistry` API is reached via `Deref` / `DerefMut`; the dispatch surface is
+//! [`Context::execute`], which is strictly 1:1 (one operation per call, one resume back).
 //!
-//! ## Protocol pieces
-//!
-//! - [`PhaseYield`] / [`PhaseResume`] / [`PhaseCo`] — the typed protocol flowing through the
-//!   underlying generator. Each yield carries one [`PhaseOperation`], a static phase name, and a
-//!   sorted snapshot of currently-live relation names. Each resume is a `Result<PhaseState,
-//!   EngineError>`.
-//! - [`Context`] — async surface SM authors call.
-//!
-//! ## Layering
-//!
-//! Engines emit [`EngineError`]; per the documented layering contract in
-//! [`engine_error`](crate::plans::state_machines::framework::engine_error), the kernel matches on
-//! [`EngineErrorKind`](crate::plans::state_machines::framework::engine_error::EngineErrorKind) at
-//! SM level and translates to a typed kernel [`DeltaError`](crate::plans::errors::DeltaError) via
+//! [`Context::execute`] returns the raw [`EngineError`]; per the layering contract in
+//! [`engine_error`](crate::plans::state_machines::framework::engine_error), SM bodies match on
+//! [`EngineErrorKind`](crate::plans::state_machines::framework::engine_error::EngineErrorKind)
+//! and translate to a typed kernel [`DeltaError`](crate::plans::errors::DeltaError) via
 //! [`EngineError::into_delta`](crate::plans::state_machines::framework::engine_error::EngineError::into_delta).
-//! [`Context::execute`] returns the raw `EngineError`; the body picks the appropriate code.
-//!
-//! ## 1:1 protocol
-//!
-//! Each `ctx.execute(op, name)` corresponds to exactly one operation handed to the engine and
-//! exactly one resume. SM bodies that need to run multiple plans in a single engine call
-//! construct a [`PhaseOperation::Plans`] with multiple plans and extract per-plan outputs from
-//! the returned [`PhaseState`] using their respective
-//! [`Extractor<O>`](crate::plans::ir::Extractor)s.
 
 use std::ops::{Deref, DerefMut};
 

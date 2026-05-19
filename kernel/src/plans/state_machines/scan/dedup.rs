@@ -1,4 +1,4 @@
-//! Dedup-key expressions used by the reconciliation pipeline.
+//! Dedup-key expressions for the reconciliation pipeline.
 //!
 //! [`fsr_dedup_key`] keys the full six-slot action set; [`scan_file_dedup_key`] keys
 //! `{add, remove}` only. Both evaluate to NULL on rows that match no known slot, so the

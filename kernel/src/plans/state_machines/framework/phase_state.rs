@@ -1,41 +1,18 @@
 //! Phase-level success-payload accumulator.
 //!
-//! [`PhaseState`] is the unified container the executor fills when a phase
-//! finishes successfully and the SM consumes on the next `advance` call. It
-//! holds two kinds of payloads the executor produces:
+//! [`PhaseState`] is the container the executor fills on phase success; the SM consumes it
+//! on the next `advance` call. It holds two payload kinds:
 //!
-//! - **KDF outputs** -- [`FinishedHandle`]s submitted by drained
-//!   [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume) pipelines and arbitrary
-//!   executor-side telemetry (e.g. write row counts), keyed by [`KdfStateToken`].
-//! - **Schema** -- a single [`SchemaRef`] produced by a
-//!   [`PhaseOperation::SchemaQuery`](super::phase_operation::PhaseOperation::SchemaQuery) phase.
+//! - **KDF outputs** -- [`FinishedHandle`]s from drained
+//!   [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume) pipelines and executor
+//!   telemetry, keyed by [`KdfStateToken`].
+//! - **Schema** -- a single [`SchemaRef`] from a `SchemaQuery` phase.
 //!
-//! ## Lifecycle
-//!
-//! 1. Executor calls [`PhaseState::empty`] at the start of a phase.
-//! 2. The drained KDF iterator calls [`Handle::finish`](crate::plans::kdf::Handle::finish) and
-//!    pushes the result into [`PhaseState::submit_kdf_handle`]. Each consume sink is
-//!    single-partition by construction, so exactly one submission per token is expected; duplicates
-//!    are an invariant violation.
-//! 3. Schema-query phases push the parsed footer schema into [`PhaseState::submit_schema`].
-//! 4. The driver hands the populated `PhaseState` back to the SM through `advance`.
-//! 5. Typed extractors built on top of `consume()` pull payloads via [`PhaseState::take_by_token`];
-//!    schema-query bodies pull via [`PhaseState::take_schema`].
-//!
-//! ## Errors
-//!
-//! Submission is infallible. Invariant violations (duplicate submit) are
-//! stashed in a first-wins internal slot and surface on the next `take_*`.
-//! Engine failures still flow on the `Result<PhaseState, EngineError>` arm.
-//!
-//! ## Mutex poisoning
-//!
-//! The internal [`Mutex`] is taken only for trivial, infallible critical
-//! sections (a handful of `HashMap`/`Option` ops). A poisoned guard always
-//! contains a consistent value, so we recover via
-//! [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) instead of
-//! panicking. This matches the convention used by the DataFusion engine
-//! crate (`unwrap_or_else(|e| e.into_inner())`).
+//! Submission is infallible. Each consume sink is single-partition, so duplicate submits are
+//! an invariant violation stashed first-wins in an internal slot and surfaced on the next
+//! `take_*`. The internal [`Mutex`] guards only trivial critical sections; poisoned guards
+//! recover via [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) so the no-panic
+//! rule holds.
 
 use std::any::Any;
 use std::collections::HashMap;

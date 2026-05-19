@@ -1,4 +1,4 @@
-//! Tombstone and txn-expiration retention predicate used by FSR plan composition.
+//! Tombstone and txn-expiration retention predicate for FSR plan composition.
 //!
 //! Centralizes the column-path constants referenced by the retention predicate
 //! ([`REMOVE_DELETION_TIMESTAMP`], [`TXN_LAST_UPDATED`]) and the

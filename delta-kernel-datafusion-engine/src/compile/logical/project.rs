@@ -9,22 +9,19 @@ use std::sync::Arc;
 use datafusion_common::arrow::datatypes::Schema as ArrowSchema;
 use datafusion_common::error::DataFusionError;
 use datafusion_common::Column;
-use datafusion_expr::expr_fn::cast;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, LogicalPlanBuilder};
-use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     ColumnName, Expression, MapToStructExpression, ParseJsonExpression,
 };
 use delta_kernel::plans::ir::nodes::ProjectNode;
 use delta_kernel::transforms::ExpressionTransform;
 
-use crate::compile::expr_translator::kernel_expr_to_df;
-use crate::error::plan_compilation;
+use crate::compile::expr_translator::{kernel_expr_to_df, TranslationContext};
 
 /// Walk every kernel projection expression and collect the set of unique top-level column
-/// roots (the first segment of any [`ColumnName`] reference). Used by the `Project` lowering
-/// to detect potential collisions with output field names.
+/// roots (the first segment of any [`ColumnName`] reference). Detects potential collisions
+/// with output field names during `Project` lowering.
 fn collect_top_level_column_roots(exprs: &[Arc<Expression>]) -> HashSet<String> {
     let mut collector = TopLevelRootCollector {
         roots: HashSet::new(),
@@ -70,8 +67,8 @@ impl<'a> ExpressionTransform<'a> for RewriteRootColumn<'_> {
 }
 
 /// Visitor that counts how many times each [`ColumnName`] path appears across one or more
-/// kernel projection expressions. Used to drive engine-side hoisting that replaces repeated
-/// nested struct/json access subexpressions with stable column references *before* DataFusion's
+/// kernel projection expressions. Drives engine-side hoisting that replaces repeated nested
+/// struct/json access subexpressions with stable column references *before* DataFusion's
 /// own CSE runs. This avoids a known interaction between `CommonSubexprEliminate` and
 /// `PushDownLeafProjections` where the merge step in `build_extraction_projection_impl`
 /// produces duplicate `__common_expr_*` schema fields when an output struct column with many
@@ -214,7 +211,7 @@ fn hoist_repeated_column_paths(
     let mut proj_exprs = pass_through;
     for (path, hoist_name) in &hoist_map {
         let kernel_col = Expression::column(path.iter().cloned());
-        let df_expr = kernel_expr_to_df(&kernel_col)?;
+        let df_expr = kernel_expr_to_df(&kernel_col, &TranslationContext::untyped())?;
         proj_exprs.push(df_expr.alias(hoist_name.clone()));
     }
 
@@ -264,12 +261,6 @@ pub(super) fn compile_project_node(
         &node.columns,
         node.output_schema.fields().count(),
     )?;
-    let output_arrow_schema: ArrowSchema =
-        node.output_schema.as_ref().try_into_arrow().map_err(|e| {
-            plan_compilation(format!(
-                "Logical projection output schema conversion failed: {e}"
-            ))
-        })?;
 
     // Insulate input names from output names to avoid DataFusion optimizer ambiguity.
     // When a kernel projection produces an output field whose name equals an unqualified
@@ -338,42 +329,12 @@ pub(super) fn compile_project_node(
     let working_arrow_schema: ArrowSchema = working_plan.schema().as_arrow().clone();
     let projection: Vec<Expr> = rewritten_columns
         .iter()
-        .zip(
-            node.output_schema
-                .fields()
-                .zip(output_arrow_schema.fields()),
-        )
-        .map(|(kernel_expr, (field, output_arrow_field))| {
-            let base_logical = crate::compile::translate_projection_expr(
-                kernel_expr.as_ref(),
-                field,
-                &working_arrow_schema,
-            )?;
-            // Struct-shaped expressions whose target is also a struct are passed through
-            // without a logical-plan cast: DataFusion's `validate_struct_compatibility` matches
-            // fields by name, so the cast cannot perform the physical->logical rename that
-            // column-mapped scans require. For these arms, `translate_projection_expr` already
-            // emits a `named_struct(...)` that constructs the target shape directly:
-            //   - `Expression::Transform` (identity, struct target): per-batch column-mapping
-            //     rename for struct columns (mirrors kernel's `apply_schema` reshape).
-            //   - `Expression::Struct`: ordinal recursion into kernel-built children.
-            //   - `Expression::MapToStruct`: per-target-field `get_field` against the map.
-            //   - `Expression::ParseJson`: JSON-extraction chain per leaf of the target struct.
-            let logical = if matches!(
-                (kernel_expr.as_ref(), field.data_type()),
-                (
-                    delta_kernel::expressions::Expression::Transform(_)
-                        | delta_kernel::expressions::Expression::Struct(_, _)
-                        | delta_kernel::expressions::Expression::MapToStruct(_)
-                        | delta_kernel::expressions::Expression::ParseJson(_),
-                    delta_kernel::schema::DataType::Struct(_)
-                )
-            ) {
-                base_logical
-            } else {
-                cast(base_logical, output_arrow_field.data_type().clone())
-            };
-            Ok::<Expr, DataFusionError>(logical.alias(field.name().to_string()))
+        .zip(node.output_schema.fields())
+        .map(|(kernel_expr, field)| {
+            let cx = TranslationContext::typed(field, &working_arrow_schema);
+            Ok::<Expr, DataFusionError>(
+                kernel_expr_to_df(kernel_expr.as_ref(), &cx)?.alias(field.name().to_string()),
+            )
         })
         .collect::<Result<Vec<_>, DataFusionError>>()?;
     LogicalPlanBuilder::from(working_plan)

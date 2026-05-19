@@ -1,31 +1,17 @@
 //! Runtime state for KDF consumers.
 //!
-//! [`Handle<K>`] is the executor's working buffer for one consumer sink.
-//! It's created from a [`ConsumeSink`] template when a phase starts,
-//! fed batches via [`Handle::apply_consumer`], and finalized via [`Handle::finish`]
-//! when the child is exhausted.
+//! [`Handle<K>`] is the executor's working buffer for one [`ConsumeSink`]: created when a
+//! phase starts, fed batches via [`Handle::apply_consumer`], finalized via [`Handle::finish`]
+//! when the child is exhausted. Type-erased into [`FinishedHandle`] for `PhaseState`
+//! submission.
+//!
+//! Generic over `K: ConsumerKdf + ?Sized`; executor code uses `Handle<dyn ConsumerKdf>`.
+//! Handles dispatch in-process and never cross a serialization boundary.
+//!
+//! Every handle is stamped with its owning SM's `(sm_id, sm_kind, phase_name)` triple,
+//! threaded through tracing spans and `PhaseState` cross-checks.
 //!
 //! [`ConsumeSink`]: crate::plans::ir::nodes::ConsumeSink
-//!
-//! Generic over `K: ConsumerKdf + ?Sized`; executor code uses
-//! `Handle<dyn ConsumerKdf>` directly. KDFs ride on the
-//! [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume)
-//! sink, which is dispatched in-process — handles never need to cross a
-//! serialization boundary.
-//!
-//! # Identity
-//!
-//! Every handle carries the owning state machine's identity tuple:
-//!
-//! - `sm_id: Uuid` — fresh per
-//!   [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM)
-//!   instance.
-//! - `sm_kind: &'static str` — static label for the SM's logical kind (e.g. `"scan_metadata"`).
-//! - `phase_name: &'static str` — the phase that minted this handle, as supplied to
-//!   [`Context::execute`](crate::plans::state_machines::framework::coroutine::context::Context::execute).
-//!
-//! Together they form the `(sm_id, sm_kind, phase_name)` correlation triple used by tracing
-//! span fields and `PhaseState` cross-checks.
 
 use std::any::Any;
 
@@ -120,7 +106,7 @@ impl<K: ConsumerKdf + ?Sized> Handle<K> {
 }
 
 /// Output of [`Handle::finish`] — carries the token, the owning SM's identity
-/// tuple, and the erased final state. Consumed by `PhaseState::submit_kdf_handle`.
+/// tuple, and the type-erased final state.
 #[derive(Debug)]
 pub struct FinishedHandle {
     pub token: KdfStateToken,

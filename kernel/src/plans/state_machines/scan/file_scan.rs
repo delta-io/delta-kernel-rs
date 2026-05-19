@@ -74,8 +74,8 @@ impl Scan {
 
     /// Append the data stage: read parquet via Load, project to the scan's logical schema,
     /// terminate at `data`. `live_actions_name` is the registered name of the materialized
-    /// live-actions relation (typically [`LIVE_ACTIONS`] within `execute`, or whatever name
-    /// was used to `adopt` an externally-minted handle in the data-only SM).
+    /// live-actions relation (typically [`LIVE_ACTIONS`], or the name under which an
+    /// externally-minted handle was adopted in the data-only SM).
     pub(super) fn do_data_stage(
         &self,
         ctx: &mut Context<'_>,
@@ -138,7 +138,7 @@ impl Scan {
         })
     }
 
-    /// Coroutine SM for data-only scan execution given a previously-materialized
+    /// Coroutine SM for data-only scan execution given a materialized
     /// `live_actions_relation` handle (typically produced by `scan_metadata_state_machine`).
     /// Adopts the handle under [`LIVE_ACTIONS`] in the new registry, then runs the data
     /// phase via [`Self::do_data_stage`].

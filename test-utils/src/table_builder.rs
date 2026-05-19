@@ -253,8 +253,7 @@ impl FeatureSet {
             .any(|(k, v)| k == "delta.feature.v2Checkpoint" && v == "supported")
     }
 
-    /// Returns the table features implied by the properties in this set. Used by tests
-    /// to check that each builder method actually enables the right feature.
+    /// Returns the table features implied by the properties in this set.
     pub fn expected_features(&self) -> Vec<TableFeature> {
         let mut out = Vec::new();
         for (k, _) in &self.table_properties {
@@ -1062,7 +1061,6 @@ impl fmt::Display for TestTable {
 // ===========================================================================
 
 /// Convenience wrapper: build a [`TestTable`] from a `log_state` and `feature_set`.
-/// Used by the `test_context!` macro and available for direct use in tests.
 pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
     TestTableBuilder::new()
         .with_log_state(log_state)

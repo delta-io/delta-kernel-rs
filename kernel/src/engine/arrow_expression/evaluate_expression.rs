@@ -784,8 +784,8 @@ pub fn evaluate_predicate(
 
 /// Converts each row's list of UTF-8-like string elements into a JSON array string column.
 ///
-/// Used by FSR deduplication keys (`Expression::array` + [`UnaryExpressionOp::ToJson`]) where the
-/// logical key is a variable-length tuple of strings encoded as `List<Utf8>`.
+/// Backs `Expression::array` + [`UnaryExpressionOp::ToJson`] in evaluation, producing a
+/// JSON-encoded null-tolerant grouping key from a variable-length `List<Utf8>` tuple.
 fn list_utf8_like_to_json_strings(array_ref: &ArrayRef) -> Result<ArrayRef, ArrowError> {
     use serde_json::Value;
 

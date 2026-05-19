@@ -1,43 +1,18 @@
 //! The [`DeclarativePlanNode`] tree plus the [`PlanBuilder`] fluent constructor.
 //!
-//! # Construction API
-//!
-//! [`PlanBuilder`] is the only path that builds [`DeclarativePlanNode`] trees. Each constructor
-//! / transform carries the cumulative output schema alongside the node so downstream operators
-//! never have to re-derive it.
+//! [`PlanBuilder`] is the only path that builds [`DeclarativePlanNode`] trees. Each
+//! constructor / transform carries the cumulative output schema alongside the node so
+//! downstream operators never re-derive it. Terminals consume the builder and either
+//! register a sink into a [`RelationRegistry`] (`into_relation` / `load` /
+//! `into_result_plan`) or attach a consumer KDF (`into_consume` / `consume`).
 //!
 //! ```ignore
-//! use delta_kernel::plans::ir::PlanBuilder;
-//! use delta_kernel::plans::ir::RelationRegistry;
-//! use uuid::Uuid;
-//!
-//! // Untyped pipeline: scan JSON, project to a sub-schema, publish to a named relation.
-//! // The terminal registers the plan into the registry as a side effect; the registry's
-//! // `into_result_plan(name)` later drains the accumulator into a finished `ResultPlan`.
 //! let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
 //! let _handle = PlanBuilder::scan_json(files, schema)
 //!     .project(projection, output_schema)
 //!     .into_relation("scanned", &mut registry)?;
 //! let result_plan = registry.into_result_plan("scanned")?;
-//!
-//! // Typed pipeline: scan JSON, drain into a typed consumer KDF, recover the typed output from
-//! // the resulting PhaseState.
-//! let (plan, extractor) =
-//!     PlanBuilder::scan_json(files, schema).consume(CheckpointHintReader::default());
-//! // ... after `phase.execute(PhaseOperation::Plans(vec![plan]), name).await?` ...
-//! // let hint = extractor.extract(&state)?;
 //! ```
-//!
-//! ## Core API
-//!
-//! - Constructors: [`PlanBuilder::scan_json`] / [`scan_parquet`](PlanBuilder::scan_parquet),
-//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`], [`PlanBuilder::union`].
-//! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`], [`PlanBuilder::project_pair`],
-//!   [`PlanBuilder::add_column`], [`PlanBuilder::window`], [`PlanBuilder::join`],
-//!   [`PlanBuilder::join_on`].
-//! - Terminals: [`PlanBuilder::into_relation`] (register-as-side-effect), [`PlanBuilder::load`]
-//!   (register-as-side-effect), [`PlanBuilder::into_result_plan`] (combined register + drain),
-//!   [`PlanBuilder::into_consume`], [`PlanBuilder::consume`].
 
 use std::sync::Arc;
 
@@ -127,7 +102,7 @@ impl PlanBuilder {
         Self { schema, node }
     }
 
-    /// Wrap a pre-built [`ScanNode`] (used by callers that need to attach `with_predicate`
+    /// Wrap a pre-built [`ScanNode`] (for callers that need to attach `with_predicate`
     /// before sealing the builder).
     pub fn from_scan(scan: ScanNode) -> Self {
         let schema = Arc::clone(&scan.schema);
@@ -250,7 +225,7 @@ impl PlanBuilder {
     /// wrapped in a passthrough+append `Project` that emits every current column followed by
     /// the new one.
     ///
-    /// Used to layer dedup-key / version / synthetic columns onto a base projection without
+    /// Layers dedup-key / version / synthetic columns onto a base projection without
     /// destructuring the pair at the call site.
     pub fn add_column(mut self, field: StructField, expr: Arc<Expression>) -> Self {
         match &mut self.node {

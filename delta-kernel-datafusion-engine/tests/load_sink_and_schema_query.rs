@@ -268,9 +268,8 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
 /// [`crate::exec::LoadExec`] must yield each kernel-handler parquet batch as soon as it is
 /// produced -- no per-file batching, no full-file materialization. Drive a single-upstream-row
 /// load over a parquet file that contains multiple row groups, then assert that the output
-/// stream yielded strictly more batches than the upstream had rows. The pre-refactor `drain_load`
-/// path would have concatenated everything into a single output `RecordBatch` per upstream row,
-/// so this check directly proves the new streaming shape.
+/// stream yielded strictly more batches than the upstream had rows. This proves the streaming
+/// shape (vs. a single concatenated `RecordBatch` per upstream row).
 #[tokio::test]
 async fn load_exec_streams_one_parquet_row_group_per_batch() {
     use std::fs::File;
