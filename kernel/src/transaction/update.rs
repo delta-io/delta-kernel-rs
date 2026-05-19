@@ -691,31 +691,36 @@ mod tests {
     }
 
     #[rstest]
-    #[case::null_stats(None, &[], true)]
-    #[case::stats_missing_num_records(Some("{}"), &[], true)]
-    #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], false)]
+    #[case::null_stats(None, &[], Some("numRecords"))]
+    #[case::stats_missing_num_records(Some("{}"), &[], Some("numRecords"))]
+    #[case::invalid_json(Some("garbage"), &[], Some("is not valid JSON"))]
+    #[case::negative_num_records(Some(r#"{"numRecords":-1}"#), &[], Some("numRecords"))]
+    #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], None)]
     #[case::extra_columns_dont_shift_indexes(
         Some(r#"{"numRecords":10}"#),
         &["size", "modificationTime"],
-        false,
+        None,
     )]
     fn dv_match_visitor_validates_matched_row_stats(
         #[case] stats: Option<&str>,
         #[case] extra_columns: &[&str],
-        #[case] expect_error: bool,
+        #[case] expected_error_substring: Option<&str>,
     ) {
         let dv_updates = dv_updates_for(TEST_PATH);
         let mut visitor = DvMatchVisitor::new(&dv_updates);
         let data = make_scan_metadata_row(TEST_PATH, stats, extra_columns);
 
         let result = visitor.visit_rows_of(&data);
-        if expect_error {
-            let msg = result.expect_err("expected error").to_string();
-            assert!(msg.contains("numRecords"), "message was: {msg}");
-            assert!(msg.contains(TEST_PATH), "message was: {msg}");
-        } else {
-            result.expect("validation should pass");
-            assert_eq!(visitor.matched_file_indexes, vec![0]);
+        match expected_error_substring {
+            Some(needle) => {
+                let msg = result.expect_err("expected error").to_string();
+                assert!(msg.contains(needle), "message was: {msg}");
+                assert!(msg.contains(TEST_PATH), "message was: {msg}");
+            }
+            None => {
+                result.expect("validation should pass");
+                assert_eq!(visitor.matched_file_indexes, vec![0]);
+            }
         }
     }
 
