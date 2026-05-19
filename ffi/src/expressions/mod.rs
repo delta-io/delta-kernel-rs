@@ -22,9 +22,8 @@ pub mod pruning;
 mod arrow_pruning;
 
 use pruning::{
-    invoke_eval_against_stats, invoke_eval_on_partition_values, invoke_eval_on_row_group_stats,
-    ChildAccessor, DirectStatsProvider, OpaquePruningCallbacks, ScalarResolver, ScalarResolverImpl,
-    StatsAccessor,
+    invoke_eval_on_partition_values, invoke_eval_on_row_group_stats, ChildAccessor,
+    DirectStatsProvider, OpaquePruningCallbacks, ScalarResolver, ScalarResolverImpl, StatsAccessor,
 };
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
@@ -150,17 +149,20 @@ impl NamedOpaquePredicateOp {
     }
 
     /// Op name as a `&str`. Used internally by the arrow adapter.
+    #[cfg(feature = "default-engine-base")]
     pub(crate) fn op_name(&self) -> &str {
         &self.name
     }
 
     /// `true` if engine callbacks are registered.
+    #[cfg(feature = "default-engine-base")]
     pub(crate) fn has_callbacks(&self) -> bool {
         self.callbacks.is_some()
     }
 
     /// Clone the callback `Arc`, if any. Used by the arrow adapter to
     /// forward the same callback bundle through batch evaluation.
+    #[cfg(feature = "default-engine-base")]
     pub(crate) fn callbacks_clone(&self) -> Option<Arc<OpaquePruningCallbacks>> {
         self.callbacks.clone()
     }
@@ -224,21 +226,6 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         // per-file refinement pass in `data_skipping.rs`.
         None
     }
-}
-
-/// Internal entry point used by the per-file refinement pass in kernel's
-/// data_skipping.rs. Invokes the engine's stats callback directly.
-#[allow(dead_code)]
-pub(crate) fn invoke_stats_callback(
-    op: &NamedOpaquePredicateOp,
-    exprs: &[Expression],
-    inverted: bool,
-    provider: &dyn pruning::StatsProvider,
-) -> Option<bool> {
-    let cb = op.callbacks.as_deref()?;
-    let children = ChildAccessor::new(exprs);
-    let stats = StatsAccessor::new(provider);
-    invoke_eval_against_stats(cb, &op.name, children, stats, inverted)
 }
 
 #[cfg(test)]

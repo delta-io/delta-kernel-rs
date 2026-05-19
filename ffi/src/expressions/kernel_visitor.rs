@@ -658,24 +658,42 @@ fn wrap_opaque_predicate_with_callbacks<I: IntoIterator<Item = usize>>(
         return Ok(0);
     }
     let exprs: Vec<Expression> = resolved.into_iter().flatten().collect();
-    let pred = match callbacks {
-        Some(cb) => {
-            let op = NamedOpaquePredicateOp::with_callbacks(name, cb);
-            // Wrap via arrow_opaque so the default engine's batch evaluator
-            // can route per-row callback invocations through eval_pred.
-            #[cfg(feature = "default-engine-base")]
-            {
-                use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
-                Predicate::arrow_opaque(op, exprs)
-            }
-            #[cfg(not(feature = "default-engine-base"))]
-            {
-                Predicate::opaque(op, exprs)
-            }
-        }
-        None => Predicate::opaque(NamedOpaquePredicateOp::new(name), exprs),
+    let op = match callbacks {
+        Some(cb) => NamedOpaquePredicateOp::with_callbacks(name, cb),
+        None => NamedOpaquePredicateOp::new(name),
     };
-    Ok(wrap_predicate(state, pred))
+    Ok(wrap_predicate(state, Predicate::opaque(op, exprs)))
+}
+
+/// Like [`wrap_opaque_predicate_with_callbacks`] but wraps the op via
+/// `Predicate::arrow_opaque` so the default engine's batch evaluator can
+/// route per-row callback invocations through `eval_pred`. Only available
+/// when arrow is wired in (`default-engine-base`).
+#[cfg(feature = "default-engine-base")]
+fn wrap_opaque_predicate_with_callbacks_arrow<I: IntoIterator<Item = usize>>(
+    state: &mut KernelExpressionVisitorState,
+    name: String,
+    child_ids: I,
+    callbacks: std::sync::Arc<crate::expressions::pruning::OpaquePruningCallbacks>,
+) -> DeltaResult<usize> {
+    use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
+
+    use crate::expressions::arrow_pruning::ArrowNamedOpaquePredicateOp;
+
+    let resolved: Vec<Option<Expression>> = child_ids
+        .into_iter()
+        .map(|id| unwrap_kernel_expression(state, id))
+        .collect();
+    if resolved.iter().any(Option::is_none) {
+        return Ok(0);
+    }
+    let exprs: Vec<Expression> = resolved.into_iter().flatten().collect();
+    let inner = NamedOpaquePredicateOp::with_callbacks(name, callbacks);
+    let arrow_op = ArrowNamedOpaquePredicateOp::new(inner);
+    Ok(wrap_predicate(
+        state,
+        Predicate::arrow_opaque(arrow_op, exprs),
+    ))
 }
 
 /// Build an opaque predicate with engine pruning callbacks attached. Same as
@@ -703,6 +721,51 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_pruning(
     let callbacks = unsafe { ctx.clone_as_arc() };
     visit_predicate_opaque_with_pruning_impl(state, name_str, children, callbacks)
         .into_extern_result(&allocate_error)
+}
+
+/// Build an opaque predicate with engine pruning callbacks AND arrow batch
+/// evaluation support. Like [`visit_predicate_opaque_with_pruning`] but the
+/// resulting op is wrapped via `Predicate::arrow_opaque` so the default
+/// engine's `evaluate_predicate` can dispatch per-row callback invocations
+/// during stats-based file pruning. Engines using the default engine should
+/// call this builder; engines with their own `EvaluationHandler` should use
+/// the plain `visit_predicate_opaque_with_pruning`.
+///
+/// Only available when arrow is wired in (`default-engine-base` feature).
+///
+/// # Safety
+/// The string slice must be valid for the duration of the call. `ctx` must
+/// be a valid handle produced by [`create_opaque_pruning_context`].
+///
+/// [`create_opaque_pruning_context`]: crate::expressions::pruning::create_opaque_pruning_context
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate_opaque_with_pruning_arrow(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+    children: &mut EngineIterator,
+    ctx: Handle<crate::expressions::pruning::SharedOpaquePruningContext>,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { String::try_from_slice(&name) };
+    let callbacks = unsafe { ctx.clone_as_arc() };
+    visit_predicate_opaque_with_pruning_arrow_impl(state, name_str, children, callbacks)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn visit_predicate_opaque_with_pruning_arrow_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: DeltaResult<String>,
+    children: &mut EngineIterator,
+    callbacks: std::sync::Arc<crate::expressions::pruning::OpaquePruningCallbacks>,
+) -> DeltaResult<usize> {
+    wrap_opaque_predicate_with_callbacks_arrow(
+        state,
+        name?,
+        children.map(|child| child as usize),
+        callbacks,
+    )
 }
 
 fn visit_predicate_opaque_with_pruning_impl(

@@ -14,8 +14,6 @@
 //!
 //! See `doc/design/opaque-predicate-data-skipping.md`.
 
-use std::sync::Arc;
-
 use delta_kernel::arrow::array::{
     Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray,
@@ -31,9 +29,7 @@ use delta_kernel::kernel_predicates::{
 use delta_kernel::schema::DataType;
 use delta_kernel::DeltaResult;
 
-use super::pruning::{
-    invoke_eval_against_stats, ChildAccessor, OpaquePruningCallbacks, StatsAccessor, StatsProvider,
-};
+use super::pruning::{invoke_eval_against_stats, ChildAccessor, StatsAccessor, StatsProvider};
 use super::NamedOpaquePredicateOp;
 
 // === BatchRowStatsProvider =====================================================
@@ -138,16 +134,45 @@ fn scalar_from_array(array: &dyn Array, row: usize, dtype: &DataType) -> Option<
     None
 }
 
-// === ArrowOpaquePredicateOp impl ==============================================
+// === ArrowNamedOpaquePredicateOp ==============================================
 
-impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
+/// Newtype wrapper that adds [`ArrowOpaquePredicateOp`] capability to a
+/// [`NamedOpaquePredicateOp`]. Use this only when constructing predicates
+/// that will be evaluated by the default engine's arrow batch evaluator;
+/// engines with their own `EvaluationHandler` should keep using plain
+/// `NamedOpaquePredicateOp`.
+///
+/// Engine-facing FFI: see
+/// [`visit_predicate_opaque_with_pruning_arrow`](crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning_arrow).
+#[derive(Debug, Clone)]
+pub struct ArrowNamedOpaquePredicateOp(NamedOpaquePredicateOp);
+
+impl ArrowNamedOpaquePredicateOp {
+    pub(crate) fn new(inner: NamedOpaquePredicateOp) -> Self {
+        Self(inner)
+    }
+
+    fn inner(&self) -> &NamedOpaquePredicateOp {
+        &self.0
+    }
+}
+
+impl PartialEq for ArrowNamedOpaquePredicateOp {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for ArrowNamedOpaquePredicateOp {}
+
+impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
     fn eval_pred(
         &self,
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
-        let Some(cb) = self.callbacks_for_arrow() else {
+        let Some(cb) = self.inner().callbacks_clone() else {
             // No callbacks: produce an all-null mask. Kernel's evaluator
             // treats null in junctions per Kleene logic; effectively the
             // predicate contributes "unknown" -> keep.
@@ -160,15 +185,20 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
             let provider = BatchRowStatsProvider::new(batch, row);
             let children = ChildAccessor::new(args);
             let accessor = StatsAccessor::new(&provider);
-            let verdict =
-                invoke_eval_against_stats(&cb, self.op_name(), children, accessor, inverted);
+            let verdict = invoke_eval_against_stats(
+                &cb,
+                self.inner().op_name(),
+                children,
+                accessor,
+                inverted,
+            );
             results.push(verdict);
         }
         Ok(BooleanArray::from(results))
     }
 
     fn name(&self) -> &str {
-        self.op_name()
+        self.inner().op_name()
     }
 
     fn eval_pred_scalar(
@@ -178,9 +208,14 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> DeltaResult<Option<bool>> {
-        // Delegate to the OpaquePredicateOp impl (already wires partition pruning).
-        <Self as delta_kernel::expressions::OpaquePredicateOp>::eval_pred_scalar(
-            self, eval_expr, eval_pred, exprs, inverted,
+        // Forward to the inner op's OpaquePredicateOp impl; that's where the
+        // engine partition-pruning callback dispatch lives.
+        <NamedOpaquePredicateOp as delta_kernel::expressions::OpaquePredicateOp>::eval_pred_scalar(
+            self.inner(),
+            eval_expr,
+            eval_pred,
+            exprs,
+            inverted,
         )
     }
 
@@ -190,8 +225,8 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<bool> {
-        <Self as delta_kernel::expressions::OpaquePredicateOp>::eval_as_data_skipping_predicate(
-            self,
+        <NamedOpaquePredicateOp as delta_kernel::expressions::OpaquePredicateOp>::eval_as_data_skipping_predicate(
+            self.inner(),
             predicate_evaluator,
             exprs,
             inverted,
@@ -205,23 +240,15 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         inverted: bool,
     ) -> Option<Predicate> {
         // When the engine has registered callbacks, return an arrow-wrapped
-        // opaque predicate so that kernel's indirect-rewrite path keeps the
-        // op live in the rewritten predicate. The default engine's
+        // opaque predicate so kernel's indirect-rewrite path keeps the op
+        // live in the rewritten predicate. The default engine's
         // `evaluate_predicate` then invokes our `eval_pred` per metadata
         // batch row.
-        if !self.has_callbacks() {
+        if !self.inner().has_callbacks() {
             return None;
         }
         let pred = Predicate::arrow_opaque(self.clone(), exprs.iter().cloned());
         Some(if inverted { Predicate::not(pred) } else { pred })
-    }
-}
-
-// === Helpers exposed to mod.rs ================================================
-
-impl NamedOpaquePredicateOp {
-    pub(crate) fn callbacks_for_arrow(&self) -> Option<Arc<OpaquePruningCallbacks>> {
-        self.callbacks_clone()
     }
 }
 
@@ -235,6 +262,7 @@ mod tests {
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 
     use super::*;
+    use crate::expressions::pruning::OpaquePruningCallbacks;
 
     fn make_stats_batch(min: &str, max: &str, nulls: i64, rows: i64) -> RecordBatch {
         let inner_fields: Vec<Field> = vec![Field::new("name", ArrowDataType::Utf8, true)];
@@ -513,7 +541,10 @@ mod tests {
     fn eval_pred_prunes_per_row_via_engine_callback() {
         use delta_kernel::expressions::{column_expr, Expression};
 
-        let op = NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", callbacks());
+        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::with_callbacks(
+            "STARTS_WITH",
+            callbacks(),
+        ));
         let args = vec![column_expr!("name"), Expression::literal("foo")];
         let batch = three_file_batch();
 
@@ -531,7 +562,7 @@ mod tests {
     fn eval_pred_without_callbacks_returns_all_unknown() {
         use delta_kernel::expressions::{column_expr, Expression};
 
-        let op = NamedOpaquePredicateOp::new("STARTS_WITH");
+        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::new("STARTS_WITH"));
         let args = vec![column_expr!("name"), Expression::literal("foo")];
         let batch = three_file_batch();
 
