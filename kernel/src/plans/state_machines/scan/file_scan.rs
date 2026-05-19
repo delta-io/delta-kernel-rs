@@ -45,7 +45,16 @@ impl Scan {
         with_data: bool,
     ) -> Result<ResultPlan, DeltaError> {
         let stats = self.physical_stats_schema();
-        let parts = self.physical_partition_schema();
+        // When the data stage runs, `scan_data_projection` references
+        // `fileConstantValues.partitionValues_parsed.<col>` for *every* partition column in the
+        // logical schema -- not just predicate-referenced ones. Use the full partition schema
+        // so projection lookups succeed; `physical_partition_schema()` is narrowed to predicate
+        // columns only and is only correct when no data stage runs.
+        let parts = if with_data {
+            self.data_stage_partition_schema()
+        } else {
+            self.physical_partition_schema()
+        };
 
         // === Stage 1-5: shared reconciliation -> RECONCILED ==============================
         execute_reconciliation(

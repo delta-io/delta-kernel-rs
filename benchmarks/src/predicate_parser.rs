@@ -211,6 +211,29 @@ fn check_expr(
     }
 }
 
+/// Pad a numeric literal's fractional digits to match a target decimal scale.
+///
+/// `PrimitiveType::parse_decimal` (kernel) requires the input string's scale to equal the
+/// target type's scale exactly. SQL predicates often use unscaled integer/short-decimal literals
+/// (`amount > 50`, `price > 100.5`) against higher-scale decimal columns, so add trailing zeros
+/// (or insert a decimal point + zeros) when the literal's scale is less than the target's.
+/// Literals with scale > target are left alone so `parse_decimal` surfaces a precision conflict.
+fn pad_decimal_literal_scale(raw: &str, target_scale: usize) -> String {
+    let cur_scale = match raw.find('.') {
+        Some(pos) => raw.len() - pos - 1,
+        None => 0,
+    };
+    if cur_scale >= target_scale {
+        return raw.to_string();
+    }
+    let zeros = "0".repeat(target_scale - cur_scale);
+    if raw.contains('.') {
+        format!("{raw}{zeros}")
+    } else {
+        format!("{raw}.{zeros}")
+    }
+}
+
 /// Checks a literal value against an expected type and converts it to that type.
 /// Uses kernel's `PrimitiveType::parse_scalar` for parsing.
 fn check_literal(
@@ -229,6 +252,15 @@ fn check_literal(
             PVal::Number(n, _),
         ) => {
             let raw = format!("{}{n}", if is_negative { "-" } else { "" });
+            // `PrimitiveType::parse_decimal` requires exact scale match against the target
+            // `Decimal(precision, scale)`. SQL predicates like `amount > 50` against a
+            // `decimal(10, 2)` column arrive here with raw `"50"` (scale 0), so pad trailing
+            // zeros (or insert `.000...`) so the literal's scale matches the target.
+            let raw = if let Decimal(dtype) = prim {
+                pad_decimal_literal_scale(&raw, dtype.scale() as usize)
+            } else {
+                raw
+            };
             let scalar = prim.parse_scalar(&raw).map_err(|e| e.to_string())?;
             Ok(scalar.into())
         }

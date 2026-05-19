@@ -16,7 +16,7 @@ use datafusion_common::DFSchema;
 use datafusion_datasource_json::file_format::JsonFormat;
 use datafusion_datasource_parquet::file_format::ParquetFormat;
 use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
-use datafusion_expr::{lit, Expr, LogicalPlanBuilder};
+use datafusion_expr::LogicalPlanBuilder;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::ir::nodes::{FileType, ScanNode};
 use delta_kernel::schema::MetadataColumnSpec;
@@ -24,7 +24,7 @@ use parquet::arrow::RowNumber;
 
 use super::canonicalize::canonicalize_output_to_kernel_schema;
 use super::providers::NullabilityEnforcingTableProvider;
-use crate::compile::expr_translator::kernel_expr_to_df;
+use crate::compile::expr_translator::{kernel_expr_to_df, TranslationContext};
 use crate::error::plan_compilation;
 use crate::exec::FieldIdPhysicalExprAdapterFactory;
 
@@ -107,12 +107,10 @@ pub(super) fn scan_to_listing_logical_plan(
     let full_schema = build_scan_arrow_schema(node)?;
     let build_listing_scan =
         |files: &[delta_kernel::FileMeta]| -> Result<LogicalPlan, DataFusionError> {
-            // Both file formats reject planning when the declared schema is stricter than what
-            // the physical file produces (parquet checkpoints commonly write `add.path` as
-            // nullable; the JSON decoder silently drops declared NOT NULL on nested children).
-            // Relax before handing to the file source; `NullabilityEnforcingTableProvider` below
-            // re-asserts the strict nullability contract at the scan boundary while preserving
-            // source-side names and PARQUET:field_id metadata via `merge_target_nullability`.
+            // File-source planning rejects schemas stricter than the physical files (parquet
+            // checkpoints commonly write `add.path` as nullable; JSON drops declared NOT NULL
+            // on nested children). Relax before passing in; `NullabilityEnforcingTableProvider`
+            // re-asserts the strict contract per-batch.
             let file_schema =
                 relax_nested_nullability_for_scan(Arc::new(full_schema.clone()).as_ref());
             let partition_cols: Vec<(String, ArrowDataType)> = Vec::new();
@@ -163,7 +161,7 @@ pub(super) fn scan_to_listing_logical_plan(
         };
     let mut scan_plan = build_listing_scan(&node.files)?;
     if let Some(predicate) = &node.predicate {
-        let pred = kernel_expr_to_df(predicate.as_ref())?;
+        let pred = kernel_expr_to_df(predicate.as_ref(), &TranslationContext::untyped())?;
         // Kernel NULL semantics keep a row when the predicate references a NULL value (SQL
         // three-valued logic would drop it). We wrap the predicate with `pred OR pred IS NULL` so
         // the downstream Filter behaves like kernel scan-skipping. Do NOT swap this for parquet
@@ -212,65 +210,4 @@ fn build_scan_arrow_schema(node: &ScanNode) -> Result<ArrowSchema, DataFusionErr
         fields,
         schema.metadata().clone(),
     ))
-}
-
-/// Build a projection that passes through every column of `pass_through_schema_src` and
-/// appends `new_column` aliased as `new_column_name`. Used for the "all-existing-columns plus
-/// one synthesized column" pattern that drives row-index plumbing and ordered-union ordinals.
-fn project_pass_through_with(
-    plan: LogicalPlan,
-    pass_through_schema_src: &LogicalPlan,
-    new_column: Expr,
-    new_column_name: &str,
-) -> Result<LogicalPlan, DataFusionError> {
-    let mut projection = pass_through_schema_src
-        .schema()
-        .columns()
-        .iter()
-        .cloned()
-        .map(Expr::Column)
-        .collect::<Vec<_>>();
-    projection.push(new_column.alias(new_column_name.to_string()));
-    LogicalPlanBuilder::from(plan).project(projection)?.build()
-}
-
-pub(super) fn append_constant_i64_column(
-    plan: LogicalPlan,
-    column_name: &str,
-    value: i64,
-) -> Result<LogicalPlan, DataFusionError> {
-    let plan_clone = plan.clone();
-    project_pass_through_with(plan_clone, &plan, lit(value), column_name)
-}
-
-pub(super) fn plan_column_by_name(
-    plan: &LogicalPlan,
-    name: &str,
-) -> Result<datafusion_common::Column, DataFusionError> {
-    plan.schema()
-        .columns()
-        .iter()
-        .find(|col| col.name == name)
-        .cloned()
-        .ok_or_else(|| {
-            plan_compilation(format!(
-                "logical scan expected column `{name}` in schema {:?}",
-                plan.schema()
-            ))
-        })
-}
-
-pub(super) fn drop_named_column(
-    plan: LogicalPlan,
-    drop_name: &str,
-) -> Result<LogicalPlan, DataFusionError> {
-    let projection = plan
-        .schema()
-        .columns()
-        .iter()
-        .filter(|col| col.name != drop_name)
-        .cloned()
-        .map(Expr::Column)
-        .collect::<Vec<_>>();
-    LogicalPlanBuilder::from(plan).project(projection)?.build()
 }

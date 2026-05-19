@@ -14,7 +14,7 @@ pub(super) fn canonicalize_output_to_kernel_schema(
     plan: LogicalPlan,
     kernel_schema: &KernelSchemaRef,
 ) -> Result<LogicalPlan, DataFusionError> {
-    let source_cols = plan.schema().columns().to_vec();
+    let source_cols = plan.schema().columns();
     let target_len = kernel_schema.fields().count();
     if source_cols.len() < target_len {
         return Err(plan_compilation(format!(
@@ -22,10 +22,14 @@ pub(super) fn canonicalize_output_to_kernel_schema(
             source_cols.len()
         )));
     }
-    let projection = kernel_schema
-        .fields()
-        .zip(source_cols)
-        .map(|(field, source_col)| Expr::Column(source_col).alias(field.name().to_string()))
-        .collect::<Vec<_>>();
-    LogicalPlanBuilder::from(plan).project(projection)?.build()
+    LogicalPlanBuilder::from(plan)
+        .project(
+            kernel_schema
+                .fields()
+                .zip(source_cols)
+                .map(|(field, source_col)| {
+                    Expr::Column(source_col).alias(field.name().to_string())
+                }),
+        )?
+        .build()
 }

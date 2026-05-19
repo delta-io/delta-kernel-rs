@@ -99,7 +99,7 @@ fn generate_struct_extract(
     struct_type: &StructType,
     path: &[String],
 ) -> Result<Expr, DataFusionError> {
-    let mut args = Vec::new();
+    let mut args = Vec::with_capacity(struct_type.fields().count() * 2);
     for field in struct_type.fields() {
         args.push(lit(field.name().to_string()));
         args.push(generate_json_extract_expr(json_col, field, path)?);

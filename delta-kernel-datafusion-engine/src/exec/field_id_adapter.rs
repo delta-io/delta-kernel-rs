@@ -282,14 +282,14 @@ impl PhysicalExpr for RenameNestedFieldsByIdExpr {
 
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn PhysicalExpr>>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> DfResult<Arc<dyn PhysicalExpr>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(
-                "RenameNestedFieldsByIdExpr requires exactly one child".into(),
-            ));
-        }
-        let child = children.pop().unwrap();
+        let [child] = children.try_into().map_err(|c: Vec<_>| {
+            DataFusionError::Internal(format!(
+                "RenameNestedFieldsByIdExpr requires exactly one child, got {}",
+                c.len()
+            ))
+        })?;
         Ok(Arc::new(Self {
             inner: child,
             renamed_field: Arc::clone(&self.renamed_field),

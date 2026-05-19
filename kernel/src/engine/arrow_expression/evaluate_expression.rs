@@ -717,6 +717,26 @@ pub fn evaluate_predicate(
                     let exists = ad.array_elements().contains(lit);
                     Ok(BooleanArray::from(vec![exists]))
                 }
+                // `col IN (lit, lit, ...)` -- the canonical SQL form, dual of the
+                // `(Literal, Column)` arm above. The literal array is fixed across rows, so
+                // build the result by OR-ing per-element equality against the column. Uses
+                // kleene OR so NULLs in either side propagate correctly: `5 IN (NULL, 5)` is
+                // TRUE, `5 IN (NULL, 3)` is NULL.
+                (Expression::Column(_), Expression::Literal(Scalar::Array(ad))) => {
+                    let column_arr = evaluate_expression(left, batch, None)?;
+                    let column_arr = arrow_convert_to_non_view_type(column_arr)?;
+                    let eq_against_literal = |lit: &Scalar| -> DeltaResult<BooleanArray> {
+                        let elem_arr =
+                            evaluate_expression(&Expression::Literal(lit.clone()), batch, None)?;
+                        let elem_arr = arrow_convert_to_non_view_type(elem_arr)?;
+                        Ok(eq(&column_arr, &elem_arr)?)
+                    };
+                    ad.array_elements()
+                        .iter()
+                        .try_fold(BooleanArray::from(vec![false; column_arr.len()]), |acc, lit| {
+                            Ok(or_kleene(&acc, &eq_against_literal(lit)?)?)
+                        })
+                }
                 (l, r) => Err(Error::invalid_expression(format!(
                     "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
                 ))),

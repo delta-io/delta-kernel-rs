@@ -11,7 +11,7 @@ use datafusion_common::arrow::datatypes::{DataType as ArrowDataType, Schema as A
 use datafusion_common::error::DataFusionError;
 use datafusion_common::DFSchema;
 use datafusion_expr::expr_fn::cast;
-use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
+use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan, Values};
 use datafusion_expr::{Expr, ExprFunctionExt, JoinType as DfJoinType, LogicalPlanBuilder};
 use datafusion_functions_window::row_number::row_number;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
@@ -20,7 +20,7 @@ use delta_kernel::plans::ir::nodes::JoinType as KernelJoinType;
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 
 use super::CompileContext;
-use crate::compile::expr_translator::kernel_expr_to_df;
+use crate::compile::expr_translator::{kernel_expr_to_df, kernel_exprs_to_df, TranslationContext};
 use crate::error::plan_compilation;
 
 mod canonicalize;
@@ -59,27 +59,36 @@ fn compile_declarative_node_logical(
                 DFSchema::try_from(arrow_schema)
                     .map_err(|e| plan_compilation(format!("Logical Values DF schema: {e}")))?,
             );
-            if values.rows.is_empty() {
-                return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
-                    produce_one_row: false,
-                    schema: df_schema,
-                }));
-            }
             let rows = values
                 .rows
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|s| kernel_expr_to_df(&Expression::literal(s.clone())))
+                        .map(|s| {
+                            kernel_expr_to_df(
+                                &Expression::literal(s.clone()),
+                                &TranslationContext::untyped(),
+                            )
+                        })
                         .collect::<Result<Vec<_>, DataFusionError>>()
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
-            let plan = LogicalPlanBuilder::values_with_schema(rows, &df_schema)?.build()?;
-            canonicalize_output_to_kernel_schema(plan, &values.schema)
+            Ok(if rows.is_empty() {
+                LogicalPlan::EmptyRelation(EmptyRelation {
+                    produce_one_row: false,
+                    schema: df_schema,
+                })
+            } else {
+                LogicalPlan::Values(Values {
+                    schema: df_schema,
+                    values: rows,
+                })
+            })
         }
         DeclarativePlanNode::Filter { child, node } => {
             let child_plan = compile_declarative_node_logical(child, ctx)?;
-            let predicate = kernel_expr_to_df(node.predicate.as_ref())?;
+            let predicate =
+                kernel_expr_to_df(node.predicate.as_ref(), &TranslationContext::untyped())?;
             LogicalPlanBuilder::from(child_plan)
                 .filter(predicate)?
                 .build()
@@ -145,16 +154,10 @@ fn compile_declarative_node_logical(
             }
             let build_plan = compile_declarative_node_logical(build, ctx)?;
             let probe_plan = compile_declarative_node_logical(probe, ctx)?;
-            let left_keys = join_node
-                .left_keys
-                .iter()
-                .map(|e| kernel_expr_to_df(e.as_ref()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let right_keys = join_node
-                .right_keys
-                .iter()
-                .map(|e| kernel_expr_to_df(e.as_ref()))
-                .collect::<Result<Vec<_>, _>>()?;
+            let left_keys =
+                kernel_exprs_to_df(&join_node.left_keys, &TranslationContext::untyped())?;
+            let right_keys =
+                kernel_exprs_to_df(&join_node.right_keys, &TranslationContext::untyped())?;
             let join_type = match join_node.join_type {
                 KernelJoinType::Inner => DfJoinType::Inner,
                 KernelJoinType::LeftAnti => DfJoinType::RightAnti,
@@ -176,16 +179,16 @@ fn compile_declarative_node_logical(
                 ));
             }
             let child_plan = compile_declarative_node_logical(child, ctx)?;
-            let partition_by = node
-                .partition_by
-                .iter()
-                .map(|e| kernel_expr_to_df(e.as_ref()))
-                .collect::<Result<Vec<_>, DataFusionError>>()?;
+            let partition_by =
+                kernel_exprs_to_df(&node.partition_by, &TranslationContext::untyped())?;
             let order_by = node
                 .order_by
                 .iter()
                 .map(|spec| {
-                    let expr = kernel_expr_to_df(&Expression::from(spec.column.clone()))?;
+                    let expr = kernel_expr_to_df(
+                        &Expression::from(spec.column.clone()),
+                        &TranslationContext::untyped(),
+                    )?;
                     Ok(expr.sort(!spec.descending, false))
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
@@ -204,14 +207,10 @@ fn compile_declarative_node_logical(
                 .iter()
                 .map(|wf| (expr_name.clone(), wf.output_col.clone()))
                 .collect();
-            let window_plan = LogicalPlanBuilder::window_plan(child_plan.clone(), window_exprs)?;
-            let input_col_count = child_plan.schema().columns().len();
-            let mut projection = child_plan
-                .schema()
-                .columns()
-                .iter()
-                .map(|col| Expr::Column(col.clone()))
-                .collect::<Vec<_>>();
+            // Snapshot columns before moving `child_plan` into the builder.
+            let child_cols = child_plan.schema().columns();
+            let input_col_count = child_cols.len();
+            let window_plan = LogicalPlanBuilder::window_plan(child_plan, window_exprs)?;
             // Single window expression covers all output_cols (see comment above). Each kernel
             // output_col aliases the same source column, cast to Int64 (kernel WindowFunction emits
             // LONG; row_number_udf emits UInt64).
@@ -225,13 +224,13 @@ fn compile_declarative_node_logical(
                         "logical window: missing computed window output at index {input_col_count}"
                     ))
                 })?;
-            projection.extend(window_expr_names.iter().map(|(_from, to)| {
+            let pass_through = child_cols.into_iter().map(Expr::Column);
+            let window_outputs = window_expr_names.iter().map(|(_from, to)| {
                 cast(Expr::Column(src_col.clone()), ArrowDataType::Int64).alias(to.clone())
-            }));
-            let plan = LogicalPlanBuilder::from(window_plan)
-                .project(projection)?
-                .build()?;
-            Ok(plan)
+            });
+            LogicalPlanBuilder::from(window_plan)
+                .project(pass_through.chain(window_outputs))?
+                .build()
         }
         DeclarativePlanNode::FileListing(node) => file_listing_to_logical_plan(node),
     }
