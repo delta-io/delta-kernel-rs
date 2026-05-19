@@ -74,29 +74,17 @@ pub(crate) fn column_mapping_mode(
     }
 }
 
-/// When column mapping mode is enabled, verify that each field in the schema is annotated with a
-/// physical name and field_id, and that no two fields share the same `delta.columnMapping.id`
-/// value. When not enabled, verifies that no fields are annotated.
-pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
-    let mut validator = ValidateColumnMappings {
-        mode,
-        logical_path: vec![],
-        seen: SeenColumnMappingAnnotations::default(),
-    };
-    validator.transform_struct(schema)
-}
-
-/// Tracks `delta.columnMapping.id` and `delta.columnMapping.physicalName` values that have
-/// already been claimed during a single schema walk, so duplicates can be rejected at the
-/// first collision (with both offending field names in the error) rather than letting the
-/// duplicate slip through to a downstream parquet read where field ids resolve ambiguously.
+/// Validates `delta.columnMapping.id` and `delta.columnMapping.physicalName` annotations across
+/// every field in `schema`. Aligns with delta-spark's validation logic.
 ///
-/// `delta.columnMapping.id` must be unique across the entire schema.
+/// When `mode` is [`ColumnMappingMode::Id`] or [`ColumnMappingMode::Name`]: each field must
+/// carry both annotations, no two fields may share a `delta.columnMapping.id`, and no two
+/// fields may share a *full physical column path*. Two fields may share the same leaf
+/// `physicalName` if they live at different physical column paths.
 ///
-/// `delta.columnMapping.physicalName` must be unique by *full physical column path*. Two
-/// fields may share the same physical name if they are at different struct paths.
+/// When `mode` is [`ColumnMappingMode::None`]: verifies no field carries either annotation.
 ///
-/// Example:
+/// Examples for physical name validation:
 /// Rejected (two siblings share `delta.columnMapping.physicalName="x"`):
 /// ```json
 /// {"type":"struct","fields":[
@@ -107,7 +95,7 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 /// ]}
 /// ```
 ///
-/// Accepted (same `delta.columnMapping.physicalName="x"` at different struct paths):
+/// Accepted (same `delta.columnMapping.physicalName="x"` at different physical column paths):
 /// ```json
 /// {"type":"struct","fields":[
 ///   {"name":"a","type":"long","nullable":true,
@@ -120,24 +108,38 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 ///   ]}}
 /// ]}
 /// ```
+pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
+    let mut validator = ValidateColumnMappings {
+        mode,
+        logical_path: vec![],
+        seen: SeenColumnMappingAnnotations::default(),
+    };
+    validator.transform_struct(schema)
+}
+
+/// Tracks `delta.columnMapping.id` and `delta.columnMapping.physicalName` values that have
+/// already been claimed during a single schema walk.
+///
+/// See [`validate_schema_column_mapping`] for the uniqueness rules and examples.
 #[derive(Default, Debug)]
 pub(crate) struct SeenColumnMappingAnnotations<'a> {
     /// `delta.columnMapping.id` -> first field name that claimed it.
     pub ids: HashMap<i64, &'a str>,
-    /// Stack of per-struct direct-children maps. Key is the direct child's physical name;
-    /// value is the direct child's logical name.
-    direct_children_physical_names: Vec<HashMap<&'a str, &'a str>>,
+    /// Stack of per-struct sibling maps, one per struct currently being walked (root included).
+    /// Each map holds the physicalNames already claimed by that struct's children: key is the
+    /// child's physical name, value is its logical name.
+    sibling_physical_names: Vec<HashMap<&'a str, &'a str>>,
 }
 
 impl<'a> SeenColumnMappingAnnotations<'a> {
     /// Walkers call this before iterating a struct's fields.
     pub(crate) fn enter_struct(&mut self) {
-        self.direct_children_physical_names.push(HashMap::new());
+        self.sibling_physical_names.push(HashMap::new());
     }
 
     /// Walkers call this after finishing a struct's fields.
     pub(crate) fn leave_struct(&mut self) {
-        self.direct_children_physical_names.pop();
+        self.sibling_physical_names.pop();
     }
 }
 
@@ -256,7 +258,7 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
             // columns with the same full physical path must diverge at some ancestor struct,
             // where they take different child branches sharing a `physicalName`, so a
             // per-struct direct-children check catches all full-path collisions.
-            if let Some(siblings) = seen.direct_children_physical_names.last_mut() {
+            if let Some(siblings) = seen.sibling_physical_names.last_mut() {
                 siblings
                     .insert(physical_name.as_str(), field.name().as_str())
                     .map_or(Ok(()), |prev| {
@@ -278,7 +280,7 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
 
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
-    /// Logical parent path of current field's parent, used for error messages.
+    /// Logical path of current field's parent, used for error messages.
     logical_path: Vec<&'a str>,
     /// CM ids and physical names already claimed during the walk, with the first claimer.
     seen: SeenColumnMappingAnnotations<'a>,
@@ -1114,7 +1116,7 @@ mod tests {
             format!("assigned to both '{a}' and '{b}'")
         }),
     )]
-    #[case::rejected_multiple_violations_reports_first(
+    #[case::multiple_violations_reports_first(
         fixtures::multiple_physical_name_collisions(),
         Some("'p' assigned to both 'a' and 'b'".to_string()),
     )]
@@ -1130,7 +1132,7 @@ mod tests {
             Some(substr) => {
                 assert_result_error_with_message(result.as_ref().map(|_| ()), &substr);
                 // For the multiple-violations case, also confirm the deeper site was never
-                // reported (would imply the walker kept going past the first error).
+                // reported.
                 if let Err(e) = &result {
                     assert!(
                         !e.to_string().contains("'q'"),

@@ -1242,13 +1242,15 @@ pub(crate) mod test_utils {
         ///
         /// Dedup must error at the shallower site and never report the deeper one.
         pub(crate) fn multiple_physical_name_collisions() -> StructType {
+            let a_struct = StructType::new_unchecked([cm_field("aa", 6, "aa", DataType::INTEGER)]);
+            let b_struct = StructType::new_unchecked([cm_field("bb", 7, "bb", DataType::INTEGER)]);
             let nested = StructType::new_unchecked([
                 cm_field("x", 4, "q", DataType::INTEGER),
                 cm_field("y", 5, "q", DataType::INTEGER),
             ]);
             StructType::new_unchecked([
-                cm_field("a", 1, "p", DataType::INTEGER),
-                cm_field("b", 2, "p", DataType::INTEGER),
+                cm_field("a", 1, "p", DataType::Struct(Box::new(a_struct))),
+                cm_field("b", 2, "p", DataType::Struct(Box::new(b_struct))),
                 cm_field("nested", 3, "nested", DataType::Struct(Box::new(nested))),
             ])
         }

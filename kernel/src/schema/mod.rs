@@ -2177,7 +2177,7 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
 
 struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
-    /// Logical parent path of current field's parent, used for error messages.
+    /// Logical path of current field's parent, used for error messages.
     logical_path: Vec<&'a str>,
     /// CM ids and physical names already claimed during the walk, with the first claimer.
     seen: SeenColumnMappingAnnotations<'a>,
@@ -2647,7 +2647,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::accepted_same_phy_name_diffrent_paths(fixtures::same_phy_name_diffrent_paths(), None)]
+    #[case::accepted_same_phy_name_diffrent_paths(fixtures::same_phy_name_diffrent_paths(), /*expected_error_substring*/None)]
     #[case::rejected_deeply_nested_repeat_physical_paths(
         fixtures::deeply_nested_repeat_physical_paths(),
         Some({
@@ -2667,7 +2667,7 @@ mod tests {
         let result = schema.make_physical(ColumnMappingMode::Name);
         match expected_error_substring {
             None => {
-                result.expect("schema must validate");
+                result.expect("The input schema should be valid");
             }
             Some(substr) => {
                 assert_result_error_with_message(result.as_ref().map(|_| ()), &substr);

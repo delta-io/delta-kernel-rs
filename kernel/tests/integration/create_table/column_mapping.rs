@@ -619,15 +619,11 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
     Ok(())
 }
 
-/// `create_table` with pre-existing `delta.columnMapping.physicalName` annotations under CM
-/// `name` mode: the builder preserves the caller's annotations (see
-/// `assign_column_mapping_metadata`), then `TableConfiguration::try_new` runs the path-aware
-/// dedup before any commit is written.
+/// Create table with pre-existing `delta.columnMapping.physicalName` annotations,
+/// verify the physical name duplicate validation logic.
 ///
-/// - **accept**: same leaf `physicalName` under two different parent structs -> distinct full
-///   physical paths -> dedup accepts -> commit succeeds.
-/// - **reject**: two siblings inside `struct -> map -> array -> struct` share a `physicalName` ->
-///   identical full physical path -> dedup rejects at build time, before any commit.
+/// - **accept**: same leaf physical name under two different parent structs.
+/// - **reject**: two siblings inside `struct -> map -> array -> struct` share same physical name.
 #[rstest::rstest]
 #[case::accept(fixtures::same_leaf_phy_name_under_different_parents(), None)]
 #[case::reject(

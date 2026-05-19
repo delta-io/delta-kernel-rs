@@ -388,7 +388,8 @@ async fn test_column_mapping_partitioned_write(
     Ok(())
 }
 
-// Two fields with same physical name at different physical paths should be accepted.
+// Two fields with same physical name at different physical paths is valid. Write
+// should succeed.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_same_phy_name_different_path() -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, _) = test_table_setup()?;
