@@ -1,5 +1,6 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod column_mapping_fixtures;
 pub mod counting_reporter;
 pub mod table_builder;
 use std::collections::HashMap;

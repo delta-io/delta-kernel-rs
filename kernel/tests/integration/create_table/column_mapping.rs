@@ -16,7 +16,9 @@ use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use test_utils::{create_table_and_load_snapshot, test_table_setup};
+use test_utils::{
+    column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
+};
 
 use super::simple_schema;
 
@@ -614,5 +616,46 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
         "Partitioned table should not have clustering columns"
     );
 
+    Ok(())
+}
+
+/// `create_table` with pre-existing `delta.columnMapping.physicalName` annotations under CM
+/// `name` mode: the builder preserves the caller's annotations (see
+/// `assign_column_mapping_metadata`), then `TableConfiguration::try_new` runs the path-aware
+/// dedup before any commit is written.
+///
+/// - **accept**: same leaf `physicalName` under two different parent structs -> distinct full
+///   physical paths -> dedup accepts -> commit succeeds.
+/// - **reject**: two siblings inside `struct -> map -> array -> struct` share a `physicalName` ->
+///   identical full physical path -> dedup rejects at build time, before any commit.
+#[rstest::rstest]
+#[case::accept(fixtures::same_leaf_phy_name_under_different_parents(), None)]
+#[case::reject(
+    fixtures::nested_field_with_same_phy_path(),
+    Some("Duplicate `delta.columnMapping.physicalName`")
+)]
+fn test_create_table_dup_physical_name(
+    #[case] schema: StructType,
+    #[case] expected_error_substring: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let result = create_table(&table_path, Arc::new(schema), "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    match expected_error_substring {
+        None => {
+            let _commit = result?.commit(engine.as_ref())?;
+        }
+        Some(substr) => {
+            let msg = result
+                .expect_err("dup physicalName must be rejected at create-table build")
+                .to_string();
+            assert!(
+                msg.contains(substr) && msg.contains(".a'") && msg.contains(".b'"),
+                "expected path-aware dedup error naming colliding leaves, got: {msg}"
+            );
+        }
+    }
     Ok(())
 }
