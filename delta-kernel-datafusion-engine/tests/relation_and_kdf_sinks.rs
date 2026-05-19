@@ -24,7 +24,10 @@ async fn relation_sink_registers_batches_readable_via_relation_leaf() {
         .expect("relation sink");
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&registry.take_plans()).await.unwrap();
+    executor
+        .execute_plans(&registry.take_plans())
+        .await
+        .unwrap();
 
     let batches = executor.collect_relation(&handle).await.unwrap();
     assert_eq!(batches.len(), 1);

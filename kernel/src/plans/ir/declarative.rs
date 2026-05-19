@@ -31,14 +31,12 @@
 //! ## Core API
 //!
 //! - Constructors: [`PlanBuilder::scan_json`] / [`scan_parquet`](PlanBuilder::scan_parquet),
-//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`],
-//!   [`PlanBuilder::union`].
-//! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`],
-//!   [`PlanBuilder::project_pair`], [`PlanBuilder::add_column`], [`PlanBuilder::window`],
-//!   [`PlanBuilder::join`], [`PlanBuilder::join_on`].
-//! - Terminals: [`PlanBuilder::into_relation`] (register-as-side-effect),
-//!   [`PlanBuilder::load`] (register-as-side-effect),
-//!   [`PlanBuilder::into_result_plan`] (combined register + drain),
+//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`], [`PlanBuilder::union`].
+//! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`], [`PlanBuilder::project_pair`],
+//!   [`PlanBuilder::add_column`], [`PlanBuilder::window`], [`PlanBuilder::join`],
+//!   [`PlanBuilder::join_on`].
+//! - Terminals: [`PlanBuilder::into_relation`] (register-as-side-effect), [`PlanBuilder::load`]
+//!   (register-as-side-effect), [`PlanBuilder::into_result_plan`] (combined register + drain),
 //!   [`PlanBuilder::into_consume`], [`PlanBuilder::consume`].
 
 use std::sync::Arc;
@@ -258,8 +256,7 @@ impl PlanBuilder {
         match &mut self.node {
             DeclarativePlanNode::Project { node, .. } => {
                 node.columns.push(expr);
-                let mut fields: Vec<StructField> =
-                    node.output_schema.fields().cloned().collect();
+                let mut fields: Vec<StructField> = node.output_schema.fields().cloned().collect();
                 fields.push(field);
                 let new_schema = arc_schema(fields);
                 node.output_schema = Arc::clone(&new_schema);
@@ -269,8 +266,7 @@ impl PlanBuilder {
             _ => {
                 // No head Project: synthesize one that passes every current field through by
                 // name and appends the new column.
-                let mut fields: Vec<StructField> =
-                    self.schema.fields().cloned().collect();
+                let mut fields: Vec<StructField> = self.schema.fields().cloned().collect();
                 let mut columns: Vec<Arc<Expression>> = self
                     .schema
                     .fields()
@@ -434,6 +430,7 @@ impl PlanBuilder {
     /// Registers the resulting [`Plan`] into the registry's accumulator as a side effect and
     /// returns the minted [`RelationHandle`] (typically discarded; downstream code references
     /// the relation by name).
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         self,
         name: &str,
@@ -461,7 +458,7 @@ impl PlanBuilder {
         if let Some(dv_ref) = dv_ref {
             sink = sink.with_dv_ref(dv_ref);
         }
-        let plan = Plan::new(self.node, SinkType::Load(sink));
+        let plan = Plan::new(self.node, SinkType::Load(Box::new(sink)));
         registry.push_plan(plan);
         Ok(handle)
     }
@@ -491,7 +488,8 @@ impl PlanBuilder {
 
     /// Typed consumer terminal. Wraps `self` in a [`Plan`] terminating in
     /// [`SinkType::Consume`] and returns the plan paired with an [`Extractor<O>`] that pulls
-    /// the typed output from the resulting [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
+    /// the typed output from the resulting
+    /// [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
     pub fn consume<S>(self, state: S) -> (Plan, Extractor<S::Output>)
     where
         S: ConsumerKdf + KdfOutput + 'static,

@@ -134,7 +134,7 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan_metadata", move |mut co, sm_id| async move {
             let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, "scan"));
-            scan.build_plans(&mut ctx, /*with_data=*/ false).await
+            scan.build_plans(&mut ctx, /* with_data= */ false).await
         })
     }
 
@@ -159,7 +159,7 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan", move |mut co, sm_id| async move {
             let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, "scan"));
-            scan.build_plans(&mut ctx, /*with_data=*/ true).await
+            scan.build_plans(&mut ctx, /* with_data= */ true).await
         })
     }
 }

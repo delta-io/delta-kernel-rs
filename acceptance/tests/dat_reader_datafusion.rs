@@ -46,9 +46,7 @@ async fn assert_fsr_add_only_matches_scan_files(
         .and_then(|fs| fs.state_machine())
         .map_err(|e| delta_kernel::Error::generic(format!("build full_state SM: {e}")))?;
     let rp = executor.drive_to_completion(sm).await.map_err(|e| {
-        delta_kernel::Error::generic(format!(
-            "drive full_state SM via DataFusionExecutor: {e}"
-        ))
+        delta_kernel::Error::generic(format!("drive full_state SM via DataFusionExecutor: {e}"))
     })?;
     let fsr_batches = executor.collect_result(rp).await.map_err(|e| {
         delta_kernel::Error::generic(format!(

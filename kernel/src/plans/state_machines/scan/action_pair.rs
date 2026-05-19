@@ -19,14 +19,15 @@
 
 use std::sync::{Arc, LazyLock};
 
+use super::dedup::FSR_JOIN_KEY_COL;
 use crate::actions::{
     Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, ADD_NAME,
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::expressions::{col, Expression};
-use crate::schema::{arc_schema, ArrayType, DataType, SchemaRef, StructField, StructType, ToSchema};
-
-use super::dedup::FSR_JOIN_KEY_COL;
+use crate::schema::{
+    arc_schema, ArrayType, DataType, SchemaRef, StructField, StructType, ToSchema,
+};
 
 /// Paired output of any action-stream stage: the row schema and the matching per-column
 /// projection expressions in declaration order.
@@ -94,11 +95,10 @@ pub(super) static VERSION_FIELD: LazyLock<StructField> =
 /// - When `stats` is `None`: no-op.
 /// - When `stats` is `Some(schema)`:
 ///   - The `add` slot's struct gains a nullable `stats_parsed` field with the requested schema.
-///   - The `add` projection expression is rebuilt as
-///     `struct_from(add.path, ..., stats_expr)` where `stats_expr` is either the native
-///     `col(["add", "stats_parsed"])` (when `native` is true, e.g. when the leaf parquet has
-///     `add.stats_parsed` and we want to passthrough) or `parse_json(col(["add", "stats"]),
-///     schema)` otherwise.
+///   - The `add` projection expression is rebuilt as `struct_from(add.path, ..., stats_expr)` where
+///     `stats_expr` is either the native `col(["add", "stats_parsed"])` (when `native` is true,
+///     e.g. when the leaf parquet has `add.stats_parsed` and we want to passthrough) or
+///     `parse_json(col(["add", "stats"]), schema)` otherwise.
 pub(super) fn with_stats(pair: Pair, stats: Option<SchemaRef>, native: bool) -> Pair {
     let Some(stats) = stats else {
         return pair;
@@ -258,7 +258,7 @@ mod tests {
         let stats = arc_schema([StructField::not_null("numRecords", DataType::LONG)]);
         let parts = arc_schema([StructField::nullable("p", DataType::STRING)]);
         let pair = with_partition_values(
-            with_stats(SCAN_BASE.clone(), Some(stats), /*native=*/ false),
+            with_stats(SCAN_BASE.clone(), Some(stats), /* native= */ false),
             Some(parts),
         );
         assert_eq!(field_names(&pair.0), [ADD_NAME, REMOVE_NAME]);

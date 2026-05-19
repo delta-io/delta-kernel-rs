@@ -113,10 +113,7 @@ impl PhaseState {
 
     /// Remove and return the erased payload for `token`. Stashed
     /// submission-time errors win over both the payload and absence.
-    pub fn take_by_token(
-        &self,
-        token: &KdfStateToken,
-    ) -> Result<Box<dyn Any + Send>, DeltaError> {
+    pub fn take_by_token(&self, token: &KdfStateToken) -> Result<Box<dyn Any + Send>, DeltaError> {
         let mut inner = self.lock();
         if let Some(err) = inner.error.take() {
             return Err(err);

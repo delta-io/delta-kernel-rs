@@ -101,7 +101,10 @@ async fn load_sink_broadcasts_passthrough_columns() {
         .expect("load sink");
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&registry.take_plans()).await.unwrap();
+    executor
+        .execute_plans(&registry.take_plans())
+        .await
+        .unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, 4);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
@@ -199,7 +202,10 @@ async fn load_sink_dv_masking(#[case] with_dv: Option<()>, #[case] expected_rows
         .expect("load sink");
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&registry.take_plans()).await.unwrap();
+    executor
+        .execute_plans(&registry.take_plans())
+        .await
+        .unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, expected_rows);
 }
 
@@ -235,7 +241,10 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
         .expect("load sink");
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&registry.take_plans()).await.unwrap();
+    executor
+        .execute_plans(&registry.take_plans())
+        .await
+        .unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, 2);
 
     let batches = executor.collect_relation(&handle).await.unwrap();
@@ -325,7 +334,10 @@ async fn load_exec_streams_one_parquet_row_group_per_batch() {
         .expect("load sink");
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&registry.take_plans()).await.unwrap();
+    executor
+        .execute_plans(&registry.take_plans())
+        .await
+        .unwrap();
 
     let batches = executor.collect_relation(&handle).await.unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();

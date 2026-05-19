@@ -249,7 +249,12 @@ pub enum SinkType {
     Consume(ConsumeSink),
     /// File-reader sink — for each upstream row, read a file and materialize
     /// the result under [`LoadSink::output_relation`]. See [`LoadSink`].
-    Load(LoadSink),
+    ///
+    /// Boxed because `LoadSink` is substantially larger than the other variants
+    /// (`output_relation` + `file_schema` + `file_meta` + `passthrough_columns` +
+    /// `dv_ref` + `base_url`); unboxed it dragged every `SinkType` instance up to
+    /// the same footprint.
+    Load(Box<LoadSink>),
 }
 
 /// Default file-meta column hints used by [`LoadSink::new`]. Matches the convention used

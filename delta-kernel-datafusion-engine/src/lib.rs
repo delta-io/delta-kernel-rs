@@ -182,7 +182,9 @@ mod tests {
         let ex = DataFusionExecutor::try_new().unwrap();
         ex.execute_plans(&registry.take_plans()).await.unwrap();
 
-        let provider = ex.relation_provider(handle.id.as_str()).expect("registered");
+        let provider = ex
+            .relation_provider(handle.id.as_str())
+            .expect("registered");
         let provider = (provider.as_ref() as &dyn TableProvider)
             .as_any()
             .downcast_ref::<LoadTableProvider>()
@@ -314,7 +316,9 @@ mod tests {
         let ex = DataFusionExecutor::try_new().unwrap();
         ex.execute_plans(&registry.take_plans()).await.unwrap();
 
-        let provider = ex.relation_provider(handle.id.as_str()).expect("registered");
+        let provider = ex
+            .relation_provider(handle.id.as_str())
+            .expect("registered");
         let provider = (provider.as_ref() as &dyn TableProvider)
             .as_any()
             .downcast_ref::<LoadTableProvider>()

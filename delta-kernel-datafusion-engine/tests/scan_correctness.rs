@@ -136,9 +136,9 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
     write_i64_parquet(&paths[2], "x", &[3, 100]);
 
     let kernel_schema = single_long_schema();
-    let pred = Arc::new(Expression::from_pred(
-        column_expr!("x").gt(Expression::literal(delta_kernel::expressions::Scalar::Long(10))),
-    ));
+    let pred = Arc::new(Expression::from_pred(column_expr!("x").gt(
+        Expression::literal(delta_kernel::expressions::Scalar::Long(10)),
+    )));
 
     let metas: Vec<FileMeta> = paths.iter().map(|p| file_meta(p)).collect();
 

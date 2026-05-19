@@ -123,11 +123,15 @@ async fn execute_read_workload_datafusion(
     if let Some(predicate_ref) = predicate.clone() {
         scan_builder = scan_builder.with_predicate(predicate_ref);
     }
-    let rp = scan_builder
+    let sm = scan_builder
         .build_replay()
         .map_err(|e| Error::generic(format!("build replay scan: {e}")))?
-        .scan_plans()
-        .map_err(|e| Error::generic(format!("build replay scan plans: {e}")))?;
+        .scan_state_machine()
+        .map_err(|e| Error::generic(format!("build replay scan SM: {e}")))?;
+    let rp = executor
+        .drive_to_completion(sm)
+        .await
+        .map_err(|e| Error::generic(format!("drive replay scan SM: {e}")))?;
     let batches = executor
         .collect_result(rp)
         .await

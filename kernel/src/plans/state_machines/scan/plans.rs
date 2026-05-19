@@ -20,11 +20,11 @@
 //!
 //! ## Sync vs async surfaces
 //!
-//! - [`register_reconciliation`] is **sync**: it builds all the plans into the registry but
-//!   does not yield phases. Callers must supply a pre-resolved [`CheckpointShape`].
+//! - [`register_reconciliation`] is **sync**: it builds all the plans into the registry but does
+//!   not yield phases. Callers must supply a pre-resolved [`CheckpointShape`].
 //! - [`execute_reconciliation`] is **async**: it first calls
-//!   [`resolve_checkpoint_shape`](super::checkpoint_shape::resolve_checkpoint_shape) (which
-//!   may yield `SchemaQuery` / `Plans` phases via `ctx`) and then delegates to
+//!   [`resolve_checkpoint_shape`](super::checkpoint_shape::resolve_checkpoint_shape) (which may
+//!   yield `SchemaQuery` / `Plans` phases via `ctx`) and then delegates to
 //!   [`register_reconciliation`].
 //!
 //! Both scan and FSR entry points use the async surface in their state machines.
@@ -33,9 +33,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::action_pair::{
-    with_partition_values, with_stats, JOIN_KEY_FIELD, VERSION_FIELD,
-};
+use super::action_pair::{with_partition_values, with_stats, JOIN_KEY_FIELD, VERSION_FIELD};
 use super::checkpoint_shape::{resolve_checkpoint_shape, CheckpointShape};
 use super::dedup::FSR_JOIN_KEY_COL;
 use super::retention::retention_filter;
@@ -99,7 +97,7 @@ pub(super) fn register_reconciliation(
     dedup_key: Arc<Expression>,
 ) -> Result<(), DeltaError> {
     let action_pair = with_partition_values(
-        with_stats((**base).clone(), stats.clone(), /*native=*/ false),
+        with_stats((**base).clone(), stats.clone(), /* native= */ false),
         parts.clone(),
     );
     // Reused twice (commit filter + checkpoint-side filter); hold as Arc<Expression> so
@@ -132,11 +130,11 @@ pub(super) fn register_reconciliation(
             ]
         })
         .collect();
-    PlanBuilder::values(path_size_schema(/*with_version=*/ true), commit_rows)
+    PlanBuilder::values(path_size_schema(/* with_version= */ true), commit_rows)
         .map_err(|e| e.into_delta_default())?
         .load(
             COMMIT_RAW,
-            (**base).0.clone(),
+            base.0.clone(),
             FileType::Json,
             Some(log_root.clone()),
             vec![ColumnName::new(["version"])],
@@ -164,7 +162,9 @@ pub(super) fn register_reconciliation(
         )
         .map_err(|e| e.into_delta_default())?
         .filter(Arc::new(
-            col(COMMIT_DEDUP_RN_COL).le(Expression::literal(1i64)).into(),
+            col(COMMIT_DEDUP_RN_COL)
+                .le(Expression::literal(1i64))
+                .into(),
         ))
         .project_pair(action_pair.clone())
         .add_column(JOIN_KEY_FIELD.clone(), dedup_key.clone())
@@ -184,9 +184,7 @@ pub(super) fn register_reconciliation(
         }
         let scan_schema = arc_schema(scan_fields);
         match shape.file_format {
-            FileFormat::Parquet => {
-                PlanBuilder::scan_parquet(checkpoint_files.clone(), scan_schema)
-            }
+            FileFormat::Parquet => PlanBuilder::scan_parquet(checkpoint_files.clone(), scan_schema),
             FileFormat::Json => PlanBuilder::scan_json(checkpoint_files.clone(), scan_schema),
         }
         .into_relation(CHECKPOINT_TOP, registry)?;
@@ -214,7 +212,7 @@ pub(super) fn register_reconciliation(
                     col([SIDECAR_NAME, "path"]).into(),
                     col([SIDECAR_NAME, "sizeInBytes"]).into(),
                 ],
-                path_size_schema(/*with_version=*/ false),
+                path_size_schema(/* with_version= */ false),
             )
             .load(
                 SIDECAR_ACTIONS,
@@ -246,7 +244,7 @@ pub(super) fn register_reconciliation(
             let side = registry
                 .relation_ref(SIDECAR_ACTIONS)?
                 .project(align_proj, align_schema);
-            PlanBuilder::union(vec![top, side], /*ordered=*/ false)
+            PlanBuilder::union(vec![top, side], /* ordered= */ false)
                 .map_err(|e| e.into_delta_default())?
         } else {
             top
@@ -271,7 +269,7 @@ pub(super) fn register_reconciliation(
 
         PlanBuilder::union(
             vec![registry.relation_ref(COMMIT_DEDUP)?, survivors],
-            /*ordered=*/ false,
+            /* ordered= */ false,
         )
         .map_err(|e| e.into_delta_default())?
     };

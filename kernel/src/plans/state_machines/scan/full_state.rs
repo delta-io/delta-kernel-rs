@@ -6,10 +6,10 @@
 //! that flow as one [`PhaseOperation::Plans`] step:
 //!
 //! 1. **commit_load** — `Values(commit metadata) → LoadSink(JSON, action schema,
-//!    passthrough=[version])` materializes the raw per-commit action stream into
-//!    `fsr.commit_raw`. The kernel cover over `ascending_commit_files ∪
-//!    ascending_compaction_files` is materialized verbatim so that downstream steps can `ORDER BY
-//!    version DESC` to recover Delta's "newest action wins" semantics inside the commit tail.
+//!    passthrough=[version])` materializes the raw per-commit action stream into `fsr.commit_raw`.
+//!    The kernel cover over `ascending_commit_files ∪ ascending_compaction_files` is materialized
+//!    verbatim so that downstream steps can `ORDER BY version DESC` to recover Delta's "newest
+//!    action wins" semantics inside the commit tail.
 //! 2. **commit_dedup** — `RelationRef(commit_raw) → Filter(has identity) → Project(action_cols +
 //!    key) → Window(row_number PARTITION BY key ORDER BY version DESC) → Filter(__rn <= k) →
 //!    Project(action_cols + key)` yields the *commit winners*, materialized into
@@ -24,8 +24,8 @@
 //!    identity) → Project(action_cols + key) → LeftAntiJoin(probe=this,
 //!    build=RelationRef(commit_dedup).project(key))` materializes the *checkpoint survivors* (rows
 //!    the commit tail didn't touch). The plan completes with `Union(RelationRef(commit_dedup),
-//!    survivors) -> Filter(retention) -> Project(action_schema) -> into_relation("results")`
-//!    so the caller reads the reconstructed action stream from `fsr.results`.
+//!    survivors) -> Filter(retention) -> Project(action_schema) -> into_relation("results")` so the
+//!    caller reads the reconstructed action stream from `fsr.results`.
 //!
 //! The window applies only to the (typically-small) commit-tail stream; the (typically-large)
 //! checkpoint stream goes through a single hash anti-join keyed on the dedup column. Compared
@@ -45,8 +45,8 @@
 //!   is intentionally omitted (UUID DVs have no offset; inline DVs with the same `pathOrInlineDv`
 //!   and distinct offsets would imply two distinct in-line DV byte payloads, which is not
 //!   representable). A follow-up can include `offset` once kernel grows an int-to-string cast.
-//! - **`action_schema`**: Full reconstructed action stream (add / remove / protocol / metaData
-//!   / domainMetadata / txn).
+//! - **`action_schema`**: Full reconstructed action stream (add / remove / protocol / metaData /
+//!   domainMetadata / txn).
 //! - **Retention thresholds**: Derived like checkpoint reconciliation via
 //!   [`crate::action_reconciliation::deleted_file_retention_timestamp_with_time`] and
 //!   [`crate::action_reconciliation::calculate_transaction_expiration_timestamp`] against
@@ -59,9 +59,9 @@ use std::sync::Arc;
 
 use super::action_pair::FSR_BASE;
 use super::dedup::fsr_dedup_key;
-use super::plans::{execute_reconciliation, RECONCILED};
 // Re-export for callers that need a stable type for the FSR commit-file row.
 pub use super::plans::CommitFileMeta;
+use super::plans::{execute_reconciliation, RECONCILED};
 use crate::plans::errors::{DeltaError, KernelErrAsDelta};
 use crate::plans::ir::{RelationRegistry, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::context::Context;
@@ -119,14 +119,14 @@ impl FullState {
                 snapshot.as_ref(),
                 &FSR_BASE,
                 stats,
-                /*parts=*/ None,
+                /* parts= */ None,
                 Arc::new(fsr_dedup_key()),
             )
             .await?;
             // The reconciled relation IS the FSR result; project (identity-rebind by name)
             // to FSR_RESULTS so the terminal handle's logical full-name reads `fsr.results`.
             ctx.relation_ref(RECONCILED)?
-                .into_result_plan(FSR_RESULTS, &mut *ctx)
+                .into_result_plan(FSR_RESULTS, &mut ctx)
         })
     }
 }

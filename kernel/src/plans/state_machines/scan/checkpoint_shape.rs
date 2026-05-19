@@ -38,10 +38,10 @@ use crate::{delta_error, FileMeta};
 /// Resolved checkpoint encoding + schema hints. Drives FSR / Scan plan composition:
 /// - `file_format`, `has_sidecars`, `actions_schema_subset`: top-level scan / sidecar Load.
 /// - `requested_stats_schema`: per-scan physical stats schema for projection.
-/// - `has_stats_parsed`: leaf parquet has compatible native `add.stats_parsed` -> plan
-///   builders prefer `col(["add", "stats_parsed"])` over `parse_json(col(["add", "stats"]))`.
-/// - `manifest_relation`: V2 multipart manifest handle published by
-///   [`resolve_checkpoint_shape`]; downstream `RelationRef`s it instead of re-scanning.
+/// - `has_stats_parsed`: leaf parquet has compatible native `add.stats_parsed` -> plan builders
+///   prefer `col(["add", "stats_parsed"])` over `parse_json(col(["add", "stats"]))`.
+/// - `manifest_relation`: V2 multipart manifest handle published by [`resolve_checkpoint_shape`];
+///   downstream `RelationRef`s it instead of re-scanning.
 #[derive(Clone, Debug)]
 pub struct CheckpointShape {
     pub file_format: FileFormat,
@@ -204,8 +204,7 @@ pub(super) async fn resolve_checkpoint_shape(
                 .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
             let checkpoint_schema = checkpoint_state.take_schema()?;
             shape.has_sidecars = checkpoint_schema.contains(SIDECAR_NAME);
-            shape.actions_schema_subset =
-                checkpoint_actions_schema_projection(&checkpoint_schema)?;
+            shape.actions_schema_subset = checkpoint_actions_schema_projection(&checkpoint_schema)?;
             if let Some(reqd) = physical_stats_schema {
                 shape.has_stats_parsed = LogSegment::schema_has_compatible_stats_parsed(
                     checkpoint_schema.as_ref(),

@@ -19,7 +19,6 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _}
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::errors::DeltaError;
-
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl};
 use delta_kernel::schema::StructType;

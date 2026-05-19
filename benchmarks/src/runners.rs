@@ -477,11 +477,15 @@ impl WorkloadRunner for ReadDataPlansRunner {
         if let Some(predicate) = &self.setup.predicate {
             builder = builder.with_predicate(predicate.clone());
         }
-        let rp = builder
+        let sm = builder
             .build_replay()
             .map_err(|e| format!("build replay scan failed: {e}"))?
-            .scan_plans()
-            .map_err(|e| format!("build replay scan plans failed: {e}"))?;
+            .scan_state_machine()
+            .map_err(|e| format!("build replay scan SM failed: {e}"))?;
+        let rp = self
+            .runtime
+            .block_on(self.executor.drive_to_completion(sm))
+            .map_err(|e| format!("drive replay scan SM failed: {e}"))?;
         let batches = self
             .runtime
             .block_on(self.executor.collect_result(rp))

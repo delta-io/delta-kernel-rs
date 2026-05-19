@@ -9,7 +9,6 @@ use std::sync::Arc;
 use common::{assert_batch_column_data_equal, concat_or_clone, kernel_literal_batch};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::expressions::Scalar;
-
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,

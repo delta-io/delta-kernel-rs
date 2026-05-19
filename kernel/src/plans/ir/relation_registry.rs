@@ -15,12 +15,12 @@ use crate::schema::{arc_schema, SchemaRef};
 ///
 /// Owned by an SM `Context` for the lifetime of one SM body. Each registry is keyed by:
 ///
-/// - `sm_id` (Uuid): mints unique `RelationHandle::id` values so handles never collide across
-///   SMs even when they share a logical relation name.
-/// - `sm_name` (`&'static str`): namespace prefix prepended to every relation name in
-///   `by_name`. SM bodies pass bare names ("commit_raw") and the registry stores them under
-///   the prefixed full name ("scan.commit_raw"); trace output and `live_relations()` show the
-///   prefixed names. Pass `""` for no prefix.
+/// - `sm_id` (Uuid): mints unique `RelationHandle::id` values so handles never collide across SMs
+///   even when they share a logical relation name.
+/// - `sm_name` (`&'static str`): namespace prefix prepended to every relation name in `by_name`. SM
+///   bodies pass bare names ("commit_raw") and the registry stores them under the prefixed full
+///   name ("scan.commit_raw"); trace output and `live_relations()` show the prefixed names. Pass
+///   `""` for no prefix.
 ///
 /// The registry also owns a private `plans: Vec<Plan>` accumulator. Every plan built via
 /// `PlanBuilder::into_relation` / `::load` lands here as a side effect. SM bodies never see
@@ -95,11 +95,7 @@ impl RelationRegistry {
     /// Used when bridging across SM executions: e.g. `scan_data_from_metadata_state_machine`
     /// receives a `live_actions` handle that was minted by a previous scan-metadata SM run,
     /// adopts it under the locally-known name, then builds the data-phase chain on top.
-    pub fn adopt(
-        &mut self,
-        name: &str,
-        handle: RelationHandle,
-    ) -> Result<(), DeltaError> {
+    pub fn adopt(&mut self, name: &str, handle: RelationHandle) -> Result<(), DeltaError> {
         let full = self.full(name);
         if self.by_name.contains_key(&full) {
             return Err(crate::delta_error!(
@@ -383,9 +379,7 @@ mod tests {
         use crate::plans::ir::nodes::SinkType;
         let mut r = RelationRegistry::new(Uuid::new_v4(), "");
         // Manually push a fake plan so we don't have to wire a full PlanBuilder chain here.
-        let handle = r
-            .register_relation_sink("t", one_col_schema("v"))
-            .unwrap();
+        let handle = r.register_relation_sink("t", one_col_schema("v")).unwrap();
         let dummy = Plan::new(
             crate::plans::ir::DeclarativePlanNode::RelationRef(handle.clone()),
             SinkType::Relation(handle.clone()),

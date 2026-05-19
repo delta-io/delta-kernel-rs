@@ -60,21 +60,37 @@ pub(super) fn fsr_dedup_key() -> Expression {
             (is_file_row(), file_arm()),
             (
                 col(["protocol"]).is_not_null(),
-                arm(crate::actions::PROTOCOL_NAME, null_str(), null_str(), null_str()),
+                arm(
+                    crate::actions::PROTOCOL_NAME,
+                    null_str(),
+                    null_str(),
+                    null_str(),
+                ),
             ),
             // Metadata is a singleton table state action: latest row wins regardless of prior id.
             (
                 col(METADATA_ID).is_not_null(),
                 arm("metadata", null_str(), null_str(), null_str()),
             ),
-            // Domain metadata is keyed by domain; newer rows replace older configs for that domain.
+            // Domain metadata is keyed by domain; newer rows replace older configs for that
+            // domain.
             (
                 col(["domainMetadata"]).is_not_null(),
-                arm(DOMAIN_METADATA_NAME, col(["domainMetadata", "domain"]), null_str(), null_str()),
+                arm(
+                    DOMAIN_METADATA_NAME,
+                    col(["domainMetadata", "domain"]),
+                    null_str(),
+                    null_str(),
+                ),
             ),
             (
                 col(["txn"]).is_not_null(),
-                arm(SET_TRANSACTION_NAME, col(["txn", "appId"]), null_str(), null_str()),
+                arm(
+                    SET_TRANSACTION_NAME,
+                    col(["txn", "appId"]),
+                    null_str(),
+                    null_str(),
+                ),
             ),
         ],
         null_string_array(),
@@ -198,7 +214,10 @@ mod tests {
         assert!(b.value(1), "remove row should produce non-NULL dedup key");
         assert!(b.value(2), "protocol row should produce non-NULL dedup key");
         assert!(b.value(3), "metaData row should produce non-NULL dedup key");
-        assert!(b.value(4), "domainMetadata row should produce non-NULL dedup key");
+        assert!(
+            b.value(4),
+            "domainMetadata row should produce non-NULL dedup key"
+        );
         assert!(b.value(5), "txn row should produce non-NULL dedup key");
         assert!(!b.value(6), "empty row should produce NULL dedup key");
     }
@@ -225,10 +244,22 @@ mod tests {
         .unwrap();
         let b = out.as_boolean();
         assert!(b.value(0), "add row should produce non-NULL scan dedup key");
-        assert!(b.value(1), "remove row should produce non-NULL scan dedup key");
-        assert!(!b.value(2), "protocol row should produce NULL scan dedup key");
-        assert!(!b.value(3), "metaData row should produce NULL scan dedup key");
-        assert!(!b.value(4), "domainMetadata row should produce NULL scan dedup key");
+        assert!(
+            b.value(1),
+            "remove row should produce non-NULL scan dedup key"
+        );
+        assert!(
+            !b.value(2),
+            "protocol row should produce NULL scan dedup key"
+        );
+        assert!(
+            !b.value(3),
+            "metaData row should produce NULL scan dedup key"
+        );
+        assert!(
+            !b.value(4),
+            "domainMetadata row should produce NULL scan dedup key"
+        );
         assert!(!b.value(5), "txn row should produce NULL scan dedup key");
         assert!(!b.value(6), "empty row should produce NULL scan dedup key");
     }

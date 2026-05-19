@@ -17,9 +17,7 @@ use delta_kernel::arrow::array::{BooleanArray, Int64Array, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
-use delta_kernel::expressions::{
-    column_expr, BinaryExpressionOp, ColumnName, Expression, Scalar,
-};
+use delta_kernel::expressions::{column_expr, BinaryExpressionOp, ColumnName, Expression, Scalar};
 use delta_kernel::plans::ir::nodes::{JoinType, OrderingSpec, WindowFunction};
 use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
