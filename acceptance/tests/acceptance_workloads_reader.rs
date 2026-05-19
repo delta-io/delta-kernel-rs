@@ -164,7 +164,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "ds_variant_null_stats/specs/ds_variant_null_stats_miss_null_v_struct_v_not_null",
             "ds_variant_null_stats/specs/ds_variant_null_stats_miss_v_is_null",
             "ds_variant_null_stats/specs/ds_variant_null_stats_miss_v_struct_v_is_null",
-            "var_null_top_level/specs/var_null_top_level_filter_null",
         ],
     ),
     (
@@ -529,7 +528,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "gc_delete/specs/gc_delete_filter_remaining",
             "gc_insert_by_name/specs/gc_insert_by_name_filter_c2_g",
             "gc_update_source/specs/gc_update_source_filter_c2_g_updated",
-            "tw_decimal_precision_read_large_values",
         ],
     ),
     (
@@ -600,7 +598,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     (
         "Known reader-workload gaps under current expression/stats support",
         &[
-            "pve_decimal_partition/specs/pve_decimal_partition_filter_positive.json",
             "pve_empty_string_partition/specs/pve_empty_string_partition_filter_nonempty.json",
         ],
     ),
