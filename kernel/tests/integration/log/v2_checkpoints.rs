@@ -1437,6 +1437,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.deletionVectors", "supported"),
+            ("delta.enableDeletionVectors", "true"),
             ("delta.enableRowTracking", "true"),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?

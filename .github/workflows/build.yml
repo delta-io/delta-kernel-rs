@@ -310,6 +310,13 @@ jobs:
           cmake ..
           make
           make test
+      - name: build update-dv example
+        run: |
+          pushd ffi/examples/update-dv
+          mkdir build
+          pushd build
+          cmake ..
+          make
       - name: build and run read-table-changes test
         run: |
           pushd ffi/examples/read-table-changes

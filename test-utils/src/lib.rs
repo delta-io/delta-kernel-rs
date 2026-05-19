@@ -442,6 +442,8 @@ pub fn engine_store_setup(
 
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
+// For property-gated writer features, this helper also writes the corresponding enablement
+// property when the writer feature is requested.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
     store: Arc<DynObjectStore>,
@@ -503,6 +505,9 @@ pub async fn create_table(
         }
         if writer_features.contains(&"changeDataFeed") {
             config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+        if writer_features.contains(&"deletionVectors") {
+            config.insert("delta.enableDeletionVectors".to_string(), json!("true"));
         }
         if reader_features.contains(&"catalogManaged") {
             config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
