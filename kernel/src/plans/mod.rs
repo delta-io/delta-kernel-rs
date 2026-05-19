@@ -23,7 +23,7 @@
 //! use delta_kernel::plans::ir::RelationRegistry;
 //! use uuid::Uuid;
 //!
-//! let mut registry = RelationRegistry::new(Uuid::new_v4());
+//! let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
 //! let plan = PlanBuilder::scan_json(files, schema.clone())
 //!     .filter(predicate)
 //!     .project(projection, output_schema)

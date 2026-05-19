@@ -38,7 +38,6 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::expressions::Scalar;
-    use delta_kernel::plans::ir::nodes::SinkType;
     use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use uuid::Uuid;
@@ -62,19 +61,16 @@ mod tests {
 
         let ex = DataFusionExecutor::try_new().unwrap();
         let schema = two_bool_schema();
-        let mut registry = RelationRegistry::new(Uuid::new_v4());
-        let plan = PlanBuilder::values(
+        let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
+        let handle = PlanBuilder::values(
             Arc::clone(&schema),
             vec![vec![Scalar::Boolean(true), Scalar::Boolean(false)]],
         )
         .unwrap()
         .into_relation("lazy_view_test", &mut registry)
         .expect("relation sink");
-        let SinkType::Relation(handle) = plan.sink.clone() else {
-            unreachable!("into_relation always produces SinkType::Relation");
-        };
 
-        ex.execute_plans(&[plan]).await.unwrap();
+        ex.execute_plans(&registry.take_plans()).await.unwrap();
 
         let provider = ex
             .relation_provider(handle.id.as_str())
@@ -162,8 +158,8 @@ mod tests {
             vec![vec![Scalar::String(rel), Scalar::Long(7), Scalar::Long(70)]],
         )
         .unwrap();
-        let mut registry = RelationRegistry::new(Uuid::new_v4());
-        let plan = lit
+        let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
+        let handle = lit
             .load(
                 "proj_pushdown_test",
                 file_schema,
@@ -182,15 +178,11 @@ mod tests {
                 &mut registry,
             )
             .expect("load sink");
-        let SinkType::Load(load_sink) = &plan.sink else {
-            unreachable!("PlanBuilder::load always produces SinkType::Load");
-        };
-        let handle_id = load_sink.output_relation.id.clone();
 
         let ex = DataFusionExecutor::try_new().unwrap();
-        ex.execute_plans(&[plan]).await.unwrap();
+        ex.execute_plans(&registry.take_plans()).await.unwrap();
 
-        let provider = ex.relation_provider(&handle_id).expect("registered");
+        let provider = ex.relation_provider(handle.id.as_str()).expect("registered");
         let provider = (provider.as_ref() as &dyn TableProvider)
             .as_any()
             .downcast_ref::<LoadTableProvider>()
@@ -301,8 +293,8 @@ mod tests {
         )]));
 
         let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
-        let mut registry = RelationRegistry::new(Uuid::new_v4());
-        let plan = lit
+        let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
+        let handle = lit
             .load(
                 "limit_pushdown_test",
                 file_schema,
@@ -318,15 +310,11 @@ mod tests {
                 &mut registry,
             )
             .expect("load sink");
-        let SinkType::Load(load_sink) = &plan.sink else {
-            unreachable!();
-        };
-        let handle_id = load_sink.output_relation.id.clone();
 
         let ex = DataFusionExecutor::try_new().unwrap();
-        ex.execute_plans(&[plan]).await.unwrap();
+        ex.execute_plans(&registry.take_plans()).await.unwrap();
 
-        let provider = ex.relation_provider(&handle_id).expect("registered");
+        let provider = ex.relation_provider(handle.id.as_str()).expect("registered");
         let provider = (provider.as_ref() as &dyn TableProvider)
             .as_any()
             .downcast_ref::<LoadTableProvider>()

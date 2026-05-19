@@ -32,7 +32,9 @@
 
 use std::ops::{Deref, DerefMut};
 
-use crate::plans::ir::RelationRegistry;
+use crate::plans::errors::{DeltaError, DeltaErrorCode};
+use crate::plans::ir::{PlanBuilder, RelationRegistry};
+use crate::plans::kdf::{ConsumerKdf, KdfOutput};
 use crate::plans::state_machines::framework::engine_error::EngineError;
 use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
 use crate::plans::state_machines::framework::phase_state::PhaseState;
@@ -105,6 +107,37 @@ impl<'a> Context<'a> {
             })
             .await;
         result
+    }
+
+    /// Yield a [`PhaseOperation::Plans`] consisting of every plan accumulated in the
+    /// registry plus a `ConsumeSink` terminating `chain` with the given consumer `state`.
+    /// Awaits the engine result and returns the extracted typed output.
+    ///
+    /// Side effect: the registry's plan accumulator is drained. Registered names persist
+    /// (the engine has materialized the corresponding relations after this returns).
+    ///
+    /// This is the only sanctioned production path for emitting `PhaseOperation::Plans`
+    /// from an SM body — it ensures no plan ever leaks to the caller and that the consume
+    /// extractor is always paired with the executed plan.
+    pub(crate) async fn consume_phase<S>(
+        &mut self,
+        chain: PlanBuilder,
+        state: S,
+        phase_name: &'static str,
+    ) -> Result<S::Output, DeltaError>
+    where
+        S: ConsumerKdf + KdfOutput + 'static,
+    {
+        let (plan, extractor) = chain.consume(state);
+        let mut plans = self.registry.take_plans();
+        plans.push(plan);
+        let result_state = self
+            .execute(PhaseOperation::Plans(plans), phase_name)
+            .await
+            .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+        extractor
+            .extract(&result_state)
+            .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))
     }
 }
 

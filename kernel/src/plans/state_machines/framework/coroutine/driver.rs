@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn two_phase_sm_executes_in_sequence() {
         let mut sm = CoroutineSM::<i64>::new("test", |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, ""));
             let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_a")
                 .await
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn multi_plan_phase_executes_in_one_engine_call() {
         let mut sm = CoroutineSM::<()>::new("test", |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, ""));
             let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan(), toy_plan()]), "ab")
                 .await
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn live_relations_surfaces_registry_snapshot_at_yield() {
         let mut sm = CoroutineSM::<()>::new("test", |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, ""));
             let schema = Arc::new(crate::schema::StructType::new_unchecked(Vec::<
                 crate::schema::StructField,
             >::new(
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn engine_error_flows_to_body_as_resume_err() {
         let mut sm = CoroutineSM::<String>::new("test", |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, ""));
             match ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "p")
                 .await

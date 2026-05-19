@@ -1,108 +1,94 @@
-//! Row-identity column paths and dedup predicates used by FSR plan composition.
+//! Dedup-key expressions used by the reconciliation pipeline.
 //!
-//! Centralizes the column-path constants (`ADD_PATH`, `REMOVE_PATH`, `PROTOCOL_MIN_READER`,
-//! `METADATA_ID`, `DOMAIN_METADATA_DOMAIN`, `TXN_APP_ID`) and the row-identity / dedup-key
-//! predicates ([`fsr_dedup_key`], [`fsr_row_has_identity_predicate`]) consumed by the FSR
-//! plan-builder. Carrying the identity-column constants here keeps the dedup-key contract
-//! cohesive: when an action's identity changes the only file that needs to follow is this one.
+//! [`fsr_dedup_key`] keys the full six-slot action set; [`scan_file_dedup_key`] keys
+//! `{add, remove}` only. Both evaluate to NULL on rows that match no known slot, so the
+//! pipeline's identity filter is simply `dedup_key IS NOT NULL`.
 
-use crate::actions::{DOMAIN_METADATA_NAME, PROTOCOL_NAME, SET_TRANSACTION_NAME};
-use crate::expressions::{ColumnName, Expression, IntoColumnName, Predicate, Scalar};
+use crate::actions::{DOMAIN_METADATA_NAME, SET_TRANSACTION_NAME};
+use crate::expressions::{col, Expression, Predicate, Scalar};
 use crate::schema::{ArrayType, DataType};
 
 /// Synthetic column carrying the materialized dedup key array so hash joins only need top-level
 /// column keys.
 pub(super) const FSR_JOIN_KEY_COL: &str = "__fsr_join_k";
 
-// === Action column paths ===
-//
-// Stable nested column references used by `fsr_dedup_key`,
-// `fsr_row_has_identity_predicate`, and the various `scan_*_projection` helpers.
-// Centralizing them means renaming an action field is a one-line change here, not
-// a sweep of string literals across multiple files (and silently introducing
-// divergence between the helpers).
-pub(super) const ADD_PATH: &[&str] = &["add", "path"];
-pub(super) const REMOVE_PATH: &[&str] = &["remove", "path"];
-pub(super) const PROTOCOL_MIN_READER: &[&str] = &["protocol", "minReaderVersion"];
-pub(super) const METADATA_ID: &[&str] = &["metaData", "id"];
-pub(super) const DOMAIN_METADATA_DOMAIN: &[&str] = &["domainMetadata", "domain"];
-pub(super) const TXN_APP_ID: &[&str] = &["txn", "appId"];
+const ADD_PATH: &[&str] = &["add", "path"];
+const REMOVE_PATH: &[&str] = &["remove", "path"];
+const METADATA_ID: &[&str] = &["metaData", "id"];
+
+/// For file rows, the identity components come from either `add.<suffix>` or
+/// `remove.<suffix>` (one is non-null per row); coalesce picks whichever side carries the
+/// value. Shared by both dedup-key builders.
+fn file_field(suffix: &[&str]) -> Expression {
+    let add_path = ["add"].into_iter().chain(suffix.iter().copied());
+    let remove_path = ["remove"].into_iter().chain(suffix.iter().copied());
+    Expression::column(add_path).or_else(Expression::column(remove_path))
+}
+
+/// `Array<String?>?` NULL — the fallback returned by both dedup-key `CASE` expressions when
+/// no arm matches.
+fn null_string_array() -> Expression {
+    Expression::literal(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+        DataType::STRING,
+        true,
+    )))))
+}
+
+/// Predicate that selects rows whose `add.path` OR `remove.path` is non-null.
+fn is_file_row() -> Predicate {
+    Predicate::or(col(ADD_PATH).is_not_null(), col(REMOVE_PATH).is_not_null())
+}
+
+/// `["file", path_coalesce, dv_storage_coalesce, dv_inline_coalesce]` — the file-row arm of
+/// both dedup keys.
+fn file_arm() -> Expression {
+    Expression::array(vec![
+        Expression::literal("file"),
+        file_field(&["path"]),
+        file_field(&["deletionVector", "storageType"]),
+        file_field(&["deletionVector", "pathOrInlineDv"]),
+    ])
+}
 
 pub(super) fn fsr_dedup_key() -> Expression {
     let null_str = || Expression::literal(Scalar::Null(DataType::STRING));
     let arm = |kind: &str, id1: Expression, id2: Expression, id3: Expression| {
         Expression::array(vec![Expression::literal(kind), id1, id2, id3])
     };
-    // For file rows, the identity components come from either add or remove (one is non-null per
-    // row); coalesce picks whichever side carries the value.
-    let file_field = |suffix: &[&str]| {
-        let add_path = ["add"].into_iter().chain(suffix.iter().copied());
-        let remove_path = ["remove"].into_iter().chain(suffix.iter().copied());
-        Expression::Column(ColumnName::new(add_path))
-            .or_else(Expression::Column(ColumnName::new(remove_path)))
-    };
-
-    let file_arm = arm(
-        "file",
-        file_field(&["path"]),
-        file_field(&["deletionVector", "storageType"]),
-        file_field(&["deletionVector", "pathOrInlineDv"]),
-    );
-    let proto_arm = arm(PROTOCOL_NAME, null_str(), null_str(), null_str());
-    // Metadata is a singleton table state action: latest row wins regardless of prior id.
-    let meta_arm = arm("metadata", null_str(), null_str(), null_str());
-    // Domain metadata is keyed by domain; newer rows replace older configs for that domain.
-    let domain_arm = arm(
-        DOMAIN_METADATA_NAME,
-        Expression::column(["domainMetadata", "domain"]),
-        null_str(),
-        null_str(),
-    );
-    let txn_arm = arm(
-        SET_TRANSACTION_NAME,
-        Expression::column(["txn", "appId"]),
-        null_str(),
-        null_str(),
-    );
-
-    let null_list = Expression::literal(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
-        DataType::STRING,
-        true,
-    )))));
-
     Expression::case_when(
         vec![
+            (is_file_row(), file_arm()),
             (
-                Predicate::or(
-                    Expression::Column(ADD_PATH.into_column_name()).is_not_null(),
-                    Expression::Column(REMOVE_PATH.into_column_name()).is_not_null(),
-                ),
-                file_arm,
+                col(["protocol"]).is_not_null(),
+                arm(crate::actions::PROTOCOL_NAME, null_str(), null_str(), null_str()),
             ),
-            (Expression::column(["protocol"]).is_not_null(), proto_arm),
+            // Metadata is a singleton table state action: latest row wins regardless of prior id.
             (
-                Expression::Column(METADATA_ID.into_column_name()).is_not_null(),
-                meta_arm,
+                col(METADATA_ID).is_not_null(),
+                arm("metadata", null_str(), null_str(), null_str()),
+            ),
+            // Domain metadata is keyed by domain; newer rows replace older configs for that domain.
+            (
+                col(["domainMetadata"]).is_not_null(),
+                arm(DOMAIN_METADATA_NAME, col(["domainMetadata", "domain"]), null_str(), null_str()),
             ),
             (
-                Expression::column(["domainMetadata"]).is_not_null(),
-                domain_arm,
+                col(["txn"]).is_not_null(),
+                arm(SET_TRANSACTION_NAME, col(["txn", "appId"]), null_str(), null_str()),
             ),
-            (Expression::column(["txn"]).is_not_null(), txn_arm),
         ],
-        null_list,
+        null_string_array(),
     )
 }
 
-pub(super) fn fsr_row_has_identity_predicate() -> Predicate {
-    Predicate::or_from([
-        Expression::Column(ADD_PATH.into_column_name()).is_not_null(),
-        Expression::Column(REMOVE_PATH.into_column_name()).is_not_null(),
-        Expression::Column(PROTOCOL_MIN_READER.into_column_name()).is_not_null(),
-        Expression::Column(METADATA_ID.into_column_name()).is_not_null(),
-        Expression::Column(DOMAIN_METADATA_DOMAIN.into_column_name()).is_not_null(),
-        Expression::Column(TXN_APP_ID.into_column_name()).is_not_null(),
-    ])
+/// Scan-pipeline dedup key: file path identity over `{add, remove}` only.
+///
+/// Returns an `ARRAY<STRING?>?` expression of the form
+/// `[kind, file_path, dv_storage, dv_inline_dv]` when the row carries an `add` or `remove`
+/// action; otherwise evaluates to NULL. `dedup_key IS NOT NULL` serves as both the dedup
+/// partition key and the "is this a valid scan-side action row" identity filter.
+pub(super) fn scan_file_dedup_key() -> Expression {
+    Expression::case_when(vec![(is_file_row(), file_arm())], null_string_array())
 }
 
 #[cfg(test)]
@@ -187,37 +173,63 @@ mod tests {
     }
 
     #[test]
-    fn fsr_row_has_identity_accepts_protocol_metadata_domain_and_file_actions() {
+    fn fsr_dedup_key_is_null_for_unknown_rows() {
+        // The pipeline's identity filter is `dedup_key IS NOT NULL`, so the dedup-key MUST
+        // evaluate to NULL on rows that match no known slot. This is the load-bearing
+        // contract.
         let rows = StringArray::from(vec![
-            // file actions
             r#"{"add":{"path":"a.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true}}"#,
             r#"{"remove":{"path":"r.parquet","deletionTimestamp":1,"dataChange":true,"partitionValues":{}}}"#,
-            // protocol / metadata / domain metadata / txn
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
             r#"{"metaData":{"id":"mid-1","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{},"createdTime":null}}"#,
             r#"{"domainMetadata":{"domain":"d1","configuration":"cfg","removed":false}}"#,
             r#"{"txn":{"appId":"app-1","version":7,"lastUpdated":100}}"#,
-            // no action payload
             r#"{}"#,
         ]);
         let batch = parse_json_to_record_batch(rows, action_schema());
-
         let out = evaluate_expression(
-            &fsr_row_has_identity_predicate().into(),
+            &fsr_dedup_key().is_not_null().into(),
             &batch,
             Some(&DataType::BOOLEAN),
         )
         .unwrap();
         let b = out.as_boolean();
-        assert!(b.value(0), "add row should pass identity predicate");
-        assert!(b.value(1), "remove row should pass identity predicate");
-        assert!(b.value(2), "protocol row should pass identity predicate");
-        assert!(b.value(3), "metaData row should pass identity predicate");
-        assert!(
-            b.value(4),
-            "domainMetadata row should pass identity predicate"
-        );
-        assert!(b.value(5), "txn row should pass identity predicate");
-        assert!(!b.value(6), "empty row should fail identity predicate");
+        assert!(b.value(0), "add row should produce non-NULL dedup key");
+        assert!(b.value(1), "remove row should produce non-NULL dedup key");
+        assert!(b.value(2), "protocol row should produce non-NULL dedup key");
+        assert!(b.value(3), "metaData row should produce non-NULL dedup key");
+        assert!(b.value(4), "domainMetadata row should produce non-NULL dedup key");
+        assert!(b.value(5), "txn row should produce non-NULL dedup key");
+        assert!(!b.value(6), "empty row should produce NULL dedup key");
+    }
+
+    #[test]
+    fn scan_file_dedup_key_is_null_for_non_file_rows() {
+        // The scan pipeline only cares about add/remove rows; everything else should be
+        // filtered out via `dedup_key IS NOT NULL`.
+        let rows = StringArray::from(vec![
+            r#"{"add":{"path":"a.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true}}"#,
+            r#"{"remove":{"path":"r.parquet","deletionTimestamp":1,"dataChange":true,"partitionValues":{}}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"mid-1","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{},"createdTime":null}}"#,
+            r#"{"domainMetadata":{"domain":"d1","configuration":"cfg","removed":false}}"#,
+            r#"{"txn":{"appId":"app-1","version":7,"lastUpdated":100}}"#,
+            r#"{}"#,
+        ]);
+        let batch = parse_json_to_record_batch(rows, action_schema());
+        let out = evaluate_expression(
+            &scan_file_dedup_key().is_not_null().into(),
+            &batch,
+            Some(&DataType::BOOLEAN),
+        )
+        .unwrap();
+        let b = out.as_boolean();
+        assert!(b.value(0), "add row should produce non-NULL scan dedup key");
+        assert!(b.value(1), "remove row should produce non-NULL scan dedup key");
+        assert!(!b.value(2), "protocol row should produce NULL scan dedup key");
+        assert!(!b.value(3), "metaData row should produce NULL scan dedup key");
+        assert!(!b.value(4), "domainMetadata row should produce NULL scan dedup key");
+        assert!(!b.value(5), "txn row should produce NULL scan dedup key");
+        assert!(!b.value(6), "empty row should produce NULL scan dedup key");
     }
 }

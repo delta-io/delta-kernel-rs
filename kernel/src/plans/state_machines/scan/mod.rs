@@ -2,6 +2,7 @@
 //! [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM) used by
 //! [`Snapshot::full_state`](crate::snapshot::Snapshot::full_state).
 
+mod action_pair;
 mod checkpoint_shape;
 mod dedup;
 mod file_scan;
@@ -15,4 +16,4 @@ pub use checkpoint_shape::{
     snapshot_has_checkpoint_files, CheckpointShape,
 };
 pub use full_state::{FullState, FullStateBuilder};
-pub use plans::{build_fsr_plans, CommitFileMeta};
+pub use plans::CommitFileMeta;

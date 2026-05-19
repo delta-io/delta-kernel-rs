@@ -15,7 +15,7 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
-use delta_kernel::expressions::{column_expr, Expression, Predicate};
+use delta_kernel::expressions::{column_expr, Expression};
 use delta_kernel::plans::ir::nodes::{FileType, ScanNode};
 use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType as KernelDataType, MetadataColumnSpec, StructType};
@@ -136,10 +136,9 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
     write_i64_parquet(&paths[2], "x", &[3, 100]);
 
     let kernel_schema = single_long_schema();
-    let pred = Arc::new(Expression::from_pred(Predicate::gt(
-        column_expr!("x"),
-        Expression::literal(delta_kernel::expressions::Scalar::Long(10)),
-    )));
+    let pred = Arc::new(Expression::from_pred(
+        column_expr!("x").gt(Expression::literal(delta_kernel::expressions::Scalar::Long(10))),
+    ));
 
     let metas: Vec<FileMeta> = paths.iter().map(|p| file_meta(p)).collect();
 

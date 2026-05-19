@@ -5,7 +5,7 @@ mod common;
 
 use common::SumRowsConsumer;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::plans::ir::nodes::{ConsumeSink, SinkType};
+use delta_kernel::plans::ir::nodes::ConsumeSink;
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
@@ -17,17 +17,14 @@ async fn relation_sink_registers_batches_readable_via_relation_leaf() {
     let schema = single_long_schema();
     let rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
 
-    let mut registry = RelationRegistry::new(Uuid::new_v4());
-    let producer = PlanBuilder::values(schema, rows)
+    let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
+    let handle = PlanBuilder::values(schema, rows)
         .expect("literal")
         .into_relation("pipe", &mut registry)
         .expect("relation sink");
-    let SinkType::Relation(handle) = producer.sink.clone() else {
-        unreachable!("into_relation always produces SinkType::Relation");
-    };
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    executor.execute_plans(&[producer]).await.unwrap();
+    executor.execute_plans(&registry.take_plans()).await.unwrap();
 
     let batches = executor.collect_relation(&handle).await.unwrap();
     assert_eq!(batches.len(), 1);

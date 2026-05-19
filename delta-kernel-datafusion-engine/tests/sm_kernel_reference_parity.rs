@@ -9,7 +9,7 @@ use std::sync::Arc;
 use common::{assert_batch_column_data_equal, concat_or_clone, kernel_literal_batch};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::plans::ir::nodes::SinkType;
+
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
@@ -70,18 +70,15 @@ async fn parity_phase_plans_relation_pipe_matches_kernel_literal_materialization
     let rows = vec![vec![Scalar::Long(100)], vec![Scalar::Long(200)]];
     let kernel_reference_batch = kernel_literal_batch(Arc::clone(&schema), &rows);
 
-    let mut registry = RelationRegistry::new(Uuid::new_v4());
-    let producer = PlanBuilder::values(Arc::clone(&schema), rows.clone())
+    let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
+    let handle = PlanBuilder::values(Arc::clone(&schema), rows.clone())
         .unwrap()
         .into_relation("parity_pipe", &mut registry)
         .expect("relation sink");
-    let SinkType::Relation(handle) = producer.sink.clone() else {
-        unreachable!("into_relation always produces SinkType::Relation");
-    };
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor
-        .execute_phase_operation(PhaseOperation::Plans(vec![producer]))
+        .execute_phase_operation(PhaseOperation::Plans(registry.take_plans()))
         .await
         .expect("phase Plans");
 

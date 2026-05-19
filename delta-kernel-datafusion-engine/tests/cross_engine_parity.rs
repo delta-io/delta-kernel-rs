@@ -18,7 +18,7 @@ use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::expressions::{
-    column_expr, BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar,
+    column_expr, BinaryExpressionOp, ColumnName, Expression, Scalar,
 };
 use delta_kernel::plans::ir::nodes::{JoinType, OrderingSpec, WindowFunction};
 use delta_kernel::plans::ir::PlanBuilder;
@@ -92,10 +92,9 @@ async fn parity_filter_matches_kernel_semantics() {
     let schema = single_long_schema();
     let rows = long_rows([[5], [15], [25]]);
     let base = kernel_literal_batch(Arc::clone(&schema), &rows);
-    let pred = Arc::new(Expression::from_pred(Predicate::gt(
-        column_expr!("x"),
-        Expression::literal(Scalar::Long(10)),
-    )));
+    let pred = Arc::new(Expression::from_pred(
+        column_expr!("x").gt(Expression::literal(Scalar::Long(10))),
+    ));
     let expected = kernel_filter(&base, pred.as_ref());
 
     let got = run_to_batches(PlanBuilder::values(schema, rows).unwrap().filter(pred))

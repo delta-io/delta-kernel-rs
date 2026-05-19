@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use super::plans::FSR_CHECKPOINT_TOP;
+use super::plans::CHECKPOINT_TOP;
 use super::schemas::{action_schema, fsr_action_schema};
 use crate::actions::{
     Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
@@ -26,12 +26,12 @@ use crate::expressions::col;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::nodes::{FileFormat, RelationHandle, SinkType};
+use crate::plans::ir::nodes::{FileFormat, RelationHandle};
 use crate::plans::ir::PlanBuilder;
 use crate::plans::kdf::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::context::Context;
 use crate::plans::state_machines::framework::phase_operation::{PhaseOperation, SchemaQueryNode};
-use crate::schema::{arc_schema, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{arc_schema, SchemaRef, StructField, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::{delta_error, FileMeta};
 
@@ -164,8 +164,8 @@ pub(super) fn checkpoint_manifest_scan_schema_with_stats(
 ///
 /// Yields at most one [`PhaseOperation::SchemaQuery`] (when `_last_checkpoint` lacks a
 /// schema) and at most one [`PhaseOperation::Plans`] (V2 multipart: publishes the manifest
-/// as `FSR_CHECKPOINT_TOP` and extracts sidecar URLs in the same phase, so
-/// [`super::plans::build_fsr_plans`] reuses the relation instead of re-scanning).
+/// as `CHECKPOINT_TOP` and extracts sidecar URLs in the same phase, so
+/// [`super::plans::register_reconciliation`] reuses the relation instead of re-scanning).
 pub(super) async fn resolve_checkpoint_shape(
     ctx: &mut Context<'_>,
     snapshot: &Snapshot,
@@ -251,40 +251,22 @@ async fn publish_v2_manifest_and_probe_sidecar(
             PlanBuilder::scan_json(checkpoint_files.clone(), manifest_schema.clone())
         }
     };
-    let manifest_publish_plan = manifest_scan.into_relation(FSR_CHECKPOINT_TOP, &mut *ctx)?;
-    let manifest_handle = match &manifest_publish_plan.sink {
-        SinkType::Relation(h) => h.clone(),
-        other => {
-            return Err(delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "fsr::resolve_checkpoint_shape: manifest_publish_plan must end in Relation sink, got {other:?}",
-            ));
-        }
-    };
+    // Register the manifest scan as a side effect; the plan is accumulated in ctx's registry.
+    let manifest_handle = manifest_scan.into_relation(CHECKPOINT_TOP, &mut *ctx)?;
 
-    // Sidecar extraction reads from the just-registered manifest relation.
-    let (sidecar_extract_plan, extract_sidecars) = ctx
-        .relation_ref(FSR_CHECKPOINT_TOP)?
-        .filter(Arc::new(col([SIDECAR_NAME]).is_not_null().into()))
-        .consume(SidecarCollector::new(
-            snapshot.log_segment().log_root.clone(),
-        ));
-
-    let sidecar_state = ctx
-        .execute(
-            PhaseOperation::Plans(vec![manifest_publish_plan, sidecar_extract_plan]),
+    // Sidecar extraction reads from the just-registered manifest relation. `consume_phase`
+    // drains the registry's accumulated plans (the manifest publish plan) + the consume
+    // plan into a `PhaseOperation::Plans`, yields it, and extracts the typed output.
+    let sidecar_chain = ctx
+        .relation_ref(CHECKPOINT_TOP)?
+        .filter(Arc::new(col([SIDECAR_NAME]).is_not_null().into()));
+    let sidecar_files = ctx
+        .consume_phase(
+            sidecar_chain,
+            SidecarCollector::new(snapshot.log_segment().log_root.clone()),
             "fsr::resolve_checkpoint_shape::publish_manifest_and_extract",
         )
-        .await
-        .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
-    let sidecar_files = extract_sidecars.extract(&sidecar_state).map_err(|e| {
-        let detail = e.display_with_source_chain();
-        delta_error!(
-            DeltaErrorCode::DeltaCommandInvariantViolation,
-            source = e,
-            "fsr::resolve_checkpoint_shape::extract_sidecars: {detail}",
-        )
-    })?;
+        .await?;
 
     // Probe the first sidecar parquet for `add.stats_parsed` if stats requested. Sidecars
     // override the manifest's stats-parsed assessment because the actual `add` rows live

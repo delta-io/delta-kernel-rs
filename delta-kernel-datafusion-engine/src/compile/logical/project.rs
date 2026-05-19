@@ -213,7 +213,7 @@ fn hoist_repeated_column_paths(
         .collect();
     let mut proj_exprs = pass_through;
     for (path, hoist_name) in &hoist_map {
-        let kernel_col = Expression::Column(ColumnName::new(path.iter().cloned()));
+        let kernel_col = Expression::column(path.iter().cloned());
         let df_expr = kernel_expr_to_df(&kernel_col)?;
         proj_exprs.push(df_expr.alias(hoist_name.clone()));
     }

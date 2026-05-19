@@ -4,7 +4,7 @@
 //! ([`REMOVE_DELETION_TIMESTAMP`], [`TXN_LAST_UPDATED`]) and the
 //! [`retention_filter`] builder.
 
-use crate::expressions::{Expression, IntoColumnName, Predicate};
+use crate::expressions::{col, Expression, Predicate};
 
 pub(super) const REMOVE_DELETION_TIMESTAMP: &[&str] = &["remove", "deletionTimestamp"];
 pub(super) const TXN_LAST_UPDATED: &[&str] = &["txn", "lastUpdated"];
@@ -17,17 +17,17 @@ pub(super) const TXN_LAST_UPDATED: &[&str] = &["txn", "lastUpdated"];
 /// rows are not filtered by age.
 pub(super) fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
     let remove_ok = Predicate::or(
-        Expression::column(["remove"]).is_null(),
-        Expression::Column(REMOVE_DELETION_TIMESTAMP.into_column_name())
+        col(["remove"]).is_null(),
+        col(REMOVE_DELETION_TIMESTAMP)
             .or_lit(0i64)
             .gt(Expression::literal(min_file_ts)),
     );
     let txn_ok = match txn_expiry {
         None => Predicate::literal(true),
         Some(cutoff) => Predicate::or_from([
-            Expression::column(["txn"]).is_null(),
-            Expression::Column(TXN_LAST_UPDATED.into_column_name()).is_null(),
-            Expression::Column(TXN_LAST_UPDATED.into_column_name()).gt(Expression::literal(cutoff)),
+            col(["txn"]).is_null(),
+            col(TXN_LAST_UPDATED).is_null(),
+            col(TXN_LAST_UPDATED).gt(Expression::literal(cutoff)),
         ]),
     };
     Predicate::and(remove_ok, txn_ok)

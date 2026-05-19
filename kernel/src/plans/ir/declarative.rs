@@ -12,10 +12,13 @@
 //! use uuid::Uuid;
 //!
 //! // Untyped pipeline: scan JSON, project to a sub-schema, publish to a named relation.
-//! let mut registry = RelationRegistry::new(Uuid::new_v4());
-//! let plan = PlanBuilder::scan_json(files, schema)
+//! // The terminal registers the plan into the registry as a side effect; the registry's
+//! // `into_result_plan(name)` later drains the accumulator into a finished `ResultPlan`.
+//! let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
+//! let _handle = PlanBuilder::scan_json(files, schema)
 //!     .project(projection, output_schema)
 //!     .into_relation("scanned", &mut registry)?;
+//! let result_plan = registry.into_result_plan("scanned")?;
 //!
 //! // Typed pipeline: scan JSON, drain into a typed consumer KDF, recover the typed output from
 //! // the resulting PhaseState.
@@ -28,10 +31,14 @@
 //! ## Core API
 //!
 //! - Constructors: [`PlanBuilder::scan_json`] / [`scan_parquet`](PlanBuilder::scan_parquet),
-//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`], [`PlanBuilder::union`].
-//! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`], [`PlanBuilder::window`],
+//!   [`PlanBuilder::values`], [`PlanBuilder::file_listing`],
+//!   [`PlanBuilder::union`].
+//! - Transforms: [`PlanBuilder::filter`], [`PlanBuilder::project`],
+//!   [`PlanBuilder::project_pair`], [`PlanBuilder::add_column`], [`PlanBuilder::window`],
 //!   [`PlanBuilder::join`], [`PlanBuilder::join_on`].
-//! - Terminals: [`PlanBuilder::into_relation`], [`PlanBuilder::load`],
+//! - Terminals: [`PlanBuilder::into_relation`] (register-as-side-effect),
+//!   [`PlanBuilder::load`] (register-as-side-effect),
+//!   [`PlanBuilder::into_result_plan`] (combined register + drain),
 //!   [`PlanBuilder::into_consume`], [`PlanBuilder::consume`].
 
 use std::sync::Arc;
@@ -208,7 +215,15 @@ impl PlanBuilder {
     }
 
     /// Wrap `self` in a [`Project`](DeclarativePlanNode::Project). New schema is `output_schema`.
-    pub fn project(self, columns: Vec<Arc<Expression>>, output_schema: SchemaRef) -> Self {
+    ///
+    /// `columns` accepts any iterator of `Arc<Expression>` so call sites can chain
+    /// `iter::once`, slice literals, and `Vec`s without an explicit `.collect()`.
+    pub fn project(
+        self,
+        columns: impl IntoIterator<Item = Arc<Expression>>,
+        output_schema: SchemaRef,
+    ) -> Self {
+        let columns: Vec<Arc<Expression>> = columns.into_iter().collect();
         Self {
             schema: Arc::clone(&output_schema),
             node: DeclarativePlanNode::Project {
@@ -218,6 +233,54 @@ impl PlanBuilder {
                     output_schema,
                 },
             },
+        }
+    }
+
+    /// Wrap `self` in a [`Project`](DeclarativePlanNode::Project) seeded from a paired
+    /// `(schema, projection)` tuple. Convenience for the common case of binding the chain
+    /// to a base shape produced by an action-pair helper before chaining further `add_column`
+    /// calls.
+    pub fn project_pair(self, pair: (SchemaRef, Vec<Arc<Expression>>)) -> Self {
+        let (output_schema, columns) = pair;
+        self.project(columns, output_schema)
+    }
+
+    /// Append a single `(field, expr)` column to the head [`Project`] node's projection.
+    ///
+    /// If `self` is already a `Project`, the head node is extended in place: `expr` is appended
+    /// to its `columns` and `field` is appended to its `output_schema`. Otherwise the chain is
+    /// wrapped in a passthrough+append `Project` that emits every current column followed by
+    /// the new one.
+    ///
+    /// Used to layer dedup-key / version / synthetic columns onto a base projection without
+    /// destructuring the pair at the call site.
+    pub fn add_column(mut self, field: StructField, expr: Arc<Expression>) -> Self {
+        match &mut self.node {
+            DeclarativePlanNode::Project { node, .. } => {
+                node.columns.push(expr);
+                let mut fields: Vec<StructField> =
+                    node.output_schema.fields().cloned().collect();
+                fields.push(field);
+                let new_schema = arc_schema(fields);
+                node.output_schema = Arc::clone(&new_schema);
+                self.schema = new_schema;
+                self
+            }
+            _ => {
+                // No head Project: synthesize one that passes every current field through by
+                // name and appends the new column.
+                let mut fields: Vec<StructField> =
+                    self.schema.fields().cloned().collect();
+                let mut columns: Vec<Arc<Expression>> = self
+                    .schema
+                    .fields()
+                    .map(|f| Arc::new(Expression::column([f.name().as_str()])))
+                    .collect();
+                fields.push(field);
+                columns.push(expr);
+                let output_schema = arc_schema(fields);
+                self.project(columns, output_schema)
+            }
         }
     }
 
@@ -341,17 +404,24 @@ impl PlanBuilder {
 // --- Terminals --------------------------------------------------------------
 
 impl PlanBuilder {
-    /// Terminal: stream every output batch to the named relation. Another plan in the same
-    /// `PhaseOperation::Plans(...)` consumes the relation via
-    /// [`RelationRegistry::relation_ref`](super::relation_registry::RelationRegistry::relation_ref), or
-    /// a [`ResultPlan`](super::plan::ResultPlan) names this relation as its caller-facing output.
+    /// Terminal: register a `SinkType::Relation` for the chain under `name` and push the
+    /// resulting [`Plan`] into the registry's accumulator. Returns the minted
+    /// [`RelationHandle`] for callers that need it (typically discarded; downstream code
+    /// references the relation by name via
+    /// [`RelationRegistry::relation_ref`](super::relation_registry::RelationRegistry::relation_ref)).
+    ///
+    /// The accumulator is drained later via
+    /// [`RelationRegistry::into_result_plan`](super::relation_registry::RelationRegistry::into_result_plan)
+    /// or [`Self::consume_phase`].
     pub fn into_relation(
         self,
         name: &str,
         registry: &mut RelationRegistry,
-    ) -> Result<Plan, DeltaError> {
+    ) -> Result<RelationHandle, DeltaError> {
         let handle = registry.register_relation_sink(name, self.schema_ref())?;
-        Ok(Plan::new(self.node, SinkType::Relation(handle)))
+        let plan = Plan::new(self.node, SinkType::Relation(handle.clone()));
+        registry.push_plan(plan);
+        Ok(handle)
     }
 
     /// Terminal: file-reader sink. For each upstream row, open the resolved file, read
@@ -360,6 +430,10 @@ impl PlanBuilder {
     /// [`LoadSink::output_relation`] for downstream
     /// [`RelationRegistry::relation_ref`](super::relation_registry::RelationRegistry::relation_ref)
     /// consumers in the same phase. See [`LoadSink`].
+    ///
+    /// Registers the resulting [`Plan`] into the registry's accumulator as a side effect and
+    /// returns the minted [`RelationHandle`] (typically discarded; downstream code references
+    /// the relation by name).
     pub fn load(
         self,
         name: &str,
@@ -370,7 +444,7 @@ impl PlanBuilder {
         file_meta: ScanFileColumns,
         dv_ref: Option<DvRef>,
         registry: &mut RelationRegistry,
-    ) -> Result<Plan, DeltaError> {
+    ) -> Result<RelationHandle, DeltaError> {
         let handle = registry.register_load_sink(
             name,
             &self.schema_ref(),
@@ -378,7 +452,7 @@ impl PlanBuilder {
             &passthrough_columns,
             file_type,
         )?;
-        let mut sink = LoadSink::new(handle, file_schema, file_type)
+        let mut sink = LoadSink::new(handle.clone(), file_schema, file_type)
             .with_passthrough_columns(passthrough_columns)
             .with_file_meta(file_meta);
         if let Some(base_url) = base_url {
@@ -387,7 +461,25 @@ impl PlanBuilder {
         if let Some(dv_ref) = dv_ref {
             sink = sink.with_dv_ref(dv_ref);
         }
-        Ok(Plan::new(self.node, SinkType::Load(sink)))
+        let plan = Plan::new(self.node, SinkType::Load(sink));
+        registry.push_plan(plan);
+        Ok(handle)
+    }
+
+    /// Terminal convenience: bind this chain to a `SinkType::Relation` named `name`, then
+    /// immediately drain the registry's accumulator into a finished [`ResultPlan`] whose
+    /// terminal handle is the one just minted.
+    ///
+    /// Equivalent to `self.into_relation(name, ctx)?; ctx.into_result_plan(name)` — kept as a
+    /// single method so call sites at the end of a pipeline don't have to crack the chain
+    /// open to recover the terminal name twice.
+    pub fn into_result_plan(
+        self,
+        name: &str,
+        registry: &mut RelationRegistry,
+    ) -> Result<crate::plans::ir::plan::ResultPlan, DeltaError> {
+        self.into_relation(name, registry)?;
+        registry.into_result_plan(name)
     }
 
     /// Terminal: explicit [`SinkType::Consume`] with a pre-built [`ConsumeSink`]. Use when the
@@ -399,8 +491,7 @@ impl PlanBuilder {
 
     /// Typed consumer terminal. Wraps `self` in a [`Plan`] terminating in
     /// [`SinkType::Consume`] and returns the plan paired with an [`Extractor<O>`] that pulls
-    /// the typed output from the resulting
-    /// [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
+    /// the typed output from the resulting [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
     pub fn consume<S>(self, state: S) -> (Plan, Extractor<S::Output>)
     where
         S: ConsumerKdf + KdfOutput + 'static,
@@ -442,7 +533,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
+    use crate::plans::ir::nodes::{OrderingSpec, WindowFunction};
     use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput};
     use crate::schema::{DataType, StructField, StructType};
 
@@ -497,6 +590,36 @@ mod tests {
             let msg = format!("{}", result.unwrap_err());
             assert!(msg.contains("schema expects"), "message was: {msg}");
         }
+    }
+
+    #[rstest]
+    #[case(vec![])]
+    #[case(vec![OrderingSpec::asc(ColumnName::new(["version"]))])]
+    fn window_order_by_cases(#[case] order_by: Vec<OrderingSpec>) {
+        let wf = WindowFunction {
+            output_col: "_rn".into(),
+        };
+        let plan = PlanBuilder::scan_json(vec![], simple_schema())
+            .window(
+                vec![wf],
+                vec![Arc::new(Expression::column(["version"]))],
+                order_by,
+            )
+            .unwrap();
+        assert!(matches!(plan.node(), DeclarativePlanNode::Window { .. }));
+    }
+
+    #[test]
+    fn empty_union_yields_empty_schema() {
+        let pb = PlanBuilder::union(Vec::<PlanBuilder>::new(), false).unwrap();
+        assert_eq!(pb.schema_ref().fields().count(), 0);
+    }
+
+    #[test]
+    fn file_listing_schema_is_canonical_triple() {
+        let pb = PlanBuilder::file_listing(url::Url::parse("file:///tmp").unwrap());
+        let names: Vec<String> = pb.schema_ref().fields().map(|f| f.name().clone()).collect();
+        assert_eq!(names, vec!["path", "size", "modification_time"]);
     }
 
     // === Consumer-KDF tests (validated via a test-local consumer state) ===

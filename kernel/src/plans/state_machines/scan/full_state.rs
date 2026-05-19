@@ -7,25 +7,25 @@
 //!
 //! 1. **commit_load** — `Values(commit metadata) → LoadSink(JSON, action schema,
 //!    passthrough=[version])` materializes the raw per-commit action stream into
-//!    [`FSR_COMMIT_RAW`]. The kernel cover over `ascending_commit_files ∪
+//!    `fsr.commit_raw`. The kernel cover over `ascending_commit_files ∪
 //!    ascending_compaction_files` is materialized verbatim so that downstream steps can `ORDER BY
 //!    version DESC` to recover Delta's "newest action wins" semantics inside the commit tail.
 //! 2. **commit_dedup** — `RelationRef(commit_raw) → Filter(has identity) → Project(action_cols +
 //!    key) → Window(row_number PARTITION BY key ORDER BY version DESC) → Filter(__rn <= k) →
 //!    Project(action_cols + key)` yields the *commit winners*, materialized into
-//!    [`FSR_COMMIT_DEDUP`]. Commits supersede (and remove-tombstone) checkpoint state for any
+//!    `fsr.commit_dedup`. Commits supersede (and remove-tombstone) checkpoint state for any
 //!    `(action_kind, identity)` pair they touch.
 //! 3. **(only when `has_sidecars`) sidecar_load** — `Scan(top-level checkpoint, sidecar-only
 //!    schema) → Filter(sidecar IS NOT NULL) → Project(sidecar.path, sidecar.sizeInBytes) →
 //!    LoadSink(Parquet, action schema)` materializes each V2-multipart sidecar parquet's action
-//!    rows into [`FSR_SIDECAR_ACTIONS`]. V1 / V2-inline checkpoints carry no sidecars; this plan is
+//!    rows into `fsr.sidecar_actions`. V1 / V2-inline checkpoints carry no sidecars; this plan is
 //!    omitted entirely so the executor never opens them.
 //! 4. **results** — `(Scan(top-level checkpoint) [∪ RelationRef(sidecar_actions)]) → Filter(has
 //!    identity) → Project(action_cols + key) → LeftAntiJoin(probe=this,
 //!    build=RelationRef(commit_dedup).project(key))` materializes the *checkpoint survivors* (rows
 //!    the commit tail didn't touch). The plan completes with `Union(RelationRef(commit_dedup),
-//!    survivors) -> Filter(retention) -> Project(action_schema) -> into_relation(FSR_RESULTS)` so
-//!    the caller reads the reconstructed action stream from [`FSR_RESULTS`].
+//!    survivors) -> Filter(retention) -> Project(action_schema) -> into_relation("results")`
+//!    so the caller reads the reconstructed action stream from `fsr.results`.
 //!
 //! The window applies only to the (typically-small) commit-tail stream; the (typically-large)
 //! checkpoint stream goes through a single hash anti-join keyed on the dedup column. Compared
@@ -45,8 +45,8 @@
 //!   is intentionally omitted (UUID DVs have no offset; inline DVs with the same `pathOrInlineDv`
 //!   and distinct offsets would imply two distinct in-line DV byte payloads, which is not
 //!   representable). A follow-up can include `offset` once kernel grows an int-to-string cast.
-//! - **`action_schema`**: Full reconstructed action stream (add / remove / protocol / metaData /
-//!   domainMetadata / txn).
+//! - **`action_schema`**: Full reconstructed action stream (add / remove / protocol / metaData
+//!   / domainMetadata / txn).
 //! - **Retention thresholds**: Derived like checkpoint reconciliation via
 //!   [`crate::action_reconciliation::deleted_file_retention_timestamp_with_time`] and
 //!   [`crate::action_reconciliation::calculate_transaction_expiration_timestamp`] against
@@ -57,14 +57,11 @@
 
 use std::sync::Arc;
 
-use super::checkpoint_shape::resolve_checkpoint_shape;
-use super::plans::build_fsr_plans;
-// Re-exports for the FSR relation handle name constants. External code references these via
-// `fsr::full_state::FSR_COMMIT_DEDUP`; the actual definitions live in `super::plans`.
-pub use super::plans::{
-    CommitFileMeta, FSR_CHECKPOINT_TOP, FSR_COMMIT_DEDUP, FSR_COMMIT_RAW, FSR_RESULTS,
-    FSR_SIDECAR_ACTIONS,
-};
+use super::action_pair::FSR_BASE;
+use super::dedup::fsr_dedup_key;
+use super::plans::{execute_reconciliation, RECONCILED};
+// Re-export for callers that need a stable type for the FSR commit-file row.
+pub use super::plans::CommitFileMeta;
 use crate::plans::errors::{DeltaError, KernelErrAsDelta};
 use crate::plans::ir::{RelationRegistry, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::context::Context;
@@ -72,6 +69,11 @@ use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::scan::state_info::StateInfo;
 use crate::scan::StatsOutputMode;
 use crate::snapshot::Snapshot;
+
+/// FSR terminal name. Combined with the `"fsr"` SM prefix this resolves to the full handle
+/// name `fsr.results` — the relation external callers read after driving
+/// [`FullState::state_machine`] to completion.
+const FSR_RESULTS: &str = "results";
 
 /// Configured FSR plan source. Construct via [`FullState::for_table`] (or
 /// [`Snapshot::full_state_builder`](crate::snapshot::Snapshot::full_state_builder)), call
@@ -101,19 +103,30 @@ impl FullState {
         }
     }
 
-    /// Coroutine SM: [`resolve_checkpoint_shape`] then [`build_fsr_plans`].
+    /// Coroutine SM driving the FSR pipeline end-to-end: resolve shape + build the shared
+    /// reconciliation pipeline over the full six-slot action set, then rebind `RECONCILED`
+    /// under `fsr.results` as the SM's terminal.
     pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let snapshot = self.snapshot.clone();
         let state_info = self.state_info.clone();
-        CoroutineSM::new("full_state", move |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id));
-            let shape = resolve_checkpoint_shape(
+        CoroutineSM::new("fsr", move |mut co, sm_id| async move {
+            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, "fsr"));
+            let stats = state_info
+                .as_ref()
+                .and_then(|si| si.physical_stats_schema.clone());
+            execute_reconciliation(
                 &mut ctx,
                 snapshot.as_ref(),
-                state_info.as_ref().and_then(|si| si.physical_stats_schema.as_ref()),
+                &FSR_BASE,
+                stats,
+                /*parts=*/ None,
+                Arc::new(fsr_dedup_key()),
             )
             .await?;
-            build_fsr_plans(snapshot.as_ref(), shape, &mut *ctx)
+            // The reconciled relation IS the FSR result; project (identity-rebind by name)
+            // to FSR_RESULTS so the terminal handle's logical full-name reads `fsr.results`.
+            ctx.relation_ref(RECONCILED)?
+                .into_result_plan(FSR_RESULTS, &mut *ctx)
         })
     }
 }
