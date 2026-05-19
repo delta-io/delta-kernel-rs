@@ -390,17 +390,7 @@ mod tests {
         column_name: &str,
         batch: RecordBatch,
     ) -> DfResult<ArrayRef> {
-        // We bind the column reference to the LOGICAL schema (engine-facing position +
-        // logical name) and rely on the adapter to rebind it to the physical schema by
-        // field-id. This matches the opener's flow: projection expressions are built
-        // against the logical schema before being rewritten.
-        let factory = FieldIdPhysicalExprAdapterFactory;
-        let adapter = factory.create(Arc::clone(&logical_schema), physical_schema)?;
-        let column = Arc::new(Column::new_with_schema(
-            column_name,
-            logical_schema.as_ref(),
-        )?) as Arc<dyn PhysicalExpr>;
-        let rewritten = adapter.rewrite(column)?;
+        let rewritten = rewrite_column(logical_schema, physical_schema, column_name)?;
         match rewritten.evaluate(&batch)? {
             ColumnarValue::Array(a) => Ok(a),
             ColumnarValue::Scalar(s) => s.to_array_of_size(batch.num_rows()),
