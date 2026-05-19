@@ -5,7 +5,7 @@
 //! receive and how the finalized state reduces into that output.
 //!
 //! The bridge from state → plan-tree insertion → typed `Extractor<O>` lives
-//! on [`crate::plans::ir::DeclarativePlanNode::consume`] — SM authors call
+//! on [`crate::plans::ir::PlanBuilder::consume`] — SM authors call
 //! it directly on a state instance; no intermediate factory wrapper is exposed.
 
 use std::any::Any;

@@ -9,9 +9,9 @@
 //!
 //! Two macros:
 //!
-//! - [`delta_error!`] — build a value. First arg is a [`DeltaErrorCode`], then an optional `source
-//!   = expr`, then an optional `format!`-style message.
-//! - [`bail_delta!`] — early-return from an enclosing function.
+//! - [`crate::delta_error!`] — build a value. First arg is a [`DeltaErrorCode`], then an optional
+//!   `source = expr`, then an optional `format!`-style message.
+//! - [`crate::bail_delta!`] — early-return from an enclosing function.
 //!
 //! Plus [`DeltaResultExt::or_delta`] for attaching a code at a `?` site while preserving the
 //! underlying error in [`DeltaError::source`].
@@ -118,7 +118,7 @@ pub type BoxedSource = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub struct DeltaError {
     /// Stable typed identifier.
     pub code: DeltaErrorCode,
-    /// Pre-formatted message — built at construction time by [`delta_error!`].
+    /// Pre-formatted message — built at construction time by [`crate::delta_error!`].
     pub message: String,
     /// Optional underlying error, forwarded via `std::error::Error::source()`.
     #[source]
@@ -185,7 +185,7 @@ impl DeltaErrAsKernel for DeltaError {
 
 /// Attach a [`DeltaErrorCode`] to any `Result<T, E>` where `E: std::error::Error`. The original
 /// error is preserved in [`DeltaError::source`], walkable via `std::error::Error::source()`.
-/// Use [`delta_error!`] directly when you also need a custom message.
+/// Use [`crate::delta_error!`] directly when you also need a custom message.
 pub trait DeltaResultExt<T> {
     fn or_delta(self, code: DeltaErrorCode) -> Result<T, DeltaError>;
 }

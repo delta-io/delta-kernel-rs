@@ -1,9 +1,11 @@
-//! DataFusion-backed [`DataFusionExecutor`] for compiling kernel [`Plan`] values.
+//! DataFusion-backed [`DataFusionExecutor`] for compiling kernel [`delta_kernel::plans::ir::Plan`]
+//! values.
 //!
-//! `Relation` and `Load` sinks register a *lazy* [`TableProvider`] into
-//! [`Self::relation_providers`] keyed by [`RelationHandle::id`]; the upstream pipeline never
-//! runs at registration time. Downstream `RelationRef` leaves resolve to that provider during
-//! compile, and DataFusion drives execution lazily when the consumer reads the relation.
+//! `Relation` and `Load` sinks register a *lazy* [`TableProvider`] into the executor's
+//! `relation_providers` map keyed by [`delta_kernel::plans::ir::nodes::RelationHandle`]'s `id`
+//! field; the upstream pipeline never runs at registration time. Downstream `RelationRef` leaves
+//! resolve to that provider during compile, and DataFusion drives execution lazily when the
+//! consumer reads the relation.
 //!
 //! - `Relation` -> [`datafusion::datasource::ViewTable`] over the upstream `LogicalPlan`;
 //!   DataFusion's `InlineTableScan` rule inlines it so pushdown and CSE cross the boundary.

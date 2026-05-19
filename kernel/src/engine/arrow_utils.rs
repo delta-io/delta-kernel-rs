@@ -1573,8 +1573,9 @@ pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema>
 }
 
 /// Walks `schema` along a dot-segment column path (e.g. `["add", "stats", "minValues"]`) and
-/// returns the resolved Arrow [`FieldRef`]. Each non-terminal segment must resolve to a struct
-/// type; mismatches or missing names produce a typed error containing the path traversed so far.
+/// returns the resolved Arrow [`crate::arrow::datatypes::FieldRef`]. Each non-terminal segment must
+/// resolve to a struct type; mismatches or missing names produce a typed error containing the path
+/// traversed so far.
 pub fn resolve_field_path(
     schema: &ArrowSchema,
     path: &[&str],

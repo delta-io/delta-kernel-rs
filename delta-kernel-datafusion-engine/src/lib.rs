@@ -1,4 +1,5 @@
-//! DataFusion execution scaffold for Delta Kernel declarative [`Plan`] trees.
+//! DataFusion execution scaffold for Delta Kernel declarative [`delta_kernel::plans::ir::Plan`]
+//! trees.
 //!
 //! Supported sinks (registration is lazy; no I/O until the consumer reads):
 //! - `Relation` -- registers a [`ViewTable`](datafusion::datasource::ViewTable) over the upstream

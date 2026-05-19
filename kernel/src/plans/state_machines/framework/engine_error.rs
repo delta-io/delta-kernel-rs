@@ -62,7 +62,7 @@ impl EngineError {
     /// Render this error together with its full source chain. Formatted as
     /// `"{kind}: {source}: {source_of_source}: ..."`.
     ///
-    /// Distinct from [`Self::to_string`] (which only renders `kind`):
+    /// Distinct from [`ToString::to_string`] (which only renders `kind`):
     /// [`EngineErrorKind::Internal`] carries its entire diagnostic payload in `source`, so
     /// `to_string()` collapses to the static `"internal engine error"`. Use this method for
     /// any diagnostic detail derived from an `Internal`.
@@ -101,7 +101,7 @@ impl EngineError {
     /// The full engine source chain is preserved via `source =` on the resulting `DeltaError`,
     /// and the detail string is built with
     /// [`display_with_source_chain`](Self::display_with_source_chain) rather than
-    /// [`to_string`](Self::to_string) — the latter would collapse [`EngineErrorKind::Internal`]
+    /// [`ToString::to_string`] — the latter would collapse [`EngineErrorKind::Internal`]
     /// to the static string `"internal engine error"` and silently drop the underlying cause.
     ///
     /// SM bodies match on [`Self::kind`] and pick a semantically appropriate [`DeltaErrorCode`].

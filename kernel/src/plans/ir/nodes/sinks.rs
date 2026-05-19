@@ -158,14 +158,14 @@ impl DvRef {
 ///
 /// The materialized result is named via [`Self::output_relation`] so that
 /// downstream plans in the same phase can consume it through
-/// [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
+/// [`crate::plans::ir::RelationRegistry::relation_ref`].
 ///
 /// An optional [`Self::dv_ref`] column hint enables per-row deletion-vector
 /// masking against a descriptor column on the upstream relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadSink {
     /// Where Load's output is materialized. Downstream plans reference this
-    /// handle via [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
+    /// handle via [`crate::plans::ir::RelationRegistry::relation_ref`].
     pub output_relation: RelationHandle,
     /// Desired per-file output columns (nullability follows
     /// [`crate::ParquetHandler::read_parquet_files`] semantics).
@@ -237,7 +237,7 @@ impl LoadSink {
 pub enum SinkType {
     /// Stream every output batch to the named [`RelationHandle`]. Another
     /// plan in the same phase consumes via
-    /// [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`],
+    /// [`crate::plans::ir::RelationRegistry::relation_ref`],
     /// or a [`ResultPlan`](crate::plans::ir::ResultPlan) names this relation
     /// as its caller-facing output.
     Relation(RelationHandle),

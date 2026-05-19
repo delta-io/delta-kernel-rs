@@ -11,9 +11,9 @@
 //!
 //! Built on [`genawaiter2`], which panics on coroutine protocol misuse (awaiting a non-yield
 //! future, retaining a `Co` after return). The no-panic rule is preserved because the only
-//! path to `Co::yield_` is through [`Context::execute`]; SM bodies are `pub(crate)`-only and
-//! FFI sees them through `Box<dyn StateMachine>`, so the panic paths are unreachable
-//! externally.
+//! path to `Co::yield_` is through [`super::context::Context::execute`]; SM bodies are
+//! `pub(crate)`-only and FFI sees them through `Box<dyn StateMachine>`, so the panic paths are
+//! unreachable externally.
 
 use std::future::Future;
 

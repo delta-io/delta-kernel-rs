@@ -2,9 +2,9 @@
 //!
 //! The `plans` module defines a typed, engine-agnostic intermediate representation
 //! for the work an engine must perform on behalf of the kernel: scan files, apply
-//! filters, project columns, collect results. See [`ir::DeclarativePlanNode`] for
-//! the tree representation, [`ir::Plan`] for the envelope the kernel hands to the
-//! engine, and [`ir::PlanBuilder`] for the fluent building API that produces these
+//! filters, project columns, collect results. See [`crate::plans::ir::DeclarativePlanNode`] for
+//! the tree representation, [`crate::plans::ir::Plan`] for the envelope the kernel hands to the
+//! engine, and [`crate::plans::ir::PlanBuilder`] for the fluent building API that produces these
 //! trees with their cumulative output schema.
 //!
 //! # Feature gate
@@ -14,7 +14,7 @@
 //!
 //! # Overview
 //!
-//! A [`ir::Plan`] is `{ root: DeclarativePlanNode, sink: SinkType }`: a
+//! A [`crate::plans::ir::Plan`] is `{ root: DeclarativePlanNode, sink: SinkType }`: a
 //! transforms-only tree terminated by a sink describing how the engine should
 //! consume the row stream. Trees are built bottom-up with chain methods:
 //!

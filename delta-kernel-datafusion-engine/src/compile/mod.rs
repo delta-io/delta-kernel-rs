@@ -1,14 +1,15 @@
-//! Declarative [`Plan`] -> DataFusion [`LogicalPlan`] compilation.
+//! Declarative [`delta_kernel::plans::ir::Plan`] -> DataFusion [`datafusion_expr::LogicalPlan`]
+//! compilation.
 //!
-//! Every kernel IR shape lowers to a [`LogicalPlan`] via [`compile_plan_logical`]; the executor
-//! optimizes + materializes physical execution and wraps sink-specific [`ExecutionPlan`]s on
-//! top of that.
+//! Every kernel IR shape lowers to a [`datafusion_expr::LogicalPlan`] via [`compile_plan_logical`];
+//! the executor optimizes + materializes physical execution and wraps sink-specific
+//! [`datafusion_physical_plan::ExecutionPlan`]s on top of that.
 //!
 //! Sinks: [`SinkType::Relation`] / [`SinkType::Load`] (drain + the executor materializes the
 //! result as a [`datafusion::datasource::MemTable`] inserted into the executor's
 //! `relation_providers` map for downstream
-//! [`DeclarativePlanNode::RelationRef`] leaves), [`SinkType::Consume`] (drained directly by
-//! the executor through a [`delta_kernel::plans::kdf::ConsumerKdf`] handle).
+//! [`delta_kernel::plans::ir::DeclarativePlanNode::RelationRef`] leaves), [`SinkType::Consume`]
+//! (drained directly by the executor through a [`delta_kernel::plans::kdf::ConsumerKdf`] handle).
 //!
 //! [`SinkType::Relation`]: delta_kernel::plans::ir::nodes::SinkType::Relation
 //! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load
@@ -32,11 +33,12 @@ pub use logical::compile_plan_logical;
 /// Context shared by the compiler for leaf nodes that need runtime side state.
 #[derive(Clone)]
 pub struct CompileContext {
-    /// Relations available to [`DeclarativePlanNode::RelationRef`] leaves, keyed by
-    /// [`RelationHandle::id`]. The executor passes a snapshot of its live registry here at
-    /// compile time, so every plan in a batch sees the relations produced by its predecessors.
-    /// An empty map is fine when the plan being compiled does not reference any relations (or for
-    /// inspection-only paths like benchmark physical-plan dumps).
+    /// Relations available to [`delta_kernel::plans::ir::DeclarativePlanNode::RelationRef`]
+    /// leaves, keyed by [`delta_kernel::plans::ir::nodes::RelationHandle`]'s `id` field. The
+    /// executor passes a snapshot of its live registry here at compile time, so every plan in
+    /// a batch sees the relations produced by its predecessors. An empty map is fine when the
+    /// plan being compiled does not reference any relations (or for inspection-only paths like
+    /// benchmark physical-plan dumps).
     pub relation_providers: Arc<HashMap<String, Arc<dyn TableProvider>>>,
     /// Active phase's [`PhaseState`] (`Some` while a phase is executing). `Consume`
     /// drains submit their finalized handles here; `None` means the executor is not inside a

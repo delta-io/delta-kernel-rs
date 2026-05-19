@@ -218,7 +218,8 @@ impl PlanBuilder {
         self.project(columns, output_schema)
     }
 
-    /// Append a single `(field, expr)` column to the head [`Project`] node's projection.
+    /// Append a single `(field, expr)` column to the head [`DeclarativePlanNode::Project`] node's
+    /// projection.
     ///
     /// If `self` is already a `Project`, the head node is extended in place: `expr` is appended
     /// to its `columns` and `field` is appended to its `output_schema`. Otherwise the chain is
@@ -383,7 +384,7 @@ impl PlanBuilder {
     ///
     /// The accumulator is drained later via
     /// [`RelationRegistry::into_result_plan`](super::relation_registry::RelationRegistry::into_result_plan)
-    /// or [`Self::consume_phase`].
+    /// or [`Self::consume`].
     pub fn into_relation(
         self,
         name: &str,
@@ -439,8 +440,8 @@ impl PlanBuilder {
     }
 
     /// Terminal convenience: bind this chain to a `SinkType::Relation` named `name`, then
-    /// immediately drain the registry's accumulator into a finished [`ResultPlan`] whose
-    /// terminal handle is the one just minted.
+    /// immediately drain the registry's accumulator into a finished [`super::plan::ResultPlan`]
+    /// whose terminal handle is the one just minted.
     ///
     /// Equivalent to `self.into_relation(name, ctx)?; ctx.into_result_plan(name)` — kept as a
     /// single method so call sites at the end of a pipeline don't have to crack the chain

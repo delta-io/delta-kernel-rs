@@ -335,7 +335,7 @@ impl CheckpointWriter {
     /// Returns the Arrow/engine checkpoint row schema after stats transforms for this snapshot.
     ///
     /// This matches the schema of rows yielded by [`Self::checkpoint_data`] after each batch has
-    /// [`crate::log_replay::HasSelectionVector::apply_selection_vector`] applied.
+    /// [`crate::engine_data::FilteredEngineData::apply_selection_vector`] applied.
     pub fn checkpoint_output_schema(&self, engine: &dyn Engine) -> DeltaResult<SchemaRef> {
         let schema_context = self.checkpoint_schema_context(engine)?;
         self.get_or_init_output_schema(|| {

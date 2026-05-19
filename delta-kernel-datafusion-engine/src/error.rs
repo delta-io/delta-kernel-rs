@@ -2,8 +2,9 @@
 //!
 //! Engine internals operate in [`DataFusionError`] space: every helper here produces a
 //! [`DataFusionError`] variant, so engine code can use bare `?` to propagate errors. Conversion
-//! into kernel-flavored errors ([`DeltaError`], [`EngineError`]) happens only at the engine ->
-//! kernel boundary methods on [`crate::DataFusionExecutor`], and is exposed as the
+//! into kernel-flavored errors ([`DeltaError`],
+//! [`delta_kernel::plans::state_machines::framework::engine_error::EngineError`]) happens only at
+//! the engine -> kernel boundary methods on [`crate::DataFusionExecutor`], and is exposed as the
 //! [`DfResultIntoDelta`] extension trait so boundary call sites can write `.into_delta()`
 //! instead of `.map_err(df_to_delta)`.
 
