@@ -81,7 +81,7 @@ impl<'a> StatsProvider for BatchRowStatsProvider<'a> {
 
     fn null_count(&self, col: &str) -> Option<i64> {
         let scalar = self.read_stat("nullCount", col, &DataType::LONG)?;
-        scalar_to_long(&scalar)
+        super::pruning::scalar_as_i64(&scalar)
     }
 
     fn row_count(&self) -> Option<i64> {
@@ -91,15 +91,7 @@ impl<'a> StatsProvider for BatchRowStatsProvider<'a> {
             return None;
         }
         let scalar = scalar_from_array(array.as_ref(), self.row, &DataType::LONG)?;
-        scalar_to_long(&scalar)
-    }
-}
-
-fn scalar_to_long(scalar: &Scalar) -> Option<i64> {
-    match scalar {
-        Scalar::Long(v) => Some(*v),
-        Scalar::Integer(v) => Some(i64::from(*v)),
-        _ => None,
+        super::pruning::scalar_as_i64(&scalar)
     }
 }
 
@@ -173,11 +165,8 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
         let Some(cb) = self.inner().callbacks_clone() else {
-            // No callbacks: produce an all-null mask. Kernel's evaluator
-            // treats null in junctions per Kleene logic; effectively the
-            // predicate contributes "unknown" -> keep.
-            let nulls: Vec<Option<bool>> = (0..batch.num_rows()).map(|_| None).collect();
-            return Ok(BooleanArray::from(nulls));
+            // No callbacks: all-null mask. Kleene-null = "unknown" -> keep.
+            return Ok(BooleanArray::from(vec![None; batch.num_rows()]));
         };
 
         let mut results: Vec<Option<bool>> = Vec::with_capacity(batch.num_rows());
@@ -370,8 +359,9 @@ mod tests {
         } {
             return;
         }
-        // Copy the column name out; the slice itself is consumed by each
-        // accessor call below.
+        // Own a copy of the column name so we can pass a fresh slice into
+        // both `stats_accessor_min_string` and `stats_accessor_max_string`
+        // (KernelStringSlice is consumed by value by each call).
         let col_name = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&col_slice) }
             .unwrap_or_default();
 

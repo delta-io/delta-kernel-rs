@@ -600,12 +600,11 @@ pub extern "C" fn visit_predicate_in(
 ///
 /// The resulting op opts out of every kernel-side pruning pass; the engine is responsible
 /// for filtering at row time. Engines that want kernel-side pruning should use
-/// [`visit_predicate_opaque_with_pruning`] (or the arrow-aware
-/// [`visit_predicate_opaque_with_pruning_arrow`] for default-engine consumers), which
-/// attach [`OpaquePruningCallbacks`] to the op.
+/// [`visit_predicate_opaque_with_pruning`] (or `visit_predicate_opaque_with_pruning_arrow`
+/// for default-engine consumers, under `default-engine-base`), which attach
+/// [`OpaquePruningCallbacks`] to the op.
 ///
 /// [`OpaquePruningCallbacks`]: crate::expressions::pruning::OpaquePruningCallbacks
-/// [`visit_predicate_opaque_with_pruning_arrow`]: visit_predicate_opaque_with_pruning_arrow
 ///
 /// Each child ID is consumed from the visitor state (an ID can only be used once). Predicate
 /// IDs are auto-promoted into expressions, mirroring `Expression::from_pred`. Returns 0 if

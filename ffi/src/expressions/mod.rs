@@ -221,9 +221,12 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         _exprs: &[Expression],
         _inverted: bool,
     ) -> Option<Predicate> {
-        // Opaque ops never rewrite to a kernel-native predicate. Per-file
-        // evaluation goes through `eval_as_data_skipping_predicate` via the
-        // per-file refinement pass in `data_skipping.rs`.
+        // No native-predicate rewrite. The arrow adapter
+        // (`ArrowNamedOpaquePredicateOp`) is the path that engages file
+        // pruning via the default engine's batch evaluator; engines using
+        // a different EvaluationHandler need the kernel-side per-file
+        // refinement pass documented in
+        // `doc/design/opaque-predicate-kernel-refinement-playbook.md`.
         None
     }
 }

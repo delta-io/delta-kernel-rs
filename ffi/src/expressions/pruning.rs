@@ -91,14 +91,23 @@ pub unsafe extern "C" fn opaque_prune_result_skip(out: *mut OpaquePruneResult) {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpaqueChildKind {
-    /// Argument shape not supported by the accessor.
+    /// Argument shape not supported by the accessor (nested expressions,
+    /// multi-segment column refs, types this enum doesn't enumerate).
     Unsupported = 0,
-    /// Single-segment column reference.
+    /// Single-segment column reference; read the name via
+    /// [`child_accessor_column_name`].
     Column = 1,
+    /// String literal; read via [`child_accessor_literal_string`].
     LiteralString = 2,
+    /// 64-bit integer literal (also widened from `Integer`); read via
+    /// [`child_accessor_literal_long`].
     LiteralLong = 3,
+    /// 64-bit floating-point literal (also widened from `Float`); read via
+    /// [`child_accessor_literal_double`].
     LiteralDouble = 4,
+    /// Boolean literal; read via [`child_accessor_literal_bool`].
     LiteralBool = 5,
+    /// SQL NULL literal of any type; no value to read.
     LiteralNull = 6,
 }
 
@@ -295,44 +304,50 @@ pub(crate) trait StatsProvider {
     fn row_count(&self) -> Option<i64>;
 }
 
+/// Append-only arena for strings handed across the FFI boundary. Each
+/// interned string lives in a `Box<str>` whose heap allocation outlives
+/// the arena (the `Box` may move within the backing `Vec`, but the bytes
+/// it points to do not).
+#[derive(Default)]
+pub(crate) struct StrArena {
+    boxes: std::cell::RefCell<Vec<Box<str>>>,
+}
+
+impl StrArena {
+    pub(crate) fn intern(&self, s: String) -> &str {
+        let boxed = s.into_boxed_str();
+        let ptr = boxed.as_ptr();
+        let len = boxed.len();
+        self.boxes.borrow_mut().push(boxed);
+        // SAFETY: `ptr` points to the heap allocation owned by the
+        // `Box<str>` we just pushed. The Vec may reallocate its backing
+        // buffer (moving the Box's position), but the heap allocation
+        // never relocates, so the slice stays valid for `&self`'s
+        // lifetime.
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
+    }
+}
+
 /// Borrowed handle wrapping a [`StatsProvider`] for FFI consumption.
 ///
 /// String slices returned from the stats getters point into a small
-/// per-accessor arena that lives for the accessor's lifetime; the arena is
-/// freed when the accessor drops (at the end of the engine callback). The
-/// engine must copy slices it needs to retain.
+/// per-accessor arena freed when the accessor drops (at the end of the
+/// engine callback). The engine must copy slices it needs to retain.
 pub struct StatsAccessor<'a> {
     provider: &'a dyn StatsProvider,
-    // Strings the accessor has handed out to the engine. Each `Box<str>`'s
-    // heap allocation has a stable address; pushing to the Vec may move the
-    // `Box` itself in the Vec's backing storage, but the underlying str
-    // bytes never relocate. So slices into a `Box<str>` stay valid as long
-    // as the accessor lives.
-    arena: std::cell::RefCell<Vec<Box<str>>>,
+    arena: StrArena,
 }
 
 impl<'a> StatsAccessor<'a> {
     pub(crate) fn new(provider: &'a dyn StatsProvider) -> Self {
         Self {
             provider,
-            arena: std::cell::RefCell::new(Vec::new()),
+            arena: StrArena::default(),
         }
     }
 
-    /// Intern `s` into the per-callback arena and return a `&str` tied to
-    /// the accessor's lifetime. The slice is valid until the accessor
-    /// drops (typically when the engine callback returns).
     fn intern(&self, s: String) -> &str {
-        let boxed = s.into_boxed_str();
-        let ptr = boxed.as_ptr();
-        let len = boxed.len();
-        self.arena.borrow_mut().push(boxed);
-        // SAFETY: the bytes at `ptr` are owned by a `Box<str>` that now
-        // lives in `self.arena`. Pushing to the Vec may relocate the
-        // `Box`'s position in the Vec, but the heap allocation it points
-        // to never moves, so `ptr` remains valid as long as `self` (and
-        // hence the arena) is alive.
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
+        self.arena.intern(s)
     }
 }
 
@@ -499,14 +514,14 @@ pub unsafe extern "C" fn stats_accessor_row_count(
 /// for strings handed back to the engine.
 pub struct ScalarResolver<'a> {
     eval_expr: &'a ScalarExpressionEvaluator<'a>,
-    arena: std::cell::RefCell<Vec<Box<str>>>,
+    arena: StrArena,
 }
 
 impl<'a> ScalarResolver<'a> {
     pub(crate) fn new(eval_expr: &'a ScalarExpressionEvaluator<'a>) -> Self {
         Self {
             eval_expr,
-            arena: std::cell::RefCell::new(Vec::new()),
+            arena: StrArena::default(),
         }
     }
 
@@ -516,12 +531,7 @@ impl<'a> ScalarResolver<'a> {
     }
 
     fn intern(&self, s: String) -> &str {
-        let boxed = s.into_boxed_str();
-        let ptr = boxed.as_ptr();
-        let len = boxed.len();
-        self.arena.borrow_mut().push(boxed);
-        // SAFETY: see `StatsAccessor::intern` for the equivalent argument.
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
+        self.arena.intern(s)
     }
 }
 
@@ -673,15 +683,9 @@ pub unsafe extern "C" fn free_opaque_pruning_context(ctx: Handle<SharedOpaquePru
 
 // === Used by NamedOpaquePredicateOp ==========================================
 
-/// Internal handle threaded through `NamedOpaquePredicateOp` so each op
-/// can invoke the engine callback.
-#[allow(dead_code)]
-pub(crate) type OpaquePruningContextRef = Arc<OpaquePruningCallbacks>;
-
-/// Invoke the engine's file-pruning callback. Used by the kernel-side
-/// per-file refinement pass (see `data_skipping.rs`); currently no other
-/// callers, hence the dead-code allow.
-#[allow(dead_code)]
+/// Invoke the engine's stats-based pruning callback. Used by the arrow
+/// adapter's `eval_pred` and by any future kernel-side per-file
+/// refinement pass.
 #[allow(clippy::needless_lifetimes)]
 pub(crate) fn invoke_eval_against_stats<'a>(
     cb: &OpaquePruningCallbacks,
@@ -783,7 +787,7 @@ where
 
 /// Widen a `Long`/`Integer` scalar to `i64`. Returns `None` for any other
 /// variant.
-fn scalar_as_i64(scalar: &Scalar) -> Option<i64> {
+pub(crate) fn scalar_as_i64(scalar: &Scalar) -> Option<i64> {
     match scalar {
         Scalar::Long(v) => Some(*v),
         Scalar::Integer(v) => Some(i64::from(*v)),
