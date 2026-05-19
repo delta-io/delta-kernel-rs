@@ -1381,7 +1381,8 @@ mod tests {
         assert_eq!(data.len(), 1);
         let batch = &data[0];
 
-        // Verify columns were renamed to match the kernel schema (not the parquet physical names)
+        // Verify columns were renamed to match the kernel schema (the names from the parquet
+        // file's schema are discarded; the matching agreed on field IDs only).
         let schema = batch.schema();
         assert_eq!(schema.field(0).name(), "user_id");
         assert_eq!(schema.field(1).name(), "user_name");

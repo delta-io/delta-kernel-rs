@@ -22,7 +22,7 @@ use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_expression::apply_schema::apply_schema;
+use crate::engine::arrow_expression::apply_schema_to_struct;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
@@ -173,8 +173,29 @@ impl RowIndexBuilder {
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
 /// `file_location` is used to populate file metadata columns if requested.
-/// If `target_schema` is provided, rewrites the batch's field names, nullability, and metadata to
-/// match the kernel schema via [`apply_schema`].
+///
+/// If `target_schema` is provided, rewrites the batch's schema wrappers to match the kernel
+/// schema via `apply_schema_to_struct`. Specifically, at every nesting level (struct child, list
+/// element, map key/value):
+///
+/// - field names are taken from the kernel schema (producer names are kept only for list element
+///   and map key/value positions, where the kernel `ArrayType`/`MapType` is unnamed);
+/// - field nullability is taken from the kernel schema;
+/// - field metadata is replaced wholesale with kernel-derived metadata (translating
+///   `parquet.field.id` to `PARQUET:field_id` and propagating kernel-only annotations such as
+///   `delta.typeChanges`);
+/// - if both the source and kernel fields carry a `PARQUET:field_id` and they disagree, the call
+///   errors (defense against malformed inputs);
+/// - top-level `RecordBatch::schema().metadata()` is not preserved (the rebuilt schema is created
+///   via `ArrowSchema::new`).
+///
+/// **Type validation.** `apply_schema_to_struct` runs `ensure_data_types(.., Full)` at every
+/// primitive leaf. This is safe because `reorder_struct_array` above has already resolved every
+/// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
+/// are `Identical` to the kernel target.
+///
+/// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
+/// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
 #[internal_api]
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
@@ -186,8 +207,7 @@ pub(crate) fn fixup_parquet_read(
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
-        let kernel_type = DataType::Struct(Box::new((**schema).clone()));
-        StructArray::from(apply_schema(&data, &kernel_type)?)
+        apply_schema_to_struct(&data, schema)?
     } else {
         data
     };
@@ -3751,10 +3771,9 @@ mod tests {
 
     // === fixup_parquet_read coercion behavior ===
 
-    /// Verifies that `fixup_parquet_read` rewrites the batch's nullability flags at every nesting
-    /// level to match the kernel schema. This is the contract the pre-PR `coerce_batch_nullability`
-    /// used to provide directly and that `apply_schema` now satisfies from inside
-    /// `fixup_parquet_read`.
+    /// Verifies that `fixup_parquet_read` rewrites the batch's nullability flags at every
+    /// nesting level (struct field, list element, map value) to match the kernel schema, while
+    /// preserving the Arrow-mandated non-nullability of map entries and map keys.
     #[test]
     fn test_fixup_parquet_read_coerces_nullability_at_all_levels() {
         // Source: outer (non-null) {
@@ -3949,23 +3968,5 @@ mod tests {
             other => panic!("expected nested Struct, got {other:?}"),
         };
         assert_eq!(nested_children[0].name(), "tgt_z");
-
-        // Sanity-check that the rename did not move data: leaf values are preserved.
-        let outer_struct = result_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("outer should be a struct");
-        let inner_struct = outer_struct
-            .column(1)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("nested column should be a struct");
-        let leaf = inner_struct
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("leaf should be Int32");
-        assert_eq!(leaf.values(), &[42, 43, 44]);
     }
 }

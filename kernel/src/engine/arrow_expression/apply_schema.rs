@@ -124,7 +124,10 @@ fn transform_struct(
 }
 
 // Transform a struct array. The data is in `array`, and the target fields are in `kernel_fields`.
-fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaResult<StructArray> {
+pub(crate) fn apply_schema_to_struct(
+    array: &dyn Array,
+    kernel_fields: &Schema,
+) -> DeltaResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
