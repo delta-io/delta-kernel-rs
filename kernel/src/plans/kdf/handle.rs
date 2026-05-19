@@ -17,7 +17,7 @@ use std::any::Any;
 
 use uuid::Uuid;
 
-use super::token::{ConsumerKdfId, KdfStateToken};
+use super::token::KdfStateToken;
 use super::traits::{ConsumerKdf, KdfControl};
 use crate::{DeltaResult, EngineData};
 
@@ -53,13 +53,6 @@ impl<K: ConsumerKdf + ?Sized> Handle<K> {
             phase_name,
             inner,
         }
-    }
-
-    pub fn token(&self) -> &KdfStateToken {
-        &self.token
-    }
-    pub fn kdf_id(&self) -> ConsumerKdfId {
-        self.inner.kdf_id()
     }
 
     /// Apply the consumer to a batch.

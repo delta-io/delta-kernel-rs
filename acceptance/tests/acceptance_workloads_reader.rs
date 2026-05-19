@@ -597,9 +597,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     // partition-value gaps still match real specs.
     (
         "Known reader-workload gaps under current expression/stats support",
-        &[
-            "pve_empty_string_partition/specs/pve_empty_string_partition_filter_nonempty.json",
-        ],
+        &["pve_empty_string_partition/specs/pve_empty_string_partition_filter_nonempty.json"],
     ),
 ];
 

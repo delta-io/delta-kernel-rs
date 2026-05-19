@@ -78,15 +78,6 @@ impl EngineError {
         out
     }
 
-    /// Attach a boxed source to an existing `EngineError`. Fluent.
-    pub fn with_source<E>(mut self, source: E) -> Self
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        self.source = Some(Box::new(source));
-        self
-    }
-
     /// Construct an [`EngineErrorKind::Internal`] with the originating
     /// error attached as `source`. Use this whenever the engine has a
     /// failure that doesn't fit a typed variant — kernel call sites
@@ -138,17 +129,6 @@ mod tests {
             path: "/tmp/x".into(),
         });
         assert_eq!(err.to_string(), "file not found: /tmp/x");
-    }
-
-    #[test]
-    fn source_is_exposed_via_std_error() {
-        use std::error::Error;
-        let inner = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
-        let err = EngineError::new(EngineErrorKind::FileNotFound {
-            path: "/tmp/x".into(),
-        })
-        .with_source(inner);
-        assert!(err.source().unwrap().to_string().contains("missing"));
     }
 
     #[test]

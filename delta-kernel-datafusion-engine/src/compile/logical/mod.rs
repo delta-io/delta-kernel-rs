@@ -223,4 +223,3 @@ fn compile_declarative_node_logical(
         DeclarativePlanNode::FileListing(node) => file_listing_to_logical_plan(node),
     }
 }
-
