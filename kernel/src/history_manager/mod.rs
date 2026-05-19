@@ -26,8 +26,9 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace};
 use url::Url;
 
-use crate::log_segment::{LogSegment, LogSegmentFiles};
-use crate::path::ParsedLogPath;
+use crate::log_segment::LogSegment;
+use crate::log_segment_files::list_from_storage;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
@@ -561,16 +562,19 @@ pub fn get_earliest_delta_file(
         return Ok(0);
     }
 
-    let commits =
-        LogSegmentFiles::list_commits(engine.storage_handler().as_ref(), log_root, Some(0), None)?;
-    commits
-        .ascending_commit_files
-        .first()
-        .map(|f| f.version)
-        .ok_or(DeltaError::generic(format!(
-            "No commit files found in the directory: {}",
-            log_root.as_str()
-        )))
+    for file_result in
+        list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+    {
+        let file = file_result?;
+        if file.file_type == LogPathFileType::Commit {
+            return Ok(file.version);
+        }
+    }
+
+    Err(DeltaError::generic(format!(
+        "No commit files found in the directory: {}",
+        log_root.as_str()
+    )))
 }
 
 #[cfg(test)]
