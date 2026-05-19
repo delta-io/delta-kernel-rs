@@ -1,11 +1,11 @@
 //! [`LoadExec`] -- the streaming physical plan that powers
 //! [`super::LoadTableProvider`].
 //!
-//! For each upstream metadata batch, [`LoadExecStream`] walks rows one at a time. For each row
-//! it resolves a file URL + optional DV mask + per-row passthrough column values, then opens
-//! the file via DataFusion's [`FileSource::create_file_opener`] + [`FileOpener::open`] -- the
-//! *same* parquet/json opener `ListingTable` uses. Each opener-produced batch is yielded
-//! downstream as soon as it's ready; there is no per-batch / per-file accumulation.
+//! For each upstream metadata batch, [`build_load_stream`] walks rows one at a time. For each
+//! row it resolves a file URL + optional DV mask + per-row passthrough column values, then
+//! opens the file via DataFusion's [`FileSource::create_file_opener`] + [`FileOpener::open`]
+//! -- the *same* parquet/json opener `ListingTable` uses. Each opener-produced batch is
+//! yielded downstream as soon as it's ready; there is no per-batch / per-file accumulation.
 //!
 //! # Why a DataFusion opener and not kernel's parquet handler
 //!
@@ -18,32 +18,29 @@
 //!
 //! # Pushdown
 //!
-//! * Passthrough columns (kernel metadata-side values like `_metadata`, `path`) are handed to
-//!   the opener as [`TableSchema::with_table_partition_cols`]. Per upstream row we extract the
-//!   corresponding [`ScalarValue`]s and stamp them onto [`PartitionedFile::partition_values`];
-//!   the [`ProjectionOpener`] (parquet) / opener wrapper (json) substitutes them as literal
-//!   columns when materializing the file's batches. No bespoke per-batch broadcast.
+//! * Passthrough columns (kernel metadata-side values like `_metadata`, `path`) are handed to the
+//!   opener as [`TableSchema::with_table_partition_cols`]. Per upstream row we extract the
+//!   corresponding [`ScalarValue`]s and stamp them onto [`PartitionedFile::partition_values`]; the
+//!   [`ProjectionOpener`] (parquet) / opener wrapper (json) substitutes them as literal columns
+//!   when materializing the file's batches. No bespoke per-batch broadcast.
 //! * `projection: Option<Vec<usize>>` is pushed straight into the [`FileSource`] via
-//!   [`FileScanConfigBuilder::with_projection_indices`]; the source then narrows both the
-//!   parquet read schema and which partition columns it materializes.
+//!   [`FileScanConfigBuilder::with_projection_indices`]; the source then narrows both the parquet
+//!   read schema and which partition columns it materializes.
 //! * `limit: Option<usize>` caps total emitted rows. Once a batch would overshoot the budget it
-//!   is sliced; the next `poll_next` returns end-of-stream without opening any further files.
+//!   is sliced; the next stream iteration returns end-of-stream without opening any further
+//!   files.
 //!
 //! Filter pushdown is intentionally left to upstream operators (see
 //! [`super::LoadTableProvider::supports_filters_pushdown`]).
 
 use std::any::Any;
 use std::fmt;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use chrono::TimeZone;
 use datafusion_common::error::DataFusionError;
-use datafusion_common::Result as DfResult;
-use datafusion_common::ScalarValue;
+use datafusion_common::{Result as DfResult, ScalarValue};
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::file_stream::FileOpenFuture;
 use datafusion_datasource::{ListingTableUrl, PartitionedFile, TableSchema};
 use datafusion_datasource_json::source::JsonSource;
 use datafusion_datasource_parquet::source::ParquetSource;
@@ -51,15 +48,18 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::EmissionType;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::array::types::Int64Type;
+use delta_kernel::arrow::array::{Array, AsArray, RecordBatch};
 use delta_kernel::arrow::datatypes::{FieldRef, SchemaRef as ArrowSchemaRef};
 use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
 use delta_kernel::Engine;
-use futures::stream::{BoxStream, Stream};
+use futures::stream::{self, BoxStream, Stream};
+use futures::StreamExt;
 use url::Url;
 
 use crate::exec::field_id_adapter::FieldIdPhysicalExprAdapterFactory;
@@ -67,8 +67,6 @@ use crate::exec::load_helpers::{
     apply_optional_dv, extract_column_array, optional_selection_vector_for_row,
     resolve_file_location,
 };
-use delta_kernel::arrow::array::types::Int64Type;
-use delta_kernel::arrow::array::{Array, AsArray};
 
 /// Default opener batch size. DataFusion's parquet/json openers require a non-`None` batch size
 /// before `create_file_opener` is called. The session config's `batch_size` would be nicer but
@@ -292,18 +290,19 @@ impl ExecutionPlan for LoadExec {
             Arc::clone(&self.upstream),
             Arc::clone(&context),
         )?;
-        Ok(Box::pin(LoadExecStream {
+        let stream = build_load_stream(
             upstream,
-            sink: Arc::clone(&self.sink),
-            engine: Arc::clone(&self.engine),
-            file_source: Arc::clone(&self.file_source),
-            output_schema: Arc::clone(&self.output_schema),
-            task_context: context,
-            remaining: self.limit,
-            current_batch: None,
-            next_row: 0,
-            row_state: RowState::Idle,
-        }))
+            Arc::clone(&self.sink),
+            Arc::clone(&self.engine),
+            Arc::clone(&self.file_source),
+            Arc::clone(&self.output_schema),
+            context,
+            self.limit,
+        );
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.output_schema),
+            stream,
+        )))
     }
 }
 
@@ -314,21 +313,13 @@ impl LoadExec {
     /// tests asserting pushdown shrunk the read request.
     pub(crate) fn projected_file_fields(&self) -> Vec<String> {
         let file_count = self.sink.file_schema.fields().len();
-        let file_names: Vec<String> = self
+        let names: Vec<String> = self
             .sink
             .file_schema
             .fields()
             .map(|f| f.name().clone())
             .collect();
-        match &self.projection {
-            Some(proj) => proj
-                .iter()
-                .copied()
-                .filter(|&i| i < file_count)
-                .map(|i| file_names[i].clone())
-                .collect(),
-            None => file_names,
-        }
+        self.project_names(&names, |i| i < file_count, |i| i)
     }
 
     /// Passthrough fields actually broadcast after projection pushdown -- the subset of
@@ -336,44 +327,50 @@ impl LoadExec {
     /// for tests.
     pub(crate) fn projected_passthrough_fields(&self) -> Vec<String> {
         let file_count = self.sink.file_schema.fields().len();
-        let pt_names: Vec<String> = self
+        let names: Vec<String> = self
             .sink
             .passthrough_columns
             .iter()
             .map(|c| c.to_string())
             .collect();
+        self.project_names(&names, |i| i >= file_count, |i| i - file_count)
+    }
+
+    /// Shared logic for the two `projected_*_fields` helpers: when `self.projection` is set,
+    /// keep indices passing `keep` and map them through `to_local` before indexing `names`;
+    /// when absent, return `names` verbatim.
+    fn project_names(
+        &self,
+        names: &[String],
+        keep: impl Fn(usize) -> bool,
+        to_local: impl Fn(usize) -> usize,
+    ) -> Vec<String> {
         match &self.projection {
             Some(proj) => proj
                 .iter()
                 .copied()
-                .filter(|&i| i >= file_count)
-                .map(|i| pt_names[i - file_count].clone())
+                .filter(|&i| keep(i))
+                .map(|i| names[to_local(i)].clone())
                 .collect(),
-            None => pt_names,
+            None => names.to_vec(),
         }
     }
 }
 
-/// Stream-time state for the row currently being processed.
-enum RowState {
-    /// No active file. Need to advance to the next upstream row.
-    Idle,
-    /// Awaiting the [`FileOpenFuture`] for a row's file.
-    Opening {
-        mask: Option<Vec<bool>>,
-        future: FileOpenFuture,
-    },
-    /// Streaming opener-produced batches for a row's file.
-    Scanning {
-        mask: Option<Vec<bool>>,
-        stream: BoxStream<'static, DfResult<RecordBatch>>,
-        /// File-local row cursor, advanced by each opener batch we apply DV to.
-        file_row_cursor: usize,
-    },
+/// An opened file's running batch stream + DV mask + file-local row cursor. Built by
+/// [`open_file_for_row`] and held in [`LoadStreamState::active`] while we drain it.
+struct ActiveFile {
+    mask: Option<Vec<bool>>,
+    stream: BoxStream<'static, DfResult<RecordBatch>>,
+    /// File-local row cursor, advanced by each opener batch we apply DV to.
+    file_row_cursor: usize,
 }
 
-/// `Stream<Item = Result<RecordBatch>>` + [`RecordBatchStream`] driver for [`LoadExec`].
-struct LoadExecStream {
+/// State carried through [`stream::unfold`] in [`build_load_stream`]: upstream + per-execute
+/// kernel/source handles + the limit budget + the currently-open file (if any) + the
+/// upstream-batch row walker. Each iteration yields zero or one [`RecordBatch`] and rethreads
+/// the state.
+struct LoadStreamState {
     upstream: SendableRecordBatchStream,
     sink: Arc<LoadSink>,
     engine: Arc<dyn Engine>,
@@ -382,213 +379,193 @@ struct LoadExecStream {
     task_context: Arc<TaskContext>,
     /// Remaining row budget. `None` = unbounded. When `Some(0)` the stream is finished.
     remaining: Option<usize>,
-    /// Current upstream batch we're walking. `None` until we pull the first; reset on
-    /// exhaustion.
-    current_batch: Option<RecordBatch>,
-    /// Next row to start within `current_batch`.
-    next_row: usize,
-    /// Per-row state machine: Idle -> Opening -> Scanning -> Idle (next row).
-    row_state: RowState,
+    /// Currently-open file we're streaming batches from, if any.
+    active: Option<ActiveFile>,
+    /// Current upstream batch + next row index within it. `None` between batches.
+    cursor: Option<(RecordBatch, usize)>,
 }
 
-impl LoadExecStream {
-    /// Resolve the next upstream row into an `Opening` row state: parse file URL + size,
-    /// resolve an optional DV mask via kernel, extract per-row [`ScalarValue`]s for every
-    /// passthrough column (stamped onto [`PartitionedFile::partition_values`] for the opener
-    /// to broadcast), then construct the DataFusion file opener (with
-    /// [`FieldIdPhysicalExprAdapterFactory`] for parquet) and start the file-open future.
-    fn start_open_row(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-    ) -> Result<RowState, DataFusionError> {
-        let path_cn = &self.sink.file_meta.path;
-        let path_arr = extract_column_array(batch, path_cn)?;
-        if path_arr.is_null(row) {
-            return Err(crate::error::plan_compilation(format!(
-                "Load sink path column `{path_cn}` was NULL at upstream row {row}"
-            )));
-        }
-        // Path columns are always Utf8 per kernel's scan_live_actions_schema (STRING).
-        let path_raw = path_arr.as_string::<i32>().value(row);
-        let url = resolve_file_location(self.sink.as_ref(), path_raw)?;
-
-        let mask = optional_selection_vector_for_row(
-            batch,
-            self.sink.as_ref(),
-            row,
-            self.engine.as_ref(),
-        )?;
-        let size = file_size_for_row(batch, self.sink.as_ref(), row, &url)?;
-
-        // Per-row partition_values: one `ScalarValue` per passthrough field declared on
-        // `file_source.table_schema().table_partition_cols()`. The opener's
-        // `replace_columns_with_literals` (parquet) / `ProjectionOpener` (json) sees these as
-        // file-constant literal columns and broadcasts them to every emitted batch. No bespoke
-        // per-batch `take` broadcast on our side.
-        let partition_values = self.extract_partition_values(batch, row)?;
-
-        let (object_store_url, mut partitioned_file) = into_partitioned_file(&url, size)?;
-        partitioned_file.partition_values = partition_values;
-        let object_store = self
-            .task_context
-            .runtime_env()
-            .object_store(&object_store_url)?;
-
-        // `create_file_opener` only consults `object_store`, `expr_adapter_factory`, `limit`,
-        // `preserve_order` -- not the file groups -- so leaving them empty is fine; we feed
-        // the actual file directly into `opener.open(...)`.
-        let base_config = FileScanConfigBuilder::new(object_store_url, Arc::clone(&self.file_source))
-            .with_expr_adapter(adapter_factory_for(self.sink.file_type))
-            .build();
-        let opener = self
-            .file_source
-            .create_file_opener(object_store, &base_config, 0)?;
-        let future = opener.open(partitioned_file)?;
-
-        Ok(RowState::Opening { mask, future })
-    }
-
-    /// Pre-extract one [`ScalarValue`] per passthrough column declared on the file source's
-    /// `table_partition_cols`. Indices line up positionally with the source's partition col
-    /// declarations because both came from `sink.passthrough_columns` in original order.
-    fn extract_partition_values(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-    ) -> Result<Vec<ScalarValue>, DataFusionError> {
-        let pt_fields: &[FieldRef] = self.file_source.table_schema().table_partition_cols();
-        let mut out = Vec::with_capacity(pt_fields.len());
-        for (cn, _field) in self.sink.passthrough_columns.iter().zip(pt_fields.iter()) {
-            let arr = extract_column_array(batch, cn)?;
-            out.push(ScalarValue::try_from_array(arr.as_ref(), row)?);
-        }
-        Ok(out)
-    }
-
-    /// Take one opener batch, apply DV mask if present, then re-stamp the kernel-declared
-    /// schema metadata onto the result. The opener already broadcast partition values into the
-    /// batch and ran logical-name reshape via [`FieldIdPhysicalExprAdapterFactory`], so
-    /// nothing else needs to be assembled here.
-    fn assemble_output(
-        &self,
-        rb: RecordBatch,
-        mask: Option<&[bool]>,
-        file_row_cursor: &mut usize,
-    ) -> Result<RecordBatch, DataFusionError> {
-        let pre_dv_rows = rb.num_rows();
-        let cursor = *file_row_cursor;
-        *file_row_cursor += pre_dv_rows;
-        let masked = apply_optional_dv(rb, mask, cursor)?;
-        crate::exec::stamp_batch_metadata(&masked, &self.output_schema)
-    }
-}
-
-impl Stream for LoadExecStream {
-    type Item = DfResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+/// Build the [`LoadExec`] output stream: walk upstream rows, open one file per row through the
+/// configured [`FileSource`] opener, then yield each opener-produced batch (DV-masked +
+/// metadata-restamped) downstream. Returns an `impl Stream` so callers wrap it in a
+/// [`RecordBatchStreamAdapter`] to attach the output schema.
+fn build_load_stream(
+    upstream: SendableRecordBatchStream,
+    sink: Arc<LoadSink>,
+    engine: Arc<dyn Engine>,
+    file_source: Arc<dyn datafusion_datasource::file::FileSource>,
+    output_schema: ArrowSchemaRef,
+    task_context: Arc<TaskContext>,
+    limit: Option<usize>,
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    let state = LoadStreamState {
+        upstream,
+        sink,
+        engine,
+        file_source,
+        output_schema,
+        task_context,
+        remaining: limit,
+        active: None,
+        cursor: None,
+    };
+    stream::unfold(state, |mut s| async move {
         loop {
             // 0) Limit exhausted? End-of-stream without doing any more I/O.
-            if matches!(self.remaining, Some(0)) {
-                self.row_state = RowState::Idle;
-                self.current_batch = None;
-                return Poll::Ready(None);
+            if matches!(s.remaining, Some(0)) {
+                return None;
             }
-
-            // 1) Drive whichever per-row state is active.
-            match std::mem::replace(&mut self.row_state, RowState::Idle) {
-                RowState::Scanning {
-                    mask,
-                    mut stream,
-                    mut file_row_cursor,
-                } => match stream.as_mut().poll_next(cx) {
-                    Poll::Pending => {
-                        self.row_state = RowState::Scanning {
-                            mask,
-                            stream,
-                            file_row_cursor,
+            // 1) If a file is currently open, pull its next batch.
+            if let Some(active) = s.active.as_mut() {
+                match active.stream.next().await {
+                    Some(Ok(rb)) => {
+                        let assembled = match assemble_output(
+                            rb,
+                            active.mask.as_deref(),
+                            &mut active.file_row_cursor,
+                            &s.output_schema,
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => return Some((Err(e), s)),
                         };
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                    Poll::Ready(Some(Ok(rb))) => {
-                        let assembled =
-                            match self.assemble_output(rb, mask.as_deref(), &mut file_row_cursor) {
-                                Ok(batch) => batch,
-                                Err(e) => return Poll::Ready(Some(Err(e))),
-                            };
                         let mut out = assembled;
-                        if let Some(rem) = self.remaining.as_mut() {
+                        if let Some(rem) = s.remaining.as_mut() {
                             if out.num_rows() > *rem {
                                 out = out.slice(0, *rem);
                             }
                             *rem -= out.num_rows();
                         }
-                        // Reinstate the scanning state so the next poll continues from this
-                        // same file iterator (subject to the budget check at step 0).
-                        self.row_state = RowState::Scanning {
-                            mask,
-                            stream,
-                            file_row_cursor,
-                        };
-                        return Poll::Ready(Some(Ok(out)));
+                        return Some((Ok(out), s));
                     }
-                    Poll::Ready(None) => {
-                        // File exhausted; fall through to advance to next upstream row.
-                    }
-                },
-                RowState::Opening { mask, mut future } => match future.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.row_state = RowState::Opening { mask, future };
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-                    Poll::Ready(Ok(stream)) => {
-                        self.row_state = RowState::Scanning {
-                            mask,
-                            stream,
-                            file_row_cursor: 0,
-                        };
-                        continue;
-                    }
-                },
-                RowState::Idle => {}
-            }
-
-            // 2) No active state. Try to advance to the next upstream row.
-            if let Some(batch) = self.current_batch.clone() {
-                if self.next_row < batch.num_rows() {
-                    let row = self.next_row;
-                    self.next_row += 1;
-                    self.row_state = match self.start_open_row(&batch, row) {
-                        Ok(state) => state,
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    };
-                    continue;
-                }
-                // Current upstream batch exhausted; drop it and pull the next.
-                self.current_batch = None;
-                self.next_row = 0;
-            }
-            // 3) Pull the next upstream batch.
-            match Pin::new(&mut self.upstream).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(Some(Ok(upstream_batch))) => {
-                    self.current_batch = Some(upstream_batch);
-                    self.next_row = 0;
+                    Some(Err(e)) => return Some((Err(e), s)),
+                    None => s.active = None, // file exhausted; advance to next row
                 }
             }
+            // 2) Open the next upstream row's file, pulling more upstream batches as needed. Loop
+            //    body either opens a file (breaks the inner loop and the outer continues so the new
+            //    file gets drained on the next iteration), or hits upstream EOF (returns None,
+            //    ending the unfold).
+            let row_to_open: Option<(RecordBatch, usize)> = loop {
+                if let Some((batch, row)) = s.cursor.as_mut() {
+                    if *row < batch.num_rows() {
+                        let r = *row;
+                        *row += 1;
+                        // `RecordBatch` clone is shallow (Arc-shared columns) so this doesn't
+                        // copy any data.
+                        break Some((batch.clone(), r));
+                    }
+                    s.cursor = None;
+                }
+                match s.upstream.next().await {
+                    Some(Ok(b)) => s.cursor = Some((b, 0)),
+                    Some(Err(e)) => return Some((Err(e), s)),
+                    None => break None,
+                }
+            };
+            let (batch, row) = row_to_open?;
+            match open_file_for_row(
+                &batch,
+                row,
+                s.sink.as_ref(),
+                s.engine.as_ref(),
+                &s.file_source,
+                &s.task_context,
+            )
+            .await
+            {
+                Ok(active) => s.active = Some(active),
+                Err(e) => return Some((Err(e), s)),
+            }
+            // continue outer loop to start draining the file we just opened
         }
-    }
+    })
 }
 
-impl RecordBatchStream for LoadExecStream {
-    fn schema(&self) -> ArrowSchemaRef {
-        Arc::clone(&self.output_schema)
+/// Resolve one upstream row into an [`ActiveFile`]: parse file URL + size, resolve an optional
+/// DV mask via kernel, extract per-row [`ScalarValue`]s for every passthrough column (stamped
+/// onto [`PartitionedFile::partition_values`] for the opener to broadcast), then construct the
+/// DataFusion file opener (with [`FieldIdPhysicalExprAdapterFactory`] for parquet) and await
+/// its file-open future to get back the running batch stream.
+async fn open_file_for_row(
+    batch: &RecordBatch,
+    row: usize,
+    sink: &LoadSink,
+    engine: &dyn Engine,
+    file_source: &Arc<dyn datafusion_datasource::file::FileSource>,
+    task_context: &Arc<TaskContext>,
+) -> DfResult<ActiveFile> {
+    let path_cn = &sink.file_meta.path;
+    let path_arr = extract_column_array(batch, path_cn)?;
+    if path_arr.is_null(row) {
+        return Err(crate::error::plan_compilation(format!(
+            "Load sink path column `{path_cn}` was NULL at upstream row {row}"
+        )));
     }
+    // Path columns are always Utf8 per kernel's scan_live_actions_schema (STRING).
+    let path_raw = path_arr.as_string::<i32>().value(row);
+    let url = resolve_file_location(sink, path_raw)?;
+
+    let mask = optional_selection_vector_for_row(batch, sink, row, engine)?;
+    let size = file_size_for_row(batch, sink, row, &url)?;
+
+    // Per-row partition_values: one `ScalarValue` per passthrough field declared on
+    // `file_source.table_schema().table_partition_cols()`. The opener's
+    // `replace_columns_with_literals` (parquet) / `ProjectionOpener` (json) sees these as
+    // file-constant literal columns and broadcasts them to every emitted batch. No bespoke
+    // per-batch `take` broadcast on our side.
+    let partition_values = extract_partition_values(batch, row, sink)?;
+
+    let (object_store_url, mut partitioned_file) = into_partitioned_file(&url, size)?;
+    partitioned_file.partition_values = partition_values;
+    let object_store = task_context.runtime_env().object_store(&object_store_url)?;
+
+    // `create_file_opener` only consults `object_store`, `expr_adapter_factory`, `limit`,
+    // `preserve_order` -- not the file groups -- so leaving them empty is fine; we feed the
+    // actual file directly into `opener.open(...)`.
+    let base_config = FileScanConfigBuilder::new(object_store_url, Arc::clone(file_source))
+        .with_expr_adapter(adapter_factory_for(sink.file_type))
+        .build();
+    let opener = file_source.create_file_opener(object_store, &base_config, 0)?;
+    let stream = opener.open(partitioned_file)?.await?;
+    Ok(ActiveFile {
+        mask,
+        stream,
+        file_row_cursor: 0,
+    })
+}
+
+/// Pre-extract one [`ScalarValue`] per passthrough column declared on the file source's
+/// `table_partition_cols`. Indices line up positionally with the source's partition col
+/// declarations because both came from `sink.passthrough_columns` in original order.
+fn extract_partition_values(
+    batch: &RecordBatch,
+    row: usize,
+    sink: &LoadSink,
+) -> DfResult<Vec<ScalarValue>> {
+    sink.passthrough_columns
+        .iter()
+        .map(|cn| {
+            let arr = extract_column_array(batch, cn)?;
+            ScalarValue::try_from_array(arr.as_ref(), row)
+        })
+        .collect()
+}
+
+/// Take one opener batch, apply DV mask if present, then re-stamp the kernel-declared schema
+/// metadata onto the result. The opener already broadcast partition values into the batch and
+/// ran logical-name reshape via [`FieldIdPhysicalExprAdapterFactory`], so nothing else needs to
+/// be assembled here.
+fn assemble_output(
+    rb: RecordBatch,
+    mask: Option<&[bool]>,
+    file_row_cursor: &mut usize,
+    output_schema: &ArrowSchemaRef,
+) -> DfResult<RecordBatch> {
+    let pre_dv_rows = rb.num_rows();
+    let cursor = *file_row_cursor;
+    *file_row_cursor += pre_dv_rows;
+    let masked = apply_optional_dv(rb, mask, cursor)?;
+    crate::exec::stamp_batch_metadata(&masked, output_schema)
 }
 
 /// Recursively strip per-field metadata from `field` so the resulting field's `data_type`
@@ -620,10 +597,10 @@ fn strip_field_metadata_recursive(
     Field::new(field.name(), stripped_dt, field.is_nullable())
 }
 
-/// Select the [`PhysicalExprAdapterFactory`](datafusion_physical_expr_adapter::PhysicalExprAdapterFactory)
-/// for a given file type. Parquet decoding goes through field-id/column-mapping aware
-/// adaptation; JSON keeps DataFusion's default name-based adapter (we don't ship column-mapped
-/// JSON loads today).
+/// Select the
+/// [`PhysicalExprAdapterFactory`](datafusion_physical_expr_adapter::PhysicalExprAdapterFactory) for
+/// a given file type. Parquet decoding goes through field-id/column-mapping aware adaptation; JSON
+/// keeps DataFusion's default name-based adapter (we don't ship column-mapped JSON loads today).
 fn adapter_factory_for(
     file_type: FileType,
 ) -> Option<Arc<dyn datafusion_physical_expr_adapter::PhysicalExprAdapterFactory>> {
@@ -651,7 +628,10 @@ fn into_partitioned_file(
         e_tag: None,
         version: None,
     };
-    Ok((object_store_url, PartitionedFile::new_from_meta(object_meta)))
+    Ok((
+        object_store_url,
+        PartitionedFile::new_from_meta(object_meta),
+    ))
 }
 
 fn file_size_for_row(
@@ -671,7 +651,9 @@ fn file_size_for_row(
     }
     if url.scheme() == "file" {
         let p = url.to_file_path().map_err(|()| {
-            crate::error::plan_compilation(format!("file URL could not be converted to path: {url}"))
+            crate::error::plan_compilation(format!(
+                "file URL could not be converted to path: {url}"
+            ))
         })?;
         return Ok(std::fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0));
     }
