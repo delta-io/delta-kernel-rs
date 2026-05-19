@@ -121,11 +121,9 @@ pub enum MetricEvent {
 
     /// CRC file read operation completed (one event per CRC file read).
     ///
-    /// Emitted when [`try_read_crc_file`] completes. The `duration` covers the entire function
+    /// Emitted when CRC read completes. The `duration` covers the entire function
     /// including storage IO and JSON deserialization. `bytes_read` is the raw byte count from
     /// storage (zero if the storage read failed before bytes were returned).
-    ///
-    /// [`try_read_crc_file`]: crate::crc::try_read_crc_file
     CrcReadCompleted { duration: Duration, bytes_read: u64 },
 
     /// Scan metadata iteration completed.
