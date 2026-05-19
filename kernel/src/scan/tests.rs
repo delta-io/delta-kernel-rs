@@ -18,7 +18,7 @@ use crate::expressions::{
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
+use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{
@@ -1038,7 +1038,8 @@ impl CheckpointParquetBuilder {
 
 /// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
 fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
-    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[])?;
+    let stats = all_referenced_columns(pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[], &stats)?;
     let mut prefixer = PrefixColumns {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
