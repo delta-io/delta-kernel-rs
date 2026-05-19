@@ -475,14 +475,13 @@ async fn open_parquet_file(
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.with_batch_size(batch_size).build()?;
 
-    let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
-            Some(&arrow_schema),
+            Some(&table_schema),
         )
         .map(Into::into)
     });
@@ -558,7 +557,6 @@ impl FileOpener for PresignedUrlOpener {
             let reader = builder.with_batch_size(batch_size).build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-            let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(
@@ -566,7 +564,7 @@ impl FileOpener for PresignedUrlOpener {
                     &requested_ordering,
                     row_indexes.as_mut(),
                     Some(&file_location),
-                    Some(&arrow_schema),
+                    Some(&table_schema),
                 )
                 .map(Into::into)
             });
