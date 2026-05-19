@@ -24,8 +24,9 @@ use std::cmp::Ordering;
 use error::LogHistoryError;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace};
+use url::Url;
 
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogSegment, LogSegmentFiles};
 use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -549,10 +550,33 @@ pub fn timestamp_range_to_versions(
     Ok((start_version, end_version))
 }
 
+/// Get the earliest commit available for this table. Note that this version is not guaranteed to
+/// exist when performing an action as a concurrent operation can delete the file during cleanup.
+pub fn get_earliest_delta_file(
+    engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<u64>,
+) -> DeltaResult<Version> {
+    if earliest_ratified_commit_version == Some(0) {
+        return Ok(0);
+    }
+
+    let commits =
+        LogSegmentFiles::list_commits(engine.storage_handler().as_ref(), log_root, Some(0), None)?;
+    commits
+        .ascending_commit_files
+        .first()
+        .map(|f| f.version)
+        .ok_or(DeltaError::generic(format!(
+            "No commit files found in the directory: {}",
+            log_root.as_str()
+        )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::OpenOptions;
+    use std::fs::{remove_file, OpenOptions};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
@@ -1449,6 +1473,44 @@ mod tests {
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
         let res = timestamp_range_to_versions(&snapshot, &engine, start, end);
+        match expected {
+            Ok(v) => assert_eq!(res.unwrap(), v),
+            Err(()) => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::no_ratified_commit(&[10, 20, 30], None, None, Ok(0))]
+    #[case::ratified_commit_version_0(&[10, 20, 30], Some(0), None, Ok(0))]
+    #[case::ratified_commit_version_greater_than_0(&[10, 20, 30], Some(2), None, Ok(0))]
+    #[case::log_listing_empty_no_ratified_commit(&[], None, None, Err(()))]
+    #[case::log_listing_empty_ratified_commit(&[], Some(2), None, Err(()))]
+    #[case::log_listing_empty_ratified_commit_v0(&[], Some(0), None, Ok(0))]
+    #[case::log_listing_with_cleanup_commit(&[10, 20, 30, 40], Some(4), Some(1), Ok(2))]
+    async fn test_get_earliest_delta_file(
+        #[case] commit_file_modification_ts: &[Timestamp],
+        #[case] earliest_ratified_commit_version: Option<Version>,
+        #[case] last_cleanup_version: Option<Version>,
+        #[case] expected: Result<Version, ()>,
+    ) {
+        let timestamps = commit_file_modification_ts
+            .iter()
+            .map(|ts| (*ts, None))
+            .collect::<Vec<_>>();
+        let table = mock_table_with_timestamps(&timestamps, None).await;
+        let engine = SyncEngine::new();
+        let log_root = Url::from_directory_path(table.table_root()).unwrap();
+
+        if last_cleanup_version.is_some() {
+            let delta_log_path = table.table_root().join("_delta_log");
+            for version in 0..=last_cleanup_version.unwrap() {
+                let filename = format!("{:020}.json", version);
+                remove_file(delta_log_path.join(filename)).unwrap();
+            }
+        }
+
+        let res = get_earliest_delta_file(&engine, &log_root, earliest_ratified_commit_version);
         match expected {
             Ok(v) => assert_eq!(res.unwrap(), v),
             Err(()) => assert!(res.is_err(), "{res:?}"),
