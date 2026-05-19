@@ -7,7 +7,8 @@
 //! A CRC tracks two categories of fields, updated differently:
 //! - **Metadata fields** (protocol, metadata, domain metadata, set transactions, in-commit
 //!   timestamp): merged from the delta. Protocol/metadata replace when the delta carries them;
-//!   DM/txn upsert by key; ICT unconditionally replaces the base (whether `Some` or `None`).
+//!   domain metadata upserts non-tombstones and removes tombstones; set transactions upsert by
+//!   app_id; ICT unconditionally replaces the base (whether `Some` or `None`).
 //! - **File stats** ([`FileStatsState`]): only updated when the state is `Complete` and
 //!   `delta.is_incremental_safe`. Once the state degrades (e.g. a non-incremental operation like
 //!   ANALYZE STATS, or a missing file size), file stats stop updating for the lifetime of that CRC.
@@ -110,8 +111,9 @@ impl Crc {
     /// Apply a commit delta.
     /// - Protocol / metadata: replaced when present in the delta, kept otherwise.
     /// - ICT: unconditional replace (whether `Some` or `None`).
-    /// - Domain metadata / set transactions: upserted by key into the existing map; the
-    ///   `Complete`/`Partial` variant is preserved.
+    /// - Domain metadata: tombstones (`is_removed()`) drop the key from the base map; all others
+    ///   upsert by domain. Set transactions: upsert by app_id. The `Complete`/`Partial` variant is
+    ///   preserved in both cases.
     /// - File stats: governed by the [`FileStatsState`] state machine.
     pub(crate) fn apply(&mut self, delta: CrcDelta) {
         // Protocol and metadata: replace if present.

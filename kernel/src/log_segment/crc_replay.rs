@@ -17,7 +17,7 @@
 //! # Preconditions
 //!
 //! The caller is responsible for:
-//! 1. Pruning the segment to commits in `(X, N]`, typically via [`Self::segment_after_crc`].
+//! 1. Pruning the segment to commits in `(X, N]`, typically via [`LogSegment::segment_after_crc`].
 //! 2. Short-circuiting `X == N` before invoking this method (just clone the base).
 //!
 //! # Per-commit boundaries
@@ -42,7 +42,7 @@ use crate::actions::{
 use crate::crc::{Crc, CrcDelta, FileSizeHistogram, FileStatsDelta};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef};
-use crate::{DeltaResult, Engine, RowVisitor, Version};
+use crate::{DeltaResult, Engine, Error, RowVisitor, Version};
 
 fn crc_replay_schema() -> DeltaResult<SchemaRef> {
     let projected = get_commit_schema().project_as_struct(&[
@@ -62,6 +62,12 @@ fn crc_replay_schema() -> DeltaResult<SchemaRef> {
 impl LogSegment {
     /// Reverse-replay this log segment, producing a [`CrcDelta`] that advances `base` (at
     /// `base_version`) to `self.end_version`. See the [module docs](self) for preconditions.
+    ///
+    /// Errors if `base_version >= self.end_version` (caller should short-circuit `X == N`
+    /// before calling; `>` is malformed input).
+    // TODO: once `Crc` carries its version (loaded from the `.crc` filename), drop the
+    //       `base_version` parameter and use `base.version` directly. Avoids the footgun
+    //       of mismatching `base` and `base_version`.
     #[instrument(name = "log_seg.build_crc_delta_from_stale", skip_all, err)]
     pub(crate) fn build_crc_delta_from_stale(
         &self,
@@ -69,6 +75,13 @@ impl LogSegment {
         base: &Crc,
         base_version: Version,
     ) -> DeltaResult<CrcDelta> {
+        if base_version >= self.end_version {
+            return Err(Error::internal_error(format!(
+                "build_crc_delta_from_stale: base_version ({base_version}) must be strictly \
+                 less than end_version ({})",
+                self.end_version,
+            )));
+        }
         // Empty histogram with the base's bucket boundaries so `Crc::apply`'s merge
         // lines up. `None` if the base has no histogram (skip histogram entirely).
         let seed_histogram = base
@@ -165,7 +178,8 @@ impl CrcReplayAccumulator {
     }
 
     /// Visitor calls this with each batch's `_file` URL. On a file-to-file transition,
-    /// finalizes the prior commit and locks ICT (only the newest commit may set it).
+    /// runs the prior commit's per-commit invariant via [`process_commit_file_end`] and
+    /// sets `is_first_commit = false` so subsequent (older) commits skip the ICT write.
     fn process_batch_start(&mut self, batch_file_url: String) {
         let is_new_file = self.current_file_url.as_deref() != Some(batch_file_url.as_str());
         if !is_new_file {
@@ -204,6 +218,21 @@ impl CrcReplayAccumulator {
 // Visitor
 // ============================================================================
 
+// === Visitor column indices ===
+// Must match the order in `selected_column_names_and_types` below.
+const COL_FILE: usize = 0;
+const COL_OP: usize = 1;
+const COL_ICT: usize = 2;
+const COL_ADD_SIZE: usize = 3;
+const COL_REMOVE_PATH: usize = 4;
+const COL_REMOVE_SIZE: usize = 5;
+const COL_DM_DOMAIN: usize = 6;
+const COL_DM_CONFIG: usize = 7;
+const COL_DM_REMOVED: usize = 8;
+const COL_TXN_APP_ID: usize = 9;
+const COL_TXN_VERSION: usize = 10;
+const COL_TXN_LAST_UPDATED: usize = 11;
+
 /// Single-batch visitor that folds row-level data into the accumulator.
 struct CrcReplayVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
@@ -214,18 +243,18 @@ impl RowVisitor for CrcReplayVisitor<'_> {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             (
                 vec![
-                    ColumnName::new(["_file"]),                           // 0
-                    ColumnName::new(["commitInfo", "operation"]),         // 1
-                    ColumnName::new(["commitInfo", "inCommitTimestamp"]), // 2
-                    ColumnName::new(["add", "size"]),                     // 3
-                    ColumnName::new(["remove", "path"]),                  // 4
-                    ColumnName::new(["remove", "size"]),                  // 5
-                    ColumnName::new(["domainMetadata", "domain"]),        // 6
-                    ColumnName::new(["domainMetadata", "configuration"]), // 7
-                    ColumnName::new(["domainMetadata", "removed"]),       // 8
-                    ColumnName::new(["txn", "appId"]),                    // 9
-                    ColumnName::new(["txn", "version"]),                  // 10
-                    ColumnName::new(["txn", "lastUpdated"]),              // 11
+                    ColumnName::new(["_file"]),
+                    ColumnName::new(["commitInfo", "operation"]),
+                    ColumnName::new(["commitInfo", "inCommitTimestamp"]),
+                    ColumnName::new(["add", "size"]),
+                    ColumnName::new(["remove", "path"]),
+                    ColumnName::new(["remove", "size"]),
+                    ColumnName::new(["domainMetadata", "domain"]),
+                    ColumnName::new(["domainMetadata", "configuration"]),
+                    ColumnName::new(["domainMetadata", "removed"]),
+                    ColumnName::new(["txn", "appId"]),
+                    ColumnName::new(["txn", "version"]),
+                    ColumnName::new(["txn", "lastUpdated"]),
                 ],
                 vec![
                     DataType::STRING,
@@ -253,28 +282,36 @@ impl RowVisitor for CrcReplayVisitor<'_> {
         }
         // `_file` is constant across all rows of a batch per the JsonHandler contract.
         // Read once from row 0 and signal a potential file (commit) transition.
-        let file_url: String = getters[0].get(0, "_file")?;
+        let file_url: String = getters[COL_FILE].get(0, "_file")?;
         self.acc.process_batch_start(file_url);
 
         let file_stats = &mut self.acc.delta.file_stats;
         for i in 0..row_count {
             // commitInfo: operation safety + ICT for the first (newest) commit only.
-            let operation: Option<String> = getters[1].get_opt(i, "commitInfo.operation")?;
+            let operation: Option<String> = getters[COL_OP].get_opt(i, "commitInfo.operation")?;
             if let Some(op) = operation {
                 self.acc.current_commit_saw_commit_info = true;
                 if !FileStatsDelta::is_incremental_safe(&op) {
                     warn!("CRC reverse-replay: non-incremental op {op:?}");
                     self.acc.delta.is_incremental_safe = false;
                 }
+                // ICT capture is unchecked here on purpose: we do not flip
+                // `is_incremental_safe` (which is for file-stats tracking, not ICT) and
+                // we do not cross-reference the table's protocol. A newest commit that
+                // omits `inCommitTimestamp` on an ICT-enabled table will produce a delta
+                // whose `in_commit_timestamp = None`, and the apply step will propagate
+                // that `None` into the CRC. The catch-net is `try_write_crc_file` in
+                // `crc/writer.rs`, which rejects writing a CRC whose ICT field
+                // disagrees with the protocol's `inCommitTimestamp` feature enablement.
                 if self.acc.is_first_commit {
                     self.acc.delta.in_commit_timestamp =
-                        getters[2].get_opt(i, "commitInfo.inCommitTimestamp")?;
+                        getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
                 }
             }
 
             // Add: net file count and bytes contribution. The histogram insert uses bin
             // boundaries seeded from the base CRC; skipped when base has no histogram.
-            if let Some(size) = getters[3].get_opt(i, "add.size")? {
+            if let Some(size) = getters[COL_ADD_SIZE].get_opt(i, "add.size")? {
                 self.acc.current_commit_saw_file_action = true;
                 let size: i64 = size;
                 file_stats.net_files += 1;
@@ -287,10 +324,11 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             // Remove: `remove.path` detects presence; null `remove.size` alongside non-null
             // path means "remove with missing size", which makes incremental tracking
             // impossible.
-            let remove_path: Option<String> = getters[4].get_opt(i, "remove.path")?;
+            let remove_path: Option<String> = getters[COL_REMOVE_PATH].get_opt(i, "remove.path")?;
             if let Some(path) = remove_path {
                 self.acc.current_commit_saw_file_action = true;
-                let remove_size: Option<i64> = getters[5].get_opt(i, "remove.size")?;
+                let remove_size: Option<i64> =
+                    getters[COL_REMOVE_SIZE].get_opt(i, "remove.size")?;
                 if let Some(size) = remove_size {
                     file_stats.net_files -= 1;
                     file_stats.net_bytes -= size;
@@ -305,13 +343,14 @@ impl RowVisitor for CrcReplayVisitor<'_> {
 
             // DomainMetadata: first-seen-wins per domain. Tombstones (`removed=true`) are
             // kept; [`Crc::apply`] consumes them as removals from the base map.
-            let dm_domain: Option<String> = getters[6].get_opt(i, "domainMetadata.domain")?;
+            let dm_domain: Option<String> =
+                getters[COL_DM_DOMAIN].get_opt(i, "domainMetadata.domain")?;
             if let Some(domain) = dm_domain {
                 if let Entry::Vacant(e) = self.acc.delta.domain_metadata.entry(domain.clone()) {
-                    let configuration: String = getters[7]
+                    let configuration: String = getters[COL_DM_CONFIG]
                         .get_opt(i, "domainMetadata.configuration")?
                         .unwrap_or_default();
-                    let removed: bool = getters[8]
+                    let removed: bool = getters[COL_DM_REMOVED]
                         .get_opt(i, "domainMetadata.removed")?
                         .unwrap_or(false);
                     let dm = if removed {
@@ -324,11 +363,12 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             }
 
             // SetTransaction: first-seen-wins per app_id.
-            let txn_app_id: Option<String> = getters[9].get_opt(i, "txn.appId")?;
+            let txn_app_id: Option<String> = getters[COL_TXN_APP_ID].get_opt(i, "txn.appId")?;
             if let Some(app_id) = txn_app_id {
                 if let Entry::Vacant(e) = self.acc.delta.set_transactions.entry(app_id.clone()) {
-                    let version: i64 = getters[10].get(i, "txn.version")?;
-                    let last_updated: Option<i64> = getters[11].get_opt(i, "txn.lastUpdated")?;
+                    let version: i64 = getters[COL_TXN_VERSION].get(i, "txn.version")?;
+                    let last_updated: Option<i64> =
+                        getters[COL_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
                     e.insert(SetTransaction::new(app_id, version, last_updated));
                 }
             }
@@ -408,8 +448,8 @@ mod tests {
         }})
     }
 
-    /// Remove with `path` set but `size` missing: trips `is_incremental_safe = false` via
-    /// the accumulator's `has_missing_remove_size` internal flag.
+    /// Remove with `path` set but `size` missing. The visitor flips
+    /// `delta.is_incremental_safe = false` when it encounters this row.
     fn remove_without_size(path: &str) -> Value {
         json!({"remove": {
             "path": path,
@@ -556,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_safe_commits_accumulate() {
+    async fn two_safe_commits_accumulate_file_stats_correctly() {
         let (engine, segment) = setup_table(vec![
             vec![add("a", 100), commit_info("WRITE")],
             vec![add("b", 200), add("c", 300), commit_info("WRITE")],
@@ -767,6 +807,66 @@ mod tests {
         assert_eq!(base.metadata.id(), "updated-table");
     }
 
+    /// Two commits each carry a protocol action; the newer one (commit 2 in reverse
+    /// iteration) wins. Pins the `is_none()` guard at the protocol-extraction call site.
+    #[tokio::test]
+    async fn protocol_in_segment_newest_in_reverse_wins() {
+        let p_v1 = json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 1}});
+        let p_v2 = json!({"protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["columnMapping"],
+            "writerFeatures": ["columnMapping"]
+        }});
+        let (engine, segment) = setup_table(vec![
+            vec![p_v1, commit_info("WRITE")],
+            vec![p_v2, commit_info("WRITE")],
+        ])
+        .await;
+
+        let base = complete_base(0, 0);
+        let delta = segment
+            .build_crc_delta_from_stale(&engine, &base, 0)
+            .unwrap();
+        let p = delta.protocol.expect("newest protocol must win");
+        assert_eq!(p.min_reader_version(), 3);
+        assert_eq!(p.min_writer_version(), 7);
+    }
+
+    /// Pins the `c.version > base_version` filter (strict-greater). Without this, an
+    /// off-by-one to `>=` or `> base_version + 1` would silently regress.
+    #[tokio::test]
+    async fn base_version_filter_is_strictly_greater() {
+        // Two appended commits at v1 and v2.
+        let (engine, segment) = setup_table(vec![
+            vec![add("a", 100), commit_info("WRITE")], // v1
+            vec![add("b", 200), commit_info("WRITE")], // v2
+        ])
+        .await;
+
+        // base_version = 1 → only v2 in the replay range → +1 file, +200 bytes.
+        let delta = segment
+            .build_crc_delta_from_stale(&engine, &complete_base(0, 0), 1)
+            .unwrap();
+        assert_eq!(delta.file_stats.net_files, 1);
+        assert_eq!(delta.file_stats.net_bytes, 200);
+    }
+
+    /// `base_version >= end_version` is a caller precondition violation; the function
+    /// returns an internal error rather than silently producing a no-op delta.
+    #[tokio::test]
+    async fn base_version_at_or_above_end_version_errors() {
+        let (engine, segment) = setup_table(vec![vec![add("a", 100), commit_info("WRITE")]]).await;
+        // end_version is 1 (v0 CREATE + v1 commit). Pass base_version=1 → equal → error.
+        let err = segment
+            .build_crc_delta_from_stale(&engine, &complete_base(0, 0), 1)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("base_version"),
+            "expected base_version precondition error, got: {err}"
+        );
+    }
+
     #[rstest]
     #[case::default_boundaries(None)]
     #[case::custom_boundaries(Some(vec![0i64, 200, 1000]))]
@@ -836,5 +936,83 @@ mod tests {
         assert_eq!(stats.num_files(), 10);
         assert_eq!(stats.table_size_bytes(), 1000);
         assert!(base.file_stats_state().is_complete());
+    }
+
+    // ===== Direct accumulator tests (bypass the engine) =====
+    //
+    // The engine emits at most one batch per file in current tests, so the per-commit
+    // flag accumulation across batches of the SAME file is not reachable from the
+    // engine-driven tests above. These tests drive `process_batch_start` and the
+    // per-commit flags directly, simulating arbitrary N files × M batches sequences.
+
+    /// One step in a simulated visitor run: `(file_url, "F" for file action / "C" for
+    /// commitInfo / "FC" for both / "" for neither)`.
+    type AccStep<'a> = (&'a str, &'a str);
+
+    fn drive_accumulator(steps: &[AccStep<'_>]) -> CrcReplayAccumulator {
+        let mut acc = CrcReplayAccumulator::with_histogram(None);
+        for (url, actions) in steps {
+            acc.process_batch_start((*url).to_string());
+            if actions.contains('F') {
+                acc.current_commit_saw_file_action = true;
+            }
+            if actions.contains('C') {
+                acc.current_commit_saw_commit_info = true;
+            }
+        }
+        // Mimic `build_crc_delta_from_stale`'s end-of-replay finalize.
+        acc.process_commit_file_end();
+        acc
+    }
+
+    /// N files × M batches per file. The per-commit invariant (file action ⇒ commitInfo)
+    /// must hold per-file, with flags accumulating across same-URL batches.
+    #[rstest]
+    // 1 file × 1 batch
+    #[case::one_file_complete(&[("a", "FC")], true)]
+    #[case::one_file_no_commit_info(&[("a", "F")], false)]
+    #[case::one_file_no_file_action(&[("a", "C")], true)]
+    // 1 file × M batches: per-commit flags persist across batches of the same file.
+    #[case::one_file_actions_split_across_batches(
+        &[("a", "F"), ("a", ""), ("a", "C")], true
+    )]
+    #[case::one_file_no_commit_info_across_batches(
+        &[("a", "F"), ("a", ""), ("a", "")], false
+    )]
+    // N files × 1 batch each
+    #[case::two_files_both_complete(&[("b", "FC"), ("a", "FC")], true)]
+    #[case::two_files_second_missing_commit_info(&[("b", "FC"), ("a", "F")], false)]
+    #[case::two_files_first_missing_commit_info(&[("b", "F"), ("a", "FC")], false)]
+    // N files × M batches each
+    #[case::two_files_each_split_into_two_batches(
+        &[("b", "F"), ("b", "C"), ("a", "F"), ("a", "C")], true
+    )]
+    #[case::three_files_mixed_layouts(
+        &[("c", "FC"), ("b", "F"), ("b", "C"), ("a", "FC")], true
+    )]
+    fn accumulator_per_commit_invariant_across_files_and_batches(
+        #[case] steps: &[AccStep<'_>],
+        #[case] expected_is_incremental_safe: bool,
+    ) {
+        let acc = drive_accumulator(steps);
+        assert_eq!(acc.delta.is_incremental_safe, expected_is_incremental_safe);
+    }
+
+    /// `is_first_commit` flips on the first file transition (and only then). Same-URL
+    /// batches don't flip; subsequent (older) file transitions don't flip again.
+    #[rstest]
+    #[case::single_file_one_batch(&[("a", "")], true)]
+    #[case::single_file_multi_batches(&[("a", ""), ("a", ""), ("a", "")], true)]
+    #[case::two_files(&[("b", ""), ("a", "")], false)]
+    #[case::two_files_multi_batches_each(
+        &[("b", ""), ("b", ""), ("a", ""), ("a", "")], false
+    )]
+    #[case::many_files(&[("c", ""), ("b", ""), ("a", "")], false)]
+    fn is_first_commit_flips_exactly_on_first_file_boundary(
+        #[case] steps: &[AccStep<'_>],
+        #[case] expected_is_first_commit_at_end: bool,
+    ) {
+        let acc = drive_accumulator(steps);
+        assert_eq!(acc.is_first_commit, expected_is_first_commit_at_end);
     }
 }

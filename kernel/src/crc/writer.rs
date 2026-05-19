@@ -3,23 +3,54 @@
 use url::Url;
 
 use super::Crc;
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`Error::ChecksumWriteUnsupported`] if `file_stats_state` is not
-/// `Complete` (only `Complete` CRCs have a well-defined on-disk representation). Per the
-/// Delta protocol, writers MUST NOT overwrite existing CRC files, so this always writes
-/// with `overwrite = false`. If the file already exists, returns
+/// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
+/// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
+///   representation); or
+/// - the protocol enables the `inCommitTimestamp` writer feature but `in_commit_timestamp_opt` is
+///   `None` (or vice versa). Per the spec, ICT presence in a CRC must match the table feature's
+///   enablement. This is the catch-net for malformed input — including malformed commits that
+///   [`LogSegment::build_crc_delta_from_stale`] passes through unchecked.
+///
+/// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
+/// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
+///
+/// [`LogSegment::build_crc_delta_from_stale`]:
+///     crate::log_segment::LogSegment::build_crc_delta_from_stale
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
         Error::ChecksumWriteUnsupported(format!(
             "Cannot write CRC file with {:?} file stats",
             crc.file_stats_state
+        ))
+    );
+    // Spec invariant: `inCommitTimestampOpt` is present in the CRC iff the table has the
+    // `inCommitTimestamp` writer feature enabled. A mismatch means the source data was
+    // malformed (e.g. a commit at the end version omitted commitInfo on an ICT-enabled
+    // table); refuse to persist the corruption.
+    let ict_feature_enabled = crc
+        .protocol
+        .has_table_feature(&TableFeature::InCommitTimestamp);
+    let ict_value_present = crc.in_commit_timestamp_opt.is_some();
+    require!(
+        ict_feature_enabled == ict_value_present,
+        Error::ChecksumWriteUnsupported(format!(
+            "Cannot write CRC file: in_commit_timestamp_opt is {} but inCommitTimestamp \
+             writer feature is {}",
+            if ict_value_present { "Some" } else { "None" },
+            if ict_feature_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
         ))
     );
     let data = serde_json::to_vec(crc)?;
@@ -214,5 +245,83 @@ mod tests {
         crc.file_stats_state = FileStatsState::Indeterminate;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
+    }
+
+    #[test]
+    fn test_write_rejects_ict_feature_without_value() {
+        // Protocol enables `inCommitTimestamp` but the CRC's `in_commit_timestamp_opt` is
+        // None — could happen if reverse replay produced a malformed delta (e.g. the
+        // newest commit's commitInfo lacked the field). The write path must catch this.
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store);
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        let mut crc = test_crc();
+        crc.in_commit_timestamp_opt = None;
+        let err = try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap_err();
+        assert!(
+            matches!(err, Error::ChecksumWriteUnsupported(_)),
+            "expected ChecksumWriteUnsupported, got: {err:?}"
+        );
+        assert!(err.to_string().contains("in_commit_timestamp_opt"));
+    }
+
+    #[test]
+    fn test_write_rejects_ict_value_without_feature() {
+        // Symmetric case: CRC has an ICT value but the protocol does NOT enable
+        // `inCommitTimestamp`. Also malformed; the write path rejects it.
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store);
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        let mut crc = test_crc();
+        crc.protocol = Protocol::try_new_modern(
+            [TableFeature::ColumnMapping],
+            [TableFeature::ColumnMapping], // <-- ICT removed
+        )
+        .unwrap();
+        // crc.in_commit_timestamp_opt is still Some from test_crc().
+        let err = try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap_err();
+        assert!(matches!(err, Error::ChecksumWriteUnsupported(_)));
+    }
+
+    #[test]
+    fn test_write_accepts_neither_ict_feature_nor_value() {
+        // ICT feature disabled AND in_commit_timestamp_opt None → consistent, accepted.
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store);
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        let mut crc = test_crc();
+        crc.protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
+                .unwrap();
+        crc.in_commit_timestamp_opt = None;
+        try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
+    }
+
+    #[test]
+    fn test_write_with_partial_dm_succeeds_and_persists_no_dm_field() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        let mut crc = test_crc();
+        crc.domain_metadata_state = DomainMetadataState::Partial(HashMap::from([(
+            "k".to_string(),
+            DomainMetadata::new("k".to_string(), "v".to_string()),
+        )]));
+
+        try_write_crc_file(&engine, path.location.as_url(), &crc).unwrap();
+
+        let read_back = try_read_crc_file(&engine, &path).unwrap();
+        assert_eq!(
+            read_back.domain_metadata_state,
+            DomainMetadataState::Partial(HashMap::new())
+        );
     }
 }
