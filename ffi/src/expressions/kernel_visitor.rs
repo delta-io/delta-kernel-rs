@@ -598,12 +598,14 @@ pub extern "C" fn visit_predicate_in(
 /// (e.g. `STARTS_WITH`, `LIKE`) through the kernel without registering a native Rust-side
 /// evaluator.
 ///
-/// Kernel-side pruning behavior depends on the name. Names recognized by the internal
-/// `skipping` shim (`STARTS_WITH`) participate in partition pruning, stats-based file
-/// pruning, and parquet row-group skipping under Delta's default binary collation;
-/// engines using non-default collations must not push the predicate through this op.
-/// Unrecognized names opt out of every pruning pass, and the engine is responsible for
-/// filtering them at row time.
+/// The resulting op opts out of every kernel-side pruning pass; the engine is responsible
+/// for filtering at row time. Engines that want kernel-side pruning should use
+/// [`visit_predicate_opaque_with_pruning`] (or the arrow-aware
+/// [`visit_predicate_opaque_with_pruning_arrow`] for default-engine consumers), which
+/// attach [`OpaquePruningCallbacks`] to the op.
+///
+/// [`OpaquePruningCallbacks`]: crate::expressions::pruning::OpaquePruningCallbacks
+/// [`visit_predicate_opaque_with_pruning_arrow`]: visit_predicate_opaque_with_pruning_arrow
 ///
 /// Each child ID is consumed from the visitor state (an ID can only be used once). Predicate
 /// IDs are auto-promoted into expressions, mirroring `Expression::from_pred`. Returns 0 if

@@ -23,7 +23,7 @@ mod arrow_pruning;
 
 use pruning::{
     invoke_eval_on_partition_values, invoke_eval_on_row_group_stats, ChildAccessor,
-    DirectStatsProvider, OpaquePruningCallbacks, ScalarResolver, ScalarResolverImpl, StatsAccessor,
+    DirectStatsProvider, OpaquePruningCallbacks, ScalarResolver, StatsAccessor,
 };
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
@@ -196,7 +196,7 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
             return Ok(None);
         };
         let children = ChildAccessor::new(exprs);
-        let resolver = ScalarResolver::new(ScalarResolverImpl::new(eval_expr));
+        let resolver = ScalarResolver::new(eval_expr);
         Ok(invoke_eval_on_partition_values(
             cb, &self.name, children, resolver, inverted,
         ))

@@ -295,13 +295,44 @@ pub(crate) trait StatsProvider {
     fn row_count(&self) -> Option<i64>;
 }
 
+/// Borrowed handle wrapping a [`StatsProvider`] for FFI consumption.
+///
+/// String slices returned from the stats getters point into a small
+/// per-accessor arena that lives for the accessor's lifetime; the arena is
+/// freed when the accessor drops (at the end of the engine callback). The
+/// engine must copy slices it needs to retain.
 pub struct StatsAccessor<'a> {
     provider: &'a dyn StatsProvider,
+    // Strings the accessor has handed out to the engine. Each `Box<str>`'s
+    // heap allocation has a stable address; pushing to the Vec may move the
+    // `Box` itself in the Vec's backing storage, but the underlying str
+    // bytes never relocate. So slices into a `Box<str>` stay valid as long
+    // as the accessor lives.
+    arena: std::cell::RefCell<Vec<Box<str>>>,
 }
 
 impl<'a> StatsAccessor<'a> {
     pub(crate) fn new(provider: &'a dyn StatsProvider) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            arena: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Intern `s` into the per-callback arena and return a `&str` tied to
+    /// the accessor's lifetime. The slice is valid until the accessor
+    /// drops (typically when the engine callback returns).
+    fn intern(&self, s: String) -> &str {
+        let boxed = s.into_boxed_str();
+        let ptr = boxed.as_ptr();
+        let len = boxed.len();
+        self.arena.borrow_mut().push(boxed);
+        // SAFETY: the bytes at `ptr` are owned by a `Box<str>` that now
+        // lives in `self.arena`. Pushing to the Vec may relocate the
+        // `Box`'s position in the Vec, but the heap allocation it points
+        // to never moves, so `ptr` remains valid as long as `self` (and
+        // hence the arena) is alive.
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
     }
 }
 
@@ -314,8 +345,10 @@ unsafe fn column_name_from_slice(col: &KernelStringSlice) -> Option<String> {
 ///
 /// # Safety
 /// `acc` valid, `col` a valid string slice, `out` a valid pointer. The
-/// returned slice borrows kernel-owned data; engine must copy if it needs
-/// to retain past the callback.
+/// returned slice points into the accessor's per-callback arena and is
+/// valid only for the lifetime of the accessor (typically the engine
+/// callback's duration). The engine must copy if it needs to retain past
+/// the callback.
 #[no_mangle]
 pub unsafe extern "C" fn stats_accessor_min_string(
     acc: *const StatsAccessor<'_>,
@@ -332,8 +365,8 @@ pub unsafe extern "C" fn stats_accessor_min_string(
     let Some(Scalar::String(s)) = acc.provider.min(&name, &DataType::STRING) else {
         return false;
     };
-    let leaked: &'static str = Box::leak(s.into_boxed_str());
-    unsafe { *out = kernel_string_slice!(leaked) };
+    let interned = acc.intern(s);
+    unsafe { *out = kernel_string_slice!(interned) };
     true
 }
 
@@ -357,8 +390,8 @@ pub unsafe extern "C" fn stats_accessor_max_string(
     let Some(Scalar::String(s)) = acc.provider.max(&name, &DataType::STRING) else {
         return false;
     };
-    let leaked: &'static str = Box::leak(s.into_boxed_str());
-    unsafe { *out = kernel_string_slice!(leaked) };
+    let interned = acc.intern(s);
+    unsafe { *out = kernel_string_slice!(interned) };
     true
 }
 
@@ -460,35 +493,44 @@ pub unsafe extern "C" fn stats_accessor_row_count(
 
 // === ScalarResolver (partition pruning) ======================================
 
-pub(crate) struct ScalarResolverImpl<'a> {
-    eval_expr: &'a ScalarExpressionEvaluator<'a>,
-}
-
-impl<'a> ScalarResolverImpl<'a> {
-    pub(crate) fn new(eval_expr: &'a ScalarExpressionEvaluator<'a>) -> Self {
-        Self { eval_expr }
-    }
-}
-
+/// Bridge from kernel's partition-value lookup machinery to the FFI accessor
+/// surface engines use during partition pruning. Holds a reference to the
+/// kernel-side [`ScalarExpressionEvaluator`] and a small per-callback arena
+/// for strings handed back to the engine.
 pub struct ScalarResolver<'a> {
-    inner: ScalarResolverImpl<'a>,
+    eval_expr: &'a ScalarExpressionEvaluator<'a>,
+    arena: std::cell::RefCell<Vec<Box<str>>>,
 }
 
 impl<'a> ScalarResolver<'a> {
-    pub(crate) fn new(inner: ScalarResolverImpl<'a>) -> Self {
-        Self { inner }
+    pub(crate) fn new(eval_expr: &'a ScalarExpressionEvaluator<'a>) -> Self {
+        Self {
+            eval_expr,
+            arena: std::cell::RefCell::new(Vec::new()),
+        }
     }
 
     fn resolve_column(&self, col: &str) -> Option<Scalar> {
         let expr = Expression::column([col]);
-        (self.inner.eval_expr)(&expr)
+        (self.eval_expr)(&expr)
+    }
+
+    fn intern(&self, s: String) -> &str {
+        let boxed = s.into_boxed_str();
+        let ptr = boxed.as_ptr();
+        let len = boxed.len();
+        self.arena.borrow_mut().push(boxed);
+        // SAFETY: see `StatsAccessor::intern` for the equivalent argument.
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
     }
 }
 
 /// Resolve a column reference to a string scalar (partition value lookup).
 ///
 /// # Safety
-/// `acc` valid, `col` valid slice, `out` valid pointer.
+/// `acc` valid, `col` valid slice, `out` valid pointer. The returned slice
+/// points into the resolver's per-callback arena; the engine must copy if
+/// it needs to retain past the callback.
 #[no_mangle]
 pub unsafe extern "C" fn scalar_resolver_string(
     acc: *const ScalarResolver<'_>,
@@ -505,8 +547,8 @@ pub unsafe extern "C" fn scalar_resolver_string(
     let Some(Scalar::String(s)) = acc.resolve_column(&name) else {
         return false;
     };
-    let leaked: &'static str = Box::leak(s.into_boxed_str());
-    unsafe { *out = kernel_string_slice!(leaked) };
+    let interned = acc.intern(s);
+    unsafe { *out = kernel_string_slice!(interned) };
     true
 }
 
@@ -721,34 +763,32 @@ where
     E: DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar> + ?Sized,
 {
     fn min(&self, col: &str, dtype: &DataType) -> Option<Scalar> {
-        let col = column_name(col)?;
+        let col = delta_kernel::expressions::ColumnName::new([col]);
         self.evaluator.get_min_stat(&col, dtype)
     }
     fn max(&self, col: &str, dtype: &DataType) -> Option<Scalar> {
-        let col = column_name(col)?;
+        let col = delta_kernel::expressions::ColumnName::new([col]);
         self.evaluator.get_max_stat(&col, dtype)
     }
     fn null_count(&self, col: &str) -> Option<i64> {
-        let col = column_name(col)?;
+        let col = delta_kernel::expressions::ColumnName::new([col]);
         let stat = self.evaluator.get_nullcount_stat(&col)?;
-        match stat {
-            Scalar::Long(v) => Some(v),
-            Scalar::Integer(v) => Some(i64::from(v)),
-            _ => None,
-        }
+        scalar_as_i64(&stat)
     }
     fn row_count(&self) -> Option<i64> {
         let stat = self.evaluator.get_rowcount_stat()?;
-        match stat {
-            Scalar::Long(v) => Some(v),
-            Scalar::Integer(v) => Some(i64::from(v)),
-            _ => None,
-        }
+        scalar_as_i64(&stat)
     }
 }
 
-fn column_name(col: &str) -> Option<delta_kernel::expressions::ColumnName> {
-    Some(delta_kernel::expressions::ColumnName::new([col]))
+/// Widen a `Long`/`Integer` scalar to `i64`. Returns `None` for any other
+/// variant.
+fn scalar_as_i64(scalar: &Scalar) -> Option<i64> {
+    match scalar {
+        Scalar::Long(v) => Some(*v),
+        Scalar::Integer(v) => Some(i64::from(*v)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -993,10 +1033,7 @@ mod tests {
             ChildAccessor::new(&exprs),
             StatsAccessor::new(&stats),
             true,
-            // `inverted` is the third positional, which we already passed
         );
-        let _ = result;
-        // Drop the verdict-applier callbacks vs Skip set above; verify roundtrip:
         let logged = CALLBACK_LOG.with(Cell::take);
         assert_eq!(logged, Some(("STARTS_WITH".to_string(), true)));
         assert_eq!(result, Some(false));

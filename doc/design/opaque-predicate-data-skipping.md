@@ -1,20 +1,43 @@
 # Opaque-predicate data skipping in delta-kernel-rs
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** chiinlquah
-**Date:** 2026-05-19
 **PR:** chiinlquah/delta-kernel-rs#chiin/ffi-opaque-skipping (stacked on PR #2527)
+
+## What shipped
+
+The framework described below is implemented in
+`ffi/src/expressions/pruning.rs` (engine-agnostic FFI callbacks + accessors)
+and `ffi/src/expressions/arrow_pruning.rs` (`ArrowNamedOpaquePredicateOp`
+newtype that adds `ArrowOpaquePredicateOp` so the default engine's batch
+evaluator dispatches per-row callback invocations during stats-based file
+pruning). Two FFI builders are exposed:
+
+- `visit_predicate_opaque_with_pruning` -- engine-agnostic. Callbacks fire
+  for partition pruning and parquet row-group skipping. File pruning via
+  the default engine requires the arrow variant; engines with their own
+  `EvaluationHandler` need the kernel-side per-file refinement pass
+  documented in `opaque-predicate-kernel-refinement-playbook.md`.
+- `visit_predicate_opaque_with_pruning_arrow` -- wraps the op via
+  `Predicate::arrow_opaque` so the default engine's batch evaluator routes
+  per-row callback invocations through `eval_pred`. Callbacks fire for all
+  three pruning passes when the default engine drives evaluation.
+
+The accessor surface uses a single `StatsAccessor` for both file pruning
+(backed by the metadata batch via `BatchRowStatsProvider`) and row-group
+skipping (backed by `DirectStatsProvider` over kernel's
+`DataSkippingPredicateEvaluator`).
 
 ## TL;DR
 
 `NamedOpaquePredicateOp` -- the FFI shim that carries engine-defined predicate
-ops (`STARTS_WITH`, `LIKE`, etc.) through kernel -- currently opts out of every
-pruning pass. This document proposes a framework that lets engines participate
-in kernel's three pruning passes (partition pruning, stats-based file pruning,
-parquet row-group skipping) for arbitrary op names, without kernel adopting
-opinions about op semantics.
+ops (`STARTS_WITH`, `LIKE`, etc.) through kernel -- opts out of every pruning
+pass by default. This framework lets engines participate in kernel's three
+pruning passes (partition pruning, stats-based file pruning, parquet
+row-group skipping) for arbitrary op names without kernel adopting opinions
+about op semantics.
 
-We considered three approaches and recommend **Option A: per-eval engine
+We considered three approaches and chose **Option A: per-eval engine
 callbacks**. Kernel invokes an engine-supplied callback for every pruning
 decision involving an opaque op. The engine writes its own pruning math in
 its own language. The tradeoff is JNI/FFM round-trips in the pruning hot loop;

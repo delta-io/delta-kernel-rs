@@ -265,7 +265,6 @@ mod tests {
     use crate::expressions::pruning::OpaquePruningCallbacks;
 
     fn make_stats_batch(min: &str, max: &str, nulls: i64, rows: i64) -> RecordBatch {
-        let inner_fields: Vec<Field> = vec![Field::new("name", ArrowDataType::Utf8, true)];
         let min_struct = StructArray::from(vec![(
             Arc::new(Field::new("name", ArrowDataType::Utf8, true)),
             Arc::new(StringArray::from(vec![min])) as ArrayRef,
@@ -279,7 +278,6 @@ mod tests {
             ArrowDataType::Struct(vec![Field::new("name", ArrowDataType::Int64, true)].into()),
             true,
         );
-        let _ = inner_fields;
         let nullcount_struct = StructArray::from(vec![(
             Arc::new(Field::new("name", ArrowDataType::Int64, true)),
             Arc::new(Int64Array::from(vec![nulls])) as ArrayRef,
