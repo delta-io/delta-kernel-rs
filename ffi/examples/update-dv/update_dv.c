@@ -97,147 +97,148 @@ int main(int argc, char* argv[]) {
   KernelStringSlice data_file_path_slice = { data_file_path, strlen(data_file_path) };
   KernelStringSlice dv_slice = { path_or_inline_dv, strlen(path_or_inline_dv) };
 
+  // Owned handles start NULL and are released by the cleanup ladder below. Each FFI call
+  // that consumes a handle (e.g. `dv_descriptor_map_insert`, `snapshot_builder_build`,
+  // `transaction_update_deletion_vectors`, `commit`) is paired with an explicit NULL
+  // assignment so the cleanup block does not double-free.
+  int rc = 1;
+  Error* err = NULL;
+  HandleSharedExternEngine engine = NULL;
+  HandleExclusiveTransaction txn = NULL;
+  HandleExclusiveDvDescriptorMap map = NULL;
+  HandleExclusiveDvDescriptor descriptor = NULL;
+  HandleMutableFfiSnapshotBuilder snapshot_builder = NULL;
+  HandleSharedSnapshot snapshot = NULL;
+  HandleSharedScan scan_handle = NULL;
+  HandleSharedScanMetadataIterator scan_iter = NULL;
+  HandleExclusiveCommittedTransaction committed = NULL;
+
   // === Build engine ===
   ExternResultEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
   if (engine_builder_res.tag != OkEngineBuilder) {
-    print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
-    free_error((Error*)engine_builder_res.err);
-    return 1;
+    err = (Error*)engine_builder_res.err;
+    print_error("Could not get engine builder.", err);
+    goto cleanup;
   }
   ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder_res.ok);
   if (engine_res.tag != OkHandleSharedExternEngine) {
-    print_error("Failed to build engine.", (Error*)engine_res.err);
-    free_error((Error*)engine_res.err);
-    return 1;
+    err = (Error*)engine_res.err;
+    print_error("Failed to build engine.", err);
+    goto cleanup;
   }
-  HandleSharedExternEngine engine = engine_res.ok;
+  engine = engine_res.ok;
 
   // === Start transaction ===
   ExternResultHandleExclusiveTransaction txn_res = transaction(table_path_slice, engine);
   if (txn_res.tag != OkHandleExclusiveTransaction) {
-    print_error("Failed to start transaction.", (Error*)txn_res.err);
-    free_error((Error*)txn_res.err);
-    free_engine(engine);
-    return 1;
+    err = (Error*)txn_res.err;
+    print_error("Failed to start transaction.", err);
+    goto cleanup;
   }
-  HandleExclusiveTransaction txn = txn_res.ok;
+  txn = txn_res.ok;
 
   const char* engine_info = "update_dv_example";
   KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
   ExternResultHandleExclusiveTransaction with_info_res =
       with_engine_info(txn, engine_info_slice, engine);
   if (with_info_res.tag != OkHandleExclusiveTransaction) {
-    print_error("with_engine_info failed.", (Error*)with_info_res.err);
-    free_error((Error*)with_info_res.err);
-    free_engine(engine);
-    return 1;
+    err = (Error*)with_info_res.err;
+    print_error("with_engine_info failed.", err);
+    goto cleanup;
   }
   txn = with_info_res.ok;
 
   // === Build descriptor map ===
-  HandleExclusiveDvDescriptorMap map = dv_descriptor_map_new();
+  map = dv_descriptor_map_new();
   ExternResultHandleExclusiveDvDescriptor descriptor_res = dv_descriptor_new(
       storage_type, dv_slice, has_offset, offset, size_in_bytes, cardinality, engine);
   if (descriptor_res.tag != OkHandleExclusiveDvDescriptor) {
-    print_error("dv_descriptor_new failed.", (Error*)descriptor_res.err);
-    free_error((Error*)descriptor_res.err);
-    free_dv_descriptor_map(map);
-    free_transaction(txn);
-    free_engine(engine);
-    return 1;
+    err = (Error*)descriptor_res.err;
+    print_error("dv_descriptor_new failed.", err);
+    goto cleanup;
   }
-  HandleExclusiveDvDescriptor descriptor = descriptor_res.ok;
+  descriptor = descriptor_res.ok;
 
   ExternResultbool insert_res =
       dv_descriptor_map_insert(map, data_file_path_slice, descriptor, engine);
   if (insert_res.tag != Okbool) {
-    print_error("dv_descriptor_map_insert failed.", (Error*)insert_res.err);
-    free_error((Error*)insert_res.err);
-    free_dv_descriptor(descriptor);
-    free_dv_descriptor_map(map);
-    free_transaction(txn);
-    free_engine(engine);
-    return 1;
+    err = (Error*)insert_res.err;
+    print_error("dv_descriptor_map_insert failed.", err);
+    goto cleanup;
   }
+  descriptor = NULL; // consumed by dv_descriptor_map_insert on success
 
   // === Build a fresh scan metadata iterator for the update call ===
   ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
       get_snapshot_builder(table_path_slice, engine);
   if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
-    print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
-    free_error((Error*)snapshot_builder_res.err);
-    free_dv_descriptor_map(map);
-    free_transaction(txn);
-    free_engine(engine);
-    return 1;
+    err = (Error*)snapshot_builder_res.err;
+    print_error("Failed to get snapshot builder.", err);
+    goto cleanup;
   }
-  ExternResultHandleSharedSnapshot snapshot_res =
-      snapshot_builder_build(snapshot_builder_res.ok);
+  snapshot_builder = snapshot_builder_res.ok;
+
+  ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder);
+  snapshot_builder = NULL; // consumed by snapshot_builder_build
   if (snapshot_res.tag != OkHandleSharedSnapshot) {
-    print_error("Failed to load snapshot.", (Error*)snapshot_res.err);
-    free_error((Error*)snapshot_res.err);
-    free_dv_descriptor_map(map);
-    free_transaction(txn);
-    free_engine(engine);
-    return 1;
+    err = (Error*)snapshot_res.err;
+    print_error("Failed to load snapshot.", err);
+    goto cleanup;
   }
-  HandleSharedSnapshot snapshot = snapshot_res.ok;
+  snapshot = snapshot_res.ok;
 
   ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
   if (scan_res.tag != OkHandleSharedScan) {
-    print_error("Failed to build scan.", (Error*)scan_res.err);
-    free_error((Error*)scan_res.err);
-    free_snapshot(snapshot);
-    free_dv_descriptor_map(map);
-    free_transaction(txn);
-    free_engine(engine);
-    return 1;
+    err = (Error*)scan_res.err;
+    print_error("Failed to build scan.", err);
+    goto cleanup;
   }
-  HandleSharedScan scan_handle = scan_res.ok;
+  scan_handle = scan_res.ok;
 
   ExternResultHandleSharedScanMetadataIterator iter_res =
       scan_metadata_iter_init(engine, scan_handle);
   if (iter_res.tag != OkHandleSharedScanMetadataIterator) {
-    print_error("scan_metadata_iter_init failed.", (Error*)iter_res.err);
-    free_error((Error*)iter_res.err);
-    free_scan(scan_handle);
-    free_snapshot(snapshot);
-    free_dv_descriptor_map(map);
-    free_transaction(txn);
-    free_engine(engine);
-    return 1;
+    err = (Error*)iter_res.err;
+    print_error("scan_metadata_iter_init failed.", err);
+    goto cleanup;
   }
-  HandleSharedScanMetadataIterator scan_iter = iter_res.ok;
+  scan_iter = iter_res.ok;
 
   ExternResultbool update_res =
       transaction_update_deletion_vectors(txn, map, scan_iter, engine);
   // map and scan_iter are consumed by transaction_update_deletion_vectors even on error.
+  map = NULL;
+  scan_iter = NULL;
   if (update_res.tag != Okbool) {
-    print_error("transaction_update_deletion_vectors failed.", (Error*)update_res.err);
-    free_error((Error*)update_res.err);
-    free_scan(scan_handle);
-    free_snapshot(snapshot);
-    free_transaction(txn);
-    free_engine(engine);
-    return 1;
+    err = (Error*)update_res.err;
+    print_error("transaction_update_deletion_vectors failed.", err);
+    goto cleanup;
   }
-
-  free_scan(scan_handle);
-  free_snapshot(snapshot);
 
   // === Commit ===
   ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn, engine);
+  txn = NULL; // consumed by commit
   if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
-    print_error("commit failed.", (Error*)commit_res.err);
-    free_error((Error*)commit_res.err);
-    free_engine(engine);
-    return 1;
+    err = (Error*)commit_res.err;
+    print_error("commit failed.", err);
+    goto cleanup;
   }
-  HandleExclusiveCommittedTransaction committed = commit_res.ok;
+  committed = commit_res.ok;
   printf("Committed DV update at version: %" PRIu64 "\n",
          committed_transaction_version(&committed));
-  free_committed_transaction(committed);
-  free_engine(engine);
-  return 0;
+  rc = 0;
+
+cleanup:
+  if (err) free_error(err);
+  if (committed) free_committed_transaction(committed);
+  if (scan_iter) free_scan_metadata_iter(scan_iter);
+  if (scan_handle) free_scan(scan_handle);
+  if (snapshot) free_snapshot(snapshot);
+  if (snapshot_builder) free_snapshot_builder(snapshot_builder);
+  if (descriptor) free_dv_descriptor(descriptor);
+  if (map) free_dv_descriptor_map(map);
+  if (txn) free_transaction(txn);
+  if (engine) free_engine(engine);
+  return rc;
 }
