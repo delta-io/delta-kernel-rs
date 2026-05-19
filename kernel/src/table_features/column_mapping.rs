@@ -126,7 +126,7 @@ pub(crate) struct SeenColumnMappingAnnotations<'a> {
     /// `delta.columnMapping.id` -> first field name that claimed it.
     pub ids: HashMap<i64, &'a str>,
     /// Stack of per-struct sibling maps, one per struct currently being walked (root included).
-    /// Each map holds the physicalNames already claimed by that struct's children: key is the
+    /// Each map holds the physical names already claimed by that struct's children: key is the
     /// child's physical name, value is its logical name.
     sibling_physical_names: Vec<HashMap<&'a str, &'a str>>,
 }
