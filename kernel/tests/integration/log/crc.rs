@@ -9,13 +9,15 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Engine, FileStats};
+use delta_kernel::{DeltaResult, Engine, FileStats, Version};
 use rstest::rstest;
 use test_utils::{add_commit, begin_transaction, insert_data, test_table_setup};
+use url::Url;
 
 // ============================================================================
 // File stats from CRC on disk
@@ -743,18 +745,27 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
     Ok(())
 }
 
+fn crc_file_path(table_path: &str, version: Version) -> PathBuf {
+    let url = Url::from_directory_path(table_path).unwrap();
+    ParsedLogPath::new_crc(&url, version)
+        .unwrap()
+        .location
+        .to_file_path()
+        .unwrap()
+}
+
+fn read_crc_json(table_path: &str, version: Version) -> serde_json::Value {
+    let bytes = std::fs::read(crc_file_path(table_path, version)).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 /// Rewrites the on-disk CRC at `version` to drop the named top-level field, leaving every
 /// other field intact.
-fn strip_field_from_crc(table_path: &str, version: u64, field: &str) {
-    let crc_path = format!(
-        "{}/_delta_log/{:020}.crc",
-        table_path.trim_end_matches('/'),
-        version
-    );
-    let bytes = std::fs::read(&crc_path).unwrap();
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+fn strip_field_from_crc(table_path: &str, version: Version, field: &str) {
+    let mut value = read_crc_json(table_path, version);
     value.as_object_mut().unwrap().remove(field);
-    std::fs::write(&crc_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let path = crc_file_path(table_path, version);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
 #[tokio::test]
@@ -1018,6 +1029,11 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Delt
         snapshot_v2.get_app_id_version("nonexistent", engine.as_ref())?,
         None
     );
+
+    // Writing the v2 CRC must drop the Partial setTransactions map on serialize: the on-disk
+    // file has a `null` setTransactions field even though the in-memory map has entries.
+    snapshot_v2.write_checksum(engine.as_ref())?;
+    assert!(read_crc_json(&table_path, 2)["setTransactions"].is_null());
 
     Ok(())
 }
