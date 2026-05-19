@@ -1,6 +1,6 @@
 //! Lowering for
 //! [`DeclarativePlanNode::Project`](delta_kernel::plans::ir::DeclarativePlanNode::Project) plus the
-//! pre-CSE column-path hoisting and root-rename visitors that the projection arm depends on.
+//! root-rename visitor that handles input/output name collisions.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
@@ -11,9 +11,7 @@ use datafusion_common::error::DataFusionError;
 use datafusion_common::Column;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, LogicalPlanBuilder};
-use delta_kernel::expressions::{
-    ColumnName, Expression, MapToStructExpression, ParseJsonExpression,
-};
+use delta_kernel::expressions::{ColumnName, Expression};
 use delta_kernel::plans::ir::nodes::ProjectNode;
 use delta_kernel::transforms::ExpressionTransform;
 
@@ -64,169 +62,6 @@ impl<'a> ExpressionTransform<'a> for RewriteRootColumn<'_> {
         }
         Some(Cow::Borrowed(name))
     }
-}
-
-/// Visitor that counts how many times each [`ColumnName`] path appears across one or more
-/// kernel projection expressions. Drives engine-side hoisting that replaces repeated nested
-/// struct/json access subexpressions with stable column references *before* DataFusion's
-/// own CSE runs. This avoids a known interaction between `CommonSubexprEliminate` and
-/// `PushDownLeafProjections` where the merge step in `build_extraction_projection_impl`
-/// produces duplicate `__common_expr_*` schema fields when an output struct column with many
-/// `get_field(...)` references is filtered on by its parent `Filter`.
-#[derive(Default)]
-struct ColumnPathCounter {
-    counts: BTreeMap<Vec<String>, usize>,
-}
-
-impl<'a> ExpressionTransform<'a> for ColumnPathCounter {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        let path: Vec<String> = name.path().to_vec();
-        *self.counts.entry(path).or_insert(0) += 1;
-        Some(Cow::Borrowed(name))
-    }
-
-    /// `ParseJson(arg, schema)` expands during DataFusion translation into one
-    /// `json_get_*(arg, ...)` call per leaf field of `schema`. Charge `arg` once per leaf field
-    /// so the hoist analysis sees the true number of times its column references appear in the
-    /// DataFusion plan that CSE will visit.
-    fn transform_expr_parse_json(
-        &mut self,
-        expr: &'a ParseJsonExpression,
-    ) -> Option<Cow<'a, ParseJsonExpression>> {
-        let multiplier = leaf_field_count(expr.output_schema.as_ref()).max(1);
-        for _ in 0..multiplier {
-            let _ = self.transform_expr(expr.json_expr.as_ref());
-        }
-        Some(Cow::Borrowed(expr))
-    }
-
-    /// `MapToStruct(arg)` expands during DataFusion translation into one `get_field(arg, key)`
-    /// call per target struct field. We do not have access to the target schema at this layer
-    /// (it lives in the parent projection's output field), so pessimistically count `arg` twice:
-    /// any nested column it references will then trigger a hoist if the parent projection has
-    /// at least two such map-to-struct expansions or repeats the map column elsewhere.
-    fn transform_expr_map_to_struct(
-        &mut self,
-        expr: &'a MapToStructExpression,
-    ) -> Option<Cow<'a, MapToStructExpression>> {
-        for _ in 0..2 {
-            let _ = self.transform_expr(expr.map_expr.as_ref());
-        }
-        Some(Cow::Borrowed(expr))
-    }
-}
-
-/// Count the number of leaf (non-struct) fields in `schema`, descending into nested struct
-/// fields. This matches the
-/// [`json_parse::generate_schema_extractions`](crate::compile::json_parse::generate_schema_extractions)
-/// expansion that the engine emits for
-/// [`ParseJson`](delta_kernel::expressions::Expression::ParseJson).
-fn leaf_field_count(schema: &delta_kernel::schema::StructType) -> usize {
-    schema
-        .fields()
-        .map(|f| match f.data_type() {
-            delta_kernel::schema::DataType::Struct(inner) => leaf_field_count(inner.as_ref()),
-            _ => 1,
-        })
-        .sum()
-}
-
-/// Rewrite a [`ColumnName`] reference whose path begins with a hoisted prefix to use the
-/// hoisted column name. The longest matching prefix wins, so chained hoists are honored.
-struct RewriteHoistedPath<'a> {
-    hoist_map: &'a BTreeMap<Vec<String>, String>,
-}
-
-impl<'a> ExpressionTransform<'a> for RewriteHoistedPath<'_> {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        let path = name.path();
-        // Longest matching hoist prefix wins so chained hoists are honored.
-        let best = self
-            .hoist_map
-            .iter()
-            .filter(|(hp, _)| path.starts_with(hp))
-            .max_by_key(|(hp, _)| hp.len());
-        if let Some((hoist_path, hoist_name)) = best {
-            let mut new_path = Vec::with_capacity(path.len() - hoist_path.len() + 1);
-            new_path.push(hoist_name.clone());
-            new_path.extend(path.iter().skip(hoist_path.len()).cloned());
-            return Some(Cow::Owned(ColumnName::new(new_path)));
-        }
-        Some(Cow::Borrowed(name))
-    }
-}
-
-/// Pre-CSE hoisting for the engine `Project` lowering.
-///
-/// Identifies kernel column references whose path is at least two segments deep and that appear
-/// at least twice across `columns`. For the *shallowest* such repeated prefix on each chain
-/// (so we never double-hoist a path and its ancestor), materializes the corresponding DataFusion
-/// `get_field(...)` chain in an intermediate `Projection` over `working_plan` under a stable
-/// `__dk_hoist_<idx>` name and rewrites every kernel reference using that prefix to point at
-/// the hoisted column.
-///
-/// When no candidate qualifies, returns `working_plan` and `columns` unchanged.
-fn hoist_repeated_column_paths(
-    working_plan: LogicalPlan,
-    columns: Vec<Arc<Expression>>,
-) -> Result<(LogicalPlan, Vec<Arc<Expression>>), DataFusionError> {
-    let mut counter = ColumnPathCounter::default();
-    for expr in &columns {
-        let _ = counter.transform_expr(expr.as_ref());
-    }
-
-    let mut candidates: Vec<Vec<String>> = counter
-        .counts
-        .into_iter()
-        .filter_map(|(path, count)| (count >= 2 && path.len() >= 2).then_some(path))
-        .collect();
-    candidates.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
-
-    let mut kept: Vec<Vec<String>> = Vec::new();
-    for cand in candidates {
-        let dominated = kept
-            .iter()
-            .any(|k| k.len() < cand.len() && cand.starts_with(k.as_slice()));
-        if !dominated {
-            kept.push(cand);
-        }
-    }
-
-    if kept.is_empty() {
-        return Ok((working_plan, columns));
-    }
-
-    let hoist_map: BTreeMap<Vec<String>, String> = kept
-        .into_iter()
-        .enumerate()
-        .map(|(idx, path)| (path, format!("__dk_hoist_{idx}")))
-        .collect();
-
-    let pass_through: Vec<Expr> = working_plan
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| Expr::Column(Column::new_unqualified(f.name())))
-        .collect();
-    let mut proj_exprs = pass_through;
-    for (path, hoist_name) in &hoist_map {
-        let kernel_col = Expression::column(path.iter().cloned());
-        let df_expr = kernel_expr_to_df(&kernel_col, &TranslationContext::untyped())?;
-        proj_exprs.push(df_expr.alias(hoist_name.clone()));
-    }
-
-    let hoisted_plan = LogicalPlanBuilder::from(working_plan)
-        .project(proj_exprs)?
-        .build()?;
-
-    let rewritten = rewrite_expressions(
-        &columns,
-        &mut RewriteHoistedPath {
-            hoist_map: &hoist_map,
-        },
-    );
-
-    Ok((hoisted_plan, rewritten))
 }
 
 /// Apply `rewriter` to every expression in `exprs`, returning a fresh `Vec<Arc<Expression>>`
@@ -319,12 +154,6 @@ pub(super) fn compile_project_node(
             );
             (renamed_plan, rewritten)
         };
-
-    // Pre-CSE hoist: materialize repeated nested struct/json access subexpressions in an
-    // intermediate `Projection` so DataFusion's CSE pass has nothing to factor out below
-    // this projection. See [`hoist_repeated_column_paths`] for the rationale.
-    let (working_plan, rewritten_columns) =
-        hoist_repeated_column_paths(working_plan, rewritten_columns)?;
 
     let working_arrow_schema: ArrowSchema = working_plan.schema().as_arrow().clone();
     let projection: Vec<Expr> = rewritten_columns

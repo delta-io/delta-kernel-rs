@@ -12,10 +12,10 @@ use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, LargeListArray, ListArray, MapArray, RecordBatch, StructArray,
+    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
 use delta_kernel::arrow::buffer::NullBuffer;
-use delta_kernel::arrow::datatypes::{DataType, Field, SchemaRef};
+use delta_kernel::arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use futures::StreamExt;
 
 /// Wraps a child plan and per-batch enforces kernel's strict NOT NULL contract while
@@ -130,34 +130,8 @@ fn validate_and_reshape(array: &ArrayRef, target_field: &Field, path: &str) -> D
                 struct_arr.nulls().cloned(),
             )))
         }
-        DataType::List(target_inner) => {
-            let list_arr = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| internal(format!("`{path}`: expected ListArray")))?;
-            let values =
-                validate_and_reshape(list_arr.values(), target_inner, &format!("{path}[]"))?;
-            Ok(Arc::new(ListArray::new(
-                Arc::new(target_inner.as_ref().clone()),
-                list_arr.offsets().clone(),
-                values,
-                list_arr.nulls().cloned(),
-            )))
-        }
-        DataType::LargeList(target_inner) => {
-            let list_arr = array
-                .as_any()
-                .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| internal(format!("`{path}`: expected LargeListArray")))?;
-            let values =
-                validate_and_reshape(list_arr.values(), target_inner, &format!("{path}[]"))?;
-            Ok(Arc::new(LargeListArray::new(
-                Arc::new(target_inner.as_ref().clone()),
-                list_arr.offsets().clone(),
-                values,
-                list_arr.nulls().cloned(),
-            )))
-        }
+        DataType::List(target_inner) => reshape_generic_list::<i32>(array, target_inner, path),
+        DataType::LargeList(target_inner) => reshape_generic_list::<i64>(array, target_inner, path),
         DataType::Map(target_entries, sorted) => {
             let map_arr = array
                 .as_any()
@@ -180,6 +154,30 @@ fn validate_and_reshape(array: &ArrayRef, target_field: &Field, path: &str) -> D
         }
         _ => Ok(array.clone()),
     }
+}
+
+/// Generic `List` / `LargeList` arm of [`validate_and_reshape`], parameterized on the offset
+/// width so the two cases collapse into one body.
+fn reshape_generic_list<O: OffsetSizeTrait>(
+    array: &ArrayRef,
+    target_inner: &FieldRef,
+    path: &str,
+) -> DfResult<ArrayRef> {
+    let list_arr = array
+        .as_any()
+        .downcast_ref::<GenericListArray<O>>()
+        .ok_or_else(|| internal(format!("`{path}`: expected generic list array")))?;
+    let values = validate_and_reshape(
+        list_arr.values(),
+        target_inner.as_ref(),
+        &format!("{path}[]"),
+    )?;
+    Ok(Arc::new(GenericListArray::<O>::new(
+        Arc::clone(target_inner),
+        list_arr.offsets().clone(),
+        values,
+        list_arr.nulls().cloned(),
+    )))
 }
 
 /// Error if any row of `child` is null while the parent is present at that row. `parent_nulls`

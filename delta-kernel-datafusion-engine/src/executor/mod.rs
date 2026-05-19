@@ -116,16 +116,13 @@ impl DataFusionExecutor {
         // shape (Filter over a Projection that builds a struct via named_struct). The rule
         // inlines the full struct definition into every Filter leaf, CommonSubexprEliminate
         // then dedups badly and ultimately fails Projection::try_new with duplicate
-        // `__common_expr_N` fields. The source for that shape is an in-memory RelationRef so
-        // the optimization buys nothing; keep it disabled (apache/datafusion#20432 tracks the
+        // `__common_expr_N` fields. Keep it disabled (apache/datafusion#20432 tracks the
         // upstream `build_extraction_projection_impl` dedup gap).
         session_config
             .options_mut()
             .optimizer
             .enable_leaf_expression_pushdown = false;
         let session_ctx = SessionContext::new_with_config(session_config);
-        let _ = session_ctx.remove_optimizer_rule("optimize_projections");
-        let _ = session_ctx.remove_optimizer_rule("optimize_unions");
         Ok(Self {
             task_ctx: Arc::new(TaskContext::default()),
             session_ctx,

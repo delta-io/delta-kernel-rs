@@ -731,11 +731,10 @@ pub fn evaluate_predicate(
                         let elem_arr = arrow_convert_to_non_view_type(elem_arr)?;
                         Ok(eq(&column_arr, &elem_arr)?)
                     };
-                    ad.array_elements()
-                        .iter()
-                        .try_fold(BooleanArray::from(vec![false; column_arr.len()]), |acc, lit| {
-                            Ok(or_kleene(&acc, &eq_against_literal(lit)?)?)
-                        })
+                    ad.array_elements().iter().try_fold(
+                        BooleanArray::from(vec![false; column_arr.len()]),
+                        |acc, lit| Ok(or_kleene(&acc, &eq_against_literal(lit)?)?),
+                    )
                 }
                 (l, r) => Err(Error::invalid_expression(format!(
                     "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"

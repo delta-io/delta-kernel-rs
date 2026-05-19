@@ -621,36 +621,17 @@ impl Scan {
 
     /// Partition schema for the scan SM's data stage projection.
     ///
-    /// The data stage's `scan_data_projection` references `fileConstantValues.partitionValues_parsed.<col>`
-    /// for every partition column appearing in the logical schema, regardless of predicate.
-    /// `physical_partition_schema()` is gated on predicate-driven data skipping, so it's `None`
-    /// for unfiltered partitioned reads -- which would leave `partitionValues_parsed`
-    /// unmaterialized and break the data-stage projection lookup.
-    ///
-    /// Returns the table's full partition schema (all partition columns with physical names +
-    /// types) whenever the table has partition columns; `None` otherwise. Mirrors the unfiltered
-    /// partition-schema construction in `state_info::try_new` (zip logical/physical schemas,
-    /// filter to partition column names, take physical fields).
+    /// The data stage's `scan_data_projection` references
+    /// `fileConstantValues.partitionValues_parsed.<col>` for every partition column appearing
+    /// in the logical schema, regardless of predicate. `physical_partition_schema()` is gated
+    /// on predicate-driven data skipping, so it's `None` for unfiltered partitioned reads --
+    /// which would leave `partitionValues_parsed` unmaterialized and break the data-stage
+    /// projection lookup. Returns the table's full partition schema instead.
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn data_stage_partition_schema(&self) -> Option<SchemaRef> {
-        let table_config = self.snapshot.table_configuration();
-        let partition_columns = table_config.partition_columns();
-        if partition_columns.is_empty() {
-            return None;
-        }
-        let partition_fields: Vec<crate::schema::StructField> = table_config
-            .logical_schema()
-            .fields()
-            .zip(table_config.physical_schema().fields())
-            .filter(|(lf, _)| partition_columns.contains(lf.name()))
-            .map(|(_, pf)| pf.clone())
-            .collect();
-        if partition_fields.is_empty() {
-            return None;
-        }
-        Some(Arc::new(crate::schema::StructType::new_unchecked(
-            partition_fields,
-        )))
+        self.snapshot
+            .table_configuration()
+            .partition_schema_with_physical_names()
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles

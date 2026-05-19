@@ -322,32 +322,16 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Build partition schema with physical names for partition pruning in data skipping.
-        // Only needed when we have a predicate and partition columns.
-        // partition_columns stores logical names (per Delta protocol), so we zip the table's
-        // logical and physical schemas (same field ordering, guaranteed by `make_physical`)
-        // to match logical names and extract the corresponding physical fields without
-        // per-field metadata lookups.
-        let table_partition_schema = if !matches!(
+        // Partition schema for predicate-driven data skipping (`partitionValues_parsed`):
+        // gated on a non-empty physical predicate. The shared
+        // `partition_schema_with_physical_names` builder zips the logical/physical schemas
+        // by ordering (guaranteed by `make_physical`) and keeps partition-column fields.
+        let table_partition_schema = (!matches!(
             physical_predicate,
             PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll
-        ) && !partition_columns.is_empty()
-        {
-            let partition_fields: Vec<StructField> = table_configuration
-                .logical_schema()
-                .fields()
-                .zip(table_configuration.physical_schema().fields())
-                .filter(|(logical_f, _)| partition_columns.contains(logical_f.name()))
-                .map(|(_, physical_f)| physical_f.clone())
-                .collect();
-            if partition_fields.is_empty() {
-                None
-            } else {
-                Some(Arc::new(StructType::new_unchecked(partition_fields)))
-            }
-        } else {
-            None
-        };
+        ))
+        .then(|| table_configuration.partition_schema_with_physical_names())
+        .flatten();
 
         let (physical_stats_schema, physical_partition_schema) = build_data_skipping_schemas(
             &stats_output_mode,

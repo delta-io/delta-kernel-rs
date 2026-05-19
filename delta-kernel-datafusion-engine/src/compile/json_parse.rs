@@ -112,12 +112,11 @@ pub(crate) fn generate_schema_extractions(
     json_col: &Expr,
     target_schema: &StructType,
 ) -> Result<Vec<(Expr, String)>, DataFusionError> {
-    let mut out = Vec::new();
-    for field in target_schema.fields() {
-        out.push((
-            generate_json_extract_expr(json_col, field, &[])?,
-            field.name().to_string(),
-        ));
-    }
-    Ok(out)
+    target_schema
+        .fields()
+        .map(|field| {
+            generate_json_extract_expr(json_col, field, &[])
+                .map(|expr| (expr, field.name().to_string()))
+        })
+        .collect()
 }

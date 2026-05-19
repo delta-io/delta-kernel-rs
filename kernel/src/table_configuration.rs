@@ -470,6 +470,32 @@ impl TableConfiguration {
         self.metadata().partition_columns()
     }
 
+    /// Partition schema with **physical** field names (and types), built from the table's
+    /// logical/physical schema pair. `None` when the table has no partition columns or none
+    /// of the declared partition columns resolve in the schema.
+    ///
+    /// Used by the scan SM data stage to materialize `partitionValues_parsed` and by the
+    /// data-skipping setup to narrow stats schemas to partition-referenced fields. Both
+    /// sites used to inline this filter+zip; consolidating here keeps the construction
+    /// (zip logical/physical fields, filter by partition column name) in one place.
+    #[cfg(feature = "declarative-plans")]
+    #[internal_api]
+    pub(crate) fn partition_schema_with_physical_names(&self) -> Option<SchemaRef> {
+        let partition_columns = self.partition_columns();
+        if partition_columns.is_empty() {
+            return None;
+        }
+        let partition_fields: Vec<StructField> = self
+            .logical_schema()
+            .fields()
+            .zip(self.physical_schema().fields())
+            .filter(|(lf, _)| partition_columns.contains(lf.name()))
+            .map(|(_, pf)| pf.clone())
+            .collect();
+        (!partition_fields.is_empty())
+            .then(|| Arc::new(StructType::new_unchecked(partition_fields)))
+    }
+
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
     #[internal_api]
     pub(crate) fn table_root(&self) -> &Url {

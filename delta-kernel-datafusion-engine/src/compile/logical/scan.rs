@@ -50,15 +50,12 @@ pub(super) fn relax_nested_nullability_for_scan(schema: &ArrowSchema) -> Arc<Arr
         )
     }
     fn relax_data_type(dt: &DataType) -> DataType {
+        let relax_inner = |inner: &Arc<Field>| relax_field(inner, true);
         match dt {
-            DataType::Struct(fields) => {
-                DataType::Struct(fields.iter().map(|f| relax_field(f, true)).collect())
-            }
-            DataType::List(inner) => DataType::List(relax_field(inner, true)),
-            DataType::LargeList(inner) => DataType::LargeList(relax_field(inner, true)),
-            DataType::FixedSizeList(inner, n) => {
-                DataType::FixedSizeList(relax_field(inner, true), *n)
-            }
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(relax_inner).collect()),
+            DataType::List(inner) => DataType::List(relax_inner(inner)),
+            DataType::LargeList(inner) => DataType::LargeList(relax_inner(inner)),
+            DataType::FixedSizeList(inner, n) => DataType::FixedSizeList(relax_inner(inner), *n),
             DataType::Map(entries, sorted) => {
                 let relaxed_entries = match entries.data_type() {
                     DataType::Struct(entry_fields) if entry_fields.len() == 2 => {
@@ -73,7 +70,7 @@ pub(super) fn relax_nested_nullability_for_scan(schema: &ArrowSchema) -> Arc<Arr
                             .with_metadata(entries.metadata().clone()),
                         )
                     }
-                    _ => relax_field(entries, true),
+                    _ => relax_inner(entries),
                 };
                 DataType::Map(relaxed_entries, *sorted)
             }

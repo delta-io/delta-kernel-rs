@@ -310,38 +310,24 @@ impl PhysicalExpr for RenameNestedFieldsByIdExpr {
 /// not-null enforcement happens downstream in [`super::NullabilityValidationExec`]).
 /// Parquet-only children pass through unchanged; the outer cast drops them.
 fn build_renamed_physical_field(physical: &Field, logical: &Field) -> Field {
+    let rename_child =
+        |p: &FieldRef, l: &FieldRef| Arc::new(build_renamed_physical_field(p.as_ref(), l.as_ref()));
     let renamed_type = match (physical.data_type(), logical.data_type()) {
         (DataType::Struct(phys_children), DataType::Struct(log_children)) => {
             let renamed: Vec<FieldRef> = phys_children
                 .iter()
-                .map(|pc| {
-                    let pc_ref = pc.as_ref();
-                    match find_physical_match(pc_ref, log_children) {
-                        Some(li) => {
-                            Arc::new(build_renamed_physical_field(pc_ref, &log_children[li]))
-                        }
-                        None => Arc::clone(pc),
-                    }
+                .map(|pc| match find_physical_match(pc.as_ref(), log_children) {
+                    Some(li) => Arc::new(build_renamed_physical_field(pc.as_ref(), &log_children[li])),
+                    None => Arc::clone(pc),
                 })
                 .collect();
             DataType::Struct(renamed.into())
         }
-        (DataType::List(phys_elem), DataType::List(log_elem)) => DataType::List(Arc::new(
-            build_renamed_physical_field(phys_elem.as_ref(), log_elem.as_ref()),
-        )),
-        (DataType::LargeList(phys_elem), DataType::LargeList(log_elem)) => {
-            DataType::LargeList(Arc::new(build_renamed_physical_field(
-                phys_elem.as_ref(),
-                log_elem.as_ref(),
-            )))
+        (DataType::List(p), DataType::List(l)) => DataType::List(rename_child(p, l)),
+        (DataType::LargeList(p), DataType::LargeList(l)) => {
+            DataType::LargeList(rename_child(p, l))
         }
-        (DataType::Map(phys_entries, sorted), DataType::Map(log_entries, _)) => DataType::Map(
-            Arc::new(build_renamed_physical_field(
-                phys_entries.as_ref(),
-                log_entries.as_ref(),
-            )),
-            *sorted,
-        ),
+        (DataType::Map(p, sorted), DataType::Map(l, _)) => DataType::Map(rename_child(p, l), *sorted),
         _ => physical.data_type().clone(),
     };
     Field::new(logical.name(), renamed_type, logical.is_nullable())
