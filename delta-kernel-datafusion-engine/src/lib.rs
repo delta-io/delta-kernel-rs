@@ -1,18 +1,18 @@
 //! DataFusion execution scaffold for Delta Kernel declarative [`Plan`] trees.
 //!
 //! Supported sinks:
-//! - [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation) -- registers a
-//!   lazy [`ViewTable`](datafusion::datasource::ViewTable) wrapping the upstream `LogicalPlan`.
-//!   DataFusion's `InlineTableScan` analyzer rule inlines the wrapped plan into the consumer's
-//!   tree when the relation is read, so predicate / projection pushdown and CSE flow across
-//!   plan boundaries.
+//! - [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation) -- registers a lazy
+//!   [`ViewTable`](datafusion::datasource::ViewTable) wrapping the upstream `LogicalPlan`.
+//!   DataFusion's `InlineTableScan` analyzer rule inlines the wrapped plan into the consumer's tree
+//!   when the relation is read, so predicate / projection pushdown and CSE flow across plan
+//!   boundaries.
 //! - [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) -- registers a lazy
 //!   [`LoadTableProvider`](exec::LoadTableProvider) capturing the upstream `LogicalPlan` + load
-//!   config + kernel [`Engine`](delta_kernel::Engine). Its `scan()` streams per-row file
-//!   batches via [`LoadExec`](exec::LoadExec); no I/O happens until the consumer reads.
-//! - [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) -- the only sink
-//!   with eager side effects: drains the physical plan into a
-//!   [`delta_kernel::plans::kdf::ConsumerKdf`] handle at execute-plan time.
+//!   config + kernel [`Engine`](delta_kernel::Engine). Its `scan()` streams per-row file batches
+//!   via [`LoadExec`](exec::LoadExec); no I/O happens until the consumer reads.
+//! - [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) -- the only sink with
+//!   eager side effects: drains the physical plan into a [`delta_kernel::plans::kdf::ConsumerKdf`]
+//!   handle at execute-plan time.
 //!
 //! Read-style state machines return a [`delta_kernel::plans::ir::ResultPlan`] naming the
 //! relation the caller reads after executing the result plan's plans. Because `Relation` /
@@ -137,18 +137,21 @@ mod tests {
             writer.write(&batch).unwrap();
             writer.close().unwrap();
         }
-        let rel = parquet_path.file_name().unwrap().to_str().unwrap().to_string();
+        let rel = parquet_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let base_url = url::Url::from_directory_path(dir.path()).unwrap();
 
         // Upstream relation carries `path` + two passthrough columns (`p1`, `p2`). The Load
         // sink reads `[a, b]` from each file and broadcasts both passthrough columns.
-        let upstream_schema = Arc::new(
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::nullable("p1", DataType::LONG),
-                StructField::nullable("p2", DataType::LONG),
-            ]),
-        );
+        let upstream_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::nullable("p1", DataType::LONG),
+            StructField::nullable("p2", DataType::LONG),
+        ]));
         let file_schema = Arc::new(StructType::new_unchecked([
             StructField::not_null("a", DataType::LONG),
             StructField::not_null("b", DataType::LONG),
@@ -276,24 +279,28 @@ mod tests {
             let props = WriterProperties::builder()
                 .set_max_row_group_row_count(Some(16))
                 .build();
-            let mut writer =
-                ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
+            let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
         }
 
-        let rel = parquet_path.file_name().unwrap().to_str().unwrap().to_string();
+        let rel = parquet_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let base_url = url::Url::from_directory_path(dir.path()).unwrap();
-        let upstream_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-        ]));
+        let upstream_schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "path",
+            DataType::STRING,
+        )]));
         let file_schema = Arc::new(StructType::new_unchecked([StructField::not_null(
             "x",
             DataType::LONG,
         )]));
 
-        let lit =
-            PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
+        let lit = PlanBuilder::values(upstream_schema, vec![vec![Scalar::String(rel)]]).unwrap();
         let mut registry = RelationRegistry::new(Uuid::new_v4());
         let plan = lit
             .load(

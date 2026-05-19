@@ -151,16 +151,15 @@ impl ExecutionPlan for FileListingExec {
     }
 }
 
-type ObjectMetaChunkStream =
-    dyn Stream<Item = Vec<Result<ObjectMeta, object_store::Error>>> + Send;
+type ObjectMetaChunkStream = dyn Stream<Item = Vec<Result<ObjectMeta, object_store::Error>>> + Send;
 
 /// Streams [`ObjectMeta`] batches converted to [`RecordBatch`]es. Two modes:
 ///
 /// * [`ListingState::Chunked`]: passthrough -- groups the underlying `list_stream` into
 ///   `BATCH_SIZE` chunks and emits one batch per chunk. The first error in a chunk surfaces
 ///   immediately and ends the stream.
-/// * [`ListingState::Collecting`] -> [`ListingState::Emitting`]: collect-then-sort -- drains
-///   the full listing into memory, sorts by `location`, then emits in `BATCH_SIZE` chunks.
+/// * [`ListingState::Collecting`] -> [`ListingState::Emitting`]: collect-then-sort -- drains the
+///   full listing into memory, sorts by `location`, then emits in `BATCH_SIZE` chunks.
 struct FileListingStream {
     state: ListingState,
     schema: delta_kernel::arrow::datatypes::SchemaRef,

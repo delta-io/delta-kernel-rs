@@ -9,8 +9,8 @@
 //!
 //! - [`PhaseYield`] / [`PhaseResume`] / [`PhaseCo`] — the typed protocol flowing through the
 //!   underlying generator. Each yield carries one [`PhaseOperation`], a static phase name, and a
-//!   sorted snapshot of currently-live relation names. Each resume is a
-//!   `Result<PhaseState, EngineError>`.
+//!   sorted snapshot of currently-live relation names. Each resume is a `Result<PhaseState,
+//!   EngineError>`.
 //! - [`Context`] — async surface SM authors call.
 //!
 //! ## Layering

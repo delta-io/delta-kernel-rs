@@ -404,7 +404,10 @@ mod tests {
 
     #[test]
     fn translates_not_predicate() {
-        assert_eq!(lower_pred(Pred::not(column_expr!("x").is_null())), "NOT x IS NULL");
+        assert_eq!(
+            lower_pred(Pred::not(column_expr!("x").is_null())),
+            "NOT x IS NULL"
+        );
     }
 
     #[test]

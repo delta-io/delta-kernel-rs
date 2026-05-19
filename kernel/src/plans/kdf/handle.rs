@@ -17,7 +17,8 @@
 //!
 //! Every handle carries the owning state machine's identity tuple:
 //!
-//! - `sm_id: Uuid` — fresh per [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM)
+//! - `sm_id: Uuid` — fresh per
+//!   [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM)
 //!   instance.
 //! - `sm_kind: &'static str` — static label for the SM's logical kind (e.g. `"scan_metadata"`).
 //! - `phase_name: &'static str` — the phase that minted this handle, as supplied to
@@ -30,8 +31,7 @@ use std::any::Any;
 
 use uuid::Uuid;
 
-use super::token::ConsumerKdfId;
-use super::token::KdfStateToken;
+use super::token::{ConsumerKdfId, KdfStateToken};
 use super::traits::{ConsumerKdf, KdfControl};
 use crate::{DeltaResult, EngineData};
 

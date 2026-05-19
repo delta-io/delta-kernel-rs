@@ -353,4 +353,3 @@ async fn load_exec_streams_one_parquet_row_group_per_batch() {
         batches.len(),
     );
 }
-

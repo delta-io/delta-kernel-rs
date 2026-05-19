@@ -36,12 +36,13 @@ pub(crate) fn stamp_batch_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
 
     use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
     use delta_kernel::arrow::buffer::NullBuffer;
     use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
+
+    use super::*;
 
     fn meta(field: Field, k: &str, v: &str) -> Field {
         field.with_metadata(HashMap::from([(k.to_string(), v.to_string())]))
@@ -50,11 +51,7 @@ mod tests {
     #[test]
     fn stamps_nested_struct_metadata_and_preserves_parent_null_bitmap() {
         let inner_meta = |name: &str, ty, id: &str| {
-            meta(
-                Field::new(name, ty, true),
-                "delta.columnMapping.id",
-                id,
-            )
+            meta(Field::new(name, ty, true), "delta.columnMapping.id", id)
         };
         let target_inner = Fields::from(vec![
             inner_meta("name", DataType::Utf8, "3"),
@@ -73,8 +70,7 @@ mod tests {
         let names: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
         let scores: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
         let nulls = NullBuffer::from(vec![true, false]);
-        let struct_arr =
-            StructArray::new(source_inner.clone(), vec![names, scores], Some(nulls));
+        let struct_arr = StructArray::new(source_inner.clone(), vec![names, scores], Some(nulls));
         let source = Arc::new(Schema::new(vec![Field::new(
             "info",
             struct_arr.data_type().clone(),
@@ -89,6 +85,9 @@ mod tests {
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
-        assert!(!out.is_valid(1), "parent struct null bitmap must survive cast");
+        assert!(
+            !out.is_valid(1),
+            "parent struct null bitmap must survive cast"
+        );
     }
 }

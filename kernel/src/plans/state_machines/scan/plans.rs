@@ -145,8 +145,8 @@ pub fn build_fsr_plans(
     //   2. Materialize the dedup key (`__fsr_join_k`) as a top-level column so the window's
     //      partition key (and the downstream LeftAnti) can reference it by name.
     //   3. Keep only the newest row per (`__fsr_join_k`) by `version DESC`.
-    //   4. Project away internal columns (`version`, row_number); persisted relation
-    //      matches `augmented_action_schema(false)` for the union in the results plan.
+    //   4. Project away internal columns (`version`, row_number); persisted relation matches
+    //      `augmented_action_schema(false)` for the union in the results plan.
     const COMMIT_DEDUP_RN_COL: &str = "__kernel_fsr_commit_dedup_rn";
     // The first project augments `add` with `stats_parsed` via `parse_json(add.stats)` when
     // stats are requested (commits are always JSON, never native parsed); the post-window

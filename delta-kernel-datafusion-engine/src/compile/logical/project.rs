@@ -143,19 +143,12 @@ struct RewriteHoistedPath<'a> {
 impl<'a> ExpressionTransform<'a> for RewriteHoistedPath<'_> {
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
         let path = name.path();
-        let mut best: Option<(&Vec<String>, &String)> = None;
-        for (hoist_path, hoist_name) in self.hoist_map {
-            if hoist_path.len() <= path.len()
-                && path
-                    .iter()
-                    .take(hoist_path.len())
-                    .zip(hoist_path.iter())
-                    .all(|(a, b)| a == b)
-                && best.is_none_or(|(p, _)| p.len() < hoist_path.len())
-            {
-                best = Some((hoist_path, hoist_name));
-            }
-        }
+        // Longest matching hoist prefix wins so chained hoists are honored.
+        let best = self
+            .hoist_map
+            .iter()
+            .filter(|(hp, _)| path.starts_with(hp))
+            .max_by_key(|(hp, _)| hp.len());
         if let Some((hoist_path, hoist_name)) = best {
             let mut new_path = Vec::with_capacity(path.len() - hoist_path.len() + 1);
             new_path.push(hoist_name.clone());
@@ -229,10 +222,24 @@ fn hoist_repeated_column_paths(
         .project(proj_exprs)?
         .build()?;
 
-    let mut rewriter = RewriteHoistedPath {
-        hoist_map: &hoist_map,
-    };
-    let rewritten = columns
+    let rewritten = rewrite_expressions(
+        &columns,
+        &mut RewriteHoistedPath {
+            hoist_map: &hoist_map,
+        },
+    );
+
+    Ok((hoisted_plan, rewritten))
+}
+
+/// Apply `rewriter` to every expression in `exprs`, returning a fresh `Vec<Arc<Expression>>`
+/// where each entry is either the rewriter's owned output or a clone of the original (when
+/// the rewriter returned `None`).
+fn rewrite_expressions<'a, R: ExpressionTransform<'a>>(
+    exprs: &'a [Arc<Expression>],
+    rewriter: &mut R,
+) -> Vec<Arc<Expression>> {
+    exprs
         .iter()
         .map(|expr| {
             Arc::new(
@@ -242,9 +249,7 @@ fn hoist_repeated_column_paths(
                     .unwrap_or_else(|| expr.as_ref().clone()),
             )
         })
-        .collect::<Vec<_>>();
-
-    Ok((hoisted_plan, rewritten))
+        .collect()
 }
 
 /// Lower a [`DeclarativePlanNode::Project`](delta_kernel::plans::ir::DeclarativePlanNode::Project)
@@ -315,20 +320,12 @@ pub(super) fn compile_project_node(
             let renamed_plan = LogicalPlanBuilder::from(child_plan)
                 .project(rename_projection)?
                 .build()?;
-            let mut rewriter = RewriteRootColumn {
-                rename: &colliding_inputs,
-            };
-            let rewritten = expanded_columns
-                .iter()
-                .map(|expr| {
-                    Arc::new(
-                        rewriter
-                            .transform_expr(expr.as_ref())
-                            .map(Cow::into_owned)
-                            .unwrap_or_else(|| expr.as_ref().clone()),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let rewritten = rewrite_expressions(
+                &expanded_columns,
+                &mut RewriteRootColumn {
+                    rename: &colliding_inputs,
+                },
+            );
             (renamed_plan, rewritten)
         };
 
@@ -365,25 +362,10 @@ pub(super) fn compile_project_node(
             let logical = if matches!(
                 (kernel_expr.as_ref(), field.data_type()),
                 (
-                    delta_kernel::expressions::Expression::Transform(_),
-                    delta_kernel::schema::DataType::Struct(_)
-                )
-            ) || matches!(
-                (kernel_expr.as_ref(), field.data_type()),
-                (
-                    delta_kernel::expressions::Expression::Struct(_, _),
-                    delta_kernel::schema::DataType::Struct(_)
-                )
-            ) || matches!(
-                (kernel_expr.as_ref(), field.data_type()),
-                (
-                    delta_kernel::expressions::Expression::MapToStruct(_),
-                    delta_kernel::schema::DataType::Struct(_)
-                )
-            ) || matches!(
-                (kernel_expr.as_ref(), field.data_type()),
-                (
-                    delta_kernel::expressions::Expression::ParseJson(_),
+                    delta_kernel::expressions::Expression::Transform(_)
+                        | delta_kernel::expressions::Expression::Struct(_, _)
+                        | delta_kernel::expressions::Expression::MapToStruct(_)
+                        | delta_kernel::expressions::Expression::ParseJson(_),
                     delta_kernel::schema::DataType::Struct(_)
                 )
             ) {

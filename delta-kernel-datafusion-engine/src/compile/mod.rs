@@ -234,7 +234,8 @@ pub(super) fn translate_projection_expr(
             )
         })?;
         let source_fields = lookup_struct_fields_via_path(input_schema, input_path)?;
-        let input_expr = expr_translator::kernel_expr_to_df(&Expression::Column(input_path.clone()))?;
+        let input_expr =
+            expr_translator::kernel_expr_to_df(&Expression::Column(input_path.clone()))?;
         return rebuild_struct_with_target_names(input_expr, &source_fields, target_struct);
     }
     expr_translator::kernel_expr_to_df(expr)

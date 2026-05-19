@@ -21,11 +21,11 @@ mod common;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use datafusion_common::assert_batches_sorted_eq;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
-use datafusion_common::assert_batches_sorted_eq;
 use rstest::rstest;
 use tempfile::TempDir;
 use url::Url;
@@ -205,15 +205,9 @@ const EXPECTED_V2_PARQUET_SIDECARS: &str = r#"
     "with_checkpoint_no_last_checkpoint",
     EXPECTED_CHECKPOINT_NO_LAST_CHECKPOINT
 )]
-#[case::v2_classic_parquet(
-    "v2-classic-parquet-struct-stats-only",
-    EXPECTED_V2_CLASSIC_PARQUET
-)]
+#[case::v2_classic_parquet("v2-classic-parquet-struct-stats-only", EXPECTED_V2_CLASSIC_PARQUET)]
 #[case::v2_json_sidecars("v2-json-sidecars-struct-stats-only", EXPECTED_V2_JSON_SIDECARS)]
-#[case::v2_parquet_sidecars(
-    "v2-parquet-sidecars-struct-stats-only",
-    EXPECTED_V2_PARQUET_SIDECARS
-)]
+#[case::v2_parquet_sidecars("v2-parquet-sidecars-struct-stats-only", EXPECTED_V2_PARQUET_SIDECARS)]
 #[tokio::test]
 async fn full_state_prints_expected_results(#[case] fixture: &str, #[case] expected: &str) {
     let (engine, snapshot) = open_snapshot_for_fixture(fixture);

@@ -69,7 +69,11 @@ async fn execute_snapshot_workload_datafusion(
     table_root: &url::Url,
     snapshot_spec: &SnapshotConstructionSpec,
 ) -> DeltaResult<SnapshotResult> {
-    let snapshot = build_snapshot(engine.as_ref(), table_root, snapshot_spec.time_travel.as_ref())?;
+    let snapshot = build_snapshot(
+        engine.as_ref(),
+        table_root,
+        snapshot_spec.time_travel.as_ref(),
+    )?;
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
     let sm = snapshot

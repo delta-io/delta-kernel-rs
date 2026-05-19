@@ -26,9 +26,8 @@
 //! * `projection: Option<Vec<usize>>` is pushed straight into the [`FileSource`] via
 //!   [`FileScanConfigBuilder::with_projection_indices`]; the source then narrows both the parquet
 //!   read schema and which partition columns it materializes.
-//! * `limit: Option<usize>` caps total emitted rows. Once a batch would overshoot the budget it
-//!   is sliced; the next stream iteration returns end-of-stream without opening any further
-//!   files.
+//! * `limit: Option<usize>` caps total emitted rows. Once a batch would overshoot the budget it is
+//!   sliced; the next stream iteration returns end-of-stream without opening any further files.
 //!
 //! Filter pushdown is intentionally left to upstream operators (see
 //! [`super::LoadTableProvider::supports_filters_pushdown`]).

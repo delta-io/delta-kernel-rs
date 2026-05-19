@@ -5,18 +5,18 @@
 //! holds two kinds of payloads the executor produces:
 //!
 //! - **KDF outputs** -- [`FinishedHandle`]s submitted by drained
-//!   [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume) pipelines and
-//!   arbitrary executor-side telemetry (e.g. write row counts), keyed by [`KdfStateToken`].
+//!   [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume) pipelines and arbitrary
+//!   executor-side telemetry (e.g. write row counts), keyed by [`KdfStateToken`].
 //! - **Schema** -- a single [`SchemaRef`] produced by a
 //!   [`PhaseOperation::SchemaQuery`](super::phase_operation::PhaseOperation::SchemaQuery) phase.
 //!
 //! ## Lifecycle
 //!
 //! 1. Executor calls [`PhaseState::empty`] at the start of a phase.
-//! 2. The drained KDF iterator calls [`Handle::finish`](crate::plans::kdf::Handle::finish)
-//!    and pushes the result into [`PhaseState::submit_kdf_handle`]. Each consume sink is
-//!    single-partition by construction, so exactly one submission per token is expected;
-//!    duplicates are an invariant violation.
+//! 2. The drained KDF iterator calls [`Handle::finish`](crate::plans::kdf::Handle::finish) and
+//!    pushes the result into [`PhaseState::submit_kdf_handle`]. Each consume sink is
+//!    single-partition by construction, so exactly one submission per token is expected; duplicates
+//!    are an invariant violation.
 //! 3. Schema-query phases push the parsed footer schema into [`PhaseState::submit_schema`].
 //! 4. The driver hands the populated `PhaseState` back to the SM through `advance`.
 //! 5. Typed extractors built on top of `consume()` pull payloads via [`PhaseState::take_by_token`];

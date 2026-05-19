@@ -174,4 +174,3 @@ fn row_number_with_order_by_desc_assigns_rank_within_partition() {
     let expected = vec![(1, 10, 3), (1, 20, 2), (1, 30, 1), (2, 40, 2), (2, 50, 1)];
     assert_eq!(tuples, expected);
 }
-

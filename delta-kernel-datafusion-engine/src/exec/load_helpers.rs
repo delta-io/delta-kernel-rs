@@ -39,7 +39,10 @@ fn sink_base_url(sink: &LoadSink) -> Result<&Url, DataFusionError> {
 
 /// Resolve a per-row path against `sink.base_url`. The path is `Url::join`-ed onto the base,
 /// matching how the kernel scan plan emits relative paths under `snapshot.table_root()`.
-pub(crate) fn resolve_file_location(sink: &LoadSink, path_str: &str) -> Result<Url, DataFusionError> {
+pub(crate) fn resolve_file_location(
+    sink: &LoadSink,
+    path_str: &str,
+) -> Result<Url, DataFusionError> {
     let base = sink_base_url(sink)?;
     base.join(path_str.trim()).map_err(|e| {
         crate::error::plan_compilation(format!(
@@ -55,9 +58,9 @@ pub(crate) fn extract_column_array(
     cn: &ColumnName,
 ) -> Result<ArrayRef, DataFusionError> {
     let mut parts = cn.path().iter();
-    let head = parts.next().ok_or_else(|| {
-        crate::error::plan_compilation(format!("empty column path `{cn}`"))
-    })?;
+    let head = parts
+        .next()
+        .ok_or_else(|| crate::error::plan_compilation(format!("empty column path `{cn}`")))?;
     let mut current = batch.column_by_name(head).cloned().ok_or_else(|| {
         crate::error::plan_compilation(format!(
             "batch schema {:?} missing top-level `{head}` while extracting `{cn}`",
@@ -82,15 +85,10 @@ pub(crate) fn extract_column_array(
 /// Read one [`DeletionVectorDescriptor`] row out of a struct array. Field types are fixed by
 /// kernel's [`DeletionVectorDescriptor::to_schema()`] (`Utf8 / Utf8 / Int32 / Int32 / Int64`)
 /// so we downcast directly via [`AsArray`] -- no defensive type dispatch.
-fn dv_from_row(
-    sa: &StructArray,
-    row: usize,
-) -> Result<DeletionVectorDescriptor, DataFusionError> {
+fn dv_from_row(sa: &StructArray, row: usize) -> Result<DeletionVectorDescriptor, DataFusionError> {
     let col = |name: &str| {
         sa.column_by_name(name).ok_or_else(|| {
-            crate::error::internal_error(format!(
-                "deletion vector struct missing `{name}` column"
-            ))
+            crate::error::internal_error(format!("deletion vector struct missing `{name}` column"))
         })
     };
     let storage_type: DeletionVectorStorageType = col("storageType")?
@@ -99,7 +97,10 @@ fn dv_from_row(
         .trim()
         .parse()
         .map_err(|e: delta_kernel::Error| crate::error::internal_error(e.to_string()))?;
-    let path_or_inline_dv = col("pathOrInlineDv")?.as_string::<i32>().value(row).to_string();
+    let path_or_inline_dv = col("pathOrInlineDv")?
+        .as_string::<i32>()
+        .value(row)
+        .to_string();
     let offset_arr = col("offset")?.as_primitive::<Int32Type>();
     let offset = (!offset_arr.is_null(row)).then(|| offset_arr.value(row));
     let size_in_bytes = col("sizeInBytes")?.as_primitive::<Int32Type>().value(row);

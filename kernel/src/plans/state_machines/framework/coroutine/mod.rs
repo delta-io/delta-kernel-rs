@@ -1,8 +1,9 @@
 //! Coroutine-backed [`StateMachine`](super::state_machine::StateMachine) implementation.
 //!
 //! - [`context`] — async [`Context<'a>`](context::Context) surface SM authors use
-//!   (`ctx.execute(operation, name).await`, plus the [`RelationRegistry`](crate::plans::ir::RelationRegistry)
-//!   API reached via `Deref` / `DerefMut`). Includes the [`PhaseYield`](context::PhaseYield) /
+//!   (`ctx.execute(operation, name).await`, plus the
+//!   [`RelationRegistry`](crate::plans::ir::RelationRegistry) API reached via `Deref` /
+//!   `DerefMut`). Includes the [`PhaseYield`](context::PhaseYield) /
 //!   [`PhaseResume`](context::PhaseResume) protocol that flows through the underlying generator.
 //! - [`driver`] — the [`CoroutineSM<R>`](driver::CoroutineSM) driver that compiles
 //!   [`PhaseYield`](context::PhaseYield) sequences into the

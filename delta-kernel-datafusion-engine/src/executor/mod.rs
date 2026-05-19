@@ -8,12 +8,12 @@
 //! execution lazily when the consumer reads the relation. Concretely:
 //!
 //! - `Relation` -> [`datafusion::datasource::ViewTable`] wrapping the upstream `LogicalPlan`.
-//!   DataFusion's `InlineTableScan` analyzer rule inlines the wrapped plan into the consumer's
-//!   tree so predicate / projection pushdown and CSE flow across the boundary.
+//!   DataFusion's `InlineTableScan` analyzer rule inlines the wrapped plan into the consumer's tree
+//!   so predicate / projection pushdown and CSE flow across the boundary.
 //! - `Load`     -> [`crate::exec::LoadTableProvider`] capturing the upstream `LogicalPlan` +
-//!   [`LoadSink`] + kernel [`Engine`]. Its `scan()` builds the upstream physical plan and wraps
-//!   it in [`crate::exec::LoadExec`], which streams per-row file batches incrementally via
-//!   kernel's parquet/json handler.
+//!   [`LoadSink`] + kernel [`Engine`]. Its `scan()` builds the upstream physical plan and wraps it
+//!   in [`crate::exec::LoadExec`], which streams per-row file batches incrementally via kernel's
+//!   parquet/json handler.
 //!
 //! [`SinkType::Consume`](delta_kernel::plans::ir::nodes::SinkType::Consume) is the only sink
 //! that drains eagerly: the physical plan runs and feeds a
@@ -29,10 +29,10 @@
 //! - [`DataFusionExecutor::execute_plans`] runs every plan in a slice in order, registering
 //!   `Relation` / `Load` providers and draining `Consume` sinks as it goes.
 //! - [`DataFusionExecutor::stream_relation`] / [`DataFusionExecutor::collect_relation`] read a
-//!   previously-registered relation as a stream or a buffered `Vec`. The actual upstream
-//!   execution happens here on demand.
-//! - [`DataFusionExecutor::collect_result`] composes the above: execute the [`ResultPlan`]'s
-//!   plans, then collect its result relation.
+//!   previously-registered relation as a stream or a buffered `Vec`. The actual upstream execution
+//!   happens here on demand.
+//! - [`DataFusionExecutor::collect_result`] composes the above: execute the [`ResultPlan`]'s plans,
+//!   then collect its result relation.
 //!
 //! [`SinkType::Relation`]: delta_kernel::plans::ir::nodes::SinkType::Relation
 //! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load

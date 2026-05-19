@@ -25,6 +25,7 @@ use delta_kernel::plans::ir::PlanBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::parquet::{file_meta, write_i64_parquet};
+use test_utils::schemas::{long_rows, long_schema, single_long_schema};
 
 fn scalar_long(s: &Scalar) -> i64 {
     match s {
@@ -77,17 +78,8 @@ fn assert_batches_equal(expected: &RecordBatch, actual: &[RecordBatch]) {
 
 #[tokio::test]
 async fn parity_literal_matches_kernel_create_many() {
-    let schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("a", DataType::LONG),
-            StructField::not_null("b", DataType::LONG),
-        ])
-        .unwrap(),
-    );
-    let rows = vec![
-        vec![Scalar::Long(1), Scalar::Long(10)],
-        vec![Scalar::Long(2), Scalar::Long(20)],
-    ];
+    let schema = long_schema(&[("a", false), ("b", false)]);
+    let rows = long_rows([[1, 10], [2, 20]]);
     let expected = kernel_literal_batch(Arc::clone(&schema), &rows);
     let got = run_to_batches(PlanBuilder::values(schema, rows).unwrap())
         .await
@@ -97,13 +89,8 @@ async fn parity_literal_matches_kernel_create_many() {
 
 #[tokio::test]
 async fn parity_filter_matches_kernel_semantics() {
-    let schema =
-        Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap());
-    let rows = vec![
-        vec![Scalar::Long(5)],
-        vec![Scalar::Long(15)],
-        vec![Scalar::Long(25)],
-    ];
+    let schema = single_long_schema();
+    let rows = long_rows([[5], [15], [25]]);
     let base = kernel_literal_batch(Arc::clone(&schema), &rows);
     let pred = Arc::new(Expression::from_pred(Predicate::gt(
         column_expr!("x"),
@@ -119,18 +106,11 @@ async fn parity_filter_matches_kernel_semantics() {
 
 #[tokio::test]
 async fn parity_project_matches_kernel_evaluation() {
-    let in_schema =
-        Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap());
-    let rows = vec![vec![Scalar::Long(3)], vec![Scalar::Long(4)]];
+    let in_schema = single_long_schema();
+    let rows = long_rows([[3], [4]]);
     let base = kernel_literal_batch(Arc::clone(&in_schema), &rows);
 
-    let out_schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("x", DataType::LONG),
-            StructField::not_null("doubled", DataType::LONG),
-        ])
-        .unwrap(),
-    );
+    let out_schema = long_schema(&[("x", false), ("doubled", false)]);
     let columns = vec![
         Arc::new(Expression::column(["x"])),
         Arc::new(Expression::binary(
@@ -154,10 +134,9 @@ async fn parity_project_matches_kernel_evaluation() {
 
 #[tokio::test]
 async fn parity_ordered_union_matches_kernel_concat() {
-    let schema =
-        Arc::new(StructType::try_new([StructField::not_null("k", DataType::LONG)]).unwrap());
-    let left_rows = vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]];
-    let right_rows = vec![vec![Scalar::Long(100)]];
+    let schema = long_schema(&[("k", false)]);
+    let left_rows = long_rows([[1], [2]]);
+    let right_rows = long_rows([[100]]);
     let b_left = kernel_literal_batch(Arc::clone(&schema), &left_rows);
     let b_right = kernel_literal_batch(Arc::clone(&schema), &right_rows);
     let expected =
@@ -180,18 +159,8 @@ async fn parity_ordered_union_matches_kernel_concat() {
 
 #[tokio::test]
 async fn parity_window_row_number_matches_ordered_partition_reference() {
-    let schema = Arc::new(
-        StructType::try_new([
-            StructField::new("part", DataType::LONG, true),
-            StructField::not_null("v", DataType::LONG),
-        ])
-        .unwrap(),
-    );
-    let rows = vec![
-        vec![Scalar::Long(1), Scalar::Long(10)],
-        vec![Scalar::Long(1), Scalar::Long(20)],
-        vec![Scalar::Long(2), Scalar::Long(30)],
-    ];
+    let schema = long_schema(&[("part", true), ("v", false)]);
+    let rows = long_rows([[1, 10], [1, 20], [2, 30]]);
 
     let mut ref_rn: Vec<i64> = Vec::new();
     let mut last_part: Option<i64> = None;
@@ -207,14 +176,7 @@ async fn parity_window_row_number_matches_ordered_partition_reference() {
         ref_rn.push(n);
     }
 
-    let out_schema = Arc::new(
-        StructType::try_new([
-            StructField::new("part", DataType::LONG, true),
-            StructField::not_null("v", DataType::LONG),
-            StructField::not_null("_rn", DataType::LONG),
-        ])
-        .unwrap(),
-    );
+    let out_schema = long_schema(&[("part", true), ("v", false), ("_rn", false)]);
 
     let base = kernel_literal_batch(Arc::clone(&schema), &rows);
     let rn_arr = Int64Array::from_iter_values(ref_rn.iter().copied());
@@ -243,29 +205,10 @@ async fn parity_window_row_number_matches_ordered_partition_reference() {
 
 #[tokio::test]
 async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
-    let build_schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("bk", DataType::LONG),
-            StructField::not_null("bv", DataType::LONG),
-        ])
-        .unwrap(),
-    );
-    let probe_schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("pk", DataType::LONG),
-            StructField::not_null("pv", DataType::LONG),
-        ])
-        .unwrap(),
-    );
-    let build_rows = vec![
-        vec![Scalar::Long(10), Scalar::Long(100)],
-        vec![Scalar::Long(10), Scalar::Long(101)],
-        vec![Scalar::Long(20), Scalar::Long(200)],
-    ];
-    let probe_rows = vec![
-        vec![Scalar::Long(10), Scalar::Long(1000)],
-        vec![Scalar::Long(99), Scalar::Long(9999)],
-    ];
+    let build_schema = long_schema(&[("bk", false), ("bv", false)]);
+    let probe_schema = long_schema(&[("pk", false), ("pv", false)]);
+    let build_rows = long_rows([[10, 100], [10, 101], [20, 200]]);
+    let probe_rows = long_rows([[10, 1000], [99, 9999]]);
 
     let root = PlanBuilder::values(build_schema, build_rows)
         .unwrap()
@@ -294,27 +237,13 @@ async fn parity_inner_join_matches_reference_including_duplicate_build_keys() {
 
 #[tokio::test]
 async fn parity_left_anti_join_matches_reference_probe_order() {
-    let build_schema =
-        Arc::new(StructType::try_new([StructField::not_null("bk", DataType::LONG)]).unwrap());
-    let probe_schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("pk", DataType::LONG),
-            StructField::not_null("pv", DataType::LONG),
-        ])
-        .unwrap(),
-    );
+    let build_schema = long_schema(&[("bk", false)]);
+    let probe_schema = long_schema(&[("pk", false), ("pv", false)]);
 
-    let root = PlanBuilder::values(build_schema, vec![vec![Scalar::Long(1)]])
+    let root = PlanBuilder::values(build_schema, long_rows([[1]]))
         .unwrap()
         .join_on(
-            PlanBuilder::values(
-                probe_schema,
-                vec![
-                    vec![Scalar::Long(2), Scalar::Long(20)],
-                    vec![Scalar::Long(1), Scalar::Long(10)],
-                ],
-            )
-            .unwrap(),
+            PlanBuilder::values(probe_schema, long_rows([[2, 20], [1, 10]])).unwrap(),
             vec![Arc::new(Expression::column(["bk"]))],
             vec![Arc::new(Expression::column(["pk"]))],
             JoinType::LeftAnti,

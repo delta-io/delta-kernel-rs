@@ -595,9 +595,7 @@ mod tests {
     use std::sync::LazyLock;
 
     use super::*;
-    use crate::models::{
-        ParallelScan, ReadConfig, ReadEngine, ReadSpec, TableInfo, TimeTravel,
-    };
+    use crate::models::{ParallelScan, ReadConfig, ReadEngine, ReadSpec, TableInfo, TimeTravel};
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
@@ -852,5 +850,4 @@ mod tests {
         .expect("setup should succeed");
         assert!(runner.execute().is_ok());
     }
-
 }
