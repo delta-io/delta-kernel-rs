@@ -637,6 +637,15 @@ fn wrap_opaque_predicate<I: IntoIterator<Item = usize>>(
     name: String,
     child_ids: I,
 ) -> DeltaResult<usize> {
+    wrap_opaque_predicate_with_callbacks(state, name, child_ids, None)
+}
+
+fn wrap_opaque_predicate_with_callbacks<I: IntoIterator<Item = usize>>(
+    state: &mut KernelExpressionVisitorState,
+    name: String,
+    child_ids: I,
+    callbacks: Option<std::sync::Arc<crate::expressions::pruning::OpaquePruningCallbacks>>,
+) -> DeltaResult<usize> {
     // Drain every id from state before deciding the result, so callers see consistent
     // consumption even when some ids are invalid. Bail out with 0 (invalid predicate) if
     // any id failed to resolve -- opaque ops are not variadic, and silently shrinking the
@@ -649,8 +658,52 @@ fn wrap_opaque_predicate<I: IntoIterator<Item = usize>>(
         return Ok(0);
     }
     let exprs: Vec<Expression> = resolved.into_iter().flatten().collect();
-    let op = NamedOpaquePredicateOp::new(name);
+    let op = match callbacks {
+        Some(cb) => NamedOpaquePredicateOp::with_callbacks(name, cb),
+        None => NamedOpaquePredicateOp::new(name),
+    };
     Ok(wrap_predicate(state, Predicate::opaque(op, exprs)))
+}
+
+/// Build an opaque predicate with engine pruning callbacks attached. Same as
+/// [`visit_predicate_opaque`] but the resulting op consults the engine via
+/// `ctx` for every pruning decision (partition pruning, stats-based file
+/// pruning, and parquet row-group skipping).
+///
+/// The context is arc-cloned; multiple opaque ops in one query can share a
+/// single context handle without duplicating engine state.
+///
+/// # Safety
+/// The string slice must be valid for the duration of the call. `ctx` must
+/// be a valid handle produced by [`create_opaque_pruning_context`].
+///
+/// [`create_opaque_pruning_context`]: crate::expressions::pruning::create_opaque_pruning_context
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate_opaque_with_pruning(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+    children: &mut EngineIterator,
+    ctx: Handle<crate::expressions::pruning::SharedOpaquePruningContext>,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { String::try_from_slice(&name) };
+    let callbacks = unsafe { ctx.clone_as_arc() };
+    visit_predicate_opaque_with_pruning_impl(state, name_str, children, callbacks)
+        .into_extern_result(&allocate_error)
+}
+
+fn visit_predicate_opaque_with_pruning_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: DeltaResult<String>,
+    children: &mut EngineIterator,
+    callbacks: std::sync::Arc<crate::expressions::pruning::OpaquePruningCallbacks>,
+) -> DeltaResult<usize> {
+    wrap_opaque_predicate_with_callbacks(
+        state,
+        name?,
+        children.map(|child| child as usize),
+        Some(callbacks),
+    )
 }
 
 #[no_mangle]

@@ -1,6 +1,7 @@
 //! This module holds functionality for moving expressions across the FFI boundary, both from
 //! engine to kernel, and from kernel to engine.
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
@@ -15,7 +16,13 @@ use crate::{kernel_string_slice, KernelStringSlice};
 
 pub mod engine_visitor;
 pub mod kernel_visitor;
-mod skipping;
+pub mod pruning;
+
+use pruning::{
+    invoke_eval_against_stats, invoke_eval_on_partition_values, invoke_eval_on_row_group_stats,
+    ChildAccessor, DirectStatsProvider, OpaquePruningCallbacks, ScalarResolver, ScalarResolverImpl,
+    StatsAccessor,
+};
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
 pub struct SharedExpression;
@@ -97,27 +104,59 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 
 // === NamedOpaquePredicateOp ====================================================
 
-/// An [`OpaquePredicateOp`] that carries only a name, intended for FFI consumers that need
-/// to push an engine-defined predicate through the kernel without registering a Rust-side
-/// evaluator.
+/// An [`OpaquePredicateOp`] that carries an engine-defined name and an
+/// optional reference to the engine's [`OpaquePruningCallbacks`].
 ///
-/// Engine-side row-level evaluation is always required: kernel has no way to evaluate the op
-/// itself. For kernel-side pruning, the internal `skipping` shim recognizes a curated list
-/// of op names (`STARTS_WITH`) and supplies the appropriate rewrites and scalar evaluators.
-/// Skipping for recognized ops assumes Delta's default binary string collation; engines
-/// using non-default collations must not push the affected predicates through this op.
-/// Ops outside the recognized list opt out of every pruning pass; the engine is
-/// responsible for filtering them at row time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Engine-side row-level evaluation is always required: kernel has no way to
+/// evaluate the op itself. For kernel-side pruning, if the engine has
+/// registered [`OpaquePruningCallbacks`] via [`create_opaque_pruning_context`],
+/// kernel invokes the appropriate callback for every pruning decision -- once
+/// per partition value set during partition pruning, once per Add action
+/// during stats-based file pruning, once per parquet row group during
+/// row-group skipping.
+///
+/// If no callbacks are registered, the op opts out of every pruning pass and
+/// the engine is responsible for filtering at row time.
+///
+/// [`create_opaque_pruning_context`]: pruning::create_opaque_pruning_context
+#[derive(Debug, Clone)]
 pub struct NamedOpaquePredicateOp {
     name: String,
+    callbacks: Option<Arc<OpaquePruningCallbacks>>,
 }
 
 impl NamedOpaquePredicateOp {
+    /// Build an op that opts out of all kernel-side pruning. The engine
+    /// remains responsible for row-time evaluation.
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            callbacks: None,
+        }
+    }
+
+    /// Build an op that consults `callbacks` during pruning passes.
+    pub(crate) fn with_callbacks(
+        name: impl Into<String>,
+        callbacks: Arc<OpaquePruningCallbacks>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            callbacks: Some(callbacks),
+        }
     }
 }
+
+impl PartialEq for NamedOpaquePredicateOp {
+    fn eq(&self, other: &Self) -> bool {
+        // Identity is the op name; the optional callbacks slot is incidental
+        // engine-side bookkeeping. Two ops with the same name represent the
+        // same engine-defined operator.
+        self.name == other.name
+    }
+}
+
+impl Eq for NamedOpaquePredicateOp {}
 
 impl OpaquePredicateOp for NamedOpaquePredicateOp {
     fn name(&self) -> &str {
@@ -131,18 +170,15 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> DeltaResult<Option<bool>> {
-        if let Some(result) =
-            skipping::evaluate_on_partition_value(&self.name, eval_expr, exprs, inverted)
-        {
-            return result;
-        }
-        // Unrecognized op -- emit the documented "no scalar eval" signal.
-        // See `OpaquePredicateOp::eval_pred_scalar`: returning `Err` opts the
-        // op out of partition pruning.
-        Err(delta_kernel::Error::generic(format!(
-            "NamedOpaquePredicateOp({}) does not support scalar evaluation",
-            self.name
-        )))
+        let Some(cb) = self.callbacks.as_deref() else {
+            // No engine callbacks registered -- opt out of partition pruning.
+            return Ok(None);
+        };
+        let children = ChildAccessor::new(exprs);
+        let resolver = ScalarResolver::new(ScalarResolverImpl::new(eval_expr));
+        Ok(invoke_eval_on_partition_values(
+            cb, &self.name, children, resolver, inverted,
+        ))
     }
 
     fn eval_as_data_skipping_predicate(
@@ -151,17 +187,39 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<bool> {
-        skipping::evaluate_for_row_group_skipping(&self.name, evaluator, exprs, inverted)
+        let cb = self.callbacks.as_deref()?;
+        let children = ChildAccessor::new(exprs);
+        let provider = DirectStatsProvider::new(evaluator);
+        let stats = StatsAccessor::new(&provider);
+        invoke_eval_on_row_group_stats(cb, &self.name, children, stats, inverted)
     }
 
     fn as_data_skipping_predicate(
         &self,
-        evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
-        exprs: &[Expression],
-        inverted: bool,
+        _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expression],
+        _inverted: bool,
     ) -> Option<Predicate> {
-        skipping::rewrite_for_file_pruning(&self.name, evaluator, exprs, inverted)
+        // Opaque ops never rewrite to a kernel-native predicate. Per-file
+        // evaluation goes through `eval_as_data_skipping_predicate` via the
+        // per-file refinement pass in `data_skipping.rs`.
+        None
     }
+}
+
+/// Internal entry point used by the per-file refinement pass in kernel's
+/// data_skipping.rs. Invokes the engine's stats callback directly.
+#[allow(dead_code)]
+pub(crate) fn invoke_stats_callback(
+    op: &NamedOpaquePredicateOp,
+    exprs: &[Expression],
+    inverted: bool,
+    provider: &dyn pruning::StatsProvider,
+) -> Option<bool> {
+    let cb = op.callbacks.as_deref()?;
+    let children = ChildAccessor::new(exprs);
+    let stats = StatsAccessor::new(provider);
+    invoke_eval_against_stats(cb, &op.name, children, stats, inverted)
 }
 
 #[cfg(test)]
