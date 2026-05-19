@@ -250,13 +250,11 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
 ) -> ExternResult<bool> {
     let txn_ref = unsafe { txn.as_mut() };
     let dv_map = unsafe { dv_map.into_inner() };
+    let scan_iter = unsafe { scan_iter.into_inner() };
     let engine_ref = unsafe { engine.as_ref() };
-    let result = {
-        let scan_iter_ref = unsafe { scan_iter.as_ref() };
-        transaction_update_deletion_vectors_impl(txn_ref, *dv_map, scan_iter_ref)
-    };
-    unsafe { scan_iter.drop_handle() };
-    result.map(|_| true).into_extern_result(&engine_ref)
+    transaction_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter)
+        .map(|_| true)
+        .into_extern_result(&engine_ref)
 }
 
 fn transaction_update_deletion_vectors_impl(
