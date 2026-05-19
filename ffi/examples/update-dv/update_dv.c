@@ -142,6 +142,7 @@ int main(int argc, char* argv[]) {
   KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
   ExternResultHandleExclusiveTransaction with_info_res =
       with_engine_info(txn, engine_info_slice, engine);
+  txn = NULL; // consumed by with_engine_info regardless of result
   if (with_info_res.tag != OkHandleExclusiveTransaction) {
     err = (Error*)with_info_res.err;
     print_error("with_engine_info failed.", err);
