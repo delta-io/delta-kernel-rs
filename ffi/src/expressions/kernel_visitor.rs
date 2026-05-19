@@ -658,11 +658,24 @@ fn wrap_opaque_predicate_with_callbacks<I: IntoIterator<Item = usize>>(
         return Ok(0);
     }
     let exprs: Vec<Expression> = resolved.into_iter().flatten().collect();
-    let op = match callbacks {
-        Some(cb) => NamedOpaquePredicateOp::with_callbacks(name, cb),
-        None => NamedOpaquePredicateOp::new(name),
+    let pred = match callbacks {
+        Some(cb) => {
+            let op = NamedOpaquePredicateOp::with_callbacks(name, cb);
+            // Wrap via arrow_opaque so the default engine's batch evaluator
+            // can route per-row callback invocations through eval_pred.
+            #[cfg(feature = "default-engine-base")]
+            {
+                use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
+                Predicate::arrow_opaque(op, exprs)
+            }
+            #[cfg(not(feature = "default-engine-base"))]
+            {
+                Predicate::opaque(op, exprs)
+            }
+        }
+        None => Predicate::opaque(NamedOpaquePredicateOp::new(name), exprs),
     };
-    Ok(wrap_predicate(state, Predicate::opaque(op, exprs)))
+    Ok(wrap_predicate(state, pred))
 }
 
 /// Build an opaque predicate with engine pruning callbacks attached. Same as

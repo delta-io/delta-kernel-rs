@@ -18,6 +18,9 @@ pub mod engine_visitor;
 pub mod kernel_visitor;
 pub mod pruning;
 
+#[cfg(feature = "default-engine-base")]
+mod arrow_pruning;
+
 use pruning::{
     invoke_eval_against_stats, invoke_eval_on_partition_values, invoke_eval_on_row_group_stats,
     ChildAccessor, DirectStatsProvider, OpaquePruningCallbacks, ScalarResolver, ScalarResolverImpl,
@@ -144,6 +147,22 @@ impl NamedOpaquePredicateOp {
             name: name.into(),
             callbacks: Some(callbacks),
         }
+    }
+
+    /// Op name as a `&str`. Used internally by the arrow adapter.
+    pub(crate) fn op_name(&self) -> &str {
+        &self.name
+    }
+
+    /// `true` if engine callbacks are registered.
+    pub(crate) fn has_callbacks(&self) -> bool {
+        self.callbacks.is_some()
+    }
+
+    /// Clone the callback `Arc`, if any. Used by the arrow adapter to
+    /// forward the same callback bundle through batch evaluation.
+    pub(crate) fn callbacks_clone(&self) -> Option<Arc<OpaquePruningCallbacks>> {
+        self.callbacks.clone()
     }
 }
 
