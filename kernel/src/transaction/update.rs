@@ -27,6 +27,7 @@ use crate::error::Error;
 use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
+use crate::scan::state::Stats;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
@@ -225,6 +226,7 @@ impl Transaction {
     /// - The table does not have deletion vectors enabled via protocol support and the
     ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
+    /// - A matched file's scan metadata is missing or has invalid `stats.numRecords`
     ///
     /// # Examples
     ///
@@ -541,6 +543,8 @@ struct DvMatchVisitor<'a> {
 impl<'a> DvMatchVisitor<'a> {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     const PATH_INDEX: usize = 0;
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    const STATS_INDEX: usize = 1;
 
     /// Creates a new DvMatchVisitor that will match file paths against the provided DV updates map.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -557,8 +561,8 @@ impl<'a> DvMatchVisitor<'a> {
 impl FilteredRowVisitor for DvMatchVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
-            let names = vec![column_name!("path")];
-            let types = vec![DataType::STRING];
+            let names = vec![column_name!("path"), column_name!("stats")];
+            let types = vec![DataType::STRING, DataType::STRING];
             (names, types)
         });
         (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
@@ -592,6 +596,26 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 continue;
             };
             if let Some(dv_result) = self.dv_updates.get(&path) {
+                // The Delta protocol's "Deletion Vectors" section requires that files with a DV
+                // carry an accurate `numRecords` statistic, so we reject scan metadata that has
+                // dropped or never had it. We parse the raw `stats` JSON string here because
+                // scan rows carry stats as a string per `SCAN_ROW_SCHEMA`; the parallel check on
+                // unparsed add-action batches lives in
+                // `stats_verifier::verify_num_records_present`.
+                let stats: Option<String> =
+                    getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
+                let stats = stats.ok_or_else(|| {
+                    Error::generic(format!(
+                        "update_deletion_vectors: file {path} has no stats; \
+                         deletion vectors require an accurate numRecords"
+                    ))
+                })?;
+                serde_json::from_str::<Stats>(&stats).map_err(|e| {
+                    Error::generic(format!(
+                        "update_deletion_vectors: stats for {path} are missing or invalid \
+                         numRecords ({e})"
+                    ))
+                })?;
                 self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
                     DV_SCHEMA_FIELDS.clone(),
                     vec![
@@ -611,5 +635,96 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         self.new_dv_entries
             .resize_with(num_rows, || NULL_DV.clone());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
+    use crate::arrow::array::{ArrayRef, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
+
+    const TEST_PATH: &str = "data/file.parquet";
+
+    /// Build a single-row scan-metadata-like batch. `path` and `stats` are addressed by name
+    /// (matching `DvMatchVisitor::selected_column_names_and_types`), so the surrounding
+    /// `extra_columns` and their positions deliberately exercise name-based getter binding.
+    fn make_scan_metadata_row(
+        path: &str,
+        stats: Option<&str>,
+        extra_columns: &[&str],
+    ) -> FilteredEngineData {
+        let mut fields = vec![
+            ArrowField::new("path", ArrowDataType::Utf8, true),
+            ArrowField::new("stats", ArrowDataType::Utf8, true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some(path)])),
+            Arc::new(StringArray::from(vec![stats])),
+        ];
+        for name in extra_columns {
+            fields.push(ArrowField::new(*name, ArrowDataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![Some("ignored")])));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    fn dv_updates_for(path: &str) -> HashMap<String, DeletionVectorDescriptor> {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            "AAAAAAAA".to_string(),
+            None,
+            8,
+            0,
+        )
+        .unwrap();
+        HashMap::from([(path.to_string(), descriptor)])
+    }
+
+    #[rstest]
+    #[case::null_stats(None, &[], true)]
+    #[case::stats_missing_num_records(Some("{}"), &[], true)]
+    #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], false)]
+    #[case::extra_columns_dont_shift_indexes(
+        Some(r#"{"numRecords":10}"#),
+        &["size", "modificationTime"],
+        false,
+    )]
+    fn dv_match_visitor_validates_matched_row_stats(
+        #[case] stats: Option<&str>,
+        #[case] extra_columns: &[&str],
+        #[case] expect_error: bool,
+    ) {
+        let dv_updates = dv_updates_for(TEST_PATH);
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, stats, extra_columns);
+
+        let result = visitor.visit_rows_of(&data);
+        if expect_error {
+            let msg = result.expect_err("expected error").to_string();
+            assert!(msg.contains("numRecords"), "message was: {msg}");
+            assert!(msg.contains(TEST_PATH), "message was: {msg}");
+        } else {
+            result.expect("validation should pass");
+            assert_eq!(visitor.matched_file_indexes, vec![0]);
+        }
+    }
+
+    #[test]
+    fn dv_match_visitor_skips_validation_for_unmatched_rows() {
+        let dv_updates = dv_updates_for("other/file.parquet");
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, None, &[]);
+
+        visitor
+            .visit_rows_of(&data)
+            .expect("unmatched rows must not trigger stats validation");
+        assert!(visitor.matched_file_indexes.is_empty());
     }
 }
