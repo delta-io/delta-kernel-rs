@@ -324,9 +324,7 @@ impl Transaction {
     }
 
     /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
-    /// writer features AND the `delta.enableDeletionVectors` table property set to `true`). Per
-    /// the Delta protocol "Deletion Vectors" section, writers MUST only write new DVs when the
-    /// property is enabled, not merely when the feature is in the protocol.
+    /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
     fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
         if !self
             .effective_table_config
@@ -373,10 +371,6 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 
 /// Schema for scan row data with nullable statistics fields.
 /// Used when generating remove actions to ensure statistics can be null if missing.
-// The panic here is acceptable because scan_row_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
 static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| schema_with_all_fields_nullable(scan_row_schema().as_ref()).into());
 
@@ -387,10 +381,6 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 
 /// Schema for restored add actions with nullable statistics fields.
 /// Used when transforming scan data back to add actions with potentially missing statistics.
-// The panic here is acceptable because restored_add_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
 static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| schema_with_all_fields_nullable(restored_add_schema()).into());
 
@@ -401,10 +391,6 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 
 /// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues
 /// with null values in required fields that aren't selected.
-// The panic here is acceptable because add_log_schema is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| schema_with_all_fields_nullable(get_log_add_schema()).into());
 
