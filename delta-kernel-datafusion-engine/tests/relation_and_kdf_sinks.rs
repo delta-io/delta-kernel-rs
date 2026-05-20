@@ -8,7 +8,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::ir::nodes::ConsumeSink;
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
-use delta_kernel_datafusion_engine::DataFusionExecutor;
+use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 use test_utils::schemas::single_long_schema;
 use uuid::Uuid;
 
@@ -29,7 +29,7 @@ async fn relation_sink_registers_batches_readable_via_relation_leaf() {
         .await
         .unwrap();
 
-    let batches = executor.collect_relation(&handle).await.unwrap();
+    let batches = testing::collect_relation(&executor, &handle).await.unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
 }

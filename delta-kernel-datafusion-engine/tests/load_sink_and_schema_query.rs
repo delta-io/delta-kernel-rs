@@ -10,7 +10,7 @@ use delta_kernel::expressions::{ColumnName, Scalar, StructData};
 use delta_kernel::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns};
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::schema::{DataType, StructField, StructType, ToSchema};
-use delta_kernel_datafusion_engine::DataFusionExecutor;
+use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 use test_utils::parquet::write_i64_parquet;
 use url::Url;
 use uuid::Uuid;
@@ -40,8 +40,7 @@ fn dv_small_fixture_base_url() -> Url {
 
 /// Sum `num_rows` across every batch registered under `handle` after the producing plan has run.
 async fn relation_row_count(executor: &DataFusionExecutor, handle: &RelationHandle) -> usize {
-    executor
-        .collect_relation(handle)
+    testing::collect_relation(executor, handle)
         .await
         .unwrap()
         .iter()
@@ -107,7 +106,7 @@ async fn load_sink_broadcasts_passthrough_columns() {
         .unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, 4);
 
-    let batches = executor.collect_relation(&handle).await.unwrap();
+    let batches = testing::collect_relation(&executor, &handle).await.unwrap();
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4);
@@ -247,7 +246,7 @@ async fn load_sink_reads_ndjson_with_matching_schema() {
         .unwrap();
     assert_eq!(relation_row_count(&executor, &handle).await, 2);
 
-    let batches = executor.collect_relation(&handle).await.unwrap();
+    let batches = testing::collect_relation(&executor, &handle).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 
     let idx_y = batches[0].schema().column_with_name("y").unwrap().0;
@@ -338,7 +337,7 @@ async fn load_exec_streams_one_parquet_row_group_per_batch() {
         .await
         .unwrap();
 
-    let batches = executor.collect_relation(&handle).await.unwrap();
+    let batches = testing::collect_relation(&executor, &handle).await.unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 64, "row count must match the file's row count");
     assert!(

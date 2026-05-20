@@ -17,7 +17,7 @@ use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use delta_kernel_unity_catalog::UCKernelClient;
@@ -28,10 +28,10 @@ use unity_catalog_delta_rest_client::{
 use url::Url;
 
 use crate::models::{
-    ParallelScan, ReadConfig, ReadEngine, ReadOperation, ReadSpec, SnapshotConstructionSpec,
-    TableInfo, TimeTravel,
+    ParallelScan, ReadConfig, ReadEngine, ReadOperation, ReadSpec, TableInfo, TimeTravel,
 };
 use crate::predicate_parser::parse_predicate;
+use crate::workload::{build_scan_for_spec, execute_read_via_datafusion};
 
 /// Delta table property indicating catalog-managed support.
 const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
@@ -348,14 +348,16 @@ impl WorkloadRunner for ReadMetadataRunner {
     }
 }
 
-/// Shared setup state for the ReadData runners: a snapshot loaded via the resolved strategy,
-/// its engine, the benchmark display name, and the parsed predicate / projected schema (if any).
+/// Shared setup state for the ReadData runners: a fully-built `Scan` (predicate +
+/// column projection pre-applied), its engine, the benchmark display name, and the
+/// original logical-schema predicate (kept separately because kernel rewrites the
+/// predicate to physical column names inside the scan; only the original can be
+/// evaluated against logical-schema output batches).
 struct ReadDataSetup {
-    snapshot: Arc<Snapshot>,
+    scan: Scan,
+    post_filter_predicate: Option<PredicateRef>,
     engine: Arc<dyn Engine>,
     name: String,
-    predicate: Option<PredicateRef>,
-    projected_schema: Option<delta_kernel::schema::SchemaRef>,
 }
 
 impl ReadDataSetup {
@@ -369,17 +371,7 @@ impl ReadDataSetup {
         let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
         let snapshot =
             strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
-        let predicate = read_spec
-            .predicate
-            .as_deref()
-            .map(|sql| parse_predicate(sql, &snapshot.schema()))
-            .transpose()?
-            .map(Arc::new);
-        let projected_schema = read_spec
-            .columns
-            .as_ref()
-            .map(|cols| snapshot.schema().project(cols))
-            .transpose()?;
+        let (scan, post_filter_predicate) = build_scan_for_spec(snapshot, read_spec)?;
         let name = format!(
             "{}/{}/{}/{}",
             table_info.name,
@@ -389,11 +381,10 @@ impl ReadDataSetup {
         );
         Ok((
             Self {
-                snapshot,
+                scan,
+                post_filter_predicate,
                 engine,
                 name,
-                predicate,
-                projected_schema,
             },
             runtime,
         ))
@@ -420,17 +411,7 @@ impl ReadDataStateMachineRunner {
 
 impl WorkloadRunner for ReadDataStateMachineRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut builder = self
-            .setup
-            .snapshot
-            .clone()
-            .scan_builder()
-            .with_predicate(self.setup.predicate.clone());
-        if let Some(schema) = &self.setup.projected_schema {
-            builder = builder.with_schema(schema.clone());
-        }
-        let scan = builder.build()?;
-        for result in scan.execute(self.setup.engine.clone())? {
+        for result in self.setup.scan.execute(self.setup.engine.clone())? {
             black_box(result?);
         }
         Ok(())
@@ -469,29 +450,12 @@ impl ReadDataPlansRunner {
 
 impl WorkloadRunner for ReadDataPlansRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut builder = self.setup.snapshot.clone().scan_builder();
-        if let Some(schema) = &self.setup.projected_schema {
-            builder = builder.with_schema(schema.clone());
-        }
-        if let Some(predicate) = &self.setup.predicate {
-            builder = builder.with_predicate(predicate.clone());
-        }
-        let sm = builder
-            .build_replay()
-            .map_err(|e| format!("build replay scan failed: {e}"))?
-            .scan_state_machine()
-            .map_err(|e| format!("build replay scan SM failed: {e}"))?;
-        let rp = self
-            .runtime
-            .block_on(self.executor.drive_to_completion(sm))
-            .map_err(|e| format!("drive replay scan SM failed: {e}"))?;
-        let batches = self
-            .runtime
-            .block_on(self.executor.collect_result(rp))
-            .map_err(|e| format!("DataFusion read execution failed: {e}"))?;
-        for batch in batches {
-            black_box(batch);
-        }
+        let result = self.runtime.block_on(execute_read_via_datafusion(
+            &self.executor,
+            &self.setup.scan,
+            self.setup.post_filter_predicate.as_deref(),
+        ))?;
+        black_box(result);
         Ok(())
     }
 
@@ -525,80 +489,12 @@ pub fn create_read_runner(
     }
 }
 
-pub struct SnapshotConstructionRunner {
-    engine: Arc<dyn Engine>,
-    runtime: Arc<tokio::runtime::Runtime>,
-    snapshot_strategy: SnapshotStrategy,
-    time_travel: Option<TimeTravel>,
-    name: String,
-}
-
-impl SnapshotConstructionRunner {
-    pub fn setup(
-        table_info: &TableInfo,
-        case_name: &str,
-        snapshot_spec: &SnapshotConstructionSpec,
-        runtime: Arc<tokio::runtime::Runtime>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let name = format!(
-            "{}/{}/{}",
-            table_info.name,
-            case_name,
-            snapshot_spec.as_str()
-        );
-
-        let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
-
-        Ok(Self {
-            engine,
-            runtime,
-            snapshot_strategy,
-            time_travel: snapshot_spec.time_travel.clone(),
-            name,
-        })
-    }
-}
-
-impl WorkloadRunner for SnapshotConstructionRunner {
-    fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot = self.snapshot_strategy.load_snapshot(
-            self.engine.as_ref(),
-            &self.runtime,
-            self.time_travel.as_ref(),
-        )?;
-        let executor = DataFusionExecutor::try_new_with_engine(Arc::clone(&self.engine))
-            .map_err(|e| format!("create DataFusionExecutor: {e}"))?;
-        let sm = snapshot
-            .full_state_builder()
-            .build()
-            .and_then(|fs| fs.state_machine())
-            .map_err(|e| format!("build full_state SM: {e}"))?;
-        let rp = self
-            .runtime
-            .block_on(executor.drive_to_completion(sm))
-            .map_err(|e| format!("drive full_state SM via DataFusionExecutor: {e}"))?;
-        self.runtime
-            .block_on(executor.collect_result(rp))
-            .map_err(|e| format!("collect full_state results via DataFusionExecutor: {e}"))?;
-        black_box((
-            snapshot.version(),
-            snapshot.protocol().clone(),
-            snapshot.metadata().clone(),
-        ));
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
 
     use super::*;
-    use crate::models::{ParallelScan, ReadConfig, ReadEngine, ReadSpec, TableInfo, TimeTravel};
+    use crate::models::{ParallelScan, ReadConfig, ReadEngine, ReadSpec, TableInfo};
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
@@ -709,51 +605,6 @@ mod tests {
         assert!(runner.execute().is_ok());
     }
 
-    fn test_snapshot_spec() -> SnapshotConstructionSpec {
-        SnapshotConstructionSpec {
-            time_travel: None,
-            expected: None,
-        }
-    }
-
-    #[test]
-    fn test_snapshot_construction_runner_setup() {
-        let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
-            &test_snapshot_spec(),
-            test_runtime(),
-        );
-        assert!(runner.is_ok());
-    }
-
-    #[test]
-    fn test_snapshot_construction_runner_name() {
-        let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
-            &test_snapshot_spec(),
-            test_runtime(),
-        )
-        .expect("setup should succeed");
-        assert_eq!(
-            runner.name(),
-            "basic_partitioned/testCase/snapshotConstruction"
-        );
-    }
-
-    #[test]
-    fn test_snapshot_construction_runner_execute() {
-        let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
-            &test_snapshot_spec(),
-            test_runtime(),
-        )
-        .expect("setup should succeed");
-        assert!(runner.execute().is_ok());
-    }
-
     #[test]
     fn test_create_read_runner_read_metadata() {
         let runner = create_read_runner(
@@ -836,21 +687,5 @@ mod tests {
         let url = Url::parse("gs://bucket/table").unwrap();
         let result = resolve_engine_for_url(&url, test_runtime());
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_snapshot_construction_with_time_travel() {
-        let spec = SnapshotConstructionSpec {
-            time_travel: Some(TimeTravel::Version { version: 0 }),
-            expected: None,
-        };
-        let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
-            &spec,
-            test_runtime(),
-        )
-        .expect("setup should succeed");
-        assert!(runner.execute().is_ok());
     }
 }

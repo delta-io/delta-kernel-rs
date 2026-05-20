@@ -23,7 +23,7 @@ use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl};
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, EngineData, EvaluationHandler};
-use delta_kernel_datafusion_engine::DataFusionExecutor;
+use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 use uuid::Uuid;
 
 /// Wrap `node` in a Relation sink, run it on a freshly created [`DataFusionExecutor`], and
@@ -43,7 +43,7 @@ pub async fn run_to_batches_with(
     let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
     let handle = node.into_relation("test_out", &mut registry)?;
     exec.execute_plans(&registry.take_plans()).await?;
-    exec.collect_relation(&handle).await
+    testing::collect_relation(exec, &handle).await
 }
 
 /// Synchronous wrapper around [`run_to_batches`] for `#[test]` (non-async) call sites.
@@ -51,8 +51,8 @@ pub async fn run_to_batches_with(
 /// Uses a fresh single-threaded Tokio runtime rather than `futures::executor::block_on` so
 /// async DataFusion operators that spawn tasks (e.g. `HashJoinExec`) have a reactor to run on.
 /// Lazy relation registration shifted some of those executions out of `execute_plans` (which is
-/// always called inside an `async fn` runtime) into `collect_relation`, where the surrounding
-/// `block_on` flavor matters.
+/// always called inside an `async fn` runtime) into the stream-drain inside `collect_relation`,
+/// where the surrounding `block_on` flavor matters.
 pub fn run_to_batches_blocking(node: PlanBuilder) -> Result<Vec<RecordBatch>, DeltaError> {
     tokio_runtime().block_on(run_to_batches(node))
 }

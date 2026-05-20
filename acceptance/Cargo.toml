@@ -43,7 +43,7 @@ tar = "0.4"
 
 [dev-dependencies]
 datatest-stable = "0.3"
-delta-kernel-datafusion-engine = { path = "../delta-kernel-datafusion-engine" }
+delta-kernel-datafusion-engine = { path = "../delta-kernel-datafusion-engine", features = ["test-utils"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 test_utils = { path = "../test-utils", default-features = false }
 tempfile = "3"
@@ -56,10 +56,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 
 [[test]]
 name = "dat_reader"
-harness = false
-
-[[test]]
-name = "dat_reader_datafusion"
 harness = false
 
 [[test]]

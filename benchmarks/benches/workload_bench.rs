@@ -5,9 +5,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadEngine, ReadOperation, Spec,
 };
-use delta_kernel_benchmarks::runners::{
-    create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
-};
+use delta_kernel_benchmarks::runners::{create_read_runner, WorkloadRunner};
 use delta_kernel_benchmarks::utils::load_all_workloads;
 use test_utils::CountingReporter;
 
@@ -43,16 +41,10 @@ fn workload_benchmarks(c: &mut Criterion) {
                     }
                 }
             }
-            Spec::SnapshotConstruction(snapshot_construction_spec) => {
-                let runner = SnapshotConstructionRunner::setup(
-                    &workload.table_info,
-                    &workload.case_name,
-                    snapshot_construction_spec,
-                    runtime.clone(),
-                )
-                .expect("Failed to create snapshot construction runner");
-                run_benchmark(c, &runner, &reporter);
-            }
+            // Snapshot construction has no DataFusion implementation yet; skip these workloads.
+            // The DataFusion acceptance harness still smoke-tests the snapshot path; this loop
+            // only registered the (dead) DataFusion-based SnapshotConstructionRunner.
+            Spec::SnapshotConstruction(_) => continue,
         }
     }
 }

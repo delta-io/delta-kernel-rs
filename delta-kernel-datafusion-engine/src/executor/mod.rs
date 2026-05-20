@@ -26,10 +26,10 @@ use datafusion::execution::context::SessionContext;
 use datafusion_common::error::DataFusionError;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::arrow::datatypes::SchemaRef;
 use delta_kernel::arrow::error::ArrowError;
-use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -46,7 +46,7 @@ use delta_kernel::plans::state_machines::framework::phase_operation::{
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
 use delta_kernel::plans::state_machines::framework::state_machine::{AdvanceResult, StateMachine};
 use delta_kernel::{Engine, Error as KernelError};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use url::Url;
 use uuid::Uuid;
 
@@ -170,8 +170,8 @@ impl DataFusionExecutor {
     /// (kernel-side decision plans, schema queries) and returning the SM's terminal value.
     ///
     /// The terminal value is whatever `R` the SM was constructed for: for read-style SMs that
-    /// is typically a [`ResultPlan`] that the caller then runs with [`Self::collect_result`]
-    /// (or by hand with [`Self::execute_plans`] + [`Self::collect_relation`]).
+    /// is typically a [`ResultPlan`] that the caller streams via [`Self::drive_to_stream`]
+    /// (or, equivalently, by hand with [`Self::execute_plans`] + [`Self::stream_relation`]).
     pub async fn drive_to_completion<R: Send + 'static>(
         &self,
         mut sm: CoroutineSM<R>,
@@ -204,15 +204,29 @@ impl DataFusionExecutor {
             .into_delta()
     }
 
-    /// Run [`ResultPlan::plans`] and then collect every batch in the result relation.
-    pub async fn collect_result(&self, rp: ResultPlan) -> Result<Vec<RecordBatch>, DeltaError> {
+    /// Drive a [`ResultPlan`]-returning SM and open a stream over its result relation.
+    ///
+    /// Combines [`Self::drive_to_completion`], [`Self::execute_plans`], and
+    /// [`Self::stream_relation`] into one call so callers that just want the row stream an
+    /// SM produces don't have to thread the intermediate [`ResultPlan`] through their own
+    /// code. Useful for read-style SMs (`scan_state_machine`, `full_state`, ...) whose
+    /// terminal value is always a `ResultPlan`. Callers wanting an eager `Vec<RecordBatch>`
+    /// can `try_collect()` on the returned stream.
+    pub async fn drive_to_stream(
+        &self,
+        sm: CoroutineSM<ResultPlan>,
+    ) -> Result<SendableRecordBatchStream, DeltaError> {
+        let rp = self.drive_to_completion(sm).await?;
         self.execute_plans(&rp.plans).await?;
-        self.collect_relation(&rp.result_relation).await
+        self.stream_relation(&rp.result_relation).await
     }
 
-    /// Stream every batch of a registered relation by handle. Returns a single
-    /// coalesced [`SendableRecordBatchStream`]; callers that want a buffered `Vec` should use
-    /// [`Self::collect_relation`].
+    /// Stream every batch of a registered relation by handle. Returns a single coalesced
+    /// [`SendableRecordBatchStream`] whose batches have their nested field-declaration
+    /// metadata re-stamped to match `handle`'s declared schema (see
+    /// [`crate::exec::stamp_batch_metadata`] for why this is necessary, primarily for
+    /// column-mapping tables). Callers that want an eager `Vec<RecordBatch>` can
+    /// `try_collect()` the returned stream.
     pub async fn stream_relation(
         &self,
         handle: &RelationHandle,
@@ -230,17 +244,7 @@ impl DataFusionExecutor {
             })
             .into_delta()?;
         let df = self.session_ctx.read_table(provider).into_delta()?;
-        df.execute_stream().await.into_delta()
-    }
-
-    /// Collect every batch of a registered relation. Thin wrapper over
-    /// [`Self::stream_relation`] that drains the stream into a `Vec` and re-stamps each
-    /// batch's nested field-declaration metadata to match the relation handle's declared
-    /// schema (see [`crate::exec::stamp_batch_metadata`] for why).
-    pub async fn collect_relation(
-        &self,
-        handle: &RelationHandle,
-    ) -> Result<Vec<RecordBatch>, DeltaError> {
+        let raw = df.execute_stream().await.into_delta()?;
         let target_schema: SchemaRef = Arc::new(
             handle
                 .schema
@@ -248,22 +252,19 @@ impl DataFusionExecutor {
                 .try_into_arrow()
                 .map_err(|e: ArrowError| {
                     crate::error::internal_error(format!(
-                        "collect_relation: failed to convert handle schema to arrow: {e}"
+                        "stream_relation: failed to convert handle schema to arrow: {e}"
                     ))
                 })
                 .into_delta()?,
         );
-        let batches: Vec<RecordBatch> = self
-            .stream_relation(handle)
-            .await?
-            .try_collect()
-            .await
-            .into_delta()?;
-        batches
-            .iter()
-            .map(|b| crate::exec::stamp_batch_metadata(b, &target_schema))
-            .collect::<Result<_, _>>()
-            .into_delta()
+        let stamp_schema = Arc::clone(&target_schema);
+        let stamped = raw.map(move |batch_res| {
+            batch_res.and_then(|b| crate::exec::stamp_batch_metadata(&b, &stamp_schema))
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            target_schema,
+            stamped,
+        )))
     }
 
     /// Execute a single [`PhaseOperation`] against the executor and return the resulting

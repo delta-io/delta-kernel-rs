@@ -23,6 +23,7 @@ ureq = "3.1"
 delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "internal-api", "declarative-plans"] }
 delta-kernel-datafusion-engine = { path = "../delta-kernel-datafusion-engine" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog" }
+futures = "0.3"
 itertools = "0.14"
 object_store = { version = "0.12.3", features = ["aws"] }
 test_utils = { path = "../test-utils" }

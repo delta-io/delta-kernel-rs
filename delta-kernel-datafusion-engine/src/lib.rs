@@ -18,6 +18,8 @@ pub mod compile;
 pub mod error;
 pub mod exec;
 pub mod executor;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testing;
 
 pub use executor::DataFusionExecutor;
 
@@ -76,7 +78,9 @@ mod tests {
         );
 
         // And reading the relation lazily must still produce the upstream's row.
-        let batches = ex.collect_relation(&handle).await.unwrap();
+        let batches = crate::testing::collect_relation(&ex, &handle)
+            .await
+            .unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 

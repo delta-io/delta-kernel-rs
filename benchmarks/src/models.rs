@@ -259,19 +259,11 @@ pub struct SnapshotConstructionSpec {
     pub expected: Option<SnapshotExpected>,
 }
 
-impl SnapshotConstructionSpec {
-    pub fn as_str(&self) -> &str {
-        "snapshotConstruction"
-    }
-}
-
 impl Spec {
     pub fn as_str(&self) -> &str {
         match self {
             Spec::Read(read_spec) => read_spec.as_str(),
-            Spec::SnapshotConstruction(snapshot_construction_spec) => {
-                snapshot_construction_spec.as_str()
-            }
+            Spec::SnapshotConstruction(_) => "snapshotConstruction",
         }
     }
 

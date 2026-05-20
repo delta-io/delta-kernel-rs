@@ -47,7 +47,19 @@ chrono = "0.4"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+# Exposes `delta_kernel_datafusion_engine::testing`: buffered collectors over
+# `stream_relation` / `execute_plans` for integration tests and acceptance harnesses
+# that want eager `Vec<RecordBatch>` materialization without taking `futures` / our
+# private `DfResultIntoDelta` extension as a per-call-site dep. Not for production use.
+# Named `testing` (not `test_utils`) to avoid clashing with the workspace `test_utils`
+# crate at import sites.
+test-utils = []
+
 [dev-dependencies]
+# Self-dep activates the `test-utils` feature for this crate's own integration tests in
+# `tests/`. Matches the pattern in `kernel/Cargo.toml`.
+delta-kernel-datafusion-engine = { path = ".", features = ["test-utils"] }
 parquet = { version = "58", default-features = false, features = ["arrow"] }
 rstest = "0.23"
 serde = { version = "1", features = ["derive"] }

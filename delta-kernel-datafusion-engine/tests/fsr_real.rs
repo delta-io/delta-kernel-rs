@@ -6,7 +6,7 @@
 //!   1. `open_snapshot_for_fixture(fixture)` -> `(engine, snapshot)`
 //!   2. `snapshot.full_state()` -> SM
 //!   3. `executor.drive_to_completion(sm)` -> `ResultPlan`
-//!   4. `executor.collect_result(rp)` -> `Vec<RecordBatch>`
+//!   4. `testing::collect_result(&executor, rp)` -> `Vec<RecordBatch>`
 //!   5. `datafusion_common::assert_batches_sorted_eq!` against the expected lines.
 //!
 //! Each `EXPECTED_*` const was captured from this same path and then cross-checked against an
@@ -25,7 +25,7 @@ use datafusion_common::assert_batches_sorted_eq;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
-use delta_kernel_datafusion_engine::DataFusionExecutor;
+use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 use rstest::rstest;
 use tempfile::TempDir;
 use url::Url;
@@ -217,8 +217,7 @@ async fn full_state_prints_expected_results(#[case] fixture: &str, #[case] expec
         .drive_to_completion(sm)
         .await
         .expect("drive full_state to completion");
-    let batches = executor
-        .collect_result(result_plan)
+    let batches = testing::collect_result(&executor, result_plan)
         .await
         .expect("collect full_state result");
     let expected_lines: Vec<&str> = expected.trim().lines().collect();
@@ -251,8 +250,7 @@ async fn full_state_with_stats_populates_add_stats_parsed(#[case] fixture: &str)
         .drive_to_completion(sm)
         .await
         .expect("drive full_state SM");
-    let batches = executor
-        .collect_result(result_plan)
+    let batches = testing::collect_result(&executor, result_plan)
         .await
         .expect("collect full_state result");
 

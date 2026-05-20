@@ -4,30 +4,20 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-use delta_kernel::expressions::Predicate;
-use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
 use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
-use delta_kernel_benchmarks::predicate_parser::parse_predicate;
+use delta_kernel_benchmarks::workload::build_scan_for_spec;
+// Re-export `ReadResult` and `filter_batches_with_predicate` for callers that import
+// them from this module. The canonical definitions live in
+// `delta_kernel_benchmarks::workload` so the bench runners and the acceptance harness
+// share one source of truth.
+pub use delta_kernel_benchmarks::workload::{filter_batches_with_predicate, ReadResult};
 use itertools::Itertools;
 use url::Url;
 
 use super::validation::{validate_read_result, validate_snapshot};
-
-/// Result of executing a read workload.
-#[derive(Debug)]
-pub struct ReadResult {
-    /// The record batches from the scan.
-    pub batches: Vec<RecordBatch>,
-    /// The kernel schema of the data.
-    pub schema: Arc<Schema>,
-    /// Total number of rows in the result.
-    pub row_count: u64,
-}
 
 /// Result of executing a snapshot workload.
 #[derive(Debug)]
@@ -65,66 +55,20 @@ pub fn execute_read_workload(
     read_spec: &ReadSpec,
 ) -> DeltaResult<ReadResult> {
     let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
+    let (scan, predicate) = build_scan_for_spec(snapshot, read_spec)?;
 
-    let table_schema = snapshot.schema();
-
-    // Build scan with optional predicate and column projection
-    let mut scan_builder = snapshot.scan_builder();
-
-    // Extract and parse the predicate if one is present
-    let predicate = if let Some(ref predicate_string) = read_spec.predicate {
-        let predicate = parse_predicate(predicate_string, &table_schema).map_err(Error::generic)?;
-        let predicate = Arc::new(predicate);
-        scan_builder = scan_builder.with_predicate(predicate.clone());
-        Some(predicate)
-    } else {
-        None
-    };
-
-    if let Some(ref cols) = read_spec.columns {
-        let projected_schema = table_schema.project(cols)?;
-        scan_builder = scan_builder.with_schema(projected_schema);
-    }
-    let scan = scan_builder.build()?;
-
-    let schema = scan.logical_schema();
-
-    // Execute scan and apply row-level filtering
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
     let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
-
-    // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
 
     Ok(ReadResult {
         batches,
-        schema: schema.clone(),
+        schema: scan.logical_schema().clone(),
         row_count,
     })
-}
-
-/// Filter record batches using a predicate expression.
-pub fn filter_batches_with_predicate(
-    batches: Vec<RecordBatch>,
-    predicate: Option<&Predicate>,
-) -> DeltaResult<Vec<RecordBatch>> {
-    let Some(predicate) = predicate else {
-        return Ok(batches);
-    };
-
-    batches
-        .into_iter()
-        .map(|batch| {
-            // Evaluate predicate to get boolean selection array
-            let selection = evaluate_predicate(predicate, &batch, false)?;
-            // Filter the batch using the selection
-            let filtered = filter_record_batch(&batch, &selection)?;
-            Ok(filtered)
-        })
-        .collect()
 }
 
 /// Execute a snapshot workload (for metadata validation).

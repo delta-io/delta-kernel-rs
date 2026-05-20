@@ -19,14 +19,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use acceptance::acceptance_workloads::validation::{validate_read_result, validate_snapshot};
-use acceptance::acceptance_workloads::workload::{
-    build_snapshot, filter_batches_with_predicate, ReadResult, SnapshotResult,
-};
+use acceptance::acceptance_workloads::workload::{build_snapshot, SnapshotResult};
 use acceptance::acceptance_workloads::TestCase;
 use delta_kernel::{DeltaResult, Engine, Error};
-use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec};
-use delta_kernel_benchmarks::predicate_parser::parse_predicate;
-use delta_kernel_datafusion_engine::DataFusionExecutor;
+use delta_kernel_benchmarks::models::{SnapshotConstructionSpec, Spec};
+use delta_kernel_benchmarks::workload::{build_scan_for_spec, execute_read_via_datafusion};
+use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 
 // Reference the reader harness as a sub-module so its `pub` SKIP_LIST and
 // EXPECTED_KERNEL_FAILURES are accessible without duplication. `dead_code` is
@@ -121,8 +119,7 @@ async fn execute_snapshot_workload_datafusion(
         .drive_to_completion(sm)
         .await
         .map_err(|e| Error::generic(format!("drive full_state SM: {e}")))?;
-    executor
-        .collect_result(rp)
+    testing::collect_result(&executor, rp)
         .await
         .map_err(|e| Error::generic(format!("collect full_state result: {e}")))?;
     let table_configuration = snapshot.table_configuration();
@@ -130,55 +127,6 @@ async fn execute_snapshot_workload_datafusion(
         version: snapshot.version(),
         protocol: table_configuration.protocol().clone(),
         metadata: table_configuration.metadata().clone(),
-    })
-}
-
-async fn execute_read_workload_datafusion(
-    engine: Arc<dyn Engine>,
-    table_root: &url::Url,
-    read_spec: &ReadSpec,
-) -> DeltaResult<ReadResult> {
-    let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
-    let table_schema = snapshot.schema();
-    let predicate = read_spec
-        .predicate
-        .as_deref()
-        .map(|sql| parse_predicate(sql, &table_schema))
-        .transpose()
-        .map_err(Error::generic)?
-        .map(Arc::new);
-    let schema = if let Some(cols) = read_spec.columns.as_ref() {
-        table_schema.project(cols)?
-    } else {
-        table_schema.clone()
-    };
-
-    let executor = DataFusionExecutor::try_new_with_engine(engine)
-        .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let mut scan_builder = snapshot.scan_builder().with_schema(schema.clone());
-    if let Some(predicate_ref) = predicate.clone() {
-        scan_builder = scan_builder.with_predicate(predicate_ref);
-    }
-    let sm = scan_builder
-        .build_replay()
-        .map_err(|e| Error::generic(format!("build replay scan: {e}")))?
-        .scan_state_machine()
-        .map_err(|e| Error::generic(format!("build replay scan SM: {e}")))?;
-    let rp = executor
-        .drive_to_completion(sm)
-        .await
-        .map_err(|e| Error::generic(format!("drive replay scan SM: {e}")))?;
-    let batches = executor
-        .collect_result(rp)
-        .await
-        .map_err(|e| Error::generic(format!("execute replay scan via DataFusionExecutor: {e}")))?;
-    let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
-    let row_count = batches.iter().map(|b| b.num_rows() as u64).sum();
-
-    Ok(ReadResult {
-        batches,
-        schema: schema.clone(),
-        row_count,
     })
 }
 
@@ -200,11 +148,18 @@ fn run_datafusion_workload(test_case: &TestCase) -> Result<(), String> {
             let Some(expected) = read_spec.expected.as_ref() else {
                 return Ok(());
             };
-            let result = runtime.block_on(execute_read_workload_datafusion(
-                Arc::clone(&engine),
-                &table_root,
-                read_spec,
-            ));
+            let result = (|| -> DeltaResult<_> {
+                let snapshot =
+                    build_snapshot(engine.as_ref(), &table_root, read_spec.time_travel.as_ref())?;
+                let (scan, predicate) = build_scan_for_spec(snapshot, read_spec)?;
+                let executor = DataFusionExecutor::try_new_with_engine(Arc::clone(&engine))
+                    .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
+                runtime.block_on(execute_read_via_datafusion(
+                    &executor,
+                    &scan,
+                    predicate.as_deref(),
+                ))
+            })();
             validate_read_result(result, &test_case.expected_dir(), expected)
                 .map_err(|e| e.to_string())
         }

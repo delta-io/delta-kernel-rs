@@ -13,7 +13,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use crate::plans::errors::{DeltaError, DeltaErrorCode};
+use crate::plans::errors::DeltaError;
 use crate::plans::ir::{PlanBuilder, RelationRegistry};
 use crate::plans::kdf::{ConsumerKdf, KdfOutput};
 use crate::plans::state_machines::framework::engine_error::EngineError;
@@ -115,10 +115,10 @@ impl<'a> Context<'a> {
         let result_state = self
             .execute(PhaseOperation::Plans(plans), phase_name)
             .await
-            .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+            .map_err(|e| e.into_delta_typed())?;
         extractor
             .extract(&result_state)
-            .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))
+            .map_err(|e| e.into_delta_typed())
     }
 }
 

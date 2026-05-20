@@ -13,7 +13,7 @@ use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
 use delta_kernel::plans::state_machines::framework::phase_operation::{
     PhaseOperation, SchemaQueryNode,
 };
-use delta_kernel_datafusion_engine::DataFusionExecutor;
+use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 use tempfile::tempdir;
 use test_utils::schemas::single_long_schema;
 use url::Url;
@@ -81,7 +81,9 @@ async fn parity_phase_plans_relation_pipe_matches_kernel_literal_materialization
         .await
         .expect("phase Plans");
 
-    let df_batches = executor.collect_relation(&handle).await.expect("collect");
+    let df_batches = testing::collect_relation(&executor, &handle)
+        .await
+        .expect("collect");
     let df_concat = concat_or_clone(&df_batches);
 
     assert_batch_column_data_equal(&schema, &kernel_reference_batch, &df_concat);

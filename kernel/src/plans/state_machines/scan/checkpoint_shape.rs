@@ -201,7 +201,7 @@ pub(super) async fn resolve_checkpoint_shape(
                     "fsr::resolve_checkpoint_shape::checkpoint_schema",
                 )
                 .await
-                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+                .map_err(|e| e.into_delta_typed())?;
             let checkpoint_schema = checkpoint_state.take_schema()?;
             shape.has_sidecars = checkpoint_schema.contains(SIDECAR_NAME);
             shape.actions_schema_subset = checkpoint_actions_schema_projection(&checkpoint_schema)?;
@@ -277,7 +277,7 @@ async fn publish_v2_manifest_and_probe_sidecar(
                 "fsr::resolve_checkpoint_shape::sidecar_schema",
             )
             .await
-            .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+            .map_err(|e| e.into_delta_typed())?;
         let sidecar_schema = sidecar_state.take_schema()?;
         shape.has_stats_parsed =
             LogSegment::schema_has_compatible_stats_parsed(sidecar_schema.as_ref(), reqd.as_ref());

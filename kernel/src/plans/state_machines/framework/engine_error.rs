@@ -106,10 +106,34 @@ impl EngineError {
     ///
     /// SM bodies match on [`Self::kind`] and pick a semantically appropriate [`DeltaErrorCode`].
     /// Bodies that don't (yet) discriminate by kind may pass
-    /// [`DeltaErrorCode::DeltaCommandInvariantViolation`] as a conservative default.
+    /// [`DeltaErrorCode::DeltaCommandInvariantViolation`] as a conservative default — or call
+    /// [`Self::into_delta_typed`] to get kind-based discrimination for free.
     pub fn into_delta(self, code: DeltaErrorCode) -> DeltaError {
         let detail = self.display_with_source_chain();
         crate::delta_error!(code, source = self, "{detail}")
+    }
+
+    /// Lift to a typed [`DeltaError`], picking the code from [`Self::kind`]. SM bodies that have
+    /// nothing more specific to add use this instead of passing
+    /// [`DeltaErrorCode::DeltaCommandInvariantViolation`] to [`Self::into_delta`] directly.
+    ///
+    /// - [`EngineErrorKind::FileNotFound`] under `/_delta_log/` ->
+    ///   [`DeltaErrorCode::DeltaLogFileNotFound`]
+    /// - other [`EngineErrorKind::FileNotFound`] -> [`DeltaErrorCode::DeltaFileNotFound`]
+    /// - [`EngineErrorKind::CommitConflict`] -> [`DeltaErrorCode::DeltaConcurrentWrite`]
+    /// - everything else -> [`DeltaErrorCode::DeltaCommandInvariantViolation`]
+    pub fn into_delta_typed(self) -> DeltaError {
+        let code = match &self.kind {
+            EngineErrorKind::FileNotFound { path } if path.contains("/_delta_log/") => {
+                DeltaErrorCode::DeltaLogFileNotFound
+            }
+            EngineErrorKind::FileNotFound { .. } => DeltaErrorCode::DeltaFileNotFound,
+            EngineErrorKind::CommitConflict { .. } => DeltaErrorCode::DeltaConcurrentWrite,
+            EngineErrorKind::Internal
+            | EngineErrorKind::IoError { .. }
+            | EngineErrorKind::EmptyInput { .. } => DeltaErrorCode::DeltaCommandInvariantViolation,
+        };
+        self.into_delta(code)
     }
 }
 

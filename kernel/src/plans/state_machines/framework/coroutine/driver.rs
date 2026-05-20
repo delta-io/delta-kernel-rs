@@ -210,11 +210,11 @@ mod tests {
             let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_a")
                 .await
-                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+                .map_err(|e| e.into_delta_typed())?;
             let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "phase_b")
                 .await
-                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+                .map_err(|e| e.into_delta_typed())?;
             Ok(42)
         })
         .unwrap();
@@ -251,7 +251,7 @@ mod tests {
             let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan(), toy_plan()]), "ab")
                 .await
-                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+                .map_err(|e| e.into_delta_typed())?;
             Ok(())
         })
         .unwrap();
@@ -280,7 +280,7 @@ mod tests {
             let _ = ctx
                 .execute(PhaseOperation::Plans(vec![toy_plan()]), "p")
                 .await
-                .map_err(|e| e.into_delta(DeltaErrorCode::DeltaCommandInvariantViolation))?;
+                .map_err(|e| e.into_delta_typed())?;
             Ok(())
         })
         .unwrap();

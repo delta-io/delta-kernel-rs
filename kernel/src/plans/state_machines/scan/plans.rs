@@ -188,7 +188,7 @@ pub(super) fn register_reconciliation(
         }
         let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
             delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
+                DeltaErrorCode::DeltaStateRecoverError,
                 "register_reconciliation::join_sidecar_base: join _sidecars base URL: {e}",
             )
         })?;
@@ -334,7 +334,7 @@ pub(super) fn commit_cover_rows(
                 .map_err(|e| e.into_delta_default())?
                 .ok_or_else(|| {
                     delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
+                        DeltaErrorCode::DeltaStateRecoverError,
                         "commit_cover_rows: cover yielded a non-log-path file: {}",
                         file.location,
                     )
