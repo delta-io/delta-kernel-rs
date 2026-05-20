@@ -585,11 +585,20 @@ pub(crate) trait IntoEngineData {
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
 pub trait StorageHandler: AsAny {
-    /// List the paths in the same directory that are lexicographically greater than
-    /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
+    /// Recursively list files whose full path is lexicographically greater than (UTF-8 sorting)
+    /// the given `path`, restricted to descendants of `path`'s parent directory. The result must
+    /// be sorted by the full path (UTF-8 byte order).
     ///
-    /// If the path is directory-like (ends with '/'), the result should contain
-    /// all the files in the directory.
+    /// The listing is **recursive**: files in nested subdirectories are included, not just files
+    /// directly under the parent. For example, listing from `dir/0001.json` may return
+    /// `dir/0002.json`, `dir/sub/0003.json`, and `dir/sub/nested/0004.json`, all interleaved
+    /// in lexicographic order.
+    ///
+    /// The parent directory is derived from `path`:
+    /// - If `path` is directory-like (ends with `/`), the parent is `path` itself and the result
+    ///   contains all files at or below that directory.
+    /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
+    ///   under that parent) whose full path sorts strictly greater than `path` are returned.
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
