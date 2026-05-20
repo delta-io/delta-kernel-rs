@@ -15,7 +15,7 @@ use crate::actions::{
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{CrcDelta, FileStatsDelta, LazyCrc};
+use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta, LazyCrc};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
@@ -1217,6 +1217,28 @@ impl<S> Transaction<S> {
             &self.remove_files_metadata,
             bin_boundaries,
         )?;
+        // TODO: drop these conversions by migrating the upstream chain
+        //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
+        //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
+        //       checks into the type system.
+        let domain_metadata = dm_changes
+            .into_iter()
+            .map(|dm| (dm.domain().to_string(), dm))
+            .collect();
+        let set_transactions = self
+            .set_transactions
+            .iter()
+            .map(|txn| (txn.app_id.clone(), txn.clone()))
+            .collect();
+        // Although `remove.size` is optional per the Delta protocol, the kernel write path
+        // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
+        // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
+        // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
+        // present, and only operation classification can flip `is_incremental_safe`.
+        let is_incremental_safe = self
+            .operation
+            .as_deref()
+            .is_some_and(is_incremental_safe_operation);
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1225,11 +1247,10 @@ impl<S> Transaction<S> {
             metadata: self
                 .should_emit_metadata
                 .then(|| self.effective_table_config.metadata().clone()),
-            domain_metadata_changes: dm_changes,
-            set_transaction_changes: self.set_transactions.clone(),
+            domain_metadata,
+            set_transactions,
             in_commit_timestamp,
-            operation: self.operation.clone(),
-            has_missing_file_size: false, // writes always have sizes
+            is_incremental_safe,
         })
     }
 
