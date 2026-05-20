@@ -118,6 +118,9 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
+# Declarative plan execution via PlanExecutor trait (experimental)
+declarative-plans = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls
 default-engine-base = [
