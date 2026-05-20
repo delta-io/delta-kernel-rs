@@ -1,20 +1,8 @@
-//! [`LoadTableProvider`] -- a lazy [`TableProvider`] wrapping a [`LoadSink`] over an upstream
-//! [`LogicalPlan`].
-//!
-//! Registered into the executor's `relation_providers` map at sink-registration time. Holds the
-//! upstream logical plan, the [`LoadSink`] config, the kernel [`Engine`], and a pre-computed
-//! Arrow output schema. Upstream is never executed until a downstream consumer calls
-//! [`TableProvider::scan`]: at that point we lower the upstream `LogicalPlan` to a physical plan
-//! via [`Session::create_physical_plan`] and hand it to [`super::LoadExec`], which streams
-//! per-row file batches one at a time.
-//!
-//! `get_logical_plan` returns `None` so DataFusion's `InlineTableScan` analyzer rule treats the
-//! provider as opaque -- pushdown flows through the standard [`TableProvider::scan(state,
-//! projection, filters, limit)`] hook. Filter pushdown is currently off
-//! ([`TableProvider::supports_filters_pushdown`] returns `Unsupported`); both projection and
-//! limit are pushed down into [`super::LoadExec`] -- projection narrows the kernel parquet/json
-//! handler's read schema and the broadcast set, and limit caps total streamed rows (no further
-//! files are opened once the budget is exhausted).
+//! Lazy [`TableProvider`] for `LoadSink`: defers all work to `scan()`, which lowers the
+//! upstream `LogicalPlan` and wraps it in a [`super::LoadExec`]. Used for non-Values
+//! upstreams or any sink with a deletion vector. See also [`super::EagerLoadTableProvider`]
+//! for the bare-Values fast path. Filter pushdown is currently off; projection and limit
+//! flow through to [`super::LoadExec`].
 
 use std::sync::Arc;
 
@@ -32,19 +20,15 @@ use delta_kernel::Engine;
 
 use crate::exec::LoadExec;
 
-/// Lazy [`TableProvider`] for a [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load)
-/// registration. See module docs.
 pub struct LoadTableProvider {
     upstream_logical: LogicalPlan,
     sink: Arc<LoadSink>,
     engine: Arc<dyn Engine>,
-    /// Full output Arrow schema = file_schema fields ++ passthrough fields. Pre-computed once
-    /// at construction so `scan()` (and `schema()`) are cheap.
+    /// `file_schema_fields ++ passthrough_fields`, pre-materialized so `schema()` is cheap.
     output_schema: ArrowSchemaRef,
 }
 
 impl LoadTableProvider {
-    /// Build the provider, materializing the Arrow form of the sink's declared output schema.
     pub fn try_new(
         upstream_logical: LogicalPlan,
         sink: Arc<LoadSink>,
@@ -57,7 +41,7 @@ impl LoadTableProvider {
                 .try_into_arrow()
                 .map_err(|e| {
                     crate::error::plan_compilation(format!(
-                        "LoadTableProvider output schema conversion: {e}"
+                        "LoadTableProvider output schema: {e}"
                     ))
                 })?,
         );
@@ -109,8 +93,6 @@ impl TableProvider for LoadTableProvider {
         Ok(Arc::new(load_exec))
     }
 
-    // Initial: leave filter pushdown off. Revisit once a benchmark motivates pushing predicates
-    // down into LoadExec (then onward into the kernel parquet handler's read).
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],

@@ -1,19 +1,6 @@
-//! Declarative [`delta_kernel::plans::ir::Plan`] -> DataFusion [`datafusion_expr::LogicalPlan`]
-//! compilation.
-//!
-//! Every kernel IR shape lowers to a [`datafusion_expr::LogicalPlan`] via [`compile_plan_logical`];
-//! the executor optimizes + materializes physical execution and wraps sink-specific
-//! [`datafusion_physical_plan::ExecutionPlan`]s on top of that.
-//!
-//! Sinks: [`SinkType::Relation`] / [`SinkType::Load`] (drain + the executor materializes the
-//! result as a [`datafusion::datasource::MemTable`] inserted into the executor's
-//! `relation_providers` map for downstream
-//! [`delta_kernel::plans::ir::DeclarativePlanNode::RelationRef`] leaves), [`SinkType::Consume`]
-//! (drained directly by the executor through a [`delta_kernel::plans::kdf::ConsumerKdf`] handle).
-//!
-//! [`SinkType::Relation`]: delta_kernel::plans::ir::nodes::SinkType::Relation
-//! [`SinkType::Load`]: delta_kernel::plans::ir::nodes::SinkType::Load
-//! [`SinkType::Consume`]: delta_kernel::plans::ir::nodes::SinkType::Consume
+//! Kernel [`delta_kernel::plans::ir::Plan`] → DataFusion [`datafusion_expr::LogicalPlan`]
+//! compilation. Sinks are routed by [`crate::executor::DataFusionExecutor`] (lazy
+//! `Relation` / `Load` providers; eager `Consume`).
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,13 +1,6 @@
-//! Re-stamp arrow field-declaration metadata on engine-produced [`RecordBatch`]es so they
-//! present the kernel's declared schema byte-for-byte (including nested per-field metadata).
-//!
-//! DataFusion's native struct/list/map primitives (`named_struct`, `get_field`, the parquet
-//! decoder, ...) never carry the Delta-protocol per-field metadata (`delta.columnMapping.*`,
-//! `parquet.field.id`, ...) that kernel schemas declare. Re-stamping is one
-//! [`arrow::compute::cast`] per top-level column: when source and target struct/list/map types
-//! differ only in nested per-field metadata, `cast` rebuilds the array using the target field
-//! declarations and reuses the source buffers; primitive leaves whose DataTypes already match
-//! pass through unchanged.
+//! Re-stamp arrow field-declaration metadata so engine batches match the kernel-declared
+//! schema byte-for-byte (DataFusion's native struct/list/map primitives don't carry the
+//! Delta-protocol `delta.columnMapping.*` / `parquet.field.id` metadata).
 
 use std::sync::Arc;
 
@@ -16,11 +9,9 @@ use delta_kernel::arrow::array::{ArrayRef, RecordBatch};
 use delta_kernel::arrow::compute::cast;
 use delta_kernel::arrow::datatypes::SchemaRef;
 
-/// Zero-copy re-stamp every top-level column of `batch` so the resulting batch's schema
-/// matches `target` byte-for-byte (including nested per-field metadata). Precondition:
-/// shape (column count, names, leaf types, nullability) already agrees with `target` -- this
-/// is satisfied by engine batches because the kernel-declared schema is what the engine
-/// compiled its plan against.
+/// Zero-copy re-stamp every top-level column of `batch` so the resulting schema matches
+/// `target` byte-for-byte. Shape (column count, names, leaf types, nullability) must already
+/// agree with `target`.
 pub(crate) fn stamp_batch_metadata(
     batch: &RecordBatch,
     target: &SchemaRef,

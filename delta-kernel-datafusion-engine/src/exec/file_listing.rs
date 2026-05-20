@@ -133,25 +133,10 @@ impl ExecutionPlan for FileListingExec {
         let prefix = object_store::path::Path::from(self.path.path());
         let schema = self.schema.clone();
         let base_url = self.path.clone();
-        // `ObjectStore::list` does not promise lexicographic order; local-fs backends are
-        // particularly inconsistent (OS directory-walk order). Collect+sort there to keep
-        // `LogStore` segmentation deterministic across hosts. Remote stores: passthrough.
-        let stream: std::pin::Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> =
-            if self.path.scheme() == "file" {
-                Box::pin(sorted_local_listing(
-                    store,
-                    prefix,
-                    schema.clone(),
-                    base_url,
-                ))
-            } else {
-                Box::pin(chunked_remote_listing(
-                    store,
-                    prefix,
-                    schema.clone(),
-                    base_url,
-                ))
-            };
+        // Local-fs `list` order is OS-dependent; collect+sort there to keep LogStore
+        // segmentation deterministic. Remote stores stream through chunked.
+        let sort_local = self.path.scheme() == "file";
+        let stream = listing_stream(store, prefix, schema, base_url, sort_local);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
             stream,
@@ -159,39 +144,32 @@ impl ExecutionPlan for FileListingExec {
     }
 }
 
-fn sorted_local_listing(
+fn listing_stream(
     store: Arc<dyn ObjectStore>,
     prefix: object_store::path::Path,
     schema: SchemaRef,
     base_url: url::Url,
-) -> impl Stream<Item = DfResult<RecordBatch>> {
-    async_stream::try_stream! {
-        let mut metas: Vec<ObjectMeta> = store
-            .list(Some(&prefix))
-            .try_collect()
-            .await
-            .map_err(crate::error::wrap_delta_err)?;
-        metas.sort_by(|a, b| a.location.cmp(&b.location));
-        for chunk in metas.chunks(BATCH_SIZE) {
-            yield metas_to_batch(chunk, &schema, &base_url)?;
-        }
-    }
-}
-
-fn chunked_remote_listing(
-    store: Arc<dyn ObjectStore>,
-    prefix: object_store::path::Path,
-    schema: SchemaRef,
-    base_url: url::Url,
-) -> impl Stream<Item = DfResult<RecordBatch>> {
-    store
-        .list(Some(&prefix))
-        .chunks(BATCH_SIZE)
-        .map(move |chunk| {
+    sort: bool,
+) -> std::pin::Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> {
+    if sort {
+        Box::pin(async_stream::try_stream! {
+            let mut metas: Vec<ObjectMeta> = store
+                .list(Some(&prefix))
+                .try_collect()
+                .await
+                .map_err(crate::error::wrap_delta_err)?;
+            metas.sort_by(|a, b| a.location.cmp(&b.location));
+            for chunk in metas.chunks(BATCH_SIZE) {
+                yield metas_to_batch(chunk, &schema, &base_url)?;
+            }
+        })
+    } else {
+        Box::pin(store.list(Some(&prefix)).chunks(BATCH_SIZE).map(move |chunk| {
             let metas: Vec<ObjectMeta> = chunk
                 .into_iter()
                 .collect::<Result<_, _>>()
                 .map_err(crate::error::wrap_delta_err)?;
             metas_to_batch(&metas, &schema, &base_url)
-        })
+        }))
+    }
 }

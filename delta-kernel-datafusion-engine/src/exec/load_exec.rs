@@ -1,34 +1,10 @@
-//! [`LoadExec`] -- the streaming physical plan that powers
-//! [`super::LoadTableProvider`].
+//! Streaming physical plan behind [`super::LoadTableProvider`].
 //!
-//! For each upstream metadata batch, [`build_load_stream`] runs an **unordered concurrent
-//! merger** over per-row open futures via [`futures::stream::buffer_unordered`]. Each open
-//! future async-resolves the optional deletion vector via
-//! [`crate::exec::load_helpers::resolve_dv_async`] (a [`tokio::task::spawn_blocking`] hop
-//! around kernel's sync `DeletionVectorDescriptor::read`), builds a per-file
-//! [`datafusion_physical_plan::ExecutionPlan`] stack via
-//! [`crate::exec::load_helpers::build_per_file_plan`], and runs `plan.execute(0, ctx)` to
-//! get a `BoxStream<RecordBatch>`.
-//!
-//! The outer flatten interleaves files freely (no upstream-row ordering across files);
-//! within each file, batches arrive in file-internal order from the parquet/json decoder.
-//!
-//! Column-mapping-aware decode reshape is handled by
-//! [`super::FieldIdPhysicalExprAdapterFactory`] wired into the per-file
-//! [`datafusion_datasource::file_scan_config::FileScanConfig::expr_adapter_factory`], so
-//! opener batches already match the kernel-declared logical file schema.
-//!
-//! Deletion vectors apply via a `not_in_dv(_row_number)` [`datafusion_expr::ScalarUDF`]
-//! plugged into a [`datafusion_physical_plan::filter::FilterExec`] above the per-file
-//! [`datafusion_datasource::source::DataSourceExec`]. The parquet decoder injects
-//! `_row_number` (Int64 + `RowNumber` extension type) only when the file has a DV; the
-//! UDF closes over the kernel-resolved `Arc<roaring::RoaringTreemap>` of deleted row
-//! IDs. JSON+DV is rejected at construction.
-//!
-//! Passthrough columns ride through as `partition_values`. `projection` is pushed into the
-//! [`FileSource`]; `limit` caps emitted rows by slicing the final batch. Filter pushdown is
-//! left to upstream operators (see
-//! [`super::LoadTableProvider::supports_filters_pushdown`]).
+//! For each upstream metadata row, [`build_load_stream`] runs `buffer_unordered` over open
+//! futures: each resolves the optional DV via [`resolve_dv_async`], builds a per-file plan
+//! via [`build_per_file_plan`] (`DataSourceExec` plus an optional `FilterExec(not_in_dv)`
+//! → `ProjectionExec` stack when DV is present), and drains it. Output ordering across files
+//! is unspecified; intra-file order is preserved. JSON+DV is rejected at construction.
 
 use std::fmt;
 use std::sync::Arc;
@@ -54,46 +30,32 @@ use crate::exec::load_helpers::{
     RowInputs,
 };
 
-/// Default per-partition file-open concurrency when `target_partitions` is zero.
+/// Per-partition file-open concurrency when `target_partitions` is zero.
 const DEFAULT_LOAD_CONCURRENCY: usize = 8;
 
-/// Upper bound on per-partition file-open concurrency. Caps tokio task pressure for very-wide
-/// scans; tunable later via a dedicated `load_concurrency` knob.
+/// Caps tokio task pressure for very-wide scans.
 const MAX_LOAD_CONCURRENCY: usize = 64;
 
-/// Custom physical plan for [`super::LoadTableProvider`] sinks: streams upstream metadata rows
-/// through per-file [`ExecutionPlan`] stacks under a [`futures::stream::buffer_unordered`]
-/// merger. See module-level docs.
 pub struct LoadExec {
     sink: Arc<LoadSink>,
-    /// Kernel engine kept only for deletion-vector resolution
-    /// ([`delta_kernel::actions::deletion_vector::DeletionVectorDescriptor::read`]).
-    /// File decoding goes through DataFusion's parquet/json sources; this engine is *not*
-    /// consulted for parquet/json reads.
+    /// Used only for deletion-vector resolution; file decoding goes through DataFusion's
+    /// parquet/json sources, not this engine.
     engine: Arc<dyn Engine>,
     upstream: Arc<dyn ExecutionPlan>,
-    /// Full pre-projection output schema (= file_schema fields ++ passthrough fields). Kept on
-    /// the struct only so that [`ExecutionPlan::with_new_children`] can rebuild the file source
-    /// against the same shape.
+    /// Pre-projection schema (= file_schema fields ++ passthrough fields). Kept so
+    /// `with_new_children` can rebuild against the same shape.
     full_schema: ArrowSchemaRef,
-    /// Original projection (kept verbatim for replay through `with_new_children`).
     projection: Option<Vec<usize>>,
-    /// Final output schema (projection applied to `full_schema`). What downstream operators
-    /// see via [`ExecutionPlan::schema`].
     output_schema: ArrowSchemaRef,
-    /// Optional row-count cap from `TableProvider::scan(limit)`. `None` = read to upstream end.
     limit: Option<usize>,
-    /// Pre-computed global indices into `sink.passthrough_columns`, in projected order
-    /// (Phase 4). Iterated once per upstream row in `extract_row_inputs` to materialize
-    /// only the kept passthrough columns. Wrapped in `Arc` so cheap clones travel into the
-    /// per-row open future without an extra allocation per row.
+    /// Indices into `sink.passthrough_columns` to materialize, in projected order. `Arc` so
+    /// per-row open futures can clone cheaply.
     projected_passthrough: Arc<Vec<usize>>,
-    /// File source built without `_row_number` -- used for files with no DV. Cloned per-execute
-    /// into the per-file [`datafusion_datasource::file_scan_config::FileScanConfig`].
+    /// File source without `_row_number` for rows whose DV column is null (or whole sink
+    /// has no DV).
     file_source_no_dv: Arc<dyn datafusion_datasource::file::FileSource>,
-    /// File source built **with** `_row_number` virtual column appended -- used for files
-    /// with a DV so the parquet decoder injects it for the not_in_dv UDF predicate. None when
-    /// the sink has no `dv_ref` (so we never construct the row-number variant).
+    /// File source with `_row_number` virtual column appended for DV rows. `None` iff
+    /// `sink.dv_ref.is_none()`.
     file_source_with_dv: Option<Arc<dyn datafusion_datasource::file::FileSource>>,
     properties: Arc<PlanProperties>,
 }
@@ -107,14 +69,11 @@ impl LoadExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> DfResult<Self> {
-        // Reject JSON + DV at construction (Phase 2). JSON has no row-number virtual column;
-        // delta DVs only apply to parquet data files in practice.
+        // JSON has no `_row_number` virtual column; delta DVs only apply to parquet anyway.
         if matches!(sink.file_type, FileType::Json) && sink.dv_ref.is_some() {
-            return Err(DataFusionError::Plan(
-                "LoadSink with FileType::Json and dv_ref set is not supported: deletion \
-                 vectors only apply to parquet data files (no _row_number virtual column \
-                 for JSON)."
-                    .to_string(),
+            return Err(crate::error::plan_compilation(
+                "LoadSink with FileType::Json and dv_ref set is not supported (no \
+                 _row_number virtual column for JSON)",
             ));
         }
 
@@ -122,37 +81,36 @@ impl LoadExec {
         let passthrough_count = sink.passthrough_columns.len();
         debug_assert_eq!(full_schema.fields().len(), file_count + passthrough_count);
 
-        // Build the no-DV file source (always needed: even when sink.dv_ref is set, individual
-        // rows may have a NULL DV column meaning "no DV for this file").
+        // Always build the no-DV variant: even when `sink.dv_ref` is set, individual rows may
+        // have a NULL DV (no DV for that file).
         let file_source_no_dv = build_file_source(
             sink.file_type,
             &full_schema,
             file_count,
             projection.as_deref(),
-            /* include_row_number */ false,
+            false,
         )?;
-        let file_source_with_dv = if sink.dv_ref.is_some() {
-            Some(build_file_source(
-                sink.file_type,
-                &full_schema,
-                file_count,
-                projection.as_deref(),
-                /* include_row_number */ true,
-            )?)
-        } else {
-            None
-        };
+        let file_source_with_dv = sink
+            .dv_ref
+            .is_some()
+            .then(|| {
+                build_file_source(
+                    sink.file_type,
+                    &full_schema,
+                    file_count,
+                    projection.as_deref(),
+                    true,
+                )
+            })
+            .transpose()?;
 
-        // Output schema: projection narrows full_schema (Phase 4 contract: file fields come
-        // first, then projected passthrough fields in order).
         let output_schema = match projection.as_ref() {
             Some(proj) => Arc::new(full_schema.project(proj)?),
             None => Arc::clone(&full_schema),
         };
 
-        // Pre-compute kept passthrough indices once (Phase 4). When projection is None, all
-        // passthrough columns are kept in their original order. When projection is set,
-        // filter to indices >= file_count and translate to passthrough-local indices.
+        // Filter projection indices to passthrough range (>= file_count) and translate to
+        // passthrough-local indices.
         let projected_passthrough: Vec<usize> = match projection.as_ref() {
             Some(proj) => proj
                 .iter()
@@ -165,8 +123,7 @@ impl LoadExec {
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
-            // Single output partition: the merger interleaves files within one stream.
-            // Multi-partition fan-out is a follow-up.
+            // Single partition: the merger interleaves files within one stream.
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             upstream.properties().boundedness,
@@ -270,8 +227,8 @@ impl ExecutionPlan for LoadExec {
                 "LoadExec only supports partition 0, got {partition}"
             )));
         }
-        // Coalesce the upstream's possibly-many partitions into a single stream so the row
-        // expander sees one batch at a time. `execute_stream` does exactly this.
+        // Coalesce the upstream's partitions into one stream so the row expander sees one
+        // batch at a time.
         let upstream = datafusion::physical_plan::execute_stream(
             Arc::clone(&self.upstream),
             Arc::clone(&context),
@@ -304,12 +261,9 @@ impl ExecutionPlan for LoadExec {
     }
 }
 
-/// Stream upstream metadata rows through the unordered concurrent merger. Each row produces
-/// a per-file `BoxStream<RecordBatch>` (built lazily inside an open future); up to
-/// `concurrency` open futures run at once via `buffer_unordered`. The outer `try_flatten`
-/// interleaves files freely; intra-file batch order is preserved by sequential drain.
-///
-/// `limit` is enforced at the flattened output by slicing + early-terminating.
+/// Up to `concurrency` per-row open futures run at once via `buffer_unordered`; the outer
+/// `try_flatten` interleaves files freely while preserving intra-file batch order. `limit`
+/// is enforced by slicing the final batch + early-terminating.
 #[allow(clippy::too_many_arguments)]
 fn build_load_stream(
     upstream: SendableRecordBatchStream,
@@ -323,8 +277,7 @@ fn build_load_stream(
     limit: Option<usize>,
     concurrency: usize,
 ) -> impl Stream<Item = DfResult<RecordBatch>> + Send + 'static {
-    // Step 1: explode upstream batches into a flat `Stream<DfResult<(Arc<RecordBatch>, usize)>>`,
-    // one item per row.
+    // Explode upstream batches into one item per row.
     let row_stream = upstream
         .map_ok(|batch| {
             let n = batch.num_rows();
@@ -335,9 +288,7 @@ fn build_load_stream(
         })
         .try_flatten();
 
-    // Step 2: per-row, build an open future returning the per-file RecordBatch stream. The
-    // outer closure owns each captured Arc; the inner `async move` body needs its own clone
-    // per row (one open future per upstream row).
+    // Per row, an open future producing the per-file `RecordBatch` stream.
     let per_file_streams = row_stream.map(move |row_result: DfResult<_>| {
         let sink = Arc::clone(&sink);
         let engine = Arc::clone(&engine);
@@ -351,7 +302,6 @@ fn build_load_stream(
             let (batch, row) = row_result?;
             let inputs: RowInputs = extract_row_inputs(&batch, row, &sink, &pt)?;
 
-            // Async-resolve DV when present.
             let dv = match inputs.dv_descriptor.clone() {
                 Some(desc) => {
                     let base = sink_base_url(&sink)?.clone();
@@ -360,19 +310,11 @@ fn build_load_stream(
                 None => None,
             };
 
-            // Pick the appropriate file_source: with `_row_number` when this file has a DV,
-            // without otherwise. We require a configured with-DV source if any row has a DV
-            // (`sink.dv_ref` is set) AND that row's DV column is non-null.
+            // `file_source_with_dv` is `Some` iff `sink.dv_ref.is_some()`, which is the only
+            // way `dv` can be `Some` here.
             let file_source = match (dv.is_some(), file_source_with_dv) {
                 (true, Some(src)) => src,
-                (true, None) => {
-                    return Err(crate::error::internal_error(
-                        "LoadExec: row has DV but file_source_with_dv was not constructed \
-                         (sink.dv_ref must be set at construction time for any DV-bearing \
-                         upstream)",
-                    ));
-                }
-                (false, _) => file_source_no_dv,
+                _ => file_source_no_dv,
             };
 
             let plan = build_per_file_plan(
@@ -389,25 +331,13 @@ fn build_load_stream(
         }
     });
 
-    // Step 3: run up to `concurrency` opens at once; flatten per-file streams into one outer
-    // stream. Order across files is arbitrary; intra-file order is preserved.
+    // Concurrent flatten + limit slicing.
     let flattened = per_file_streams
         .buffer_unordered(concurrency)
         .try_flatten();
-
-    // Step 4: limit by slicing + early termination.
-    apply_limit(flattened, limit)
-}
-
-/// Apply an optional row-count cap to a stream of [`RecordBatch`]es. Slices the final batch
-/// when it would overshoot, and stops pulling once the budget is exhausted.
-fn apply_limit<S>(stream: S, limit: Option<usize>) -> impl Stream<Item = DfResult<RecordBatch>>
-where
-    S: Stream<Item = DfResult<RecordBatch>> + Send + 'static,
-{
     async_stream::try_stream! {
         let mut remaining = limit;
-        let mut s = std::pin::pin!(stream);
+        let mut s = std::pin::pin!(flattened);
         while let Some(batch) = s.try_next().await? {
             let mut out = batch;
             if let Some(rem) = remaining.as_mut() {

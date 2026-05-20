@@ -1,20 +1,8 @@
-//! [`PhysicalExprAdapterFactory`] that adapts a parquet scan's physical batches to the
-//! kernel-declared logical schema by matching columns and nested struct/list/map children
-//! by `PARQUET:field_id` metadata (with a name fallback).
-//!
-//! For each [`Column`] reference in projection/predicate expressions:
-//!
-//! 1. Looks up the logical field by name in `logical_file_schema`.
-//! 2. Finds the matching physical field via [`find_physical_match`].
-//! 3. Rebuilds the column reference to point at the physical column index.
-//! 4. If the logical and physical [`DataType`]s differ, wraps the column in a two-stage chain:
-//!    - inner [`RenameNestedFieldsByIdExpr`] -- a pure metadata rename via kernel's
-//!      [`apply_schema_to`] driven by a field-id-aware walk of the parquet field against the
-//!      logical field.
-//!    - outer [`CastExpr`] -- drops parquet-only extras, fills missing-but-nullable targets
-//!      with NULL, errors on missing-and-non-nullable, applies type-widening casts.
-//!
-//! [`apply_schema_to`]: delta_kernel::engine::arrow_expression::apply_schema::apply_schema_to
+//! Field-id-aware [`PhysicalExprAdapter`]: rewrites column references to match physical
+//! parquet schemas via `PARQUET:field_id` (name fallback), then -- if logical vs physical
+//! [`DataType`]s differ -- wraps the column in `RenameNestedFieldsByIdExpr` (metadata
+//! rename via kernel's `apply_schema_to`) → `CastExpr` (drop extras, NULL-fill missing
+//! nullables, error on missing non-nullables, apply type widening).
 
 use std::fmt;
 use std::hash::Hash;
@@ -34,13 +22,8 @@ use delta_kernel::engine::arrow_expression::apply_schema::apply_schema_to;
 use delta_kernel::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use delta_kernel::schema::{DataType as KernelDataType, StructField};
 
-/// Factory for [`FieldIdPhysicalExprAdapter`].
-///
-/// Hand an instance of this to a parquet
-/// [`FileScanConfig::expr_adapter_factory`](datafusion_datasource::file_scan_config::FileScanConfig)
-/// (e.g. via
-/// [`ListingTableConfig::with_expr_adapter_factory`](datafusion::datasource::listing::ListingTableConfig))
-/// so every file open during scan runs through field-id-aware schema adaptation.
+/// Wire into a parquet `FileScanConfig::expr_adapter_factory` so every opened file runs
+/// through field-id-aware schema adaptation.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FieldIdPhysicalExprAdapterFactory;
 
@@ -87,19 +70,10 @@ impl FieldIdPhysicalExprAdapter {
             }
         };
 
-        // Virtual columns (parquet `RowNumber` etc.) are injected by the decoder via
-        // `ArrowReaderOptions::with_virtual_columns`. The opener's simplifier evaluates
-        // against `physical_for_rewrite = physical_file_schema ++ virtuals`; this is the
-        // schema where the column will actually be looked up. Rebind to the column's
-        // position there: virtuals sit past the physical file columns, so its index is
-        // `physical_file_schema.fields().len()` (assuming a single virtual; if multiple,
-        // the position needs to be looked up in the schema). The original
-        // `column.index()` was computed against the LoadExec's projected `TableSchema`
-        // (file ++ partition ++ virtual), which doesn't match either logical_for_rewrite
-        // (file ++ virtual, no partition) or physical_for_rewrite (physical_file ++
-        // virtual). Schema evolution can also make the two diverge in length: an
-        // older file with fewer physical columns than the latest logical schema needs
-        // the virtual to land at the **physical** length, not the logical one.
+        // Virtual columns (parquet `RowNumber`, ...) are injected by the decoder. The
+        // opener's simplifier evaluates against `physical_file_schema ++ virtuals`, so we
+        // rebind to the virtual's position there. Schema evolution can shorten the physical
+        // schema, so we always anchor against `physical_file_schema.fields().len()`.
         if is_virtual_column(logical_field) {
             let physical_idx = self
                 .physical_file_schema
@@ -391,9 +365,7 @@ mod tests {
         }
     }
 
-    // Flat rename. PARQUET:field_id links physical roots to logical roots; no nested
-    // structs. Output column data_type already matches → pass through Column (no
-    // reshape needed).
+    // Flat rename via PARQUET:field_id; output type matches → plain Column.
     #[test]
     fn flat_rename_passthrough() -> DfResult<()> {
         let logical = Arc::new(Schema::new(vec![
@@ -432,16 +404,10 @@ mod tests {
         Ok(())
     }
 
-    // Nested missing-nullable-field schema evolution. The logical struct has one more
-    // (nullable) inner field than the physical parquet does — the outer `CastExpr`
-    // inserts a NULL column for the missing field. Production scenario; exercises the
-    // rename + cast pipeline. Deep recursion (lists, maps, deeper structs) is exercised
-    // end-to-end by the engine's integration tests.
+    // Nested missing-nullable schema evolution: logical struct has `a` + `b`, physical has
+    // only `a`; rename + cast pipeline must NULL-fill `b`.
     #[test]
     fn nested_missing_nullable_field_filled_with_nulls() -> DfResult<()> {
-        // Logical (kernel's physical_schema for an evolved table): struct has `a` and `b`.
-        // Physical (parquet, written before `b` was added): struct has only `a`.
-        // Names match between logical and physical at every level (per `make_physical`).
         let logical_a = Arc::new(fid(Field::new("a", DataType::Int64, false), 2));
         let logical_b = Arc::new(fid(Field::new("b", DataType::Utf8, true), 3));
         let physical_a = Arc::new(fid(Field::new("a", DataType::Int64, false), 2));
@@ -472,8 +438,7 @@ mod tests {
 
         let out =
             evaluate_via_adapter(Arc::clone(&logical), Arc::clone(&physical), "outer", batch)?;
-        // Output's DataType must match the LOGICAL field's DataType byte-for-byte (so the
-        // opener's `RecordBatch::try_new(output_schema, arrays)` re-wrap will accept).
+        // Output DataType must match logical byte-for-byte so opener's `try_new` accepts it.
         assert_eq!(out.data_type(), logical.field(0).data_type());
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(out_struct.fields().len(), 2);
@@ -484,33 +449,28 @@ mod tests {
             .unwrap();
         assert_eq!(a_out.value(0), 10);
         assert_eq!(a_out.value(2), 30);
-        // `b` was missing in parquet → adapter inserts an all-null column.
         let b_out = out_struct.column(1);
         assert_eq!(b_out.len(), 3);
         assert_eq!(b_out.null_count(), 3);
         Ok(())
     }
 
-    // No field IDs anywhere → adapter resolves by name fallback and passes through
-    // unchanged. This is the "no column mapping" baseline.
+    // No field IDs anywhere → name-fallback passthrough.
     #[test]
     fn no_field_ids_passthrough() -> DfResult<()> {
         let logical = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let physical = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let rewritten = rewrite_column(Arc::clone(&logical), Arc::clone(&physical), "a")?;
-        // Should not have wrapped — physical and logical types already agree.
         assert!(rewritten.downcast_ref::<CastExpr>().is_none());
         assert!(rewritten
             .downcast_ref::<RenameNestedFieldsByIdExpr>()
             .is_none());
-        // Should be a plain Column.
         assert!(rewritten.downcast_ref::<Column>().is_some());
         Ok(())
     }
 
-    // Name-mode column mapping. Kernel stamps PARQUET:field_id in name mode too (via
-    // `StructField::make_physical`), so the same field-id matching applies. We exercise it
-    // by using different physical / logical names with matching IDs.
+    // Name-mode column mapping: kernel stamps PARQUET:field_id even when names match, so the
+    // same field-id rebinding applies under different physical names.
     #[test]
     fn name_mode_uses_field_ids() -> DfResult<()> {
         let logical = Arc::new(Schema::new(vec![fid(
@@ -526,18 +486,15 @@ mod tests {
             Arc::clone(&physical),
             "logical_rename",
         )?;
-        // Data types match — should be a Column pointing at the physical name.
         let col = rewritten
             .downcast_ref::<Column>()
-            .expect("expected Column after adapter rewrite");
+            .expect("expected Column after rewrite");
         assert_eq!(col.name(), "phys_rename");
         assert_eq!(col.index(), 0);
         Ok(())
     }
 
-    // Forward-compat: logical schema has a nullable column that the physical schema
-    // doesn't (e.g. `domainMetadata` against an older V1 checkpoint). The adapter must
-    // substitute a typed NULL literal, matching DefaultPhysicalExprAdapter semantics.
+    // Missing nullable logical column → typed NULL literal (matches default adapter).
     #[test]
     fn missing_nullable_logical_column_yields_null_literal() -> DfResult<()> {
         let logical = Arc::new(Schema::new(vec![
@@ -553,8 +510,7 @@ mod tests {
         Ok(())
     }
 
-    // Missing NON-nullable logical column must error — silently filling with NULL would
-    // be data corruption.
+    // Missing non-nullable logical column → error (silent NULL-fill would be data corruption).
     #[test]
     fn missing_non_nullable_logical_column_errors() {
         let logical = Arc::new(Schema::new(vec![

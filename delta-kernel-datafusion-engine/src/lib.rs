@@ -1,18 +1,5 @@
-//! DataFusion execution scaffold for Delta Kernel declarative [`delta_kernel::plans::ir::Plan`]
-//! trees.
-//!
-//! Supported sinks (registration is lazy; no I/O until the consumer reads):
-//! - `Relation` -- registers a [`ViewTable`](datafusion::datasource::ViewTable) over the upstream
-//!   `LogicalPlan`; DataFusion's `InlineTableScan` rule inlines it so pushdown and CSE cross plan
-//!   boundaries.
-//! - `Load` -- registers a [`LoadTableProvider`](exec::LoadTableProvider) whose `scan()` yields a
-//!   [`LoadExec`](exec::LoadExec) streaming per-row file batches.
-//! - `Consume` -- the only sink with eager side effects: drains the physical plan into a
-//!   [`delta_kernel::plans::kdf::ConsumerKdf`] handle at execute-plan time.
-//!
-//! Unsupported constructs surface via [`error::unsupported`]; the engine -> kernel boundary
-//! methods on [`DataFusionExecutor`] translate that into a
-//! [`delta_kernel::plans::errors::DeltaError`].
+//! DataFusion execution scaffold for kernel [`delta_kernel::plans::ir::Plan`] trees. See
+//! [`DataFusionExecutor`] and [`exec`] / [`compile`] modules.
 
 pub mod compile;
 pub mod error;
@@ -41,10 +28,7 @@ mod tests {
         ]))
     }
 
-    /// `Relation` sinks must register a *lazy* `ViewTable` -- not an eagerly-materialized
-    /// `MemTable`. Downcasting the provider returned by `relation_provider` proves both that the
-    /// upstream `LogicalPlan` round-trips into the registry and that no eager `collect` path
-    /// remains.
+    /// `Relation` sinks must register a lazy `ViewTable` (not an eager `MemTable`).
     #[tokio::test]
     async fn relation_sink_registers_view_table_not_memtable() {
         use datafusion::datasource::{MemTable, ViewTable};
@@ -64,31 +48,21 @@ mod tests {
 
         let provider = ex
             .relation_provider(handle.id.as_str())
-            .expect("relation sink should register a provider under its handle id");
-        // Critical: lazy registration must yield a `ViewTable`. A `MemTable` here would prove
-        // we still eagerly drain the upstream pipeline at register time.
+            .expect("relation sink should register a provider");
         assert!(
             provider.as_ref().downcast_ref::<ViewTable>().is_some(),
-            "relation provider must be a ViewTable (got {:?})",
-            provider,
+            "expected ViewTable, got {provider:?}",
         );
-        assert!(
-            provider.as_ref().downcast_ref::<MemTable>().is_none(),
-            "relation provider must NOT be a MemTable; lazy registration regressed",
-        );
+        assert!(provider.as_ref().downcast_ref::<MemTable>().is_none());
 
-        // And reading the relation lazily must still produce the upstream's row.
         let batches = crate::testing::collect_relation(&ex, &handle)
             .await
             .unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 
-    /// Projection pushdown through the registered Load provider must narrow BOTH (a) the
-    /// kernel parquet/json handler's request schema and (b) the broadcast passthrough set,
-    /// all the way through. This test drives `scan(state, Some(projection), &[], None)`
-    /// directly and asserts the resulting batch shape -- robust against the
-    /// streaming/eager dispatch split (Phase 5): both routes must produce the same
+    /// Projection pushdown through a Load provider narrows both the file read schema and the
+    /// passthrough broadcast set; both eager and streaming dispatch must produce the same
     /// projected output.
     #[tokio::test]
     async fn load_provider_projection_narrows_read_and_passthrough() {
@@ -173,25 +147,16 @@ mod tests {
         let ex = DataFusionExecutor::try_new().unwrap();
         ex.execute_plans(&registry.take_plans()).await.unwrap();
 
-        // Eager dispatch (Phase 5): bare Values upstream + no DV routes to
-        // `EagerLoadTableProvider`, which produces a `DataSourceExec` over a `FileGroup`
-        // whose `PartitionedFile`s carry per-row `partition_values`. Projection narrows
-        // both the parquet read schema and the broadcast partition-value set via the
-        // standard `with_projection_indices` pushdown -- this test pins the end-to-end
-        // shape of that contract: output columns = `[b, p1]`, two rows, correct values.
+        // Output schema is `[a, b, p1, p2]`; projecting `[b, p1]` should yield 2 cols, 2 rows.
         let provider = ex
             .relation_provider(handle.id.as_str())
             .expect("registered");
-
-        // Output schema = [a, b, p1, p2]. Project [b, p1] -> kernel handler should be asked
-        // for just `b`, and only `p1` should be broadcast.
         let state = ex.session_state();
         let projected_plan = (provider.as_ref() as &dyn TableProvider)
             .scan(&state, Some(&vec![1usize, 2usize]), &[], None)
             .await
             .expect("scan");
 
-        // And the data shape matches: 2 cols, ordered [b, p1], 2 rows.
         let stream = datafusion::physical_plan::execute_stream(
             projected_plan,
             Arc::new(datafusion::execution::TaskContext::default()),
@@ -207,11 +172,8 @@ mod tests {
         assert_eq!(names, vec!["b", "p1"]);
     }
 
-    /// Limit pushdown into a [`LoadTableProvider`] must (a) cap the total emitted row count
-    /// across files / row groups and (b) stop opening further row groups / files once the
-    /// budget is exhausted. We drive a single file containing 64 rows across 4 row groups and
-    /// ask for `limit = 20`; the new streaming `LoadExec` slices the second row group and
-    /// declines to open the third.
+    /// Limit pushdown caps the total emitted row count and stops opening further row groups
+    /// once the budget is exhausted. 64 rows across 4 row groups, `limit = 20`.
     #[tokio::test]
     async fn load_provider_limit_caps_total_streamed_rows() {
         use std::fs::File;
@@ -285,10 +247,6 @@ mod tests {
         let ex = DataFusionExecutor::try_new().unwrap();
         ex.execute_plans(&registry.take_plans()).await.unwrap();
 
-        // Eager dispatch (Phase 5): bare Values upstream + no DV + no passthrough columns
-        // routes to a `ListingTable`-backed `ViewTable`. This test still validates that
-        // limit pushdown caps the emitted row count exactly, regardless of which provider
-        // serves the query.
         let provider = ex
             .relation_provider(handle.id.as_str())
             .expect("registered");
@@ -307,18 +265,9 @@ mod tests {
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(
-            total_rows, 20,
-            "limit must cap total emitted rows to exactly the budget; got {total_rows}",
-        );
-
-        // And every batch must be non-empty (no degenerate zero-row slices appended after the
-        // budget hit).
+        assert_eq!(total_rows, 20, "limit must cap rows exactly; got {total_rows}");
         for b in &batches {
-            assert!(
-                b.num_rows() > 0,
-                "LoadExec must not emit zero-row batches after limit slicing",
-            );
+            assert!(b.num_rows() > 0, "no zero-row slices after limit");
         }
     }
 }

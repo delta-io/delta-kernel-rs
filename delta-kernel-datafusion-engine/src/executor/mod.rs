@@ -1,21 +1,9 @@
-//! DataFusion-backed [`DataFusionExecutor`] for compiling kernel [`delta_kernel::plans::ir::Plan`]
-//! values.
+//! [`DataFusionExecutor`]: compiles and runs [`delta_kernel::plans::ir::Plan`] trees.
 //!
-//! `Relation` and `Load` sinks register a *lazy* [`TableProvider`] into the executor's
-//! `relation_providers` map keyed by [`delta_kernel::plans::ir::nodes::RelationHandle`]'s `id`
-//! field; the upstream pipeline never runs at registration time. Downstream `RelationRef` leaves
-//! resolve to that provider during compile, and DataFusion drives execution lazily when the
-//! consumer reads the relation.
-//!
-//! - `Relation` -> [`datafusion::datasource::ViewTable`] over the upstream `LogicalPlan`;
-//!   DataFusion's `InlineTableScan` rule inlines it so pushdown and CSE cross the boundary.
-//! - `Load`     -> [`crate::exec::LoadTableProvider`] wrapping the upstream `LogicalPlan` +
-//!   [`LoadSink`] + [`Engine`]; `scan()` produces a [`crate::exec::LoadExec`] that streams per-row
-//!   file batches via kernel's parquet/json handler.
-//!
-//! `Consume` is the only sink that drains eagerly: the physical plan runs and feeds a
-//! [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle whose finalized state
-//! submits into the active phase's [`PhaseState`].
+//! `Relation` / `Load` sinks register lazy [`TableProvider`]s into `relation_providers`
+//! keyed by `RelationHandle.id`; downstream `RelationRef` leaves resolve through that map.
+//! `Consume` is the only sink with eager side effects -- it drains the physical plan into a
+//! [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -58,7 +46,6 @@ use crate::exec::LoadTableProvider;
 fn default_kernel_engine() -> Arc<dyn Engine> {
     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
 }
-
 
 fn resolve_schema_query_url(path: &str) -> Result<Url, EngineError> {
     Url::parse(path).or_else(|_| {
@@ -347,17 +334,9 @@ impl DataFusionExecutor {
         Ok(())
     }
 
-    /// Wrap `logical` in a [`ViewTable`] and register it under `handle.id`. The view is opaque
-    /// to plan-level execution: DataFusion's `InlineTableScan` analyzer inlines it into the
-    /// consumer's tree when the consumer reads the relation, exposing every upstream node for
-    /// predicate / projection pushdown + CSE.
-    ///
-    /// The upstream plan's runtime output is expected to match the kernel-declared relation
-    /// schema field-for-field at every nesting level. Parquet scans get there via
-    /// [`crate::exec::FieldIdPhysicalExprAdapterFactory`] (column-mapping-aware decode
-    /// reshape); `LoadSink` outputs get there by handing kernel's parquet handler the
-    /// kernel-declared logical schema so its built-in field-id matching + nested coerce step
-    /// produces logically-shaped batches.
+    /// Register `logical` as a [`ViewTable`] under `handle.id`; DataFusion's
+    /// `InlineTableScan` analyzer inlines it into consumer trees so pushdown + CSE cross
+    /// the boundary.
     fn register_view_relation(
         &self,
         handle: &RelationHandle,
@@ -368,60 +347,32 @@ impl DataFusionExecutor {
         Ok(())
     }
 
-    /// Compile-time dispatch (Phase 5) for [`SinkType::Load`].
-    ///
-    /// When the upstream logical plan is a bare [`LogicalPlan::Values`] AND the sink has
-    /// no deletion vector, every file path + size + per-row passthrough scalar is known
-    /// at registration time. We short-circuit to a custom [`EagerLoadTableProvider`] that
-    /// holds a pre-built `Vec<PartitionedFile>` (each carrying its own
-    /// `partition_values`) and produces a single [`DataSourceExec`] from `scan()`. This
-    /// unlocks DataFusion's native parquet/json file scanning -- multi-partition
-    /// fan-out, projection / limit pushdown -- without any of the per-row plumbing in
-    /// [`crate::exec::LoadExec`].
-    ///
-    /// Passthrough columns ride through as
-    /// [`PartitionedFile::partition_values`](datafusion_datasource::PartitionedFile::partition_values)
-    /// -- the same per-file constant-broadcast mechanism the streaming path uses today.
-    ///
-    /// Anything else (non-Values upstream, DV present) falls through to the streaming
-    /// [`LoadTableProvider`].
-    ///
-    /// **Note** the bare-Values match is intentionally non-recursive: the kernel's typical
-    /// Load IR (`commit_load`, `sidecar_load`) emits a literal Values listing files; if a
-    /// future producer wraps Values in a Projection or Filter, we can extend this match
-    /// then.
+    /// Bare `Values` upstream + no DV → register an eager [`EagerLoadTableProvider`] that
+    /// produces a single [`DataSourceExec`] (DataFusion's native fan-out / pushdown apply).
+    /// Anything else (non-Values upstream, DV present) → streaming [`LoadTableProvider`].
+    /// On eager-build failure we fall through to streaming so the input still gets a
+    /// diagnostic error from the same code path.
     fn register_load_relation(
         &self,
         sink: &LoadSink,
         logical: datafusion_expr::LogicalPlan,
         ctx: &CompileContext,
     ) -> Result<(), DataFusionError> {
-        let eager_eligible =
-            sink.dv_ref.is_none() && matches!(logical, LogicalPlan::Values(_));
-        let provider: Arc<dyn TableProvider> = if eager_eligible {
-            let LogicalPlan::Values(values) = &logical else {
-                unreachable!("eager_eligible guards this");
-            };
-            match crate::exec::EagerLoadTableProvider::try_new(sink, values) {
-                Ok(eager) => Arc::new(eager),
-                Err(_err) => {
-                    // Defensive: an eager build failure should never silently regress
-                    // behaviour relative to the streaming path. Fall through; the
-                    // streaming path errors with a more diagnostic message if it can't
-                    // handle the same input.
-                    Arc::new(LoadTableProvider::try_new(
-                        logical,
-                        Arc::new(sink.clone()),
-                        ctx.engine.clone(),
-                    )?)
-                }
-            }
-        } else {
-            Arc::new(LoadTableProvider::try_new(
-                logical,
+        let lazy = || -> Result<Arc<dyn TableProvider>, DataFusionError> {
+            Ok(Arc::new(LoadTableProvider::try_new(
+                logical.clone(),
                 Arc::new(sink.clone()),
                 ctx.engine.clone(),
-            )?)
+            )?))
+        };
+        let provider: Arc<dyn TableProvider> = match (&logical, sink.dv_ref.is_none()) {
+            (LogicalPlan::Values(values), true) => {
+                match crate::exec::EagerLoadTableProvider::try_new(sink, values) {
+                    Ok(eager) => Arc::new(eager),
+                    Err(_) => lazy()?,
+                }
+            }
+            _ => lazy()?,
         };
         self.providers_lock()?
             .insert(sink.output_relation.id.clone(), provider);
