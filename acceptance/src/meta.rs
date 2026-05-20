@@ -26,15 +26,12 @@ pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;
 struct TestCaseInfoJson {
     name: String,
     description: String,
-    #[serde(default)]
-    read_mode: Option<String>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct TestCaseInfo {
     name: String,
     description: String,
-    read_mode: Option<String>,
     root_dir: PathBuf,
 }
 
@@ -47,12 +44,6 @@ impl TestCaseInfo {
 
     pub fn root_dir(&self) -> &PathBuf {
         &self.root_dir
-    }
-
-    /// Read execution mode declared in `test_case_info.json` (e.g. `"fsr_add_only"`).
-    /// `None` means the default scan-based reader.
-    pub fn read_mode(&self) -> Option<&str> {
-        self.read_mode.as_deref()
     }
 
     async fn versions(&self) -> TestResult<(TableVersionMetaData, Vec<TableVersionMetaData>)> {
@@ -142,7 +133,6 @@ pub fn read_dat_case(case_root: impl AsRef<Path>) -> TestResult<TestCaseInfo> {
         root_dir: case_root.as_ref().into(),
         name: info.name,
         description: info.description,
-        read_mode: info.read_mode,
     })
 }
 

@@ -1,5 +1,4 @@
-//! Helpers to validate Engine implementations. DAT reader cases may set `read_mode`
-//! on `TestCaseInfo`; the DataFusion harness honors `"fsr_add_only"`.
+//! Helpers to validate Engine implementations.
 
 pub mod acceptance_workloads;
 pub mod data;
