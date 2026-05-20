@@ -20,15 +20,15 @@
 //! not guaranteed to be monotonically increasing across commits.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
 
 use error::LogHistoryError;
+use itertools::Itertools;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace};
 use url::Url;
 
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::iter_log_files;
+use crate::log_segment_files::list_from_storage;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -582,22 +582,16 @@ pub fn get_earliest_published_commit_version(
         return Ok(0);
     }
 
-    let commit_only = HashSet::from([LogPathFileType::Commit]);
-    let first = iter_log_files(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        &commit_only,
-    )?
-    .next()
-    .transpose()?;
-
-    first.map(|f| f.version).ok_or_else(|| {
-        DeltaError::from(LogHistoryError::NoPublishedCommits {
-            log_root: log_root.clone(),
+    list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+        .next()
+        .transpose()?
+        .map(|f| f.version)
+        .ok_or_else(|| {
+            DeltaError::from(LogHistoryError::NoPublishedCommits {
+                log_root: log_root.clone(),
+            })
         })
-    })
 }
 
 #[cfg(test)]

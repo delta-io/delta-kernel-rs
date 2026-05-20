@@ -29,7 +29,7 @@ const STAGED_COMMITS_DIR: &str = "_staged_commits/";
 /// The subdirectory name within the delta log where checkpoint sidecars reside
 const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum LogPathFileType {
     Commit,

@@ -16,7 +16,7 @@
 //! [`list_with_checkpoint_hint`]: Self::list_with_checkpoint_hint
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -64,7 +64,7 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
-fn list_from_storage(
+pub(crate) fn list_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
@@ -87,23 +87,6 @@ fn list_from_storage(
             Err(_) => true,
         });
     Ok(files)
-}
-
-/// Returns a lazy iterator over log files in `log_root` whose [`LogPathFileType`] is
-/// contained in `file_types`, in ascending version order from `start_version` up to and
-/// including `end_version`. Staged commits are always excluded (filtered upstream by
-/// [`ParsedLogPath::should_list`]).
-pub(crate) fn iter_log_files<'a>(
-    storage: &dyn StorageHandler,
-    log_root: &Url,
-    start_version: Version,
-    end_version: Version,
-    file_types: &'a HashSet<LogPathFileType>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>> + 'a> {
-    Ok(
-        list_from_storage(storage, log_root, start_version, end_version)?
-            .filter_ok(|f| file_types.contains(&f.file_type)),
-    )
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
