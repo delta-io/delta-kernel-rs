@@ -169,7 +169,7 @@ mod tests {
 
     impl<'a> GetData<'a> for MockGetData {
         fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-            if field_name == "numRecords" {
+            if field_name == STATS_NUM_RECORDS {
                 Ok(self.num_records_values.get(row_index).copied().flatten())
             } else {
                 Ok(None)
@@ -311,7 +311,7 @@ mod tests {
         let visitor = RowTrackingVisitor::new(Some(0), None);
         let (names, types) = visitor.selected_column_names_and_types();
 
-        assert_eq!(names, (vec![ColumnName::new(["stats", "numRecords"])]));
+        assert_eq!(names, (vec![ColumnName::new(["stats", STATS_NUM_RECORDS])]));
         assert_eq!(types, vec![DataType::LONG]);
     }
 

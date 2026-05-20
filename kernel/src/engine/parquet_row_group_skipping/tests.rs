@@ -518,17 +518,17 @@ fn write_checkpoint_parquet(
     part_values: Option<&[Option<&str>]>,
 ) -> tempfile::NamedTempFile {
     let (min_f, min_a) = build_stat_column(
-        "minValues",
+        STATS_MIN_VALUES,
         col_path,
         Arc::new(Int64Array::from(min_values.to_vec())),
     );
     let (max_f, max_a) = build_stat_column(
-        "maxValues",
+        STATS_MAX_VALUES,
         col_path,
         Arc::new(Int64Array::from(max_values.to_vec())),
     );
     let (nc_f, nc_a) = build_stat_column(
-        "nullCount",
+        STATS_NULL_COUNT,
         col_path,
         Arc::new(Int64Array::from(null_counts.to_vec())),
     );
@@ -1037,17 +1037,17 @@ fn checkpoint_filter_multi_row_group_skipping() {
     // Build schema: add.stats_parsed.{minValues,maxValues,nullCount}.x (INT64)
     let col_field = Arc::new(Field::new("x", ArrowDataType::Int64, true));
     let min_field = Arc::new(Field::new(
-        "minValues",
+        STATS_MIN_VALUES,
         ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
         true,
     ));
     let max_field = Arc::new(Field::new(
-        "maxValues",
+        STATS_MAX_VALUES,
         ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
         true,
     ));
     let nc_field = Arc::new(Field::new(
-        "nullCount",
+        STATS_NULL_COUNT,
         ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
         true,
     ));

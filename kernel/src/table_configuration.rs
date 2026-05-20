@@ -895,7 +895,7 @@ mod test {
     use url::Url;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{Metadata, Protocol, STATS_MIN_VALUES};
     use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -1864,7 +1864,7 @@ mod test {
         // Verify field names are logical names
         let min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(STATS_MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = min_values {
@@ -1888,7 +1888,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(STATS_MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = physical_min_values {
@@ -1924,7 +1924,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(STATS_MIN_VALUES)
             .unwrap()
             .data_type();
         let DataType::Struct(inner) = physical_min_values else {
@@ -2020,7 +2020,7 @@ mod test {
 
         let DataType::Struct(inner) = stats_schemas
             .physical
-            .field("minValues")
+            .field(STATS_MIN_VALUES)
             .unwrap()
             .data_type()
         else {

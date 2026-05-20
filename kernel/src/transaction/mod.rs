@@ -1740,11 +1740,11 @@ mod tests {
             StructField::nullable(
                 "stats",
                 DataType::struct_type_unchecked(vec![
-                    StructField::nullable("numRecords", DataType::LONG),
-                    StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("tightBounds", DataType::BOOLEAN),
+                    StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
+                    StructField::nullable(STATS_NULL_COUNT, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(STATS_MIN_VALUES, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(STATS_MAX_VALUES, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(STATS_TIGHT_BOUNDS, DataType::BOOLEAN),
                 ]),
             ),
         ]);
@@ -2513,16 +2513,16 @@ mod tests {
         let value_fields = vec![StructField::nullable("value", DataType::LONG)];
         let value_struct_type = DataType::struct_type_unchecked(value_fields.clone());
         let stats_type = DataType::struct_type_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", value_struct_type.clone()),
-            StructField::nullable("minValues", value_struct_type.clone()),
-            StructField::nullable("maxValues", value_struct_type.clone()),
+            StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
+            StructField::nullable(STATS_NULL_COUNT, value_struct_type.clone()),
+            StructField::nullable(STATS_MIN_VALUES, value_struct_type.clone()),
+            StructField::nullable(STATS_MAX_VALUES, value_struct_type.clone()),
         ]);
         let stats_fields = vec![
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", value_struct_type.clone()),
-            StructField::nullable("minValues", value_struct_type.clone()),
-            StructField::nullable("maxValues", value_struct_type),
+            StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
+            StructField::nullable(STATS_NULL_COUNT, value_struct_type.clone()),
+            StructField::nullable(STATS_MIN_VALUES, value_struct_type.clone()),
+            StructField::nullable(STATS_MAX_VALUES, value_struct_type),
         ];
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),

@@ -12,6 +12,7 @@ use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NUM_RECORDS,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -2869,13 +2870,13 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
 
     // Build a V1 checkpoint schema with stats_parsed containing an integer column.
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "minValues",
+            STATS_MIN_VALUES,
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
         ),
         StructField::nullable(
-            "maxValues",
+            STATS_MAX_VALUES,
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
         ),
     ]);
@@ -3053,12 +3054,12 @@ async fn test_max_published_version_checkpoint_only() {
 // Helper to create a checkpoint schema with stats_parsed for testing
 fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "minValues",
+            STATS_MIN_VALUES,
             StructType::new_unchecked(min_values_fields.clone()),
         ),
-        StructField::nullable("maxValues", StructType::new_unchecked(min_values_fields)),
+        StructField::nullable(STATS_MAX_VALUES, StructType::new_unchecked(min_values_fields)),
     ]);
 
     let add_schema = StructType::new_unchecked([
@@ -3072,12 +3073,12 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 // Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
 fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
     StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "minValues",
+            STATS_MIN_VALUES,
             StructType::new_unchecked(column_fields.clone()),
         ),
-        StructField::nullable("maxValues", StructType::new_unchecked(column_fields)),
+        StructField::nullable(STATS_MAX_VALUES, StructType::new_unchecked(column_fields)),
     ])
 }
 
@@ -3220,7 +3221,7 @@ fn test_schema_has_compatible_stats_parsed_multiple_columns() {
 fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
     // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
         // No minValues or maxValues fields
     ]);
 
@@ -3244,10 +3245,10 @@ fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
 fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
         // minValues is a primitive type instead of a Struct
-        StructField::nullable("minValues", DataType::STRING),
-        StructField::nullable("maxValues", DataType::STRING),
+        StructField::nullable(STATS_MIN_VALUES, DataType::STRING),
+        StructField::nullable(STATS_MAX_VALUES, DataType::STRING),
     ]);
 
     let add_schema = StructType::new_unchecked([

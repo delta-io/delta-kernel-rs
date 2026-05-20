@@ -711,7 +711,7 @@ mod tests {
         let result = visitor.visit_rows_of(&data);
         if expect_error {
             let msg = result.expect_err("expected error").to_string();
-            assert!(msg.contains("numRecords"), "message was: {msg}");
+            assert!(msg.contains(STATS_NUM_RECORDS), "message was: {msg}");
             assert!(msg.contains(TEST_PATH), "message was: {msg}");
         } else {
             result.expect("validation should pass");

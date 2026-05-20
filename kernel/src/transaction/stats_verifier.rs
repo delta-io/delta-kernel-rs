@@ -399,10 +399,10 @@ mod tests {
         };
 
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            inner_struct_type("nullCount"),
-            inner_struct_type("minValues"),
-            inner_struct_type("maxValues"),
+            ArrowField::new(STATS_NUM_RECORDS, ArrowDataType::Int64, true),
+            inner_struct_type(STATS_NULL_COUNT),
+            inner_struct_type(STATS_MIN_VALUES),
+            inner_struct_type(STATS_MAX_VALUES),
         ]);
         let stats_struct = StructArray::new(
             stats_fields.clone(),
@@ -454,9 +454,9 @@ mod tests {
     #[test]
     fn test_verify_missing_stat_category() {
         let cases = [
-            ("nullCount", vec![None], vec![Some(1)], vec![Some(100)]),
-            ("minValues", vec![Some(0)], vec![None], vec![Some(100)]),
-            ("maxValues", vec![Some(0)], vec![Some(1)], vec![None]),
+            (STATS_NULL_COUNT, vec![None], vec![Some(1)], vec![Some(100)]),
+            (STATS_MIN_VALUES, vec![Some(0)], vec![None], vec![Some(100)]),
+            (STATS_MAX_VALUES, vec![Some(0)], vec![Some(1)], vec![None]),
         ];
         for (category, null_counts, min_values, max_values) in cases {
             let batch = create_add_file_batch(
@@ -548,7 +548,7 @@ mod tests {
         let result = verifier.verify(&[batch]);
         assert!(matches!(result, Err(Error::StatsValidation(_))));
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("minValues"));
+        assert!(err.contains(STATS_MIN_VALUES));
     }
 
     /// Creates test data with two columns (col_a, col_b) in stats, both LONG.
@@ -589,10 +589,10 @@ mod tests {
             ArrowField::new("col_b", ArrowDataType::Int64, true),
         ]));
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            ArrowField::new("nullCount", inner_type.clone(), true),
-            ArrowField::new("minValues", inner_type.clone(), true),
-            ArrowField::new("maxValues", inner_type, true),
+            ArrowField::new(STATS_NUM_RECORDS, ArrowDataType::Int64, true),
+            ArrowField::new(STATS_NULL_COUNT, inner_type.clone(), true),
+            ArrowField::new(STATS_MIN_VALUES, inner_type.clone(), true),
+            ArrowField::new(STATS_MAX_VALUES, inner_type, true),
         ]);
         let stats_struct = StructArray::new(
             stats_fields.clone(),
@@ -654,7 +654,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_msg.contains("col_b"));
-        assert!(err_msg.contains("minValues"));
+        assert!(err_msg.contains(STATS_MIN_VALUES));
         assert!(!err_msg.contains("col_a"));
     }
 
@@ -715,7 +715,7 @@ mod tests {
 
         // numRecords should match row count
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(STATS_NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -724,7 +724,7 @@ mod tests {
 
         // All-null/empty columns are present in minValues/maxValues with null values
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(STATS_MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -732,7 +732,7 @@ mod tests {
         assert!(min_values.column_by_name("col").unwrap().is_null(0));
 
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(STATS_MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -991,10 +991,10 @@ mod tests {
             )
         };
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            inner_struct_type("nullCount"),
-            inner_struct_type("minValues"),
-            inner_struct_type("maxValues"),
+            ArrowField::new(STATS_NUM_RECORDS, ArrowDataType::Int64, true),
+            inner_struct_type(STATS_NULL_COUNT),
+            inner_struct_type(STATS_MIN_VALUES),
+            inner_struct_type(STATS_MAX_VALUES),
         ]);
         let zero_inner_struct_array = StructArray::new(
             Fields::from(vec![col_field]),
