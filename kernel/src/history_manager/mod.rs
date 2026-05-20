@@ -20,6 +20,7 @@
 //! not guaranteed to be monotonically increasing across commits.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use error::LogHistoryError;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
@@ -27,8 +28,8 @@ use tracing::{info, trace};
 use url::Url;
 
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::list_commits_iter;
-use crate::path::ParsedLogPath;
+use crate::log_segment_files::iter_log_files;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
@@ -557,11 +558,6 @@ pub fn timestamp_range_to_versions(
 /// `log_root`. The returned version is not guaranteed to still exist by the time the caller
 /// acts on it: a concurrent log-cleanup operation may delete the file.
 ///
-/// Note: this function returns the earliest **published commit file**, not the earliest
-/// *reachable* version. On a cleaned-up table a checkpoint may be retained for a version
-/// whose commit file has been deleted; in that case the snapshot is still loadable from the
-/// checkpoint, but this function will not return that checkpoint-only version.
-///
 /// # Parameters
 /// - `engine`: kernel engine used to list `log_root`.
 /// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
@@ -569,8 +565,7 @@ pub fn timestamp_range_to_versions(
 ///   catalog has ratified. Pass `None` for filesystem-only tables. When `Some(0)` is passed this
 ///   function returns `0` immediately without listing storage, since for a catalog-managed table
 ///   the only way no published commits exist on the filesystem is when v0 has not yet been
-///   published (commits ratify in order). In that short-circuit case the returned version `0` does
-///   not correspond to a commit file on disk.
+///   published (commits ratify in order).
 ///
 /// # Errors
 /// - Propagates any error from listing the log directory.
@@ -587,15 +582,22 @@ pub fn get_earliest_published_commit_version(
         return Ok(0);
     }
 
-    list_commits_iter(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
-        .next()
-        .transpose()?
-        .map(|f| f.version)
-        .ok_or_else(|| {
-            DeltaError::from(LogHistoryError::NoPublishedCommits {
-                log_root: log_root.clone(),
-            })
+    let commit_only = HashSet::from([LogPathFileType::Commit]);
+    let first = iter_log_files(
+        engine.storage_handler().as_ref(),
+        log_root,
+        0,
+        Version::MAX,
+        &commit_only,
+    )?
+    .next()
+    .transpose()?;
+
+    first.map(|f| f.version).ok_or_else(|| {
+        DeltaError::from(LogHistoryError::NoPublishedCommits {
+            log_root: log_root.clone(),
         })
+    })
 }
 
 #[cfg(test)]
@@ -1519,8 +1521,9 @@ mod tests {
         #[case] last_cleanup_version: Option<Version>,
         #[case] expected: Result<Version, ()>,
     ) {
-        let timestamps: Vec<(Timestamp, Option<Timestamp>)> =
-            (0..num_commits).map(|_| (0, None)).collect();
+        let timestamps = (0..num_commits)
+            .map(|i| (i as i64, None))
+            .collect::<Vec<_>>();
         let table = mock_table_with_timestamps(&timestamps, None).await;
         let engine = SyncEngine::new();
         let log_root = Url::from_directory_path(table.table_root().join("_delta_log")).unwrap();
@@ -1539,7 +1542,9 @@ mod tests {
         );
         match expected {
             Ok(v) => assert_eq!(res.unwrap(), v),
-            Err(()) => assert!(res.is_err(), "{res:?}"),
+            Err(()) => assert!(
+                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoPublishedCommits { .. }))
+            ),
         }
     }
 
@@ -1547,7 +1552,7 @@ mod tests {
     /// listing is forward-scanning and the lowest commit version remains v0.
     #[tokio::test]
     async fn test_get_earliest_published_commit_version_with_gap_in_middle() {
-        let timestamps: Vec<(Timestamp, Option<Timestamp>)> = (0..4).map(|_| (0, None)).collect();
+        let timestamps = (0..4).map(|_| (0, None)).collect::<Vec<_>>();
         let table = mock_table_with_timestamps(&timestamps, None).await;
         let engine = SyncEngine::new();
         let log_root = Url::from_directory_path(table.table_root().join("_delta_log")).unwrap();
@@ -1565,11 +1570,9 @@ mod tests {
         assert_eq!(res.unwrap(), 0);
     }
 
-    /// Staged commits live under `_delta_log/_staged_commits/` and must be ignored by the
-    /// listing -- only published commit files (e.g. `00000000000000000000.json`) count.
     #[tokio::test]
     async fn test_get_earliest_published_commit_version_ignores_staged_commits() {
-        let timestamps: Vec<(Timestamp, Option<Timestamp>)> = vec![(0, None)];
+        let timestamps = vec![(0, None)];
         let table = mock_table_with_timestamps(&timestamps, None).await;
         let engine = SyncEngine::new();
         let log_dir = table.table_root().join("_delta_log");

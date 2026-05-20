@@ -16,7 +16,7 @@
 //! [`list_with_checkpoint_hint`]: Self::list_with_checkpoint_hint
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -89,19 +89,20 @@ fn list_from_storage(
     Ok(files)
 }
 
-/// Returns a lazy iterator over published commit files in `log_root` in ascending order,
-/// starting from `start_version` up to and including `end_version`. Filters out checkpoints,
-/// compactions, CRCs, and staged commits -- only [`LogPathFileType::Commit`] entries are
-/// yielded.
-pub(crate) fn list_commits_iter(
+/// Returns a lazy iterator over log files in `log_root` whose [`LogPathFileType`] is
+/// contained in `file_types`, in ascending version order from `start_version` up to and
+/// including `end_version`. Staged commits are always excluded (filtered upstream by
+/// [`ParsedLogPath::should_list`]).
+pub(crate) fn iter_log_files<'a>(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
     end_version: Version,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
+    file_types: &'a HashSet<LogPathFileType>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>> + 'a> {
     Ok(
         list_from_storage(storage, log_root, start_version, end_version)?
-            .filter_ok(|f| f.file_type == LogPathFileType::Commit),
+            .filter_ok(|f| file_types.contains(&f.file_type)),
     )
 }
 
