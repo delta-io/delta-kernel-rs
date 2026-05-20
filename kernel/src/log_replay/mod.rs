@@ -549,11 +549,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo {
-            key,
-            size: _size,
-            is_add,
-        } = result.unwrap();
+        let FileActionInfo { key, is_add, .. } = result.unwrap();
         assert_eq!(key.path, "file2.parquet");
         assert!(!is_add);
 
@@ -574,11 +570,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo {
-            key,
-            size: _size,
-            is_add,
-        } = result.unwrap();
+        let FileActionInfo { key, is_add, .. } = result.unwrap();
         assert!(matches!(
             key.dv_unique_id.as_deref(),
             Some("s3path/to/dv@100")
@@ -699,11 +691,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo {
-            key,
-            size: _size,
-            is_add,
-        } = result.unwrap();
+        let FileActionInfo { key, is_add, .. } = result.unwrap();
         assert_eq!(key.path, "checkpoint_file.parquet");
         assert!(key.dv_unique_id.is_none());
         assert!(is_add);
@@ -725,11 +713,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo {
-            key,
-            size: _size,
-            is_add,
-        } = result.unwrap();
+        let FileActionInfo { key, is_add, .. } = result.unwrap();
         assert_eq!(key.path, "file_with_dv.parquet");
         assert!(matches!(
             key.dv_unique_id.as_deref(),

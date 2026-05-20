@@ -421,7 +421,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
         //   3-5
         // - For Remove actions (in log batches only): path is at index 7, followed by DV fields at
-        //   indexes 8-9
+        //   indexes 8-10
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.

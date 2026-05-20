@@ -446,8 +446,8 @@ impl ActionReconciliationVisitor<'_> {
         // Extract the file action and handle errors immediately
         let Some(FileActionInfo {
             key: file_key,
-            size: _size,
             is_add,
+            ..
         }) = self.deduplicator.extract_file_action(i, getters, false)?
         else {
             return Ok(None); // No file action found, continue checking other types
