@@ -112,43 +112,16 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
     let mut validator = ValidateColumnMappings {
         mode,
         logical_path: vec![],
-        seen: SeenColumnMappingAnnotations::default(),
+        seen_ids: HashMap::new(),
+        sibling_names_stack: vec![],
     };
     validator.transform_struct(schema)
 }
 
-/// Tracks `delta.columnMapping.id` and `delta.columnMapping.physicalName` values that have
-/// already been claimed during a single schema walk.
-///
-/// See [`validate_schema_column_mapping`] for the uniqueness rules and examples.
-#[derive(Default, Debug)]
-pub(crate) struct SeenColumnMappingAnnotations<'a> {
-    /// `delta.columnMapping.id` -> first field name that claimed it.
-    pub ids: HashMap<i64, &'a str>,
-    /// Stack of per-struct sibling maps, one per struct currently being walked (root included).
-    /// Structs-only (not arrays or maps, since their elements / keys / values are anonymous in
-    /// delta). Call [`enter_struct`](Self::enter_struct) before iterating a struct's fields
-    /// and [`leave_struct`](Self::leave_struct) after finishing them. Each map holds the
-    /// physical names already claimed by that struct's children: key is the child's physical
-    /// name, value is its logical name.
-    sibling_physical_names: Vec<HashMap<&'a str, &'a str>>,
-}
-
-impl<'a> SeenColumnMappingAnnotations<'a> {
-    /// Walkers call this before iterating a struct's fields.
-    pub(crate) fn enter_struct(&mut self) {
-        self.sibling_physical_names.push(HashMap::new());
-    }
-
-    /// Walkers call this after finishing a struct's fields.
-    pub(crate) fn leave_struct(&mut self) {
-        self.sibling_physical_names.pop();
-    }
-}
-
 /// Validates a field's column mapping annotations and extracts the physical name and column
-/// mapping id. If `seen` is provided, also checks for duplicate column mapping IDs (globally)
-/// and duplicate physical names among the siblings.
+/// mapping id. If `seen_ids` is provided, also checks that this field's
+/// `delta.columnMapping.id` is globally unique. If `current_field_siblings` is provided, also
+/// checks that this field's `delta.columnMapping.physicalName` is unique among its siblings.
 ///
 /// Metadata columns are not subject to column mapping and must not carry column mapping
 /// annotations. Returns the logical field name and `None` for such fields.
@@ -163,11 +136,18 @@ impl<'a> SeenColumnMappingAnnotations<'a> {
 ///
 /// `parent_field_logical_path` is the field's parent path, used to render full paths in error
 /// messages (e.g. parent `&["a", "b"]` and field `c` renders as `a.b.c`).
+///
+/// `seen_ids` is the global map of `delta.columnMapping.id` -> first claimer logical name.
+/// `None` skips the ID-dedup check.
+///
+/// `current_field_siblings` is the map of `delta.columnMapping.physicalName` -> first claimer
+/// logical name *for the current field's siblings only*. `None` skips the sibling-dedup check.
 pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     field: &'a StructField,
     mode: ColumnMappingMode,
     parent_field_logical_path: &[&'a str],
-    seen: Option<&mut SeenColumnMappingAnnotations<'a>>,
+    seen_ids: Option<&mut HashMap<i64, &'a str>>,
+    current_field_siblings: Option<&mut HashMap<&'a str, &'a str>>,
 ) -> DeltaResult<(&'a str, Option<i64>)> {
     let logical_field_path = || {
         ColumnName::new(
@@ -248,33 +228,28 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     // within its parent struct, not globally -- so dedup is gated on CM being enabled. ID dedup
     // additionally requires `Some(id)` because `id` is `None` outside CM-enabled mode.
     if mode != ColumnMappingMode::None {
-        if let Some(seen) = seen {
-            if let Some(id) = id {
-                seen.ids.insert(id, field.name()).map_or(Ok(()), |prev| {
+        if let (Some(id), Some(seen_ids)) = (id, seen_ids) {
+            seen_ids.insert(id, field.name()).map_or(Ok(()), |prev| {
+                Err(Error::schema(format!(
+                    "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
+                    field.name()
+                )))
+            })?;
+        }
+        // Dedup `physicalName` among siblings. Two distinct columns with the same full
+        // physical path must diverge at some ancestor struct, where two siblings share
+        // the same `physicalName`.
+        if let Some(siblings) = current_field_siblings {
+            siblings
+                .insert(physical_name.as_str(), field.name().as_str())
+                .map_or(Ok(()), |prev| {
                     Err(Error::schema(format!(
-                        "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
-                        field.name()
+                        "Duplicate `delta.columnMapping.physicalName` '{physical_name}' \
+                         assigned to both '{}' and '{}'",
+                        ColumnName::new(parent_field_logical_path.iter().copied().chain([prev])),
+                        logical_field_path(),
                     )))
                 })?;
-            }
-            // Dedup `physicalName` among the parent struct's direct children. Two distinct
-            // columns with the same full physical path must diverge at some ancestor struct,
-            // where they take different child branches sharing a `physicalName`, so a
-            // per-struct direct-children check catches all full-path collisions.
-            if let Some(siblings) = seen.sibling_physical_names.last_mut() {
-                siblings
-                    .insert(physical_name.as_str(), field.name().as_str())
-                    .map_or(Ok(()), |prev| {
-                        Err(Error::schema(format!(
-                            "Duplicate `delta.columnMapping.physicalName` '{physical_name}' \
-                             assigned to both '{}' and '{}'",
-                            ColumnName::new(
-                                parent_field_logical_path.iter().copied().chain([prev])
-                            ),
-                            logical_field_path(),
-                        )))
-                    })?;
-            }
         }
     }
 
@@ -285,8 +260,14 @@ struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
     logical_path: Vec<&'a str>,
-    /// CM ids and physical names already claimed during the walk, with the first claimer.
-    seen: SeenColumnMappingAnnotations<'a>,
+    /// `delta.columnMapping.id` -> first claimer logical name.
+    seen_ids: HashMap<i64, &'a str>,
+    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
+    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
+    /// pushed in `transform_struct` (root struct included) and popped after iterating its
+    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
+    /// elements / keys / values are anonymous.
+    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
 }
 
 impl<'a> ValidateColumnMappings<'a> {
@@ -305,9 +286,9 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     transform_output_type!(|'a, T| DeltaResult<()>);
 
     fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<()> {
-        self.seen.enter_struct();
+        self.sibling_names_stack.push(HashMap::new());
         let result = self.recurse_into_struct(stype);
-        self.seen.leave_struct();
+        self.sibling_names_stack.pop();
         result
     }
 
@@ -326,7 +307,8 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
             field,
             self.mode,
             &self.logical_path,
-            Some(&mut self.seen),
+            Some(&mut self.seen_ids),
+            self.sibling_names_stack.last_mut(),
         )?;
         self.transform_inner(field.name(), |this| this.recurse_into_struct_field(field))
     }

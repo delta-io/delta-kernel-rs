@@ -18,7 +18,6 @@ pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
-    SeenColumnMappingAnnotations,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
@@ -2179,15 +2178,22 @@ struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
     logical_path: Vec<&'a str>,
-    /// CM ids and physical names already claimed during the walk, with the first claimer.
-    seen: SeenColumnMappingAnnotations<'a>,
+    /// `delta.columnMapping.id` -> first claimer logical name.
+    seen_ids: HashMap<i64, &'a str>,
+    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
+    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
+    /// pushed in `transform_struct` (root struct included) and popped after iterating its
+    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
+    /// elements / keys / values are anonymous.
+    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
         Self {
             column_mapping_mode,
             logical_path: vec![],
-            seen: SeenColumnMappingAnnotations::default(),
+            seen_ids: HashMap::new(),
+            sibling_names_stack: vec![],
         }
     }
 
@@ -2206,9 +2212,9 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
 
     fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
-        self.seen.enter_struct();
+        self.sibling_names_stack.push(HashMap::new());
         let result = self.recurse_into_struct(stype);
-        self.seen.leave_struct();
+        self.sibling_names_stack.pop();
         result
     }
 
@@ -2229,7 +2235,8 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
             field,
             self.column_mapping_mode,
             &self.logical_path,
-            Some(&mut self.seen),
+            Some(&mut self.seen_ids),
+            self.sibling_names_stack.last_mut(),
         )?;
 
         if field.is_metadata_column() {
