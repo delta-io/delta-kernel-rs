@@ -18,7 +18,9 @@ use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::crc::Crc;
-use crate::crc::{try_write_crc_file, CrcDelta, DomainMetadataState, FileStats, LazyCrc};
+use crate::crc::{
+    try_write_crc_file, CrcDelta, DomainMetadataState, FileStats, LazyCrc, SetTransactionState,
+};
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
@@ -904,16 +906,27 @@ impl Snapshot {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
-        // Fast path: serve from CRC if it tracks set transactions at this version.
+        // Fast path: serve from CRC if available at this version.
         if let Some(crc) = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())
         {
-            if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map
-                    .get(application_id)
-                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                    .map(|txn| txn.version));
+            match &crc.set_transaction_state {
+                SetTransactionState::Complete(map) => {
+                    // Complete is authoritative: a miss means the app_id has no transaction.
+                    return Ok(map
+                        .get(application_id)
+                        .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                        .map(|txn| txn.version));
+                }
+                SetTransactionState::Partial(map) => {
+                    // Hit is authoritative; miss falls through to log replay below.
+                    if let Some(txn) = map.get(application_id) {
+                        let version = (!is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                            .then_some(txn.version);
+                        return Ok(version);
+                    }
+                }
             }
         }
 

@@ -117,7 +117,7 @@ mod tests {
         assert!(dms["myApp.metadata"].configuration().contains("key"));
 
         // Verify set transactions
-        let txns = crc.set_transactions.as_ref().unwrap();
+        let txns = crc.set_transaction_state.expect_complete();
         assert_eq!(txns.len(), 2);
         assert_eq!(txns["spark-app-1"].version, 42);
         assert_eq!(txns["spark-app-1"].last_updated, Some(1694758250000));
