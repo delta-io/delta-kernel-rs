@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::STATS_MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -70,10 +71,10 @@ fn verify_column_names_in_stats(
     let stats = add_actions
         .iter()
         .filter_map(|a| a.stats.as_ref())
-        .find(|s| s.get("minValues").is_some());
+        .find(|s| s.get(STATS_MIN_VALUES).is_some());
 
     if let Some(stats) = stats {
-        let min_values = &stats["minValues"];
+        let min_values = &stats[STATS_MIN_VALUES];
         for logical_path in VERIFIED_PATHS {
             let col = ColumnName::new(logical_path.iter().copied());
             let expected =

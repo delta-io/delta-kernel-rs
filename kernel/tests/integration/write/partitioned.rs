@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use delta_kernel::actions::{STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -807,23 +808,23 @@ async fn test_materialized_partition_columns_excluded_from_stats(
 
     // Stats should contain the data column but NOT the partition column.
     assert!(
-        stats["minValues"].get("number").is_some(),
+        stats[STATS_MIN_VALUES].get("number").is_some(),
         "data column 'number' should have minValues"
     );
     assert!(
-        stats["maxValues"].get("number").is_some(),
+        stats[STATS_MAX_VALUES].get("number").is_some(),
         "data column 'number' should have maxValues"
     );
     assert!(
-        stats["minValues"].get(partition_col).is_none(),
+        stats[STATS_MIN_VALUES].get(partition_col).is_none(),
         "partition column should not have minValues even when materialized"
     );
     assert!(
-        stats["maxValues"].get(partition_col).is_none(),
+        stats[STATS_MAX_VALUES].get(partition_col).is_none(),
         "partition column should not have maxValues even when materialized"
     );
     assert!(
-        stats["nullCount"].get(partition_col).is_none(),
+        stats[STATS_NULL_COUNT].get(partition_col).is_none(),
         "partition column should not have nullCount even when materialized"
     );
 
