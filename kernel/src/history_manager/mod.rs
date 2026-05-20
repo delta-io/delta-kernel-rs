@@ -558,6 +558,10 @@ pub fn get_earliest_delta_file(
     log_root: &Url,
     earliest_ratified_commit_version: Option<u64>,
 ) -> DeltaResult<Version> {
+    // For a catalogManaged table, the only time no published commits exist is when v0 has not yet
+    // been published. Otherwise, since checkpoints must have a published delta file, and log clean
+    // up must always preserve a checkpoint, there must be published commits present on the
+    // file-system.
     if earliest_ratified_commit_version == Some(0) {
         return Ok(0);
     }
