@@ -5,8 +5,10 @@
 //! ```text
 //! engine                                                     kernel
 //! ------                                                     ------
-//! 1. fill OpaquePruningCallbacks { file_fn, partition_fn,
-//!                                  row_group_fn, engine_state }
+//! 1. fill OpaquePruningCallbacks { eval_against_stats,
+//!                                  eval_on_partition_values,
+//!                                  eval_on_row_group_stats,
+//!                                  engine_state, free_state }
 //! 2. create_opaque_pruning_context(callbacks) -> ctx handle
 //! 3. visit_predicate_opaque_with_pruning(name, children, ctx)
 //!         |
@@ -17,15 +19,16 @@
 //!         |
 //!         v
 //!    kernel pruning passes invoke the op's callback:
-//!      - partition prune:    eval_pred_scalar          -> partition_fn
-//!      - row-group skip:     eval_as_data_skipping_predicate -> row_group_fn
-//!      - file prune (arrow): ArrowNamedOpaquePredicateOp::eval_pred (per row of metadata batch)
-//!                              -> file_fn
+//!      - partition prune:  eval_pred_scalar -> eval_on_partition_values
+//!      - row-group skip:   eval_as_data_skipping_predicate -> eval_on_row_group_stats
+//!      - file prune:       ArrowOpaquePredicateOp::eval_pred (arrow-only;
+//!                          per row of metadata batch) -> eval_against_stats
 //!         |
 //!         v
 //!    each invocation hands the engine:
-//!      - ChildAccessor   (read-only view of the op's children)
-//!      - StatsAccessor / partition resolver (typed stats lookups)
+//!      - ChildAccessor    (read-only view of the op's children)
+//!      - StatsAccessor    (typed stats lookups; row-group + file passes)
+//!      - ScalarResolver   (typed scalar lookups; partition pass)
 //!      - OpaquePruneResult (write-only verdict slot)
 //!    engine fills the verdict; kernel maps Keep/Skip/Unknown to its
 //!    Option<bool> pruning decision.

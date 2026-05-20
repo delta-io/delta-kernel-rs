@@ -112,10 +112,13 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 /// Engine-side row-level evaluation is always required: kernel has no way to
 /// evaluate the op itself. For kernel-side pruning, if the engine has
 /// registered [`OpaquePruningCallbacks`] via [`create_opaque_pruning_context`],
-/// kernel invokes the appropriate callback for every pruning decision -- once
-/// per partition value set during partition pruning, once per Add action
-/// during stats-based file pruning, once per parquet row group during
-/// row-group skipping.
+/// kernel invokes the appropriate callback once per partition value set during
+/// partition pruning, and once per parquet row group during row-group skipping.
+/// Stats-based file pruning does NOT engage for this op directly -- kernel's
+/// indirect rewrite drops the opaque branch before file pruning runs. Engines
+/// that need file pruning should wrap the op via `ArrowNamedOpaquePredicateOp`
+/// (default-engine-base), which dispatches per-row callback invocations through
+/// the arrow batch evaluator.
 ///
 /// If no callbacks are registered, the op opts out of every pruning pass and
 /// the engine is responsible for filtering at row time.

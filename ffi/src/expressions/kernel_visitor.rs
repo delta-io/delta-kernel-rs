@@ -662,13 +662,10 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
     Some(resolved.into_iter().flatten().collect())
 }
 
-/// Build a `NamedOpaquePredicateOp` and hand it to `wrap` to produce the final
-/// `Predicate`. Centralizes the resolve-children + build-op steps so the three
-/// public builders (no callbacks, plain-pruning, arrow-pruning) differ only in
-/// the closure they pass.
-///
-/// Returns `Ok(0)` if any child id fails to resolve (mirrors the binary
-/// `visit_predicate_*` invariant).
+/// Resolve `child_ids`, build a `NamedOpaquePredicateOp`, and hand both to
+/// `wrap` to produce the final `Predicate`. Returns `Ok(0)` if any child id
+/// fails to resolve (matching the convention used by `visit_predicate_and`
+/// et al.).
 fn build_opaque_predicate<I, F>(
     state: &mut KernelExpressionVisitorState,
     name: String,
