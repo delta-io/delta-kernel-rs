@@ -602,6 +602,14 @@ impl Scan {
         self.state_info.physical_partition_schema.clone()
     }
 
+    /// Internal accessor for the scan's [`StateInfo`]. The scan SM data stage uses the
+    /// precomputed transform spec to drive its physical->logical projection instead of
+    /// re-deriving partition / row-id / row-index classification from the snapshot.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn state_info(&self) -> &StateInfo {
+        &self.state_info
+    }
+
     /// Partition schema for the scan SM's data stage projection.
     ///
     /// The data stage's `scan_data_projection` references

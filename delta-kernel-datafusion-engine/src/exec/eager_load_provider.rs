@@ -212,7 +212,11 @@ fn column_index_in_dfschema(
     dfschema.index_of_column_by_name(None, name).ok_or_else(|| {
         crate::error::plan_compilation(format!(
             "column `{name}` not in upstream Values schema ({:?})",
-            dfschema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+            dfschema
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
         ))
     })
 }

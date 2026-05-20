@@ -40,9 +40,7 @@ impl LoadTableProvider {
                 .as_ref()
                 .try_into_arrow()
                 .map_err(|e| {
-                    crate::error::plan_compilation(format!(
-                        "LoadTableProvider output schema: {e}"
-                    ))
+                    crate::error::plan_compilation(format!("LoadTableProvider output schema: {e}"))
                 })?,
         );
         Ok(Self {

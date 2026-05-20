@@ -135,9 +135,7 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
 #[tokio::test]
 async fn scan_with_row_index_and_utf8_column() {
     use delta_kernel::arrow::array::{Int64Array, RecordBatch as ArrowRecordBatch, StringArray};
-    use delta_kernel::arrow::datatypes::{
-        DataType as ArrowDataType, Field, Schema as ArrowSchema,
-    };
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::schema::{DataType, StructField, StructType};
 

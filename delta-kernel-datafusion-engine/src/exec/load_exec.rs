@@ -282,9 +282,7 @@ fn build_load_stream(
         .map_ok(|batch| {
             let n = batch.num_rows();
             let batch = Arc::new(batch);
-            futures::stream::iter(
-                (0..n).map(move |row| DfResult::Ok((Arc::clone(&batch), row))),
-            )
+            futures::stream::iter((0..n).map(move |row| DfResult::Ok((Arc::clone(&batch), row))))
         })
         .try_flatten();
 
@@ -332,9 +330,7 @@ fn build_load_stream(
     });
 
     // Concurrent flatten + limit slicing.
-    let flattened = per_file_streams
-        .buffer_unordered(concurrency)
-        .try_flatten();
+    let flattened = per_file_streams.buffer_unordered(concurrency).try_flatten();
     async_stream::try_stream! {
         let mut remaining = limit;
         let mut s = std::pin::pin!(flattened);

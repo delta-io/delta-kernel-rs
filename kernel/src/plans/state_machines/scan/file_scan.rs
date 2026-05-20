@@ -12,15 +12,17 @@ use super::action_pair::scan_file_row_pair;
 use super::dedup::scan_file_dedup_key;
 use super::plans::{execute_reconciliation, RECONCILED};
 use crate::delta_error;
-use crate::expressions::{col, BinaryExpressionOp, ColumnName, Expression, Transform};
+use crate::expressions::{col, ColumnName, Expression, Transform};
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns};
 use crate::plans::ir::{RelationRegistry, ResultPlan};
 use crate::plans::state_machines::framework::coroutine::context::Context;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
+use crate::scan::state_info::StateInfo;
+use crate::scan::transform_spec::{row_id_coalesce_expr, FieldTransformSpec};
 use crate::scan::Scan;
-use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField};
+use crate::schema::{DataType, MetadataColumnSpec, StructField};
 
 // === Scan-side stage names ================================================================
 //
@@ -45,11 +47,9 @@ impl Scan {
         with_data: bool,
     ) -> Result<ResultPlan, DeltaError> {
         let stats = self.physical_stats_schema();
-        // When the data stage runs, `scan_data_projection` references
-        // `fileConstantValues.partitionValues_parsed.<col>` for *every* partition column in the
-        // logical schema -- not just predicate-referenced ones. Use the full partition schema
-        // so projection lookups succeed; `physical_partition_schema()` is narrowed to predicate
-        // columns only and is only correct when no data stage runs.
+        // The data stage needs the full partition schema (see `data_stage_partition_schema`
+        // doc); the predicate-narrowed `physical_partition_schema()` only works for
+        // metadata-only execution.
         let parts = if with_data {
             self.data_stage_partition_schema()
         } else {
@@ -90,29 +90,16 @@ impl Scan {
         ctx: &mut Context<'_>,
         live_actions_name: &str,
     ) -> Result<ResultPlan, DeltaError> {
-        let snapshot = self.snapshot();
-        let partition_columns: HashSet<String> = snapshot
-            .table_configuration()
-            .partition_columns()
-            .iter()
-            .filter(|name| self.logical_schema().contains(name.as_str()))
-            .cloned()
-            .collect();
         let logical_schema = self.logical_schema().clone();
-        let logical_projection = scan_data_projection(
-            &logical_schema,
-            self.physical_schema(),
-            &partition_columns,
-            snapshot.table_configuration().column_mapping_mode(),
-        )?;
+        let logical_projection = scan_data_projection(self.state_info())?;
 
-        // Per-file parquet read keyed by the live-actions relation. Broadcasts the
-        // file-constant struct and the path through to the projected output.
+        // Per-file parquet read; broadcasts the file-constant struct and `path` to every
+        // output row of the read.
         ctx.relation_ref(live_actions_name)?.load(
             DATA_ROWS_RAW,
             self.physical_schema().clone(),
             FileType::Parquet,
-            Some(snapshot.table_root().clone()),
+            Some(self.snapshot().table_root().clone()),
             vec![
                 ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
                 ColumnName::new(["path"]),
@@ -125,9 +112,7 @@ impl Scan {
             Some(DvRef::skip(ColumnName::new(["deletionVector"]))),
             &mut *ctx,
         )?;
-        // Final projection: physical → logical. The terminal `into_result_plan` registers
-        // the projected output under `DATA` and drains the registry's accumulated plans
-        // into a `ResultPlan` whose terminal relation is `DATA`.
+        // Final projection: physical -> logical. Terminates at `DATA`.
         ctx.relation_ref(DATA_ROWS_RAW)?
             .project(logical_projection, logical_schema)
             .into_result_plan(DATA, &mut *ctx)
@@ -173,58 +158,91 @@ impl Scan {
     }
 }
 
-// === Data-phase projection helpers =======================================================
+// === Data-phase projection ===============================================================
 
+/// Build the per-logical-field projection list that converts raw Load output (physical schema +
+/// broadcast file-constant struct + parquet-synthesized metadata columns) into the scan's
+/// logical schema. Emits one expression per logical field, in order.
+///
+/// Classification is driven by [`StateInfo::transform_spec`] (the same source of truth as the
+/// visitor path's `get_transform_expr`) plus each field's [`MetadataColumnSpec`]:
+///
+/// - Partition columns ([`FieldTransformSpec::MetadataDerivedColumn`]) ->
+///   `fileConstantValues.partitionValues_parsed.<physical_name>`.
+/// - `RowId` (paired with [`FieldTransformSpec::GenerateRowId`]) -> `coalesce(materialized,
+///   baseRowId + row_index)` via [`row_id_coalesce_expr`], with `baseRowId` read from the
+///   file-constant struct (vs. a literal in the visitor path).
+/// - `RowIndex` -> `col([field.physical_name])`, the parquet-synthesized column under the user's
+///   chosen name (not the kernel default `_metadata.row_index`).
+/// - Regular fields -> `col([physical_name])`, except struct-typed fields which emit an identity
+///   [`Expression::Transform`] for engines to lower to struct-reshape against the projection's
+///   declared output schema.
+///
+/// Returns [`DeltaErrorCode::DeltaCommandInvariantViolation`] for shapes the SM data stage
+/// doesn't (yet) support: [`FieldTransformSpec::DynamicColumn`] (CDF-only),
+/// [`MetadataColumnSpec::FilePath`] (no DF synthesizer yet), and
+/// [`MetadataColumnSpec::RowCommitVersion`] (rejected at `StateInfo::try_new`).
 pub(super) fn scan_data_projection(
-    logical_schema: &SchemaRef,
-    physical_schema: &SchemaRef,
-    partition_columns: &HashSet<String>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    state_info: &StateInfo,
 ) -> Result<Vec<Arc<Expression>>, DeltaError> {
-    let row_index_name = StructField::default_row_index_column().name.clone();
-    let mut physical_fields = physical_schema.fields();
+    let logical_schema = &state_info.logical_schema;
+    let column_mapping_mode = state_info.column_mapping_mode;
+
+    // Index the spec once for O(1) per-field dispatch. Partition columns are keyed by
+    // `field_index`; the at-most-one `GenerateRowId` entry feeds the `RowId` arm.
+    // `StaticInsert` / `StaticDrop` don't affect the logical projection (the scan classifier
+    // emits neither today, and `StaticDrop` targets columns this projection doesn't read).
+    let mut partition_indices: HashSet<usize> = HashSet::new();
+    let mut row_id_spec: Option<&FieldTransformSpec> = None;
+    if let Some(spec) = state_info.transform_spec.as_deref() {
+        for entry in spec {
+            match entry {
+                FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => {
+                    partition_indices.insert(*field_index);
+                }
+                FieldTransformSpec::GenerateRowId { .. } => row_id_spec = Some(entry),
+                FieldTransformSpec::StaticInsert { .. } | FieldTransformSpec::StaticDrop { .. } => {
+                }
+                FieldTransformSpec::DynamicColumn { .. } => {
+                    return Err(delta_error!(
+                        DeltaErrorCode::DeltaCommandInvariantViolation,
+                        "fsr::scan_data_projection: DynamicColumn entries are emitted only \
+                         by the CDF classifier; the scan data stage does not run for CDF",
+                    ));
+                }
+            }
+        }
+    }
+
     logical_schema
         .fields()
-        .map(|field| {
+        .enumerate()
+        .map(|(field_index, field)| {
             let expr = match field.get_metadata_column_spec() {
-                Some(MetadataColumnSpec::RowIndex) => col([row_index_name.as_str()]),
-                Some(MetadataColumnSpec::RowCommitVersion) => {
-                    col([FILE_CONSTANT_VALUES_NAME, "defaultRowCommitVersion"])
+                Some(MetadataColumnSpec::RowIndex) => {
+                    // Metadata columns aren't subject to column mapping, so `physical_name`
+                    // returns the user-supplied field name -- the same name the parquet
+                    // reader stamps onto the synthesized column.
+                    col([field.physical_name(column_mapping_mode)])
                 }
-                Some(MetadataColumnSpec::RowId) => Expression::binary(
-                    BinaryExpressionOp::Plus,
-                    col([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
-                    col([row_index_name.as_str()]),
-                ),
-                Some(MetadataColumnSpec::FilePath) => col(["path"]),
-                None if partition_columns.contains(field.name()) => col([
+                Some(MetadataColumnSpec::RowId) => row_id_expr(field, row_id_spec)?,
+                Some(
+                    spec @ (MetadataColumnSpec::FilePath | MetadataColumnSpec::RowCommitVersion),
+                ) => return Err(unsupported_metadata_column(field, spec)),
+                None if partition_indices.contains(&field_index) => col([
                     FILE_CONSTANT_VALUES_NAME,
                     "partitionValues_parsed",
                     field.physical_name(column_mapping_mode),
                 ]),
                 None => {
-                    let physical_field = physical_fields.next().ok_or_else(|| {
-                        delta_error!(
-                            DeltaErrorCode::DeltaCommandInvariantViolation,
-                            "fsr::scan_data_projection: missing physical field for logical field `{}`",
-                            field.name(),
-                        )
-                    })?;
-                    // For struct-shaped logical fields, emit an identity `Transform` rooted at the
-                    // physical column. This is the kernel IR primitive for "give me this struct,
-                    // then reshape to the projection's declared output schema" -- it is exactly the
-                    // case `Expression::Transform(t) if t.is_identity()` that
-                    // `engine/arrow_expression::evaluate` already handles via `apply_schema`. Engines
-                    // that lower to other runtimes (e.g. DataFusion) translate this identity
-                    // transform into their native struct-construction primitive against the
-                    // projection's output schema. Non-struct fields keep the bare `col(...)` form
-                    // because their top-level rename is handled by the engine's per-field cast.
+                    // Struct fields wrap in identity `Transform` so engines reshape to the
+                    // declared output schema (logical names + nullability/order). Non-structs
+                    // are renamed by the engine's per-field cast.
+                    let physical_name = field.physical_name(column_mapping_mode);
                     if matches!(field.data_type(), DataType::Struct(_)) {
-                        Expression::Transform(Transform::new_nested([physical_field
-                            .name()
-                            .as_str()]))
+                        Expression::Transform(Transform::new_nested([physical_name]))
                     } else {
-                        col([physical_field.name().as_str()])
+                        col([physical_name])
                     }
                 }
             };
@@ -233,24 +251,60 @@ pub(super) fn scan_data_projection(
         .collect()
 }
 
+/// Build the `RowId` projection expression for `field`, matched against the spec's at-most-one
+/// [`FieldTransformSpec::GenerateRowId`] entry. `baseRowId` is read from the per-file
+/// file-constant struct (the SM pipeline doesn't know the value at projection-build time).
+fn row_id_expr(
+    field: &StructField,
+    row_id_spec: Option<&FieldTransformSpec>,
+) -> Result<Expression, DeltaError> {
+    let Some(FieldTransformSpec::GenerateRowId {
+        field_name,
+        row_index_field_name,
+    }) = row_id_spec
+    else {
+        return Err(delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            "fsr::scan_data_projection: RowId column `{}` has no GenerateRowId entry in \
+             the transform spec",
+            field.name(),
+        ));
+    };
+    Ok(row_id_coalesce_expr(
+        field_name,
+        row_index_field_name,
+        col([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
+    ))
+}
+
+/// Typed error for metadata-column specs the scan SM data stage doesn't (yet) support; see
+/// [`scan_data_projection`]'s doc for the full rationale.
+fn unsupported_metadata_column(field: &StructField, spec: MetadataColumnSpec) -> DeltaError {
+    delta_error!(
+        DeltaErrorCode::DeltaCommandInvariantViolation,
+        "fsr::scan_data_projection: metadata column `{}` ({:?}) is not supported in the \
+         scan data stage yet",
+        field.name(),
+        spec,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::*;
-    use crate::schema::StructType;
+    use crate::expressions::BinaryExpressionOp;
+    use crate::scan::state_info::tests::{
+        get_simple_state_info, get_state_info, ROW_TRACKING_FEATURES,
+    };
+    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
 
-    /// Helper: build a logical schema from `fields`, then derive the physical schema via
-    /// `make_physical(Name)`. Returns `(logical, physical)`.
-    fn schemas_with_cm_name(fields: Vec<StructField>) -> (SchemaRef, SchemaRef) {
-        use crate::table_features::ColumnMappingMode;
-        let logical = Arc::new(StructType::try_new(fields).unwrap());
-        let physical = Arc::new(logical.make_physical(ColumnMappingMode::Name).unwrap());
-        (logical, physical)
-    }
+    // === Helpers ==========================================================================
 
-    /// Helper: build a `StructField` annotated with the given physical name + a fresh column ID
-    /// suitable for `make_physical(Name)`.
+    /// Build a `StructField` annotated with the given physical name + column ID, suitable for
+    /// `column_mapping_mode = Name`.
     fn annotated_field(
         logical_name: &str,
         physical_name: &str,
@@ -258,7 +312,6 @@ mod tests {
         data_type: DataType,
         nullable: bool,
     ) -> StructField {
-        use crate::schema::{ColumnMetadataKey, MetadataValue};
         StructField::new(logical_name, data_type, nullable).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -271,8 +324,30 @@ mod tests {
         ])
     }
 
-    /// Verifies the per-shape projection emitted by `scan_data_projection` for non-metadata,
-    /// non-partition columns:
+    /// Metadata configuration that turns on column mapping mode `Name`.
+    fn cm_name_metadata() -> HashMap<String, String> {
+        HashMap::from([("delta.columnMapping.mode".to_string(), "name".to_string())])
+    }
+
+    /// Metadata configuration required by `StateInfo::try_new` to accept a `RowId` metadata
+    /// column, parameterised by the materialized row-id column name.
+    fn row_tracking_metadata(materialized_row_id_col: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("delta.enableRowTracking".to_string(), "true".to_string()),
+            (
+                "delta.rowTracking.materializedRowIdColumnName".to_string(),
+                materialized_row_id_col.to_string(),
+            ),
+            (
+                "delta.rowTracking.materializedRowCommitVersionColumnName".to_string(),
+                "some_row_commit_version_col".to_string(),
+            ),
+        ])
+    }
+
+    // === Tests ============================================================================
+
+    /// Verifies the per-shape projection emitted for non-metadata, non-partition columns:
     ///
     /// - Primitive / list / map fields: a single top-level `col([physical_root])` reference.
     /// - Struct fields: an identity [`Expression::Transform`] rooted at the physical column.
@@ -286,17 +361,15 @@ mod tests {
         #[case] data_type: DataType,
         #[case] expect_transform: bool,
     ) {
-        use crate::table_features::ColumnMappingMode;
-        let (logical, physical) = schemas_with_cm_name(vec![annotated_field(
-            "field", "col-phys", 1, data_type, true,
-        )]);
-        let exprs = scan_data_projection(
-            &logical,
-            &physical,
-            &HashSet::new(),
-            ColumnMappingMode::Name,
-        )
-        .unwrap();
+        let schema = Arc::new(
+            StructType::try_new(vec![annotated_field(
+                "field", "col-phys", 1, data_type, true,
+            )])
+            .unwrap(),
+        );
+        let state_info =
+            get_state_info(schema, vec![], None, &[], cm_name_metadata(), vec![]).unwrap();
+        let exprs = scan_data_projection(&state_info).unwrap();
         assert_eq!(exprs.len(), 1);
         if expect_transform {
             let expected = Expression::Transform(Transform::new_nested(["col-phys"]));
@@ -304,5 +377,137 @@ mod tests {
         } else {
             assert_eq!(exprs[0].as_ref(), &col(["col-phys"]));
         }
+    }
+
+    #[test]
+    fn scan_data_projection_partition_column() {
+        let schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("id", DataType::STRING),
+                StructField::nullable("date", DataType::DATE),
+            ])
+            .unwrap(),
+        );
+        let state_info = get_simple_state_info(schema, vec!["date".to_string()]).unwrap();
+        let exprs = scan_data_projection(&state_info).unwrap();
+        assert_eq!(exprs.len(), 2);
+        assert_eq!(exprs[0].as_ref(), &col(["id"]));
+        assert_eq!(
+            exprs[1].as_ref(),
+            &col([FILE_CONSTANT_VALUES_NAME, "partitionValues_parsed", "date"]),
+        );
+    }
+
+    #[test]
+    fn scan_data_projection_file_path_errors() {
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::STRING)]).unwrap(),
+        );
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            &[],
+            HashMap::new(),
+            vec![("my_path", MetadataColumnSpec::FilePath)],
+        )
+        .unwrap();
+        let err = scan_data_projection(&state_info)
+            .expect_err("FilePath metadata column should not be projected today");
+        assert_eq!(err.code, DeltaErrorCode::DeltaCommandInvariantViolation);
+        assert!(
+            err.message.contains("metadata column `my_path` (FilePath)"),
+            "unexpected error message: {}",
+            err.message,
+        );
+    }
+
+    /// Regression test: the previous implementation always emitted `col(["_metadata.row_index"])`
+    /// regardless of the metadata column's actual name.
+    #[test]
+    fn scan_data_projection_user_named_row_index() {
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::STRING)]).unwrap(),
+        );
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            &[],
+            HashMap::new(),
+            vec![("my_row_idx", MetadataColumnSpec::RowIndex)],
+        )
+        .unwrap();
+        let exprs = scan_data_projection(&state_info).unwrap();
+        assert_eq!(exprs.len(), 2);
+        assert_eq!(exprs[0].as_ref(), &col(["id"]));
+        assert_eq!(exprs[1].as_ref(), &col(["my_row_idx"]));
+    }
+
+    /// Regression test: the previous implementation emitted `baseRowId +
+    /// col("_metadata.row_index")` and ignored the materialized row-id column. Asserts the
+    /// `coalesce(materialized, baseRowId + row_index)` form, with the classifier-synthesized
+    /// row-index column name from the spec.
+    #[test]
+    fn scan_data_projection_row_id_synthesized_index() {
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::STRING)]).unwrap(),
+        );
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            row_tracking_metadata("some_row_id_col"),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        )
+        .unwrap();
+        let exprs = scan_data_projection(&state_info).unwrap();
+        assert_eq!(exprs.len(), 2);
+        assert_eq!(exprs[0].as_ref(), &col(["id"]));
+        let expected_row_id = Expression::coalesce([
+            col(["some_row_id_col"]),
+            Expression::binary(
+                BinaryExpressionOp::Plus,
+                col([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
+                col(["row_indexes_for_row_id_0"]),
+            ),
+        ]);
+        assert_eq!(exprs[1].as_ref(), &expected_row_id);
+    }
+
+    /// `RowId` reuses the user's `RowIndex` column when both are requested -- the
+    /// `GenerateRowId` spec carries the same `row_index_field_name`. Previously both branches
+    /// hardcoded the kernel default `_metadata.row_index`.
+    #[test]
+    fn scan_data_projection_row_id_with_explicit_index() {
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::STRING)]).unwrap(),
+        );
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            row_tracking_metadata("some_row_id_col"),
+            vec![
+                ("row_id", MetadataColumnSpec::RowId),
+                ("row_index", MetadataColumnSpec::RowIndex),
+            ],
+        )
+        .unwrap();
+        let exprs = scan_data_projection(&state_info).unwrap();
+        assert_eq!(exprs.len(), 3);
+        assert_eq!(exprs[0].as_ref(), &col(["id"]));
+        let expected_row_id = Expression::coalesce([
+            col(["some_row_id_col"]),
+            Expression::binary(
+                BinaryExpressionOp::Plus,
+                col([FILE_CONSTANT_VALUES_NAME, "baseRowId"]),
+                col(["row_index"]),
+            ),
+        ]);
+        assert_eq!(exprs[1].as_ref(), &expected_row_id);
+        assert_eq!(exprs[2].as_ref(), &col(["row_index"]));
     }
 }

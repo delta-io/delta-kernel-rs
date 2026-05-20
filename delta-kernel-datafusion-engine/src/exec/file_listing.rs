@@ -164,12 +164,17 @@ fn listing_stream(
             }
         })
     } else {
-        Box::pin(store.list(Some(&prefix)).chunks(BATCH_SIZE).map(move |chunk| {
-            let metas: Vec<ObjectMeta> = chunk
-                .into_iter()
-                .collect::<Result<_, _>>()
-                .map_err(crate::error::wrap_delta_err)?;
-            metas_to_batch(&metas, &schema, &base_url)
-        }))
+        Box::pin(
+            store
+                .list(Some(&prefix))
+                .chunks(BATCH_SIZE)
+                .map(move |chunk| {
+                    let metas: Vec<ObjectMeta> = chunk
+                        .into_iter()
+                        .collect::<Result<_, _>>()
+                        .map_err(crate::error::wrap_delta_err)?;
+                    metas_to_batch(&metas, &schema, &base_url)
+                }),
+        )
     }
 }

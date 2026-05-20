@@ -49,9 +49,9 @@ const ROW_NUMBER_COL: &str = "_row_number";
 /// Resolve a `LoadSink`'s `base_url`. Scan-emitted plans always set it; the runtime check
 /// only catches IR-level misuse.
 pub(crate) fn sink_base_url(sink: &LoadSink) -> Result<&Url, DataFusionError> {
-    sink.base_url.as_ref().ok_or_else(|| {
-        crate::error::plan_compilation("LoadSink.base_url must be set")
-    })
+    sink.base_url
+        .as_ref()
+        .ok_or_else(|| crate::error::plan_compilation("LoadSink.base_url must be set"))
 }
 
 /// Join `path_str` onto the sink's `base_url`.
@@ -209,11 +209,12 @@ pub(crate) async fn resolve_dv_async(
     base_url: Url,
     engine: Arc<dyn Engine>,
 ) -> Result<Arc<RoaringTreemap>, DataFusionError> {
-    let join = tokio::task::spawn_blocking(move || {
-        descriptor.read(engine.storage_handler(), &base_url)
-    })
-    .await
-    .map_err(|e| crate::error::internal_error(format!("DV resolve task join failed: {e}")))?;
+    let join =
+        tokio::task::spawn_blocking(move || descriptor.read(engine.storage_handler(), &base_url))
+            .await
+            .map_err(|e| {
+                crate::error::internal_error(format!("DV resolve task join failed: {e}"))
+            })?;
     let treemap =
         join.map_err(|e| crate::error::internal_error(format!("DV resolve failed: {e}")))?;
     Ok(Arc::new(treemap))
@@ -464,6 +465,7 @@ pub(crate) async fn build_per_file_plan(
             })
         })
         .collect::<DfResult<Vec<_>>>()?;
-    let projected: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(proj_exprs, filtered)?);
+    let projected: Arc<dyn ExecutionPlan> =
+        Arc::new(ProjectionExec::try_new(proj_exprs, filtered)?);
     Ok(projected)
 }

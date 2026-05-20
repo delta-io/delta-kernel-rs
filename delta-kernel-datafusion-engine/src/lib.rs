@@ -265,7 +265,10 @@ mod tests {
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 20, "limit must cap rows exactly; got {total_rows}");
+        assert_eq!(
+            total_rows, 20,
+            "limit must cap rows exactly; got {total_rows}"
+        );
         for b in &batches {
             assert!(b.num_rows() > 0, "no zero-row slices after limit");
         }
