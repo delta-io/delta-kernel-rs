@@ -325,32 +325,27 @@ fn build_load_stream(
 ) -> impl Stream<Item = DfResult<RecordBatch>> + Send + 'static {
     // Step 1: explode upstream batches into a flat `Stream<DfResult<(Arc<RecordBatch>, usize)>>`,
     // one item per row.
-    let row_stream = upstream.map_ok(|batch| {
-        let n = batch.num_rows();
-        let batch = Arc::new(batch);
-        futures::stream::iter((0..n).map(move |row| Ok((Arc::clone(&batch), row))))
-    });
-    let row_stream = row_stream
-        .try_flatten()
-        .map_err(|e: DataFusionError| e);
+    let row_stream = upstream
+        .map_ok(|batch| {
+            let n = batch.num_rows();
+            let batch = Arc::new(batch);
+            futures::stream::iter(
+                (0..n).map(move |row| DfResult::Ok((Arc::clone(&batch), row))),
+            )
+        })
+        .try_flatten();
 
-    // Step 2: per-row, build an open future returning the per-file RecordBatch stream.
-    let sink_for_map = Arc::clone(&sink);
-    let engine_for_map = Arc::clone(&engine);
-    let task_ctx_for_map = Arc::clone(&task_context);
-    let pt_for_map = Arc::clone(&projected_passthrough);
-    let no_dv_for_map = Arc::clone(&file_source_no_dv);
-    let with_dv_for_map = file_source_with_dv;
-    let output_schema_for_map = Arc::clone(&output_schema);
-
-    let per_file_streams = row_stream.map(move |row_result| {
-        let sink = Arc::clone(&sink_for_map);
-        let engine = Arc::clone(&engine_for_map);
-        let task_ctx = Arc::clone(&task_ctx_for_map);
-        let pt = Arc::clone(&pt_for_map);
-        let file_source_no_dv = Arc::clone(&no_dv_for_map);
-        let file_source_with_dv = with_dv_for_map.as_ref().map(Arc::clone);
-        let output_schema = Arc::clone(&output_schema_for_map);
+    // Step 2: per-row, build an open future returning the per-file RecordBatch stream. The
+    // outer closure owns each captured Arc; the inner `async move` body needs its own clone
+    // per row (one open future per upstream row).
+    let per_file_streams = row_stream.map(move |row_result: DfResult<_>| {
+        let sink = Arc::clone(&sink);
+        let engine = Arc::clone(&engine);
+        let task_ctx = Arc::clone(&task_context);
+        let pt = Arc::clone(&projected_passthrough);
+        let file_source_no_dv = Arc::clone(&file_source_no_dv);
+        let file_source_with_dv = file_source_with_dv.as_ref().map(Arc::clone);
+        let output_schema = Arc::clone(&output_schema);
 
         async move {
             let (batch, row) = row_result?;

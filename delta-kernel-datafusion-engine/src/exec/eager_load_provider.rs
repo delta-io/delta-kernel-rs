@@ -58,6 +58,7 @@ use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
 
 use crate::exec::load_helpers::{
     adapter_factory_for, build_file_source, into_partitioned_file, resolve_size_if_unknown,
+    sink_base_url,
 };
 
 /// Eager-dispatch [`TableProvider`] for [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load)
@@ -103,11 +104,7 @@ impl EagerLoadTableProvider {
             .map(|cn| column_index_in_dfschema(dfschema, cn))
             .collect::<Result<_, _>>()?;
 
-        let base_url = sink.base_url.as_ref().ok_or_else(|| {
-            crate::error::plan_compilation(
-                "LoadSink.base_url must be set: scan-emitted plans always populate it.",
-            )
-        })?;
+        let base_url = sink_base_url(sink)?;
 
         let mut partitioned_files: Vec<PartitionedFile> = Vec::with_capacity(values.values.len());
         let mut object_store_url: Option<ObjectStoreUrl> = None;
