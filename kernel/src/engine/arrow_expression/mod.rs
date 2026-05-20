@@ -19,6 +19,7 @@ use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
 mod apply_schema;
+pub(crate) use apply_schema::apply_schema_to_struct;
 pub mod evaluate_expression;
 pub mod opaque;
 

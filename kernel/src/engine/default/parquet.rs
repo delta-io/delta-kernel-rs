@@ -475,14 +475,13 @@ async fn open_parquet_file(
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.with_batch_size(batch_size).build()?;
 
-    let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
-            Some(&arrow_schema),
+            Some(&table_schema),
         )
         .map(Into::into)
     });
@@ -558,7 +557,6 @@ impl FileOpener for PresignedUrlOpener {
             let reader = builder.with_batch_size(batch_size).build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-            let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(
@@ -566,7 +564,7 @@ impl FileOpener for PresignedUrlOpener {
                     &requested_ordering,
                     row_indexes.as_mut(),
                     Some(&file_location),
-                    Some(&arrow_schema),
+                    Some(&table_schema),
                 )
                 .map(Into::into)
             });
@@ -598,7 +596,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
     use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::EngineData;
@@ -1314,8 +1312,6 @@ mod tests {
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     #[test]
     fn test_read_parquet_with_field_id_matching() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
-
         // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
         // The kernel will transform these to parquet.field.id when reading
         let fields = vec![
@@ -1384,6 +1380,12 @@ mod tests {
         // Verify data was correctly matched by field ID
         assert_eq!(data.len(), 1);
         let batch = &data[0];
+
+        // Verify columns were renamed to match the kernel schema (the names from the parquet
+        // file's schema are discarded; the matching agreed on field IDs only).
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).name(), "user_id");
+        assert_eq!(schema.field(1).name(), "user_name");
 
         let id_col = batch
             .column(0)
