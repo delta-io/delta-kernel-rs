@@ -1,5 +1,7 @@
 //! Some utilities for working with arrow data types
 
+pub(crate) mod apply_schema;
+
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -8,6 +10,7 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::debug;
 
+use self::apply_schema::apply_schema_to_struct;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray, OffsetSizeTrait,
@@ -22,7 +25,6 @@ use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_expression::apply_schema_to_struct;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};

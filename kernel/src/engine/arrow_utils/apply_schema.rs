@@ -8,7 +8,7 @@ use super::super::arrow_conversion::{
     kernel_flat_parquet_id_to_arrow_metadata, lookup_nested_field_id, parquet_field_id_metadata,
     LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
 };
-use super::super::arrow_utils::make_arrow_error;
+use super::make_arrow_error;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };

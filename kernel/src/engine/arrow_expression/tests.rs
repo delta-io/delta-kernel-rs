@@ -4,7 +4,6 @@ use rstest::rstest;
 use Expression as Expr;
 use Predicate as Pred;
 
-use super::apply_schema::apply_schema;
 use super::*;
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
@@ -20,6 +19,7 @@ use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
 };
+use crate::engine::arrow_utils::apply_schema::apply_schema;
 use crate::expressions::*;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
