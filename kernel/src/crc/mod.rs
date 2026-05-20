@@ -31,7 +31,7 @@ pub(crate) use delta::CrcDelta;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
-pub(crate) use file_stats::FileStatsDelta;
+pub(crate) use file_stats::{is_incremental_safe_operation, FileStatsDelta};
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
