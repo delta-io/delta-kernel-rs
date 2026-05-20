@@ -401,6 +401,8 @@ pub(crate) trait HasSelectionVector {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use rstest::rstest;
+
     use super::deduplicator::CheckpointDeduplicator;
     use super::*;
     use crate::engine_data::GetData;
@@ -497,7 +499,7 @@ mod tests {
         let empty_ref = &*EMPTY;
         vec![
             add_mock.unwrap_or(empty_ref),    // 0: add.path
-            empty_ref,                        // 1: (unused)
+            add_mock.unwrap_or(empty_ref),    // 1: add.size
             add_mock.unwrap_or(empty_ref),    // 2: add.dv.storageType
             add_mock.unwrap_or(empty_ref),    // 3: add.dv.pathOrInlineDv
             add_mock.unwrap_or(empty_ref),    // 4: add.dv.offset
@@ -508,26 +510,30 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn test_extract_file_action_add() -> DeltaResult<()> {
+    #[rstest]
+    #[case::valid_size(Some(100), 100)]
+    #[case::missing_size_defaults_to_zero(None, 0)]
+    #[case::negative_size_defaults_to_zero(Some(-1), 0)]
+    fn test_extract_file_action_add(
+        #[case] raw_size: Option<i64>,
+        #[case] expected_size: u64,
+    ) -> DeltaResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "file1.parquet");
-        mock_add.add_long(1, "add.size", 100);
+        if let Some(s) = raw_size {
+            mock_add.add_long(0, "add.size", s);
+        }
         let getters = create_getters_with_mocks(Some(&mock_add), None);
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
-        assert!(result.is_some());
-        let FileActionInfo {
-            key,
-            size: _size,
-            is_add,
-        } = result.unwrap();
+        let FileActionInfo { key, size, is_add } = result.unwrap();
         assert_eq!(key.path, "file1.parquet");
         assert!(key.dv_unique_id.is_none());
         assert!(is_add);
+        assert_eq!(size, expected_size);
 
         Ok(())
     }
