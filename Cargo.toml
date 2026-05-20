@@ -58,6 +58,13 @@ datafusion-pruning = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/p
 datafusion-session = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/session" }
 datafusion-sql = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/sql" }
 
+# datafusion-functions-json 0.53.1 was published against branch-53's API
+# (`ScalarUDFImpl::as_any`, `Cast.data_type`). Apache main (which our datafusion-fork now
+# tracks via PR apache/datafusion#22026) drops `as_any` from the trait (`Any` is a
+# supertrait) and renamed `Cast.data_type` to `Cast.field`. Local fork applies the
+# 2-line patch to keep `json_parse.rs` working.
+datafusion-functions-json = { path = "/home/oussama.saoudi/datafusion-functions-json-fork" }
+
 [workspace.package]
 edition = "2021"
 homepage = "https://delta.io"

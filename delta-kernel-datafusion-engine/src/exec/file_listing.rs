@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -86,10 +85,6 @@ impl ExecutionPlan for FileListingExec {
         "FileListingExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -100,6 +95,15 @@ impl ExecutionPlan for FileListingExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr,
+        ) -> DfResult<datafusion_common::tree_node::TreeNodeRecursion>,
+    ) -> DfResult<datafusion_common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

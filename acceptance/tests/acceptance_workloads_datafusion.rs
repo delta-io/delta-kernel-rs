@@ -72,6 +72,13 @@ const FIXED_IN_DATAFUSION: &[&str] = &[
     "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
     "tw_nested_field/specs/tw_nested_field_read_all",
     "tw_nested_field/specs/tw_nested_field_read_large_count",
+    // CDC schema evolution + column-mapping id-swap: the kernel default engine's
+    // apply_schema currently rejects these but the DataFusion field-id-aware
+    // PhysicalExprAdapter handles them end-to-end (id-keyed root rebinding +
+    // nested struct cast).
+    "cdc_schema_evolution/specs/cdc_schema_evolution_read_all",
+    "cdf_with_schema_evolution/specs/cdf_with_schema_evolution_read_all",
+    "cm_id_matching_swapped/specs/cm_id_matching_swapped_select_a_reads_e",
 ];
 
 /// Locate the expected-failure entry for `spec_path_str`, applying the

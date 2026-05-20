@@ -11,12 +11,11 @@
 //!    - inner [`RenameNestedFieldsByIdExpr`] -- a pure metadata rename via kernel's
 //!      [`apply_schema_to`] driven by a field-id-aware walk of the parquet field against the
 //!      logical field.
-//!    - outer [`CastColumnExpr`] -- drops parquet-only extras, fills missing-but-nullable targets
+//!    - outer [`CastExpr`] -- drops parquet-only extras, fills missing-but-nullable targets
 //!      with NULL, errors on missing-and-non-nullable, applies type-widening casts.
 //!
 //! [`apply_schema_to`]: delta_kernel::engine::arrow_expression::apply_schema::apply_schema_to
 
-use std::any::Any;
 use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -25,7 +24,7 @@ use datafusion_common::error::DataFusionError;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result as DfResult, ScalarValue};
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_expr::expressions::{self, CastColumnExpr, Column};
+use datafusion_physical_expr::expressions::{self, CastExpr, Column};
 use datafusion_physical_expr_adapter::{PhysicalExprAdapter, PhysicalExprAdapterFactory};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use delta_kernel::arrow::array::RecordBatch;
@@ -68,7 +67,7 @@ pub(crate) struct FieldIdPhysicalExprAdapter {
 impl PhysicalExprAdapter for FieldIdPhysicalExprAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> DfResult<Arc<dyn PhysicalExpr>> {
         expr.transform(|e| {
-            if let Some(column) = e.as_any().downcast_ref::<Column>() {
+            if let Some(column) = e.downcast_ref::<Column>() {
                 return Ok(Transformed::yes(self.rewrite_column(column)?));
             }
             Ok(Transformed::no(e))
@@ -89,10 +88,26 @@ impl FieldIdPhysicalExprAdapter {
         };
 
         // Virtual columns (parquet `RowNumber` etc.) are injected by the decoder via
-        // `ArrowReaderOptions::with_virtual_columns` and never appear in the on-disk schema.
-        // Pass through; the opener's `reassign_expr_columns` rebinds by name post-injection.
+        // `ArrowReaderOptions::with_virtual_columns`. The opener's simplifier evaluates
+        // against `physical_for_rewrite = physical_file_schema ++ virtuals`; this is the
+        // schema where the column will actually be looked up. Rebind to the column's
+        // position there: virtuals sit past the physical file columns, so its index is
+        // `physical_file_schema.fields().len()` (assuming a single virtual; if multiple,
+        // the position needs to be looked up in the schema). The original
+        // `column.index()` was computed against the LoadExec's projected `TableSchema`
+        // (file ++ partition ++ virtual), which doesn't match either logical_for_rewrite
+        // (file ++ virtual, no partition) or physical_for_rewrite (physical_file ++
+        // virtual). Schema evolution can also make the two diverge in length: an
+        // older file with fewer physical columns than the latest logical schema needs
+        // the virtual to land at the **physical** length, not the logical one.
         if is_virtual_column(logical_field) {
-            return Ok(Arc::new(column.clone()));
+            let physical_idx = self
+                .physical_file_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == column.name())
+                .unwrap_or_else(|| self.physical_file_schema.fields().len());
+            return Ok(Arc::new(Column::new(column.name(), physical_idx)));
         }
 
         let physical_idx =
@@ -129,7 +144,7 @@ impl FieldIdPhysicalExprAdapter {
         }
 
         // Types differ. Build a per-column rename chain:
-        //   Column -> RenameNestedFieldsByIdExpr (kernel) -> CastColumnExpr (datafusion)
+        //   Column -> RenameNestedFieldsByIdExpr (kernel) -> CastExpr (datafusion)
         // The renamed-physical field mirrors the parquet shape with logical names stamped
         // on matched children, so the outer cast's name-based matching just works.
         let renamed_physical_field =
@@ -149,9 +164,8 @@ impl FieldIdPhysicalExprAdapter {
             renamed_field: Arc::clone(&renamed_physical_field),
             rename_target: Arc::new(renamed_kernel_type),
         });
-        Ok(Arc::new(CastColumnExpr::new(
+        Ok(Arc::new(CastExpr::new_with_target_field(
             rename_expr,
-            renamed_physical_field,
             Arc::new(logical_field.clone()),
             None,
         )))
@@ -197,7 +211,7 @@ fn is_virtual_column(field: &Field) -> bool {
 
 /// [`PhysicalExpr`] that renames the inner column's nested children to match a precomputed
 /// kernel target type. The structural transform (drop extras, null-fill missing, type-widen)
-/// happens in the outer [`CastColumnExpr`] wrapping this expression.
+/// happens in the outer [`CastExpr`] wrapping this expression.
 #[derive(Debug, Clone)]
 pub(crate) struct RenameNestedFieldsByIdExpr {
     inner: Arc<dyn PhysicalExpr>,
@@ -236,10 +250,6 @@ impl fmt::Display for RenameNestedFieldsByIdExpr {
 }
 
 impl PhysicalExpr for RenameNestedFieldsByIdExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> DfResult<DataType> {
         Ok(self.renamed_field.data_type().clone())
     }
@@ -303,7 +313,7 @@ impl PhysicalExpr for RenameNestedFieldsByIdExpr {
 /// *nullability* of `logical` wherever a field-id (or name) match exists. Recurses into
 /// structs, lists, and map entries. The result mirrors parquet 1:1 so `apply_schema_to`
 /// can rename in lockstep without rebuilding arrays. Logical nullability is stamped on
-/// matched children to satisfy `CastColumnExpr::validate_struct_compatibility`. Parquet-only
+/// matched children to satisfy `CastExpr::validate_struct_compatibility`. Parquet-only
 /// children pass through unchanged; the outer cast drops them.
 fn build_renamed_physical_field(physical: &Field, logical: &Field) -> Field {
     let rename_child =
@@ -423,7 +433,7 @@ mod tests {
     }
 
     // Nested missing-nullable-field schema evolution. The logical struct has one more
-    // (nullable) inner field than the physical parquet does — the outer `CastColumnExpr`
+    // (nullable) inner field than the physical parquet does — the outer `CastExpr`
     // inserts a NULL column for the missing field. Production scenario; exercises the
     // rename + cast pipeline. Deep recursion (lists, maps, deeper structs) is exercised
     // end-to-end by the engine's integration tests.
@@ -489,16 +499,12 @@ mod tests {
         let physical = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let rewritten = rewrite_column(Arc::clone(&logical), Arc::clone(&physical), "a")?;
         // Should not have wrapped — physical and logical types already agree.
+        assert!(rewritten.downcast_ref::<CastExpr>().is_none());
         assert!(rewritten
-            .as_any()
-            .downcast_ref::<CastColumnExpr>()
-            .is_none());
-        assert!(rewritten
-            .as_any()
             .downcast_ref::<RenameNestedFieldsByIdExpr>()
             .is_none());
         // Should be a plain Column.
-        assert!(rewritten.as_any().downcast_ref::<Column>().is_some());
+        assert!(rewritten.downcast_ref::<Column>().is_some());
         Ok(())
     }
 
@@ -522,7 +528,6 @@ mod tests {
         )?;
         // Data types match — should be a Column pointing at the physical name.
         let col = rewritten
-            .as_any()
             .downcast_ref::<Column>()
             .expect("expected Column after adapter rewrite");
         assert_eq!(col.name(), "phys_rename");
@@ -542,7 +547,6 @@ mod tests {
         let physical = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let rewritten = rewrite_column(Arc::clone(&logical), Arc::clone(&physical), "b_missing")?;
         let literal = rewritten
-            .as_any()
             .downcast_ref::<datafusion_physical_expr::expressions::Literal>()
             .expect("expected NULL literal for missing nullable column");
         assert!(literal.value().is_null());

@@ -16,7 +16,6 @@
 //! handler's read schema and the broadcast set, and limit caps total streamed rows (no further
 //! files are opened once the budget is exhausted).
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -83,10 +82,6 @@ impl std::fmt::Debug for LoadTableProvider {
 
 #[async_trait]
 impl TableProvider for LoadTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         Arc::clone(&self.output_schema)
     }

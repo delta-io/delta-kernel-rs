@@ -2,7 +2,6 @@
 //! [`DeclarativePlanNode::FileListing`](delta_kernel::plans::ir::DeclarativePlanNode::FileListing)
 //! nodes, emitting one `(path, size, modification_time)` row per object under a URL prefix.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::catalog::{Session, TableProvider};
@@ -41,9 +40,6 @@ impl FileListingTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for FileListingTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> Arc<ArrowSchema> {
         Arc::clone(&self.schema)
     }

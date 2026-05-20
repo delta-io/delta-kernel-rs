@@ -86,10 +86,10 @@ fn generate_primitive_extract(
     };
 
     match target_type {
-        Some(data_type) => Ok(Expr::Cast(datafusion_expr::expr::Cast {
-            expr: Box::new(extracted),
+        Some(data_type) => Ok(Expr::Cast(datafusion_expr::expr::Cast::new(
+            Box::new(extracted),
             data_type,
-        })),
+        ))),
         None => Ok(extracted),
     }
 }

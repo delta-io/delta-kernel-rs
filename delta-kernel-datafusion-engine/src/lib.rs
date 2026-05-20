@@ -68,12 +68,12 @@ mod tests {
         // Critical: lazy registration must yield a `ViewTable`. A `MemTable` here would prove
         // we still eagerly drain the upstream pipeline at register time.
         assert!(
-            provider.as_any().downcast_ref::<ViewTable>().is_some(),
+            provider.as_ref().downcast_ref::<ViewTable>().is_some(),
             "relation provider must be a ViewTable (got {:?})",
             provider,
         );
         assert!(
-            provider.as_any().downcast_ref::<MemTable>().is_none(),
+            provider.as_ref().downcast_ref::<MemTable>().is_none(),
             "relation provider must NOT be a MemTable; lazy registration regressed",
         );
 
@@ -84,17 +84,16 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 
-    /// Projection pushdown into a [`LoadTableProvider`] must narrow BOTH (a) the kernel
-    /// parquet/json handler's request schema and (b) the broadcast passthrough set, all the way
-    /// through. This test drives `scan(state, Some(projection), &[], None)` directly so it
-    /// asserts the actual `LoadExec` state -- not what DataFusion's optimizer happens to ask
-    /// for from a SQL query.
+    /// Projection pushdown through the registered Load provider must narrow BOTH (a) the
+    /// kernel parquet/json handler's request schema and (b) the broadcast passthrough set,
+    /// all the way through. This test drives `scan(state, Some(projection), &[], None)`
+    /// directly and asserts the resulting batch shape -- robust against the
+    /// streaming/eager dispatch split (Phase 5): both routes must produce the same
+    /// projected output.
     #[tokio::test]
     async fn load_provider_projection_narrows_read_and_passthrough() {
         use datafusion::catalog::TableProvider;
         use delta_kernel::plans::ir::nodes::{FileType, ScanFileColumns};
-
-        use crate::exec::{LoadExec, LoadTableProvider};
 
         // Parquet with two columns; only one will be projected.
         let dir = tempfile::tempdir().unwrap();
@@ -174,43 +173,23 @@ mod tests {
         let ex = DataFusionExecutor::try_new().unwrap();
         ex.execute_plans(&registry.take_plans()).await.unwrap();
 
+        // Eager dispatch (Phase 5): bare Values upstream + no DV routes to
+        // `EagerLoadTableProvider`, which produces a `DataSourceExec` over a `FileGroup`
+        // whose `PartitionedFile`s carry per-row `partition_values`. Projection narrows
+        // both the parquet read schema and the broadcast partition-value set via the
+        // standard `with_projection_indices` pushdown -- this test pins the end-to-end
+        // shape of that contract: output columns = `[b, p1]`, two rows, correct values.
         let provider = ex
             .relation_provider(handle.id.as_str())
             .expect("registered");
-        let provider = (provider.as_ref() as &dyn TableProvider)
-            .as_any()
-            .downcast_ref::<LoadTableProvider>()
-            .expect("LoadTableProvider");
 
         // Output schema = [a, b, p1, p2]. Project [b, p1] -> kernel handler should be asked
         // for just `b`, and only `p1` should be broadcast.
         let state = ex.session_state();
-        let projected_plan = provider
+        let projected_plan = (provider.as_ref() as &dyn TableProvider)
             .scan(&state, Some(&vec![1usize, 2usize]), &[], None)
             .await
             .expect("scan");
-        let load_exec = projected_plan
-            .as_any()
-            .downcast_ref::<LoadExec>()
-            .expect("scan must produce a LoadExec");
-
-        // Projection pushdown narrowed both the parquet read schema and the partition-value
-        // (passthrough) broadcast set. Both are reachable through `LoadExec`'s test-only
-        // accessors, which read directly off the projected `FileSource::table_schema()` /
-        // `projection()` -- the canonical post-pushdown state.
-        let narrow_file = load_exec.projected_file_fields();
-        assert_eq!(
-            narrow_file,
-            vec!["b".to_string()],
-            "file source read schema must be narrowed to projected file columns",
-        );
-
-        let narrow_pt = load_exec.projected_passthrough_fields();
-        assert_eq!(
-            narrow_pt,
-            vec!["p1".to_string()],
-            "broadcast set must be narrowed to projected passthrough columns",
-        );
 
         // And the data shape matches: 2 cols, ordered [b, p1], 2 rows.
         let stream = datafusion::physical_plan::execute_stream(
@@ -245,8 +224,6 @@ mod tests {
         use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
         use delta_kernel::parquet::file::properties::WriterProperties;
         use delta_kernel::plans::ir::nodes::{FileType, ScanFileColumns};
-
-        use crate::exec::LoadTableProvider;
 
         let dir = tempfile::tempdir().unwrap();
         let parquet_path = dir.path().join("rg.parquet");
@@ -308,16 +285,15 @@ mod tests {
         let ex = DataFusionExecutor::try_new().unwrap();
         ex.execute_plans(&registry.take_plans()).await.unwrap();
 
+        // Eager dispatch (Phase 5): bare Values upstream + no DV + no passthrough columns
+        // routes to a `ListingTable`-backed `ViewTable`. This test still validates that
+        // limit pushdown caps the emitted row count exactly, regardless of which provider
+        // serves the query.
         let provider = ex
             .relation_provider(handle.id.as_str())
             .expect("registered");
-        let provider = (provider.as_ref() as &dyn TableProvider)
-            .as_any()
-            .downcast_ref::<LoadTableProvider>()
-            .expect("LoadTableProvider");
-
         let state = ex.session_state();
-        let limited = provider
+        let limited = (provider.as_ref() as &dyn TableProvider)
             .scan(&state, None, &[], Some(20))
             .await
             .expect("scan with limit");

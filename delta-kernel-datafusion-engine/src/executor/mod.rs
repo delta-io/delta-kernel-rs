@@ -26,6 +26,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion_common::error::DataFusionError;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_expr::LogicalPlan;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::arrow::datatypes::SchemaRef;
@@ -57,6 +58,7 @@ use crate::exec::LoadTableProvider;
 fn default_kernel_engine() -> Arc<dyn Engine> {
     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
 }
+
 
 fn resolve_schema_query_url(path: &str) -> Result<Url, EngineError> {
     Url::parse(path).or_else(|_| {
@@ -366,18 +368,61 @@ impl DataFusionExecutor {
         Ok(())
     }
 
-    /// Capture `(upstream_logical, sink, engine)` in a [`LoadTableProvider`] and register it
-    /// under the sink's output handle id. The provider streams file rows lazily on
-    /// [`TableProvider::scan`] via [`crate::exec::LoadExec`]; no I/O happens at registration.
+    /// Compile-time dispatch (Phase 5) for [`SinkType::Load`].
+    ///
+    /// When the upstream logical plan is a bare [`LogicalPlan::Values`] AND the sink has
+    /// no deletion vector, every file path + size + per-row passthrough scalar is known
+    /// at registration time. We short-circuit to a custom [`EagerLoadTableProvider`] that
+    /// holds a pre-built `Vec<PartitionedFile>` (each carrying its own
+    /// `partition_values`) and produces a single [`DataSourceExec`] from `scan()`. This
+    /// unlocks DataFusion's native parquet/json file scanning -- multi-partition
+    /// fan-out, projection / limit pushdown -- without any of the per-row plumbing in
+    /// [`crate::exec::LoadExec`].
+    ///
+    /// Passthrough columns ride through as
+    /// [`PartitionedFile::partition_values`](datafusion_datasource::PartitionedFile::partition_values)
+    /// -- the same per-file constant-broadcast mechanism the streaming path uses today.
+    ///
+    /// Anything else (non-Values upstream, DV present) falls through to the streaming
+    /// [`LoadTableProvider`].
+    ///
+    /// **Note** the bare-Values match is intentionally non-recursive: the kernel's typical
+    /// Load IR (`commit_load`, `sidecar_load`) emits a literal Values listing files; if a
+    /// future producer wraps Values in a Projection or Filter, we can extend this match
+    /// then.
     fn register_load_relation(
         &self,
         sink: &LoadSink,
         logical: datafusion_expr::LogicalPlan,
         ctx: &CompileContext,
     ) -> Result<(), DataFusionError> {
-        let provider =
-            LoadTableProvider::try_new(logical, Arc::new(sink.clone()), ctx.engine.clone())?;
-        let provider: Arc<dyn TableProvider> = Arc::new(provider);
+        let eager_eligible =
+            sink.dv_ref.is_none() && matches!(logical, LogicalPlan::Values(_));
+        let provider: Arc<dyn TableProvider> = if eager_eligible {
+            let LogicalPlan::Values(values) = &logical else {
+                unreachable!("eager_eligible guards this");
+            };
+            match crate::exec::EagerLoadTableProvider::try_new(sink, values) {
+                Ok(eager) => Arc::new(eager),
+                Err(_err) => {
+                    // Defensive: an eager build failure should never silently regress
+                    // behaviour relative to the streaming path. Fall through; the
+                    // streaming path errors with a more diagnostic message if it can't
+                    // handle the same input.
+                    Arc::new(LoadTableProvider::try_new(
+                        logical,
+                        Arc::new(sink.clone()),
+                        ctx.engine.clone(),
+                    )?)
+                }
+            }
+        } else {
+            Arc::new(LoadTableProvider::try_new(
+                logical,
+                Arc::new(sink.clone()),
+                ctx.engine.clone(),
+            )?)
+        };
         self.providers_lock()?
             .insert(sink.output_relation.id.clone(), provider);
         Ok(())

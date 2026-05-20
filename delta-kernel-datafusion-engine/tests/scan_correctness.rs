@@ -124,6 +124,69 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
     }
 }
 
+/// Repro for the latent parquet-rs bug where `with_supplied_schema` validation fails when
+/// the supplied schema includes virtual columns AND the table contains Utf8/Utf8View types
+/// (which trips `apply_file_schema_type_coercions` early-return guard).
+///
+/// The existing `multi_file_parquet_row_index_resets_each_file_by_value_range` doesn't hit
+/// this because all columns are Int64 → no Utf8 → coercion path skipped → no validation.
+/// Adding a Utf8 column should reproduce the "expected N struct fields got N+1" error if the
+/// bug exists in the scan.rs flow too (independent of LoadExec changes).
+#[tokio::test]
+async fn scan_with_row_index_and_utf8_column() {
+    use delta_kernel::arrow::array::{Int64Array, RecordBatch as ArrowRecordBatch, StringArray};
+    use delta_kernel::arrow::datatypes::{
+        DataType as ArrowDataType, Field, Schema as ArrowSchema,
+    };
+    use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+    use delta_kernel::schema::{DataType, StructField, StructType};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.parquet");
+    {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("x", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+        ]));
+        let batch = ArrowRecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values([10_i64, 20, 30])),
+                Arc::new(StringArray::from_iter_values(["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let kernel_schema = Arc::new(
+        StructType::try_new([
+            StructField::not_null("x", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+        ])
+        .unwrap(),
+    );
+    let with_row_index = Arc::new(
+        kernel_schema
+            .as_ref()
+            .add_metadata_column("rid", MetadataColumnSpec::RowIndex)
+            .unwrap(),
+    );
+
+    let plan = PlanBuilder::from_scan(ScanNode::new(
+        FileType::Parquet,
+        vec![file_meta(&path)],
+        with_row_index,
+    ));
+
+    let batches = scan_collect(plan).await.unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "must read all 3 rows from the file");
+}
+
 #[tokio::test]
 async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,32 +1,40 @@
 //! [`LoadExec`] -- the streaming physical plan that powers
 //! [`super::LoadTableProvider`].
 //!
-//! For each upstream metadata batch, [`build_load_stream`] walks rows one at a time, resolves
-//! a file URL + optional DV mask + per-row passthrough values, then opens the file via the
-//! same DataFusion parquet/json opener `ListingTable` uses. Each opener-produced batch is
-//! yielded immediately; no per-file accumulation.
+//! For each upstream metadata batch, [`build_load_stream`] runs an **unordered concurrent
+//! merger** over per-row open futures via [`futures::stream::buffer_unordered`]. Each open
+//! future async-resolves the optional deletion vector via
+//! [`crate::exec::load_helpers::resolve_dv_async`] (a [`tokio::task::spawn_blocking`] hop
+//! around kernel's sync `DeletionVectorDescriptor::read`), builds a per-file
+//! [`datafusion_physical_plan::ExecutionPlan`] stack via
+//! [`crate::exec::load_helpers::build_per_file_plan`], and runs `plan.execute(0, ctx)` to
+//! get a `BoxStream<RecordBatch>`.
+//!
+//! The outer flatten interleaves files freely (no upstream-row ordering across files);
+//! within each file, batches arrive in file-internal order from the parquet/json decoder.
 //!
 //! Column-mapping-aware decode reshape is handled by
-//! [`super::FieldIdPhysicalExprAdapterFactory`] wired into the opener's
-//! [`FileScanConfig::expr_adapter_factory`], so opener batches already match the
-//! kernel-declared logical file schema.
+//! [`super::FieldIdPhysicalExprAdapterFactory`] wired into the per-file
+//! [`datafusion_datasource::file_scan_config::FileScanConfig::expr_adapter_factory`], so
+//! opener batches already match the kernel-declared logical file schema.
 //!
-//! Passthrough columns ride through as `partition_values`; `projection` is pushed into the
+//! Deletion vectors apply via a `not_in_dv(_row_number)` [`datafusion_expr::ScalarUDF`]
+//! plugged into a [`datafusion_physical_plan::filter::FilterExec`] above the per-file
+//! [`datafusion_datasource::source::DataSourceExec`]. The parquet decoder injects
+//! `_row_number` (Int64 + `RowNumber` extension type) only when the file has a DV; the
+//! UDF closes over the kernel-resolved `Arc<roaring::RoaringTreemap>` of deleted row
+//! IDs. JSON+DV is rejected at construction.
+//!
+//! Passthrough columns ride through as `partition_values`. `projection` is pushed into the
 //! [`FileSource`]; `limit` caps emitted rows by slicing the final batch. Filter pushdown is
-//! left to upstream operators (see [`super::LoadTableProvider::supports_filters_pushdown`]).
+//! left to upstream operators (see
+//! [`super::LoadTableProvider::supports_filters_pushdown`]).
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use chrono::TimeZone;
 use datafusion_common::error::DataFusionError;
-use datafusion_common::{Result as DfResult, ScalarValue};
-use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::{ListingTableUrl, PartitionedFile, TableSchema};
-use datafusion_datasource_json::source::JsonSource;
-use datafusion_datasource_parquet::source::ParquetSource;
-use datafusion_execution::object_store::ObjectStoreUrl;
+use datafusion_common::Result as DfResult;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::EmissionType;
@@ -35,36 +43,33 @@ use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use delta_kernel::arrow::array::types::Int64Type;
-use delta_kernel::arrow::array::{Array, AsArray, RecordBatch};
-use delta_kernel::arrow::datatypes::{FieldRef, SchemaRef as ArrowSchemaRef};
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
 use delta_kernel::Engine;
-use futures::stream::{BoxStream, Stream};
-use futures::TryStreamExt;
-use url::Url;
+use futures::stream::{Stream, StreamExt, TryStreamExt};
 
-use crate::exec::field_id_adapter::FieldIdPhysicalExprAdapterFactory;
 use crate::exec::load_helpers::{
-    apply_optional_dv, extract_column_array, optional_selection_vector_for_row,
-    resolve_file_location,
+    build_file_source, build_per_file_plan, extract_row_inputs, resolve_dv_async, sink_base_url,
+    RowInputs,
 };
 
-/// Default opener batch size. DataFusion's parquet/json openers require a non-`None` batch size
-/// before `create_file_opener` is called. The session config's `batch_size` would be nicer but
-/// it's only available at `execute()` time and the source is built at construction time -- we
-/// pre-populate this default and let the per-execute path override if desired.
-const DEFAULT_OPENER_BATCH_SIZE: usize = 8192;
+/// Default per-partition file-open concurrency when `target_partitions` is zero.
+const DEFAULT_LOAD_CONCURRENCY: usize = 8;
 
-/// Custom physical plan for [`super::LoadTableProvider`] sinks: stream upstream metadata rows
-/// through the configured DataFusion [`FileOpener`] one file at a time, yielding each
-/// opener-produced batch as soon as it's ready (no per-batch / per-file buffering). See the
-/// module-level docs for opener selection + pushdown semantics.
+/// Upper bound on per-partition file-open concurrency. Caps tokio task pressure for very-wide
+/// scans; tunable later via a dedicated `load_concurrency` knob.
+const MAX_LOAD_CONCURRENCY: usize = 64;
+
+/// Custom physical plan for [`super::LoadTableProvider`] sinks: streams upstream metadata rows
+/// through per-file [`ExecutionPlan`] stacks under a [`futures::stream::buffer_unordered`]
+/// merger. See module-level docs.
 pub struct LoadExec {
     sink: Arc<LoadSink>,
-    /// Kernel engine kept only for deletion-vector resolution (kernel
-    /// [`selection_vector`](delta_kernel::scan::selection_vector)). File decoding goes through
-    /// the DataFusion opener; this engine is *not* consulted for parquet/json reads.
+    /// Kernel engine kept only for deletion-vector resolution
+    /// ([`delta_kernel::actions::deletion_vector::DeletionVectorDescriptor::read`]).
+    /// File decoding goes through DataFusion's parquet/json sources; this engine is *not*
+    /// consulted for parquet/json reads.
     engine: Arc<dyn Engine>,
     upstream: Arc<dyn ExecutionPlan>,
     /// Full pre-projection output schema (= file_schema fields ++ passthrough fields). Kept on
@@ -73,15 +78,23 @@ pub struct LoadExec {
     full_schema: ArrowSchemaRef,
     /// Original projection (kept verbatim for replay through `with_new_children`).
     projection: Option<Vec<usize>>,
-    /// Final output schema (projection applied to `full_schema`). What downstream operators see
-    /// via [`ExecutionPlan::schema`].
+    /// Final output schema (projection applied to `full_schema`). What downstream operators
+    /// see via [`ExecutionPlan::schema`].
     output_schema: ArrowSchemaRef,
     /// Optional row-count cap from `TableProvider::scan(limit)`. `None` = read to upstream end.
     limit: Option<usize>,
-    /// File source with [`TableSchema`] = file fields ++ passthrough fields, projection applied
-    /// once via [`FileScanConfigBuilder::with_projection_indices`]. Cloned per-execute into the
-    /// per-file [`FileScanConfig`].
-    file_source: Arc<dyn datafusion_datasource::file::FileSource>,
+    /// Pre-computed global indices into `sink.passthrough_columns`, in projected order
+    /// (Phase 4). Iterated once per upstream row in `extract_row_inputs` to materialize
+    /// only the kept passthrough columns. Wrapped in `Arc` so cheap clones travel into the
+    /// per-row open future without an extra allocation per row.
+    projected_passthrough: Arc<Vec<usize>>,
+    /// File source built without `_row_number` -- used for files with no DV. Cloned per-execute
+    /// into the per-file [`datafusion_datasource::file_scan_config::FileScanConfig`].
+    file_source_no_dv: Arc<dyn datafusion_datasource::file::FileSource>,
+    /// File source built **with** `_row_number` virtual column appended -- used for files
+    /// with a DV so the parquet decoder injects it for the not_in_dv UDF predicate. None when
+    /// the sink has no `dv_ref` (so we never construct the row-number variant).
+    file_source_with_dv: Option<Arc<dyn datafusion_datasource::file::FileSource>>,
     properties: Arc<PlanProperties>,
 }
 
@@ -94,25 +107,66 @@ impl LoadExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> DfResult<Self> {
+        // Reject JSON + DV at construction (Phase 2). JSON has no row-number virtual column;
+        // delta DVs only apply to parquet data files in practice.
+        if matches!(sink.file_type, FileType::Json) && sink.dv_ref.is_some() {
+            return Err(DataFusionError::Plan(
+                "LoadSink with FileType::Json and dv_ref set is not supported: deletion \
+                 vectors only apply to parquet data files (no _row_number virtual column \
+                 for JSON)."
+                    .to_string(),
+            ));
+        }
+
         let file_count = sink.file_schema.fields().len();
         let passthrough_count = sink.passthrough_columns.len();
         debug_assert_eq!(full_schema.fields().len(), file_count + passthrough_count);
-        let file_source = build_file_source(
+
+        // Build the no-DV file source (always needed: even when sink.dv_ref is set, individual
+        // rows may have a NULL DV column meaning "no DV for this file").
+        let file_source_no_dv = build_file_source(
             sink.file_type,
             &full_schema,
             file_count,
             projection.as_deref(),
+            /* include_row_number */ false,
         )?;
-        // The output schema is derived from the projected file source's table_schema, which
-        // carries the kernel-stamped per-field metadata end-to-end (set on the TableSchema in
-        // build_file_source, narrowed by `with_projection_indices`).
+        let file_source_with_dv = if sink.dv_ref.is_some() {
+            Some(build_file_source(
+                sink.file_type,
+                &full_schema,
+                file_count,
+                projection.as_deref(),
+                /* include_row_number */ true,
+            )?)
+        } else {
+            None
+        };
+
+        // Output schema: projection narrows full_schema (Phase 4 contract: file fields come
+        // first, then projected passthrough fields in order).
         let output_schema = match projection.as_ref() {
             Some(proj) => Arc::new(full_schema.project(proj)?),
             None => Arc::clone(&full_schema),
         };
+
+        // Pre-compute kept passthrough indices once (Phase 4). When projection is None, all
+        // passthrough columns are kept in their original order. When projection is set,
+        // filter to indices >= file_count and translate to passthrough-local indices.
+        let projected_passthrough: Vec<usize> = match projection.as_ref() {
+            Some(proj) => proj
+                .iter()
+                .copied()
+                .filter(|&i| i >= file_count)
+                .map(|i| i - file_count)
+                .collect(),
+            None => (0..passthrough_count).collect(),
+        };
+
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
-            // File openers are single-stream; emit on a single partition.
+            // Single output partition: the merger interleaves files within one stream.
+            // Multi-partition fan-out is a follow-up.
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             upstream.properties().boundedness,
@@ -125,66 +179,12 @@ impl LoadExec {
             projection,
             output_schema,
             limit,
-            file_source,
+            projected_passthrough: Arc::new(projected_passthrough),
+            file_source_no_dv,
+            file_source_with_dv,
             properties,
         })
     }
-}
-
-/// Build a [`FileSource`] for the load's file type whose [`TableSchema`] = file fields ++
-/// passthrough fields. Passthrough fields are registered as DataFusion *partition columns*
-/// so the opener broadcasts their per-file values from `PartitionedFile.partition_values`
-/// (parquet via `replace_columns_with_literals`, json via `ProjectionOpener`). Projection,
-/// when present, is pushed straight into the source via [`with_projection_indices`] -- which
-/// narrows both the parquet read schema and the partition column materialization.
-fn build_file_source(
-    file_type: FileType,
-    full_schema: &ArrowSchemaRef,
-    file_field_count: usize,
-    projection: Option<&[usize]>,
-) -> DfResult<Arc<dyn datafusion_datasource::file::FileSource>> {
-    let (file_fields, passthrough_fields) = full_schema.fields().split_at(file_field_count);
-    let file_arrow_schema: ArrowSchemaRef = Arc::new(
-        datafusion_common::arrow::datatypes::Schema::new(file_fields.to_vec())
-            .with_metadata(full_schema.metadata().clone()),
-    );
-    // Strip per-field metadata from passthrough fields before handing them to `TableSchema`.
-    // DataFusion's partition-col broadcast (`replace_columns_with_literals` / `ProjectionOpener`)
-    // synthesizes the output array's `data_type` from the upstream-extracted `ScalarValue`, which
-    // never carries the kernel's `delta.columnMapping.*` / `PARQUET:field_id` per-field metadata.
-    // Declaring the partition cols with metadata would make the opener's projection output
-    // schema disagree with the broadcast array (which DataFusion compares structurally,
-    // including nested field metadata), and the opener would fail before producing a batch.
-    // The kernel-declared metadata is reapplied per-batch in `assemble_output` via
-    // [`stamp_batch_metadata`].
-    let stripped_passthrough_fields: Vec<FieldRef> = passthrough_fields
-        .iter()
-        .map(|f| Arc::new(strip_field_metadata_recursive(f.as_ref())))
-        .collect();
-    let table_schema = TableSchema::new(file_arrow_schema, stripped_passthrough_fields);
-    let source: Arc<dyn datafusion_datasource::file::FileSource> = match file_type {
-        FileType::Parquet => Arc::new(ParquetSource::new(table_schema)),
-        FileType::Json => {
-            // NDJSON; matches the kernel default for delta JSON sidecars/logs.
-            Arc::new(JsonSource::new(table_schema))
-        }
-    };
-    let source = source.with_batch_size(DEFAULT_OPENER_BATCH_SIZE);
-    // Push projection into the source. `with_projection_indices` calls
-    // `FileSource::try_pushdown_projection` which (for both parquet and json) narrows the
-    // read + adjusts the partition-column materialization to match.
-    let Some(proj) = projection else {
-        return Ok(source);
-    };
-    let projected_config = FileScanConfigBuilder::new(
-        // Placeholder URL; `with_projection_indices` only mutates the file_source, not the
-        // object_store_url -- we'll set the real URL per file in `start_open_row`.
-        ObjectStoreUrl::local_filesystem(),
-        source,
-    )
-    .with_projection_indices(Some(proj.to_vec()))?
-    .build();
-    Ok(Arc::clone(projected_config.file_source()))
 }
 
 impl fmt::Debug for LoadExec {
@@ -219,10 +219,6 @@ impl ExecutionPlan for LoadExec {
         "LoadExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         Arc::clone(&self.output_schema)
     }
@@ -233,6 +229,15 @@ impl ExecutionPlan for LoadExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.upstream]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr,
+        ) -> DfResult<datafusion_common::tree_node::TreeNodeRecursion>,
+    ) -> DfResult<datafusion_common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -266,19 +271,31 @@ impl ExecutionPlan for LoadExec {
             )));
         }
         // Coalesce the upstream's possibly-many partitions into a single stream so the row
-        // walker sees one batch at a time. `execute_stream` does exactly this.
+        // expander sees one batch at a time. `execute_stream` does exactly this.
         let upstream = datafusion::physical_plan::execute_stream(
             Arc::clone(&self.upstream),
             Arc::clone(&context),
         )?;
+        let concurrency = context
+            .session_config()
+            .target_partitions()
+            .clamp(1, MAX_LOAD_CONCURRENCY);
+        let concurrency = if concurrency == 0 {
+            DEFAULT_LOAD_CONCURRENCY
+        } else {
+            concurrency
+        };
         let stream = build_load_stream(
             upstream,
             Arc::clone(&self.sink),
             Arc::clone(&self.engine),
-            Arc::clone(&self.file_source),
+            Arc::clone(&self.file_source_no_dv),
+            self.file_source_with_dv.as_ref().map(Arc::clone),
+            Arc::clone(&self.projected_passthrough),
             Arc::clone(&self.output_schema),
             context,
             self.limit,
+            concurrency,
         );
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.output_schema),
@@ -287,280 +304,129 @@ impl ExecutionPlan for LoadExec {
     }
 }
 
-#[cfg(test)]
-impl LoadExec {
-    /// File-schema fields actually retained after projection pushdown -- the subset of
-    /// `sink.file_schema` referenced by `self.projection`, in original order. Exposed for
-    /// tests asserting pushdown shrunk the read request.
-    pub(crate) fn projected_file_fields(&self) -> Vec<String> {
-        let file_count = self.sink.file_schema.fields().len();
-        let names: Vec<String> = self
-            .sink
-            .file_schema
-            .fields()
-            .map(|f| f.name().clone())
-            .collect();
-        self.project_names(&names, |i| i < file_count, |i| i)
-    }
-
-    /// Passthrough fields actually broadcast after projection pushdown -- the subset of
-    /// `sink.passthrough_columns` referenced by `self.projection`, in original order. Exposed
-    /// for tests.
-    pub(crate) fn projected_passthrough_fields(&self) -> Vec<String> {
-        let file_count = self.sink.file_schema.fields().len();
-        let names: Vec<String> = self
-            .sink
-            .passthrough_columns
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
-        self.project_names(&names, |i| i >= file_count, |i| i - file_count)
-    }
-
-    /// Shared logic for the two `projected_*_fields` helpers: when `self.projection` is set,
-    /// keep indices passing `keep` and map them through `to_local` before indexing `names`;
-    /// when absent, return `names` verbatim.
-    fn project_names(
-        &self,
-        names: &[String],
-        keep: impl Fn(usize) -> bool,
-        to_local: impl Fn(usize) -> usize,
-    ) -> Vec<String> {
-        match &self.projection {
-            Some(proj) => proj
-                .iter()
-                .copied()
-                .filter(|&i| keep(i))
-                .map(|i| names[to_local(i)].clone())
-                .collect(),
-            None => names.to_vec(),
-        }
-    }
-}
-
-/// An opened file's running batch stream + DV mask, returned by [`open_file_for_row`].
-struct ActiveFile {
-    mask: Option<Vec<bool>>,
-    stream: BoxStream<'static, DfResult<RecordBatch>>,
-}
-
-/// Walk upstream rows, open one file per row, yield each opener batch (DV-masked +
-/// metadata-restamped). Cap total emitted rows at `limit` if set.
+/// Stream upstream metadata rows through the unordered concurrent merger. Each row produces
+/// a per-file `BoxStream<RecordBatch>` (built lazily inside an open future); up to
+/// `concurrency` open futures run at once via `buffer_unordered`. The outer `try_flatten`
+/// interleaves files freely; intra-file batch order is preserved by sequential drain.
+///
+/// `limit` is enforced at the flattened output by slicing + early-terminating.
+#[allow(clippy::too_many_arguments)]
 fn build_load_stream(
-    mut upstream: SendableRecordBatchStream,
+    upstream: SendableRecordBatchStream,
     sink: Arc<LoadSink>,
     engine: Arc<dyn Engine>,
-    file_source: Arc<dyn datafusion_datasource::file::FileSource>,
+    file_source_no_dv: Arc<dyn datafusion_datasource::file::FileSource>,
+    file_source_with_dv: Option<Arc<dyn datafusion_datasource::file::FileSource>>,
+    projected_passthrough: Arc<Vec<usize>>,
     output_schema: ArrowSchemaRef,
     task_context: Arc<TaskContext>,
     limit: Option<usize>,
-) -> impl Stream<Item = DfResult<RecordBatch>> {
+    concurrency: usize,
+) -> impl Stream<Item = DfResult<RecordBatch>> + Send + 'static {
+    // Step 1: explode upstream batches into a flat `Stream<DfResult<(Arc<RecordBatch>, usize)>>`,
+    // one item per row.
+    let row_stream = upstream.map_ok(|batch| {
+        let n = batch.num_rows();
+        let batch = Arc::new(batch);
+        futures::stream::iter((0..n).map(move |row| Ok((Arc::clone(&batch), row))))
+    });
+    let row_stream = row_stream
+        .try_flatten()
+        .map_err(|e: DataFusionError| e);
+
+    // Step 2: per-row, build an open future returning the per-file RecordBatch stream.
+    let sink_for_map = Arc::clone(&sink);
+    let engine_for_map = Arc::clone(&engine);
+    let task_ctx_for_map = Arc::clone(&task_context);
+    let pt_for_map = Arc::clone(&projected_passthrough);
+    let no_dv_for_map = Arc::clone(&file_source_no_dv);
+    let with_dv_for_map = file_source_with_dv;
+    let output_schema_for_map = Arc::clone(&output_schema);
+
+    let per_file_streams = row_stream.map(move |row_result| {
+        let sink = Arc::clone(&sink_for_map);
+        let engine = Arc::clone(&engine_for_map);
+        let task_ctx = Arc::clone(&task_ctx_for_map);
+        let pt = Arc::clone(&pt_for_map);
+        let file_source_no_dv = Arc::clone(&no_dv_for_map);
+        let file_source_with_dv = with_dv_for_map.as_ref().map(Arc::clone);
+        let output_schema = Arc::clone(&output_schema_for_map);
+
+        async move {
+            let (batch, row) = row_result?;
+            let inputs: RowInputs = extract_row_inputs(&batch, row, &sink, &pt)?;
+
+            // Async-resolve DV when present.
+            let dv = match inputs.dv_descriptor.clone() {
+                Some(desc) => {
+                    let base = sink_base_url(&sink)?.clone();
+                    Some(resolve_dv_async(desc, base, Arc::clone(&engine)).await?)
+                }
+                None => None,
+            };
+
+            // Pick the appropriate file_source: with `_row_number` when this file has a DV,
+            // without otherwise. We require a configured with-DV source if any row has a DV
+            // (`sink.dv_ref` is set) AND that row's DV column is non-null.
+            let file_source = match (dv.is_some(), file_source_with_dv) {
+                (true, Some(src)) => src,
+                (true, None) => {
+                    return Err(crate::error::internal_error(
+                        "LoadExec: row has DV but file_source_with_dv was not constructed \
+                         (sink.dv_ref must be set at construction time for any DV-bearing \
+                         upstream)",
+                    ));
+                }
+                (false, _) => file_source_no_dv,
+            };
+
+            let plan = build_per_file_plan(
+                inputs,
+                dv,
+                file_source,
+                sink.file_type,
+                &output_schema,
+                task_ctx.as_ref(),
+            )
+            .await?;
+            let stream = plan.execute(0, task_ctx)?;
+            Ok::<_, DataFusionError>(stream)
+        }
+    });
+
+    // Step 3: run up to `concurrency` opens at once; flatten per-file streams into one outer
+    // stream. Order across files is arbitrary; intra-file order is preserved.
+    let flattened = per_file_streams
+        .buffer_unordered(concurrency)
+        .try_flatten();
+
+    // Step 4: limit by slicing + early termination.
+    apply_limit(flattened, limit)
+}
+
+/// Apply an optional row-count cap to a stream of [`RecordBatch`]es. Slices the final batch
+/// when it would overshoot, and stops pulling once the budget is exhausted.
+fn apply_limit<S>(stream: S, limit: Option<usize>) -> impl Stream<Item = DfResult<RecordBatch>>
+where
+    S: Stream<Item = DfResult<RecordBatch>> + Send + 'static,
+{
     async_stream::try_stream! {
-        let mut remaining: Option<usize> = limit;
-        while let Some(batch) = upstream.try_next().await? {
-            let batch: RecordBatch = batch;
-            for row in 0..batch.num_rows() {
-                if matches!(remaining, Some(0)) {
-                    return;
+        let mut remaining = limit;
+        let mut s = std::pin::pin!(stream);
+        while let Some(batch) = s.try_next().await? {
+            let mut out = batch;
+            if let Some(rem) = remaining.as_mut() {
+                if out.num_rows() > *rem {
+                    out = out.slice(0, *rem);
                 }
-                let mut active = open_file_for_row(
-                    &batch,
-                    row,
-                    sink.as_ref(),
-                    engine.as_ref(),
-                    &file_source,
-                    &task_context,
-                )
-                .await?;
-                let mut file_row_cursor = 0usize;
-                while let Some(rb) = active.stream.try_next().await? {
-                    let mut out = assemble_output(
-                        rb,
-                        active.mask.as_deref(),
-                        &mut file_row_cursor,
-                        &output_schema,
-                    )?;
-                    if let Some(rem) = remaining.as_mut() {
-                        if out.num_rows() > *rem {
-                            out = out.slice(0, *rem);
-                        }
-                        *rem -= out.num_rows();
-                    }
-                    if out.num_rows() == 0 {
-                        continue;
-                    }
-                    yield out;
-                    if matches!(remaining, Some(0)) {
-                        return;
-                    }
-                }
+                *rem -= out.num_rows();
+            }
+            if out.num_rows() > 0 {
+                yield out;
+            }
+            if matches!(remaining, Some(0)) {
+                return;
             }
         }
     }
-}
-
-/// Resolve one upstream row into an [`ActiveFile`]: parse file URL + size, resolve an optional
-/// DV mask via kernel, extract per-row [`ScalarValue`]s for every passthrough column (stamped
-/// onto [`PartitionedFile::partition_values`] for the opener to broadcast), then construct the
-/// DataFusion file opener (with [`FieldIdPhysicalExprAdapterFactory`] for parquet) and await
-/// its file-open future to get back the running batch stream.
-async fn open_file_for_row(
-    batch: &RecordBatch,
-    row: usize,
-    sink: &LoadSink,
-    engine: &dyn Engine,
-    file_source: &Arc<dyn datafusion_datasource::file::FileSource>,
-    task_context: &Arc<TaskContext>,
-) -> DfResult<ActiveFile> {
-    let path_cn = &sink.file_meta.path;
-    let path_arr = extract_column_array(batch, path_cn)?;
-    if path_arr.is_null(row) {
-        return Err(crate::error::plan_compilation(format!(
-            "Load sink path column `{path_cn}` was NULL at upstream row {row}"
-        )));
-    }
-    // Path columns are always Utf8 per kernel's scan_live_actions_schema (STRING).
-    let path_raw = path_arr.as_string::<i32>().value(row);
-    let url = resolve_file_location(sink, path_raw)?;
-
-    let mask = optional_selection_vector_for_row(batch, sink, row, engine)?;
-    let size = file_size_for_row(batch, sink, row, &url)?;
-
-    // Per-row partition_values: one `ScalarValue` per passthrough field declared on
-    // `file_source.table_schema().table_partition_cols()`. The opener's
-    // `replace_columns_with_literals` (parquet) / `ProjectionOpener` (json) sees these as
-    // file-constant literal columns and broadcasts them to every emitted batch. No bespoke
-    // per-batch `take` broadcast on our side.
-    let partition_values = extract_partition_values(batch, row, sink)?;
-
-    let (object_store_url, mut partitioned_file) = into_partitioned_file(&url, size)?;
-    partitioned_file.partition_values = partition_values;
-    let object_store = task_context.runtime_env().object_store(&object_store_url)?;
-
-    // `create_file_opener` only consults `object_store`, `expr_adapter_factory`, `limit`,
-    // `preserve_order` -- not the file groups -- so leaving them empty is fine; we feed the
-    // actual file directly into `opener.open(...)`.
-    let base_config = FileScanConfigBuilder::new(object_store_url, Arc::clone(file_source))
-        .with_expr_adapter(adapter_factory_for(sink.file_type))
-        .build();
-    let opener = file_source.create_file_opener(object_store, &base_config, 0)?;
-    let stream = opener.open(partitioned_file)?.await?;
-    Ok(ActiveFile { mask, stream })
-}
-
-/// Pre-extract one [`ScalarValue`] per passthrough column declared on the file source's
-/// `table_partition_cols`. Indices line up positionally with the source's partition col
-/// declarations because both came from `sink.passthrough_columns` in original order.
-fn extract_partition_values(
-    batch: &RecordBatch,
-    row: usize,
-    sink: &LoadSink,
-) -> DfResult<Vec<ScalarValue>> {
-    sink.passthrough_columns
-        .iter()
-        .map(|cn| {
-            let arr = extract_column_array(batch, cn)?;
-            ScalarValue::try_from_array(arr.as_ref(), row)
-        })
-        .collect()
-}
-
-/// Take one opener batch, apply DV mask if present, then re-stamp the kernel-declared schema
-/// metadata onto the result. The opener already broadcast partition values into the batch and
-/// ran logical-name reshape via [`FieldIdPhysicalExprAdapterFactory`], so nothing else needs to
-/// be assembled here.
-fn assemble_output(
-    rb: RecordBatch,
-    mask: Option<&[bool]>,
-    file_row_cursor: &mut usize,
-    output_schema: &ArrowSchemaRef,
-) -> DfResult<RecordBatch> {
-    let pre_dv_rows = rb.num_rows();
-    let cursor = *file_row_cursor;
-    *file_row_cursor += pre_dv_rows;
-    let masked = apply_optional_dv(rb, mask, cursor)?;
-    crate::exec::stamp_batch_metadata(&masked, output_schema)
-}
-
-/// Recursively strip per-field metadata from `field` so the resulting field's `data_type`
-/// matches structurally what DataFusion's partition-col broadcast (literal-substituted via
-/// `ScalarValue`) produces at runtime. Used only for declaring `TableSchema.table_partition_cols`;
-/// the kernel's metadata is reapplied per-batch in `assemble_output` via [`stamp_batch_metadata`].
-fn strip_field_metadata_recursive(
-    field: &delta_kernel::arrow::datatypes::Field,
-) -> delta_kernel::arrow::datatypes::Field {
-    use delta_kernel::arrow::datatypes::{DataType, Field, Fields};
-    let strip_inner = |f: &Arc<Field>| Arc::new(strip_field_metadata_recursive(f.as_ref()));
-    let stripped_dt = match field.data_type() {
-        DataType::Struct(fs) => DataType::Struct(Fields::from_iter(fs.iter().map(strip_inner))),
-        DataType::List(inner) => DataType::List(strip_inner(inner)),
-        DataType::LargeList(inner) => DataType::LargeList(strip_inner(inner)),
-        DataType::FixedSizeList(inner, n) => DataType::FixedSizeList(strip_inner(inner), *n),
-        DataType::Map(entry, sorted) => DataType::Map(strip_inner(entry), *sorted),
-        other => other.clone(),
-    };
-    Field::new(field.name(), stripped_dt, field.is_nullable())
-}
-
-/// Select the
-/// [`PhysicalExprAdapterFactory`](datafusion_physical_expr_adapter::PhysicalExprAdapterFactory) for
-/// a given file type. Parquet decoding goes through field-id/column-mapping aware adaptation; JSON
-/// keeps DataFusion's default name-based adapter (we don't ship column-mapped JSON loads today).
-fn adapter_factory_for(
-    file_type: FileType,
-) -> Option<Arc<dyn datafusion_physical_expr_adapter::PhysicalExprAdapterFactory>> {
-    match file_type {
-        FileType::Parquet => Some(Arc::new(FieldIdPhysicalExprAdapterFactory)),
-        FileType::Json => None,
-    }
-}
-
-/// Translate `url` + `size` into a DataFusion [`ObjectStoreUrl`] + [`PartitionedFile`] pair.
-/// The ObjectStoreUrl carries the scheme + authority (e.g. `s3://bucket/` or `file://`); the
-/// PartitionedFile's `object_meta.location` is the path within that store (matches what
-/// `ListingTableUrl::parse(url).prefix()` produces).
-fn into_partitioned_file(
-    url: &Url,
-    size: i64,
-) -> Result<(ObjectStoreUrl, PartitionedFile), DataFusionError> {
-    let listing = ListingTableUrl::parse(url.as_str())?;
-    let object_store_url = listing.object_store();
-    let store_path = listing.prefix().clone();
-    let object_meta = delta_kernel::object_store::ObjectMeta {
-        location: store_path,
-        last_modified: chrono::Utc.timestamp_nanos(0),
-        size: u64::try_from(size.max(0)).unwrap_or(0),
-        e_tag: None,
-        version: None,
-    };
-    Ok((
-        object_store_url,
-        PartitionedFile::new_from_meta(object_meta),
-    ))
-}
-
-fn file_size_for_row(
-    batch: &RecordBatch,
-    sink: &LoadSink,
-    row: usize,
-    url: &Url,
-) -> Result<i64, DataFusionError> {
-    if let Some(sz_cn) = sink.file_meta.size.as_ref() {
-        // Size columns are always Int64 per kernel's scan_live_actions_schema (LONG).
-        let arr = extract_column_array(batch, sz_cn)?;
-        return Ok(if arr.is_null(row) {
-            0
-        } else {
-            arr.as_primitive::<Int64Type>().value(row)
-        });
-    }
-    if url.scheme() == "file" {
-        let p = url.to_file_path().map_err(|()| {
-            crate::error::plan_compilation(format!(
-                "file URL could not be converted to path: {url}"
-            ))
-        })?;
-        return Ok(std::fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0));
-    }
-    Ok(0)
 }
