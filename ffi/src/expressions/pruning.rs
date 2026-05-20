@@ -1,13 +1,45 @@
 //! Engine callback framework for opaque-predicate data skipping.
 //!
-//! Engines wrap [`OpaquePruningCallbacks`] in a [`SharedOpaquePruningContext`]
-//! (see [`create_opaque_pruning_context`]) and attach the context to an opaque
-//! predicate via [`visit_predicate_opaque_with_pruning`]. Kernel then invokes
-//! the appropriate callback for every pruning decision involving that
-//! predicate -- once per Add action for stats-based file pruning, once per
-//! partition value set for partition pruning, once per parquet row group for
-//! row-group skipping. The engine evaluates the op in its own language using
-//! the accessors over the op's children and the relevant stats.
+//! ## Data flow
+//!
+//! ```text
+//! engine                                                     kernel
+//! ------                                                     ------
+//! 1. fill OpaquePruningCallbacks { file_fn, partition_fn,
+//!                                  row_group_fn, engine_state }
+//! 2. create_opaque_pruning_context(callbacks) -> ctx handle
+//! 3. visit_predicate_opaque_with_pruning(name, children, ctx)
+//!         |
+//!         v
+//!    builds NamedOpaquePredicateOp { name, Arc<callbacks> }
+//!    wraps in Predicate::opaque (or Predicate::arrow_opaque
+//!    for the "_arrow" variant). engine receives a predicate id.
+//!         |
+//!         v
+//!    kernel pruning passes invoke the op's callback:
+//!      - partition prune:    eval_pred_scalar          -> partition_fn
+//!      - row-group skip:     eval_as_data_skipping_predicate -> row_group_fn
+//!      - file prune (arrow): ArrowNamedOpaquePredicateOp::eval_pred (per row of metadata batch)
+//!                              -> file_fn
+//!         |
+//!         v
+//!    each invocation hands the engine:
+//!      - ChildAccessor   (read-only view of the op's children)
+//!      - StatsAccessor / partition resolver (typed stats lookups)
+//!      - OpaquePruneResult (write-only verdict slot)
+//!    engine fills the verdict; kernel maps Keep/Skip/Unknown to its
+//!    Option<bool> pruning decision.
+//! ```
+//!
+//! ## Two builders
+//!
+//! - [`visit_predicate_opaque_with_pruning`] -- engine-agnostic. Callbacks fire for partition
+//!   pruning and parquet row-group skipping. Stats-based file pruning does NOT engage: kernel's
+//!   indirect rewrite drops the opaque branch before file pruning runs.
+//! - [`visit_predicate_opaque_with_pruning_arrow`] (requires `default-engine-base`) -- wraps the op
+//!   so the default engine's batch evaluator dispatches per-row callback invocations during
+//!   stats-based file pruning. All three pruning passes fire. Engines using the default engine
+//!   should call this builder.
 //!
 //! ## Contract
 //!
@@ -26,6 +58,7 @@
 //!
 //! [`Predicate::Opaque`]: delta_kernel::expressions::Predicate::Opaque
 //! [`visit_predicate_opaque_with_pruning`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning
+//! [`visit_predicate_opaque_with_pruning_arrow`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning_arrow
 
 use std::ffi::c_void;
 use std::sync::Arc;

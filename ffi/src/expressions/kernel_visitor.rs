@@ -635,7 +635,13 @@ fn visit_predicate_opaque_impl(
     name: DeltaResult<String>,
     children: &mut EngineIterator,
 ) -> DeltaResult<usize> {
-    wrap_opaque_predicate_with_callbacks(state, name?, children.map(|child| child as usize), None)
+    build_opaque_predicate(
+        state,
+        name?,
+        children.map(|child| child as usize),
+        None,
+        Predicate::opaque,
+    )
 }
 
 /// Resolve child IDs in order and drain every one of them from the visitor
@@ -656,12 +662,24 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
     Some(resolved.into_iter().flatten().collect())
 }
 
-fn wrap_opaque_predicate_with_callbacks<I: IntoIterator<Item = usize>>(
+/// Build a `NamedOpaquePredicateOp` and hand it to `wrap` to produce the final
+/// `Predicate`. Centralizes the resolve-children + build-op steps so the three
+/// public builders (no callbacks, plain-pruning, arrow-pruning) differ only in
+/// the closure they pass.
+///
+/// Returns `Ok(0)` if any child id fails to resolve (mirrors the binary
+/// `visit_predicate_*` invariant).
+fn build_opaque_predicate<I, F>(
     state: &mut KernelExpressionVisitorState,
     name: String,
     child_ids: I,
     callbacks: Option<Arc<OpaquePruningCallbacks>>,
-) -> DeltaResult<usize> {
+    wrap: F,
+) -> DeltaResult<usize>
+where
+    I: IntoIterator<Item = usize>,
+    F: FnOnce(NamedOpaquePredicateOp, Vec<Expression>) -> Predicate,
+{
     let Some(exprs) = resolve_opaque_children(state, child_ids) else {
         return Ok(0);
     };
@@ -669,29 +687,7 @@ fn wrap_opaque_predicate_with_callbacks<I: IntoIterator<Item = usize>>(
         Some(cb) => NamedOpaquePredicateOp::with_callbacks(name, cb),
         None => NamedOpaquePredicateOp::new(name),
     };
-    Ok(wrap_predicate(state, Predicate::opaque(op, exprs)))
-}
-
-/// Like [`wrap_opaque_predicate_with_callbacks`] but wraps the op via
-/// `Predicate::arrow_opaque` so the default engine's batch evaluator can
-/// route per-row callback invocations through `eval_pred`. Only available
-/// when arrow is wired in (`default-engine-base`).
-#[cfg(feature = "default-engine-base")]
-fn wrap_opaque_predicate_with_callbacks_arrow<I: IntoIterator<Item = usize>>(
-    state: &mut KernelExpressionVisitorState,
-    name: String,
-    child_ids: I,
-    callbacks: Arc<OpaquePruningCallbacks>,
-) -> DeltaResult<usize> {
-    let Some(exprs) = resolve_opaque_children(state, child_ids) else {
-        return Ok(0);
-    };
-    let inner = NamedOpaquePredicateOp::with_callbacks(name, callbacks);
-    let arrow_op = ArrowNamedOpaquePredicateOp::new(inner);
-    Ok(wrap_predicate(
-        state,
-        Predicate::arrow_opaque(arrow_op, exprs),
-    ))
+    Ok(wrap_predicate(state, wrap(op, exprs)))
 }
 
 /// Build an opaque predicate with engine pruning callbacks attached. Same as
@@ -758,11 +754,12 @@ fn visit_predicate_opaque_with_pruning_arrow_impl(
     children: &mut EngineIterator,
     callbacks: Arc<OpaquePruningCallbacks>,
 ) -> DeltaResult<usize> {
-    wrap_opaque_predicate_with_callbacks_arrow(
+    build_opaque_predicate(
         state,
         name?,
         children.map(|child| child as usize),
-        callbacks,
+        Some(callbacks),
+        |op, exprs| Predicate::arrow_opaque(ArrowNamedOpaquePredicateOp::new(op), exprs),
     )
 }
 
@@ -772,11 +769,12 @@ fn visit_predicate_opaque_with_pruning_impl(
     children: &mut EngineIterator,
     callbacks: Arc<OpaquePruningCallbacks>,
 ) -> DeltaResult<usize> {
-    wrap_opaque_predicate_with_callbacks(
+    build_opaque_predicate(
         state,
         name?,
         children.map(|child| child as usize),
         Some(callbacks),
+        Predicate::opaque,
     )
 }
 
@@ -1098,7 +1096,7 @@ mod tests {
     }
 
     // ============================================================================
-    // wrap_opaque_predicate_with_callbacks
+    // build_opaque_predicate
     // ============================================================================
 
     fn wrap_opaque(
@@ -1106,7 +1104,7 @@ mod tests {
         name: &str,
         child_ids: impl IntoIterator<Item = usize>,
     ) -> usize {
-        wrap_opaque_predicate_with_callbacks(state, name.to_string(), child_ids, None).unwrap()
+        build_opaque_predicate(state, name.to_string(), child_ids, None, Predicate::opaque).unwrap()
     }
 
     #[test]
