@@ -1,11 +1,19 @@
 //! Error types for the history manager module.
 
+use url::Url;
+
 use super::Timestamp;
 use crate::Version;
 
 /// Represents errors that can occur when converting commit timestamps to versions.
 #[derive(Debug, thiserror::Error)]
 pub enum LogHistoryError {
+    /// No published commit files were found in the log directory.
+    #[error("no published commits found in log directory {log_root}")]
+    NoPublishedCommits {
+        /// The log directory URL that was searched.
+        log_root: Url,
+    },
     /// The provided timestamp range is invalid (start > end).
     #[error("Invalid timestamp range: ({start_timestamp}, {end_timestamp})")]
     InvalidTimestampRange {
