@@ -1,9 +1,10 @@
 //! Arrow-based per-row evaluation of [`NamedOpaquePredicateOp`].
 //!
-//! Implements [`ArrowOpaquePredicateOp`] for `NamedOpaquePredicateOp` so the
-//! default engine's batch evaluator can run an opaque op directly against
-//! the file-stats metadata batch. `eval_pred` iterates the batch rows,
-//! invokes the engine's `eval_against_stats` callback per row with a
+//! [`ArrowNamedOpaquePredicateOp`] is a newtype wrapper around
+//! [`NamedOpaquePredicateOp`] that adds an [`ArrowOpaquePredicateOp`] impl, so
+//! the default engine's batch evaluator can run an opaque op directly against
+//! the file-stats metadata batch. `eval_pred` iterates the batch rows, invokes
+//! the engine's `eval_against_stats` callback per row with a
 //! [`BatchRowStatsProvider`] that reads from the row's `stats_parsed.*`
 //! columns, and packs the verdicts into a `BooleanArray`.
 //!
@@ -11,8 +12,6 @@
 //! avoids per-file JNI for the kernel-side native predicates (those are
 //! still batch-evaluated as today) but does cross the FFI boundary once
 //! per file for the opaque parts of the predicate.
-//!
-//! See `doc/design/opaque-predicate-data-skipping.md`.
 
 use delta_kernel::arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
