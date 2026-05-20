@@ -444,7 +444,11 @@ impl ActionReconciliationVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
         // Extract the file action and handle errors immediately
-        let Some(FileActionInfo{key: file_key, size: _size, is_add}) = self.deduplicator.extract_file_action(i, getters, false)?
+        let Some(FileActionInfo {
+            key: file_key,
+            size: _size,
+            is_add,
+        }) = self.deduplicator.extract_file_action(i, getters, false)?
         else {
             return Ok(None); // No file action found, continue checking other types
         };
@@ -1351,7 +1355,6 @@ mod tests {
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
-        println!("ERROR IS {}", err_str);
         assert!(err_str.contains("lastUpdated is not of type i64"));
 
         // Test remove.deletionTimestamp

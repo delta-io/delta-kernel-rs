@@ -149,8 +149,8 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     /// - `skip_removes`: Whether to skip remove actions when extracting file actions
     ///
     /// # Returns
-    /// - `Ok(Some((key, is_add)))`: When a file action is found, returns the key and whether it's
-    ///   an add operation
+    /// - `Ok(Some(FileActionInfo))`: When a file action is found, This contains the key whether
+    ///   it's an add operation, and the size of the file
     /// - `Ok(None)`: When no file action is found
     /// - `Err(...)`: On any error during extraction
     fn extract_file_action<'a>(
@@ -161,18 +161,15 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     ) -> DeltaResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
-            let size = getters[self.add_size_index].get_long(i, "add.size")?;
-            let size = if let Some(size) = size {
-                match size.try_into() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Could not convert size to usize: {e}");
-                        0
-                    }
+            let size = match getters[self.add_size_index].get_long(i, "add.size")? {
+                Some(s) => u64::try_from(s).unwrap_or_else(|e| {
+                    warn!("Could not convert add.size {s} to u64: {e}");
+                    0
+                }),
+                None => {
+                    warn!("Add action without required size field");
+                    0
                 }
-            } else {
-                warn!("Found an add action without required size field");
-                0
             };
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
             return Ok(Some(FileActionInfo {
@@ -523,7 +520,11 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
+        let FileActionInfo {
+            key,
+            size: _size,
+            is_add,
+        } = result.unwrap();
         assert_eq!(key.path, "file1.parquet");
         assert!(key.dv_unique_id.is_none());
         assert!(is_add);
@@ -542,7 +543,11 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
+        let FileActionInfo {
+            key,
+            size: _size,
+            is_add,
+        } = result.unwrap();
         assert_eq!(key.path, "file2.parquet");
         assert!(!is_add);
 
@@ -563,7 +568,11 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
+        let FileActionInfo {
+            key,
+            size: _size,
+            is_add,
+        } = result.unwrap();
         assert!(matches!(
             key.dv_unique_id.as_deref(),
             Some("s3path/to/dv@100")
@@ -684,7 +693,11 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
+        let FileActionInfo {
+            key,
+            size: _size,
+            is_add,
+        } = result.unwrap();
         assert_eq!(key.path, "checkpoint_file.parquet");
         assert!(key.dv_unique_id.is_none());
         assert!(is_add);
@@ -706,7 +719,11 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
+        let FileActionInfo {
+            key,
+            size: _size,
+            is_add,
+        } = result.unwrap();
         assert_eq!(key.path, "file_with_dv.parquet");
         assert!(matches!(
             key.dv_unique_id.as_deref(),

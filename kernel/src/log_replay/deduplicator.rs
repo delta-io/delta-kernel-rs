@@ -12,6 +12,8 @@
 
 use std::collections::HashSet;
 
+use tracing::warn;
+
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::log_replay::FileActionKey;
@@ -19,13 +21,16 @@ use crate::DeltaResult;
 
 /// Information we want to return to the add-dedup about file related actions
 pub(crate) struct FileActionInfo {
+    /// A key that uniquely identifies the file, includes the path and dv info
     pub(crate) key: FileActionKey,
-    pub(crate) size: usize,
+    /// The size of the file. Might be 0 for removes
+    pub(crate) size: u64,
+    /// If this action was an add
     pub(crate) is_add: bool,
 }
 
 pub(crate) trait Deduplicator {
-    /// Extracts a file action key from the data. Returns `(key, is_add)` if found.
+    /// Extracts a file action key from the data. Returns a `FileActionInfo` if found.
     ///
     /// TODO: Remove the skip_removes field in the future. The caller is responsible for using the
     /// correct Deduplicator instance depending on whether the batch belongs to a commit or to a
@@ -86,6 +91,7 @@ pub(crate) trait Deduplicator {
 pub(crate) struct CheckpointDeduplicator<'a> {
     seen_file_keys: &'a HashSet<FileActionKey>,
     add_path_index: usize,
+    add_size_index: usize,
     add_dv_start_index: usize,
 }
 
@@ -100,6 +106,7 @@ impl<'a> CheckpointDeduplicator<'a> {
         Ok(CheckpointDeduplicator {
             seen_file_keys,
             add_path_index,
+            add_size_index,
             add_dv_start_index,
         })
     }
@@ -117,9 +124,19 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
             return Ok(None);
         };
         let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
+        let size = match getters[self.add_size_index].get_long(i, "add.size")? {
+            Some(s) => u64::try_from(s).unwrap_or_else(|e| {
+                warn!("Could not convert add.size {s} to u64: {e}");
+                0
+            }),
+            None => {
+                warn!("Add action without required size field");
+                0
+            }
+        };
         Ok(Some(FileActionInfo {
             key: FileActionKey::new(path, dv_unique_id),
-            size: 0, // TODO
+            size,
             is_add: true,
         }))
     }

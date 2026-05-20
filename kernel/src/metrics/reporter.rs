@@ -312,7 +312,7 @@ impl ScanMetadataVisitor {
             total_duration: std::time::Duration::from_nanos(self.total_duration_ns),
             num_add_files_seen: self.num_add_files_seen,
             num_active_add_files: self.num_active_add_files,
-            active_add_files_bytes: self.active_add_files_bytes as usize,
+            active_add_files_bytes: self.active_add_files_bytes,
             num_remove_files_seen: self.num_remove_files_seen,
             num_non_file_actions: self.num_non_file_actions,
             num_predicate_filtered: self.num_predicate_filtered,

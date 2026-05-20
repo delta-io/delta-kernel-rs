@@ -1569,7 +1569,15 @@ mod scan_metadata_completed_tests {
         0
     )]
     #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 0, 2, 0)]
-    #[case::with_checkpoint("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1010, 1, 0)]
+    #[case::with_checkpoint(
+        "./tests/data/with_checkpoint_no_last_checkpoint/",
+        None,
+        2,
+        1,
+        1010,
+        1,
+        0
+    )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
@@ -1580,7 +1588,7 @@ mod scan_metadata_completed_tests {
         #[case] predicate: Option<Arc<Pred>>,
         #[case] expected_add_seen: u64,
         #[case] expected_active: u64,
-        #[case] expected_active_bytes: usize,
+        #[case] expected_active_bytes: u64,
         #[case] expected_removes: u64,
         #[case] expected_filtered: u64,
     ) {

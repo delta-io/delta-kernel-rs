@@ -139,7 +139,7 @@ pub enum MetricEvent {
         /// Add files that survived log replay (files to read).
         num_active_add_files: u64,
         /// Size in bytes of the files that survived log replay (files to read).
-        active_add_files_bytes: usize,
+        active_add_files_bytes: u64,
         /// Remove files seen (from delta/commit files only).
         num_remove_files_seen: u64,
         /// Non-file actions seen (protocol, metadata, etc.).
@@ -239,7 +239,7 @@ impl fmt::Display for MetricEvent {
             } => write!(
                 f,
                 "ScanMetadataCompleted(id={operation_id}, scan_type={scan_type}, duration={total_duration:?}, \
-                 add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, active_add_files_bytes={active_add_files_bytes} \
+                 add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, active_add_files_bytes={active_add_files_bytes}, \
                  remove_files_seen={num_remove_files_seen}, non_file_actions={num_non_file_actions}, \
                  predicate_filtered={num_predicate_filtered}, peak_hash_set_size={peak_hash_set_size}, \
                  dedup_visitor_time_ms={dedup_visitor_time_ms}, predicate_eval_time_ms={predicate_eval_time_ms})"

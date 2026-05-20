@@ -16,8 +16,8 @@ pub(crate) struct ScanMetrics {
     /// Add files that survived log replay (files to read). includes files that survived
     /// dataskipping, partition pruning, and add/remove deduplication.
     num_active_add_files: AtomicU64,
-    /// Number of bytes in the active add files as reported by the add action size filed
-    active_add_files_bytes: AtomicUsize,
+    /// Number of bytes in the active add files as reported by the add action size field
+    active_add_files_bytes: AtomicU64,
     /// Remove files seen (from delta/commit files only).
     num_remove_files_seen: AtomicU64,
     /// Non-file actions seen (protocol, metadata, etc.).
@@ -37,7 +37,7 @@ impl Default for ScanMetrics {
         Self {
             num_add_files_seen: AtomicU64::new(0),
             num_active_add_files: AtomicU64::new(0),
-            active_add_files_bytes: AtomicUsize::new(0),
+            active_add_files_bytes: AtomicU64::new(0),
             num_remove_files_seen: AtomicU64::new(0),
             num_non_file_actions: AtomicU64::new(0),
             num_predicate_filtered: AtomicU64::new(0),
@@ -54,9 +54,10 @@ impl ScanMetrics {
     }
 
     /// Record that we've seen an active add file, plus its size
-    pub(crate) fn record_active_add_file(&self, bytes: usize) {
+    pub(crate) fn record_active_add_file(&self, bytes: u64) {
         self.num_active_add_files.fetch_add(1, Ordering::Relaxed);
-        self.active_add_files_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.active_add_files_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn incr_remove_files_seen(&self) {
@@ -94,6 +95,7 @@ impl ScanMetrics {
     pub(crate) fn reset_counters(&self) {
         self.num_add_files_seen.store(0, Ordering::Relaxed);
         self.num_active_add_files.store(0, Ordering::Relaxed);
+        self.active_add_files_bytes.store(0, Ordering::Relaxed);
         self.num_remove_files_seen.store(0, Ordering::Relaxed);
         self.num_non_file_actions.store(0, Ordering::Relaxed);
         self.num_predicate_filtered.store(0, Ordering::Relaxed);
@@ -131,6 +133,7 @@ impl ScanMetrics {
     pub(crate) fn log(&self, message: impl AsRef<str>) {
         let add_files_seen = self.num_add_files_seen.load(Ordering::Relaxed);
         let active_add_files = self.num_active_add_files.load(Ordering::Relaxed);
+        let active_add_files_bytes = self.active_add_files_bytes.load(Ordering::Relaxed);
         let remove_files_seen = self.num_remove_files_seen.load(Ordering::Relaxed);
         let non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
         let predicate_filtered = self.num_predicate_filtered.load(Ordering::Relaxed);
@@ -141,6 +144,7 @@ impl ScanMetrics {
         info!(
             add_files_seen,
             active_add_files,
+            active_add_files_bytes,
             remove_files_seen,
             non_file_actions,
             predicate_filtered,

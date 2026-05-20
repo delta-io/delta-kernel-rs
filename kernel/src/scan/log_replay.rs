@@ -411,16 +411,25 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'b>(&mut self, row: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(
+        &mut self,
+        row: usize,
+        getters: &[&'b dyn GetData<'b>],
+    ) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
-        // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
-        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at
-        //   indexes 6-8
+        // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
+        //   3-5
+        // - For Remove actions (in log batches only): path is at index 7, followed by DV fields at
+        //   indexes 8-9
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
-        let Some(FileActionInfo{key: file_key, size, is_add}) = self.deduplicator.extract_file_action(
+        let Some(FileActionInfo {
+            key: file_key,
+            size,
+            is_add,
+        }) = self.deduplicator.extract_file_action(
             row,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch

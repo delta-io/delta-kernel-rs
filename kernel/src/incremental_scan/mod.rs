@@ -396,7 +396,11 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
         );
 
         for i in 0..row_count {
-            let Some(FileActionInfo{key, size: _size, is_add}) = self.deduplicator.extract_file_action(i, getters, false)?
+            let Some(FileActionInfo {
+                key,
+                size: _size,
+                is_add,
+            }) = self.deduplicator.extract_file_action(i, getters, false)?
             else {
                 continue;
             };
