@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+use crate::actions::{
+    STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT, STATS_NUM_RECORDS, STATS_TIGHT_BOUNDS,
+};
 use crate::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
     LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
@@ -511,9 +514,9 @@ pub(crate) fn collect_stats(
     let schema = batch.schema();
 
     // Collect all stats in a single traversal
-    let mut null_counts = StatsAccumulator::new("nullCount");
-    let mut min_values = StatsAccumulator::new("minValues");
-    let mut max_values = StatsAccumulator::new("maxValues");
+    let mut null_counts = StatsAccumulator::new(STATS_NULL_COUNT);
+    let mut min_values = StatsAccumulator::new(STATS_MIN_VALUES);
+    let mut max_values = StatsAccumulator::new(STATS_MAX_VALUES);
 
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let mut path = vec![field.name().to_string()];
@@ -534,7 +537,7 @@ pub(crate) fn collect_stats(
     }
 
     // Build output struct
-    let mut fields = vec![Field::new("numRecords", DataType::Int64, true)];
+    let mut fields = vec![Field::new(STATS_NUM_RECORDS, DataType::Int64, true)];
     let mut arrays: Vec<Arc<dyn Array>> =
         vec![Arc::new(Int64Array::from(vec![batch.num_rows() as i64]))];
 
@@ -546,7 +549,7 @@ pub(crate) fn collect_stats(
     }
 
     // tightBounds
-    fields.push(Field::new("tightBounds", DataType::Boolean, true));
+    fields.push(Field::new(STATS_TIGHT_BOUNDS, DataType::Boolean, true));
     arrays.push(Arc::new(BooleanArray::from(vec![true])));
 
     StructArray::try_new(fields.into(), arrays, None)

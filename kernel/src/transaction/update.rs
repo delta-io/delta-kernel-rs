@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::get_log_add_schema;
+use crate::actions::{get_log_add_schema, STATS_NUM_RECORDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
@@ -601,7 +601,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 let stats = stats.ok_or_else(|| {
                     Error::generic(format!(
                         "update_deletion_vectors: file {path} has no stats; \
-                         deletion vectors require an accurate numRecords"
+                         deletion vectors require an accurate {STATS_NUM_RECORDS}"
                     ))
                 })?;
                 let parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
@@ -610,12 +610,12 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     ))
                 })?;
                 if parsed
-                    .get("numRecords")
+                    .get(STATS_NUM_RECORDS)
                     .and_then(serde_json::Value::as_u64)
                     .is_none()
                 {
                     return Err(Error::generic(format!(
-                        "update_deletion_vectors: stats for {path} is missing numRecords \
+                        "update_deletion_vectors: stats for {path} is missing {STATS_NUM_RECORDS} \
                          or it is not a non-negative integer"
                     )));
                 }

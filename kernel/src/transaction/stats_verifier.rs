@@ -7,10 +7,10 @@
 
 use std::sync::LazyLock;
 
+use crate::actions::{STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT, STATS_NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
-use crate::scan::data_skipping::stats_schema::STATS_NUM_RECORDS;
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
 use crate::DeltaResult;
@@ -56,10 +56,10 @@ impl StatsColumnVerifier {
     ) -> DeltaResult<()> {
         let column_names = vec![
             ColumnName::new(["path"]),
-            ColumnName::new(["stats", "numRecords"]),
-            build_stat_path(column, "nullCount"),
-            build_stat_path(column, "minValues"),
-            build_stat_path(column, "maxValues"),
+            ColumnName::new(["stats", STATS_NUM_RECORDS]),
+            build_stat_path(column, STATS_NULL_COUNT),
+            build_stat_path(column, STATS_MIN_VALUES),
+            build_stat_path(column, STATS_MAX_VALUES),
         ];
         let types = column_types_for(data_type)?;
 
@@ -251,8 +251,8 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 
         for row_idx in 0..row_count {
             let path: String = getters[0].get(row_idx, "path")?;
-            let num_records = getters[1].get_long(row_idx, "numRecords")?;
-            let null_count = getters[2].get_long(row_idx, "nullCount")?;
+            let num_records = getters[1].get_long(row_idx, STATS_NUM_RECORDS)?;
+            let null_count = getters[2].get_long(row_idx, STATS_NULL_COUNT)?;
 
             // When all rows are null (or the file is empty), minValues/maxValues are
             // expected to be null since there are no non-null values to aggregate.

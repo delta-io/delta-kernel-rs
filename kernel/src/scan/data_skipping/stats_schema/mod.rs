@@ -8,15 +8,15 @@ use std::sync::Arc;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
+use crate::actions::{
+    STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT, STATS_NUM_RECORDS, STATS_TIGHT_BOUNDS,
+};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
     StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
-
-/// Sub-field of an AddFile's `stats` struct: total number of rows in the file.
-pub(crate) const STATS_NUM_RECORDS: &str = "numRecords";
 
 /// Generates the expected schema for file statistics.
 ///
@@ -140,7 +140,7 @@ pub(crate) fn expected_stats_schema(
     requested_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
     let mut fields = Vec::with_capacity(5);
-    fields.push(StructField::nullable("numRecords", DataType::LONG));
+    fields.push(StructField::nullable(STATS_NUM_RECORDS, DataType::LONG));
 
     // generate the base stats schema:
     // - make all fields nullable
@@ -155,7 +155,7 @@ pub(crate) fn expected_stats_schema(
         let mut null_count_transform = NullCountStatsTransform;
         let null_count_schema = null_count_transform.transform_struct(&base_schema);
         fields.push(StructField::nullable(
-            "nullCount",
+            STATS_NULL_COUNT,
             null_count_schema.into_owned(),
         ));
 
@@ -163,14 +163,17 @@ pub(crate) fn expected_stats_schema(
         let mut min_max_transform = MinMaxStatsTransform;
         if let Some(min_max_schema) = min_max_transform.transform_struct(&base_schema) {
             let min_max_schema = min_max_schema.into_owned();
-            fields.push(StructField::nullable("minValues", min_max_schema.clone()));
-            fields.push(StructField::nullable("maxValues", min_max_schema));
+            fields.push(StructField::nullable(
+                STATS_MIN_VALUES,
+                min_max_schema.clone(),
+            ));
+            fields.push(StructField::nullable(STATS_MAX_VALUES, min_max_schema));
         }
     }
 
     // tightBounds indicates whether min/max statistics are accurate (true) or potentially
     // outdated due to deletion vectors (false)
-    fields.push(StructField::nullable("tightBounds", DataType::BOOLEAN));
+    fields.push(StructField::nullable(STATS_TIGHT_BOUNDS, DataType::BOOLEAN));
 
     StructType::try_new(fields)
 }
@@ -208,10 +211,10 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
         .into_owned();
 
     let schema = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
-        StructField::nullable("nullCount", nullcount_schema),
-        StructField::nullable("minValues", stats_schema.clone()),
-        StructField::nullable("maxValues", stats_schema),
+        StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
+        StructField::nullable(STATS_NULL_COUNT, nullcount_schema),
+        StructField::nullable(STATS_MIN_VALUES, stats_schema.clone()),
+        StructField::nullable(STATS_MAX_VALUES, stats_schema),
     ]);
 
     // Strip field metadata. The stats types are derived from the table schema, but the metadata on

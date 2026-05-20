@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::DomainMetadata;
+use crate::actions::{DomainMetadata, STATS_NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
@@ -113,7 +113,7 @@ impl RowVisitor for RowTrackingVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             (
-                vec![ColumnName::new(["stats", "numRecords"])],
+                vec![ColumnName::new(["stats", STATS_NUM_RECORDS])],
                 vec![DataType::LONG],
             )
                 .into()
@@ -135,11 +135,10 @@ impl RowVisitor for RowTrackingVisitor {
 
         let mut current_hwm = self.row_id_high_water_mark;
         for i in 0..row_count {
-            let num_records: i64 = getters[0].get_opt(i, "numRecords")?.ok_or_else(|| {
-                Error::InternalError(
-                    "numRecords must be present in Add actions when row tracking is enabled."
-                        .to_string(),
-                )
+            let num_records: i64 = getters[0].get_opt(i, STATS_NUM_RECORDS)?.ok_or_else(|| {
+                Error::InternalError(format!(
+                    "{STATS_NUM_RECORDS} must be present in Add actions when row tracking is enabled."
+                ))
             })?;
             batch_base_row_ids.push(current_hwm + 1);
             current_hwm += num_records;

@@ -6,6 +6,7 @@ use std::time::Instant;
 use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
+use crate::actions::{STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT, STATS_NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, column_name, joined_column_expr, BinaryPredicateOp, ColumnName,
@@ -430,7 +431,9 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
         } else {
-            Some(Expr::from(column_name!("stats_parsed.minValues").join(col)))
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", STATS_MIN_VALUES]).join(col),
+            ))
         }
     }
 
@@ -440,7 +443,9 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
         } else {
-            Some(Expr::from(column_name!("stats_parsed.maxValues").join(col)))
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", STATS_MAX_VALUES]).join(col),
+            ))
         }
     }
 
@@ -468,13 +473,18 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             None
         } else {
-            Some(Expr::from(column_name!("stats_parsed.nullCount").join(col)))
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", STATS_NULL_COUNT]).join(col),
+            ))
         }
     }
 
     /// Retrieves the row count statistic.
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(column_expr!("stats_parsed.numRecords"))
+        Some(Expr::from(ColumnName::new([
+            "stats_parsed",
+            STATS_NUM_RECORDS,
+        ])))
     }
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
@@ -583,25 +593,25 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         if self.is_partition_column(col) {
             return None;
         }
-        Some(joined_column_expr!("minValues", col))
+        Some(Expr::from(ColumnName::new([STATS_MIN_VALUES]).join(col)))
     }
 
     fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             return None;
         }
-        Some(joined_column_expr!("maxValues", col))
+        Some(Expr::from(ColumnName::new([STATS_MAX_VALUES]).join(col)))
     }
 
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
         if self.is_partition_column(col) {
             return None;
         }
-        Some(joined_column_expr!("nullCount", col))
+        Some(Expr::from(ColumnName::new([STATS_NULL_COUNT]).join(col)))
     }
 
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(column_expr!("numRecords"))
+        Some(Expr::from(ColumnName::new([STATS_NUM_RECORDS])))
     }
 
     /// Compares a column's max stat against a literal value, adjusting for timestamp

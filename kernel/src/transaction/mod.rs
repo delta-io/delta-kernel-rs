@@ -10,6 +10,7 @@ use tracing::{info, instrument};
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
     DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT, STATS_NUM_RECORDS, STATS_TIGHT_BOUNDS,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
@@ -112,14 +113,14 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
     let stats = StructField::nullable(
         "stats",
         DataType::struct_type_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(STATS_NUM_RECORDS, DataType::LONG),
             // nullCount, minValues, maxValues are dynamic based on data schema.
             // Empty struct placeholders indicate these fields exist but their inner
             // structure depends on the table schema and stats column configuration.
-            StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(STATS_NULL_COUNT, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(STATS_MIN_VALUES, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(STATS_MAX_VALUES, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(STATS_TIGHT_BOUNDS, DataType::BOOLEAN),
         ]),
     );
 
