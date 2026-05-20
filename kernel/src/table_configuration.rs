@@ -478,7 +478,6 @@ impl TableConfiguration {
     /// data-skipping setup to narrow stats schemas to partition-referenced fields. Both
     /// sites used to inline this filter+zip; consolidating here keeps the construction
     /// (zip logical/physical fields, filter by partition column name) in one place.
-    #[cfg(feature = "declarative-plans")]
     #[internal_api]
     pub(crate) fn partition_schema_with_physical_names(&self) -> Option<SchemaRef> {
         let partition_columns = self.partition_columns();

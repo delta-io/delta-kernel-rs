@@ -409,28 +409,11 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
         self.logical_path.push(field.name.clone());
         self.folded_logical_path.push(field.name.to_lowercase());
         self.physical_path.push(physical_name.to_string());
-        let field_result = self.recurse_into_struct_field(field);
-        // Predicates can reference a struct column directly (e.g. `IS NULL` on a struct).
-        // The primitive-leaf walk in `transform_primitive` won't see those references because
-        // they target the struct path itself, so resolve them here after recursing. Data
-        // skipping can't use a struct-level predicate (no stats at struct level), but the
-        // predicate still evaluates row-by-row downstream -- without resolving the reference
-        // the caller raises a misleading "unknown column" error.
-        if let Some(pred_cols) = self
-            .folded_references
-            .remove(self.folded_logical_path.as_slice())
-        {
-            let physical = ColumnName::new(&self.physical_path);
-            for pred_col in pred_cols {
-                self.unresolved_references.remove(pred_col);
-                self.column_mappings
-                    .insert(pred_col.clone(), physical.clone());
-            }
-        }
+        let field = self.recurse_into_struct_field(field);
         self.logical_path.pop();
         self.folded_logical_path.pop();
         self.physical_path.pop();
-        Some(Cow::Owned(field_result?.with_name(physical_name)))
+        Some(Cow::Owned(field?.with_name(physical_name)))
     }
 }
 

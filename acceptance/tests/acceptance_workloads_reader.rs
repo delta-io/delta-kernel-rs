@@ -11,7 +11,9 @@ use acceptance::acceptance_workloads::TestCase;
 /// Tests that cannot be executed due to test harness limitations.
 /// These fail at parse time or cause infrastructure issues (OOM, hang).
 /// All other failures (bugs, divergences, missing features) go in EXPECTED_KERNEL_FAILURES.
-const SKIP_LIST: &[(&str, &str)] = &[
+/// `pub` so the DataFusion harness can reference it via `#[path]` include
+/// (see `acceptance_workloads_datafusion.rs`).
+pub const SKIP_LIST: &[(&str, &str)] = &[
     ("DV-017/", "Huge table (2B rows) causes OOM/hang"),
     // The Spec enum only supports "read" and "snapshot" types.
     // CDF, transaction, and domain metadata specs fail at parse time.
@@ -58,7 +60,9 @@ fn should_skip_test(test_path: &str) -> Option<&'static str> {
 /// Tests that CAN be executed but are expected to fail (kernel bugs or divergences).
 /// Unlike SKIP_LIST, these workloads run and we assert they produce wrong results or errors.
 /// When a kernel fix lands, the test will pass and the entry should be removed.
-const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
+/// `pub` so the DataFusion harness can reference it via `#[path]` include
+/// (see `acceptance_workloads_datafusion.rs`).
+pub const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     // Kernel reads timestamps as Timestamp(Microsecond, Some("UTC")),
     // Spark writes expected data as Timestamp(Nanosecond, None).
     // Same instant, different Arrow representation.
@@ -91,9 +95,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "st_datetime_stats/specs/st_datetime_stats_filter_date_eq",
             "st_datetime_stats/specs/st_datetime_stats_filter_date_range",
             "st_datetime_stats/specs/st_datetime_stats_full_scan",
-            "ds_multi_file_time/specs/ds_multi_file_time_read_miss_future",
-            "ds_multi_file_time/specs/ds_multi_file_time_read_ts_gte_timestamp20240601_000000",
-            "ds_multi_file_time/specs/ds_multi_file_time_read_ts_lt_timestamp20240201_000000",
             "cdc_multiple_types/specs/cdc_multiple_types_read_all",
             "cdc_timestamp_tz_handling/specs/cdc_timestamp_tz_handling_read_all",
             "gc_append_data/specs/gc_append_data_read_all",
@@ -164,6 +165,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "ds_variant_null_stats/specs/ds_variant_null_stats_miss_null_v_struct_v_not_null",
             "ds_variant_null_stats/specs/ds_variant_null_stats_miss_v_is_null",
             "ds_variant_null_stats/specs/ds_variant_null_stats_miss_v_struct_v_is_null",
+            "var_null_top_level/specs/var_null_top_level_filter_null",
         ],
     ),
     (
@@ -211,6 +213,10 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Schema deserialization fails for TimestampNTZ type",
+        &["ds_multi_file_time/"],
+    ),
+    (
         "Column mapping id mode fails with None in final_fields_cols",
         &[
             "cm_id_matching_swapped/specs/cm_id_matching_swapped_select_",
@@ -228,6 +234,10 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "ct_missing_delta_log/specs/ct_missing_delta_log_snapshot",
             "dseReadNonDeltaPath/specs/dseReadNonDeltaPath_snapshot",
         ],
+    ),
+    (
+        "Accepts truncated log when initial commits are missing but CRC files exist",
+        &["prod_truncated_log/"],
     ),
     (
         "Accepts checkpoint-only tables (no commits)",
@@ -306,6 +316,10 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     (
         "_metadata.file_path column projection not supported",
         &["DV-003/specs/DV-003_metadata_file_path"],
+    ),
+    (
+        "variantShredding feature not supported",
+        &["pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_read_latest"],
     ),
     // Predicate parser: LIKE operator not supported
     (
@@ -528,6 +542,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "gc_delete/specs/gc_delete_filter_remaining",
             "gc_insert_by_name/specs/gc_insert_by_name_filter_c2_g",
             "gc_update_source/specs/gc_update_source_filter_c2_g_updated",
+            "tw_decimal_precision_read_large_values",
         ],
     ),
     (
@@ -591,14 +606,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "ddefReadDefaultNested/specs/ddefReadDefaultNested_readNonNull",
         ],
     ),
-    // Reader-workload gaps under current expression/stats support. Most of the historical
-    // entries were dead orphans (renamed/deleted specs, or redundantly covered by the
-    // "Timestamp-based time travel not yet supported" / predicate-parser groups); only these
-    // partition-value gaps still match real specs.
-    (
-        "Known reader-workload gaps under current expression/stats support",
-        &["pve_empty_string_partition/specs/pve_empty_string_partition_filter_nonempty.json"],
-    ),
 ];
 
 fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
@@ -623,6 +630,7 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
     if expected_failure.is_none() && should_skip_test(&spec_path_str).is_some() {
         return Ok(());
     }
+
     // Load and execute test case
     let test_case = TestCase::from_spec_path(&spec_path_abs);
     let table_root = test_case.table_root().expect("Failed to get table URL");

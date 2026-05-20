@@ -1,15 +1,26 @@
 //! DataFusion-specific acceptance workload harness.
 //!
-//! This harness is intentionally separate from `acceptance_workloads_reader` so DataFusion
-//! coverage can evolve independently from the default kernel engine workload suite.
+//! Mirrors `acceptance_workloads_reader`'s structure so the two suites are
+//! directly comparable. The expected-failure set for DataFusion is defined as
+//! a *transformation* on the kernel default engine's set:
+//!
+//! ```text
+//! EXPECTED_DATAFUSION_FAILURES =
+//!     (reader::EXPECTED_KERNEL_FAILURES ∪ ADDITIONAL_DF_FAILURES) ∖ FIXED_IN_DATAFUSION
+//! ```
+//!
+//! `ADDITIONAL_DF_FAILURES` lists divergences DataFusion introduces (workloads
+//! the kernel default engine passes but DataFusion fails). `FIXED_IN_DATAFUSION`
+//! lists improvements DataFusion makes (kernel-failure workloads DataFusion
+//! handles correctly). Both are explicit so divergences from the reference are
+//! always visible at a glance.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use acceptance::acceptance_workloads::validation::{validate_read_result, validate_snapshot};
 use acceptance::acceptance_workloads::workload::{
-    build_snapshot, execute_and_validate_workload, filter_batches_with_predicate, ReadResult,
-    SnapshotResult,
+    build_snapshot, filter_batches_with_predicate, ReadResult, SnapshotResult,
 };
 use acceptance::acceptance_workloads::TestCase;
 use delta_kernel::{DeltaResult, Engine, Error};
@@ -17,51 +28,76 @@ use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec};
 use delta_kernel_benchmarks::predicate_parser::parse_predicate;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 
-/// Harness-level skips that are not about DataFusion read semantics.
-const HARNESS_SKIP_PATTERNS: &[(&str, &str)] = &[
-    ("DV-017/", "Huge table (2B rows) causes OOM/hang"),
-    // The reference reader short-circuits protocol/metadata extraction via the CRC at
-    // end_version (see `LogSegment::read_protocol_metadata_opt`, Case 1), so it never reads
-    // commit-1's JSON for this table. Commit 1 contains a spec-violating partial `metaData`
-    // (Spark's protocol-downgrade encoding) with no `schemaString` field, which our strict
-    // `Metadata::to_schema()` correctly rejects at the arrow-json read boundary. The
-    // DataFusion full_state SM here has no equivalent prune step -- it always replays every
-    // commit -- so it hits the partial metaData and fails. Tracked as a follow-up: mirror
-    // the reference reader's CRC short-circuit in the FSR full_state SM. Until then, skip
-    // to keep the workspace green; reader-path coverage of this table still passes.
-    (
-        "pv_protocol_downgrade/",
-        "FSR full_state SM lacks the reference reader's CRC-based commit prune; partial \
-         metaData in commit 1 (spec-violating Spark protocol-downgrade encoding) is rejected \
-         at the strict JSON-read boundary. Follow-up: prune covered commits via CRC.",
-    ),
+// Reference the reader harness as a sub-module so its `pub` SKIP_LIST and
+// EXPECTED_KERNEL_FAILURES are accessible without duplication. `dead_code` is
+// allowed because we only consume the lists, not the harness function.
+#[path = "acceptance_workloads_reader.rs"]
+#[allow(dead_code)]
+mod reader;
+
+/// Workloads where DataFusion fails but the kernel default engine passes.
+/// Each entry is `(reason, &[spec_path_infix, ...])` matching the format of
+/// `reader::EXPECTED_KERNEL_FAILURES`.
+const ADDITIONAL_DF_FAILURES: &[(&str, &[&str])] = &[];
+
+/// Workloads where DataFusion succeeds but the kernel default engine fails.
+/// Each entry is a spec-path infix. The workload runs through DataFusion and
+/// is expected to pass; the listing exists only to override the corresponding
+/// reader-side `EXPECTED_KERNEL_FAILURES` entry so the harness's
+/// "expected-fail-but-succeeded" check doesn't false-positive on improvements
+/// the DataFusion path makes over the default engine.
+const FIXED_IN_DATAFUSION: &[&str] = &[
+    // Reading corrupt/invalid commit or checkpoint: default engine accepts these
+    // (no validation), DataFusion's FSR replay rejects them at the strict
+    // arrow-json read boundary.
+    "corrupt_truncated_commit_json/specs/corrupt_truncated_commit_json_error",
+    "cp_err_missing_protocol/specs/cp_err_missing_protocol_error",
+    "ct_invalid_json/specs/ct_invalid_json_error",
+    "dsReadCorruptJson/specs/dsReadCorruptJson_error",
+    "dsReadCorruptCheckpoint/specs/dsReadCorruptCheckpoint_error",
+    "dsReadModifyCheckpoint/specs/dsReadModifyCheckpoint_error",
+    // Schema-integrity validation: same as above; DataFusion rejects an invalid
+    // / empty schemaString at the strict JSON-read boundary.
+    "err_schema_invalid_json/specs/err_schema_invalid_json_error",
+    "err_schema_empty/specs/err_schema_empty_error",
+    // Spark's protocol-downgrade encoding writes a partial `metaData` action
+    // with no `schemaString` in commit 1; the default engine short-circuits
+    // protocol/metadata via the CRC at end_version, but DataFusion's full_state
+    // SM replays every commit and rejects the partial action. The reader test
+    // is in EXPECTED_KERNEL_FAILURES because spec is `error`-typed and the
+    // default engine doesn't error there; DataFusion erroring matches `error`.
+    "pv_protocol_downgrade/specs/pv_protocol_downgrade_snapshot",
+    // Type widening: DataFusion's parquet field-id-aware adapter handles list-
+    // element / map-key widening and nested-field metadata correctly, where the
+    // kernel default engine's apply_schema currently bails.
+    "tw_array_element/specs/tw_array_element_read_all",
+    "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
+    "tw_nested_field/specs/tw_nested_field_read_all",
+    "tw_nested_field/specs/tw_nested_field_read_large_count",
 ];
 
-fn should_skip_harness_path(test_path: &str) -> Option<&'static str> {
-    for (pattern, reason) in HARNESS_SKIP_PATTERNS {
-        if test_path.contains(pattern) {
-            return Some(reason);
-        }
+/// Locate the expected-failure entry for `spec_path_str`, applying the
+/// DataFusion delta on top of `reader::EXPECTED_KERNEL_FAILURES`.
+fn datafusion_expected_failure(
+    spec_path_str: &str,
+) -> Option<(&'static str, &'static [&'static str])> {
+    if FIXED_IN_DATAFUSION
+        .iter()
+        .any(|p| spec_path_str.contains(p))
+    {
+        return None;
     }
-    None
+    reader::EXPECTED_KERNEL_FAILURES
+        .iter()
+        .chain(ADDITIONAL_DF_FAILURES.iter())
+        .copied()
+        .find(|(_, patterns)| patterns.iter().any(|p| spec_path_str.contains(p)))
 }
 
-fn workload_spec_type(spec_path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(spec_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    json.get("type")?.as_str().map(str::to_owned)
-}
-
-fn should_skip_datafusion_spec_type(spec_type: Option<&str>) -> Option<&'static str> {
-    match spec_type.unwrap_or_default() {
-        "read" | "snapshot" | "snapshotConstruction" | "snapshot_construction" => None,
-        "cdf" => Some("CDF workload type not supported in this DataFusion read harness"),
-        "txn" => Some("Transaction workload type not supported in this DataFusion read harness"),
-        other if other.contains("domain_metadata") => {
-            Some("Domain metadata workload type not supported in this DataFusion read harness")
-        }
-        _ => Some("Unsupported workload type for DataFusion read harness"),
-    }
+fn should_skip_test(test_path: &str) -> Option<&'static str> {
+    reader::SKIP_LIST
+        .iter()
+        .find_map(|(p, r)| test_path.contains(p).then_some(*r))
 }
 
 async fn execute_snapshot_workload_datafusion(
@@ -146,6 +182,46 @@ async fn execute_read_workload_datafusion(
     })
 }
 
+/// Run a workload through DataFusion and return the validation outcome.
+fn run_datafusion_workload(test_case: &TestCase) -> Result<(), String> {
+    let table_root = test_case
+        .table_root()
+        .map_err(|e| format!("Failed to get table URL: {e}"))?;
+    let engine: Arc<dyn Engine> = test_utils::create_default_engine(&table_root)
+        .map_err(|e| format!("Failed to create engine: {e}"))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to build runtime: {e}"))?;
+
+    match &test_case.spec {
+        Spec::Read(read_spec) => {
+            let Some(expected) = read_spec.expected.as_ref() else {
+                return Ok(());
+            };
+            let result = runtime.block_on(execute_read_workload_datafusion(
+                Arc::clone(&engine),
+                &table_root,
+                read_spec,
+            ));
+            validate_read_result(result, &test_case.expected_dir(), expected)
+                .map_err(|e| e.to_string())
+        }
+        Spec::SnapshotConstruction(snapshot_spec) => {
+            let Some(expected) = snapshot_spec.expected.as_ref() else {
+                return Ok(());
+            };
+            let result = runtime.block_on(execute_snapshot_workload_datafusion(
+                Arc::clone(&engine),
+                &table_root,
+                snapshot_spec.as_ref(),
+            ));
+            validate_snapshot(result, expected).map_err(|e| e.to_string())
+        }
+    }
+}
+
 fn acceptance_workloads_datafusion_test(spec_path: &Path) -> datatest_stable::Result<()> {
     let spec_path_raw = format!(
         "{}/{}",
@@ -158,75 +234,28 @@ fn acceptance_workloads_datafusion_test(spec_path: &Path) -> datatest_stable::Re
     #[cfg(windows)]
     let spec_path_str = spec_path_str.replace('\\', "/");
 
-    if should_skip_harness_path(&spec_path_str).is_some() {
-        return Ok(());
-    }
-    if should_skip_datafusion_spec_type(workload_spec_type(&spec_path_abs).as_deref()).is_some() {
+    // Match reader's ordering: expected-failure check first (those workloads must
+    // actually run to assert they still fail), then SKIP_LIST short-circuit.
+    let expected_failure = datafusion_expected_failure(&spec_path_str);
+    if expected_failure.is_none() && should_skip_test(&spec_path_str).is_some() {
         return Ok(());
     }
 
     let test_case = TestCase::from_spec_path(&spec_path_abs);
-    let table_root = test_case.table_root().expect("Failed to get table URL");
-    let engine: Arc<dyn Engine> =
-        test_utils::create_default_engine(&table_root).expect("Failed to create engine");
+    let result = run_datafusion_workload(&test_case);
 
-    // Keep DataFusion comparison scoped to workloads that pass in kernel's default engine harness.
-    // This makes DataFusion ignore the same failing set as kernel. Log the skip so output remains
-    // diagnosable when DataFusion silently regresses on workloads kernel handles.
-    if let Err(e) = execute_and_validate_workload(
-        Arc::clone(&engine),
-        &table_root,
-        &test_case.spec,
-        &test_case.expected_dir(),
-    ) {
-        eprintln!(
-            "SKIP DataFusion workload '{}': kernel-default-engine also fails ({e})",
+    match (result, expected_failure) {
+        (Err(_), Some(_)) => {} // Expected to fail, did fail
+        (Ok(_), None) => {}     // Expected to pass, did pass
+        (Ok(_), Some((reason, _))) => panic!(
+            "DataFusion workload '{}' was expected to fail but succeeded! \
+             Reason: {reason}. Remove from ADDITIONAL_DF_FAILURES or add to FIXED_IN_DATAFUSION!",
             test_case.workload_name
-        );
-        return Ok(());
-    }
-
-    match &test_case.spec {
-        Spec::Read(read_spec) => {
-            let expected = match read_spec.expected.as_ref() {
-                Some(expected) => expected,
-                None => return Ok(()),
-            };
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(execute_read_workload_datafusion(
-                    Arc::clone(&engine),
-                    &table_root,
-                    read_spec,
-                ));
-            if let Err(e) = validate_read_result(result, &test_case.expected_dir(), expected) {
-                return Err(Box::new(std::io::Error::other(format!(
-                    "DataFusion workload '{}' failed: {e}",
-                    test_case.workload_name
-                ))));
-            }
-        }
-        Spec::SnapshotConstruction(snapshot_spec) => {
-            let expected = match snapshot_spec.expected.as_ref() {
-                Some(expected) => expected,
-                None => return Ok(()),
-            };
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(execute_snapshot_workload_datafusion(
-                    Arc::clone(&engine),
-                    &table_root,
-                    snapshot_spec.as_ref(),
-                ));
-            if let Err(rendered) = validate_snapshot(result, expected) {
-                return Err(Box::new(std::io::Error::other(format!(
-                    "DataFusion snapshot workload '{}' failed: {rendered}",
-                    test_case.workload_name
-                ))));
-            }
-        }
+        ),
+        (Err(e), None) => panic!(
+            "DataFusion workload '{}' failed: {}",
+            test_case.workload_name, e
+        ),
     }
     Ok(())
 }
