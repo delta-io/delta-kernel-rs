@@ -633,10 +633,11 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
 fn test_create_table_dup_physical_name(
     #[case] schema: StructType,
     #[case] expected_error_substring: Option<&str>,
+    #[values("name", "id")] cm_mode: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let result = create_table(&table_path, Arc::new(schema), "Test/1.0")
-        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
     match expected_error_substring {
@@ -649,7 +650,7 @@ fn test_create_table_dup_physical_name(
                 .to_string();
             assert!(
                 msg.contains(substr) && msg.contains(".a'") && msg.contains(".b'"),
-                "expected path-aware dedup error naming colliding leaves, got: {msg}"
+                "expected path-aware dedup error naming colliding leaves under {cm_mode}, got: {msg}"
             );
         }
     }

@@ -2664,18 +2664,21 @@ mod tests {
         #[case] schema: StructType,
         #[case] expected_error_substring: Option<String>,
     ) {
-        let result = schema.make_physical(ColumnMappingMode::Name);
-        match expected_error_substring {
-            None => {
-                result.expect("The input schema should be valid");
-            }
-            Some(substr) => {
-                assert_result_error_with_message(result.as_ref().map(|_| ()), &substr);
-                if let Err(e) = &result {
-                    assert!(
-                        !e.to_string().contains("'q'"),
-                        "walker must short-circuit on first collision; got: {e}"
-                    );
+        // The same dedup rules should apply under both CM modes.
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result = schema.make_physical(mode);
+            match &expected_error_substring {
+                None => {
+                    result.expect("The input schema should be valid");
+                }
+                Some(substr) => {
+                    assert_result_error_with_message(result.as_ref().map(|_| ()), substr);
+                    if let Err(e) = &result {
+                        assert!(
+                            !e.to_string().contains("'q'"),
+                            "walker must short-circuit on first collision under {mode:?}; got: {e}"
+                        );
+                    }
                 }
             }
         }

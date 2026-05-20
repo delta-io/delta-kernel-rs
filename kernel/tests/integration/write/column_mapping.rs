@@ -390,8 +390,11 @@ async fn test_column_mapping_partitioned_write(
 
 // Two fields with same physical name at different physical paths is valid. Write
 // should succeed.
+#[rstest::rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_same_phy_name_different_path() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_same_phy_name_different_path(
+    #[values("name", "id")] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, _) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
@@ -405,7 +408,7 @@ async fn test_same_phy_name_different_path() -> Result<(), Box<dyn std::error::E
 
     let logical_schema = Arc::new(fixtures::same_leaf_phy_name_under_different_parents());
     let snapshot = create_table(table_url.as_str(), logical_schema.clone(), "Test/1.0")
-        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -448,8 +451,11 @@ async fn test_same_phy_name_different_path() -> Result<(), Box<dyn std::error::E
 }
 
 /// A schema with two fields sharing same physical path should be rejected.
+#[rstest::rstest]
 #[tokio::test]
-async fn test_duplicated_phy_path_rejected() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_duplicated_phy_path_rejected(
+    #[values("name", "id")] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_url) = engine_store_setup("dup_phys_path", None);
     let schema = fixtures::nested_field_with_same_phy_path();
     let schema_json = serde_json::to_string(&schema)?;
@@ -457,7 +463,7 @@ async fn test_duplicated_phy_path_rejected() -> Result<(), Box<dyn std::error::E
     // Create a v0 commit in a hack way to bypass create_table validation.
     let v0 = format!(
         r#"{{"protocol":{{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}}}
-{{"metaData":{{"id":"test-id","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"4"}},"createdTime":1700000000000}}}}
+{{"metaData":{{"id":"test-id","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{"delta.columnMapping.mode":"{cm_mode}","delta.columnMapping.maxColumnId":"4"}},"createdTime":1700000000000}}}}
 "#
     );
     add_commit(table_url.as_str(), store.as_ref(), 0, v0).await?;

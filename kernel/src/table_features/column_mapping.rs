@@ -126,8 +126,11 @@ pub(crate) struct SeenColumnMappingAnnotations<'a> {
     /// `delta.columnMapping.id` -> first field name that claimed it.
     pub ids: HashMap<i64, &'a str>,
     /// Stack of per-struct sibling maps, one per struct currently being walked (root included).
-    /// Each map holds the physical names already claimed by that struct's children: key is the
-    /// child's physical name, value is its logical name.
+    /// Structs-only (not arrays or maps, since their elements / keys / values are anonymous in
+    /// delta). Call [`enter_struct`](Self::enter_struct) before iterating a struct's fields
+    /// and [`leave_struct`](Self::leave_struct) after finishing them. Each map holds the
+    /// physical names already claimed by that struct's children: key is the child's physical
+    /// name, value is its logical name.
     sibling_physical_names: Vec<HashMap<&'a str, &'a str>>,
 }
 
@@ -1124,20 +1127,23 @@ mod tests {
         #[case] schema: StructType,
         #[case] expected_error_substring: Option<String>,
     ) {
-        let result = validate_schema_column_mapping(&schema, ColumnMappingMode::Name);
-        match expected_error_substring {
-            None => {
-                result.expect("schema must validate");
-            }
-            Some(substr) => {
-                assert_result_error_with_message(result.as_ref().map(|_| ()), &substr);
-                // For the multiple-violations case, also confirm the deeper site was never
-                // reported.
-                if let Err(e) = &result {
-                    assert!(
-                        !e.to_string().contains("'q'"),
-                        "walker must short-circuit on first collision; got: {e}"
-                    );
+        // The same dedup rules should apply under both CM modes.
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result = validate_schema_column_mapping(&schema, mode);
+            match &expected_error_substring {
+                None => {
+                    result.expect("schema must validate");
+                }
+                Some(substr) => {
+                    assert_result_error_with_message(result.as_ref().map(|_| ()), substr);
+                    // For the multiple-violations case, also confirm the deeper site was never
+                    // reported.
+                    if let Err(e) = &result {
+                        assert!(
+                            !e.to_string().contains("'q'"),
+                            "walker must short-circuit on first collision under {mode:?}; got: {e}"
+                        );
+                    }
                 }
             }
         }
