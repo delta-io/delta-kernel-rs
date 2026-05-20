@@ -1558,27 +1558,29 @@ mod scan_metadata_completed_tests {
     }
 
     #[rstest]
-    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 0, 0)]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
         Some(Arc::new(Pred::literal(false))),
         0,
         0,
         0,
+        0,
         0
     )]
-    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
-    #[case::with_checkpoint("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 0, 2, 0)]
+    #[case::with_checkpoint("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1010, 1, 0)]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
-        2, 2, 0, 4
+        2, 2, 1502, 0, 4
     )]
     fn test_scan_metrics(
         #[case] table: &str,
         #[case] predicate: Option<Arc<Pred>>,
         #[case] expected_add_seen: u64,
         #[case] expected_active: u64,
+        #[case] expected_active_bytes: usize,
         #[case] expected_removes: u64,
         #[case] expected_filtered: u64,
     ) {
@@ -1587,6 +1589,7 @@ mod scan_metadata_completed_tests {
             total_duration,
             num_add_files_seen,
             num_active_add_files,
+            active_add_files_bytes,
             num_remove_files_seen,
             num_predicate_filtered,
             ..
@@ -1597,6 +1600,7 @@ mod scan_metadata_completed_tests {
         assert!(total_duration > Duration::ZERO);
         assert_eq!(num_add_files_seen, expected_add_seen);
         assert_eq!(num_active_add_files, expected_active);
+        assert_eq!(active_add_files_bytes, expected_active_bytes);
         assert_eq!(num_remove_files_seen, expected_removes);
         assert_eq!(num_predicate_filtered, expected_filtered);
     }

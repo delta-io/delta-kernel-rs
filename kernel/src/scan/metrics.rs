@@ -12,14 +12,13 @@ use crate::metrics::{MetricEvent, MetricId, ScanType};
 pub(crate) struct ScanMetrics {
     /// Add files seen during add remove deduplication. This does not include data skipped add
     /// files.
-    /// Java equivalent: `addFilesCounter`
     num_add_files_seen: AtomicU64,
     /// Add files that survived log replay (files to read). includes files that survived
     /// dataskipping, partition pruning, and add/remove deduplication.
-    /// Java equivalent: `activeAddFilesCounter`
     num_active_add_files: AtomicU64,
+    /// Number of bytes in the active add files as reported by the add action size filed
+    active_add_files_bytes: AtomicUsize,
     /// Remove files seen (from delta/commit files only).
-    /// Java equivalent: `removeFilesFromDeltaFilesCounter`
     num_remove_files_seen: AtomicU64,
     /// Non-file actions seen (protocol, metadata, etc.).
     num_non_file_actions: AtomicU64,
@@ -38,6 +37,7 @@ impl Default for ScanMetrics {
         Self {
             num_add_files_seen: AtomicU64::new(0),
             num_active_add_files: AtomicU64::new(0),
+            active_add_files_bytes: AtomicUsize::new(0),
             num_remove_files_seen: AtomicU64::new(0),
             num_non_file_actions: AtomicU64::new(0),
             num_predicate_filtered: AtomicU64::new(0),
@@ -53,8 +53,10 @@ impl ScanMetrics {
         self.num_add_files_seen.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn incr_active_add_files(&self) {
+    /// Record that we've seen an active add file, plus its size
+    pub(crate) fn record_active_add_file(&self, bytes: usize) {
         self.num_active_add_files.fetch_add(1, Ordering::Relaxed);
+        self.active_add_files_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn incr_remove_files_seen(&self) {
@@ -115,6 +117,7 @@ impl ScanMetrics {
             total_duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),
             num_active_add_files: self.num_active_add_files.load(Ordering::Relaxed),
+            active_add_files_bytes: self.active_add_files_bytes.load(Ordering::Relaxed),
             num_remove_files_seen: self.num_remove_files_seen.load(Ordering::Relaxed),
             num_non_file_actions: self.num_non_file_actions.load(Ordering::Relaxed),
             num_predicate_filtered: self.num_predicate_filtered.load(Ordering::Relaxed),

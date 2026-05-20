@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -161,11 +161,23 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     ) -> DeltaResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
-            //let size = getters[self.si
+            let size = getters[self.add_size_index].get_long(i, "add.size")?;
+            let size = if let Some(size) = size {
+                match size.try_into() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Could not convert size to usize: {e}");
+                        0
+                    }
+                }
+            } else {
+                warn!("Found an add action without required size field");
+                0
+            };
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
             return Ok(Some(FileActionInfo {
                 key: FileActionKey::new(path, dv_unique_id),
-                size: 0,
+                size,
                 is_add: true,
             }));
         }
@@ -401,6 +413,7 @@ mod tests {
     struct MockGetData {
         string_values: HashMap<(usize, String), String>,
         int_values: HashMap<(usize, String), i32>,
+        long_values: HashMap<(usize, String), i64>,
         errors: HashMap<(usize, String), String>,
     }
 
@@ -409,6 +422,7 @@ mod tests {
             Self {
                 string_values: HashMap::new(),
                 int_values: HashMap::new(),
+                long_values: HashMap::new(),
                 errors: HashMap::new(),
             }
         }
@@ -420,6 +434,10 @@ mod tests {
 
         fn add_int(&mut self, row: usize, field: &str, value: i32) {
             self.int_values.insert((row, field.to_string()), value);
+        }
+
+        fn add_long(&mut self, row: usize, field: &str, value: i64) {
+            self.long_values.insert((row, field.to_string()), value);
         }
     }
 
@@ -440,6 +458,16 @@ mod tests {
             }
             Ok(self
                 .int_values
+                .get(&(row_index, field_name.to_string()))
+                .cloned())
+        }
+
+        fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+            if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
+                return Err(crate::Error::Generic(error_msg.clone()));
+            }
+            Ok(self
+                .long_values
                 .get(&(row_index, field_name.to_string()))
                 .cloned())
         }
@@ -490,6 +518,7 @@ mod tests {
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "file1.parquet");
+        mock_add.add_long(1, "add.size", 100);
         let getters = create_getters_with_mocks(Some(&mock_add), None);
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 

@@ -420,7 +420,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
-        let Some(FileActionInfo{key: file_key, size: _size, is_add}) = self.deduplicator.extract_file_action(
+        let Some(FileActionInfo{key: file_key, size, is_add}) = self.deduplicator.extract_file_action(
             row,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
@@ -477,7 +477,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             self.row_transform_exprs.resize_with(row, Default::default);
             self.row_transform_exprs.push(transform);
         }
-        self.metrics.incr_active_add_files();
+        self.metrics.record_active_add_file(size);
         Ok(true)
     }
 }
