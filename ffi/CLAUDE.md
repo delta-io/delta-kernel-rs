@@ -29,6 +29,13 @@ the caller's memory space.
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
+- `src/expressions/kernel_visitor.rs` -- engine-to-kernel expression visitor;
+  hosts `visit_predicate_opaque*` for engine-defined ops
+- `src/expressions/pruning.rs` -- engine-callback framework for opaque-predicate
+  data skipping (`OpaquePruningCallbacks`, child/stats/scalar accessors)
+- `src/expressions/arrow_pruning.rs` -- `ArrowNamedOpaquePredicateOp`, the
+  default-engine adapter that routes per-row callback invocations during
+  stats-based file pruning (only built with `default-engine-base`)
 
 ## Read Flow
 

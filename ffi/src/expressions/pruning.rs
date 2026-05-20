@@ -1,14 +1,31 @@
 //! Engine callback framework for opaque-predicate data skipping.
 //!
-//! Engines register [`OpaquePruningCallbacks`] alongside their
-//! `EvaluationHandler`; kernel invokes them every time it needs a pruning
-//! decision for a [`Predicate::Opaque`] node. The engine evaluates the op
-//! in its own language using kernel-provided accessors over the op's
-//! children and the relevant stats.
+//! Engines wrap [`OpaquePruningCallbacks`] in a [`SharedOpaquePruningContext`]
+//! (see [`create_opaque_pruning_context`]) and attach the context to an opaque
+//! predicate via [`visit_predicate_opaque_with_pruning`]. Kernel then invokes
+//! the appropriate callback for every pruning decision involving that
+//! predicate -- once per Add action for stats-based file pruning, once per
+//! partition value set for partition pruning, once per parquet row group for
+//! row-group skipping. The engine evaluates the op in its own language using
+//! the accessors over the op's children and the relevant stats.
 //!
-//! See `doc/design/opaque-predicate-data-skipping.md` for the design.
+//! ## Contract
+//!
+//! - **Column names are physical.** Stats and partition values are keyed by physical column names
+//!   (the names that appear in parquet files), not logical schema names. Engines that build
+//!   predicates from a logical schema must resolve to physical names before constructing the opaque
+//!   op; otherwise lookups silently miss and every file is kept.
+//! - **Single-segment columns only.** [`ChildAccessor`] reports nested column references (`a.b.c`)
+//!   as [`OpaqueChildKind::Unsupported`]. Nested-column opaque predicates degrade to no pruning.
+//!   Engines that need nested-column pruning must add accessor surface or fall back to row-time
+//!   filtering.
+//! - **Supported scalar types.** Accessors cover `String`, integer types widened to `i64` (`Long`,
+//!   `Integer`, `Short`, `Byte`), and floats widened to `f64` (`Double`, `Float`). `Date`,
+//!   `Timestamp`, `Decimal`, and `Binary` are not yet wired through; engines requesting them get
+//!   `false` from the accessor.
 //!
 //! [`Predicate::Opaque`]: delta_kernel::expressions::Predicate::Opaque
+//! [`visit_predicate_opaque_with_pruning`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -25,35 +42,34 @@ use crate::{kernel_string_slice, KernelStringSlice, TryFromStringSlice};
 
 /// Pruning verdict written by the engine.
 ///
-/// `Unknown` is the default and is treated as "keep" by kernel; engines that
-/// cannot evaluate a particular op should leave the verdict at `Unknown`
-/// rather than guessing.
+/// `Unknown` is the zero value, so a default-initialized [`OpaquePruneResult`]
+/// is already "I don't know" -- engines that cannot evaluate the op leave the
+/// result alone and kernel keeps the file/row-group/partition conservatively.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpaquePruneVerdict {
+    /// Engine could not determine; keep conservatively.
+    Unknown = 0,
     /// Predicate evaluates true; keep the file/row-group/partition.
     Keep = 1,
     /// Predicate evaluates false; skip.
     Skip = 2,
-    /// Engine could not determine; keep conservatively.
-    Unknown = 3,
 }
 
-/// Write handle the engine populates inside a callback.
+/// Write handle the engine populates inside a callback. Zero-initialized
+/// (`verdict = 0`) means [`OpaquePruneVerdict::Unknown`].
 #[repr(C)]
+#[derive(Default)]
 pub struct OpaquePruneResult {
     verdict: u32,
 }
 
-impl Default for OpaquePruneResult {
-    fn default() -> Self {
-        Self {
-            verdict: OpaquePruneVerdict::Unknown as u32,
-        }
-    }
-}
-
 impl OpaquePruneResult {
+    /// Translate the engine-written verdict into kernel's `Option<bool>`.
+    /// `Keep` -> `Some(true)`, `Skip` -> `Some(false)`. Any other value
+    /// (including the default `Unknown`, or an out-of-range value from a
+    /// buggy engine) maps to `None` -- treated as "keep conservatively"
+    /// downstream.
     pub(crate) fn into_option(self) -> Option<bool> {
         match self.verdict {
             v if v == OpaquePruneVerdict::Keep as u32 => Some(true),
@@ -91,19 +107,20 @@ pub unsafe extern "C" fn opaque_prune_result_skip(out: *mut OpaquePruneResult) {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpaqueChildKind {
-    /// Argument shape not supported by the accessor (nested expressions,
-    /// multi-segment column refs, types this enum doesn't enumerate).
+    /// Argument shape not supported by the accessor: nested expressions
+    /// (`a + b`, `f(x)`), multi-segment column refs (`a.b.c`), or scalar
+    /// types this enum does not enumerate (decimal, date, timestamp, binary).
     Unsupported = 0,
     /// Single-segment column reference; read the name via
     /// [`child_accessor_column_name`].
     Column = 1,
     /// String literal; read via [`child_accessor_literal_string`].
     LiteralString = 2,
-    /// 64-bit integer literal (also widened from `Integer`); read via
-    /// [`child_accessor_literal_long`].
+    /// Integer literal (`Long`, `Integer`, `Short`, or `Byte` -- widened to
+    /// `i64`); read via [`child_accessor_literal_long`].
     LiteralLong = 3,
-    /// 64-bit floating-point literal (also widened from `Float`); read via
-    /// [`child_accessor_literal_double`].
+    /// Floating-point literal (`Double` or `Float` -- widened to `f64`); read
+    /// via [`child_accessor_literal_double`].
     LiteralDouble = 4,
     /// Boolean literal; read via [`child_accessor_literal_bool`].
     LiteralBool = 5,
@@ -113,6 +130,13 @@ pub enum OpaqueChildKind {
 
 /// Read accessor over an opaque op's child expressions. Borrowed for the
 /// duration of the callback; engines must not retain it.
+///
+/// Only single-segment column references are visible to the engine: a child
+/// like `Expression::Column("a.b.c")` (path length > 1) reports as
+/// [`OpaqueChildKind::Unsupported`] and the engine has no way to read its
+/// path. Predicates that reference nested struct fields therefore degrade
+/// to no kernel-side pruning -- the engine should fall back to row-time
+/// filtering for such cases.
 pub struct ChildAccessor<'a> {
     children: &'a [Expression],
 }
@@ -158,10 +182,9 @@ pub unsafe extern "C" fn child_accessor_kind(acc: *const ChildAccessor<'_>, idx:
     let kind = match child {
         Expression::Column(c) if c.path().len() == 1 => OpaqueChildKind::Column,
         Expression::Literal(Scalar::String(_)) => OpaqueChildKind::LiteralString,
-        Expression::Literal(Scalar::Long(_)) => OpaqueChildKind::LiteralLong,
-        Expression::Literal(Scalar::Integer(_)) => OpaqueChildKind::LiteralLong,
-        Expression::Literal(Scalar::Double(_)) => OpaqueChildKind::LiteralDouble,
-        Expression::Literal(Scalar::Float(_)) => OpaqueChildKind::LiteralDouble,
+        Expression::Literal(Scalar::Long(_) | Scalar::Integer(_))
+        | Expression::Literal(Scalar::Short(_) | Scalar::Byte(_)) => OpaqueChildKind::LiteralLong,
+        Expression::Literal(Scalar::Double(_) | Scalar::Float(_)) => OpaqueChildKind::LiteralDouble,
         Expression::Literal(Scalar::Boolean(_)) => OpaqueChildKind::LiteralBool,
         Expression::Literal(Scalar::Null(_)) => OpaqueChildKind::LiteralNull,
         _ => OpaqueChildKind::Unsupported,
@@ -221,8 +244,9 @@ pub unsafe extern "C" fn child_accessor_literal_string(
     true
 }
 
-/// Read an integer-literal child as i64. Accepts both `Long` and `Integer`
-/// scalars (the latter widened to i64). Returns `false` otherwise.
+/// Read an integer-literal child as i64. Accepts any signed integer scalar
+/// (`Long`, `Integer`, `Short`, `Byte`), widened to i64. Returns `false` for
+/// any non-integer literal.
 ///
 /// # Safety
 /// `acc` valid, `out` valid pointer.
@@ -236,17 +260,18 @@ pub unsafe extern "C" fn child_accessor_literal_long(
         return false;
     }
     let acc = unsafe { &*acc };
-    let value = match acc.child(idx) {
-        Some(Expression::Literal(Scalar::Long(v))) => *v,
-        Some(Expression::Literal(Scalar::Integer(v))) => i64::from(*v),
-        _ => return false,
+    let Some(Expression::Literal(scalar)) = acc.child(idx) else {
+        return false;
+    };
+    let Some(value) = scalar_as_i64(scalar) else {
+        return false;
     };
     unsafe { *out = value };
     true
 }
 
 /// Read a floating-point-literal child as f64. Accepts both `Double` and
-/// `Float` scalars.
+/// `Float` scalars (the latter widened).
 ///
 /// # Safety
 /// `acc` valid, `out` valid pointer.
@@ -304,10 +329,10 @@ pub(crate) trait StatsProvider {
     fn row_count(&self) -> Option<i64>;
 }
 
-/// Append-only arena for strings handed across the FFI boundary. Each
-/// interned string lives in a `Box<str>` whose heap allocation outlives
-/// the arena (the `Box` may move within the backing `Vec`, but the bytes
-/// it points to do not).
+/// Append-only arena for strings handed across the FFI boundary. The
+/// `RefCell` makes `StrArena: !Sync`, which is fine because each
+/// [`StatsAccessor`]/[`ScalarResolver`] is constructed and consumed within
+/// a single engine callback on a single kernel thread.
 #[derive(Default)]
 pub(crate) struct StrArena {
     boxes: std::cell::RefCell<Vec<Box<str>>>,
@@ -319,20 +344,27 @@ impl StrArena {
         let ptr = boxed.as_ptr();
         let len = boxed.len();
         self.boxes.borrow_mut().push(boxed);
-        // SAFETY: `ptr` points to the heap allocation owned by the
-        // `Box<str>` we just pushed. The Vec may reallocate its backing
-        // buffer (moving the Box's position), but the heap allocation
-        // never relocates, so the slice stays valid for `&self`'s
-        // lifetime.
+        // SAFETY: A `Box<str>` is a (ptr, len) pair pointing to a heap
+        // allocation it owns. When the backing `Vec<Box<str>>` reallocates,
+        // only the (ptr, len) pairs move; the heap allocations each box
+        // points to do not. The `Box` we just pushed will not be popped or
+        // freed for `&self`'s lifetime (the arena is append-only). The
+        // source `String` was valid UTF-8, so the bytes are too.
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
     }
 }
 
-/// Borrowed handle wrapping a [`StatsProvider`] for FFI consumption.
+/// Borrowed handle wrapping a `StatsProvider` for FFI consumption.
 ///
 /// String slices returned from the stats getters point into a small
 /// per-accessor arena freed when the accessor drops (at the end of the
 /// engine callback). The engine must copy slices it needs to retain.
+///
+/// Column names passed to the accessors must be **physical** names -- the
+/// names that appear in parquet files and in `Add.partitionValues`. Engines
+/// that built the opaque predicate from a logical (column-mapped) schema
+/// must resolve to physical names before constructing the children;
+/// otherwise lookups silently miss and every file is kept.
 pub struct StatsAccessor<'a> {
     provider: &'a dyn StatsProvider,
     arena: StrArena,
@@ -427,10 +459,13 @@ pub unsafe extern "C" fn stats_accessor_min_long(
     let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
         return false;
     };
-    let value = match acc.provider.min(&name, &DataType::LONG) {
-        Some(Scalar::Long(v)) => v,
-        Some(Scalar::Integer(v)) => i64::from(v),
-        _ => return false,
+    let Some(value) = acc
+        .provider
+        .min(&name, &DataType::LONG)
+        .as_ref()
+        .and_then(scalar_as_i64)
+    else {
+        return false;
     };
     unsafe { *out = value };
     true
@@ -453,10 +488,13 @@ pub unsafe extern "C" fn stats_accessor_max_long(
     let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
         return false;
     };
-    let value = match acc.provider.max(&name, &DataType::LONG) {
-        Some(Scalar::Long(v)) => v,
-        Some(Scalar::Integer(v)) => i64::from(v),
-        _ => return false,
+    let Some(value) = acc
+        .provider
+        .max(&name, &DataType::LONG)
+        .as_ref()
+        .and_then(scalar_as_i64)
+    else {
+        return false;
     };
     unsafe { *out = value };
     true
@@ -512,6 +550,10 @@ pub unsafe extern "C" fn stats_accessor_row_count(
 /// surface engines use during partition pruning. Holds a reference to the
 /// kernel-side [`ScalarExpressionEvaluator`] and a small per-callback arena
 /// for strings handed back to the engine.
+///
+/// Column names passed to the resolver must be **physical** names. Partition
+/// values in `Add.partitionValues` are keyed by physical name; a logical name
+/// from a column-mapped schema will silently miss every lookup.
 pub struct ScalarResolver<'a> {
     eval_expr: &'a ScalarExpressionEvaluator<'a>,
     arena: StrArena,
@@ -579,10 +621,8 @@ pub unsafe extern "C" fn scalar_resolver_long(
     let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
         return false;
     };
-    let value = match acc.resolve_column(&name) {
-        Some(Scalar::Long(v)) => v,
-        Some(Scalar::Integer(v)) => i64::from(v),
-        _ => return false,
+    let Some(value) = acc.resolve_column(&name).as_ref().and_then(scalar_as_i64) else {
+        return false;
     };
     unsafe { *out = value };
     true
@@ -619,9 +659,14 @@ pub type EvalOnPartitionValuesFn = extern "C" fn(
 pub type EvalOnRowGroupStatsFn = EvalAgainstStatsFn;
 
 /// Bundle of engine callbacks for opaque-predicate pruning. All three
-/// callbacks must be non-null when the struct is passed into kernel;
-/// engines that don't support a particular pass should provide a callback
-/// that immediately writes `Unknown`.
+/// callbacks are required (the `extern "C" fn` field type forbids null);
+/// engines that do not support a given pass should supply a callback that
+/// leaves the verdict at [`OpaquePruneVerdict::Unknown`].
+///
+/// Engines that pass `engine_state` to multiple
+/// [`create_opaque_pruning_context`] calls must arrange for `free_state` to
+/// be idempotent: every context owns one drop, and a shared raw state would
+/// be freed multiple times.
 #[repr(C)]
 #[derive(Debug)]
 pub struct OpaquePruningCallbacks {
@@ -634,18 +679,27 @@ pub struct OpaquePruningCallbacks {
     pub eval_on_partition_values: EvalOnPartitionValuesFn,
     /// Row-group-skipping callback.
     pub eval_on_row_group_stats: EvalOnRowGroupStatsFn,
-    /// Destructor for `engine_state`. Called when the last reference to
-    /// the pruning context is dropped.
+    /// Destructor for `engine_state`. Called once when the last reference
+    /// to the pruning context is dropped; may run on any kernel thread.
     pub free_state: extern "C" fn(engine_state: *mut c_void),
 }
 
-// SAFETY: engine is responsible for ensuring engine_state is sound to
-// access from any thread; kernel makes no thread guarantees beyond
-// "callbacks may be invoked concurrently".
+// SAFETY: `engine_state` and all four function pointers may be touched from
+// any kernel thread. The struct lives behind `Arc<...>` via
+// `SharedOpaquePruningContext`, and `SharedHandle` requires `T: Sync`, so
+// these impls are not optional. Engines must therefore ensure:
+//   - Every callback is safe to invoke from any thread, possibly concurrently (kernel currently
+//     invokes them sequentially per query, but does not promise to keep doing so).
+//   - `engine_state` is safe to access from whichever thread releases the last `Arc` reference --
+//     that is the thread that runs `free_state`.
 unsafe impl Send for OpaquePruningCallbacks {}
 unsafe impl Sync for OpaquePruningCallbacks {}
 
 impl Drop for OpaquePruningCallbacks {
+    /// Invokes `free_state` exactly once, on whichever thread releases the
+    /// last `Arc<OpaquePruningCallbacks>` reference. Engines that pin
+    /// `engine_state` to a particular thread (JNI handles, GC roots, etc.)
+    /// must arrange for thread-safe destruction.
     fn drop(&mut self) {
         (self.free_state)(self.engine_state);
     }
@@ -686,62 +740,59 @@ pub unsafe extern "C" fn free_opaque_pruning_context(ctx: Handle<SharedOpaquePru
 /// Invoke the engine's stats-based pruning callback. Used by the arrow
 /// adapter's `eval_pred` and by any future kernel-side per-file
 /// refinement pass.
-#[allow(clippy::needless_lifetimes)]
-pub(crate) fn invoke_eval_against_stats<'a>(
+pub(crate) fn invoke_eval_against_stats(
     cb: &OpaquePruningCallbacks,
     op_name: &str,
-    children: ChildAccessor<'a>,
-    stats: StatsAccessor<'a>,
+    children: &ChildAccessor<'_>,
+    stats: &StatsAccessor<'_>,
     inverted: bool,
 ) -> Option<bool> {
     let mut out = OpaquePruneResult::default();
     (cb.eval_against_stats)(
         cb.engine_state,
         kernel_string_slice!(op_name),
-        &children as *const _,
-        &stats as *const _,
+        children,
+        stats,
         inverted,
-        &mut out as *mut _,
+        &mut out,
     );
     out.into_option()
 }
 
-#[allow(clippy::needless_lifetimes)]
-pub(crate) fn invoke_eval_on_partition_values<'a>(
+pub(crate) fn invoke_eval_on_partition_values(
     cb: &OpaquePruningCallbacks,
     op_name: &str,
-    children: ChildAccessor<'a>,
-    resolver: ScalarResolver<'a>,
+    children: &ChildAccessor<'_>,
+    resolver: &ScalarResolver<'_>,
     inverted: bool,
 ) -> Option<bool> {
     let mut out = OpaquePruneResult::default();
     (cb.eval_on_partition_values)(
         cb.engine_state,
         kernel_string_slice!(op_name),
-        &children as *const _,
-        &resolver as *const _,
+        children,
+        resolver,
         inverted,
-        &mut out as *mut _,
+        &mut out,
     );
     out.into_option()
 }
 
-#[allow(clippy::needless_lifetimes)]
-pub(crate) fn invoke_eval_on_row_group_stats<'a>(
+pub(crate) fn invoke_eval_on_row_group_stats(
     cb: &OpaquePruningCallbacks,
     op_name: &str,
-    children: ChildAccessor<'a>,
-    stats: StatsAccessor<'a>,
+    children: &ChildAccessor<'_>,
+    stats: &StatsAccessor<'_>,
     inverted: bool,
 ) -> Option<bool> {
     let mut out = OpaquePruneResult::default();
     (cb.eval_on_row_group_stats)(
         cb.engine_state,
         kernel_string_slice!(op_name),
-        &children as *const _,
-        &stats as *const _,
+        children,
+        stats,
         inverted,
-        &mut out as *mut _,
+        &mut out,
     );
     out.into_option()
 }
@@ -785,12 +836,14 @@ where
     }
 }
 
-/// Widen a `Long`/`Integer` scalar to `i64`. Returns `None` for any other
-/// variant.
+/// Widen any signed integer scalar (`Long`, `Integer`, `Short`, `Byte`) to
+/// `i64`. Returns `None` for any other variant.
 pub(crate) fn scalar_as_i64(scalar: &Scalar) -> Option<i64> {
     match scalar {
         Scalar::Long(v) => Some(*v),
         Scalar::Integer(v) => Some(i64::from(*v)),
+        Scalar::Short(v) => Some(i64::from(*v)),
+        Scalar::Byte(v) => Some(i64::from(*v)),
         _ => None,
     }
 }
@@ -801,6 +854,8 @@ mod tests {
 
     use std::cell::Cell;
     use std::ptr;
+
+    use delta_kernel::expressions::column_expr;
 
     use super::*;
 
@@ -836,8 +891,6 @@ mod tests {
 
     #[test]
     fn child_accessor_reads_column_and_literal() {
-        use delta_kernel::expressions::{column_expr, Expression};
-
         let exprs = [column_expr!("name"), Expression::literal("foo")];
         let acc = ChildAccessor::new(&exprs);
 
@@ -872,8 +925,6 @@ mod tests {
 
     #[test]
     fn child_accessor_rejects_wrong_kind() {
-        use delta_kernel::expressions::{column_expr, Expression};
-
         let exprs = [column_expr!("name"), Expression::literal("foo")];
         let acc = ChildAccessor::new(&exprs);
 
@@ -1034,8 +1085,8 @@ mod tests {
         let result = invoke_eval_against_stats(
             &cb,
             "STARTS_WITH",
-            ChildAccessor::new(&exprs),
-            StatsAccessor::new(&stats),
+            &ChildAccessor::new(&exprs),
+            &StatsAccessor::new(&stats),
             true,
         );
         let logged = CALLBACK_LOG.with(Cell::take);
@@ -1059,8 +1110,8 @@ mod tests {
         let result = invoke_eval_against_stats(
             &cb,
             "FOO",
-            ChildAccessor::new(&exprs),
-            StatsAccessor::new(&stats),
+            &ChildAccessor::new(&exprs),
+            &StatsAccessor::new(&stats),
             false,
         );
         assert_eq!(result, Some(true));
@@ -1082,8 +1133,8 @@ mod tests {
         let result = invoke_eval_against_stats(
             &cb,
             "FOO",
-            ChildAccessor::new(&exprs),
-            StatsAccessor::new(&stats),
+            &ChildAccessor::new(&exprs),
+            &StatsAccessor::new(&stats),
             false,
         );
         assert_eq!(result, None);

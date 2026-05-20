@@ -15,8 +15,8 @@
 //! See `doc/design/opaque-predicate-data-skipping.md`.
 
 use delta_kernel::arrow::array::{
-    Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray,
+    Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaquePredicate, ArrowOpaquePredicateOp,
@@ -97,33 +97,56 @@ impl<'a> StatsProvider for BatchRowStatsProvider<'a> {
 
 /// Read a typed value out of `array` at index `row`, coercing to the
 /// requested `dtype`. Returns `None` for unsupported types.
+///
+/// For an integer `dtype` (LONG / INTEGER / SHORT / BYTE) any narrower signed
+/// integer array is accepted and reported as the corresponding `Scalar`
+/// variant. For a `DOUBLE` request, both `Float64Array` and `Float32Array` are
+/// accepted. Engines that need to know the original width should keep the
+/// dispatch granular.
 fn scalar_from_array(array: &dyn Array, row: usize, dtype: &DataType) -> Option<Scalar> {
-    if *dtype == DataType::STRING {
-        let arr = array.as_any().downcast_ref::<StringArray>()?;
-        return Some(Scalar::String(arr.value(row).to_string()));
-    }
-    if *dtype == DataType::LONG {
-        if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-            return Some(Scalar::Long(arr.value(row)));
-        }
-        if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
-            return Some(Scalar::Integer(arr.value(row)));
-        }
-        return None;
-    }
-    if *dtype == DataType::INTEGER {
-        return array
-            .as_any()
+    let any = array.as_any();
+    match dtype {
+        d if *d == DataType::STRING => any
+            .downcast_ref::<StringArray>()
+            .map(|arr| Scalar::String(arr.value(row).to_string())),
+        d if *d == DataType::LONG => integer_scalar(any, row),
+        d if *d == DataType::INTEGER => any
             .downcast_ref::<Int32Array>()
-            .map(|arr| Scalar::Integer(arr.value(row)));
+            .map(|arr| Scalar::Integer(arr.value(row))),
+        d if *d == DataType::SHORT => any
+            .downcast_ref::<Int16Array>()
+            .map(|arr| Scalar::Short(arr.value(row))),
+        d if *d == DataType::BYTE => any
+            .downcast_ref::<Int8Array>()
+            .map(|arr| Scalar::Byte(arr.value(row))),
+        d if *d == DataType::DOUBLE => double_scalar(any, row),
+        d if *d == DataType::FLOAT => any
+            .downcast_ref::<Float32Array>()
+            .map(|arr| Scalar::Float(arr.value(row))),
+        _ => None,
     }
-    if *dtype == DataType::DOUBLE {
-        return array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .map(|arr| Scalar::Double(arr.value(row)));
+}
+
+fn integer_scalar(any: &dyn std::any::Any, row: usize) -> Option<Scalar> {
+    if let Some(arr) = any.downcast_ref::<Int64Array>() {
+        return Some(Scalar::Long(arr.value(row)));
     }
-    None
+    if let Some(arr) = any.downcast_ref::<Int32Array>() {
+        return Some(Scalar::Integer(arr.value(row)));
+    }
+    if let Some(arr) = any.downcast_ref::<Int16Array>() {
+        return Some(Scalar::Short(arr.value(row)));
+    }
+    any.downcast_ref::<Int8Array>()
+        .map(|arr| Scalar::Byte(arr.value(row)))
+}
+
+fn double_scalar(any: &dyn std::any::Any, row: usize) -> Option<Scalar> {
+    if let Some(arr) = any.downcast_ref::<Float64Array>() {
+        return Some(Scalar::Double(arr.value(row)));
+    }
+    any.downcast_ref::<Float32Array>()
+        .map(|arr| Scalar::Float(arr.value(row)))
 }
 
 // === ArrowNamedOpaquePredicateOp ==============================================
@@ -165,22 +188,18 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
         let Some(cb) = self.inner().callbacks_clone() else {
-            // No callbacks: all-null mask. Kleene-null = "unknown" -> keep.
+            // No callbacks registered: every-row unknown. Data-skipping treats
+            // unknown as keep, so kernel won't prune any files.
             return Ok(BooleanArray::from(vec![None; batch.num_rows()]));
         };
 
+        let op_name = self.inner().op_name();
+        let children = ChildAccessor::new(args);
         let mut results: Vec<Option<bool>> = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let provider = BatchRowStatsProvider::new(batch, row);
-            let children = ChildAccessor::new(args);
-            let accessor = StatsAccessor::new(&provider);
-            let verdict = invoke_eval_against_stats(
-                &cb,
-                self.inner().op_name(),
-                children,
-                accessor,
-                inverted,
-            );
+            let stats = StatsAccessor::new(&provider);
+            let verdict = invoke_eval_against_stats(&cb, op_name, &children, &stats, inverted);
             results.push(verdict);
         }
         Ok(BooleanArray::from(results))
@@ -197,8 +216,7 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> DeltaResult<Option<bool>> {
-        // Forward to the inner op's OpaquePredicateOp impl; that's where the
-        // engine partition-pruning callback dispatch lives.
+        // Partition pruning dispatch lives on the inner op.
         <NamedOpaquePredicateOp as delta_kernel::expressions::OpaquePredicateOp>::eval_pred_scalar(
             self.inner(),
             eval_expr,
@@ -228,11 +246,11 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
-        // When the engine has registered callbacks, return an arrow-wrapped
-        // opaque predicate so kernel's indirect-rewrite path keeps the op
-        // live in the rewritten predicate. The default engine's
-        // `evaluate_predicate` then invokes our `eval_pred` per metadata
-        // batch row.
+        // With callbacks present, keep the op live across the indirect rewrite
+        // so the default engine's `evaluate_predicate` can drive `eval_pred`
+        // per metadata-batch row. When `inverted`, wrap in `Not`; kernel's
+        // batch evaluator pushes that down into the `eval_pred` call with
+        // `inverted=true` so the engine sees a single (un-doubled) inversion.
         if !self.inner().has_callbacks() {
             return None;
         }
@@ -245,10 +263,12 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use delta_kernel::arrow::array::ArrayRef;
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use delta_kernel::expressions::column_expr;
 
     use super::*;
     use crate::expressions::pruning::OpaquePruningCallbacks;
@@ -359,9 +379,7 @@ mod tests {
         } {
             return;
         }
-        // Own a copy of the column name so we can pass a fresh slice into
-        // both `stats_accessor_min_string` and `stats_accessor_max_string`
-        // (KernelStringSlice is consumed by value by each call).
+        // KernelStringSlice is consumed by value; copy so we can pass it twice.
         let col_name = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&col_slice) }
             .unwrap_or_default();
 
@@ -527,8 +545,6 @@ mod tests {
 
     #[test]
     fn eval_pred_prunes_per_row_via_engine_callback() {
-        use delta_kernel::expressions::{column_expr, Expression};
-
         let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::with_callbacks(
             "STARTS_WITH",
             callbacks(),
@@ -548,8 +564,6 @@ mod tests {
 
     #[test]
     fn eval_pred_without_callbacks_returns_all_unknown() {
-        use delta_kernel::expressions::{column_expr, Expression};
-
         let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::new("STARTS_WITH"));
         let args = vec![column_expr!("name"), Expression::literal("foo")];
         let batch = three_file_batch();
@@ -560,5 +574,75 @@ mod tests {
         assert!(result.is_null(0));
         assert!(result.is_null(1));
         assert!(result.is_null(2));
+    }
+
+    // === Inverted-flag forwarding =============================================
+
+    // Callback that records whether kernel passed `inverted=true` and returns
+    // Skip unconditionally so we can verify both the inversion flag and the
+    // verdict propagation in one shot.
+    extern "C" fn inverted_recording_eval(
+        _state: *mut std::ffi::c_void,
+        _op_name: crate::KernelStringSlice,
+        _children: *const ChildAccessor<'_>,
+        _stats: *const StatsAccessor<'_>,
+        inverted: bool,
+        out: *mut crate::expressions::pruning::OpaquePruneResult,
+    ) {
+        SAW_INVERTED.with(|c| c.set(c.get() || inverted));
+        unsafe { crate::expressions::pruning::opaque_prune_result_skip(out) };
+    }
+
+    thread_local! {
+        static SAW_INVERTED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn inverted_recording_callbacks() -> Arc<OpaquePruningCallbacks> {
+        Arc::new(OpaquePruningCallbacks {
+            engine_state: std::ptr::null_mut(),
+            eval_against_stats: inverted_recording_eval,
+            eval_on_partition_values: no_op_partition,
+            eval_on_row_group_stats: inverted_recording_eval,
+            free_state: no_op_free,
+        })
+    }
+
+    #[test]
+    fn eval_pred_forwards_inverted_flag_to_engine() {
+        SAW_INVERTED.with(|c| c.set(false));
+        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::with_callbacks(
+            "STARTS_WITH",
+            inverted_recording_callbacks(),
+        ));
+        let args = vec![column_expr!("name"), Expression::literal("foo")];
+        let batch = three_file_batch();
+
+        let result = ArrowOpaquePredicateOp::eval_pred(&op, &args, &batch, true).unwrap();
+        assert_eq!(result.len(), 3);
+        // All Skip verdicts since the engine wrote Skip every time.
+        for row in 0..3 {
+            assert!(!result.value(row), "row {row} should be skipped");
+        }
+        assert!(
+            SAW_INVERTED.with(Cell::get),
+            "engine callback should have observed inverted=true"
+        );
+    }
+
+    #[test]
+    fn eval_pred_inverted_false_does_not_set_flag() {
+        SAW_INVERTED.with(|c| c.set(false));
+        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::with_callbacks(
+            "STARTS_WITH",
+            inverted_recording_callbacks(),
+        ));
+        let args = vec![column_expr!("name"), Expression::literal("foo")];
+        let batch = three_file_batch();
+
+        ArrowOpaquePredicateOp::eval_pred(&op, &args, &batch, false).unwrap();
+        assert!(
+            !SAW_INVERTED.with(Cell::get),
+            "engine callback should not have observed inverted=true"
+        );
     }
 }

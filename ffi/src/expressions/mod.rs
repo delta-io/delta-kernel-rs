@@ -170,9 +170,7 @@ impl NamedOpaquePredicateOp {
 
 impl PartialEq for NamedOpaquePredicateOp {
     fn eq(&self, other: &Self) -> bool {
-        // Identity is the op name; the optional callbacks slot is incidental
-        // engine-side bookkeeping. Two ops with the same name represent the
-        // same engine-defined operator.
+        // Identity is the op name; callbacks are engine-side bookkeeping.
         self.name == other.name
     }
 }
@@ -198,7 +196,7 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         let children = ChildAccessor::new(exprs);
         let resolver = ScalarResolver::new(eval_expr);
         Ok(invoke_eval_on_partition_values(
-            cb, &self.name, children, resolver, inverted,
+            cb, &self.name, &children, &resolver, inverted,
         ))
     }
 
@@ -212,7 +210,7 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         let children = ChildAccessor::new(exprs);
         let provider = DirectStatsProvider::new(evaluator);
         let stats = StatsAccessor::new(&provider);
-        invoke_eval_on_row_group_stats(cb, &self.name, children, stats, inverted)
+        invoke_eval_on_row_group_stats(cb, &self.name, &children, &stats, inverted)
     }
 
     fn as_data_skipping_predicate(
@@ -221,12 +219,9 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         _exprs: &[Expression],
         _inverted: bool,
     ) -> Option<Predicate> {
-        // No native-predicate rewrite. The arrow adapter
-        // (`ArrowNamedOpaquePredicateOp`) is the path that engages file
-        // pruning via the default engine's batch evaluator; engines using
-        // a different EvaluationHandler need the kernel-side per-file
-        // refinement pass documented in
-        // `doc/design/opaque-predicate-kernel-refinement-playbook.md`.
+        // No native rewrite: file pruning runs through the arrow adapter
+        // (`ArrowNamedOpaquePredicateOp`). Engines with a custom
+        // `EvaluationHandler` get partition + row-group pruning only.
         None
     }
 }
@@ -234,6 +229,9 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::cell::RefCell;
+    use std::ffi::c_void;
 
     use super::*;
     use crate::TryFromStringSlice;
@@ -297,9 +295,6 @@ mod tests {
         // can be wrapped into a SharedOpaquePredicateOp handle and the name read back via
         // visit_kernel_opaque_predicate_op_name -- the same path engine_visitor uses when it
         // hands the op back to the engine.
-        use std::cell::RefCell;
-        use std::ffi::c_void;
-
         let pred = Predicate::opaque(
             NamedOpaquePredicateOp::new("STARTS_WITH"),
             [Expression::literal("test")],
