@@ -18,7 +18,10 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
         .read_files(vec![(url, None)])?
         .next()
         .ok_or_else(|| Error::generic("CRC file read returned no data"))??;
-    let crc: Crc = serde_json::from_slice(&data)?;
+    let mut crc: Crc = serde_json::from_slice(&data)?;
+    // The wire format does not carry a version; the filename does. Populate it here so
+    // `crc.version` is the source of truth for downstream callers.
+    crc.version = crc_path.version;
     Ok(crc)
 }
 
@@ -139,6 +142,16 @@ mod tests {
         assert!(crc.num_deleted_records_opt.is_none());
         assert!(crc.num_deletion_vectors_opt.is_none());
         assert!(crc.deleted_record_counts_histogram_opt.is_none());
+    }
+
+    #[test]
+    fn test_read_crc_file_populates_version_from_filename() {
+        let engine = SyncEngine::new();
+        let table_root = test_table_root("./tests/data/crc-full/");
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+        let crc = try_read_crc_file(&engine, &crc_path).unwrap();
+        // Body has no version; reader populates it from the `.crc` filename.
+        assert_eq!(crc.version, 0);
     }
 
     #[test]

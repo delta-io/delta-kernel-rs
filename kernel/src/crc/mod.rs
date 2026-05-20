@@ -41,7 +41,7 @@ pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 pub(crate) use writer::try_write_crc_file;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::Error;
+use crate::{Error, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -65,6 +65,10 @@ use crate::Error;
 #[serde(try_from = "CrcRaw")]
 pub struct Crc {
     // ===== Required fields =====
+    /// The table version this CRC describes. Loaded from the `.crc` filename, not from the
+    /// file's JSON body, so this is the source of truth for "what version is `self`".
+    #[serde(skip)]
+    pub version: Version,
     /// The table [`Metadata`] at this version.
     pub metadata: Metadata,
     /// The table [`Protocol`] at this version.
@@ -189,6 +193,9 @@ impl TryFrom<CrcRaw> for Crc {
             file_size_histogram: raw.file_size_histogram,
         });
         Ok(Crc {
+            // CrcRaw does not carry a version field; [`try_read_crc_file`] overwrites this
+            // with the version parsed from the `.crc` filename.
+            version: 0,
             metadata: raw.metadata,
             protocol: raw.protocol,
             file_stats_state,

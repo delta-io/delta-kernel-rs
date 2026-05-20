@@ -591,6 +591,7 @@ impl Snapshot {
             .map(|base| {
                 let mut crc = base.as_ref().clone();
                 crc.apply(crc_delta);
+                crc.version = new_version;
                 crc
             });
 
