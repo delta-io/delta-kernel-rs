@@ -17,7 +17,6 @@ use delta_kernel::schema::SchemaRef;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
-use futures::TryStreamExt;
 
 use crate::models::ReadSpec;
 use crate::predicate_parser::parse_predicate;
@@ -88,29 +87,40 @@ pub fn build_scan_for_spec(
     Ok((scan, predicate))
 }
 
-/// Drive an already-built [`Scan`] to completion via the [`DataFusionExecutor`],
-/// collect the result batches, apply the residual predicate (if any), and return a
+/// Drive an already-built [`Scan`] to completion via
+/// [`DataFusionExecutor::scan_data`], collect the result batches, apply the residual
+/// predicate (if any) post-collect via [`filter_batches_with_predicate`], and return a
 /// [`ReadResult`].
+///
+/// The residual predicate runs post-collect rather than via `df.filter(...)` because
+/// the scan's underlying plan still mixes batches whose nested partition-column
+/// metadata isn't consistent across the parquet-read and partition-broadcast paths
+/// (see `partitionValues_parsed.col-<uuid>`); pushing a filter into the DataFusion
+/// plan triggers an arrow-side `coalesce_batches` assertion when these mixed-metadata
+/// batches need to be combined. The outer projection installed by
+/// [`DataFusionExecutor::read_relation`] makes the *output* schema consistent
+/// (logical names + Delta metadata everywhere), but the *input-side* coalesce inside
+/// the scan plan still sees the unstamped variants. Until those upstream operators
+/// stamp consistent metadata too, predicate pushdown stays disabled here. The
+/// post-collect path runs on already-stamped batches, sidestepping the mismatch.
 pub async fn execute_read_via_datafusion(
     executor: &DataFusionExecutor,
     scan: &Scan,
     post_filter_predicate: Option<&Predicate>,
 ) -> DeltaResult<ReadResult> {
-    let sm = scan
-        .scan_state_machine()
-        .map_err(|e| Error::generic(format!("build replay scan SM: {e}")))?;
-    let batches: Vec<RecordBatch> = executor
-        .drive_to_stream(sm)
+    let raw_batches = executor
+        .scan_data(scan)
         .await
         .map_err(|e| Error::generic(format!("drive replay scan via DataFusionExecutor: {e}")))?
-        .try_collect()
+        .collect()
         .await
-        .map_err(|e| Error::generic(format!("collect replay scan stream: {e}")))?;
-    let batches = filter_batches_with_predicate(batches, post_filter_predicate)?;
+        .map_err(|e| Error::generic(format!("collect replay scan DataFrame: {e}")))?;
+    let batches = filter_batches_with_predicate(raw_batches, post_filter_predicate)?;
+    let logical_schema = scan.logical_schema();
     let row_count = batches.iter().map(|b| b.num_rows() as u64).sum();
     Ok(ReadResult {
         batches,
-        schema: scan.logical_schema().clone(),
+        schema: logical_schema.clone(),
         row_count,
     })
 }

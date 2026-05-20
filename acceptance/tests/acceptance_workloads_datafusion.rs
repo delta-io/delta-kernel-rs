@@ -24,7 +24,7 @@ use acceptance::acceptance_workloads::TestCase;
 use delta_kernel::{DeltaResult, Engine, Error};
 use delta_kernel_benchmarks::models::{SnapshotConstructionSpec, Spec};
 use delta_kernel_benchmarks::workload::{build_scan_for_spec, execute_read_via_datafusion};
-use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
+use delta_kernel_datafusion_engine::DataFusionExecutor;
 
 // Reference the reader harness as a sub-module so its `pub` SKIP_LIST and
 // EXPECTED_KERNEL_FAILURES are accessible without duplication. `dead_code` is
@@ -117,18 +117,17 @@ async fn execute_snapshot_workload_datafusion(
     )?;
     let executor = DataFusionExecutor::try_new_with_engine(engine)
         .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let sm = snapshot
+    let fsr = snapshot
         .full_state_builder()
         .build()
-        .and_then(|fs| fs.state_machine())
-        .map_err(|e| Error::generic(format!("build full_state SM: {e}")))?;
-    let rp = executor
-        .drive_to_completion(sm)
+        .map_err(|e| Error::generic(format!("build full_state plan: {e}")))?;
+    executor
+        .full_state(&fsr)
         .await
-        .map_err(|e| Error::generic(format!("drive full_state SM: {e}")))?;
-    testing::collect_result(&executor, rp)
+        .map_err(|e| Error::generic(format!("drive full_state via DataFusionExecutor: {e}")))?
+        .collect()
         .await
-        .map_err(|e| Error::generic(format!("collect full_state result: {e}")))?;
+        .map_err(|e| Error::generic(format!("collect full_state DataFrame: {e}")))?;
     let table_configuration = snapshot.table_configuration();
     Ok(SnapshotResult {
         version: snapshot.version(),

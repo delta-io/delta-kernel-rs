@@ -51,11 +51,11 @@ uuid = { version = "1", features = ["v4"] }
 
 [features]
 # Exposes `delta_kernel_datafusion_engine::testing`: buffered collectors over
-# `stream_relation` / `execute_plans` for integration tests and acceptance harnesses
-# that want eager `Vec<RecordBatch>` materialization without taking `futures` / our
-# private `DfResultIntoDelta` extension as a per-call-site dep. Not for production use.
-# Named `testing` (not `test_utils`) to avoid clashing with the workspace `test_utils`
-# crate at import sites.
+# `read_relation` / `execute_plans` for integration tests and acceptance harnesses
+# that want eager `Vec<RecordBatch>` materialization without re-wiring `.collect()`
+# on the returned `DataFrame` and our private `DfResultIntoDelta` extension at every
+# call site. Not for production use. Named `testing` (not `test_utils`) to avoid
+# clashing with the workspace `test_utils` crate at import sites.
 test-utils = []
 
 [dev-dependencies]

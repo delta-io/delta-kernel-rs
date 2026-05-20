@@ -9,16 +9,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::catalog::TableProvider;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::ViewTable;
 use datafusion::execution::context::SessionContext;
+use datafusion_common::arrow::datatypes::{FieldRef, Schema as ArrowSchema};
 use datafusion_common::error::DataFusionError;
 use datafusion_execution::config::SessionConfig;
-use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_expr::LogicalPlan;
-use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::TaskContext;
+use datafusion_expr::{Expr, LogicalPlan};
 use datafusion_physical_plan::ExecutionPlan;
-use delta_kernel::arrow::datatypes::SchemaRef;
-use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -34,11 +33,17 @@ use delta_kernel::plans::state_machines::framework::phase_operation::{
 };
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
 use delta_kernel::plans::state_machines::framework::state_machine::{AdvanceResult, StateMachine};
-use delta_kernel::{Engine, Error as KernelError};
-use futures::{StreamExt, TryStreamExt};
+use delta_kernel::plans::state_machines::scan::FullState;
+use delta_kernel::scan::Scan;
+use delta_kernel::schema::StructType;
+use delta_kernel::Engine;
+use delta_kernel::Error as KernelError;
+use futures::TryStreamExt;
 use url::Url;
 use uuid::Uuid;
 
+use crate::compile::expr_translator::build_logical_projection;
+use crate::compile::stamp_udf::StampFieldUdf;
 use crate::compile::{compile_plan_logical, CompileContext};
 use crate::error::DfResultIntoDelta;
 use crate::exec::LoadTableProvider;
@@ -159,8 +164,8 @@ impl DataFusionExecutor {
     /// (kernel-side decision plans, schema queries) and returning the SM's terminal value.
     ///
     /// The terminal value is whatever `R` the SM was constructed for: for read-style SMs that
-    /// is typically a [`ResultPlan`] that the caller streams via [`Self::drive_to_stream`]
-    /// (or, equivalently, by hand with [`Self::execute_plans`] + [`Self::stream_relation`]).
+    /// is typically a [`ResultPlan`] the caller opens via [`Self::drive_to_dataframe`]
+    /// (or, equivalently, by hand with [`Self::execute_plans`] + [`Self::read_relation`]).
     pub async fn drive_to_completion<R: Send + 'static>(
         &self,
         mut sm: CoroutineSM<R>,
@@ -193,33 +198,48 @@ impl DataFusionExecutor {
             .into_delta()
     }
 
-    /// Drive a [`ResultPlan`]-returning SM and open a stream over its result relation.
+    /// Drive a [`ResultPlan`]-returning SM and open its result relation as a [`DataFrame`].
     ///
     /// Combines [`Self::drive_to_completion`], [`Self::execute_plans`], and
-    /// [`Self::stream_relation`] into one call so callers that just want the row stream an
-    /// SM produces don't have to thread the intermediate [`ResultPlan`] through their own
+    /// [`Self::read_relation`] into one call so callers that just want a DataFrame over an
+    /// SM's output don't have to thread the intermediate [`ResultPlan`] through their own
     /// code. Useful for read-style SMs (`scan_state_machine`, `full_state`, ...) whose
-    /// terminal value is always a `ResultPlan`. Callers wanting an eager `Vec<RecordBatch>`
-    /// can `try_collect()` on the returned stream.
-    pub async fn drive_to_stream(
+    /// terminal value is always a `ResultPlan`.
+    pub async fn drive_to_dataframe(
         &self,
         sm: CoroutineSM<ResultPlan>,
-    ) -> Result<SendableRecordBatchStream, DeltaError> {
+    ) -> Result<DataFrame, DeltaError> {
         let rp = self.drive_to_completion(sm).await?;
         self.execute_plans(&rp.plans).await?;
-        self.stream_relation(&rp.result_relation).await
+        self.read_relation(&rp.result_relation).await
     }
 
-    /// Stream every batch of a registered relation by handle. Returns a single coalesced
-    /// [`SendableRecordBatchStream`] whose batches have their nested field-declaration
-    /// metadata re-stamped to match `handle`'s declared schema (see
-    /// [`crate::exec::stamp_batch_metadata`] for why this is necessary, primarily for
-    /// column-mapping tables). Callers that want an eager `Vec<RecordBatch>` can
-    /// `try_collect()` the returned stream.
-    pub async fn stream_relation(
+    /// Open a registered relation as a [`DataFrame`] whose logical schema matches
+    /// `handle.schema` byte-for-byte: top-level column names, nested struct field
+    /// names, *and* `delta.columnMapping.*` / `parquet.field.id` field metadata.
+    /// Callers can run `.collect()`, `.execute_stream()`, `.filter(...)`, or further
+    /// `.select(...)` directly against the kernel-logical schema without re-stamping.
+    ///
+    /// The underlying provider exposes the *physical* arrow schema (column-mapping
+    /// id-renamed `col-<uuid>` names on nested fields, no Delta metadata). To bridge
+    /// the gap this method wraps the raw provider DataFrame in a per-top-level-field
+    /// projection built by [`build_logical_projection`]:
+    ///
+    /// - Primitive top-level fields pass through bare; the [`StampFieldUdf`] declares
+    ///   the projection's output [`FieldRef`] so metadata flows into the schema.
+    /// - Nested struct fields are reshaped into a `named_struct(get_field(...))` tree
+    ///   that emits logical names at every depth.
+    /// - `List<Struct>` / `Map<*, Struct>` (where supported) get an `array_transform`
+    ///   lambda that recursively reshapes the element struct.
+    ///
+    /// This path replaces the historical post-collect `stamp_batch_metadata` shim --
+    /// every reshape happens inside the logical plan so the projection is composable
+    /// with downstream `df.filter` / `df.select` / coalesce ops without schema
+    /// mismatches.
+    pub async fn read_relation(
         &self,
         handle: &RelationHandle,
-    ) -> Result<SendableRecordBatchStream, DeltaError> {
+    ) -> Result<DataFrame, DeltaError> {
         let provider = self
             .providers_lock()
             .and_then(|g| {
@@ -232,28 +252,44 @@ impl DataFusionExecutor {
                 })
             })
             .into_delta()?;
-        let df = self.session_ctx.read_table(provider).into_delta()?;
-        let raw = df.execute_stream().await.into_delta()?;
-        let target_schema: SchemaRef = Arc::new(
-            handle
-                .schema
-                .as_ref()
-                .try_into_arrow()
-                .map_err(|e: ArrowError| {
-                    crate::error::internal_error(format!(
-                        "stream_relation: failed to convert handle schema to arrow: {e}"
-                    ))
-                })
-                .into_delta()?,
-        );
-        let stamp_schema = Arc::clone(&target_schema);
-        let stamped = raw.map(move |batch_res| {
-            batch_res.and_then(|b| crate::exec::stamp_batch_metadata(&b, &stamp_schema))
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            target_schema,
-            stamped,
-        )))
+        let raw_df = self.session_ctx.read_table(provider).into_delta()?;
+        let projection =
+            build_stamped_logical_projection(&raw_df, handle.schema.as_ref()).into_delta()?;
+        raw_df.select(projection).into_delta()
+    }
+
+    /// Drive a combined metadata + data scan and return the data DataFrame.
+    ///
+    /// Sugar for `self.drive_to_dataframe(scan.scan_state_machine()?)`. The returned
+    /// DataFrame carries the scan's logical schema (column-mapping renames + Delta
+    /// metadata fully applied -- see [`Self::read_relation`]).
+    pub async fn scan_data(&self, scan: &Scan) -> Result<DataFrame, DeltaError> {
+        self.drive_to_dataframe(scan.scan_state_machine()?).await
+    }
+
+    /// Drive a metadata-only scan and return the live-actions DataFrame.
+    ///
+    /// Sugar for `self.drive_to_dataframe(scan.scan_metadata_state_machine()?)`. The
+    /// returned DataFrame's rows are the reconciled `add` actions (path / size /
+    /// `partitionValues_parsed` / `deletionVector` / ...). Callers wanting to inspect
+    /// or cache the file set before opening the data scan should use this directly and
+    /// feed the resulting relation to
+    /// `scan.scan_data_from_metadata_state_machine(handle)` via
+    /// [`Self::drive_to_dataframe`].
+    pub async fn scan_metadata(&self, scan: &Scan) -> Result<DataFrame, DeltaError> {
+        self.drive_to_dataframe(scan.scan_metadata_state_machine()?)
+            .await
+    }
+
+    /// Drive a Full State Reconstruction and return the reconciled-actions DataFrame.
+    ///
+    /// Sugar for `self.drive_to_dataframe(fsr.state_machine()?)`. The result rows are
+    /// the dedup'd action union (`Add` / `Remove` / `Metadata` / `Protocol` / `Txn` /
+    /// `CDC` / `DomainMetadata`) that survives `_last_checkpoint` resolution plus
+    /// commit-tail dedup. Useful for snapshot inspection and protocol/metadata
+    /// queries.
+    pub async fn full_state(&self, fsr: &FullState) -> Result<DataFrame, DeltaError> {
+        self.drive_to_dataframe(fsr.state_machine()?).await
     }
 
     /// Execute a single [`PhaseOperation`] against the executor and return the resulting
@@ -413,4 +449,48 @@ impl DataFusionExecutor {
         state.submit_kdf_handle(finished);
         Ok(())
     }
+}
+
+/// Bridge `raw_df`'s physical arrow schema to `target`'s logical kernel schema.
+///
+/// Builds one projection [`Expr`] per top-level kernel field by combining:
+///
+/// 1. The recursive rename walker (`build_logical_projection`) which emits
+///    `named_struct(get_field(...))` for nested struct renames and
+///    `array_transform(_, lambda)` for `List<Struct>` element renames.
+/// 2. A per-top-level [`StampFieldUdf`] wrapper that declares the kernel's logical
+///    Arrow [`FieldRef`] (name, datatype, recursive field metadata including
+///    `delta.columnMapping.*` / `parquet.field.id`) on the projection's output schema.
+/// 3. An `Expr::alias(target_name)` so the projection's column name matches the
+///    kernel logical name even for primitive fields (where
+///    [`ScalarUDFImpl::return_field_from_args`] discards the top-level field name per
+///    its rustdoc).
+///
+/// Returns one `Expr` per top-level kernel field in declared order, ready to feed
+/// directly to [`DataFrame::select`].
+fn build_stamped_logical_projection(
+    raw_df: &DataFrame,
+    target: &StructType,
+) -> Result<Vec<Expr>, DataFusionError> {
+    let source_schema: &ArrowSchema = raw_df.schema().as_arrow();
+    let rename_exprs = build_logical_projection(source_schema, target)?;
+
+    // Convert the kernel target schema to an arrow schema once so each top-level field
+    // surfaces as a fully-populated `FieldRef` with `delta.columnMapping.*` /
+    // `parquet.field.id` metadata applied recursively (the kernel -> arrow conversion
+    // walks into nested struct / list / map fields and stamps each level).
+    let arrow_target: ArrowSchema = target.try_into_arrow().map_err(|e| {
+        crate::error::plan_compilation(format!(
+            "read_relation: failed to convert kernel target schema to arrow: {e}"
+        ))
+    })?;
+
+    let mut stamped: Vec<Expr> = Vec::with_capacity(rename_exprs.len());
+    for (rename, target_field) in rename_exprs.into_iter().zip(arrow_target.fields().iter()) {
+        let target_field: FieldRef = Arc::clone(target_field);
+        let logical_name = target_field.name().to_string();
+        let stamp = StampFieldUdf::new(target_field).call(rename);
+        stamped.push(stamp.alias(logical_name));
+    }
+    Ok(stamped)
 }

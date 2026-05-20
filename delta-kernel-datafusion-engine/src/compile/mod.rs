@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub mod expr_translator;
 mod json_parse;
 pub mod logical;
+pub mod stamp_udf;
 
 pub use logical::compile_plan_logical;
 

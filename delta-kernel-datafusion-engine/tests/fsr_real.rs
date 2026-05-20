@@ -1,13 +1,12 @@
-//! FSR golden tests: open a snapshot, drive its [`Snapshot::full_state`] state machine through
-//! the [`DataFusionExecutor`], pretty-print the reconstructed actions, and compare against a
-//! frozen expected string.
+//! FSR golden tests: open a snapshot, drive its Full State Reconstruction plan through
+//! the [`DataFusionExecutor`], pretty-print the reconstructed actions, and compare
+//! against a frozen expected string.
 //!
-//! Per fixture the recipe is exactly five steps:
+//! Per fixture the recipe is exactly four steps:
 //!   1. `open_snapshot_for_fixture(fixture)` -> `(engine, snapshot)`
-//!   2. `snapshot.full_state()` -> SM
-//!   3. `executor.drive_to_completion(sm)` -> `ResultPlan`
-//!   4. `testing::collect_result(&executor, rp)` -> `Vec<RecordBatch>`
-//!   5. `datafusion_common::assert_batches_sorted_eq!` against the expected lines.
+//!   2. `snapshot.full_state_builder().build()` -> `FullState`
+//!   3. `executor.full_state(&fsr).await?.collect().await?` -> `Vec<RecordBatch>`
+//!   4. `datafusion_common::assert_batches_sorted_eq!` against the expected lines.
 //!
 //! Each `EXPECTED_*` const was captured from this same path and then cross-checked against an
 //! independent source of truth before being frozen here: the FSR result's `add.path` set is
@@ -25,7 +24,7 @@ use datafusion_common::assert_batches_sorted_eq;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
-use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
+use delta_kernel_datafusion_engine::DataFusionExecutor;
 use rstest::rstest;
 use tempfile::TempDir;
 use url::Url;
@@ -212,14 +211,17 @@ const EXPECTED_V2_PARQUET_SIDECARS: &str = r#"
 async fn full_state_prints_expected_results(#[case] fixture: &str, #[case] expected: &str) {
     let (engine, snapshot) = open_snapshot_for_fixture(fixture);
     let executor = DataFusionExecutor::try_new_with_engine(engine).expect("executor");
-    let sm = snapshot.full_state().expect("full_state SM");
-    let result_plan = executor
-        .drive_to_completion(sm)
+    let fsr = snapshot
+        .full_state_builder()
+        .build()
+        .expect("build full_state plan");
+    let batches = executor
+        .full_state(&fsr)
         .await
-        .expect("drive full_state to completion");
-    let batches = testing::collect_result(&executor, result_plan)
+        .expect("full_state DataFrame")
+        .collect()
         .await
-        .expect("collect full_state result");
+        .expect("collect full_state DataFrame");
     let expected_lines: Vec<&str> = expected.trim().lines().collect();
     assert_batches_sorted_eq!(expected_lines, &batches);
 }
@@ -240,19 +242,18 @@ async fn full_state_with_stats_populates_add_stats_parsed(#[case] fixture: &str)
 
     let (engine, snapshot) = open_snapshot_for_fixture(fixture);
     let executor = DataFusionExecutor::try_new_with_engine(engine).expect("executor");
-    let sm = snapshot
+    let fsr = snapshot
         .full_state_builder()
         .with_stats()
         .build()
-        .and_then(|fs| fs.state_machine())
-        .expect("build full_state SM with stats");
-    let result_plan = executor
-        .drive_to_completion(sm)
+        .expect("build full_state plan with stats");
+    let batches = executor
+        .full_state(&fsr)
         .await
-        .expect("drive full_state SM");
-    let batches = testing::collect_result(&executor, result_plan)
+        .expect("full_state DataFrame")
+        .collect()
         .await
-        .expect("collect full_state result");
+        .expect("collect full_state DataFrame");
 
     let mut stats_parsed_seen = false;
     for batch in &batches {

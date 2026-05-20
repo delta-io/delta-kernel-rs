@@ -15,11 +15,11 @@ use datafusion_common::arrow::datatypes::{
 };
 use datafusion_common::error::DataFusionError;
 use datafusion_common::{Column, ScalarValue};
-use datafusion_expr::expr::{BinaryExpr, Case, InList};
-use datafusion_expr::expr_fn::cast;
+use datafusion_expr::expr::{BinaryExpr, Case, InList, LambdaVariable};
+use datafusion_expr::expr_fn::{cast, lambda};
 use datafusion_expr::{lit, Expr, Operator};
 use datafusion_functions::core::expr_fn::{get_field, named_struct, r#struct as make_struct};
-use datafusion_functions_nested::expr_fn::make_array;
+use datafusion_functions_nested::expr_fn::{array_transform, make_array};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
@@ -579,12 +579,11 @@ fn rebuild_struct_with_target_names(
     let mut args: Vec<Expr> = Vec::with_capacity(target_count * 2);
     for (source_field, target_field) in source_fields.iter().zip(target_struct.fields()) {
         let child_expr = get_field(input_expr.clone(), source_field.name().to_string());
-        let renamed = match (source_field.data_type(), target_field.data_type()) {
-            (ArrowDataType::Struct(src_nested), DataType::Struct(tgt_nested)) => {
-                rebuild_struct_with_target_names(child_expr, src_nested, tgt_nested.as_ref())?
-            }
-            _ => child_expr,
-        };
+        let renamed = rebuild_field_for_target(
+            child_expr,
+            source_field.data_type(),
+            target_field.data_type(),
+        )?;
         args.push(lit(target_field.name().to_string()));
         args.push(renamed);
     }
@@ -597,6 +596,123 @@ fn rebuild_struct_with_target_names(
         )],
         Some(Box::new(Expr::Literal(ScalarValue::Null, None))),
     )))
+}
+
+/// Reshape `base_expr` so its values use `target_dt`'s logical names while keeping the
+/// physical values intact. The recursion mirrors the kernel's column-mapping rename
+/// shape:
+///
+/// - Struct -> Struct: recurse via [`rebuild_struct_with_target_names`] (which emits
+///   `CASE WHEN parent IS NOT NULL THEN named_struct(...) ELSE NULL END` over the
+///   children).
+/// - List / LargeList / FixedSizeList of any element -> Array: dispatch to
+///   [`rebuild_list_with_target_element`] which wraps the list in an `array_transform`
+///   lambda that recursively reshapes the element.
+/// - Everything else (primitive, Map, mismatched outer kinds): pass `base_expr` through
+///   unchanged. Primitive names flow through the parent's `named_struct` literal; Map
+///   reshape isn't implemented yet (no kernel schema in the current test corpus needs
+///   it; the engine's outer projection still produces the right top-level name via
+///   `Expr::alias`).
+fn rebuild_field_for_target(
+    base_expr: Expr,
+    source_dt: &ArrowDataType,
+    target_dt: &DataType,
+) -> Result<Expr, DataFusionError> {
+    match (source_dt, target_dt) {
+        (ArrowDataType::Struct(src_fields), DataType::Struct(tgt_struct)) => {
+            rebuild_struct_with_target_names(base_expr, src_fields, tgt_struct.as_ref())
+        }
+        (
+            ArrowDataType::List(src_elem)
+            | ArrowDataType::LargeList(src_elem)
+            | ArrowDataType::FixedSizeList(src_elem, _),
+            DataType::Array(tgt_array),
+        ) => rebuild_list_with_target_element(base_expr, src_elem, &tgt_array.element_type),
+        _ => Ok(base_expr),
+    }
+}
+
+/// Reshape every element of `list_expr` from `src_elem`'s physical names to
+/// `tgt_elem_dt`'s logical names using `array_transform(list, x -> reshape(x))`.
+///
+/// Short-circuits to a bare `list_expr` when the element doesn't actually need renaming
+/// (primitive elements, or nested types whose names already match) so we don't pay for an
+/// extra higher-order-function eval on the hot path.
+fn rebuild_list_with_target_element(
+    list_expr: Expr,
+    src_elem: &Arc<ArrowField>,
+    tgt_elem_dt: &DataType,
+) -> Result<Expr, DataFusionError> {
+    if !field_needs_rename(src_elem.data_type(), tgt_elem_dt) {
+        return Ok(list_expr);
+    }
+    let lambda_field = Arc::new(ArrowField::new(
+        "x",
+        src_elem.data_type().clone(),
+        src_elem.is_nullable(),
+    ));
+    let lambda_var = Expr::LambdaVariable(LambdaVariable::new(
+        "x".to_string(),
+        Some(lambda_field),
+    ));
+    let body = rebuild_field_for_target(lambda_var, src_elem.data_type(), tgt_elem_dt)?;
+    Ok(array_transform(list_expr, lambda(["x"], body)))
+}
+
+/// True when reshaping `source_dt` to `target_dt` would change a struct field name
+/// somewhere inside the type tree. Walks the same shape as [`rebuild_field_for_target`]
+/// so the answer matches what that helper would actually emit.
+fn field_needs_rename(source_dt: &ArrowDataType, target_dt: &DataType) -> bool {
+    match (source_dt, target_dt) {
+        (ArrowDataType::Struct(src), DataType::Struct(tgt)) => {
+            if src.len() != tgt.fields().count() {
+                // Mismatch: surface at recurse-time so the caller's error message wins.
+                return true;
+            }
+            src.iter().zip(tgt.fields()).any(|(s, t)| {
+                s.name() != t.name() || field_needs_rename(s.data_type(), t.data_type())
+            })
+        }
+        (
+            ArrowDataType::List(src)
+            | ArrowDataType::LargeList(src)
+            | ArrowDataType::FixedSizeList(src, _),
+            DataType::Array(tgt),
+        ) => field_needs_rename(src.data_type(), &tgt.element_type),
+        _ => false,
+    }
+}
+
+/// Build a per-top-level-field projection that maps the underlying provider's raw arrow
+/// schema (physical column-id names on column-mapping tables) into the kernel's logical
+/// schema. Each output expression is rooted at `col(source.name)` and is reshaped
+/// recursively via [`rebuild_field_for_target`] when the field has nested structs or
+/// lists of structs whose names differ between source and target.
+///
+/// Returns one [`Expr`] per top-level kernel field, in order. Callers wrap each result
+/// in an alias (and, if they care about Arrow field metadata, the stamp UDF) before
+/// handing it to [`DataFrame::select`](datafusion::dataframe::DataFrame::select).
+pub fn build_logical_projection(
+    source: &ArrowSchema,
+    target: &StructType,
+) -> Result<Vec<Expr>, DataFusionError> {
+    let source_count = source.fields().len();
+    let target_count = target.fields().count();
+    if source_count != target_count {
+        return Err(crate::error::plan_compilation(format!(
+            "build_logical_projection: source schema has {source_count} top-level field(s); \
+             target schema has {target_count}"
+        )));
+    }
+    source
+        .fields()
+        .iter()
+        .zip(target.fields())
+        .map(|(source_field, target_field)| {
+            let base = Expr::Column(Column::new_unqualified(source_field.name()));
+            rebuild_field_for_target(base, source_field.data_type(), target_field.data_type())
+        })
+        .collect()
 }
 
 fn binary(l: Expr, op: Operator, r: Expr) -> Expr {
