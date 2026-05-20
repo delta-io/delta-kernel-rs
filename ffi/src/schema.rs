@@ -330,6 +330,11 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
+            // Geometry/Geography are WKB-encoded bytes at the FFI layer
+            // TODO: Add visit_geometry / visit_geography callbacks carrying the SRID once real FFI
+            // geo support lands
+            DataType::Primitive(PrimitiveType::Geometry(_))
+            | DataType::Primitive(PrimitiveType::Geography(_)) => call!(visit_binary),
         }
     }
 

@@ -500,6 +500,9 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
+                // TODO: Once real FFI geo support lands, new NullTypeTag::Geometry / ::Geography
+                // variants will replace this arm.
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => (Self::Binary, 0, 0),
             },
             _ => (Self::NonPrimitive, 0, 0),
         }
