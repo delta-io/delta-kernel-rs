@@ -1,16 +1,15 @@
-//! Arrow-based per-row evaluation of [`NamedOpaquePredicateOp`].
+//! Arrow-backed batched evaluation of [`NamedOpaquePredicateOp`].
 //!
 //! Adds an [`ArrowOpaquePredicateOp`] impl on [`NamedOpaquePredicateOp`] so the
-//! default engine's batch evaluator can run an opaque op directly against the
-//! file-stats metadata batch. `eval_pred` iterates the batch rows, invokes
-//! the engine's `eval_against_stats` callback per row with a
-//! [`BatchRowStatsProvider`] that reads from the row's `stats_parsed.*`
-//! columns, and packs the verdicts into a `BooleanArray`.
+//! default engine's batch evaluator can run an opaque op against the file-stats
+//! metadata batch with a single FFI upcall: kernel hands the engine a
+//! `BatchStatsAccessor` (backed by `BatchedArrowStatsProvider`) plus a verdicts
+//! buffer of length `n_rows`, the engine writes per-row verdicts inline, and
+//! kernel translates them back into a `BooleanArray`.
 //!
-//! This is the file-pruning path for engines using the default engine. It
-//! avoids per-file JNI for the kernel-side native predicates (those are
-//! still batch-evaluated as today) but does cross the FFI boundary once
-//! per file for the opaque parts of the predicate.
+//! `BatchedArrowStatsProvider` resolves the top-level `stats_parsed.*` columns
+//! once at construction so per-row reads inside the callback skip the schema
+//! walk.
 
 use delta_kernel::arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
@@ -27,68 +26,87 @@ use delta_kernel::kernel_predicates::{
 use delta_kernel::schema::DataType;
 use delta_kernel::DeltaResult;
 
-use super::pruning::{invoke_eval_against_stats, ChildAccessor, StatsAccessor, StatsProvider};
+use super::pruning::{
+    invoke_eval_against_stats, BatchStatsAccessor, BatchStatsProvider, ChildAccessor,
+    OpaquePruneVerdict,
+};
 use super::NamedOpaquePredicateOp;
 
-// === BatchRowStatsProvider =====================================================
+// === BatchedArrowStatsProvider =================================================
 
-/// `StatsProvider` that reads min/max/nullcount/rowcount for a single file
-/// from one row of the data-skipping metadata batch.
+/// `BatchStatsProvider` that serves the whole metadata batch. Column references
+/// for `stats_parsed.minValues`, `.maxValues`, `.nullCount`, and `.numRecords`
+/// are resolved once at construction; per-row reads skip the schema walk and
+/// dispatch straight to the cached struct.
 ///
-/// The batch follows kernel's data-skipping schema convention: stats live
-/// under a `stats_parsed` struct column with sub-fields `numRecords`,
-/// `nullCount`, `minValues`, `maxValues`. Each of the latter three is
-/// itself a struct keyed by physical column name.
-pub(crate) struct BatchRowStatsProvider<'a> {
-    batch: &'a RecordBatch,
-    row: usize,
+/// Missing top-level columns are tracked as `None`; reads return `None` (which
+/// the FFI surface reports as "stat absent"). Per-column lookups inside each
+/// stat-kind struct still happen on every call -- engines that need to amortize
+/// those should add a column-level cache.
+pub(crate) struct BatchedArrowStatsProvider<'a> {
+    min_values: Option<&'a StructArray>,
+    max_values: Option<&'a StructArray>,
+    null_count: Option<&'a StructArray>,
+    num_records: Option<&'a dyn Array>,
 }
 
-impl<'a> BatchRowStatsProvider<'a> {
-    fn new(batch: &'a RecordBatch, row: usize) -> Self {
-        Self { batch, row }
+impl<'a> BatchedArrowStatsProvider<'a> {
+    pub(crate) fn new(batch: &'a RecordBatch) -> Self {
+        let stats_parsed = batch
+            .column_by_name("stats_parsed")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>());
+        let sub_struct = |name: &str| -> Option<&StructArray> {
+            stats_parsed?
+                .column_by_name(name)?
+                .as_any()
+                .downcast_ref::<StructArray>()
+        };
+        let num_records = stats_parsed
+            .and_then(|s| s.column_by_name("numRecords"))
+            .map(|c| c.as_ref());
+        Self {
+            min_values: sub_struct("minValues"),
+            max_values: sub_struct("maxValues"),
+            null_count: sub_struct("nullCount"),
+            num_records,
+        }
     }
 
-    fn stats_parsed(&self) -> Option<&StructArray> {
-        let col = self.batch.column_by_name("stats_parsed")?;
-        col.as_any().downcast_ref::<StructArray>()
-    }
-
-    /// Read the value of `stats_parsed.<kind>.<col>` at the current row,
-    /// matching the requested `dtype`.
-    fn read_stat(&self, kind: &str, col: &str, dtype: &DataType) -> Option<Scalar> {
-        let stats_parsed = self.stats_parsed()?;
-        let kind_array = stats_parsed.column_by_name(kind)?;
-        let kind_struct = kind_array.as_any().downcast_ref::<StructArray>()?;
+    fn read_stat(
+        kind_struct: Option<&'a StructArray>,
+        row: usize,
+        col: &str,
+        dtype: &DataType,
+    ) -> Option<Scalar> {
+        let kind_struct = kind_struct?;
         let value_array = kind_struct.column_by_name(col)?;
-        if value_array.is_null(self.row) {
+        if value_array.is_null(row) {
             return None;
         }
-        scalar_from_array(value_array.as_ref(), self.row, dtype)
+        scalar_from_array(value_array.as_ref(), row, dtype)
     }
 }
 
-impl<'a> StatsProvider for BatchRowStatsProvider<'a> {
-    fn min(&self, col: &str, dtype: &DataType) -> Option<Scalar> {
-        self.read_stat("minValues", col, dtype)
+impl<'a> BatchStatsProvider for BatchedArrowStatsProvider<'a> {
+    fn min(&self, row: usize, col: &str, dtype: &DataType) -> Option<Scalar> {
+        Self::read_stat(self.min_values, row, col, dtype)
     }
 
-    fn max(&self, col: &str, dtype: &DataType) -> Option<Scalar> {
-        self.read_stat("maxValues", col, dtype)
+    fn max(&self, row: usize, col: &str, dtype: &DataType) -> Option<Scalar> {
+        Self::read_stat(self.max_values, row, col, dtype)
     }
 
-    fn null_count(&self, col: &str) -> Option<i64> {
-        let scalar = self.read_stat("nullCount", col, &DataType::LONG)?;
+    fn null_count(&self, row: usize, col: &str) -> Option<i64> {
+        let scalar = Self::read_stat(self.null_count, row, col, &DataType::LONG)?;
         super::pruning::scalar_as_i64(&scalar)
     }
 
-    fn row_count(&self) -> Option<i64> {
-        let stats_parsed = self.stats_parsed()?;
-        let array = stats_parsed.column_by_name("numRecords")?;
-        if array.is_null(self.row) {
+    fn row_count(&self, row: usize) -> Option<i64> {
+        let array = self.num_records?;
+        if array.is_null(row) {
             return None;
         }
-        let scalar = scalar_from_array(array.as_ref(), self.row, &DataType::LONG)?;
+        let scalar = scalar_from_array(array, row, &DataType::LONG)?;
         super::pruning::scalar_as_i64(&scalar)
     }
 }
@@ -151,11 +169,11 @@ fn double_scalar(any: &dyn std::any::Any, row: usize) -> Option<Scalar> {
 
 /// Adds arrow batch-evaluator capability to [`NamedOpaquePredicateOp`]. The
 /// default engine's `evaluate_predicate` recovers this impl from the
-/// `Predicate::Opaque` adaptor and drives `eval_pred` per metadata-batch row,
-/// invoking the engine's `eval_against_stats` callback with a
-/// `BatchRowStatsProvider` that reads from the row's `stats_parsed.*` columns.
-/// Partition and row-group dispatch reuses the `OpaquePredicateOp` impl on the
-/// same type.
+/// `Predicate::Opaque` adaptor and invokes `eval_pred` once per metadata
+/// batch. The engine receives a `BatchStatsAccessor` covering all rows and
+/// writes one verdict per row; `eval_pred` maps the verdicts into a
+/// `BooleanArray` for kernel. Partition and row-group dispatch reuses the
+/// `OpaquePredicateOp` impl on the same type.
 impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
     fn eval_pred(
         &self,
@@ -163,22 +181,36 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         batch: &RecordBatch,
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
+        let n_rows = batch.num_rows();
         let Some(cb) = self.callbacks_clone() else {
             // No callbacks registered: every-row unknown. Data-skipping treats
             // unknown as keep, so kernel won't prune any files.
-            return Ok(BooleanArray::from(vec![None; batch.num_rows()]));
+            return Ok(BooleanArray::from(vec![None; n_rows]));
         };
 
-        let op_name = self.op_name();
+        let provider = BatchedArrowStatsProvider::new(batch);
+        let stats = BatchStatsAccessor::new(&provider);
         let children = ChildAccessor::new(args);
-        let mut results: Vec<Option<bool>> = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let provider = BatchRowStatsProvider::new(batch, row);
-            let stats = StatsAccessor::new(&provider);
-            let verdict = invoke_eval_against_stats(&cb, op_name, &children, &stats, inverted);
-            results.push(verdict);
-        }
-        Ok(BooleanArray::from(results))
+        let mut verdicts = vec![OpaquePruneVerdict::Unknown; n_rows];
+        invoke_eval_against_stats(
+            &cb,
+            self.op_name(),
+            &children,
+            &stats,
+            n_rows,
+            inverted,
+            &mut verdicts,
+        );
+
+        let bools: Vec<Option<bool>> = verdicts
+            .iter()
+            .map(|v| match *v {
+                OpaquePruneVerdict::Keep => Some(true),
+                OpaquePruneVerdict::Skip => Some(false),
+                OpaquePruneVerdict::Unknown => None,
+            })
+            .collect();
+        Ok(BooleanArray::from(bools))
     }
 
     fn name(&self) -> &str {
@@ -301,11 +333,11 @@ mod tests {
     }
 
     #[test]
-    fn batch_row_stats_provider_reads_string_min_max() {
+    fn batched_arrow_stats_provider_reads_string_min_max() {
         let batch = make_stats_batch("apple", "zebra", 0, 100);
-        let provider = BatchRowStatsProvider::new(&batch, 0);
-        let min = provider.min("name", &DataType::STRING).unwrap();
-        let max = provider.max("name", &DataType::STRING).unwrap();
+        let provider = BatchedArrowStatsProvider::new(&batch);
+        let min = provider.min(0, "name", &DataType::STRING).unwrap();
+        let max = provider.max(0, "name", &DataType::STRING).unwrap();
         match (min, max) {
             (Scalar::String(min_s), Scalar::String(max_s)) => {
                 assert_eq!(min_s, "apple");
@@ -313,21 +345,23 @@ mod tests {
             }
             other => panic!("expected string scalars, got {other:?}"),
         }
-        assert_eq!(provider.null_count("name"), Some(0));
-        assert_eq!(provider.row_count(), Some(100));
+        assert_eq!(provider.null_count(0, "name"), Some(0));
+        assert_eq!(provider.row_count(0), Some(100));
     }
 
     // === End-to-end eval_pred =================================================
 
-    // A toy STARTS_WITH evaluator wired as an engine callback. Computes the
-    // skipping math against the row's min/max for "name" and writes a verdict.
-    extern "C" fn starts_with_eval_stats(
+    // A toy STARTS_WITH evaluator wired as a batched engine callback. Loops
+    // over `n_rows` and writes the per-row verdict via the
+    // batch_stats_min/max_string accessors.
+    extern "C" fn starts_with_eval_batch(
         _state: *mut std::ffi::c_void,
         op_name: crate::KernelStringSlice,
         children: *const ChildAccessor<'_>,
-        stats: *const StatsAccessor<'_>,
+        stats: *const BatchStatsAccessor<'_>,
+        n_rows: usize,
         inverted: bool,
-        out: *mut crate::expressions::pruning::OpaquePruneResult,
+        verdicts: *mut crate::expressions::pruning::OpaquePruneVerdict,
     ) {
         if inverted {
             return;
@@ -349,7 +383,6 @@ mod tests {
         } {
             return;
         }
-        // KernelStringSlice is consumed by value; copy so we can pass it twice.
         let col_name = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&col_slice) }
             .unwrap_or_default();
 
@@ -369,50 +402,49 @@ mod tests {
         let prefix =
             unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&prefix_slice) }
                 .unwrap_or_default();
-
-        let mut min_slice = crate::KernelStringSlice {
-            ptr: std::ptr::null(),
-            len: 0,
-        };
-        if !unsafe {
-            crate::expressions::pruning::stats_accessor_min_string(
-                stats,
-                crate::kernel_string_slice!(col_name),
-                &mut min_slice,
-            )
-        } {
-            return;
-        }
-        let min = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&min_slice) }
-            .unwrap_or_default();
-
-        let mut max_slice = crate::KernelStringSlice {
-            ptr: std::ptr::null(),
-            len: 0,
-        };
-        if !unsafe {
-            crate::expressions::pruning::stats_accessor_max_string(
-                stats,
-                crate::kernel_string_slice!(col_name),
-                &mut max_slice,
-            )
-        } {
-            return;
-        }
-        let max = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&max_slice) }
-            .unwrap_or_default();
-        // Range overlap: max >= prefix AND min < next_prefix(prefix)
-        if max.as_str() < prefix.as_str() {
-            unsafe { crate::expressions::pruning::opaque_prune_result_skip(out) };
-            return;
-        }
-        if let Some(upper) = next_prefix(&prefix) {
-            if min.as_str() >= upper.as_str() {
-                unsafe { crate::expressions::pruning::opaque_prune_result_skip(out) };
-                return;
+        let upper = next_prefix(&prefix);
+        let verdicts = unsafe { std::slice::from_raw_parts_mut(verdicts, n_rows) };
+        for (row, verdict_slot) in verdicts.iter_mut().enumerate() {
+            let mut min_slice = crate::KernelStringSlice {
+                ptr: std::ptr::null(),
+                len: 0,
+            };
+            if !unsafe {
+                crate::expressions::pruning::batch_stats_min_string(
+                    stats,
+                    row,
+                    crate::kernel_string_slice!(col_name),
+                    &mut min_slice,
+                )
+            } {
+                continue;
             }
+            let min = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&min_slice) }
+                .unwrap_or_default();
+            let mut max_slice = crate::KernelStringSlice {
+                ptr: std::ptr::null(),
+                len: 0,
+            };
+            if !unsafe {
+                crate::expressions::pruning::batch_stats_max_string(
+                    stats,
+                    row,
+                    crate::kernel_string_slice!(col_name),
+                    &mut max_slice,
+                )
+            } {
+                continue;
+            }
+            let max = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&max_slice) }
+                .unwrap_or_default();
+            let skip = max.as_str() < prefix.as_str()
+                || upper.as_ref().is_some_and(|u| min.as_str() >= u.as_str());
+            *verdict_slot = if skip {
+                crate::expressions::pruning::OpaquePruneVerdict::Skip
+            } else {
+                crate::expressions::pruning::OpaquePruneVerdict::Keep
+            };
         }
-        unsafe { crate::expressions::pruning::opaque_prune_result_keep(out) };
     }
 
     extern "C" fn no_op_partition(
@@ -420,6 +452,16 @@ mod tests {
         _op_name: crate::KernelStringSlice,
         _children: *const ChildAccessor<'_>,
         _resolver: *const crate::expressions::pruning::ScalarResolver<'_>,
+        _inverted: bool,
+        _out: *mut crate::expressions::pruning::OpaquePruneResult,
+    ) {
+    }
+
+    extern "C" fn no_op_row_group(
+        _state: *mut std::ffi::c_void,
+        _op_name: crate::KernelStringSlice,
+        _children: *const ChildAccessor<'_>,
+        _stats: *const crate::expressions::pruning::StatsAccessor<'_>,
         _inverted: bool,
         _out: *mut crate::expressions::pruning::OpaquePruneResult,
     ) {
@@ -445,9 +487,9 @@ mod tests {
     fn callbacks() -> Arc<OpaquePruningCallbacks> {
         Arc::new(OpaquePruningCallbacks {
             engine_state: std::ptr::null_mut(),
-            eval_against_stats: starts_with_eval_stats,
+            eval_against_stats: starts_with_eval_batch,
             eval_on_partition_values: no_op_partition,
-            eval_on_row_group_stats: starts_with_eval_stats,
+            eval_on_row_group_stats: no_op_row_group,
             free_state: no_op_free,
         })
     }
@@ -545,19 +587,23 @@ mod tests {
 
     // === Inverted-flag forwarding =============================================
 
-    // Callback that records whether kernel passed `inverted=true` and returns
-    // Skip unconditionally so we can verify both the inversion flag and the
+    // Callback that records whether kernel passed `inverted=true` and writes
+    // `Skip` to every row so we can verify both the inversion flag and the
     // verdict propagation in one shot.
     extern "C" fn inverted_recording_eval(
         _state: *mut std::ffi::c_void,
         _op_name: crate::KernelStringSlice,
         _children: *const ChildAccessor<'_>,
-        _stats: *const StatsAccessor<'_>,
+        _stats: *const BatchStatsAccessor<'_>,
+        n_rows: usize,
         inverted: bool,
-        out: *mut crate::expressions::pruning::OpaquePruneResult,
+        verdicts: *mut crate::expressions::pruning::OpaquePruneVerdict,
     ) {
         SAW_INVERTED.with(|c| c.set(c.get() || inverted));
-        unsafe { crate::expressions::pruning::opaque_prune_result_skip(out) };
+        let verdicts = unsafe { std::slice::from_raw_parts_mut(verdicts, n_rows) };
+        for slot in verdicts.iter_mut() {
+            *slot = crate::expressions::pruning::OpaquePruneVerdict::Skip;
+        }
     }
 
     thread_local! {
@@ -569,7 +615,7 @@ mod tests {
             engine_state: std::ptr::null_mut(),
             eval_against_stats: inverted_recording_eval,
             eval_on_partition_values: no_op_partition,
-            eval_on_row_group_stats: inverted_recording_eval,
+            eval_on_row_group_stats: no_op_row_group,
             free_state: no_op_free,
         })
     }

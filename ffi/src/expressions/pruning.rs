@@ -19,23 +19,26 @@
 //!         |
 //!         v
 //!    kernel pruning passes invoke the op's callback:
-//!      - partition prune:  eval_pred_scalar -> eval_on_partition_values
+//!      - partition prune:  eval_pred_scalar -> eval_on_partition_values (per-decision)
 //!      - row-group skip:   eval_as_data_skipping_predicate -> eval_on_row_group_stats
+//!                            (per-row-group)
 //!      - file prune:       indirect rewrite keeps the opaque branch live, then either
-//!                            * default engine: ArrowOpaquePredicateOp::eval_pred runs
-//!                              per metadata-batch row -> eval_against_stats
+//!                            * default engine: ArrowOpaquePredicateOp::eval_pred fires
+//!                              eval_against_stats once per metadata batch
 //!                            * other engines: the engine's own EvaluationHandler must
 //!                              recognize Predicate::Opaque and dispatch to the callback;
 //!                              otherwise file pruning conservatively keeps every file.
 //!         |
 //!         v
 //!    each invocation hands the engine:
-//!      - ChildAccessor    (read-only view of the op's children)
-//!      - StatsAccessor    (typed stats lookups; row-group + file passes)
-//!      - ScalarResolver   (typed scalar lookups; partition pass)
-//!      - OpaquePruneResult (write-only verdict slot)
-//!    engine fills the verdict; kernel maps Keep/Skip/Unknown to its
-//!    Option<bool> pruning decision.
+//!      - ChildAccessor       (read-only view of the op's children)
+//!      - BatchStatsAccessor  (typed stats lookups + row index; file pruning, batched)
+//!      - StatsAccessor       (typed stats lookups; row-group pruning, per-decision)
+//!      - ScalarResolver      (typed scalar lookups; partition pruning)
+//!      - OpaquePruneVerdict[] (file pruning: write one verdict per row)
+//!      - OpaquePruneResult   (row-group / partition: write single verdict)
+//!    engine fills the verdicts; kernel maps Keep/Skip/Unknown to its
+//!    Option<bool> pruning decisions.
 //! ```
 //!
 //! ## Contract
@@ -573,6 +576,207 @@ pub unsafe extern "C" fn stats_accessor_row_count(
     true
 }
 
+// === BatchStatsAccessor (file pruning) =======================================
+
+/// Per-batch stats provider for file pruning. Implementations cache column
+/// references at construction so that per-row reads are cheap (no schema walk).
+/// The `row` index is passed in by the engine on each call.
+pub trait BatchStatsProvider {
+    fn min(&self, row: usize, col: &str, dtype: &DataType) -> Option<Scalar>;
+    fn max(&self, row: usize, col: &str, dtype: &DataType) -> Option<Scalar>;
+    fn null_count(&self, row: usize, col: &str) -> Option<i64>;
+    fn row_count(&self, row: usize) -> Option<i64>;
+}
+
+/// Borrowed accessor handed to the engine during file pruning. Wraps a
+/// [`BatchStatsProvider`] plus a per-callback string arena. All getters take
+/// a `row` index; the same accessor serves every row in the metadata batch.
+///
+/// String slices returned by the getters point into the arena and are valid
+/// only for the duration of the surrounding `eval_against_stats` callback.
+/// Engines must copy slices they need to retain past the callback.
+///
+/// Column names passed to the accessors must be **physical** names; engines
+/// that built the opaque predicate from a logical (column-mapped) schema must
+/// resolve to physical names before constructing the children, otherwise
+/// lookups silently miss and every file is kept.
+pub struct BatchStatsAccessor<'a> {
+    provider: &'a dyn BatchStatsProvider,
+    arena: StrArena,
+}
+
+impl<'a> BatchStatsAccessor<'a> {
+    pub(crate) fn new(provider: &'a dyn BatchStatsProvider) -> Self {
+        Self {
+            provider,
+            arena: StrArena::default(),
+        }
+    }
+
+    fn intern(&self, s: String) -> &str {
+        self.arena.intern(s)
+    }
+}
+
+/// Read the string min stat for `(row, col)`.
+///
+/// # Safety
+/// `acc` valid, `col` a valid string slice, `out` a valid pointer. The
+/// returned slice points into the accessor's per-callback arena and is valid
+/// only for the lifetime of the accessor.
+#[no_mangle]
+pub unsafe extern "C" fn batch_stats_min_string(
+    acc: *const BatchStatsAccessor<'_>,
+    row: usize,
+    col: KernelStringSlice,
+    out: *mut KernelStringSlice,
+) -> bool {
+    if acc.is_null() || out.is_null() {
+        return false;
+    }
+    let acc = unsafe { &*acc };
+    let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
+        return false;
+    };
+    let Some(Scalar::String(s)) = acc.provider.min(row, &name, &DataType::STRING) else {
+        return false;
+    };
+    let interned = acc.intern(s);
+    unsafe { *out = kernel_string_slice!(interned) };
+    true
+}
+
+/// Read the string max stat for `(row, col)`.
+///
+/// # Safety
+/// `acc` valid, `col` a valid string slice, `out` a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn batch_stats_max_string(
+    acc: *const BatchStatsAccessor<'_>,
+    row: usize,
+    col: KernelStringSlice,
+    out: *mut KernelStringSlice,
+) -> bool {
+    if acc.is_null() || out.is_null() {
+        return false;
+    }
+    let acc = unsafe { &*acc };
+    let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
+        return false;
+    };
+    let Some(Scalar::String(s)) = acc.provider.max(row, &name, &DataType::STRING) else {
+        return false;
+    };
+    let interned = acc.intern(s);
+    unsafe { *out = kernel_string_slice!(interned) };
+    true
+}
+
+/// Read the i64 min stat for `(row, col)`. Accepts `Long`, `Integer`,
+/// `Short`, and `Byte` stat types (widened to i64).
+///
+/// # Safety
+/// `acc` valid, `col` a valid string slice, `out` a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn batch_stats_min_long(
+    acc: *const BatchStatsAccessor<'_>,
+    row: usize,
+    col: KernelStringSlice,
+    out: *mut i64,
+) -> bool {
+    if acc.is_null() || out.is_null() {
+        return false;
+    }
+    let acc = unsafe { &*acc };
+    let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
+        return false;
+    };
+    let Some(scalar) = acc.provider.min(row, &name, &DataType::LONG) else {
+        return false;
+    };
+    let Some(v) = scalar_as_i64(&scalar) else {
+        return false;
+    };
+    unsafe { *out = v };
+    true
+}
+
+/// Read the i64 max stat for `(row, col)`. Same widening rules as
+/// [`batch_stats_min_long`].
+///
+/// # Safety
+/// `acc` valid, `col` a valid string slice, `out` a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn batch_stats_max_long(
+    acc: *const BatchStatsAccessor<'_>,
+    row: usize,
+    col: KernelStringSlice,
+    out: *mut i64,
+) -> bool {
+    if acc.is_null() || out.is_null() {
+        return false;
+    }
+    let acc = unsafe { &*acc };
+    let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
+        return false;
+    };
+    let Some(scalar) = acc.provider.max(row, &name, &DataType::LONG) else {
+        return false;
+    };
+    let Some(v) = scalar_as_i64(&scalar) else {
+        return false;
+    };
+    unsafe { *out = v };
+    true
+}
+
+/// Read the null count for `(row, col)`.
+///
+/// # Safety
+/// `acc` valid, `col` a valid string slice, `out` a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn batch_stats_null_count(
+    acc: *const BatchStatsAccessor<'_>,
+    row: usize,
+    col: KernelStringSlice,
+    out: *mut i64,
+) -> bool {
+    if acc.is_null() || out.is_null() {
+        return false;
+    }
+    let acc = unsafe { &*acc };
+    let Some(name) = (unsafe { column_name_from_slice(&col) }) else {
+        return false;
+    };
+    let Some(v) = acc.provider.null_count(row, &name) else {
+        return false;
+    };
+    unsafe { *out = v };
+    true
+}
+
+/// Read the row count for `row` (the number of records in the corresponding
+/// file).
+///
+/// # Safety
+/// `acc` valid, `out` a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn batch_stats_row_count(
+    acc: *const BatchStatsAccessor<'_>,
+    row: usize,
+    out: *mut i64,
+) -> bool {
+    if acc.is_null() || out.is_null() {
+        return false;
+    }
+    let acc = unsafe { &*acc };
+    let Some(v) = acc.provider.row_count(row) else {
+        return false;
+    };
+    unsafe { *out = v };
+    true
+}
+
 // === ScalarResolver (partition pruning) ======================================
 
 /// Bridge from kernel's partition-value lookup machinery to the FFI accessor
@@ -659,16 +863,19 @@ pub unsafe extern "C" fn scalar_resolver_long(
 
 // === Callback struct =========================================================
 
-/// Signature: kernel passes the engine the op name, the op's children, and
-/// a stats accessor for the file or row-group under consideration. Engine
-/// writes its verdict to `*out`.
+/// Signature: kernel passes the engine the op name, children, and a batched
+/// stats accessor covering all files in the current metadata batch. The
+/// engine loops over `0..n_rows`, reads stats via [`BatchStatsAccessor`]
+/// getters, and writes one verdict per row into `verdicts` (a slice of
+/// length `n_rows` zero-initialized to [`OpaquePruneVerdict::Unknown`]).
 pub type EvalAgainstStatsFn = extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
     children: *const ChildAccessor<'_>,
-    stats: *const StatsAccessor<'_>,
+    stats: *const BatchStatsAccessor<'_>,
+    n_rows: usize,
     inverted: bool,
-    out: *mut OpaquePruneResult,
+    verdicts: *mut OpaquePruneVerdict,
 );
 
 /// Signature: kernel passes the engine the op name, children, and a
@@ -682,10 +889,17 @@ pub type EvalOnPartitionValuesFn = extern "C" fn(
     out: *mut OpaquePruneResult,
 );
 
-/// Signature: same as `EvalAgainstStatsFn` but the accessor reads parquet
-/// footer stats. Kept distinct so engines can route differently if
-/// row-group pruning has different semantics than file-level pruning.
-pub type EvalOnRowGroupStatsFn = EvalAgainstStatsFn;
+/// Signature: per-decision stats callback used for parquet row-group pruning.
+/// Kept distinct from [`EvalAgainstStatsFn`] (which is batch-shaped) because
+/// row-group pruning is one decision per row group, not per batch.
+pub type EvalOnRowGroupStatsFn = extern "C" fn(
+    engine_state: *mut c_void,
+    op_name: KernelStringSlice,
+    children: *const ChildAccessor<'_>,
+    stats: *const StatsAccessor<'_>,
+    inverted: bool,
+    out: *mut OpaquePruneResult,
+);
 
 /// Bundle of engine callbacks for opaque-predicate pruning. All three
 /// callbacks are required (the `extern "C" fn` field type forbids null);
@@ -766,26 +980,29 @@ pub unsafe extern "C" fn free_opaque_pruning_context(ctx: Handle<SharedOpaquePru
 
 // === Used by NamedOpaquePredicateOp ==========================================
 
-/// Invoke the engine's stats-based pruning callback. Used by the arrow
-/// adapter's `eval_pred` and by any future kernel-side per-file
-/// refinement pass.
+/// Invoke the engine's batched file-pruning callback once for an entire
+/// metadata batch. `verdicts` is sized to `n_rows` and pre-initialized to
+/// [`OpaquePruneVerdict::Unknown`]; the engine writes per-row verdicts into
+/// it.
 pub(crate) fn invoke_eval_against_stats(
     cb: &OpaquePruningCallbacks,
     op_name: &str,
     children: &ChildAccessor<'_>,
-    stats: &StatsAccessor<'_>,
+    stats: &BatchStatsAccessor<'_>,
+    n_rows: usize,
     inverted: bool,
-) -> Option<bool> {
-    let mut out = OpaquePruneResult::default();
+    verdicts: &mut [OpaquePruneVerdict],
+) {
+    debug_assert_eq!(verdicts.len(), n_rows);
     (cb.eval_against_stats)(
         cb.engine_state,
         kernel_string_slice!(op_name),
         children,
         stats,
+        n_rows,
         inverted,
-        &mut out,
+        verdicts.as_mut_ptr(),
     );
-    out.into_option()
 }
 
 pub(crate) fn invoke_eval_on_partition_values(
@@ -1050,6 +1267,80 @@ mod tests {
         assert_eq!(row_count, 100);
     }
 
+    struct FixedBatchStatsRow {
+        min: Option<Scalar>,
+        max: Option<Scalar>,
+        nulls: Option<i64>,
+        rows: Option<i64>,
+    }
+
+    impl BatchStatsProvider for FixedBatchStatsRow {
+        fn min(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+            self.min.clone()
+        }
+        fn max(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+            self.max.clone()
+        }
+        fn null_count(&self, _row: usize, _col: &str) -> Option<i64> {
+            self.nulls
+        }
+        fn row_count(&self, _row: usize) -> Option<i64> {
+            self.rows
+        }
+    }
+
+    #[test]
+    fn batch_stats_accessor_round_trips_numeric_getters() {
+        let stats = FixedBatchStatsRow {
+            min: Some(Scalar::Long(7)),
+            max: Some(Scalar::Long(42)),
+            nulls: Some(3),
+            rows: Some(100),
+        };
+        let acc = BatchStatsAccessor::new(&stats);
+        let col_name = "any_col";
+
+        let mut min_out = 0_i64;
+        assert!(unsafe {
+            batch_stats_min_long(&acc, 0, kernel_string_slice!(col_name), &mut min_out)
+        });
+        assert_eq!(min_out, 7);
+
+        let mut max_out = 0_i64;
+        assert!(unsafe {
+            batch_stats_max_long(&acc, 0, kernel_string_slice!(col_name), &mut max_out)
+        });
+        assert_eq!(max_out, 42);
+
+        let mut null_out = 0_i64;
+        assert!(unsafe {
+            batch_stats_null_count(&acc, 0, kernel_string_slice!(col_name), &mut null_out)
+        });
+        assert_eq!(null_out, 3);
+
+        let mut row_out = 0_i64;
+        assert!(unsafe { batch_stats_row_count(&acc, 0, &mut row_out) });
+        assert_eq!(row_out, 100);
+    }
+
+    #[test]
+    fn batch_stats_accessor_returns_false_when_stat_absent() {
+        let stats = FixedBatchStatsRow {
+            min: None,
+            max: None,
+            nulls: None,
+            rows: None,
+        };
+        let acc = BatchStatsAccessor::new(&stats);
+        let col_name = "any_col";
+
+        let mut out = 0_i64;
+        assert!(!unsafe {
+            batch_stats_min_long(&acc, 0, kernel_string_slice!(col_name), &mut out)
+        });
+        assert!(!unsafe { batch_stats_row_count(&acc, 0, &mut out) });
+    }
+
     // === End-to-end callback round-trip ======================================
 
     // A captured invocation -- proves the callback fired with the expected args.
@@ -1062,18 +1353,28 @@ mod tests {
         _state: *mut c_void,
         op_name: KernelStringSlice,
         _children: *const ChildAccessor<'_>,
-        _stats: *const StatsAccessor<'_>,
+        _stats: *const BatchStatsAccessor<'_>,
+        n_rows: usize,
         inverted: bool,
-        out: *mut OpaquePruneResult,
+        verdicts: *mut OpaquePruneVerdict,
     ) {
         let name = unsafe { String::try_from_slice(&op_name) }.unwrap();
         CALLBACK_LOG.with(|c| c.set(Some((name, inverted))));
         let verdict = CALLBACK_VERDICT.with(Cell::get);
-        match verdict {
-            OpaquePruneVerdict::Keep => unsafe { opaque_prune_result_keep(out) },
-            OpaquePruneVerdict::Skip => unsafe { opaque_prune_result_skip(out) },
-            OpaquePruneVerdict::Unknown => {}
+        let slots = unsafe { std::slice::from_raw_parts_mut(verdicts, n_rows) };
+        for slot in slots.iter_mut() {
+            *slot = verdict;
         }
+    }
+
+    extern "C" fn test_eval_on_row_group_stats(
+        _state: *mut c_void,
+        _op_name: KernelStringSlice,
+        _children: *const ChildAccessor<'_>,
+        _stats: *const StatsAccessor<'_>,
+        _inverted: bool,
+        _out: *mut OpaquePruneResult,
+    ) {
     }
 
     extern "C" fn test_eval_on_partition_values(
@@ -1093,9 +1394,48 @@ mod tests {
             engine_state: ptr::null_mut(),
             eval_against_stats: test_eval_against_stats,
             eval_on_partition_values: test_eval_on_partition_values,
-            eval_on_row_group_stats: test_eval_against_stats,
+            eval_on_row_group_stats: test_eval_on_row_group_stats,
             free_state: test_free_state,
         }
+    }
+
+    struct FixedBatchStats;
+
+    impl BatchStatsProvider for FixedBatchStats {
+        fn min(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+            None
+        }
+        fn max(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+            None
+        }
+        fn null_count(&self, _row: usize, _col: &str) -> Option<i64> {
+            None
+        }
+        fn row_count(&self, _row: usize) -> Option<i64> {
+            None
+        }
+    }
+
+    fn invoke_with_verdict(
+        op_name: &str,
+        inverted: bool,
+        n_rows: usize,
+    ) -> Vec<OpaquePruneVerdict> {
+        let cb = build_test_callbacks();
+        let stats_provider = FixedBatchStats;
+        let stats = BatchStatsAccessor::new(&stats_provider);
+        let exprs: Vec<Expression> = vec![];
+        let mut verdicts = vec![OpaquePruneVerdict::Unknown; n_rows];
+        invoke_eval_against_stats(
+            &cb,
+            op_name,
+            &ChildAccessor::new(&exprs),
+            &stats,
+            n_rows,
+            inverted,
+            &mut verdicts,
+        );
+        verdicts
     }
 
     #[test]
@@ -1103,24 +1443,10 @@ mod tests {
         CALLBACK_LOG.with(|c| c.set(None));
         CALLBACK_VERDICT.with(|c| c.set(OpaquePruneVerdict::Skip));
 
-        let cb = build_test_callbacks();
-        let stats = FixedStats {
-            min: None,
-            max: None,
-            nulls: None,
-            rows: None,
-        };
-        let exprs: Vec<Expression> = vec![];
-        let result = invoke_eval_against_stats(
-            &cb,
-            "STARTS_WITH",
-            &ChildAccessor::new(&exprs),
-            &StatsAccessor::new(&stats),
-            true,
-        );
+        let verdicts = invoke_with_verdict("STARTS_WITH", true, 1);
         let logged = CALLBACK_LOG.with(Cell::take);
         assert_eq!(logged, Some(("STARTS_WITH".to_string(), true)));
-        assert_eq!(result, Some(false));
+        assert_eq!(verdicts[0], OpaquePruneVerdict::Skip);
     }
 
     #[test]
@@ -1128,22 +1454,8 @@ mod tests {
         CALLBACK_LOG.with(|c| c.set(None));
         CALLBACK_VERDICT.with(|c| c.set(OpaquePruneVerdict::Keep));
 
-        let cb = build_test_callbacks();
-        let stats = FixedStats {
-            min: None,
-            max: None,
-            nulls: None,
-            rows: None,
-        };
-        let exprs: Vec<Expression> = vec![];
-        let result = invoke_eval_against_stats(
-            &cb,
-            "FOO",
-            &ChildAccessor::new(&exprs),
-            &StatsAccessor::new(&stats),
-            false,
-        );
-        assert_eq!(result, Some(true));
+        let verdicts = invoke_with_verdict("FOO", false, 1);
+        assert_eq!(verdicts[0], OpaquePruneVerdict::Keep);
     }
 
     #[test]
@@ -1151,21 +1463,7 @@ mod tests {
         CALLBACK_LOG.with(|c| c.set(None));
         CALLBACK_VERDICT.with(|c| c.set(OpaquePruneVerdict::Unknown));
 
-        let cb = build_test_callbacks();
-        let stats = FixedStats {
-            min: None,
-            max: None,
-            nulls: None,
-            rows: None,
-        };
-        let exprs: Vec<Expression> = vec![];
-        let result = invoke_eval_against_stats(
-            &cb,
-            "FOO",
-            &ChildAccessor::new(&exprs),
-            &StatsAccessor::new(&stats),
-            false,
-        );
-        assert_eq!(result, None);
+        let verdicts = invoke_with_verdict("FOO", false, 1);
+        assert_eq!(verdicts[0], OpaquePruneVerdict::Unknown);
     }
 }
