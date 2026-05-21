@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
@@ -16,11 +18,13 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use test_utils::{
-    assert_partition_values, assert_schema_has_field, copy_directory,
-    create_table_and_load_snapshot, nested_batches, nested_schema, read_actions_from_commit,
-    read_add_infos, remove_all_and_get_remove_actions, resolve_field, test_table_setup,
+    add_commit, assert_partition_values, assert_schema_has_field,
+    column_mapping_fixtures as fixtures, copy_directory, create_table_and_load_snapshot,
+    engine_store_setup, nested_batches, nested_schema, read_actions_from_commit, read_add_infos,
+    read_scan, remove_all_and_get_remove_actions, resolve_field, test_table_setup,
     write_batch_to_table,
 };
 use url::Url;
@@ -381,5 +385,98 @@ async fn test_column_mapping_partitioned_write(
         assert_partition_values(remove, &physical_name, "A");
     }
 
+    Ok(())
+}
+
+// Two fields with same physical name at different physical paths is valid. Write
+// should succeed.
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_same_phy_name_different_path(
+    #[values("name", "id")] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    let logical_schema = Arc::new(fixtures::same_leaf_phy_name_under_different_parents());
+    let snapshot = create_table(table_url.as_str(), logical_schema.clone(), "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    // Build a RecordBatch matching the logical schema.
+    let arrow_schema: ArrowSchema = logical_schema.as_ref().try_into_arrow()?;
+    let inner_fields_of =
+        |outer: &str| match arrow_schema.field_with_name(outer).unwrap().data_type() {
+            ArrowDataType::Struct(fields) => fields.clone(),
+            _ => panic!("expected struct for {outer}"),
+        };
+    let outer1_array = StructArray::new(
+        inner_fields_of("outer1"),
+        vec![Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef],
+        None,
+    );
+    let outer2_array = StructArray::new(
+        inner_fields_of("outer2"),
+        vec![Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(outer1_array), Arc::new(outer2_array)],
+    )?;
+
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Scan back and verify the round-tripped rows.
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "expected 2 rows back");
+    let combined = StructArray::from(batches[0].clone());
+    let outer1_a: &Int32Array = resolve_struct_field(&combined, &["outer1".into(), "a".into()]);
+    let outer2_a: &Int32Array = resolve_struct_field(&combined, &["outer2".into(), "a".into()]);
+    assert_eq!(outer1_a.values(), &[10, 20]);
+    assert_eq!(outer2_a.values(), &[100, 200]);
+    Ok(())
+}
+
+/// A schema with two fields sharing same physical path should be rejected.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_duplicated_phy_path_rejected(
+    #[values("name", "id")] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, engine, table_url) = engine_store_setup("dup_phys_path", None);
+    let schema = fixtures::nested_field_with_same_phy_path();
+    let schema_json = serde_json::to_string(&schema)?;
+    let escaped = serde_json::to_string(&schema_json)?;
+    // Create a v0 commit in a hack way to bypass create_table validation.
+    let v0 = format!(
+        r#"{{"protocol":{{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}}}
+{{"metaData":{{"id":"test-id","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{"delta.columnMapping.mode":"{cm_mode}","delta.columnMapping.maxColumnId":"4"}},"createdTime":1700000000000}}}}
+"#
+    );
+    add_commit(table_url.as_str(), store.as_ref(), 0, v0).await?;
+
+    let msg = Snapshot::builder_for(table_url)
+        .build(&engine)
+        .expect_err("dup physicalName must be rejected at snapshot load")
+        .to_string();
+    assert!(
+        msg.contains("Duplicate `delta.columnMapping.physicalName`")
+            && msg.contains(".a'")
+            && msg.contains(".b'"),
+        "expected path-aware dedup error naming colliding leaves, got: {msg}"
+    );
     Ok(())
 }

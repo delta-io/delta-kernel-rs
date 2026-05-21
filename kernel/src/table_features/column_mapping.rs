@@ -74,39 +74,54 @@ pub(crate) fn column_mapping_mode(
     }
 }
 
-/// When column mapping mode is enabled, verify that each field in the schema is annotated with a
-/// physical name and field_id, and that no two fields share the same `delta.columnMapping.id`
-/// value. When not enabled, verifies that no fields are annotated.
+/// Validates `delta.columnMapping.id` and `delta.columnMapping.physicalName` annotations across
+/// every field in `schema`. Aligns with delta-spark's validation logic.
+///
+/// When `mode` is [`ColumnMappingMode::Id`] or [`ColumnMappingMode::Name`]: each field must
+/// carry both annotations, no two fields may share a `delta.columnMapping.id`, and no two
+/// fields may share a *full physical column path*. Two fields may share the same leaf
+/// `physicalName` if they live at different physical column paths.
+///
+/// When `mode` is [`ColumnMappingMode::None`]: verifies no field carries either annotation.
+///
+/// Examples for physical name validation:
+/// Rejected (two siblings share `delta.columnMapping.physicalName="x"`):
+/// ```json
+/// {"type":"struct","fields":[
+///   {"name":"a","type":"long","nullable":true,
+///    "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"x"}},
+///   {"name":"b","type":"long","nullable":true,
+///    "metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"x"}}
+/// ]}
+/// ```
+///
+/// Accepted (same `delta.columnMapping.physicalName="x"` at different physical column paths):
+/// ```json
+/// {"type":"struct","fields":[
+///   {"name":"a","type":"long","nullable":true,
+///    "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"x"}},
+///   {"name":"nested","nullable":true,
+///    "metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"nested"},
+///    "type":{"type":"struct","fields":[
+///      {"name":"a","type":"long","nullable":true,
+///       "metadata":{"delta.columnMapping.id":3,"delta.columnMapping.physicalName":"x"}}
+///   ]}}
+/// ]}
+/// ```
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
-        path: vec![],
-        seen: SeenColumnMappingAnnotations::default(),
+        logical_path: vec![],
+        seen_ids: HashMap::new(),
+        sibling_names_stack: vec![],
     };
     validator.transform_struct(schema)
 }
 
-/// Tracks `delta.columnMapping.id` and `delta.columnMapping.physicalName` values that have
-/// already been claimed during a single schema walk, so duplicates can be rejected at the
-/// first collision (with both offending field names in the error) rather than letting the
-/// duplicate slip through to a downstream parquet read where field ids resolve ambiguously.
-///
-/// Both maps key the duplicate value to the first field name that claimed it, so the error
-/// can name *both* fields. Tracking physical names addresses delta-spark parity (their
-/// `checkColumnIdAndPhysicalNameAssignments` rejects both kinds of collision) and matches the
-/// PROTOCOL.md "globally unique identifier" requirement for `physicalName` -- duplicate
-/// physical names would break parquet column resolution under `ColumnMappingMode::Name`.
-#[derive(Default, Debug)]
-pub(crate) struct SeenColumnMappingAnnotations<'a> {
-    /// `delta.columnMapping.id` -> first field name that claimed it.
-    pub ids: HashMap<i64, &'a str>,
-    /// `delta.columnMapping.physicalName` -> first field name that claimed it.
-    pub physical_names: HashMap<&'a str, &'a str>,
-}
-
 /// Validates a field's column mapping annotations and extracts the physical name and column
-/// mapping id. If `seen` is provided, also checks for duplicate column mapping IDs and
-/// duplicate `physicalName` values across the schema walk.
+/// mapping id. If `seen_ids` is provided, also checks that this field's
+/// `delta.columnMapping.id` is globally unique. If `current_field_siblings` is provided, also
+/// checks that this field's `delta.columnMapping.physicalName` is unique among its siblings.
 ///
 /// Metadata columns are not subject to column mapping and must not carry column mapping
 /// annotations. Returns the logical field name and `None` for such fields.
@@ -119,14 +134,61 @@ pub(crate) struct SeenColumnMappingAnnotations<'a> {
 /// and `None`. In `None` mode no dedup is performed (the returned "physical name" is just the
 /// logical field name and is only schema-unique within its parent struct, not globally).
 ///
-/// `path` identifies the field in error messages (e.g. `&["a", "b"]` renders as `a.b`).
+/// # Parameters
+///
+/// - `field`: The field to validate.
+/// - `mode`: Column mapping mode.
+/// - `parent_field_logical_path`: The field's parent path, used to render full paths in error
+///   messages (e.g. parent `&["a", "b"]` and field `c` renders as `a.b.c`).
+/// - `seen_ids`: Global map of `delta.columnMapping.id` -> first claimer logical name. `None` skips
+///   the ID-dedup check.
+/// - `current_field_siblings`: Map of `delta.columnMapping.physicalName` -> first claimer logical
+///   name *for the current field's siblings only*. `None` skips the sibling-dedup check.
+///
+/// # Errors
+///
+/// - The field is a metadata column carrying any CM annotation.
+/// - CM is enabled but `delta.columnMapping.physicalName` is missing or non-string.
+/// - CM is enabled but `delta.columnMapping.id` is missing or non-numeric.
+/// - CM is disabled but either annotation is present.
+/// - `seen_ids` is provided and the current field's `delta.columnMapping.id` is already in the map.
+///   Example rejection (two fields share `delta.columnMapping.id=1`):
+///
+///   ```json
+///   {"type":"struct","fields":[
+///     {"name":"a","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-a"}},
+///     {"name":"b","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-b"}}
+///   ]}
+///   ```
+/// - `current_field_siblings` is provided and the current field's
+///   `delta.columnMapping.physicalName` is already claimed by a sibling. Example rejection (two
+///   siblings share `delta.columnMapping.physicalName="x"`):
+///
+///   ```json
+///   {"type":"struct","fields":[
+///     {"name":"a","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"x"}},
+///     {"name":"b","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"x"}}
+///   ]}
+///   ```
 pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     field: &'a StructField,
     mode: ColumnMappingMode,
-    path: &[&str],
-    seen: Option<&mut SeenColumnMappingAnnotations<'a>>,
+    parent_field_logical_path: &[&'a str],
+    seen_ids: Option<&mut HashMap<i64, &'a str>>,
+    current_field_siblings: Option<&mut HashMap<&'a str, &'a str>>,
 ) -> DeltaResult<(&'a str, Option<i64>)> {
-    let field_path = || ColumnName::new(path.iter().copied());
+    let logical_field_path = || {
+        ColumnName::new(
+            parent_field_logical_path
+                .iter()
+                .copied()
+                .chain([field.name().as_str()]),
+        )
+    };
     let physical_name_meta = field
         .metadata
         .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref());
@@ -151,19 +213,19 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
             return Err(Error::schema(format!(
                 "The {annotation} annotation on field '{}' must be a string",
-                field_path(),
+                logical_field_path(),
             )));
         }
         (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
             return Err(Error::schema(format!(
                 "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
-                field_path(),
+                logical_field_path(),
             )));
         }
         (ColumnMappingMode::None, Some(_)) => {
             return Err(Error::schema(format!(
                 "Column mapping is not enabled but field '{}' is annotated with {annotation}",
-                field_path(),
+                logical_field_path(),
             )));
         }
     };
@@ -177,19 +239,19 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
             return Err(Error::schema(format!(
                 "The {annotation} annotation on field '{}' must be a number",
-                field_path(),
+                logical_field_path(),
             )));
         }
         (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
             return Err(Error::schema(format!(
                 "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
-                field_path(),
+                logical_field_path(),
             )));
         }
         (ColumnMappingMode::None, Some(_)) => {
             return Err(Error::schema(format!(
                 "Column mapping is not enabled but field '{}' is annotated with {annotation}",
-                field_path(),
+                logical_field_path(),
             )));
         }
     };
@@ -198,22 +260,26 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     // within its parent struct, not globally -- so dedup is gated on CM being enabled. ID dedup
     // additionally requires `Some(id)` because `id` is `None` outside CM-enabled mode.
     if mode != ColumnMappingMode::None {
-        if let Some(seen) = seen {
-            if let Some(id) = id {
-                seen.ids.insert(id, field.name()).map_or(Ok(()), |prev| {
-                    Err(Error::schema(format!(
-                        "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
-                        field.name()
-                    )))
-                })?;
-            }
-            seen.physical_names
-                .insert(physical_name, field.name())
+        if let (Some(id), Some(seen_ids)) = (id, seen_ids) {
+            seen_ids.insert(id, field.name()).map_or(Ok(()), |prev| {
+                Err(Error::schema(format!(
+                    "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
+                    field.name()
+                )))
+            })?;
+        }
+        // Dedup `physicalName` among siblings. Two distinct columns with the same full
+        // physical path must diverge at some ancestor struct, where two siblings share
+        // the same `physicalName`.
+        if let Some(siblings) = current_field_siblings {
+            siblings
+                .insert(physical_name.as_str(), field.name().as_str())
                 .map_or(Ok(()), |prev| {
                     Err(Error::schema(format!(
                         "Duplicate `delta.columnMapping.physicalName` '{physical_name}' \
-                         assigned to both '{prev}' and '{}'",
-                        field.name(),
+                         assigned to both '{}' and '{}'",
+                        ColumnName::new(parent_field_logical_path.iter().copied().chain([prev])),
+                        logical_field_path(),
                     )))
                 })?;
         }
@@ -224,25 +290,39 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
 
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
-    path: Vec<&'a str>,
-    /// CM ids and physical names already claimed during the walk, with the first claimer.
-    seen: SeenColumnMappingAnnotations<'a>,
+    /// Logical path of current field's parent, used for error messages.
+    logical_path: Vec<&'a str>,
+    /// `delta.columnMapping.id` -> first claimer logical name.
+    seen_ids: HashMap<i64, &'a str>,
+    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
+    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
+    /// pushed in `transform_struct` (root struct included) and popped after iterating its
+    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
+    /// elements / keys / values are anonymous.
+    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
 }
 
 impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner<V>(&mut self, field_name: &'a str, validate: V) -> DeltaResult<()>
+    fn transform_inner<V>(&mut self, logical_name: &'a str, validate: V) -> DeltaResult<()>
     where
         V: FnOnce(&mut Self) -> DeltaResult<()>,
     {
-        self.path.push(field_name);
+        self.logical_path.push(logical_name);
         let result = validate(self);
-        self.path.pop();
+        self.logical_path.pop();
         result
     }
 }
 
 impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     transform_output_type!(|'a, T| DeltaResult<()>);
+
+    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<()> {
+        self.sibling_names_stack.push(HashMap::new());
+        let result = self.recurse_into_struct(stype);
+        self.sibling_names_stack.pop();
+        result
+    }
 
     // Override array element and map key/value for better error messages
     fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
@@ -255,15 +335,14 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
         self.transform_inner("<map value>", |this| this.transform(vtype))
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
-        self.transform_inner(field.name(), |this| {
-            validate_and_extract_column_mapping_annotations(
-                field,
-                this.mode,
-                &this.path,
-                Some(&mut this.seen),
-            )?;
-            this.recurse_into_struct_field(field)
-        })
+        validate_and_extract_column_mapping_annotations(
+            field,
+            self.mode,
+            &self.logical_path,
+            Some(&mut self.seen_ids),
+            self.sibling_names_stack.last_mut(),
+        )?;
+        self.transform_inner(field.name(), |this| this.recurse_into_struct_field(field))
     }
     fn transform_variant(&mut self, _stype: &'a StructType) -> DeltaResult<()> {
         // don't recurse into variant's fields, as they are not expected to have column mapping
@@ -761,7 +840,8 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, MetadataValue, StructField, StructType};
     use crate::utils::test_utils::{
-        assert_result_error_with_message, make_test_tc, test_deep_nested_schema_missing_leaf_cm,
+        assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
+        make_test_tc, test_deep_nested_schema_missing_leaf_cm,
     };
 
     #[test]
@@ -1041,6 +1121,46 @@ mod tests {
             ),
             "Duplicate column mapping ID",
         );
+    }
+
+    #[rstest::rstest]
+    #[case::accepted_distinct_paths(fixtures::same_phy_name_different_paths(), None)]
+    #[case::rejected_deeply_nested_repeat(
+        fixtures::deeply_nested_repeat_physical_paths(),
+        Some({
+            let (a, b) =
+                fixtures::deeply_nested_collider_paths();
+            format!("assigned to both '{a}' and '{b}'")
+        }),
+    )]
+    #[case::multiple_violations_reports_first(
+        fixtures::multiple_physical_name_collisions(),
+        Some("'p' assigned to both 'a' and 'b'".to_string()),
+    )]
+    fn test_dup_physical_name(
+        #[case] schema: StructType,
+        #[case] expected_error_substring: Option<String>,
+    ) {
+        // The same dedup rules should apply under both CM modes.
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result = validate_schema_column_mapping(&schema, mode);
+            match &expected_error_substring {
+                None => {
+                    result.expect("schema must validate");
+                }
+                Some(substr) => {
+                    assert_result_error_with_message(result.as_ref().map(|_| ()), substr);
+                    // For the multiple-violations case, also confirm the deeper site was never
+                    // reported.
+                    if let Err(e) = &result {
+                        assert!(
+                            !e.to_string().contains("'q'"),
+                            "walker must short-circuit on first collision under {mode:?}; got: {e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================

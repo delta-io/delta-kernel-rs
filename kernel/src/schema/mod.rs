@@ -18,7 +18,6 @@ pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
-    SeenColumnMappingAnnotations,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
@@ -2177,34 +2176,47 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
 
 struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
-    path: Vec<&'a str>,
-    /// CM ids and physical names already claimed during the walk, with the first claimer.
-    /// Threaded into `validate_and_extract_column_mapping_annotations` so duplicate IDs and
-    /// duplicate `physicalName` values are rejected at the first collision.
-    seen: SeenColumnMappingAnnotations<'a>,
+    /// Logical path of current field's parent, used for error messages.
+    logical_path: Vec<&'a str>,
+    /// `delta.columnMapping.id` -> first claimer logical name.
+    seen_ids: HashMap<i64, &'a str>,
+    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
+    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
+    /// pushed in `transform_struct` (root struct included) and popped after iterating its
+    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
+    /// elements / keys / values are anonymous.
+    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
         Self {
             column_mapping_mode,
-            path: vec![],
-            seen: SeenColumnMappingAnnotations::default(),
+            logical_path: vec![],
+            seen_ids: HashMap::new(),
+            sibling_names_stack: vec![],
         }
     }
 
     fn transform_inner<T>(
         &mut self,
-        field_name: &'a str,
+        logical_name: &'a str,
         transform: impl FnOnce(&mut Self) -> DeltaResult<T>,
     ) -> DeltaResult<T> {
-        self.path.push(field_name);
+        self.logical_path.push(logical_name);
         let result = transform(self);
-        self.path.pop();
+        self.logical_path.pop();
         result
     }
 }
 impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
+
+    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
+        self.sibling_names_stack.push(HashMap::new());
+        let result = self.recurse_into_struct(stype);
+        self.sibling_names_stack.pop();
+        result
+    }
 
     fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<array element>", |this| this.transform(etype))
@@ -2219,18 +2231,19 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         &mut self,
         field: &'a StructField,
     ) -> DeltaResult<Cow<'a, StructField>> {
+        let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
+            field,
+            self.column_mapping_mode,
+            &self.logical_path,
+            Some(&mut self.seen_ids),
+            self.sibling_names_stack.last_mut(),
+        )?;
+
+        if field.is_metadata_column() {
+            return Ok(Cow::Borrowed(field));
+        }
+
         self.transform_inner(field.name(), |this| {
-            let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
-                field,
-                this.column_mapping_mode,
-                &this.path,
-                Some(&mut this.seen),
-            )?;
-
-            if field.is_metadata_column() {
-                return Ok(Cow::Borrowed(field));
-            }
-
             let field = this.recurse_into_struct_field(field)?;
 
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
@@ -2255,7 +2268,8 @@ mod tests {
     use super::*;
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::{
-        assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
+        assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
+        test_deep_nested_schema_missing_leaf_cm,
     };
 
     fn example_schema_metadata() -> &'static str {
@@ -2639,68 +2653,42 @@ mod tests {
         );
     }
 
-    /// Two fields sharing the same `delta.columnMapping.physicalName` (at top level OR across
-    /// nesting depth) must be rejected during `make_physical`. PROTOCOL.md requires
-    /// `physicalName` to be a "globally unique identifier"; without dedup, two columns sharing
-    /// a physical name would resolve ambiguously in parquet under `ColumnMappingMode::Name`.
-    /// The walk runs from `TableConfiguration::try_new` so both CREATE and ALTER hit it.
     #[rstest]
-    #[case::same_level("a", "a")]
-    #[case::nested("a", "x")]
-    fn test_make_physical_rejects_duplicate_physical_names(
-        #[case] outer_name: &str,
-        #[case] inner_name: &str,
+    #[case::accepted_same_phy_name_different_paths(fixtures::same_phy_name_different_paths(), /*expected_error_substring*/None)]
+    #[case::rejected_deeply_nested_repeat_physical_paths(
+        fixtures::deeply_nested_repeat_physical_paths(),
+        Some({
+            let (a, b) =
+                fixtures::deeply_nested_collider_paths();
+            format!("assigned to both '{a}' and '{b}'")
+        }),
+    )]
+    #[case::multiple_physical_name_collisions_reports_first(
+        fixtures::multiple_physical_name_collisions(),
+        Some("'p' assigned to both 'a' and 'b'".to_string()),
+    )]
+    fn test_make_physical_dup_physical_name(
+        #[case] schema: StructType,
+        #[case] expected_error_substring: Option<String>,
     ) {
-        use crate::schema::ColumnMetadataKey;
-
-        // Both fields advertise the SAME physicalName ("col-shared") with distinct ids
-        // (so the duplicate-ID check doesn't fire first). For `same_level` both fields are
-        // top-level siblings; for `nested` the second field lives one struct deeper to prove
-        // the walker checks across nesting boundaries.
-        fn cm_field(
-            name: &str,
-            id: i64,
-            physical: &str,
-            data_type: impl Into<DataType>,
-        ) -> StructField {
-            StructField::not_null(name, data_type).with_metadata([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(id),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String(physical.to_string()),
-                ),
-            ])
+        // The same dedup rules should apply under both CM modes.
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result = schema.make_physical(mode);
+            match &expected_error_substring {
+                None => {
+                    result.expect("The input schema should be valid");
+                }
+                Some(substr) => {
+                    assert_result_error_with_message(result.as_ref().map(|_| ()), substr);
+                    if let Err(e) = &result {
+                        assert!(
+                            !e.to_string().contains("'q'"),
+                            "walker must short-circuit on first collision under {mode:?}; got: {e}"
+                        );
+                    }
+                }
+            }
         }
-
-        let schema = if outer_name == inner_name {
-            StructType::new_unchecked([
-                cm_field(outer_name, 1, "col-shared", DataType::INTEGER),
-                cm_field("sibling", 2, "col-shared", DataType::STRING),
-            ])
-        } else {
-            let inner = StructType::new_unchecked([cm_field(
-                inner_name,
-                2,
-                "col-shared",
-                DataType::INTEGER,
-            )]);
-            StructType::new_unchecked([
-                cm_field(outer_name, 1, "col-shared", DataType::INTEGER),
-                cm_field(
-                    "nested_holder",
-                    3,
-                    "col-nested-holder",
-                    DataType::Struct(Box::new(inner)),
-                ),
-            ])
-        };
-        assert_result_error_with_message(
-            schema.make_physical(ColumnMappingMode::Name),
-            "Duplicate `delta.columnMapping.physicalName` 'col-shared'",
-        );
     }
 
     #[test]
