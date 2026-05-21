@@ -94,10 +94,10 @@ impl<'a> SchemaTransform<'a> for TypeAllowlistVisitor {
     }
 }
 
-/// Rejects fields carrying the deprecated `parquet.field.nested.ids` metadata,
-/// which is superseded by `delta.columnMapping.nested.ids`.
+/// `parquet.field.nested.ids` is to be deprecated in favor of `delta.columnMapping.nested.ids`.
+/// Validates that no fields in the schema have `parquet.field.nested.ids` metadata.
 ///
-/// Tracking: <https://github.com/delta-io/delta/issues/6688>
+/// Tracking issue: <https://github.com/delta-io/delta/issues/6688>
 pub(super) fn check_no_legacy_nested_ids(tc: &TableConfiguration) -> DeltaResult<()> {
     let mut v = LegacyNestedIdsVisitor {
         path: vec![],
