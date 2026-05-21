@@ -11,8 +11,6 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
 
-#[cfg(feature = "default-engine-base")]
-use crate::expressions::arrow_pruning::ArrowNamedOpaquePredicateOp;
 use crate::expressions::pruning::{OpaquePruningCallbacks, SharedOpaquePruningContext};
 use crate::expressions::{NamedOpaquePredicateOp, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
@@ -605,8 +603,7 @@ pub extern "C" fn visit_predicate_in(
 ///
 /// The resulting op opts out of every kernel-side pruning pass; the engine is responsible
 /// for filtering at row time. Engines that want kernel-side pruning should use
-/// [`visit_predicate_opaque_with_pruning`] (or `visit_predicate_opaque_with_pruning_arrow`
-/// for default-engine consumers, under `default-engine-base`), which attach
+/// [`visit_predicate_opaque_with_pruning`], which attaches
 /// [`OpaquePruningCallbacks`] to the op.
 ///
 /// [`OpaquePruningCallbacks`]: crate::expressions::pruning::OpaquePruningCallbacks
@@ -714,64 +711,29 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_pruning(
         .into_extern_result(&allocate_error)
 }
 
-/// Build an opaque predicate with engine pruning callbacks AND arrow batch
-/// evaluation support. Like [`visit_predicate_opaque_with_pruning`] but the
-/// resulting op is wrapped via `Predicate::arrow_opaque` so the default
-/// engine's `evaluate_predicate` can dispatch per-row callback invocations
-/// during stats-based file pruning. Engines using the default engine should
-/// call this builder; engines with their own `EvaluationHandler` should use
-/// the plain `visit_predicate_opaque_with_pruning`.
-///
-/// Only available when arrow is wired in (`default-engine-base` feature).
-///
-/// # Safety
-/// The string slice must be valid for the duration of the call. `ctx` must
-/// be a valid handle produced by [`create_opaque_pruning_context`].
-///
-/// [`create_opaque_pruning_context`]: crate::expressions::pruning::create_opaque_pruning_context
-#[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn visit_predicate_opaque_with_pruning_arrow(
-    state: &mut KernelExpressionVisitorState,
-    name: KernelStringSlice,
-    children: &mut EngineIterator,
-    ctx: Handle<SharedOpaquePruningContext>,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<usize> {
-    let name_str = unsafe { String::try_from_slice(&name) };
-    let callbacks = unsafe { ctx.clone_as_arc() };
-    visit_predicate_opaque_with_pruning_arrow_impl(state, name_str, children, callbacks)
-        .into_extern_result(&allocate_error)
-}
-
-#[cfg(feature = "default-engine-base")]
-fn visit_predicate_opaque_with_pruning_arrow_impl(
-    state: &mut KernelExpressionVisitorState,
-    name: DeltaResult<String>,
-    children: &mut EngineIterator,
-    callbacks: Arc<OpaquePruningCallbacks>,
-) -> DeltaResult<usize> {
-    build_opaque_predicate(
-        state,
-        name?,
-        children.map(|child| child as usize),
-        Some(callbacks),
-        |op, exprs| Predicate::arrow_opaque(ArrowNamedOpaquePredicateOp::new(op), exprs),
-    )
-}
-
 fn visit_predicate_opaque_with_pruning_impl(
     state: &mut KernelExpressionVisitorState,
     name: DeltaResult<String>,
     children: &mut EngineIterator,
     callbacks: Arc<OpaquePruningCallbacks>,
 ) -> DeltaResult<usize> {
+    // With `default-engine-base`, wrap via `arrow_opaque` so the default
+    // engine recovers the `ArrowOpaquePredicateOp` impl during batch
+    // evaluation. Without it, hand the op through as plain `Opaque` -- the
+    // engine's own `EvaluationHandler` must recognize the variant to drive
+    // file pruning.
+    #[cfg(feature = "default-engine-base")]
+    let wrap = |op: NamedOpaquePredicateOp, exprs: Vec<Expression>| -> Predicate {
+        Predicate::arrow_opaque(op, exprs)
+    };
+    #[cfg(not(feature = "default-engine-base"))]
+    let wrap = Predicate::opaque;
     build_opaque_predicate(
         state,
         name?,
         children.map(|child| child as usize),
         Some(callbacks),
-        Predicate::opaque,
+        wrap,
     )
 }
 

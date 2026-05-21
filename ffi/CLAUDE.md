@@ -33,9 +33,10 @@ the caller's memory space.
   hosts `visit_predicate_opaque*` for engine-defined ops
 - `src/expressions/pruning.rs` -- engine-callback framework for opaque-predicate
   data skipping (`OpaquePruningCallbacks`, child/stats/scalar accessors)
-- `src/expressions/arrow_pruning.rs` -- `ArrowNamedOpaquePredicateOp`, the
-  default-engine adapter that routes per-row callback invocations during
-  stats-based file pruning (only built with `default-engine-base`)
+- `src/expressions/arrow_pruning.rs` -- `ArrowOpaquePredicateOp` impl on
+  `NamedOpaquePredicateOp` that routes per-row callback invocations through
+  the default engine's batch evaluator during stats-based file pruning (only
+  built with `default-engine-base`)
 
 ## Read Flow
 

@@ -1,9 +1,8 @@
 //! Arrow-based per-row evaluation of [`NamedOpaquePredicateOp`].
 //!
-//! [`ArrowNamedOpaquePredicateOp`] is a newtype wrapper around
-//! [`NamedOpaquePredicateOp`] that adds an [`ArrowOpaquePredicateOp`] impl, so
-//! the default engine's batch evaluator can run an opaque op directly against
-//! the file-stats metadata batch. `eval_pred` iterates the batch rows, invokes
+//! Adds an [`ArrowOpaquePredicateOp`] impl on [`NamedOpaquePredicateOp`] so the
+//! default engine's batch evaluator can run an opaque op directly against the
+//! file-stats metadata batch. `eval_pred` iterates the batch rows, invokes
 //! the engine's `eval_against_stats` callback per row with a
 //! [`BatchRowStatsProvider`] that reads from the row's `stats_parsed.*`
 //! columns, and packs the verdicts into a `BooleanArray`.
@@ -148,51 +147,29 @@ fn double_scalar(any: &dyn std::any::Any, row: usize) -> Option<Scalar> {
         .map(|arr| Scalar::Float(arr.value(row)))
 }
 
-// === ArrowNamedOpaquePredicateOp ==============================================
+// === ArrowOpaquePredicateOp impl ==============================================
 
-/// Newtype wrapper that adds [`ArrowOpaquePredicateOp`] capability to a
-/// [`NamedOpaquePredicateOp`]. Use this only when constructing predicates
-/// that will be evaluated by the default engine's arrow batch evaluator;
-/// engines with their own `EvaluationHandler` should keep using plain
-/// `NamedOpaquePredicateOp`.
-///
-/// Engine-facing FFI: see
-/// [`visit_predicate_opaque_with_pruning_arrow`](crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning_arrow).
-#[derive(Debug, Clone)]
-pub struct ArrowNamedOpaquePredicateOp(NamedOpaquePredicateOp);
-
-impl ArrowNamedOpaquePredicateOp {
-    pub(crate) fn new(inner: NamedOpaquePredicateOp) -> Self {
-        Self(inner)
-    }
-
-    fn inner(&self) -> &NamedOpaquePredicateOp {
-        &self.0
-    }
-}
-
-impl PartialEq for ArrowNamedOpaquePredicateOp {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for ArrowNamedOpaquePredicateOp {}
-
-impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
+/// Adds arrow batch-evaluator capability to [`NamedOpaquePredicateOp`]. The
+/// default engine's `evaluate_predicate` recovers this impl from the
+/// `Predicate::Opaque` adaptor and drives `eval_pred` per metadata-batch row,
+/// invoking the engine's `eval_against_stats` callback with a
+/// `BatchRowStatsProvider` that reads from the row's `stats_parsed.*` columns.
+/// Partition and row-group dispatch reuses the `OpaquePredicateOp` impl on the
+/// same type.
+impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
     fn eval_pred(
         &self,
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
-        let Some(cb) = self.inner().callbacks_clone() else {
+        let Some(cb) = self.callbacks_clone() else {
             // No callbacks registered: every-row unknown. Data-skipping treats
             // unknown as keep, so kernel won't prune any files.
             return Ok(BooleanArray::from(vec![None; batch.num_rows()]));
         };
 
-        let op_name = self.inner().op_name();
+        let op_name = self.op_name();
         let children = ChildAccessor::new(args);
         let mut results: Vec<Option<bool>> = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
@@ -205,7 +182,7 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
     }
 
     fn name(&self) -> &str {
-        self.inner().op_name()
+        self.op_name()
     }
 
     fn eval_pred_scalar(
@@ -215,13 +192,8 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> DeltaResult<Option<bool>> {
-        // Partition pruning dispatch lives on the inner op.
-        <NamedOpaquePredicateOp as delta_kernel::expressions::OpaquePredicateOp>::eval_pred_scalar(
-            self.inner(),
-            eval_expr,
-            eval_pred,
-            exprs,
-            inverted,
+        <Self as delta_kernel::expressions::OpaquePredicateOp>::eval_pred_scalar(
+            self, eval_expr, eval_pred, exprs, inverted,
         )
     }
 
@@ -231,8 +203,8 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<bool> {
-        <NamedOpaquePredicateOp as delta_kernel::expressions::OpaquePredicateOp>::eval_as_data_skipping_predicate(
-            self.inner(),
+        <Self as delta_kernel::expressions::OpaquePredicateOp>::eval_as_data_skipping_predicate(
+            self,
             predicate_evaluator,
             exprs,
             inverted,
@@ -245,12 +217,12 @@ impl ArrowOpaquePredicateOp for ArrowNamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
-        // With callbacks present, keep the op live across the indirect rewrite
-        // so the default engine's `evaluate_predicate` can drive `eval_pred`
-        // per metadata-batch row. When `inverted`, wrap in `Not`; kernel's
-        // batch evaluator pushes that down into the `eval_pred` call with
-        // `inverted=true` so the engine sees a single (un-doubled) inversion.
-        if !self.inner().has_callbacks() {
+        // Keep the op live across the indirect rewrite so the default engine's
+        // `evaluate_predicate` can drive `eval_pred` per metadata-batch row.
+        // When `inverted`, wrap in `Not`; the batch evaluator pushes that down
+        // into the `eval_pred` call with `inverted=true` so the engine sees a
+        // single (un-doubled) inversion.
+        if !self.has_callbacks() {
             return None;
         }
         let pred = Predicate::arrow_opaque(self.clone(), exprs.iter().cloned());
@@ -544,10 +516,7 @@ mod tests {
 
     #[test]
     fn eval_pred_prunes_per_row_via_engine_callback() {
-        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::with_callbacks(
-            "STARTS_WITH",
-            callbacks(),
-        ));
+        let op = NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", callbacks());
         let args = vec![column_expr!("name"), Expression::literal("foo")];
         let batch = three_file_batch();
 
@@ -563,7 +532,7 @@ mod tests {
 
     #[test]
     fn eval_pred_without_callbacks_returns_all_unknown() {
-        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::new("STARTS_WITH"));
+        let op = NamedOpaquePredicateOp::new("STARTS_WITH");
         let args = vec![column_expr!("name"), Expression::literal("foo")];
         let batch = three_file_batch();
 
@@ -609,10 +578,8 @@ mod tests {
     #[test]
     fn eval_pred_forwards_inverted_flag_to_engine() {
         SAW_INVERTED.with(|c| c.set(false));
-        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::with_callbacks(
-            "STARTS_WITH",
-            inverted_recording_callbacks(),
-        ));
+        let op =
+            NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", inverted_recording_callbacks());
         let args = vec![column_expr!("name"), Expression::literal("foo")];
         let batch = three_file_batch();
 
@@ -631,10 +598,8 @@ mod tests {
     #[test]
     fn eval_pred_inverted_false_does_not_set_flag() {
         SAW_INVERTED.with(|c| c.set(false));
-        let op = ArrowNamedOpaquePredicateOp::new(NamedOpaquePredicateOp::with_callbacks(
-            "STARTS_WITH",
-            inverted_recording_callbacks(),
-        ));
+        let op =
+            NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", inverted_recording_callbacks());
         let args = vec![column_expr!("name"), Expression::literal("foo")];
         let batch = three_file_batch();
 

@@ -113,12 +113,18 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 /// evaluate the op itself. For kernel-side pruning, if the engine has
 /// registered [`OpaquePruningCallbacks`] via [`create_opaque_pruning_context`],
 /// kernel invokes the appropriate callback once per partition value set during
-/// partition pruning, and once per parquet row group during row-group skipping.
-/// Stats-based file pruning does NOT engage for this op directly -- kernel's
-/// indirect rewrite drops the opaque branch before file pruning runs. Engines
-/// that need file pruning should wrap the op via `ArrowNamedOpaquePredicateOp`
-/// (default-engine-base), which dispatches per-row callback invocations through
-/// the arrow batch evaluator.
+/// partition pruning, once per parquet row group during row-group skipping,
+/// and once per metadata-batch row during stats-based file pruning. The
+/// indirect rewrite preserves the opaque branch so the file-pruning pass can
+/// dispatch back to the engine.
+///
+/// With the `default-engine-base` feature, this type also implements
+/// `ArrowOpaquePredicateOp` so the default engine's batch evaluator drives
+/// `eval_pred` per metadata-batch row directly. Without the feature, the FFI
+/// builder wraps via `Predicate::opaque` and the engine's own
+/// `EvaluationHandler` is responsible for evaluating the opaque op against
+/// per-file stats -- typically by recognizing `Predicate::Opaque` and
+/// dispatching to the callbacks itself.
 ///
 /// If no callbacks are registered, the op opts out of every pruning pass and
 /// the engine is responsible for filtering at row time.
@@ -219,13 +225,20 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
     fn as_data_skipping_predicate(
         &self,
         _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
-        _exprs: &[Expression],
-        _inverted: bool,
+        exprs: &[Expression],
+        inverted: bool,
     ) -> Option<Predicate> {
-        // No native rewrite: file pruning runs through the arrow adapter
-        // (`ArrowNamedOpaquePredicateOp`). Engines with a custom
-        // `EvaluationHandler` get partition + row-group pruning only.
-        None
+        // Preserve the opaque branch through the indirect rewrite so file
+        // pruning can dispatch back to the engine. This impl is only reached
+        // when the predicate was built via `Predicate::opaque` (i.e. without
+        // the `default-engine-base` arrow adaptor); the engine's own
+        // `EvaluationHandler` must then recognize `Predicate::Opaque` and run
+        // the callback against per-file stats. Returning `None` (when no
+        // callbacks are registered) suppresses the branch at rewrite time so
+        // engines never see an op they can't evaluate.
+        self.callbacks.as_ref()?;
+        let pred = Predicate::opaque(self.clone(), exprs.iter().cloned());
+        Some(if inverted { Predicate::not(pred) } else { pred })
     }
 }
 

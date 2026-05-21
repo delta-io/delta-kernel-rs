@@ -13,16 +13,20 @@
 //! 3. visit_predicate_opaque_with_pruning(name, children, ctx)
 //!         |
 //!         v
-//!    builds NamedOpaquePredicateOp { name, Arc<callbacks> }
-//!    wraps in Predicate::opaque (or Predicate::arrow_opaque
-//!    for the "_arrow" variant). engine receives a predicate id.
+//!    builds NamedOpaquePredicateOp { name, Arc<callbacks> }, then wraps via
+//!    Predicate::arrow_opaque (when `default-engine-base` is on) or
+//!    Predicate::opaque (otherwise). engine receives a predicate id.
 //!         |
 //!         v
 //!    kernel pruning passes invoke the op's callback:
 //!      - partition prune:  eval_pred_scalar -> eval_on_partition_values
 //!      - row-group skip:   eval_as_data_skipping_predicate -> eval_on_row_group_stats
-//!      - file prune:       ArrowOpaquePredicateOp::eval_pred (arrow-only;
-//!                          per row of metadata batch) -> eval_against_stats
+//!      - file prune:       indirect rewrite keeps the opaque branch live, then either
+//!                            * default engine: ArrowOpaquePredicateOp::eval_pred runs
+//!                              per metadata-batch row -> eval_against_stats
+//!                            * other engines: the engine's own EvaluationHandler must
+//!                              recognize Predicate::Opaque and dispatch to the callback;
+//!                              otherwise file pruning conservatively keeps every file.
 //!         |
 //!         v
 //!    each invocation hands the engine:
@@ -33,16 +37,6 @@
 //!    engine fills the verdict; kernel maps Keep/Skip/Unknown to its
 //!    Option<bool> pruning decision.
 //! ```
-//!
-//! ## Two builders
-//!
-//! - [`visit_predicate_opaque_with_pruning`] -- engine-agnostic. Callbacks fire for partition
-//!   pruning and parquet row-group skipping. Stats-based file pruning does NOT engage: kernel's
-//!   indirect rewrite drops the opaque branch before file pruning runs.
-//! - [`visit_predicate_opaque_with_pruning_arrow`] (requires `default-engine-base`) -- wraps the op
-//!   so the default engine's batch evaluator dispatches per-row callback invocations during
-//!   stats-based file pruning. All three pruning passes fire. Engines using the default engine
-//!   should call this builder.
 //!
 //! ## Contract
 //!
@@ -61,7 +55,6 @@
 //!
 //! [`Predicate::Opaque`]: delta_kernel::expressions::Predicate::Opaque
 //! [`visit_predicate_opaque_with_pruning`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning
-//! [`visit_predicate_opaque_with_pruning_arrow`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning_arrow
 
 use std::ffi::c_void;
 use std::sync::Arc;
