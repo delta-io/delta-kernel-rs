@@ -1132,10 +1132,11 @@ impl Snapshot {
     /// # Errors
     ///
     /// - [`Error::ChecksumWriteUnsupported`] if no in-memory CRC is available at this snapshot's
-    ///   version (e.g. a snapshot loaded from disk that has no CRC file), or if the CRC's
+    ///   version (e.g. a snapshot loaded from disk that has no CRC file), if the CRC's
     ///   `file_stats_state` is `Indeterminate` (a non-incremental operation like ANALYZE STATS was
-    ///   encountered, or a file action had a missing size). Recoverable with a full state
-    ///   reconstruction in the future.
+    ///   encountered, or a file action had a missing size; recoverable with a full state
+    ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
+    ///   `inCommitTimestampOpt` is absent.
     /// - I/O errors from the engine's storage handler if the write fails.
     ///
     /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
@@ -1170,7 +1171,6 @@ impl Snapshot {
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        // Note: try_write_crc_file validates that file_stats_state is Complete before writing.
         match try_write_crc_file(engine, &crc_path.location, crc) {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);

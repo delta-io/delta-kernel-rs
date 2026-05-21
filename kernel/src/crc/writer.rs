@@ -3,16 +3,20 @@
 use url::Url;
 
 use super::Crc;
+use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`Error::ChecksumWriteUnsupported`] if `file_stats_state` is not
-/// `Complete` (only `Complete` CRCs have a well-defined on-disk representation). Per the
-/// Delta protocol, writers MUST NOT overwrite existing CRC files, so this always writes
-/// with `overwrite = false`. If the file already exists, returns
+/// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
+/// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
+///   representation); or
+/// - `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
+///
+/// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
+/// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     require!(
@@ -21,6 +25,20 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
             "Cannot write CRC file with {:?} file stats",
             crc.file_stats_state
         ))
+    );
+    // If ICT is enabled, the CRC must carry an ICT value.
+    let ict_enabled = crc
+        .metadata
+        .configuration()
+        .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+        .is_some_and(|v| v == "true");
+    let ict_value_present = crc.in_commit_timestamp_opt.is_some();
+    require!(
+        !ict_enabled || ict_value_present,
+        Error::ChecksumWriteUnsupported(
+            "Cannot write CRC file: In-Commit Timestamps enabled but inCommitTimestampOpt is absent"
+                .to_string()
+        )
     );
     let data = serde_json::to_vec(crc)?;
     engine
@@ -33,8 +51,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use super::*;
-    use crate::actions::{DomainMetadata, Protocol, SetTransaction};
+    use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
     use crate::crc::{
         DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
@@ -44,19 +64,31 @@ mod tests {
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
 
-    fn test_crc() -> Crc {
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::ColumnMapping],
-            [
-                TableFeature::ColumnMapping,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-                TableFeature::InCommitTimestamp,
-            ],
-        )
-        .unwrap();
+    fn writer_test_env() -> (SyncEngine, ParsedLogPath) {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let table_root = Url::parse("memory:///test_table/").unwrap();
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+        (engine, crc_path)
+    }
+
+    fn test_crc(ict_supported: bool, ict_enabled: bool) -> Crc {
+        let mut writer_features = vec![
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ];
+        if ict_supported {
+            writer_features.push(TableFeature::InCommitTimestamp);
+        }
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], writer_features).unwrap();
+        let metadata = if ict_enabled {
+            Metadata::default().with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "true")
+        } else {
+            Metadata::default()
+        };
         // NOTE: Adding more entries here will break test_crc_serialized_json_content because
-        // domain_metadata is backed by an unsorted HashMap -- the serialized array order is
+        // domain_metadata is backed by an unsorted HashMap. The serialized array order is
         // non-deterministic. If you need multiple entries, either make the test order-independent
         // (e.g. sort both sides by domain name) or switch to a BTreeMap.
         let domain_metadata = HashMap::from([(
@@ -82,6 +114,7 @@ mod tests {
                 file_size_histogram: Some(histogram),
             }),
             protocol,
+            metadata,
             txn_id: None,
             in_commit_timestamp_opt: Some(ict),
             set_transaction_state: SetTransactionState::Complete(set_transactions),
@@ -92,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_serde_round_trip() {
-        let crc = test_crc();
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         let json_bytes = serde_json::to_vec(&crc).unwrap();
         let round_tripped: Crc = serde_json::from_slice(&json_bytes).unwrap();
 
@@ -101,23 +134,19 @@ mod tests {
 
     #[test]
     fn test_write_then_read_crc_file() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store);
-        let table_root = url::Url::parse("memory:///test_table/").unwrap();
-        let write_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
-        let read_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
-        let crc = test_crc();
+        let (engine, crc_path) = writer_test_env();
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
 
-        try_write_crc_file(&engine, write_path.location.as_url(), &crc).unwrap();
+        try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
-        let read_back = try_read_crc_file(&engine, &read_path).unwrap();
+        let read_back = try_read_crc_file(&engine, &crc_path).unwrap();
         assert_eq!(read_back, crc);
     }
 
     /// Verify JSON content produced by CRC serialization via serde_json::Value comparison.
     #[test]
     fn test_crc_serialized_json_content() {
-        let crc = test_crc();
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         let actual: serde_json::Value = serde_json::to_value(&crc).unwrap();
 
         // Verify non-histogram fields match exactly.
@@ -138,7 +167,9 @@ mod tests {
                 "schemaString": "",
                 "partitionColumns": [],
                 "createdTime": null,
-                "configuration": {}
+                "configuration": {
+                    "delta.enableInCommitTimestamps": "true"
+                }
             },
             "protocol": {
                 "minReaderVersion": 3,
@@ -190,29 +221,52 @@ mod tests {
 
     #[test]
     fn test_write_crc_file_already_exists() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store);
-        let table_root = url::Url::parse("memory:///test_table/").unwrap();
-        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
-        let crc = test_crc();
+        let (engine, crc_path) = writer_test_env();
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
         // Second write should fail (never overwrites)
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
     }
 
     #[test]
     fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store);
-        let table_root = url::Url::parse("memory:///test_table/").unwrap();
-        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
-
-        let mut crc = test_crc();
+        let (engine, crc_path) = writer_test_env();
+        let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         crc.file_stats_state = FileStatsState::Indeterminate;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
+    }
+
+    #[rstest]
+    #[case::not_supported(false, false)]
+    #[case::supported_not_enabled(true, false)]
+    #[case::supported_and_enabled(true, true)]
+    fn test_write_enforces_ict_enablement_value_consistency(
+        #[case] ict_supported: bool,
+        #[case] ict_enabled: bool,
+        #[values(false, true)] ict_value_present: bool,
+    ) {
+        let (engine, crc_path) = writer_test_env();
+
+        let mut crc = test_crc(ict_supported, ict_enabled);
+        if !ict_value_present {
+            crc.in_commit_timestamp_opt = None;
+        }
+
+        // If ICT is enabled, then the ICT value must be present.
+        let should_succeed = !ict_enabled || ict_value_present;
+        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        if should_succeed {
+            result.unwrap();
+        } else {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, Error::ChecksumWriteUnsupported(_)),
+                "expected ChecksumWriteUnsupported, got: {err:?}"
+            );
+        }
     }
 }
