@@ -4,32 +4,33 @@ pub mod column_mapping_fixtures;
 pub mod counting_reporter;
 pub mod table_builder;
 
-// Required so rstest_reuse templates exported with `#[export]` can resolve
-// `rstest_reuse::*` when expanded in a downstream crate.
-// rstest_reuse's `#[template]` looks for a bare `#[rstest]` (single-segment path)
-// to locate the attribute split point, so we import `rstest` here as a bare name.
-// The `#[values(...)]` and type idents live inside the template macro body and
-// are only resolved at expansion time in consumer crates.
+// The `#[rstest]` attribute and the `table_builder` factories below appear inside
+// the `define_sweeps!` body. They get stored as `macro_rules!` tokens in the
+// generated template macros and only resolve when a consumer applies them, so
+// rustc doesn't see them as used in this crate.
 #[allow(unused_imports)]
 use rstest::rstest;
 pub use rstest_reuse;
 use rstest_reuse::template;
 #[allow(unused_imports)]
-use table_builder::{
-    DataLayoutConfig, FeatureSet, LastCheckpointHintState, LogState, VersionTarget,
-    DEFAULT_SWEEP_MID_VERSION,
-};
+use table_builder::*;
 
-/// Emits all canonical sweep templates from a single source: `default_sweep` (the full
-/// 4-axis cross-product) plus one per-axis template per axis (`log_state_sweep`,
-/// `feature_set_sweep`, `data_layout_sweep`, `version_target_sweep`).
+/// Emits canonical sweep templates: `default_sweep` (all axes) plus one per-axis
+/// template per axis. A per-axis template only supplies its named axis; the test
+/// supplies the rest:
 ///
-/// Each per-axis template iterates one axis from the canonical list; the test author
-/// supplies their own `#[values(...)]` for the other params.
+/// ```ignore
+/// #[apply(log_state_sweep)]
+/// fn my_test(
+///     log_state: LogState,                                    // 7 canonical values
+///     #[values(no_features())] feature_set: FeatureSet,
+///     #[values(unpartitioned_json())] data_layout: DataLayoutConfig,
+///     #[values(version_latest())] version_target: VersionTarget,
+/// ) { /* ... */ }
+/// ```
 ///
-/// Lives at crate root so `#[macro_export]`-generated templates are reachable cross-crate
-/// as `test_utils::<name>`. Each canonical value list is captured as a single token tree
-/// (`$tt`) so the parens carry through to `#[values $list]` substitution.
+/// Defined at crate root so the `#[macro_export]`-generated macros are reachable
+/// cross-crate as `test_utils::<name>`.
 macro_rules! define_sweeps {
     (
         log_state_values = $ls:tt,
@@ -71,66 +72,42 @@ macro_rules! define_sweeps {
 }
 
 define_sweeps! {
-    // Aligned with the cardinality doc's Required tier. TODOs cover rows that need
-    // builder support not yet present in `TestTableBuilder`.
     // TODO: CRC at last / stale CRC (needs LogState::with_crc_at).
     // TODO: Log compaction (needs LogState::with_compaction_at, #2337).
     // TODO: Schema history (add/drop/rename) (needs schema-evolution support).
     log_state_values = (
-        LogState::with_latest_version(10),
-        LogState::with_latest_version(10).with_checkpoint_at([10]),
-        LogState::with_latest_version(10)
-            .with_checkpoint_at([10])
-            .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
-        LogState::with_latest_version(10).with_checkpoint_at([5]),
-        LogState::with_latest_version(10)
-            .with_checkpoint_at([5])
-            .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
-        LogState::with_latest_version(10)
-            .with_checkpoint_at([5, 10])
-            .with_last_checkpoint_hint(LastCheckpointHintState::Stale)
+        commits_only(),
+        checkpoint_at_end(),
+        checkpoint_at_end_no_hint(),
+        checkpoint_mid(),
+        checkpoint_mid_no_hint(),
+        two_checkpoints_stale_hint(),
+        post_cleanup()
     ),
-    // Aligned with the cardinality doc's Compressed sweep (3.6): a few maxed-out rows
-    // rather than per-feature singletons. TODOs cover rows that need features without
-    // builder support yet.
     // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
     //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
     //       allowColumnDefaults, identityColumns, NTZ/variant (schema-driven),
     //       catalogManaged, collations for CM=name, typeWidening write support).
     // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
     // TODO: iceV3 (needs icebergCompatV3).
-    feature_set_values = (
-        FeatureSet::empty(),
-        FeatureSet::new()
-            .column_mapping("id")
-            .deletion_vectors()
-            .row_tracking()
-            .domain_metadata()
-            .ict()
-            .v2_checkpoint()
-            .vacuum_protocol_check()
-            .change_data_feed()
-            .append_only(),
-        FeatureSet::new()
-            .column_mapping("name")
-            .deletion_vectors()
-            .row_tracking()
-            .domain_metadata()
-            .ict()
-            .v2_checkpoint()
-            .vacuum_protocol_check()
-            .change_data_feed()
-            .append_only()
-    ),
+    feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
+    // Three layouts crossed with three stats formats. TODO: null-distribution and
+    // partition-by-timestamp-with-CM rows.
     data_layout_values = (
-        DataLayoutConfig::Unpartitioned,
-        DataLayoutConfig::PartitionedAllTypes,
-        DataLayoutConfig::ClusteredAllTypes
+        unpartitioned(json_stats()),
+        unpartitioned(struct_stats()),
+        unpartitioned(no_stats()),
+        partitioned(json_stats()),
+        partitioned(struct_stats()),
+        partitioned(no_stats()),
+        clustered(json_stats()),
+        clustered(struct_stats()),
+        clustered(no_stats())
     ),
     version_target_values = (
-        VersionTarget::Latest,
-        VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION),
-        VersionTarget::IncrementalToLatest { from: DEFAULT_SWEEP_MID_VERSION }
+        version_latest(),
+        version_at_mid(),
+        version_incremental_to_latest()
     ),
 }
 use std::collections::HashMap;

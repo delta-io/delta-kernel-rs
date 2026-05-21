@@ -5,18 +5,25 @@ use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
 use test_utils::table_builder::{
-    test_table, DataLayoutConfig, FeatureSet, LastCheckpointHintState, LogState, VersionTarget,
-    DEFAULT_SWEEP_MID_VERSION,
+    all_features_cm_id, all_features_cm_name, checkpoint_at_end, checkpoint_at_end_no_hint,
+    checkpoint_mid, checkpoint_mid_no_hint, clustered, commits_only, json_stats, no_features,
+    no_stats, partitioned, post_cleanup, struct_stats, test_table, two_checkpoints_stale_hint,
+    unpartitioned, version_at_mid, version_incremental_to_latest, version_latest, DataLayoutConfig,
+    FeatureSet, LogState, VersionTarget,
 };
 use test_utils::{build_snapshot, default_sweep, read_scan};
 
-/// Each data commit (versions `1..=latest`) writes [`TestTableBuilder`]'s
-/// default 1-file-of-10-rows, so the row count at any snapshot version `v` is
-/// exactly `v * ROWS_PER_COMMIT`.
+/// `TestTableBuilder`'s default is one file per data commit with this many rows, so a
+/// snapshot at version `v` has exactly `v * ROWS_PER_COMMIT` total rows. File count
+/// per commit isn't asserted because partitioned layouts may emit multiple files.
 const ROWS_PER_COMMIT: usize = 10;
 
+/// `default_sweep` is the canonical `{LogState x FeatureSet x DataLayoutConfig x
+/// VersionTarget}` cross-product defined in `test_utils`. Each combination expands
+/// into its own test runner case. Invoking `test_table` here also exercises the
+/// write path that produces each table state.
 #[apply(default_sweep)]
-fn read_cross_product(
+fn test_cross_product_read_write(
     log_state: LogState,
     feature_set: FeatureSet,
     data_layout: DataLayoutConfig,
