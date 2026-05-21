@@ -3,18 +3,21 @@
 //! Each test sets up an in-memory Delta log with V2 checkpoint JSONs, commit files, and CRC files,
 //! then verifies that Protocol & Metadata loading and ICT reads resolve correctly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::json;
 use test_utils::{assert_result_error_with_message, delta_path_for_version};
 use url::Url;
 
+use super::LogSegment;
 use crate::actions::{CommitInfo, Format, Metadata, Protocol};
+use crate::crc::{try_read_crc_file, Crc, FileSizeHistogram};
 use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
-use crate::Snapshot;
+use crate::path::ParsedLogPath;
+use crate::{DeltaResult, Engine, Snapshot};
 
 // ============================================================================
 // Expected values
@@ -22,11 +25,11 @@ use crate::Snapshot;
 
 const SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}},{"name":"val","type":"string","nullable":true,"metadata":{}}]}"#;
 
-fn protocol_v2() -> Protocol {
+pub(super) fn protocol_v2() -> Protocol {
     Protocol::try_new_modern(["v2Checkpoint"], ["v2Checkpoint"]).unwrap()
 }
 
-fn protocol_v2_dv() -> Protocol {
+pub(super) fn protocol_v2_dv() -> Protocol {
     Protocol::try_new_modern(
         ["v2Checkpoint", "deletionVectors"],
         ["v2Checkpoint", "deletionVectors"],
@@ -34,7 +37,7 @@ fn protocol_v2_dv() -> Protocol {
     .unwrap()
 }
 
-fn protocol_v2_dv_ntz() -> Protocol {
+pub(super) fn protocol_v2_dv_ntz() -> Protocol {
     Protocol::try_new_modern(
         ["v2Checkpoint", "deletionVectors", "timestampNtz"],
         ["v2Checkpoint", "deletionVectors", "timestampNtz"],
@@ -42,7 +45,7 @@ fn protocol_v2_dv_ntz() -> Protocol {
     .unwrap()
 }
 
-fn protocol_v2_ict() -> Protocol {
+pub(super) fn protocol_v2_ict() -> Protocol {
     Protocol::try_new(
         3,
         7,
@@ -52,7 +55,7 @@ fn protocol_v2_ict() -> Protocol {
     .unwrap()
 }
 
-fn metadata_a() -> Metadata {
+pub(super) fn metadata_a() -> Metadata {
     Metadata::new_unchecked(
         "aaa",
         None,
@@ -65,7 +68,7 @@ fn metadata_a() -> Metadata {
     )
 }
 
-fn metadata_b() -> Metadata {
+pub(super) fn metadata_b() -> Metadata {
     Metadata::new_unchecked(
         "bbb",
         None,
@@ -78,7 +81,7 @@ fn metadata_b() -> Metadata {
     )
 }
 
-fn metadata_ict() -> Metadata {
+pub(super) fn metadata_ict() -> Metadata {
     Metadata::new_unchecked(
         "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
         None,
@@ -128,19 +131,79 @@ fn commit_info_json_with_ict(ict: i64) -> serde_json::Value {
     }})
 }
 
-fn crc_json(protocol: &Protocol, metadata: &Metadata, ict: Option<i64>) -> serde_json::Value {
+fn crc_json(
+    protocol: &Protocol,
+    metadata: &Metadata,
+    ict: Option<i64>,
+    file_sizes: &[i64],
+) -> serde_json::Value {
+    let total_bytes: i64 = file_sizes.iter().sum();
+    let num_files = file_sizes.len() as i64;
     let mut v = json!({
-        "tableSizeBytes": 0,
-        "numFiles": 0,
+        "tableSizeBytes": total_bytes,
+        "numFiles": num_files,
         "numMetadata": 1,
         "numProtocol": 1,
         "metadata": serde_json::to_value(metadata).unwrap(),
         "protocol": serde_json::to_value(protocol).unwrap(),
     });
+    if !file_sizes.is_empty() {
+        let mut hist = FileSizeHistogram::create_default();
+        for &s in file_sizes {
+            hist.insert(s).unwrap();
+        }
+        v["fileSizeHistogram"] = serde_json::to_value(&hist).unwrap();
+    }
     if let Some(ict) = ict {
         v["inCommitTimestampOpt"] = json!(ict);
     }
     v
+}
+
+fn add_action_json(path: &str, size: i64) -> serde_json::Value {
+    json!({"add": {
+        "path": path, "size": size, "partitionValues": {},
+        "modificationTime": 0, "dataChange": true,
+    }})
+}
+
+fn remove_action_json(path: &str, size: Option<i64>) -> serde_json::Value {
+    match size {
+        Some(s) => json!({"remove": {
+            "path": path, "size": s,
+            "dataChange": true, "deletionTimestamp": 0,
+        }}),
+        None => json!({"remove": {
+            "path": path,
+            "dataChange": true, "deletionTimestamp": 0,
+        }}),
+    }
+}
+
+fn domain_metadata_action_json(
+    domain: &str,
+    configuration: &str,
+    removed: bool,
+) -> serde_json::Value {
+    json!({"domainMetadata": {
+        "domain": domain, "configuration": configuration, "removed": removed,
+    }})
+}
+
+fn set_transaction_action_json(
+    app_id: &str,
+    txn_version: i64,
+    last_updated: Option<i64>,
+) -> serde_json::Value {
+    let mut v = json!({"txn": {"appId": app_id, "version": txn_version}});
+    if let Some(lu) = last_updated {
+        v["txn"]["lastUpdated"] = json!(lu);
+    }
+    v
+}
+
+fn commit_info_json_with_op(operation: &str) -> serde_json::Value {
+    json!({"commitInfo": {"timestamp": 1587968586154i64, "operation": operation}})
 }
 
 // ============================================================================
@@ -148,7 +211,7 @@ fn crc_json(protocol: &Protocol, metadata: &Metadata, ict: Option<i64>) -> serde
 // ============================================================================
 
 /// Operations that can be applied to an in-memory Delta log.
-enum Op {
+pub(super) enum Op {
     V2Checkpoint {
         version: u64,
         protocol: Protocol,
@@ -164,27 +227,61 @@ enum Op {
         version: u64,
         ict: i64,
     },
+    DeltaWithAdd {
+        version: u64,
+        path: String,
+        size: i64,
+    },
+    DeltaWithAddAndOperation {
+        version: u64,
+        path: String,
+        size: i64,
+        operation: String,
+    },
+    DeltaWithRemove {
+        version: u64,
+        path: String,
+        size: Option<i64>,
+    },
+    DeltaWithDomainMetadata {
+        version: u64,
+        domain: String,
+        configuration: String,
+        removed: bool,
+    },
+    DeltaWithTxn {
+        version: u64,
+        app_id: String,
+        txn_version: i64,
+        last_updated: Option<i64>,
+    },
     Crc {
         version: u64,
         protocol: Protocol,
         metadata: Metadata,
         ict: Option<i64>,
+        file_sizes: Vec<i64>,
     },
     CorruptCrc(u64),
 }
 
 /// Declarative test builder: accumulate log operations, then build and assert.
-struct CrcReadTest {
+pub(super) struct CrcReadTest {
     ops: Vec<Op>,
 }
 
 impl CrcReadTest {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self { ops: vec![] }
     }
 
     /// Write a V2 checkpoint at the given version.
-    fn v2_checkpoint(mut self, version: u64, protocol: Protocol, metadata: Metadata) -> Self {
+    pub(super) fn v2_checkpoint(
+        mut self,
+        version: u64,
+        protocol: Protocol,
+        metadata: Metadata,
+    ) -> Self {
         self.ops.push(Op::V2Checkpoint {
             version,
             protocol,
@@ -194,13 +291,13 @@ impl CrcReadTest {
     }
 
     /// Write a plain delta (commitInfo only, no protocol or metadata).
-    fn delta(mut self, version: u64) -> Self {
+    pub(super) fn delta(mut self, version: u64) -> Self {
         self.ops.push(Op::Delta(version));
         self
     }
 
     /// Write a delta with optional protocol and/or metadata overrides.
-    fn delta_with_p_m(
+    pub(super) fn delta_with_p_m(
         mut self,
         version: u64,
         protocol: impl Into<Option<Protocol>>,
@@ -215,13 +312,85 @@ impl CrcReadTest {
     }
 
     /// Write a delta with an in-commit timestamp in commitInfo.
-    fn delta_with_ict(mut self, version: u64, ict: i64) -> Self {
+    pub(super) fn delta_with_ict(mut self, version: u64, ict: i64) -> Self {
         self.ops.push(Op::DeltaWithIct { version, ict });
         self
     }
 
-    /// Write a CRC file with the given protocol, metadata, and optional ICT.
-    fn crc(
+    /// Write a delta containing an `add` action.
+    pub(super) fn delta_with_add(mut self, version: u64, path: &str, size: i64) -> Self {
+        self.ops.push(Op::DeltaWithAdd {
+            version,
+            path: path.to_string(),
+            size,
+        });
+        self
+    }
+
+    /// Write a delta containing an `add` action AND a commitInfo with the given operation
+    /// (e.g., `"ANALYZE STATS"`). Single commit, two action rows.
+    pub(super) fn delta_with_add_and_op(
+        mut self,
+        version: u64,
+        path: &str,
+        size: i64,
+        operation: &str,
+    ) -> Self {
+        self.ops.push(Op::DeltaWithAddAndOperation {
+            version,
+            path: path.to_string(),
+            size,
+            operation: operation.to_string(),
+        });
+        self
+    }
+
+    /// Write a delta containing a `remove` action. `size = None` omits the field on disk.
+    pub(super) fn delta_with_remove(mut self, version: u64, path: &str, size: Option<i64>) -> Self {
+        self.ops.push(Op::DeltaWithRemove {
+            version,
+            path: path.to_string(),
+            size,
+        });
+        self
+    }
+
+    /// Write a delta containing a `domainMetadata` action.
+    pub(super) fn delta_with_dm(
+        mut self,
+        version: u64,
+        domain: &str,
+        configuration: &str,
+        removed: bool,
+    ) -> Self {
+        self.ops.push(Op::DeltaWithDomainMetadata {
+            version,
+            domain: domain.to_string(),
+            configuration: configuration.to_string(),
+            removed,
+        });
+        self
+    }
+
+    /// Write a delta containing a `txn` action.
+    pub(super) fn delta_with_txn(
+        mut self,
+        version: u64,
+        app_id: &str,
+        txn_version: i64,
+        last_updated: Option<i64>,
+    ) -> Self {
+        self.ops.push(Op::DeltaWithTxn {
+            version,
+            app_id: app_id.to_string(),
+            txn_version,
+            last_updated,
+        });
+        self
+    }
+
+    /// Write a CRC file with the given protocol, metadata, and optional ICT. No file stats.
+    pub(super) fn crc(
         mut self,
         version: u64,
         protocol: Protocol,
@@ -233,21 +402,52 @@ impl CrcReadTest {
             protocol,
             metadata,
             ict: ict.into(),
+            file_sizes: vec![],
+        });
+        self
+    }
+
+    /// Write a CRC file with a real on-disk `FileSizeHistogram` computed from `file_sizes`.
+    pub(super) fn crc_with_files(
+        mut self,
+        version: u64,
+        protocol: Protocol,
+        metadata: Metadata,
+        ict: impl Into<Option<i64>>,
+        file_sizes: &[i64],
+    ) -> Self {
+        self.ops.push(Op::Crc {
+            version,
+            protocol,
+            metadata,
+            ict: ict.into(),
+            file_sizes: file_sizes.to_vec(),
         });
         self
     }
 
     /// Write a corrupt CRC file.
-    fn corrupt_crc(mut self, version: u64) -> Self {
+    pub(super) fn corrupt_crc(mut self, version: u64) -> Self {
         self.ops.push(Op::CorruptCrc(version));
         self
     }
 
     /// Execute all operations, returning a built test that can be asserted against.
-    async fn build(self) -> BuiltCrcTest {
+    pub(super) async fn build(self) -> BuiltCrcTest {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///").unwrap();
         let engine = SyncEngine::new_with_store(store.clone());
+
+        // Catch the footgun where two ops resolve to the same `(version, suffix)` on disk,
+        // because `put` is last-writer-wins and would silently clobber the earlier write.
+        let mut seen: HashSet<(u64, &'static str)> = HashSet::new();
+        let mut claim = |v: u64, suffix: &'static str| {
+            assert!(
+                seen.insert((v, suffix)),
+                "CrcReadTest: two ops both write to version={v} suffix={suffix:?}; \
+                 the later one silently overwrites the earlier one"
+            );
+        };
 
         for op in self.ops {
             match op {
@@ -256,6 +456,7 @@ impl CrcReadTest {
                     ref protocol,
                     ref metadata,
                 } => {
+                    claim(v, V2_CKPT_SUFFIX);
                     let content = format!(
                         "{}\n{}\n{}",
                         protocol_action_json(protocol),
@@ -265,6 +466,7 @@ impl CrcReadTest {
                     put(&store, v, V2_CKPT_SUFFIX, &content).await;
                 }
                 Op::Delta(v) => {
+                    claim(v, "json");
                     put(&store, v, "json", &commit_info_json().to_string()).await;
                 }
                 Op::DeltaWithPM {
@@ -272,6 +474,7 @@ impl CrcReadTest {
                     protocol,
                     metadata,
                 } => {
+                    claim(v, "json");
                     let mut lines = vec![commit_info_json().to_string()];
                     if let Some(ref p) = protocol {
                         lines.push(protocol_action_json(p).to_string());
@@ -282,6 +485,7 @@ impl CrcReadTest {
                     put(&store, v, "json", &lines.join("\n")).await;
                 }
                 Op::DeltaWithIct { version: v, ict } => {
+                    claim(v, "json");
                     put(
                         &store,
                         v,
@@ -290,21 +494,85 @@ impl CrcReadTest {
                     )
                     .await;
                 }
+                Op::DeltaWithAdd {
+                    version: v,
+                    ref path,
+                    size,
+                } => {
+                    claim(v, "json");
+                    let content =
+                        format!("{}\n{}", add_action_json(path, size), commit_info_json());
+                    put(&store, v, "json", &content).await;
+                }
+                Op::DeltaWithAddAndOperation {
+                    version: v,
+                    ref path,
+                    size,
+                    ref operation,
+                } => {
+                    claim(v, "json");
+                    let content = format!(
+                        "{}\n{}",
+                        add_action_json(path, size),
+                        commit_info_json_with_op(operation)
+                    );
+                    put(&store, v, "json", &content).await;
+                }
+                Op::DeltaWithRemove {
+                    version: v,
+                    ref path,
+                    size,
+                } => {
+                    claim(v, "json");
+                    let content =
+                        format!("{}\n{}", remove_action_json(path, size), commit_info_json());
+                    put(&store, v, "json", &content).await;
+                }
+                Op::DeltaWithDomainMetadata {
+                    version: v,
+                    ref domain,
+                    ref configuration,
+                    removed,
+                } => {
+                    claim(v, "json");
+                    let content = format!(
+                        "{}\n{}",
+                        domain_metadata_action_json(domain, configuration, removed),
+                        commit_info_json()
+                    );
+                    put(&store, v, "json", &content).await;
+                }
+                Op::DeltaWithTxn {
+                    version: v,
+                    ref app_id,
+                    txn_version,
+                    last_updated,
+                } => {
+                    claim(v, "json");
+                    // No commitInfo: an ICT replay test exercises "newest commit has no
+                    // commitInfo" via a txn-only commit.
+                    let content =
+                        set_transaction_action_json(app_id, txn_version, last_updated).to_string();
+                    put(&store, v, "json", &content).await;
+                }
                 Op::Crc {
                     version: v,
                     ref protocol,
                     ref metadata,
                     ict,
+                    ref file_sizes,
                 } => {
+                    claim(v, "crc");
                     put(
                         &store,
                         v,
                         "crc",
-                        &crc_json(protocol, metadata, ict).to_string(),
+                        &crc_json(protocol, metadata, ict, file_sizes).to_string(),
                     )
                     .await;
                 }
                 Op::CorruptCrc(v) => {
+                    claim(v, "crc");
                     put(&store, v, "crc", "CORRUPT_CRC_DATA").await;
                 }
             }
@@ -314,12 +582,42 @@ impl CrcReadTest {
     }
 }
 
-struct BuiltCrcTest {
-    engine: SyncEngine,
-    url: Url,
+pub(super) struct BuiltCrcTest {
+    pub(super) engine: SyncEngine,
+    pub(super) url: Url,
 }
 
 impl BuiltCrcTest {
+    /// Construct a `LogSegment` directly from the store state (no `Snapshot`) and run
+    /// `build_crc_from_stale` against `base`. `target_version = None` means latest.
+    pub(super) fn incrementally_build_crc(
+        &self,
+        base: &Crc,
+        target_version: impl Into<Option<u64>>,
+    ) -> DeltaResult<Crc> {
+        let storage = self.engine.storage_handler();
+        let log_root = self.url.join("_delta_log/").unwrap();
+        let log_segment = LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            None,
+            target_version.into(),
+        )?;
+        log_segment.build_crc_from_stale(&self.engine, base)
+    }
+
+    /// Load the on-disk CRC at `crc_version` and use it as the replay base.
+    pub(super) fn incrementally_build_crc_from_disk_crc_at(
+        &self,
+        crc_version: u64,
+        target_version: impl Into<Option<u64>>,
+    ) -> DeltaResult<Crc> {
+        let crc_path = ParsedLogPath::create_parsed_crc(&self.url, crc_version);
+        let base = try_read_crc_file(&self.engine, &crc_path)?;
+        self.incrementally_build_crc(&base, target_version)
+    }
+
     fn assert_p_m(
         &self,
         version: impl Into<Option<u64>>,

@@ -38,6 +38,8 @@ mod protocol_metadata_replay;
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
 
 #[cfg(test)]
+mod crc_replay_tests;
+#[cfg(test)]
 mod crc_tests;
 #[cfg(test)]
 mod tests;

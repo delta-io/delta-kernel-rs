@@ -1,15 +1,14 @@
-// `build_crc_delta_from_stale` and its supporting types are exercised by the in-file test
-// module but have no production caller yet. Snapshot wiring lands in a follow-up PR.
+// `build_crc_from_stale` is exercised by the in-file test module but has no production
+// caller yet. Snapshot wiring lands in a follow-up PR.
 #![cfg_attr(not(test), allow(dead_code))]
 
 //! Reverse log replay for stale-CRC catch-up.
 //!
-//! A [`CrcDelta`] aggregates the CRC-relevant changes from commits `(X, N]`. Applying it to a
-//! base CRC at `X` yields the CRC at `N`: `Crc[X] + CrcDelta = Crc[N]`. This module produces
-//! such a delta by reverse-replaying a log segment's commit files. [`Crc::apply`] is the
-//! consumer.
+//! Given a stale `Crc` at version `X`, this module builds the `Crc` at version `N` by
+//! reverse-replaying a log segment's commit files. Internally it accumulates a [`CrcDelta`]
+//! over commits `(X, N]`, then applies it via [`Crc::apply`].
 //!
-//! Entry point: [`LogSegment::build_crc_delta_from_stale`].
+//! Entry point: [`LogSegment::build_crc_from_stale`].
 //
 // TODO: see if we can support log compaction files.
 
@@ -50,8 +49,8 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 impl LogSegment {
-    /// Reverse-replay this log segment, producing a [`CrcDelta`] that advances `base` from
-    /// `base.version` to `self.end_version`.
+    /// Reverse-replay this log segment, producing a fresh `Crc` at `self.end_version` by
+    /// applying the changes in commits `(base.version, self.end_version]` to `base`.
     ///
     /// The strategy: hand all commit files in `(base.version, self.end_version]` to
     /// [`Engine`] for streaming reads (newest first), then build up a [`CrcDelta`] in one
@@ -59,27 +58,25 @@ impl LogSegment {
     /// [`CrcReplayVisitor`] pulls leaf values from the row data and forwards them to the
     /// accumulator's `on_*` methods. For per-key fields (Protocol, Metadata, DomainMetadata,
     /// SetTransaction) the first observation wins; older commits cannot override it. ICT is
-    /// special: it is captured only from the newest commit.
+    /// special: it is captured only from the newest commit. Once the delta is built, it is
+    /// applied to a clone of `base` via [`Crc::apply`] and the result's `version` is
+    /// stamped to `self.end_version`.
     ///
     /// # Preconditions
     ///
-    /// 1. The caller must skip calling this when `base.version == self.end_version` (the delta
-    ///    would be empty; just clone the base).
+    /// 1. The caller must skip calling this when `base.version == self.end_version` (the resulting
+    ///    `Crc` would just be a clone of `base`).
     /// 2. `self.listed.ascending_commit_files` must cover every commit in `(base.version,
     ///    self.end_version]`. The typical caller arranges this with
     ///    [`LogSegment::segment_after_crc`] when a checkpoint sits above `base.version`.
     ///
     /// Returns `Error::InternalError` when either precondition fails.
-    #[instrument(name = "log_seg.build_crc_delta_from_stale", skip_all, err)]
-    pub(crate) fn build_crc_delta_from_stale(
-        &self,
-        engine: &dyn Engine,
-        base: &Crc,
-    ) -> DeltaResult<CrcDelta> {
+    #[instrument(name = "log_seg.build_crc_from_stale", skip_all, err)]
+    pub(crate) fn build_crc_from_stale(&self, engine: &dyn Engine, base: &Crc) -> DeltaResult<Crc> {
         require!(
             base.version < self.end_version,
             Error::internal_error(format!(
-                "build_crc_delta_from_stale: base.version ({}) must be strictly less than \
+                "build_crc_from_stale: base.version ({}) must be strictly less than \
                  end_version ({})",
                 base.version, self.end_version,
             ))
@@ -91,12 +88,12 @@ impl LogSegment {
             .filter(|c| c.version > base.version)
             .collect();
         // The first commit above base.version must be base.version + 1; otherwise the
-        // segment is missing intermediate commits and we'd produce an incorrect delta.
+        // segment is missing intermediate commits and we'd produce an incorrect result.
         let first_above = filtered.first().map(|c| c.version);
         require!(
             first_above == Some(base.version + 1),
             Error::internal_error(format!(
-                "build_crc_delta_from_stale: segment is missing commit {} (lowest commit \
+                "build_crc_from_stale: segment is missing commit {} (lowest commit \
                  above base.version is {:?})",
                 base.version + 1,
                 first_above,
@@ -141,7 +138,10 @@ impl LogSegment {
         // will trigger it.
         acc.process_commit_file_end();
 
-        Ok(acc.into_crc_delta())
+        let mut crc = base.clone();
+        crc.apply(acc.into_crc_delta());
+        crc.version = self.end_version;
+        Ok(crc)
     }
 }
 
@@ -408,45 +408,18 @@ impl RowVisitor for CrcReplayVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
-    use serde_json::{json, Value};
-    use test_utils::delta_path_for_version;
-    use url::Url;
-
     use super::*;
     use crate::crc::FileSizeHistogram;
-    use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::ObjectStoreExt as _;
-    use crate::Snapshot;
 
-    // === Tier 1: narrow unit tests on `on_*` methods (no engine) ===
+    // === Unit tests on `on_*` methods, in visitor column order ===
+
+    // commitInfo
 
     #[test]
-    fn on_add_increments_files_and_bytes() {
+    fn on_commit_info_safe_op_keeps_is_incremental_safe_true() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_add(100).unwrap();
-        acc.on_add(200).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files, 2);
-        assert_eq!(acc.delta.file_stats.net_bytes, 300);
+        acc.on_commit_info(Some("WRITE"), None);
         assert!(acc.delta.is_incremental_safe);
-    }
-
-    #[test]
-    fn on_remove_with_size_decrements_files_and_bytes() {
-        let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_remove("p", Some(50)).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files, -1);
-        assert_eq!(acc.delta.file_stats.net_bytes, -50);
-        assert!(acc.delta.is_incremental_safe);
-    }
-
-    #[test]
-    fn on_remove_missing_size_trips_is_incremental_safe() {
-        let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_remove("p", None).unwrap();
-        assert!(!acc.delta.is_incremental_safe);
-        assert!(acc.current_commit_saw_file_action);
     }
 
     #[test]
@@ -455,13 +428,6 @@ mod tests {
         acc.on_commit_info(Some("ANALYZE STATS"), None);
         assert!(!acc.delta.is_incremental_safe);
         assert!(acc.current_commit_saw_commit_info);
-    }
-
-    #[test]
-    fn on_commit_info_safe_op_keeps_is_incremental_safe_true() {
-        let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_commit_info(Some("WRITE"), None);
-        assert!(acc.delta.is_incremental_safe);
     }
 
     #[test]
@@ -495,6 +461,39 @@ mod tests {
         assert_eq!(acc.delta.in_commit_timestamp, None);
     }
 
+    // add
+
+    #[test]
+    fn on_add_increments_files_and_bytes() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.on_add(100).unwrap();
+        acc.on_add(200).unwrap();
+        assert_eq!(acc.delta.file_stats.net_files, 2);
+        assert_eq!(acc.delta.file_stats.net_bytes, 300);
+        assert!(acc.delta.is_incremental_safe);
+    }
+
+    // remove
+
+    #[test]
+    fn on_remove_with_size_decrements_files_and_bytes() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.on_remove("p", Some(50)).unwrap();
+        assert_eq!(acc.delta.file_stats.net_files, -1);
+        assert_eq!(acc.delta.file_stats.net_bytes, -50);
+        assert!(acc.delta.is_incremental_safe);
+    }
+
+    #[test]
+    fn on_remove_missing_size_trips_is_incremental_safe() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.on_remove("p", None).unwrap();
+        assert!(!acc.delta.is_incremental_safe);
+        assert!(acc.current_commit_saw_file_action);
+    }
+
+    // domainMetadata
+
     #[test]
     fn on_domain_metadata_first_seen_in_reverse_wins() {
         let mut acc = CrcReplayAccumulator::new(None);
@@ -511,6 +510,8 @@ mod tests {
         assert!(acc.delta.domain_metadata["d"].is_removed());
     }
 
+    // txn
+
     #[test]
     fn on_set_transaction_first_seen_in_reverse_wins() {
         let mut acc = CrcReplayAccumulator::new(None);
@@ -518,6 +519,8 @@ mod tests {
         acc.on_set_transaction("a".into(), 1, Some(0));
         assert_eq!(acc.delta.set_transactions["a"].version, 99);
     }
+
+    // auxiliary
 
     #[test]
     fn histogram_inherits_seed_boundaries() {
@@ -546,240 +549,47 @@ mod tests {
         assert_eq!(delta.file_stats.net_bytes, 42);
     }
 
-    // === Tier 2: per-commit invariant + is_first_commit (rstest, no engine) ===
+    // === Commit-boundary state machine — direct accumulator tests ===
     //
-    // Each step is `(file_url, actions)` where `actions` is a string containing `'F'` (this
-    // batch carries a file action) and/or `'C'` (this batch carries a commitInfo). The
-    // SyncEngine emits one batch per file, so multi-batch-per-file coverage is reachable
-    // only via these direct tests.
+    // `SyncEngine` emits one batch per file, so multi-batch-per-file scenarios are only
+    // reachable by driving the accumulator directly.
 
-    type Step<'a> = (&'a str, &'a str);
-
-    fn drive(steps: &[Step<'_>]) -> CrcReplayAccumulator {
+    #[test]
+    fn per_commit_invariant_holds_when_file_action_and_commit_info_split_across_batches_of_one_file(
+    ) {
         let mut acc = CrcReplayAccumulator::new(None);
-        for (url, actions) in steps {
-            acc.process_batch_start(url);
-            if actions.contains('F') {
-                acc.on_add(0).unwrap();
-            }
-            if actions.contains('C') {
-                acc.on_commit_info(Some("WRITE"), None);
-            }
-        }
+        acc.process_batch_start("v1.json");
+        acc.on_add(0).unwrap();
+        acc.process_batch_start("v1.json");
+        acc.on_commit_info(Some("WRITE"), None);
         acc.process_commit_file_end();
-        acc
+        assert!(acc.delta.is_incremental_safe);
     }
 
-    #[rstest]
-    // 1 file x 1 batch
-    #[case::one_file_complete(&[("a", "FC")], true)]
-    #[case::one_file_no_commit_info(&[("a", "F")], false)]
-    #[case::one_file_no_file_action(&[("a", "C")], true)]
-    // 1 file x M batches: per-commit flags persist across same-URL batches.
-    #[case::one_file_actions_split(&[("a", "F"), ("a", ""), ("a", "C")], true)]
-    #[case::one_file_no_commit_info_split(&[("a", "F"), ("a", ""), ("a", "")], false)]
-    // N files x 1 batch each
-    #[case::two_files_both_complete(&[("b", "FC"), ("a", "FC")], true)]
-    #[case::two_files_second_missing_ci(&[("b", "FC"), ("a", "F")], false)]
-    #[case::two_files_first_missing_ci(&[("b", "F"), ("a", "FC")], false)]
-    // N files x M batches each
-    #[case::two_files_split_batches(&[("b", "F"), ("b", "C"), ("a", "F"), ("a", "C")], true)]
-    fn per_commit_invariant_across_files_and_batches(
-        #[case] steps: &[Step<'_>],
-        #[case] expected_is_incremental_safe: bool,
-    ) {
-        let acc = drive(steps);
-        assert_eq!(acc.delta.is_incremental_safe, expected_is_incremental_safe);
+    #[test]
+    fn per_commit_invariant_trips_when_file_action_has_no_commit_info_across_batches() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v1.json");
+        acc.on_add(0).unwrap();
+        acc.process_batch_start("v1.json");
+        acc.process_commit_file_end();
+        assert!(!acc.delta.is_incremental_safe);
     }
 
-    #[rstest]
-    #[case::single_file_one_batch(&[("a", "")], true)]
-    #[case::single_file_multi_batches(&[("a", ""), ("a", ""), ("a", "")], true)]
-    #[case::two_files(&[("b", ""), ("a", "")], false)]
-    #[case::two_files_multi_batches(&[("b", ""), ("b", ""), ("a", ""), ("a", "")], false)]
-    #[case::many_files(&[("c", ""), ("b", ""), ("a", "")], false)]
-    fn is_first_commit_flips_on_first_file_boundary(
-        #[case] steps: &[Step<'_>],
-        #[case] expected_is_first_commit_at_end: bool,
-    ) {
-        let acc = drive(steps);
-        assert_eq!(acc.is_first_commit, expected_is_first_commit_at_end);
+    #[test]
+    fn is_first_commit_stays_true_across_batches_of_same_file() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v2.json");
+        acc.process_batch_start("v2.json");
+        acc.process_batch_start("v2.json");
+        assert!(acc.is_first_commit);
     }
 
-    // === Tier 3: engine smoke tests + precondition test ===
-
-    async fn put_commit(store: &InMemory, version: u64, actions: &[Value]) {
-        let body = actions
-            .iter()
-            .map(|a| a.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        store
-            .put(
-                &delta_path_for_version(version, "json"),
-                body.into_bytes().into(),
-            )
-            .await
-            .unwrap();
-    }
-
-    fn create_table_actions() -> Vec<Value> {
-        vec![
-            json!({"protocol": {
-                "minReaderVersion": 1,
-                "minWriterVersion": 7,
-                "writerFeatures": ["domainMetadata", "inCommitTimestamp"]
-            }}),
-            json!({"metaData": {
-                "id": "t",
-                "format": {"provider": "parquet", "options": {}},
-                "schemaString": r#"{"type":"struct","fields":[]}"#,
-                "partitionColumns": [],
-                "configuration": {},
-                "createdTime": 0
-            }}),
-            json!({"commitInfo": {"timestamp": 0, "operation": "CREATE TABLE"}}),
-        ]
-    }
-
-    /// One commit with a mix of actions exercises every visitor column plus the `_file`
-    /// metadata wiring. The asserted delta values prove each `on_*` method received the
-    /// right leaf value from real `EngineData`.
-    #[tokio::test]
-    async fn end_to_end_mixed_commit_through_engine() {
-        let store = Arc::new(InMemory::new());
-        put_commit(&store, 0, &create_table_actions()).await;
-        put_commit(
-            &store,
-            1,
-            &[
-                json!({"protocol": {
-                    "minReaderVersion": 1, "minWriterVersion": 7,
-                    "writerFeatures": ["domainMetadata", "inCommitTimestamp"]
-                }}),
-                json!({"metaData": {
-                    "id": "t-updated",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": r#"{"type":"struct","fields":[]}"#,
-                    "partitionColumns": [], "configuration": {}, "createdTime": 0
-                }}),
-                json!({"add": {
-                    "path": "a", "size": 100, "partitionValues": {},
-                    "modificationTime": 0, "dataChange": true
-                }}),
-                json!({"remove": {
-                    "path": "old", "size": 30,
-                    "dataChange": true, "deletionTimestamp": 0
-                }}),
-                json!({"domainMetadata": {
-                    "domain": "d", "configuration": "v", "removed": false
-                }}),
-                json!({"domainMetadata": {
-                    "domain": "gone", "configuration": "pre", "removed": true
-                }}),
-                json!({"txn": {"appId": "app", "version": 42, "lastUpdated": 0}}),
-                json!({"commitInfo": {
-                    "timestamp": 0, "operation": "WRITE", "inCommitTimestamp": 9999
-                }}),
-            ],
-        )
-        .await;
-
-        let engine = SyncEngine::new_with_store(store);
-        let snapshot = Snapshot::builder_for(Url::parse("memory:///").unwrap())
-            .build(&engine)
-            .unwrap();
-
-        let base = Crc::default();
-        let delta = snapshot
-            .log_segment()
-            .build_crc_delta_from_stale(&engine, &base)
-            .unwrap();
-
-        assert_eq!(delta.file_stats.net_files, 0); // +1 add, -1 remove
-        assert_eq!(delta.file_stats.net_bytes, 70); // +100 -30
-        assert_eq!(delta.domain_metadata["d"].configuration(), "v");
-        assert!(!delta.domain_metadata["d"].is_removed());
-        assert!(delta.domain_metadata["gone"].is_removed());
-        assert_eq!(delta.set_transactions["app"].version, 42);
-        assert_eq!(delta.set_transactions["app"].last_updated, Some(0));
-        assert_eq!(delta.in_commit_timestamp, Some(9999));
-        assert!(delta.is_incremental_safe);
-        assert_eq!(delta.protocol.as_ref().unwrap().min_writer_version(), 7);
-        assert_eq!(delta.metadata.as_ref().unwrap().id(), "t-updated");
-    }
-
-    /// Two commits each carry distinct protocol/metadata. The `is_none()` guards in the
-    /// entry point must select the newest values (v2). Without the engine going through
-    /// multiple commits this path would only be covered at the accumulator level.
-    #[tokio::test]
-    async fn end_to_end_newest_protocol_and_metadata_win() {
-        let store = Arc::new(InMemory::new());
-        put_commit(&store, 0, &create_table_actions()).await;
-        put_commit(
-            &store,
-            1,
-            &[
-                json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
-                json!({"metaData": {
-                    "id": "old",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": r#"{"type":"struct","fields":[]}"#,
-                    "partitionColumns": [], "configuration": {}, "createdTime": 0
-                }}),
-                json!({"commitInfo": {"timestamp": 0, "operation": "WRITE"}}),
-            ],
-        )
-        .await;
-        put_commit(
-            &store,
-            2,
-            &[
-                json!({"protocol": {
-                    "minReaderVersion": 1, "minWriterVersion": 7,
-                    "writerFeatures": ["domainMetadata"]
-                }}),
-                json!({"metaData": {
-                    "id": "new",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": r#"{"type":"struct","fields":[]}"#,
-                    "partitionColumns": [], "configuration": {}, "createdTime": 0
-                }}),
-                json!({"commitInfo": {"timestamp": 0, "operation": "WRITE"}}),
-            ],
-        )
-        .await;
-        let engine = SyncEngine::new_with_store(store);
-        let snapshot = Snapshot::builder_for(Url::parse("memory:///").unwrap())
-            .build(&engine)
-            .unwrap();
-        let delta = snapshot
-            .log_segment()
-            .build_crc_delta_from_stale(&engine, &Crc::default())
-            .unwrap();
-        assert_eq!(delta.metadata.as_ref().unwrap().id(), "new");
-        assert_eq!(delta.protocol.as_ref().unwrap().min_writer_version(), 7);
-    }
-
-    #[rstest]
-    #[case::equal(0_u64)]
-    #[case::greater(5_u64)]
-    #[tokio::test]
-    async fn base_version_at_or_above_end_version_errors(#[case] base_version: u64) {
-        let store = Arc::new(InMemory::new());
-        put_commit(&store, 0, &create_table_actions()).await;
-        let engine = SyncEngine::new_with_store(store);
-        let snapshot = Snapshot::builder_for(Url::parse("memory:///").unwrap())
-            .build(&engine)
-            .unwrap();
-        let base = Crc {
-            version: base_version,
-            ..Default::default()
-        };
-        let err = snapshot
-            .log_segment()
-            .build_crc_delta_from_stale(&engine, &base)
-            .unwrap_err();
-        assert!(matches!(err, Error::InternalError(_)));
+    #[test]
+    fn is_first_commit_becomes_false_after_file_transition() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v2.json");
+        acc.process_batch_start("v1.json");
+        assert!(!acc.is_first_commit);
     }
 }
