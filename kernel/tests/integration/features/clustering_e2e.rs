@@ -7,9 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::actions::{
-    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS,
-};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::ColumnName;

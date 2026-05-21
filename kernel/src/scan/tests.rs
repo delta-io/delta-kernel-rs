@@ -5,9 +5,7 @@ use bytes::Bytes;
 use rstest::rstest;
 
 use super::*;
-use crate::actions::{
-    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS,
-};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};

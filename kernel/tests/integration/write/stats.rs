@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::actions::{
-    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS,
-};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{
     ArrayRef, BinaryArray, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
 };

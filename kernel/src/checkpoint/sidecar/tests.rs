@@ -7,9 +7,7 @@ use url::Url;
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
-use crate::actions::{
-    Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS,
-};
+use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
@@ -628,10 +626,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
                 .column_by_name("stats_parsed")
                 .unwrap()
                 .as_struct();
-            assert_eq!(
-                struct_field_value::<Int64Type>(stats, NUM_RECORDS, row),
-                42
-            );
+            assert_eq!(struct_field_value::<Int64Type>(stats, NUM_RECORDS, row), 42);
             let min_vals = stats.column_by_name(MIN_VALUES).unwrap().as_struct();
             assert_eq!(struct_field_value::<Int64Type>(min_vals, "id", row), 1);
             assert_eq!(struct_field_string(min_vals, "name", row), "alice");

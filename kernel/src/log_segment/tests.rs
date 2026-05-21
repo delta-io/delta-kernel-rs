@@ -11,8 +11,8 @@ use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
-    MAX_VALUES, MIN_VALUES, NUM_RECORDS,
+    MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -3074,10 +3074,7 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
     StructType::new_unchecked([
         StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(
-            MIN_VALUES,
-            StructType::new_unchecked(column_fields.clone()),
-        ),
+        StructField::nullable(MIN_VALUES, StructType::new_unchecked(column_fields.clone())),
         StructField::nullable(MAX_VALUES, StructType::new_unchecked(column_fields)),
     ])
 }

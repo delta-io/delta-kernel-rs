@@ -481,10 +481,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 
     /// Retrieves the row count statistic.
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(Expr::from(ColumnName::new([
-            "stats_parsed",
-            NUM_RECORDS,
-        ])))
+        Some(Expr::from(ColumnName::new(["stats_parsed", NUM_RECORDS])))
     }
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that

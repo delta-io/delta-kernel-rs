@@ -10,8 +10,7 @@ pub use counting_reporter::{
     CountingReporter, RelaxedCounter,
 };
 use delta_kernel::actions::{
-    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS,
-    TIGHT_BOUNDS,
+    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,

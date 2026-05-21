@@ -8,9 +8,7 @@ use std::sync::Arc;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
-use crate::actions::{
-    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
-};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
     StructType,
@@ -163,10 +161,7 @@ pub(crate) fn expected_stats_schema(
         let mut min_max_transform = MinMaxStatsTransform;
         if let Some(min_max_schema) = min_max_transform.transform_struct(&base_schema) {
             let min_max_schema = min_max_schema.into_owned();
-            fields.push(StructField::nullable(
-                MIN_VALUES,
-                min_max_schema.clone(),
-            ));
+            fields.push(StructField::nullable(MIN_VALUES, min_max_schema.clone()));
             fields.push(StructField::nullable(MAX_VALUES, min_max_schema));
         }
     }

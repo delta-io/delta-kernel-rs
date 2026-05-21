@@ -10,8 +10,8 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME,
-    PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME, MAX_VALUES, MIN_VALUES,
+    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, MAX_VALUES,
+    METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
