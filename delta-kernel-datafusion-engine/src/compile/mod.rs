@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion_common::error::DataFusionError;
-use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
+use delta_kernel::plans::operations::framework::step_result::StepResult;
 use delta_kernel::Engine;
 use uuid::Uuid;
 
@@ -28,10 +28,10 @@ pub struct CompileContext {
     /// plan being compiled does not reference any relations (or for inspection-only paths like
     /// benchmark physical-plan dumps).
     pub relation_providers: Arc<HashMap<String, Arc<dyn TableProvider>>>,
-    /// Active phase's [`PhaseState`] (`Some` while a phase is executing). `Consume`
+    /// Active phase's [`StepResult`] (`Some` while a phase is executing). `Consume`
     /// drains submit their finalized handles here; `None` means the executor is not inside a
     /// phase and any consume sink encountered surfaces an internal error.
-    pub phase_state: Option<PhaseState>,
+    pub step_result: Option<StepResult>,
     /// Kernel [`Engine`] for sinks that delegate IO to parquet/json handlers
     /// ([`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load)).
     pub engine: Arc<dyn Engine>,
@@ -40,7 +40,7 @@ pub struct CompileContext {
     /// SM-less entry points.
     pub sm_id: Uuid,
     pub sm_kind: &'static str,
-    pub phase_name: &'static str,
+    pub step_name: &'static str,
 }
 
 impl CompileContext {
@@ -52,11 +52,11 @@ impl CompileContext {
     ) -> Self {
         Self {
             relation_providers,
-            phase_state: None,
+            step_result: None,
             engine,
             sm_id: Uuid::new_v4(),
             sm_kind: "standalone",
-            phase_name: "execute",
+            step_name: "execute",
         }
     }
 }

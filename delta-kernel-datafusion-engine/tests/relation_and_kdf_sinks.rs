@@ -7,7 +7,7 @@ use common::SumRowsConsumer;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::ir::nodes::ConsumeSink;
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
-use delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation;
+use delta_kernel::plans::operations::framework::step::Step;
 use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 use test_utils::schemas::single_long_schema;
 use uuid::Uuid;
@@ -46,7 +46,7 @@ async fn consume_sink_drains_literal_and_harvests_finished_handle() {
 
     let executor = DataFusionExecutor::try_new().unwrap();
     let state = executor
-        .execute_phase_operation(PhaseOperation::Plans(vec![plan]))
+        .execute_step(Step::Plans(vec![plan]))
         .await
         .expect("phase execution");
 

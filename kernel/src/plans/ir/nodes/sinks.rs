@@ -5,24 +5,24 @@ use uuid::Uuid;
 
 use super::FileType;
 use crate::expressions::ColumnName;
-use crate::plans::kdf::{ConsumerKdf, Handle, KdfStateToken};
+use crate::plans::kernel_consumers::{Handle, KernelConsumer, KernelConsumerToken};
 use crate::schema::SchemaRef;
 
-/// Template for draining a row stream into a [`ConsumerKdf`] via [`SinkType::Consume`].
+/// Template for draining a row stream into a [`KernelConsumer`] via [`SinkType::Consume`].
 ///
 /// - `initial_state`: cloned per partition via [`DynClone`](dyn_clone::DynClone) into a
-///   [`Handle`](crate::plans::kdf::Handle).
-/// - `token`: joins finalized state back to the phase's `PhaseState`.
+///   [`Handle`](crate::plans::kernel_consumers::Handle).
+/// - `token`: joins finalized state back to the phase's `StepResult`.
 #[derive(Debug, Clone)]
 pub struct ConsumeSink {
-    pub initial_state: Box<dyn ConsumerKdf>,
-    pub token: KdfStateToken,
+    pub initial_state: Box<dyn KernelConsumer>,
+    pub token: KernelConsumerToken,
 }
 
 impl ConsumeSink {
-    /// Construct from a concrete consumer and mint a fresh token from `kdf_id`.
-    pub fn new_consumer<C: ConsumerKdf + 'static>(state: C) -> Self {
-        let token = KdfStateToken::new(state.kdf_id());
+    /// Construct from a concrete consumer and mint a fresh token from its `kind`.
+    pub fn new_consumer<C: KernelConsumer + 'static>(state: C) -> Self {
+        let token = KernelConsumerToken::new(state.kind());
         Self {
             initial_state: Box::new(state),
             token,
@@ -35,20 +35,20 @@ impl ConsumeSink {
         &self,
         sm_id: Uuid,
         sm_kind: &'static str,
-        phase_name: &'static str,
-    ) -> Handle<dyn ConsumerKdf> {
+        step_name: &'static str,
+    ) -> Handle<dyn KernelConsumer> {
         Handle::new(
             self.token.clone(),
             sm_id,
             sm_kind,
-            phase_name,
+            step_name,
             self.initial_state.clone(),
         )
     }
 }
 
 // Token identity drives equality: tokens are process-unique by id, and the
-// `initial_state` trait object (`Box<dyn ConsumerKdf>`) is not `Eq`-able. Two
+// `initial_state` trait object (`Box<dyn KernelConsumer>`) is not `Eq`-able. Two
 // sinks sharing a token were constructed from the same plan node and therefore
 // describe the same consumer.
 impl PartialEq for ConsumeSink {
@@ -60,7 +60,7 @@ impl PartialEq for ConsumeSink {
 impl Eq for ConsumeSink {}
 
 /// Identifier for a relation produced by one plan and consumed by another in
-/// the same `PhaseOperation::Plans(...)`. Created via [`RelationHandle::fresh`];
+/// the same `Step::Plans(...)`. Created via [`RelationHandle::fresh`];
 /// each handle is unique across all kernel plans for the lifetime of the
 /// process (id-based comparison).
 ///
@@ -232,7 +232,7 @@ impl LoadSink {
 ///
 /// Sink shapes: `Relation` (pipe into another plan or expose to the caller via
 /// a [`ResultPlan`](crate::plans::ir::ResultPlan)), `Consume` (drain into
-/// a [`ConsumerKdf`]), and `Load` (per-row file read).
+/// a [`KernelConsumer`]), and `Load` (per-row file read).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkType {
     /// Stream every output batch to the named [`RelationHandle`]. Another
@@ -243,9 +243,9 @@ pub enum SinkType {
     Relation(RelationHandle),
     /// Drain every output batch through the wrapped consumer KDF. The KDF's
     /// finalized state is harvested by the engine into the
-    /// phase's `PhaseState` (and recovered by the typed
-    /// [`Extractor`](crate::plans::kdf::Extractor) that yields
-    /// `O = ConsumerKdf::Output`).
+    /// phase's `StepResult` (and recovered by the typed
+    /// [`Extractor`](crate::plans::kernel_consumers::Extractor) that yields
+    /// `O = KernelConsumer::Output`).
     Consume(ConsumeSink),
     /// File-reader sink — for each upstream row, read a file and materialize
     /// the result under [`LoadSink::output_relation`]. See [`LoadSink`].

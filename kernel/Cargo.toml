@@ -61,7 +61,7 @@ z85 = "3.0.6"
 
 # optional deps
 futures = { version = "0.3", optional = true }
-# dyn-clone: `Clone` for `Box<dyn ConsumerKdf>` trait objects via the
+# dyn-clone: `Clone` for `Box<dyn KernelConsumer>` trait objects via the
 # `DynClone` supertrait. Blanket impl covers any `Clone` KDF state, so
 # concrete KDFs don't write their own `clone_boxed`.
 dyn-clone = { version = "1.0", optional = true }

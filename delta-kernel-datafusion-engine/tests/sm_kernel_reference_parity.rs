@@ -10,9 +10,7 @@ use common::{assert_batch_column_data_equal, concat_or_clone, kernel_literal_bat
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
-use delta_kernel::plans::state_machines::framework::phase_operation::{
-    PhaseOperation, SchemaQueryNode,
-};
+use delta_kernel::plans::operations::framework::step::{SchemaQueryNode, Step};
 use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 use tempfile::tempdir;
 use test_utils::schemas::single_long_schema;
@@ -50,7 +48,7 @@ async fn parity_phase_schema_query_matches_kernel_parquet_footer_read() {
 
     let node = SchemaQueryNode::new(url.as_str());
     let state = executor
-        .execute_phase_operation(PhaseOperation::SchemaQuery(node))
+        .execute_step(Step::SchemaQuery(node))
         .await
         .expect("schema query phase");
 
@@ -59,7 +57,7 @@ async fn parity_phase_schema_query_matches_kernel_parquet_footer_read() {
     assert_eq!(
         phase_schema.as_ref(),
         kernel_direct.as_ref(),
-        "PhaseOperation::SchemaQuery (DF executor driver) matches direct kernel footer schema read"
+        "Step::SchemaQuery (DF executor driver) matches direct kernel footer schema read"
     );
 }
 
@@ -77,7 +75,7 @@ async fn parity_phase_plans_relation_pipe_matches_kernel_literal_materialization
 
     let executor = DataFusionExecutor::try_new().unwrap();
     executor
-        .execute_phase_operation(PhaseOperation::Plans(registry.take_plans()))
+        .execute_step(Step::Plans(registry.take_plans()))
         .await
         .expect("phase Plans");
 

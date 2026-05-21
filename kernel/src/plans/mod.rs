@@ -32,6 +32,6 @@
 
 pub mod errors;
 pub mod ir;
-pub mod kdf;
-pub mod record_schemas;
-pub mod state_machines;
+pub mod kernel_consumers;
+pub mod operations;
+pub mod record_types;

@@ -3,7 +3,7 @@
 //! `Relation` / `Load` sinks register lazy [`TableProvider`]s into `relation_providers`
 //! keyed by `RelationHandle.id`; downstream `RelationRef` leaves resolve through that map.
 //! `Consume` is the only sink with eager side effects -- it drains the physical plan into a
-//! [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle.
+//! [`KernelConsumer`](delta_kernel::plans::kernel_consumers::KernelConsumer) handle.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,15 +25,13 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::{ConsumeSink, LoadSink, RelationHandle, SinkType};
 use delta_kernel::plans::ir::{Plan, ResultPlan};
-use delta_kernel::plans::kdf::{FinishedHandle, KdfControl};
-use delta_kernel::plans::state_machines::framework::coroutine::driver::CoroutineSM;
-use delta_kernel::plans::state_machines::framework::engine_error::{EngineError, EngineErrorKind};
-use delta_kernel::plans::state_machines::framework::phase_operation::{
-    PhaseOperation, SchemaQueryNode,
-};
-use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
-use delta_kernel::plans::state_machines::framework::state_machine::{AdvanceResult, StateMachine};
-use delta_kernel::plans::state_machines::scan::FullState;
+use delta_kernel::plans::kernel_consumers::{FinishedHandle, KdfControl};
+use delta_kernel::plans::operations::framework::coroutine::driver::Coroutine;
+use delta_kernel::plans::operations::framework::engine_error::{EngineError, EngineErrorKind};
+use delta_kernel::plans::operations::framework::state_machine::{NextStep, StateMachine};
+use delta_kernel::plans::operations::framework::step::{SchemaQueryNode, Step};
+use delta_kernel::plans::operations::framework::step_result::StepResult;
+use delta_kernel::plans::operations::scan::FullState;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::StructType;
 use delta_kernel::{Engine, Error as KernelError};
@@ -64,7 +62,7 @@ fn resolve_schema_query_url(path: &str) -> Result<Url, EngineError> {
 fn execute_schema_query_phase(
     engine: &Arc<dyn Engine>,
     node: SchemaQueryNode,
-) -> Result<PhaseState, EngineError> {
+) -> Result<StepResult, EngineError> {
     let map_kernel_err = |err: KernelError| match err {
         KernelError::FileNotFound(path) => EngineError::new(EngineErrorKind::FileNotFound { path }),
         other => EngineError::internal(other),
@@ -78,7 +76,7 @@ fn execute_schema_query_phase(
         .parquet_handler()
         .read_parquet_footer(&meta)
         .map_err(map_kernel_err)?;
-    let state = PhaseState::empty();
+    let state = StepResult::empty();
     state.submit_schema(footer.schema);
     Ok(state)
 }
@@ -165,33 +163,42 @@ impl DataFusionExecutor {
     /// The terminal value is whatever `R` the SM was constructed for: for read-style SMs that
     /// is typically a [`ResultPlan`] the caller opens via [`Self::drive_to_dataframe`]
     /// (or, equivalently, by hand with [`Self::execute_plans`] + [`Self::read_relation`]).
-    pub async fn drive_to_completion<R: Send + 'static>(
+    ///
+    /// # `!Send` future
+    ///
+    /// The kernel state machine is a CPU-only sequencer (see
+    /// [`Coroutine`](delta_kernel::plans::operations::framework::coroutine::driver::Coroutine)
+    /// module docs); it intentionally does not implement `Send`. The future returned here
+    /// inherits that and is therefore `!Send`. Callers needing a `Send` future drive this on a
+    /// single-threaded runtime (`tokio::runtime::Builder::new_current_thread()` +
+    /// `block_on`) or wrap the call in a [`tokio::task::LocalSet`].
+    pub async fn drive_to_completion<R: 'static>(
         &self,
-        mut sm: CoroutineSM<R>,
+        mut sm: Coroutine<R>,
     ) -> Result<R, DeltaError> {
         let sm_id = sm.sm_id();
         let sm_kind = sm.sm_kind();
         loop {
-            // Zero-yield SMs have no operation to fetch; the first `advance` hands the stored
-            // terminal value back directly. Fall back to an empty `PhaseState` in that case so
-            // `advance` has a valid (unused) input.
-            let phase_name = sm.phase_name();
-            let phase_result = match sm.get_operation() {
-                Ok(op) => self.run_phase(op, sm_id, sm_kind, phase_name).await,
-                Err(_) => Ok(PhaseState::empty()),
+            // Zero-yield SMs have no step to fetch; the first `submit` hands the stored
+            // terminal value back directly. Fall back to an empty `StepResult` in that case so
+            // `submit` has a valid (unused) input.
+            let step_name = sm.step_name();
+            let phase_result = match sm.get_step() {
+                Ok(op) => self.run_phase(op, sm_id, sm_kind, step_name).await,
+                Err(_) => Ok(StepResult::empty()),
             };
-            match sm.advance(phase_result)? {
-                AdvanceResult::Continue => {}
-                AdvanceResult::Done(value) => return Ok(value),
+            match sm.submit(phase_result)? {
+                NextStep::Continue => {}
+                NextStep::Done(value) => return Ok(value),
             }
         }
     }
 
     /// Execute every plan in `plans` in order. `Relation` / `Load` plans register lazy table
     /// providers (no I/O); `Consume` plans drain physically and feed the active phase's
-    /// [`PhaseState`].
+    /// [`StepResult`].
     pub async fn execute_plans(&self, plans: &[Plan]) -> Result<(), DeltaError> {
-        let state = PhaseState::empty();
+        let state = StepResult::empty();
         self.run_plans(plans, &state, Uuid::new_v4(), "standalone", "execute")
             .await
             .into_delta()
@@ -206,7 +213,7 @@ impl DataFusionExecutor {
     /// terminal value is always a `ResultPlan`.
     pub async fn drive_to_dataframe(
         &self,
-        sm: CoroutineSM<ResultPlan>,
+        sm: Coroutine<ResultPlan>,
     ) -> Result<DataFrame, DeltaError> {
         let rp = self.drive_to_completion(sm).await?;
         self.execute_plans(&rp.plans).await?;
@@ -288,37 +295,43 @@ impl DataFusionExecutor {
         self.drive_to_dataframe(fsr.state_machine()?).await
     }
 
-    /// Execute a single [`PhaseOperation`] against the executor and return the resulting
-    /// [`PhaseState`]. Used internally by [`Self::drive_to_completion`] and exposed for
+    /// Execute a single [`Step`] against the executor and return the resulting
+    /// [`StepResult`]. Used internally by [`Self::drive_to_completion`] and exposed for
     /// callers (typically tests) that need to drive an individual phase op directly --
     /// for example, draining a [`Consume`](SinkType::Consume) plan and inspecting
-    /// the [`PhaseState`] for its finalized handle.
-    pub async fn execute_phase_operation(
-        &self,
-        op: PhaseOperation,
-    ) -> Result<PhaseState, EngineError> {
+    /// the [`StepResult`] for its finalized handle.
+    pub async fn execute_step(&self, op: Step) -> Result<StepResult, EngineError> {
         self.run_phase(op, Uuid::new_v4(), "standalone", "execute")
             .await
     }
 
-    /// Execute one [`PhaseOperation`], stamping any `Consume` handles minted during the run
-    /// with `(sm_id, sm_kind, phase_name)`.
+    /// Execute one [`Step`], stamping any `Consume` handles minted during the run
+    /// with `(sm_id, sm_kind, step_name)`.
     async fn run_phase(
         &self,
-        op: PhaseOperation,
+        op: Step,
         sm_id: Uuid,
         sm_kind: &'static str,
-        phase_name: &'static str,
-    ) -> Result<PhaseState, EngineError> {
+        step_name: &'static str,
+    ) -> Result<StepResult, EngineError> {
         match op {
-            PhaseOperation::Plans(plans) => {
-                let state = PhaseState::empty();
-                self.run_plans(&plans, &state, sm_id, sm_kind, phase_name)
+            Step::Plans(plans) => {
+                let state = StepResult::empty();
+                self.run_plans(&plans, &state, sm_id, sm_kind, step_name)
                     .await
                     .map_err(EngineError::internal)?;
                 Ok(state)
             }
-            PhaseOperation::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
+            Step::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
+            // SSA `Step::Consume` lands on the executor in a follow-on PR. Until kernel
+            // SMs start emitting it (PR6+), the variant is unreachable in practice; we
+            // surface a clear engine-level error so the SM body sees an actionable
+            // failure rather than a panic if a future kernel build emits it ahead of
+            // executor support.
+            Step::Consume { .. } => Err(EngineError::internal(delta_kernel::delta_error!(
+                delta_kernel::plans::errors::DeltaErrorCode::DeltaCommandInvariantViolation,
+                "Step::Consume is not yet supported by the DataFusion executor",
+            ))),
         }
     }
 
@@ -333,10 +346,10 @@ impl DataFusionExecutor {
     async fn run_plans(
         &self,
         plans: &[Plan],
-        state: &PhaseState,
+        state: &StepResult,
         sm_id: Uuid,
         sm_kind: &'static str,
-        phase_name: &'static str,
+        step_name: &'static str,
     ) -> Result<(), DataFusionError> {
         for plan in plans {
             // Snapshot the live relation registry into the compile context. The map is built
@@ -344,11 +357,11 @@ impl DataFusionExecutor {
             let providers = Arc::new(self.providers_lock()?.clone());
             let ctx = CompileContext {
                 relation_providers: providers,
-                phase_state: Some(state.clone()),
+                step_result: Some(state.clone()),
                 engine: Arc::clone(&self.engine),
                 sm_id,
                 sm_kind,
-                phase_name,
+                step_name,
             };
             let logical = compile_plan_logical(plan, &ctx)?;
             match &plan.sink {
@@ -411,16 +424,17 @@ impl DataFusionExecutor {
         Ok(())
     }
 
-    /// Drain `physical` through a [`ConsumerKdf`](delta_kernel::plans::kdf::ConsumerKdf) handle
+    /// Drain `physical` through a
+    /// [`KernelConsumer`](delta_kernel::plans::kernel_consumers::KernelConsumer) handle
     /// minted from `sink`. The finalized handle submits into the active phase's
-    /// [`PhaseState`].
+    /// [`StepResult`].
     async fn drain_consume_sink(
         &self,
         physical: Arc<dyn ExecutionPlan>,
         sink: &ConsumeSink,
         ctx: &CompileContext,
     ) -> Result<(), DataFusionError> {
-        let mut handle = sink.new_handle(ctx.sm_id, ctx.sm_kind, ctx.phase_name);
+        let mut handle = sink.new_handle(ctx.sm_id, ctx.sm_kind, ctx.step_name);
         // Consume sinks are single-partition by construction; read partition 0 directly without
         // coalesce.
         let mut stream = physical.execute(0, Arc::clone(&self.task_ctx))?;
@@ -435,14 +449,14 @@ impl DataFusionExecutor {
             }
         }
         let finished = handle.finish();
-        let Some(state) = ctx.phase_state.as_ref() else {
+        let Some(state) = ctx.step_result.as_ref() else {
             // Consume sink called outside of an active phase has nowhere to land its handle.
             let _: FinishedHandle = finished;
             return Err(crate::error::internal_error(
                 "Consume sink drained without an active phase state to submit into",
             ));
         };
-        state.submit_kdf_handle(finished);
+        state.submit_consumer_handle(finished);
         Ok(())
     }
 }

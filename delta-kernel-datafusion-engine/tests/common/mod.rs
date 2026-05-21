@@ -20,7 +20,7 @@ use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::{PlanBuilder, RelationRegistry};
-use delta_kernel::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl};
+use delta_kernel::plans::kernel_consumers::{KdfControl, KernelConsumer, KernelConsumerKind};
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, EngineData, EvaluationHandler};
 use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
@@ -98,22 +98,22 @@ pub fn kernel_literal_batch(schema: Arc<StructType>, rows: &[Vec<Scalar>]) -> Re
 /// Consumer KDF that accumulates the total number of rows seen across all batches and finishes
 /// with the count as a `usize`. Used by tests that verify KDF wiring end-to-end.
 ///
-/// Token identity is by-UUID, so the [`ConsumerKdfId`] tag is incidental for test wiring; we
-/// reuse [`ConsumerKdfId::CheckpointHint`] as a stable placeholder.
+/// Token identity is by-UUID, so the [`KernelConsumerKind`] tag is incidental for test wiring; we
+/// reuse [`KernelConsumerKind::CheckpointHint`] as a stable placeholder.
 #[derive(Debug, Clone, Default)]
 pub struct SumRowsConsumer {
     pub total: usize,
 }
 
 impl SumRowsConsumer {
-    pub fn new(_kdf_id_label: &'static str) -> Self {
+    pub fn new(_kind_label: &'static str) -> Self {
         Self::default()
     }
 }
 
-impl ConsumerKdf for SumRowsConsumer {
-    fn kdf_id(&self) -> ConsumerKdfId {
-        ConsumerKdfId::CheckpointHint
+impl KernelConsumer for SumRowsConsumer {
+    fn kind(&self) -> KernelConsumerKind {
+        KernelConsumerKind::CheckpointHint
     }
 
     fn finish(self: Box<Self>) -> Box<dyn Any + Send> {

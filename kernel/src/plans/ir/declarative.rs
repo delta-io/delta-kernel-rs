@@ -23,7 +23,7 @@ use super::plan::Plan;
 use super::relation_registry::RelationRegistry;
 use crate::expressions::{ColumnName, Expression, Scalar};
 use crate::plans::errors::DeltaError;
-use crate::plans::kdf::{ConsumerKdf, Extractor, KdfOutput};
+use crate::plans::kernel_consumers::{Extractor, KernelConsumer, KernelConsumerOutput};
 use crate::schema::{arc_schema, DataType, SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Error, FileMeta};
 
@@ -465,15 +465,15 @@ impl PlanBuilder {
     /// Typed consumer terminal. Wraps `self` in a [`Plan`] terminating in
     /// [`SinkType::Consume`] and returns the plan paired with an [`Extractor<O>`] that pulls
     /// the typed output from the resulting
-    /// [`PhaseState`](crate::plans::state_machines::framework::phase_state::PhaseState).
+    /// [`StepResult`](crate::plans::operations::framework::step_result::StepResult).
     pub fn consume<S>(self, state: S) -> (Plan, Extractor<S::Output>)
     where
-        S: ConsumerKdf + KdfOutput + 'static,
+        S: KernelConsumer + KernelConsumerOutput + 'static,
     {
         let node = ConsumeSink::new_consumer(state);
         let token = node.token.clone();
         let plan = Plan::new(self.node, SinkType::Consume(node));
-        (plan, Extractor::for_kdf::<S>(token))
+        (plan, Extractor::for_consumer::<S>(token))
     }
 }
 
@@ -510,7 +510,9 @@ mod tests {
     use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
     use crate::plans::ir::nodes::{OrderingSpec, WindowFunction};
-    use crate::plans::kdf::{ConsumerKdf, ConsumerKdfId, KdfControl, KdfOutput};
+    use crate::plans::kernel_consumers::{
+        KdfControl, KernelConsumer, KernelConsumerKind, KernelConsumerOutput,
+    };
     use crate::schema::{DataType, StructField, StructType};
 
     fn simple_schema() -> SchemaRef {
@@ -600,9 +602,9 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct NoopConsumer;
-    impl ConsumerKdf for NoopConsumer {
-        fn kdf_id(&self) -> ConsumerKdfId {
-            ConsumerKdfId::CheckpointHint
+    impl KernelConsumer for NoopConsumer {
+        fn kind(&self) -> KernelConsumerKind {
+            KernelConsumerKind::CheckpointHint
         }
         fn finish(self: Box<Self>) -> Box<dyn Any + Send> {
             Box::new(*self)
@@ -611,7 +613,7 @@ mod tests {
             Ok(KdfControl::Break)
         }
     }
-    impl KdfOutput for NoopConsumer {
+    impl KernelConsumerOutput for NoopConsumer {
         type Output = bool;
         fn into_output(self) -> Result<bool, DeltaError> {
             Ok(true)
@@ -622,29 +624,29 @@ mod tests {
     fn consume_produces_plan_and_extractor_with_consume_sink() {
         use uuid::Uuid;
 
-        use crate::plans::kdf::FinishedHandle;
-        use crate::plans::state_machines::framework::phase_state::PhaseState;
+        use crate::plans::kernel_consumers::FinishedHandle;
+        use crate::plans::operations::framework::step_result::StepResult;
 
         let (plan, extractor) =
             PlanBuilder::scan_json(vec![], simple_schema()).consume(NoopConsumer);
         let _ = plan;
-        assert_eq!(extractor.token().kdf_id, ConsumerKdfId::CheckpointHint);
+        assert_eq!(extractor.token().kind, KernelConsumerKind::CheckpointHint);
 
-        let state = PhaseState::empty();
-        state.submit_kdf_handle(FinishedHandle {
+        let state = StepResult::empty();
+        state.submit_consumer_handle(FinishedHandle {
             token: extractor.token().clone(),
             sm_id: Uuid::new_v4(),
             sm_kind: "test",
-            phase_name: "consume",
+            step_name: "consume",
             erased: Box::new(NoopConsumer),
         });
         assert!(extractor.extract(&state).unwrap());
     }
 
     #[test]
-    fn token_embeds_kdf_id_name() {
+    fn token_embeds_kind_name() {
         let node = ConsumeSink::new_consumer(NoopConsumer);
-        assert_eq!(node.token.kdf_id, ConsumerKdfId::CheckpointHint);
+        assert_eq!(node.token.kind, KernelConsumerKind::CheckpointHint);
         let s = node.token.to_string();
         assert!(s.starts_with("checkpoint_hint#"), "got: {s}");
     }

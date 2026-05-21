@@ -7,8 +7,13 @@ code actually is.
 
 ## Motivation
 
-- **"State machine"** is wrong: there are no states/transitions. The trait describes a
-  multi-step procedure driven by message-passing.
+- ~~**"State machine"** is wrong: there are no states/transitions. The trait describes a
+  multi-step procedure driven by message-passing.~~
+  Considered renaming `StateMachine` → `Operation`/`Procedure`/`Routine`/etc. Decision:
+  **keep `StateMachine`**. Familiar to current contributors; the rename's accuracy gain
+  doesn't outweigh the migration cost. The method renames (`get_step`, `submit`) and
+  associated vocabulary (`Step`, `StepResult`, `NextStep`) still apply — they're tied
+  to the step-centric framing, independent of the trait name.
 - **"Sink"** is overloaded: `Relation` is an output, `Load` is a transform, `Consume` is
   a true drain. Three radically different semantics under one umbrella.
 - **"KDF" / "Kernel-Defined Function"** is misleading: these are stateful batch observers,
@@ -21,8 +26,9 @@ code actually is.
 Two layers:
 
 - **IR (`Plan`)** — SSA dataflow DAG that describes pure compute.
-- **Operation** — kernel-authored multi-step procedure that issues `Step`s to the engine
-  and consumes results, eventually returning a typed `Output`.
+- **State machine** — kernel-authored multi-step procedure that issues `Step`s to the
+  engine and consumes results, eventually returning a typed `Output`. Implemented via
+  the `StateMachine` trait.
 
 Engine boundary is **message-passing**: `get_step → run → submit → continue or done`.
 
@@ -96,17 +102,17 @@ pub enum JoinKind { Inner, LeftAnti }
 SSA is **truly pure compute**. Every Stmt has a Ref output; no Node side-effects the
 engine's state.
 
-### Operation outputs
+### State machine outputs
 
-There are two ways an Operation surfaces work to the engine:
+There are two ways a state machine surfaces work to the engine:
 
-- **`Step`s yielded mid-Operation**: eager work — validation, schema discovery,
+- **`Step`s yielded mid-execution**: eager work — validation, schema discovery,
   state accumulation. Each is a `Step::Consume` (drain into a `KernelConsumer`) or a
-  `Step::SchemaQuery`. The consumer's output flows back through `StepResult` and the SM
-  body uses it for the next decision.
+  `Step::SchemaQuery`. The consumer's output flows back through `StepResult` and the
+  SM body uses it for the next decision.
 - **`ResultPlan` returned at the end**: lazy work — the SSA program for the user's
   result, plus the Ref in that program that is the result. The driver streams it after
-  the Operation completes.
+  the state machine completes.
 
 ## Context owns plan-construction state
 
@@ -309,10 +315,10 @@ No materialize. No cross-Step named relations. Data flows across Steps via:
 - Schemas returned from `ctx.schema_query(...).await` — same.
 - Re-reading the source (commit log, checkpoint manifest, etc.) in subsequent phases.
 
-## Operation framework
+## State machine framework
 
 ```rust
-pub trait Operation {
+pub trait StateMachine {
     type Output;
 
     fn get_step(&mut self) -> Result<Step, DeltaError>;
@@ -346,8 +352,8 @@ pub enum Step {
 
 pub struct StepResult { /* consumer output by token + schema slot */ }
 
-/// The Operation's terminal value. Driver runs `plan` lazily and streams the relation
-/// produced at `result`.
+/// The state machine's terminal value. Driver runs `plan` lazily and streams the
+/// relation produced at `result`.
 pub struct ResultPlan {
     pub plan: Plan,
     pub result: Ref,
@@ -378,7 +384,7 @@ pub enum KernelConsumerKind { CheckpointHint, MetadataProtocol, SidecarCollector
 
 ## Coroutine helper
 
-Concrete `impl Operation` that wraps an `async fn` body. Same role as today's `CoroutineSM`,
+Concrete `impl StateMachine` that wraps an `async fn` body. Same role as today's `CoroutineSM`,
 renamed `Coroutine`.
 
 ## Surviving projections (the whole pipeline)
@@ -408,7 +414,7 @@ kernel/src/plans/
 │   └── framework/
 │       ├── context.rs       // Context, Cursor, ContextState (replaces PlanBuilder)
 │   ├── framework/
-│   │   ├── operation.rs     // Operation trait, NextStep, ResultPlan
+│   │   ├── state_machine.rs // StateMachine trait, NextStep, ResultPlan
 │   │   ├── step.rs          // Step, SchemaQueryNode
 │   │   ├── step_result.rs   // StepResult
 │   │   ├── engine_error.rs
@@ -429,7 +435,7 @@ kernel/src/plans/
 | `plans/state_machines/` | `plans/operations/` |
 | `plans/kdf/` | `plans/kernel_consumers/` |
 | `record_schemas.rs` | `record_types.rs` |
-| `StateMachine` | `Operation` |
+| `StateMachine` | `StateMachine` (kept) |
 | `CoroutineSM` | `Coroutine` |
 | `get_operation` | `get_step` |
 | `advance` | `submit` |
@@ -682,9 +688,9 @@ impl Scan {
 - **Pure SSA**: every Stmt produces a Ref, no `Option<Ref>` anywhere, no side-effecting
   Node variants. No materialize concept anywhere.
 - **One Step variant per output kind**: `Consume` returns consumer state (eager),
-  `SchemaQuery` returns a schema (eager). Operations with mid-flight needs (e.g., CDF:
-  validate-then-read; FSR/Scan: shape resolution) yield one or more `Consume`/`SchemaQuery`
-  Steps before returning `ResultPlan`.
+  `SchemaQuery` returns a schema (eager). State machines with mid-flight needs (e.g.,
+  CDF: validate-then-read; FSR/Scan: shape resolution) yield one or more
+  `Consume`/`SchemaQuery` Steps before returning `ResultPlan`.
 - **No cross-Step relations**. Cross-Step data flows via consumer outputs (small data
   via SM body locals) or by re-reading the source in subsequent SSA (cheap for commit
   logs, checkpoint manifests, schemas, etc.). The driver/engine doesn't need a name
@@ -767,7 +773,7 @@ These were not resolved during synthesis; surface during the migration:
 - **`Expression::infer_type(&Schema) -> DataType`**: needs a single canonical walk that
   the builder can use. Kernel already has type knowledge scattered across evaluators;
   centralize it.
-- **Kernel-internal projection helpers**: ad-hoc functions per Operation that return
+- **Kernel-internal projection helpers**: ad-hoc functions per state machine that return
   `(Vec<ExpressionRef>, SchemaRef)` for feeding to `cursor.project_with_schema`. The
   scan data phase has `scan_data_projection(&state_info)`; CDF will likely add its own.
   These are not part of the cursor API surface — just regular kernel-side functions.
@@ -784,7 +790,8 @@ These were not resolved during synthesis; surface during the migration:
 ## Status
 
 Vocabulary settled. Not yet implemented. Migration order:
-(1) operations/consumers/file renames, (2) `Operation` trait + framework (slim:
+(1) consumers/file renames (operations module kept under existing `state_machines/`
+name or renamed independently), (2) `StateMachine` trait + framework (slim:
 `Step::Consume` + `Step::SchemaQuery`), (3) IR SSA rewrite (`Plan`, `Stmt`, `Node`,
 `Ref`), (4) `Context` + `Cursor` (Rc/RefCell shared state, session_id, dead-code
 elimination on dispatch), (5) pipeline rewrite (FSR, Scan) using `ctx`-as-builder
