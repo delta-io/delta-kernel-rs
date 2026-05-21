@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::{
-    STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT, STATS_NUM_RECORDS,
+    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS,
 };
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::FileSystemCommitter;
@@ -93,11 +93,11 @@ async fn test_clustered_table_write_and_checkpoint(
         for col in &expected_clustering {
             let col_name = col.to_string();
             assert!(
-                stats[STATS_MIN_VALUES].get(&col_name).is_some(),
+                stats[MIN_VALUES].get(&col_name).is_some(),
                 "Stats should include minValues for clustering column '{col_name}'"
             );
             assert!(
-                stats[STATS_MAX_VALUES].get(&col_name).is_some(),
+                stats[MAX_VALUES].get(&col_name).is_some(),
                 "Stats should include maxValues for clustering column '{col_name}'"
             );
         }
@@ -129,11 +129,11 @@ async fn test_clustered_table_write_and_checkpoint(
         for col in &expected_clustering {
             let col_name = col.to_string();
             assert!(
-                stats[STATS_MIN_VALUES].get(&col_name).is_some(),
+                stats[MIN_VALUES].get(&col_name).is_some(),
                 "Stats should include minValues for clustering column '{col_name}' after checkpoint"
             );
             assert!(
-                stats[STATS_MAX_VALUES].get(&col_name).is_some(),
+                stats[MAX_VALUES].get(&col_name).is_some(),
                 "Stats should include maxValues for clustering column '{col_name}' after checkpoint"
             );
         }
@@ -203,14 +203,14 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     let add_infos = read_add_infos(&snapshot, engine.as_ref()).unwrap();
     assert_eq!(add_infos.len(), 1);
     let stats = add_infos[0].stats.as_ref().expect("should have stats");
-    assert_eq!(stats[STATS_NUM_RECORDS], 3);
-    assert_eq!(stats[STATS_NULL_COUNT]["region_id"], 3);
+    assert_eq!(stats[NUM_RECORDS], 3);
+    assert_eq!(stats[NULL_COUNT]["region_id"], 3);
     assert!(
-        stats[STATS_MIN_VALUES].get("region_id").is_none(),
+        stats[MIN_VALUES].get("region_id").is_none(),
         "JSON minValues should omit region_id when all values are null"
     );
     assert!(
-        stats[STATS_MAX_VALUES].get("region_id").is_none(),
+        stats[MAX_VALUES].get("region_id").is_none(),
         "JSON maxValues should omit region_id when all values are null"
     );
 }

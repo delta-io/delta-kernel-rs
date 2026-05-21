@@ -663,7 +663,7 @@ fn test_partition_column_rewrite() {
     assert!(
         pred_str
             .as_ref()
-            .is_some_and(|s| !s.contains(STATS_MIN_VALUES) && !s.contains(STATS_MAX_VALUES)),
+            .is_some_and(|s| !s.contains(MIN_VALUES) && !s.contains(MAX_VALUES)),
         "Should not contain minValues/maxValues for partition columns"
     );
 

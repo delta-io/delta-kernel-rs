@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::actions::{STATS_MAX_VALUES, STATS_MIN_VALUES};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{
     Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
@@ -114,10 +114,10 @@ async fn test_column_mapping_write(
     let mut all_stats: Vec<_> = add_actions
         .iter()
         .filter_map(|a| a.stats.as_ref())
-        .filter(|s| s.get(STATS_MIN_VALUES).is_some())
+        .filter(|s| s.get(MIN_VALUES).is_some())
         .collect();
     assert_eq!(all_stats.len(), 2, "should have stats for 2 files");
-    all_stats.sort_by_key(|s| s[STATS_MIN_VALUES][&row_number_physical[0]].as_i64().unwrap());
+    all_stats.sort_by_key(|s| s[MIN_VALUES][&row_number_physical[0]].as_i64().unwrap());
 
     // Batch 1: row_number 1..3, address.street "st1".."st3"
     assert_min_max_stats(all_stats[0], &row_number_physical, 1, 3);
@@ -147,10 +147,10 @@ async fn test_column_mapping_write(
                 resolve_struct_field(&batch_struct, &["stats_parsed".into()]);
 
             let min_path = |field: &[String]| -> Vec<String> {
-                [&["stats_parsed".into(), STATS_MIN_VALUES.into()], field].concat()
+                [&["stats_parsed".into(), MIN_VALUES.into()], field].concat()
             };
             let max_path = |field: &[String]| -> Vec<String> {
-                [&["stats_parsed".into(), STATS_MAX_VALUES.into()], field].concat()
+                [&["stats_parsed".into(), MAX_VALUES.into()], field].concat()
             };
             let min_row_num: &Int64Array =
                 resolve_struct_field(&batch_struct, &min_path(&row_number_physical));

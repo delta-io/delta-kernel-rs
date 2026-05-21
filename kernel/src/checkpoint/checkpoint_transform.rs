@@ -331,7 +331,7 @@ fn build_add_output_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::STATS_NUM_RECORDS;
+    use crate::actions::NUM_RECORDS;
 
     #[test]
     fn test_config_defaults() {
@@ -581,7 +581,7 @@ mod tests {
         ]);
 
         let injected_schema =
-            StructType::new_unchecked([StructField::nullable(STATS_NUM_RECORDS, DataType::LONG)]);
+            StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]);
 
         let result = add_schema
             .with_field_inserted_after(
@@ -635,7 +635,7 @@ mod tests {
         ]);
 
         let stats_schema =
-            StructType::new_unchecked([StructField::nullable(STATS_NUM_RECORDS, DataType::LONG)]);
+            StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]);
 
         let result = build_add_output_schema(&config, &add_schema, &stats_schema, None)
             .expect("build add output schema should produce a valid schema");
@@ -658,7 +658,7 @@ mod tests {
         ]);
 
         let stats_schema =
-            StructType::new_unchecked([StructField::nullable(STATS_NUM_RECORDS, DataType::LONG)]);
+            StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]);
 
         let result = build_add_output_schema(&config, &add_schema, &stats_schema, None)
             .expect("build add output schema should produce a valid schema");
@@ -689,7 +689,7 @@ mod tests {
         ]);
 
         let stats_schema =
-            StructType::new_unchecked([StructField::nullable(STATS_NUM_RECORDS, DataType::LONG)]);
+            StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]);
         let pv_schema = StructType::new_unchecked([
             StructField::nullable("year", DataType::INTEGER),
             StructField::nullable("month", DataType::INTEGER),

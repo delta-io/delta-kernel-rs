@@ -62,15 +62,15 @@ pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 // === Sub-fields of an AddFile's `stats` struct ===
 // See the Delta protocol spec, "Per-file Statistics".
 /// Total number of rows in the file.
-pub const STATS_NUM_RECORDS: &str = "numRecords";
+pub const NUM_RECORDS: &str = "numRecords";
 /// Per-column count of null values.
-pub const STATS_NULL_COUNT: &str = "nullCount";
+pub const NULL_COUNT: &str = "nullCount";
 /// Per-column smallest non-null value (truncated for strings; omitted for all-null columns).
-pub const STATS_MIN_VALUES: &str = "minValues";
+pub const MIN_VALUES: &str = "minValues";
 /// Per-column largest non-null value (truncated for strings; omitted for all-null columns).
-pub const STATS_MAX_VALUES: &str = "maxValues";
+pub const MAX_VALUES: &str = "maxValues";
 /// Whether the min/max values are tight bounds (vs. lower/upper bounds).
-pub const STATS_TIGHT_BOUNDS: &str = "tightBounds";
+pub const TIGHT_BOUNDS: &str = "tightBounds";
 
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([

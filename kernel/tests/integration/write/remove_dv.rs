@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::actions::STATS_NUM_RECORDS;
+use delta_kernel::actions::NUM_RECORDS;
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -149,7 +149,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
             // stats (optional)
             let stats = remove["stats"].as_str().expect("Missing stats");
             let stats_json: serde_json::Value = serde_json::from_str(stats)?;
-            assert_eq!(stats_json[STATS_NUM_RECORDS], 10);
+            assert_eq!(stats_json[NUM_RECORDS], 10);
 
             // tags (optional)
             let tags = remove["tags"].as_object().expect("Missing tags");
@@ -978,7 +978,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
                 .expect("stats field should be a non-null JSON string");
             let stats: serde_json::Value = serde_json::from_str(stats_str)?;
             assert!(
-                stats[STATS_NUM_RECORDS].as_i64().unwrap_or(0) > 0,
+                stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
                 "stats.numRecords should be populated, got: {stats}"
             );
         }
@@ -1116,7 +1116,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
                 .expect("stats field should be a non-null JSON string");
             let stats: serde_json::Value = serde_json::from_str(stats_str)?;
             assert!(
-                stats[STATS_NUM_RECORDS].as_i64().unwrap_or(0) > 0,
+                stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
                 "stats.numRecords should be populated, got: {stats}"
             );
         }

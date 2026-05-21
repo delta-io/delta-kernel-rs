@@ -11,7 +11,7 @@ use url::Url;
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME,
-    PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME, STATS_MAX_VALUES, STATS_MIN_VALUES,
+    PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME, MAX_VALUES, MIN_VALUES,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -1241,7 +1241,7 @@ impl LogSegment {
         // Check type compatibility for both minValues and maxValues structs.
         // While these typically have the same schema, the protocol doesn't guarantee it,
         // so we check both to be safe.
-        for field_name in [STATS_MIN_VALUES, STATS_MAX_VALUES] {
+        for field_name in [MIN_VALUES, MAX_VALUES] {
             let Some(checkpoint_values_field) = stats_struct.field(field_name) else {
                 // stats_parsed exists but no minValues/maxValues - unusual but valid
                 continue;

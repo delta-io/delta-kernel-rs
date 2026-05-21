@@ -6,7 +6,7 @@ use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
 use tracing::debug;
 
-use crate::actions::{STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
@@ -549,9 +549,9 @@ fn compute_checkpoint_field_indices(
             }
             let entry = stats_indices.entry(col_name).or_default();
             match stat_type {
-                STATS_MIN_VALUES => entry.min_index = Some(i),
-                STATS_MAX_VALUES => entry.max_index = Some(i),
-                STATS_NULL_COUNT => entry.nullcount_index = Some(i),
+                MIN_VALUES => entry.min_index = Some(i),
+                MAX_VALUES => entry.max_index = Some(i),
+                NULL_COUNT => entry.nullcount_index = Some(i),
                 _ => {}
             }
         }

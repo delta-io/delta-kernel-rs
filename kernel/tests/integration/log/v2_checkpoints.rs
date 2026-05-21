@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::actions::{STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NUM_RECORDS};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray,
     StructArray,
@@ -623,7 +623,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
         let stats_parsed = get_struct_column_from_struct_array(add_col, "stats_parsed");
 
         let num_records_col = stats_parsed
-            .column_by_name(STATS_NUM_RECORDS)
+            .column_by_name(NUM_RECORDS)
             .expect("stats_parsed should have numRecords");
         for &row in &add_rows {
             all_record_counts.push(
@@ -633,7 +633,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
             );
         }
 
-        let min_values = get_struct_column_from_struct_array(stats_parsed, STATS_MIN_VALUES);
+        let min_values = get_struct_column_from_struct_array(stats_parsed, MIN_VALUES);
         let min_id_col = min_values
             .column_by_name("id")
             .expect("minValues should have id");
@@ -645,7 +645,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
             );
         }
 
-        let max_values = get_struct_column_from_struct_array(stats_parsed, STATS_MAX_VALUES);
+        let max_values = get_struct_column_from_struct_array(stats_parsed, MAX_VALUES);
         let max_id_col = max_values
             .column_by_name("id")
             .expect("maxValues should have id");
@@ -699,7 +699,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
         .iter()
         .map(|s| serde_json::from_str(s).expect("add.stats should be valid JSON"))
         .collect();
-    parsed_stats.sort_by_key(|v| v[STATS_NUM_RECORDS].as_i64().unwrap());
+    parsed_stats.sort_by_key(|v| v[NUM_RECORDS].as_i64().unwrap());
     assert_eq!(
         parsed_stats,
         vec![

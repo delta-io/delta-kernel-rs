@@ -9,7 +9,7 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::actions::{
-    STATS_MAX_VALUES, STATS_MIN_VALUES, STATS_NULL_COUNT, STATS_NUM_RECORDS, STATS_TIGHT_BOUNDS,
+    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use crate::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
@@ -514,9 +514,9 @@ pub(crate) fn collect_stats(
     let schema = batch.schema();
 
     // Collect all stats in a single traversal
-    let mut null_counts = StatsAccumulator::new(STATS_NULL_COUNT);
-    let mut min_values = StatsAccumulator::new(STATS_MIN_VALUES);
-    let mut max_values = StatsAccumulator::new(STATS_MAX_VALUES);
+    let mut null_counts = StatsAccumulator::new(NULL_COUNT);
+    let mut min_values = StatsAccumulator::new(MIN_VALUES);
+    let mut max_values = StatsAccumulator::new(MAX_VALUES);
 
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let mut path = vec![field.name().to_string()];
@@ -537,7 +537,7 @@ pub(crate) fn collect_stats(
     }
 
     // Build output struct
-    let mut fields = vec![Field::new(STATS_NUM_RECORDS, DataType::Int64, true)];
+    let mut fields = vec![Field::new(NUM_RECORDS, DataType::Int64, true)];
     let mut arrays: Vec<Arc<dyn Array>> =
         vec![Arc::new(Int64Array::from(vec![batch.num_rows() as i64]))];
 
@@ -549,7 +549,7 @@ pub(crate) fn collect_stats(
     }
 
     // tightBounds
-    fields.push(Field::new(STATS_TIGHT_BOUNDS, DataType::Boolean, true));
+    fields.push(Field::new(TIGHT_BOUNDS, DataType::Boolean, true));
     arrays.push(Arc::new(BooleanArray::from(vec![true])));
 
     StructArray::try_new(fields.into(), arrays, None)
@@ -580,7 +580,7 @@ mod tests {
 
         assert_eq!(stats.len(), 1);
         let num_records = stats
-            .column_by_name(STATS_NUM_RECORDS)
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -608,7 +608,7 @@ mod tests {
 
         // Check nullCount struct
         let null_count = stats
-            .column_by_name(STATS_NULL_COUNT)
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -653,7 +653,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id")]).unwrap();
 
         let null_count = stats
-            .column_by_name(STATS_NULL_COUNT)
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -689,7 +689,7 @@ mod tests {
 
         // Check minValues
         let min_values = stats
-            .column_by_name(STATS_MIN_VALUES)
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -713,7 +713,7 @@ mod tests {
 
         // Check maxValues
         let max_values = stats
-            .column_by_name(STATS_MAX_VALUES)
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -758,7 +758,7 @@ mod tests {
 
         // numRecords should be 3
         let num_records = stats
-            .column_by_name(STATS_NUM_RECORDS)
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -767,7 +767,7 @@ mod tests {
 
         // nullCount should be 3
         let null_count = stats
-            .column_by_name(STATS_NULL_COUNT)
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -785,7 +785,7 @@ mod tests {
         // check nullCount == numRecords. The JSON serializer omits null fields, so
         // the on-disk format still matches Spark's ignoreNullFields behavior.
         let min_values = stats
-            .column_by_name(STATS_MIN_VALUES)
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -794,7 +794,7 @@ mod tests {
         assert!(min_col.is_null(0));
 
         let max_values = stats
-            .column_by_name(STATS_MAX_VALUES)
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -814,13 +814,13 @@ mod tests {
         let stats = collect_stats(&batch, &[]).unwrap();
 
         // Should still have numRecords and tightBounds
-        assert!(stats.column_by_name(STATS_NUM_RECORDS).is_some());
-        assert!(stats.column_by_name(STATS_TIGHT_BOUNDS).is_some());
+        assert!(stats.column_by_name(NUM_RECORDS).is_some());
+        assert!(stats.column_by_name(TIGHT_BOUNDS).is_some());
 
         // Should not have nullCount, minValues, maxValues
-        assert!(stats.column_by_name(STATS_NULL_COUNT).is_none());
-        assert!(stats.column_by_name(STATS_MIN_VALUES).is_none());
-        assert!(stats.column_by_name(STATS_MAX_VALUES).is_none());
+        assert!(stats.column_by_name(NULL_COUNT).is_none());
+        assert!(stats.column_by_name(MIN_VALUES).is_none());
+        assert!(stats.column_by_name(MAX_VALUES).is_none());
     }
 
     #[test]
@@ -839,7 +839,7 @@ mod tests {
 
         // Check minValues - should be truncated to exactly 32 chars
         let min_values = stats
-            .column_by_name(STATS_MIN_VALUES)
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -857,7 +857,7 @@ mod tests {
 
         // Check maxValues - should be 32 chars + 0x7F tie-breaker (since 'a' < 0x7F)
         let max_values = stats
-            .column_by_name(STATS_MAX_VALUES)
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -892,7 +892,7 @@ mod tests {
 
         // Check maxValues - should use UTF8_MAX_CHAR since 'À' (the truncated char) >= 0x7F
         let max_values = stats
-            .column_by_name(STATS_MAX_VALUES)
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -925,7 +925,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
 
         let min_values = stats
-            .column_by_name(STATS_MIN_VALUES)
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(text_min.value(0), short_string);
 
         let max_values = stats
-            .column_by_name(STATS_MAX_VALUES)
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1047,7 +1047,7 @@ mod tests {
 
         // Check nullCount.nested.a = 0, nullCount.nested.b = 1
         let null_count = stats
-            .column_by_name(STATS_NULL_COUNT)
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1078,7 +1078,7 @@ mod tests {
 
         // Check minValues.nested.a = 5, minValues.nested.b = "apple"
         let min_values = stats
-            .column_by_name(STATS_MIN_VALUES)
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1109,7 +1109,7 @@ mod tests {
 
         // Check maxValues.nested.a = 20, maxValues.nested.b = "zebra"
         let max_values = stats
-            .column_by_name(STATS_MAX_VALUES)
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1174,7 +1174,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("list_col")]).unwrap();
 
         let null_count = stats
-            .column_by_name(STATS_NULL_COUNT)
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1200,7 +1200,7 @@ mod tests {
 
         // minValues should have id but NOT list_col
         let min_values = stats
-            .column_by_name(STATS_MIN_VALUES)
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1210,7 +1210,7 @@ mod tests {
 
         // maxValues should have id but NOT list_col
         let max_values = stats
-            .column_by_name(STATS_MAX_VALUES)
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1268,14 +1268,14 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("map_col")]).unwrap();
 
         // === THEN: map_col has nullCount=1 but no min/max ===
-        let null_count = child_struct(&stats, STATS_NULL_COUNT);
+        let null_count = child_struct(&stats, NULL_COUNT);
         let map_nulls = null_count
             .column_by_name("map_col")
             .unwrap()
             .as_primitive::<Int64Type>();
         assert_eq!(map_nulls.value(0), 1);
 
-        let min_values = child_struct(&stats, STATS_MIN_VALUES);
+        let min_values = child_struct(&stats, MIN_VALUES);
         assert!(min_values.column_by_name("id").is_some());
         assert!(min_values.column_by_name("map_col").is_none());
     }
@@ -1325,7 +1325,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("v")]).unwrap();
 
         // === THEN: v has nullCount=1 at the struct level, no recursion, no min/max ===
-        let null_count = child_struct(&stats, STATS_NULL_COUNT);
+        let null_count = child_struct(&stats, NULL_COUNT);
         let v_nulls = null_count
             .column_by_name("v")
             .unwrap()
@@ -1336,7 +1336,7 @@ mod tests {
         assert!(null_count.column_by_name("metadata").is_none());
         assert!(null_count.column_by_name("value").is_none());
 
-        let min_values = child_struct(&stats, STATS_MIN_VALUES);
+        let min_values = child_struct(&stats, MIN_VALUES);
         assert!(min_values.column_by_name("id").is_some());
         assert!(min_values.column_by_name("v").is_none());
     }
@@ -1394,31 +1394,31 @@ mod tests {
 
         // nullCount includes struct-level nulls
         assert_eq!(
-            get_stat::<Int64Type>(&stats, STATS_NULL_COUNT, "my_struct", "a"),
+            get_stat::<Int64Type>(&stats, NULL_COUNT, "my_struct", "a"),
             2
         );
         assert_eq!(
-            get_stat::<Int64Type>(&stats, STATS_NULL_COUNT, "my_struct", "b"),
+            get_stat::<Int64Type>(&stats, NULL_COUNT, "my_struct", "b"),
             3
         );
 
         // minValues excludes values from null struct rows
         assert_eq!(
-            get_stat::<Int32Type>(&stats, STATS_MIN_VALUES, "my_struct", "a"),
+            get_stat::<Int32Type>(&stats, MIN_VALUES, "my_struct", "a"),
             2
         );
         assert_eq!(
-            get_stat::<Int32Type>(&stats, STATS_MIN_VALUES, "my_struct", "b"),
+            get_stat::<Int32Type>(&stats, MIN_VALUES, "my_struct", "b"),
             20
         );
 
         // maxValues excludes values from null struct rows
         assert_eq!(
-            get_stat::<Int32Type>(&stats, STATS_MAX_VALUES, "my_struct", "a"),
+            get_stat::<Int32Type>(&stats, MAX_VALUES, "my_struct", "a"),
             3
         );
         assert_eq!(
-            get_stat::<Int32Type>(&stats, STATS_MAX_VALUES, "my_struct", "b"),
+            get_stat::<Int32Type>(&stats, MAX_VALUES, "my_struct", "b"),
             20
         );
     }
@@ -1673,12 +1673,12 @@ mod tests {
         // ===== THEN =====
         // Kernel stats must match Spark's numRecords, nullCount, minValues, and maxValues.
         assert_eq!(
-            spark_stats[STATS_NUM_RECORDS], kernel_stats[STATS_NUM_RECORDS],
+            spark_stats[NUM_RECORDS], kernel_stats[NUM_RECORDS],
             "numRecords mismatch"
         );
 
         // Compare nullCount, minValues, maxValues (only keys present in Spark's stats)
-        for section in &[STATS_NULL_COUNT, STATS_MIN_VALUES, STATS_MAX_VALUES] {
+        for section in &[NULL_COUNT, MIN_VALUES, MAX_VALUES] {
             if let Some(spark_section) = spark_stats.get(*section) {
                 let kernel_section = kernel_stats
                     .get(*section)
