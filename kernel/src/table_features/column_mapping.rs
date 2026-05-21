@@ -134,14 +134,46 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 /// and `None`. In `None` mode no dedup is performed (the returned "physical name" is just the
 /// logical field name and is only schema-unique within its parent struct, not globally).
 ///
-/// `parent_field_logical_path` is the field's parent path, used to render full paths in error
-/// messages (e.g. parent `&["a", "b"]` and field `c` renders as `a.b.c`).
+/// # Parameters
 ///
-/// `seen_ids` is the global map of `delta.columnMapping.id` -> first claimer logical name.
-/// `None` skips the ID-dedup check.
+/// - `field`: The field to validate.
+/// - `mode`: Column mapping mode.
+/// - `parent_field_logical_path`: The field's parent path, used to render full paths in error
+///   messages (e.g. parent `&["a", "b"]` and field `c` renders as `a.b.c`).
+/// - `seen_ids`: Global map of `delta.columnMapping.id` -> first claimer logical name. `None` skips
+///   the ID-dedup check.
+/// - `current_field_siblings`: Map of `delta.columnMapping.physicalName` -> first claimer logical
+///   name *for the current field's siblings only*. `None` skips the sibling-dedup check.
 ///
-/// `current_field_siblings` is the map of `delta.columnMapping.physicalName` -> first claimer
-/// logical name *for the current field's siblings only*. `None` skips the sibling-dedup check.
+/// # Errors
+///
+/// - The field is a metadata column carrying any CM annotation.
+/// - CM is enabled but `delta.columnMapping.physicalName` is missing or non-string.
+/// - CM is enabled but `delta.columnMapping.id` is missing or non-numeric.
+/// - CM is disabled but either annotation is present.
+/// - `seen_ids` is provided and the current field's `delta.columnMapping.id` is already in the map.
+///   Example rejection (two fields share `delta.columnMapping.id=1`):
+///
+///   ```json
+///   {"type":"struct","fields":[
+///     {"name":"a","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-a"}},
+///     {"name":"b","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-b"}}
+///   ]}
+///   ```
+/// - `current_field_siblings` is provided and the current field's
+///   `delta.columnMapping.physicalName` is already claimed by a sibling. Example rejection (two
+///   siblings share `delta.columnMapping.physicalName="x"`):
+///
+///   ```json
+///   {"type":"struct","fields":[
+///     {"name":"a","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"x"}},
+///     {"name":"b","type":"long","nullable":true,
+///      "metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"x"}}
+///   ]}
+///   ```
 pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     field: &'a StructField,
     mode: ColumnMappingMode,
