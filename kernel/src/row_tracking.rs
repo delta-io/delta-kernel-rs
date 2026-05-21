@@ -300,7 +300,7 @@ mod tests {
         let result = visitor.visit(1, &getters);
         assert_result_error_with_message(
             result,
-            "numRecords must be present in Add actions when row tracking is enabled",
+            &format!("{NUM_RECORDS} must be present in Add actions when row tracking is enabled"),
         );
 
         Ok(())
