@@ -67,25 +67,9 @@ pub struct CommitFileMeta {
 
 // === Sync reconciliation pipeline (registry-only, no yields) ==============================
 
-/// Sync core of the reconciliation pipeline. Builds every stage into `registry` without
-/// yielding phases; caller is responsible for resolving the [`ScanShapeInfo`] beforehand
-/// (typically via [`ScanShapeInfo::resolve`] inside an async wrapper — see
-/// [`execute_reconciliation`]).
-///
-/// `base` selects the action-slot set (`SCAN_BASE` for `{add, remove}`, `FSR_BASE` for the full
-/// six slots). `dedup_key` MUST evaluate to NULL on rows that match no known slot — the pipeline's
-/// identity filter is `dedup_key IS NOT NULL`.
-///
-/// Two parallel action-stream pairs drive the projections:
-///
-/// - `commit_pair`: `augment_add(base, stats (has_parsed_stats=false), parts)`. Commit log rows
-///   never carry native `add.stats_parsed`, so `stats_parsed` is always derived via
-///   `parse_json(add.stats, ..)` on the commit side.
-/// - `checkpoint_pair`: `augment_add(base, stats (has_parsed_stats=shape.stats.has_parsed_stats),
-///   parts)`. When the checkpoint leaf (classic or V2 sidecar) carries native `add.stats_parsed`,
-///   the projection is a passthrough column reference instead of `parse_json` per row. Used for
-///   every projection downstream of the initial commit augmentation, including the post-union keyed
-///   and terminal steps, so the natively-materialized stats survive into `RECONCILED`.
+/// Sync core of the reconciliation pipeline; caller resolves the [`ScanShapeInfo`] beforehand
+/// (see [`execute_reconciliation`]). `base` picks the action-slot set; `dedup_key` MUST
+/// evaluate to NULL on rows matching no known slot (the pipeline filter is `IS NOT NULL`).
 pub(super) fn register_reconciliation(
     registry: &mut RelationRegistry,
     snapshot: &Snapshot,
@@ -93,27 +77,34 @@ pub(super) fn register_reconciliation(
     base: &'static std::sync::LazyLock<Pair>,
     dedup_key: Arc<Expression>,
 ) -> Result<(), DeltaError> {
-    let commit_pair = augment_add(
-        (**base).clone(),
+    let stats_for = |has_parsed: bool| {
         shape
             .stats
             .stats_schema
             .as_ref()
-            .map(|s| (s.clone(), /* has_parsed_stats= */ false)),
+            .map(|s| (s.clone(), has_parsed))
+    };
+    // commit_pair: rows from commit logs / manifest tops never carry native `add.stats_parsed`,
+    // so stats are derived via `parse_json` here. checkpoint_pair: leaf files (classic checkpoint
+    // or V2 sidecar) may carry native `add.stats_parsed`, in which case it's a passthrough.
+    let commit_pair = augment_add(
+        (**base).clone(),
+        stats_for(false),
         shape.partition_schema.clone(),
     );
     let checkpoint_pair = augment_add(
         (**base).clone(),
-        shape
-            .stats
-            .stats_schema
-            .as_ref()
-            .map(|s| (s.clone(), shape.stats.has_parsed_stats)),
+        stats_for(shape.stats.has_parsed_stats),
         shape.partition_schema.clone(),
     );
+    // checkpoint_pair is identity-equivalent to commit_pair when stats are absent or already
+    // native — in that case the checkpoint-side `project_pair(checkpoint_pair)` is a no-op and
+    // we can skip the node entirely.
+    let checkpoint_project_is_identity = shape.partition_schema.is_none()
+        && (shape.stats.stats_schema.is_none() || shape.stats.has_parsed_stats);
 
     // Reused twice (commit filter + checkpoint-side filter); hold as Arc<Expression> so
-    // each `.filter(...)` call is a cheap Arc clone instead of a Predicate clone + Arc alloc.
+    // each `.filter(...)` call is a cheap Arc clone.
     let identity_not_null: Arc<Expression> =
         Arc::new(dedup_key.as_ref().clone().is_not_null().into());
 
@@ -170,7 +161,7 @@ pub(super) fn register_reconciliation(
                 .le(Expression::literal(1i64))
                 .into(),
         ))
-        .project_pair(commit_pair)
+        .project_pair(commit_pair.clone())
         .add_column(JOIN_KEY_FIELD.clone(), dedup_key.clone())
         .into_relation(COMMIT_DEDUP, registry)?;
 
@@ -182,34 +173,26 @@ pub(super) fn register_reconciliation(
     let checkpoint_view: Option<PlanBuilder> = match &shape.checkpoint {
         CheckpointShape::NoCheckpoint => None,
         CheckpointShape::Scan { files, file_format } => {
-            // Scan the checkpoint files directly into `checkpoint_pair.0` so the engine can
-            // surface native `add.stats_parsed` / `add.partitionValues_parsed` when present.
+            // Scan checkpoint files directly into `checkpoint_pair.0` so the engine surfaces
+            // native `add.stats_parsed` / `add.partitionValues_parsed` when present.
             let scan_schema = checkpoint_pair.0.clone();
             let scan = match file_format {
                 FileFormat::Parquet => PlanBuilder::scan_parquet(files.clone(), scan_schema),
                 FileFormat::Json => PlanBuilder::scan_json(files.clone(), scan_schema),
             };
             scan.into_relation(CHECKPOINT_TOP, registry)?;
-
-            // Reproject to checkpoint_pair shape — turns native `add.stats_parsed` into the
-            // passthrough column when `has_parsed_stats=true`, runs `parse_json` otherwise.
-            // Elision: when augment_add was identity (no stats AND no parts, OR
-            // partition_schema=None AND has_parsed_stats=true), the projection is a bare
-            // passthrough so we skip the project_pair node entirely.
-            let project_is_identity = shape.partition_schema.is_none()
-                && (shape.stats.stats_schema.is_none() || shape.stats.has_parsed_stats);
             let top = registry.relation_ref(CHECKPOINT_TOP)?;
-            Some(if project_is_identity {
+            Some(if checkpoint_project_is_identity {
                 top
             } else {
                 top.project_pair(checkpoint_pair.clone())
             })
         }
         CheckpointShape::Manifest { .. } => {
-            // The resolver already published the manifest as `CHECKPOINT_TOP` (schema:
-            // `action_schema + sidecar`, no `stats_parsed` field). Sidecars carry the actual
-            // `add`/`remove` rows; the manifest's own rows are mostly sidecar pointers (with
-            // `add IS NULL`) and are filtered out by `identity_not_null` downstream.
+            // Resolver already published `CHECKPOINT_TOP` as the manifest (schema:
+            // `action_schema + sidecar`, no `stats_parsed`). Manifest rows are mostly
+            // sidecar-pointers with `add IS NULL` and get filtered out below; the
+            // manifest's own action rows use commit-style `parse_json`.
             let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
                 delta_error!(
                     DeltaErrorCode::DeltaStateRecoverError,
@@ -237,35 +220,18 @@ pub(super) fn register_reconciliation(
                     registry,
                 )?;
 
-            // Top (manifest): the manifest schema lacks `add.stats_parsed`, so we can't use
-            // checkpoint_pair (which would `col(add.stats_parsed)` under `has_parsed_stats=true`).
-            // Use commit_pair-style `parse_json` instead. Manifest rows that actually carry
-            // `add`/`remove` get a real `stats_parsed` from parse_json; sidecar-pointer rows
-            // get NULL and are filtered out by `identity_not_null` in stage 5b.
-            let manifest_pair = augment_add(
-                (**base).clone(),
-                shape
-                    .stats
-                    .stats_schema
-                    .as_ref()
-                    .map(|s| (s.clone(), false)),
-                shape.partition_schema.clone(),
-            );
+            // Manifest top: commit_pair derives stats via parse_json — identical to what
+            // we'd want for the manifest, which never has native stats either.
             let top = registry
                 .relation_ref(CHECKPOINT_TOP)?
-                .project_pair(manifest_pair);
-
-            // Side (sidecars): identity-elide checkpoint_pair when augment_add is a passthrough.
-            let project_is_identity = shape.partition_schema.is_none()
-                && (shape.stats.stats_schema.is_none() || shape.stats.has_parsed_stats);
-            let side = if project_is_identity {
+                .project_pair(commit_pair.clone());
+            let side = if checkpoint_project_is_identity {
                 registry.relation_ref(SIDECAR_ACTIONS)?
             } else {
                 registry
                     .relation_ref(SIDECAR_ACTIONS)?
                     .project_pair(checkpoint_pair.clone())
             };
-
             Some(
                 PlanBuilder::union(vec![top, side], /* ordered= */ false)
                     .map_err(|e| e.into_delta_default())?,
