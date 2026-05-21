@@ -36,7 +36,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -273,7 +273,10 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 }
 
 // Resolve a table from a root and relative path
-fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+pub(crate) fn resolve_table_path(
+    table_root: impl AsRef<str>,
+    relative: &Path,
+) -> DeltaResult<Path> {
     let url = try_parse_uri(table_root)?;
     Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
 }
@@ -439,6 +442,8 @@ pub fn engine_store_setup(
 
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
+// For property-gated writer features, this helper also writes the corresponding enablement
+// property when the writer feature is requested.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
     store: Arc<DynObjectStore>,
@@ -500,6 +505,9 @@ pub async fn create_table(
         }
         if writer_features.contains(&"changeDataFeed") {
             config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+        if writer_features.contains(&"deletionVectors") {
+            config.insert("delta.enableDeletionVectors".to_string(), json!("true"));
         }
         if reader_features.contains(&"catalogManaged") {
             config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
@@ -671,8 +679,7 @@ pub async fn insert_data<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
@@ -683,6 +690,23 @@ pub async fn insert_data<E: TaskExecutor>(
     txn.add_files(add_files_metadata);
 
     txn.commit(engine.as_ref())
+}
+
+/// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
+pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
+    snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+}
+
+/// Load latest snapshot from `table_url` and start a transaction using a [`FileSystemCommitter`].
+///
+/// Convenience for the common test pattern of building a fresh snapshot just to start a
+/// transaction, when the snapshot itself is not needed afterward.
+pub fn load_and_begin_transaction(
+    table_url: impl AsRef<str>,
+    engine: &dyn Engine,
+) -> DeltaResult<Transaction> {
+    let snapshot = Snapshot::builder_for(table_url).build(engine)?;
+    begin_transaction(snapshot, engine)
 }
 
 // Helper function to set json values in a serde_json Values
@@ -903,10 +927,12 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
 }
 
 /// Creates add file metadata for one or more files without partition values.
-/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+///
+/// Each tuple contains `(file_path, file_size, mod_time, num_records)`. `num_records` is
+/// `Option<i64>` so callers can produce a NULL `stats.numRecords` cell.
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
-    files: Vec<(&str, i64, i64, i64)>,
+    files: Vec<(&str, i64, i64, Option<i64>)>,
 ) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
     let num_files = files.len();
 

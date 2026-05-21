@@ -74,17 +74,24 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
 ///
 /// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
 /// - `without_partition`: lazily computed variant that excludes partition columns.
+///
+/// Note:
+/// `without_partition` is wrapped in an `Arc` so that the lazily-initialized schema is shared
+/// across clones of this struct (and therefore across clones of [`TableConfiguration`]).  Without
+/// Arc'ing the lock, clones of a [`TableConfiguration`] with an uninitialized schema would clone
+/// the empty `OnceLock`, meaning later schema loads would unnecessarily store independent
+/// copies of the same schema.
 #[derive(Debug, Clone, Eq)]
 struct PhysicalSchemas {
     full: SchemaRef,
-    without_partition: OnceLock<SchemaRef>,
+    without_partition: Arc<OnceLock<SchemaRef>>,
 }
 
 impl PhysicalSchemas {
     fn new(full: SchemaRef) -> Self {
         Self {
             full,
-            without_partition: OnceLock::new(),
+            without_partition: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -857,6 +864,25 @@ impl TableConfiguration {
         // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
         self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
+
+    /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
+    /// See `crate::table_features::ROW_TRACKING_INFO` for more details.
+    pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
+        // RowTracking is a prerequisite for IcebergCompatV3, so the IcebergCompatV3 arm is
+        // technically redundant. Just be conservative here to check both.
+        if self.should_write_row_tracking() {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with rowTracking supported \
+                 and not suspended",
+            ));
+        }
+        if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -878,6 +904,7 @@ mod test {
     use crate::table_properties::{
         TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
         ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+        ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2013,6 +2040,82 @@ mod test {
         );
     }
 
+    /// Verifies that the lazily-computed physical-without-partition schema is shared across
+    /// clones of `TableConfiguration` (both direct clones and the no-P/M version-bump path in
+    /// `try_new_from`), while configurations built from independent or updated metadata each
+    /// get their own `Arc<OnceLock>` and therefore their own schema allocation. This guards
+    /// against the per-version memory amplification seen when callers retain many adjacent
+    /// versions of a wide table.
+    #[test]
+    fn test_physical_data_schema_without_partition_columns_is_shared_across_clones() {
+        let base = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+
+        let clone_direct = base.clone();
+        let clone_bumped = TableConfiguration::try_new_from(&base, None, None, 1).unwrap();
+
+        let schema_from_bumped = clone_bumped.physical_data_schema_without_partition_columns();
+
+        let schema_from_base = base.physical_data_schema_without_partition_columns();
+        let schema_from_direct = clone_direct.physical_data_schema_without_partition_columns();
+        assert!(
+            Arc::ptr_eq(&schema_from_bumped, &schema_from_base),
+            "version-bumped clone and base should share the cached SchemaRef"
+        );
+        assert!(
+            Arc::ptr_eq(&schema_from_bumped, &schema_from_direct),
+            "direct .clone() and base should share the cached SchemaRef"
+        );
+
+        // A separately constructed TableConfiguration with the same logical schema must NOT
+        // share storage -- each construction allocates its own Arc<OnceLock>.
+        let independent = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+        let schema_from_independent = independent.physical_data_schema_without_partition_columns();
+        assert_eq!(
+            schema_from_independent.as_ref(),
+            schema_from_base.as_ref(),
+            "independent config should produce an equal schema"
+        );
+        assert!(
+            !Arc::ptr_eq(&schema_from_independent, &schema_from_base),
+            "independent TableConfiguration must not share the cached SchemaRef"
+        );
+
+        // try_new_from that actually changes metadata (here: drop one partition column) must
+        // also build a fresh PhysicalSchemas. The new cached schema differs from the original.
+        let new_schema = partitioned_schema_with_column_mapping();
+        let new_metadata = Metadata::try_new(
+            None,
+            None,
+            new_schema,
+            vec!["part_a".to_string()],
+            0,
+            HashMap::from_iter([(COLUMN_MAPPING_MODE.to_string(), "name".to_string())]),
+        )
+        .unwrap();
+        let updated = TableConfiguration::try_new_from(&base, Some(new_metadata), None, 2).unwrap();
+        let schema_from_updated = updated.physical_data_schema_without_partition_columns();
+        assert!(
+            !Arc::ptr_eq(&schema_from_updated, &schema_from_base),
+            "updated metadata must allocate a fresh OnceLock cell"
+        );
+        assert_ne!(
+            schema_from_updated.as_ref(),
+            schema_from_base.as_ref(),
+            "updated metadata changes which columns are partition columns, so the schemas \
+             must differ"
+        );
+    }
+
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns() {
         let config = create_partitioned_table_config_with_column_mapping(
@@ -2287,7 +2390,7 @@ mod test {
     }
 
     #[test]
-    fn test_iceberg_compat_v3_write_rejected_as_not_supported() {
+    fn test_iceberg_compat_v3_write_supported() {
         let config = create_mock_table_config_with_cm(
             &[
                 (ENABLE_ICEBERG_COMPAT_V3, "true"),
@@ -2302,10 +2405,9 @@ mod test {
                 TableFeature::DomainMetadata,
             ],
         );
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            "Feature 'icebergCompatV3' is not supported",
-        );
+        config
+            .ensure_operation_supported(Operation::Write)
+            .expect("V3 write should be supported once kernel_support flips to Supported");
     }
 
     #[rstest]
@@ -2526,6 +2628,24 @@ mod test {
             config.validate_feature_requirements(&feature_to_enable),
             expected_error_substring,
         );
+    }
+
+    /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_
+    /// and not _suspended_, which is broader than _enabled_.
+    #[rstest]
+    #[case::supported_only(&[], Some("rowTracking"))]
+    #[case::supported_and_enabled(&[(ENABLE_ROW_TRACKING, "true")], Some("rowTracking"))]
+    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None /*expected_error_substring */)]
+    fn test_validate_feature_support_for_remove_row_tracking(
+        #[case] props: &[(&str, &str)],
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = create_mock_table_config(props, &[TableFeature::RowTracking]);
+        let result = config.validate_feature_support_for_remove();
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
     }
 
     /// Test helper: variant of `create_mock_table_config` that also takes an optional

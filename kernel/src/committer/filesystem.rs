@@ -93,7 +93,7 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::committer::{CommitProtocolMetadata, CommitType};
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -103,7 +103,7 @@ mod tests {
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = SyncEngine::new_with_store(storage.clone());
 
         let actions = [
             r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,
@@ -135,7 +135,7 @@ mod tests {
     async fn test_filesystem_committer_returns_valid_commit_response() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = SyncEngine::new_with_store(storage);
 
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
@@ -172,7 +172,7 @@ mod tests {
     async fn test_filesystem_committer_returns_conflict_for_existing_version() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = SyncEngine::new_with_store(storage);
 
         let committer = FileSystemCommitter::new();
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();

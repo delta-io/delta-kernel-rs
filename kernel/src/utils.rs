@@ -186,7 +186,6 @@ pub(crate) mod test_utils {
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
     use crate::object_store::local::LocalFileSystem;
@@ -767,7 +766,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build the kernel schema described by [`complex_nested_with_field_ids`].
-    fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
+    pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
         let top_nested_ids = test_utils::nested_ids_json(&[
             ("top.key", 100),
             ("top.key.element", 101),
@@ -1087,7 +1086,7 @@ pub(crate) mod test_utils {
             ColumnMappingMode::None => "none",
         };
         let store = Arc::new(InMemory::new());
-        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store));
 
         let txn = create_table("memory:///test_table", schema, "DefaultEngine")
             .with_table_properties([("delta.columnMapping.mode", mode_str)])
@@ -1196,8 +1195,7 @@ pub(crate) mod test_utils {
         let url = Url::from_directory_path(&path)
             .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
 
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store).build());
+        let engine = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         Ok((engine, snapshot, tempdir))
     }

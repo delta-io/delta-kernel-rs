@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -15,7 +14,7 @@ use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use tempfile::TempDir;
-use test_utils::engine_store_setup;
+use test_utils::{engine_store_setup, load_and_begin_transaction};
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;
@@ -100,16 +99,17 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // FIRST COMMIT: This exercises version() == 0 branch and generates ICT
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    assert_eq!(
-        snapshot.version(),
-        0,
-        "Initial snapshot should be version 0"
-    );
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        assert_eq!(
+            snapshot.version(),
+            0,
+            "Initial snapshot should be version 0"
+        );
+    }
 
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_engine_info("ict test");
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), &engine)?.with_engine_info("ict test");
 
     // Add some data
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
@@ -144,16 +144,17 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Second commit
-    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    assert_eq!(
-        snapshot2.version(),
-        1,
-        "Second snapshot should be version 1"
-    );
+    {
+        let snapshot2 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        assert_eq!(
+            snapshot2.version(),
+            1,
+            "Second snapshot should be version 1"
+        );
+    }
 
-    let mut txn2 = snapshot2
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_engine_info("ict test 2");
+    let mut txn2 =
+        load_and_begin_transaction(table_url.clone(), &engine)?.with_engine_info("ict test 2");
 
     // Add more data
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;

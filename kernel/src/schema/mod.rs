@@ -16,7 +16,10 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
-use crate::table_features::{get_field_column_mapping_info, ColumnMappingMode};
+use crate::table_features::{
+    validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
+    SeenColumnMappingAnnotations,
+};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -236,6 +239,18 @@ pub struct StructField {
     pub metadata: HashMap<String, MetadataValue>,
 }
 
+/// Parsed (and validated) pre-existing column-mapping annotations on a single field, as
+/// returned by [`StructField::validate_and_extract_existing_column_mapping_annotations`].
+/// Either, both, or neither of the two fields may be present; a field with neither set has no
+/// pre-populated column-mapping metadata.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExistingColumnMappingAnnotations<'a> {
+    /// Parsed `delta.columnMapping.id`, if present. Guaranteed non-negative.
+    pub id: Option<i64>,
+    /// Borrowed `delta.columnMapping.physicalName`, if present. Guaranteed non-empty.
+    pub physical_name: Option<&'a str>,
+}
+
 impl StructField {
     /// The name of the default row index metadata column.
     ///
@@ -367,6 +382,66 @@ impl StructField {
             MetadataValue::Number(n) => Some(*n),
             _ => None,
         }
+    }
+
+    /// Validates and extracts pre-existing column-mapping annotations on this field, returning
+    /// the parsed `id` and `physical_name` borrowed from the field's metadata. Returning the
+    /// parsed values lets the column-mapping assignment dispatch match on
+    /// `(Option<i64>, Option<&str>)` directly, which makes the dispatch total and obviates a
+    /// catch-all panic for malformed annotations the validator already rejects.
+    ///
+    /// Rejects:
+    /// - `delta.columnMapping.id` is present but not a `MetadataValue::Number`,
+    /// - `delta.columnMapping.id` is a `Number` but lies outside the protocol's 32-bit non-negative
+    ///   range (negative or `> i32::MAX`); see
+    ///   [`crate::table_features::validate_column_mapping_id`],
+    /// - `delta.columnMapping.physicalName` is present but not a `MetadataValue::String`,
+    /// - `delta.columnMapping.physicalName` is an empty `String`.
+    ///
+    /// Empty-name, negative-id, and over-`i32::MAX` id are stricter than delta-spark (which
+    /// accepts the first two and historically truncates the third); kernel fails fast at
+    /// write time so a connector that supplies bad metadata learns about it on the call that
+    /// produced it. Wrong-typed `id` errors take precedence over wrong-typed `physicalName`
+    /// errors (a connector that fixes the `id` and retries will then see the `physicalName`
+    /// error).
+    pub(crate) fn validate_and_extract_existing_column_mapping_annotations(
+        &self,
+    ) -> DeltaResult<ExistingColumnMappingAnnotations<'_>> {
+        let id = match self.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+            Some(MetadataValue::Number(n)) => {
+                validate_column_mapping_id(*n)
+                    .map_err(|e| Error::schema(format!("Field '{}': {e}", self.name)))?;
+                Some(*n)
+            }
+            None => None,
+            Some(_) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-numeric `{}` annotation",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                )));
+            }
+        };
+        let physical_name =
+            match self.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                Some(MetadataValue::String(s)) if s.is_empty() => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has an empty `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+                Some(MetadataValue::String(s)) => Some(s.as_str()),
+                None => None,
+                Some(_) => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has a non-string `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+            };
+        Ok(ExistingColumnMappingAnnotations { id, physical_name })
     }
 
     /// Recursively collects every `delta.columnMapping.id` reachable from this field --
@@ -515,8 +590,8 @@ impl StructField {
     /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
     ///
     /// NOTE: Caller affirms that `self` was already validated by
-    /// [`crate::table_features::get_field_column_mapping_info`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`], to ensure that
+    /// annotations are always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
@@ -529,7 +604,8 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `get_field_column_mapping_info` should have verified that this has a field Id
+                    // `validate_and_extract_column_mapping_annotations` should have verified that
+                    // this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -2102,14 +2178,17 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
 struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     path: Vec<&'a str>,
-    seen: HashMap<i64, &'a str>,
+    /// CM ids and physical names already claimed during the walk, with the first claimer.
+    /// Threaded into `validate_and_extract_column_mapping_annotations` so duplicate IDs and
+    /// duplicate `physicalName` values are rejected at the first collision.
+    seen: SeenColumnMappingAnnotations<'a>,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
         Self {
             column_mapping_mode,
             path: vec![],
-            seen: HashMap::new(),
+            seen: SeenColumnMappingAnnotations::default(),
         }
     }
 
@@ -2141,7 +2220,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         field: &'a StructField,
     ) -> DeltaResult<Cow<'a, StructField>> {
         self.transform_inner(field.name(), |this| {
-            let (physical_name, _id) = get_field_column_mapping_info(
+            let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
                 field,
                 this.column_mapping_mode,
                 &this.path,
@@ -2557,6 +2636,70 @@ mod tests {
         assert_result_error_with_message(
             schema.make_physical(ColumnMappingMode::Id),
             "Duplicate column mapping ID",
+        );
+    }
+
+    /// Two fields sharing the same `delta.columnMapping.physicalName` (at top level OR across
+    /// nesting depth) must be rejected during `make_physical`. PROTOCOL.md requires
+    /// `physicalName` to be a "globally unique identifier"; without dedup, two columns sharing
+    /// a physical name would resolve ambiguously in parquet under `ColumnMappingMode::Name`.
+    /// The walk runs from `TableConfiguration::try_new` so both CREATE and ALTER hit it.
+    #[rstest]
+    #[case::same_level("a", "a")]
+    #[case::nested("a", "x")]
+    fn test_make_physical_rejects_duplicate_physical_names(
+        #[case] outer_name: &str,
+        #[case] inner_name: &str,
+    ) {
+        use crate::schema::ColumnMetadataKey;
+
+        // Both fields advertise the SAME physicalName ("col-shared") with distinct ids
+        // (so the duplicate-ID check doesn't fire first). For `same_level` both fields are
+        // top-level siblings; for `nested` the second field lives one struct deeper to prove
+        // the walker checks across nesting boundaries.
+        fn cm_field(
+            name: &str,
+            id: i64,
+            physical: &str,
+            data_type: impl Into<DataType>,
+        ) -> StructField {
+            StructField::not_null(name, data_type).with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(id),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String(physical.to_string()),
+                ),
+            ])
+        }
+
+        let schema = if outer_name == inner_name {
+            StructType::new_unchecked([
+                cm_field(outer_name, 1, "col-shared", DataType::INTEGER),
+                cm_field("sibling", 2, "col-shared", DataType::STRING),
+            ])
+        } else {
+            let inner = StructType::new_unchecked([cm_field(
+                inner_name,
+                2,
+                "col-shared",
+                DataType::INTEGER,
+            )]);
+            StructType::new_unchecked([
+                cm_field(outer_name, 1, "col-shared", DataType::INTEGER),
+                cm_field(
+                    "nested_holder",
+                    3,
+                    "col-nested-holder",
+                    DataType::Struct(Box::new(inner)),
+                ),
+            ])
+        };
+        assert_result_error_with_message(
+            schema.make_physical(ColumnMappingMode::Name),
+            "Duplicate `delta.columnMapping.physicalName` 'col-shared'",
         );
     }
 

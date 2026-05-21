@@ -1,20 +1,23 @@
 //! Integration tests for CRC (version checksum) file-based APIs on Snapshot.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::crc::{Crc, FileStatsValidity};
+use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Engine, FileStats};
+use delta_kernel::{DeltaResult, Engine, FileStats, Version};
 use rstest::rstest;
-use test_utils::{add_commit, insert_data, test_table_setup};
+use test_utils::{add_commit, begin_transaction, insert_data, test_table_setup};
+use url::Url;
 
 // ============================================================================
 // File stats from CRC on disk
@@ -80,8 +83,7 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
 
     // ===== WHEN =====
     // Empty commit to advance to version 1 (no new CRC file written)
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    let _ = txn.commit(engine.as_ref())?;
+    let _ = begin_transaction(snapshot, engine.as_ref())?.commit(engine.as_ref())?;
 
     // ===== THEN =====
     // Load a fresh snapshot at version 1
@@ -118,15 +120,13 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     let file_stats = crc.file_stats().unwrap();
     assert_eq!(file_stats.table_size_bytes(), 5259);
     assert_eq!(file_stats.num_files(), 10);
-    assert_eq!(crc.num_metadata, 1);
-    assert_eq!(crc.num_protocol, 1);
 
     // Protocol and metadata should match the snapshot's table configuration
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
 
     // Domain metadata
-    let dms = crc.domain_metadata.as_ref().unwrap();
+    let dms = crc.domain_metadata_state.expect_complete();
     assert_eq!(dms.len(), 3);
     assert!(dms.contains_key("delta.clustering"));
     assert!(dms.contains_key("delta.rowTracking"));
@@ -192,11 +192,9 @@ async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
     let file_stats = crc.file_stats().unwrap();
     assert_eq!(file_stats.num_files(), 0);
     assert_eq!(file_stats.table_size_bytes(), 0);
-    assert_eq!(crc.num_metadata, 1);
-    assert_eq!(crc.num_protocol, 1);
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
-    let dms = crc.domain_metadata.as_ref().unwrap();
+    let dms = crc.domain_metadata_state.expect_complete();
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     Ok(())
@@ -226,8 +224,7 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
         use_post_commit_snapshot
     );
 
-    let committed = read_snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let committed = begin_transaction(read_snapshot, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string())
         .commit(engine.as_ref())?
@@ -307,9 +304,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
 
     // ===== WHEN: Remove all files =====
     let scan = snapshot_v2.clone().scan_builder().build()?;
-    let mut txn = snapshot_v2
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot_v2.clone(), engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(true);
     for sm in scan.scan_metadata(engine.as_ref())? {
@@ -338,13 +333,11 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
 
     // ===== THEN: should have CRC at v0 with zip -> zap0 =====
     let crc_v0 = write_and_verify_crc(snapshot_v0, &table_path, engine.as_ref());
-    let dms = crc_v0.domain_metadata.as_ref().unwrap();
+    let dms = crc_v0.domain_metadata_state.expect_complete();
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     // ===== WHEN: update zip -> zap1, add foo -> bar =====
-    let txn = snapshot_v0
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let txn = begin_transaction(snapshot_v0.clone(), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string()) // <-- set to zap1
         .with_domain_metadata("foo".to_string(), "bar".to_string()); // <-- add foo
@@ -353,14 +346,12 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
     let crc_v1 = write_and_verify_crc(snapshot_v1, &table_path, engine.as_ref());
-    let dms = crc_v1.domain_metadata.as_ref().unwrap();
+    let dms = crc_v1.domain_metadata_state.expect_complete();
     assert_eq!(dms["zip"].configuration(), "zap1"); // <-- must be zap1
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must be bar
 
     // ===== WHEN: remove zip, keep foo =====
-    let txn = snapshot_v1
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let txn = begin_transaction(snapshot_v1.clone(), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata_removed("zip".to_string()); // <-- remove zip
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -368,7 +359,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== THEN: should have CRC at v2 with zip gone, foo still there =====
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
-    let dms = crc_v2.domain_metadata.as_ref().unwrap();
+    let dms = crc_v2.domain_metadata_state.expect_complete();
     assert!(!dms.contains_key("zip")); // <-- must be gone
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must still be bar
 
@@ -391,9 +382,7 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
     // ===== WHEN: Commit a non-incremental operation (ANALYZE STATS) =====
-    let committed = snapshot_v1
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let committed = begin_transaction(snapshot_v1.clone(), engine.as_ref())?
         .with_operation("ANALYZE STATS".to_string())
         .commit(engine.as_ref())?
         .unwrap_committed();
@@ -402,7 +391,7 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     assert_eq!(committed.commit_version(), 2);
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = snapshot_v2.get_current_crc_if_loaded_for_testing().unwrap();
-    assert_eq!(crc_v2.file_stats_validity, FileStatsValidity::Indeterminate);
+    assert!(crc_v2.file_stats_state().is_indeterminate());
 
     Ok(())
 }
@@ -501,7 +490,7 @@ async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> Delt
     // Verify histogram totals match disk ground truth
     let disk_sizes = parquet_file_sizes_on_disk(&table_path);
     assert_eq!(disk_sizes.len(), 5);
-    assert_histogram_totals(&crc_stats, 5, disk_sizes.iter().sum());
+    assert_histogram_totals(crc_stats, 5, disk_sizes.iter().sum());
 
     Ok(())
 }
@@ -653,7 +642,11 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
         .get_all_domain_metadata(engine.as_ref())?
         .is_empty());
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
-    assert_eq!(crc.domain_metadata, Some(Default::default()));
+    // CREATE TABLE without any DM actions produces an authoritative empty map.
+    assert_eq!(
+        crc.domain_metadata_state,
+        DomainMetadataState::Complete(HashMap::new())
+    );
 
     Ok(())
 }
@@ -689,9 +682,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
     let snapshot_v0 = committed.post_commit_snapshot().unwrap();
 
     // v1: update zip -> zap1, add foo -> bar
-    let committed = snapshot_v0
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let committed = begin_transaction(snapshot_v0.clone(), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string())
         .with_domain_metadata("foo".to_string(), "bar".to_string())
@@ -707,6 +698,11 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
         assert_eq!(
             snapshot.get_domain_metadata("foo", engine).unwrap(),
             Some("bar".to_string())
+        );
+        // Miss on a Complete cache: served as authoritative None without log replay.
+        assert_eq!(
+            snapshot.get_domain_metadata("nonexistent", engine).unwrap(),
+            None
         );
         assert!(snapshot
             .get_domain_metadata_internal("delta.clustering", engine)
@@ -749,6 +745,103 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
     Ok(())
 }
 
+fn crc_file_path(table_path: &str, version: Version) -> PathBuf {
+    let url = Url::from_directory_path(table_path).unwrap();
+    ParsedLogPath::new_crc(&url, version)
+        .unwrap()
+        .location
+        .to_file_path()
+        .unwrap()
+}
+
+fn read_crc_json(table_path: &str, version: Version) -> serde_json::Value {
+    let bytes = std::fs::read(crc_file_path(table_path, version)).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Rewrites the on-disk CRC at `version` to drop the named top-level field, leaving every
+/// other field intact.
+fn strip_field_from_crc(table_path: &str, version: Version, field: &str) {
+    let mut value = read_crc_json(table_path, version);
+    value.as_object_mut().unwrap().remove(field);
+    let path = crc_file_path(table_path, version);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // v0: CREATE TABLE with zip -> zap0 (post-commit writes CRC with full DM).
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0_orig = committed.post_commit_snapshot().unwrap();
+    snapshot_v0_orig.write_checksum(engine.as_ref())?;
+
+    // Strip DM from v0 CRC, then reload: base snapshot has `Partial(empty)` DM rather than
+    // the post-commit `Complete(...)` state.
+    strip_field_from_crc(&table_path, 0, "domainMetadata");
+    let snapshot_v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot_v0
+            .get_current_crc_if_loaded_for_testing()
+            .unwrap()
+            .domain_metadata_state,
+        DomainMetadataState::Partial(HashMap::new())
+    );
+
+    // v1: post-commit chain accumulates DM into `Partial(map)`.
+    let committed = begin_transaction(snapshot_v0.clone(), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_domain_metadata("foo".to_string(), "bar".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+
+    let crc_v1 = snapshot_v1.get_current_crc_if_loaded_for_testing().unwrap();
+    let map = crc_v1.domain_metadata_state.expect_partial();
+    assert!(map.contains_key("foo"));
+
+    // Hit: "foo" is in the Partial cache, so served without log replay.
+    assert_eq!(
+        snapshot_v1.get_domain_metadata("foo", &FailingEngine)?,
+        Some("bar".to_string())
+    );
+
+    // Miss: "zip" is not in this Partial cache; FailingEngine panics, real engine finds it.
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        snapshot_v1.get_domain_metadata("zip", &FailingEngine).ok()
+    }))
+    .is_err());
+    assert_eq!(
+        snapshot_v1.get_domain_metadata("zip", engine.as_ref())?,
+        Some("zap0".to_string())
+    );
+
+    // Miss on a nonexistent domain falls through and returns None.
+    assert_eq!(
+        snapshot_v1.get_domain_metadata("nonexistent", engine.as_ref())?,
+        None
+    );
+
+    // Multi-key filter with a mixed hit ("foo") and miss ("zip"): the first miss
+    // short-circuits the cache lookup and the full result comes from log replay.
+    let filter = HashSet::from(["foo", "zip"]);
+    let map = snapshot_v1.get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
+    assert_eq!(map.len(), 2);
+    assert_eq!(map["foo"].configuration(), "bar");
+    assert_eq!(map["zip"].configuration(), "zap0");
+
+    // "All" queries against Partial always fall through. The replay-derived set must
+    // include BOTH entries.
+    let mut all = snapshot_v1.get_all_domain_metadata(engine.as_ref())?;
+    all.sort_by(|a, b| a.domain().cmp(b.domain()));
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].domain(), "foo");
+    assert_eq!(all[1].domain(), "zip");
+
+    Ok(())
+}
+
 // ============================================================================
 // Set transaction CRC tracking
 // ============================================================================
@@ -764,9 +857,12 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot_v0 = committed.post_commit_snapshot().unwrap();
 
-    // Post-commit CRC has empty set_transactions (not null)
+    // Post-commit CRC has empty Complete set_transaction_state (not Partial).
     let crc_v0 = write_and_verify_crc(snapshot_v0, &table_path, engine.as_ref());
-    assert_eq!(crc_v0.set_transactions, Some(Default::default()));
+    assert_eq!(
+        crc_v0.set_transaction_state,
+        SetTransactionState::Complete(HashMap::new())
+    );
 
     // Fresh snapshot with CRC on disk serves queries via fast path (no log replay)
     let fresh_v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -779,9 +875,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
     );
 
     // -- v1: commit with my-app=1 --
-    let committed = snapshot_v0
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let committed = begin_transaction(snapshot_v0.clone(), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
@@ -804,7 +898,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
 
     // Write CRC to disk, reload, verify round-trip and fast path
     let crc_v1 = write_and_verify_crc(snapshot_v1, &table_path, engine.as_ref());
-    let txns_v1 = crc_v1.set_transactions.as_ref().unwrap();
+    let txns_v1 = crc_v1.set_transaction_state.expect_complete();
     assert_eq!(txns_v1.len(), 1);
     assert!(txns_v1.contains_key("my-app"));
 
@@ -824,9 +918,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
     );
 
     // -- v2: commit with my-app=2 (upsert) + other-app=1 (new) --
-    let committed = snapshot_v1
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let committed = begin_transaction(snapshot_v1.clone(), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 2)
         .with_transaction_id("other-app".to_string(), 1)
@@ -850,7 +942,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
 
     // Write CRC to disk, reload, verify round-trip and fast path
     let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
-    let txns_v2 = crc_v2.set_transactions.as_ref().unwrap();
+    let txns_v2 = crc_v2.set_transaction_state.expect_complete();
     assert_eq!(txns_v2.len(), 2);
 
     let fresh_v2 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -867,6 +959,81 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
             .unwrap(),
         Some(1)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // v0: CREATE TABLE. v1: commit with v1-app=1, then write CRC to disk.
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap();
+    let committed = begin_transaction(snapshot_v0.clone(), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("v1-app".to_string(), 1)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+    snapshot_v1.write_checksum(engine.as_ref())?;
+
+    // Strip setTransactions from the v1 CRC so it reloads as Partial(empty).
+    strip_field_from_crc(&table_path, 1, "setTransactions");
+
+    let snapshot_v1_reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot_v1_reloaded
+            .get_current_crc_if_loaded_for_testing()
+            .unwrap()
+            .set_transaction_state,
+        SetTransactionState::Partial(HashMap::new())
+    );
+
+    // v2: commit with my-app=1; post-commit CRC accumulates into Partial.
+    let committed = begin_transaction(snapshot_v1_reloaded.clone(), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 1)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap();
+
+    let map = snapshot_v2
+        .get_current_crc_if_loaded_for_testing()
+        .unwrap()
+        .set_transaction_state
+        .expect_partial();
+    assert!(map.contains_key("my-app"));
+    assert!(!map.contains_key("v1-app"));
+
+    // Hit: "my-app" is in the Partial cache -- served without log replay.
+    assert_eq!(
+        snapshot_v2.get_app_id_version("my-app", &FailingEngine)?,
+        Some(1)
+    );
+
+    // Miss: "v1-app" is NOT in the Partial cache; FailingEngine panics, real engine finds it.
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        snapshot_v2
+            .get_app_id_version("v1-app", &FailingEngine)
+            .ok()
+    }))
+    .is_err());
+    assert_eq!(
+        snapshot_v2.get_app_id_version("v1-app", engine.as_ref())?,
+        Some(1)
+    );
+
+    // Miss: completely absent app_id falls through and returns None.
+    assert_eq!(
+        snapshot_v2.get_app_id_version("nonexistent", engine.as_ref())?,
+        None
+    );
+
+    // Writing the v2 CRC must drop the Partial setTransactions map on serialize: the on-disk
+    // file has a `null` setTransactions field even though the in-memory map has entries.
+    snapshot_v2.write_checksum(engine.as_ref())?;
+    assert!(read_crc_json(&table_path, 2)["setTransactions"].is_null());
 
     Ok(())
 }
@@ -905,8 +1072,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 
     // v1: commit a set transaction for "my-app" (lastUpdated = now)
     let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
-    let committed = snapshot_v0
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let committed = begin_transaction(snapshot_v0, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
@@ -928,6 +1094,67 @@ async fn test_set_txn_expiration_via_crc_fast_path(
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         expected
+    );
+
+    Ok(())
+}
+
+/// Mirrors `test_set_txn_expiration_via_crc_fast_path` for the `Partial` branch: a cached
+/// transaction whose `lastUpdated` is older than retention must return `None` via the fast path,
+/// without falling through to log replay.
+#[tokio::test]
+async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+
+    // v0: create the table with zero-second retention so any past lastUpdated expires.
+    let committed = create_table(&table_path, schema, "test_engine")
+        .with_table_properties([(
+            "delta.setTransactionRetentionDuration",
+            "interval 0 seconds",
+        )])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // v1: commit my-app=1, write CRC at v1.
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    let committed = begin_transaction(snapshot_v0, engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 1)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    committed
+        .post_commit_snapshot()
+        .unwrap()
+        .write_checksum(engine.as_ref())?;
+
+    // Strip setTransactions from the v1 CRC so it reloads as Partial(empty).
+    strip_field_from_crc(&table_path, 1, "setTransactions");
+    let snapshot_v1_reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+
+    // v2: commit my-app=2 from the Partial base; post-commit CRC is Partial(map) containing my-app.
+    let committed = begin_transaction(snapshot_v1_reloaded, engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 2)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap();
+
+    let map = snapshot_v2
+        .get_current_crc_if_loaded_for_testing()
+        .unwrap()
+        .set_transaction_state
+        .expect_partial();
+    assert!(map.contains_key("my-app"));
+
+    // FailingEngine proves the Partial fast path is used; the expiration filter drops the txn.
+    assert_eq!(
+        snapshot_v2.get_app_id_version("my-app", &FailingEngine)?,
+        None
     );
 
     Ok(())
@@ -1075,7 +1302,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
     let crc_v0 = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
-    assert_histogram_totals(&crc_v0.file_stats().unwrap(), 0, 0);
+    assert_histogram_totals(crc_v0.file_stats().unwrap(), 0, 0);
 
     // ===== v1: insert small file (< 8KB -> bin 0) =====
     let ids: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
@@ -1088,7 +1315,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     assert_eq!(disk_sizes.len(), 1);
     let crc_v1 = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
     let stats_v1 = crc_v1.file_stats().unwrap();
-    assert_histogram_totals(&stats_v1, 1, disk_sizes.iter().sum());
+    assert_histogram_totals(stats_v1, 1, disk_sizes.iter().sum());
 
     // Verify boundary metadata via public getters
     let hist = stats_v1.file_size_histogram().unwrap();
@@ -1142,9 +1369,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
 
     // ===== v3: remove all files =====
     let scan = snapshot.clone().scan_builder().build()?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(true);
     for sm in scan.scan_metadata(engine.as_ref())? {
@@ -1158,7 +1383,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     assert!(parquet_file_sizes_on_disk(&table_path).is_empty());
 
     let crc_v3 = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
-    assert_histogram_totals(&crc_v3.file_stats().unwrap(), 0, 0);
+    assert_histogram_totals(crc_v3.file_stats().unwrap(), 0, 0);
 
     Ok(())
 }
@@ -1206,7 +1431,7 @@ async fn test_file_histogram_survives_disk_round_trip_then_delta_merge() -> Delt
     let disk_sizes = parquet_file_sizes_on_disk(&table_path);
     assert_eq!(disk_sizes.len(), 2);
     assert!(disk_sizes.iter().sum::<i64>() > v1_bytes);
-    assert_histogram_totals(&crc_v2.file_stats().unwrap(), 2, disk_sizes.iter().sum());
+    assert_histogram_totals(crc_v2.file_stats().unwrap(), 2, disk_sizes.iter().sum());
 
     Ok(())
 }
@@ -1286,8 +1511,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         assert_eq!(committed.commit_version(), 2);
         committed.post_commit_snapshot().unwrap().clone()
     } else {
-        let committed = fresh_v1
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        let committed = begin_transaction(fresh_v1, engine.as_ref())?
             .with_operation("ANALYZE STATS".to_string())
             .commit(engine.as_ref())?
             .unwrap_committed();
@@ -1300,7 +1524,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
 
     if !incremental {
         // Non-incremental operations drop the histogram regardless of bin type
-        assert_eq!(crc_v2.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert!(crc_v2.file_stats_state().is_indeterminate());
         assert!(crc_v2.file_stats().is_none());
         return Ok(());
     }
@@ -1326,7 +1550,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
     } else {
         // Default 95-bin boundaries: all small test files land in bin 0 ([0, 8KB))
         assert_eq!(counts.len(), 95, "default bins should have 95 bins");
-        assert_histogram_totals(&stats_v2, 2, total_disk_bytes);
+        assert_histogram_totals(stats_v2, 2, total_disk_bytes);
     }
 
     Ok(())

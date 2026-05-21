@@ -18,11 +18,20 @@
 // Demonstrates the write-path FFI surface:
 //   - transaction(path, engine) to start an existing-table transaction
 //   - with_engine_info(txn, "...", engine) to set commitInfo.engineInfo
-//   - get_unpartitioned_write_context(txn, engine) + get_write_schema/get_write_path
-//     (the values an engine needs when writing parquet files itself)
+//   - get_unpartitioned_write_context(txn, engine) plus the four
+//     write-context accessors an engine needs when writing parquet files itself:
+//       - get_write_schema           -- logical (user-facing) schema
+//       - get_physical_write_schema  -- on-disk parquet schema (carries
+//                                       parquet.field.id under column mapping)
+//       - get_logical_to_physical    -- transform to apply per batch
+//       - get_write_path             -- table root URL (partitioned write
+//                                       directory support tracked by #2355)
 //   - set_data_change(txn, false) because this empty commit does not add data
-//   - commit(txn, engine) to produce an empty commit
-//   - Reading the committed version back via a new snapshot to confirm
+//   - commit(txn, engine) to produce an empty commit, returning a CommittedTransaction handle
+//   - committed_transaction_version + committed_transaction_post_commit_snapshot to read the
+//     version and the post-commit snapshot directly from the result, avoiding a fresh
+//     snapshot load
+//   - free_committed_transaction to release the result handle
 //
 // NOTE: This example does NOT call add_files. Staging new files requires building an Arrow
 // RecordBatch that matches Transaction::add_files_schema (path, partitionValues, size,
@@ -86,9 +95,9 @@ int main(int argc, char* argv[]) {
 
   // === Inspect the unpartitioned write context ===
   //
-  // The WriteContext tells an engine what schema its parquet writer should use and where to
-  // put the files. This example does not actually write any files, but we print these so
-  // users see the shape of the information they'd consume in a real engine.
+  // The WriteContext carries the schema an engine's parquet writer should use plus the table
+  // root URL it should write under. This example does not actually write any files, but we
+  // print these so users see the shape of the information they'd consume in a real engine.
   ExternResultHandleSharedWriteContext wc_res = get_unpartitioned_write_context(txn, engine);
   if (wc_res.tag != OkHandleSharedWriteContext) {
     print_error("get_unpartitioned_write_context failed.", (Error*)wc_res.err);
@@ -99,52 +108,76 @@ int main(int argc, char* argv[]) {
   }
   SharedWriteContext* write_context = wc_res.ok;
 
-  // SharedSchema is opaque in the C API; engines typically walk it with visit_schema (see
-  // read-table/schema.h). We just confirm we got a valid handle and then free it.
-  SharedSchema* write_schema = get_write_schema(write_context);
+  // SharedSchema and SharedExpression are opaque in the C API. Schemas are walked with
+  // visit_schema (see read-table/schema.h); expressions are consumed by passing them to
+  // new_expression_evaluator. A real engine feeds (logical_schema, logical_to_physical,
+  // physical_schema) into new_expression_evaluator and applies the resulting evaluator to
+  // each batch before handing the rewritten data to its parquet writer.
+  SharedSchema* logical_schema = get_write_schema(write_context);
+  SharedSchema* physical_schema = get_physical_write_schema(write_context);
+  SharedExpression* logical_to_physical = get_logical_to_physical(write_context);
   printf("Write context:\n");
-  printf("  schema_handle: %s\n", write_schema ? "<obtained>" : "<null>");
+  printf("  logical_schema:      %s\n", logical_schema ? "<obtained>" : "<null>");
+  printf("  physical_schema:     %s\n", physical_schema ? "<obtained>" : "<null>");
+  printf("  logical_to_physical: %s\n", logical_to_physical ? "<obtained>" : "<null>");
   char* write_path = get_write_path(write_context, allocate_string);
   if (write_path) {
-    printf("  write_path:    %s\n", write_path);
+    printf("  write_path:          %s\n", write_path);
     free(write_path);
   } else {
-    printf("  write_path:    <none>\n");
+    printf("  write_path:          <none>\n");
   }
-  free_schema(write_schema);
+  free_kernel_expression(logical_to_physical);
+  free_schema(physical_schema);
+  free_schema(logical_schema);
   free_write_context(write_context);
 
   // === Commit ===
-  ExternResultu64 commit_res = commit(txn, engine);
-  if (commit_res.tag != Oku64) {
+  ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn, engine);
+  if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
     print_error("commit failed.", (Error*)commit_res.err);
     free_error((Error*)commit_res.err);
     free_engine(engine);
     return 1;
   }
-  printf("Committed version: %" PRIu64 "\n", commit_res.ok);
+  HandleExclusiveCommittedTransaction committed = commit_res.ok;
+  printf("Committed version: %" PRIu64 "\n", committed_transaction_version(&committed));
 
-  // === Read back via snapshot to confirm ===
-  ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
-      get_snapshot_builder(table_path_slice, engine);
-  if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
-    print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
-    free_error((Error*)snapshot_builder_res.err);
-    free_engine(engine);
-    return 1;
+  // === Read post-commit snapshot directly from the CommittedTransaction ===
+  // Avoids a fresh snapshot load: the kernel hands back the already-built snapshot
+  // for the post-commit version.
+  struct OptionalValueHandleSharedSnapshot post_commit =
+      committed_transaction_post_commit_snapshot(&committed);
+  if (post_commit.tag == SomeHandleSharedSnapshot) {
+    HandleSharedSnapshot snap = post_commit.some;
+    printf("Post-commit snapshot version: %" PRIu64 "\n", version(snap));
+    free_snapshot(snap);
+  } else {
+    printf("No post-commit snapshot available; loading via snapshot builder.\n");
+    ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
+        get_snapshot_builder(table_path_slice, engine);
+    if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+      print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
+      free_error((Error*)snapshot_builder_res.err);
+      free_committed_transaction(committed);
+      free_engine(engine);
+      return 1;
+    }
+    ExternResultHandleSharedSnapshot snap_res =
+        snapshot_builder_build(snapshot_builder_res.ok);
+    if (snap_res.tag != OkHandleSharedSnapshot) {
+      print_error("Failed to load snapshot after commit.", (Error*)snap_res.err);
+      free_error((Error*)snap_res.err);
+      free_committed_transaction(committed);
+      free_engine(engine);
+      return 1;
+    }
+    HandleSharedSnapshot loaded = snap_res.ok;
+    printf("Snapshot version after commit: %" PRIu64 "\n", version(loaded));
+    free_snapshot(loaded);
   }
-  ExternResultHandleSharedSnapshot snap_res =
-      snapshot_builder_build(snapshot_builder_res.ok);
-  if (snap_res.tag != OkHandleSharedSnapshot) {
-    print_error("Failed to load snapshot after commit.", (Error*)snap_res.err);
-    free_error((Error*)snap_res.err);
-    free_engine(engine);
-    return 1;
-  }
-  SharedSnapshot* snap = snap_res.ok;
-  printf("Snapshot version after commit: %" PRIu64 "\n", version(snap));
 
-  free_snapshot(snap);
+  free_committed_transaction(committed);
   free_engine(engine);
   return 0;
 }

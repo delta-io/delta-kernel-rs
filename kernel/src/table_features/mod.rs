@@ -5,8 +5,9 @@ pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
-    get_column_mapping_mode_from_properties, get_field_column_mapping_info,
-    physical_to_logical_column_name, try_assign_field_column_mapping,
+    get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
+    validate_column_mapping_id, SeenColumnMappingAnnotations,
 };
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -346,6 +347,16 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+// TODO(#2538): Currently we reject `Transaction::commit` when it contains staged remove-file
+// actions on RowTracking-supported (and not-suspended) tables because
+//   1. kernel does not yet materialize stable row IDs / commit versions on write, which blocks COW
+//      rewrites,
+//   2. kernel does not yet validate if remove actions correctly reserved row IDs / commit versions.
+// Unblock after both 1 and 2 are supported.
+//
+// TODO: When kernel writes the materialized `row_id` / `row_commit_version` columns, they must
+// use the reserved parquet field IDs defined by the protocol on IcebergCompatV3 tables, not
+// auto-assigned IDs.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -416,6 +427,17 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// TODO: Implement the write-side requirements for IcebergCompatV3.
 /// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
 ///
+/// Attention in the future:
+/// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
+///   tables.
+/// - Column defaults: when supported, only literal expressions are allowed.
+/// - REPLACE TABLE: when supported, partition columns must not change across the replace.
+/// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
+///   always use INT64; INT96 is forbidden.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
+///   disable IcebergCompatV3 on an existing table.
+/// - Void type: when supported, it must not appear inside map or array types.
+///
 /// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
@@ -431,7 +453,7 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
     ],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v3 == Some(true)
     }),
@@ -494,8 +516,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    // We support writing to tables with DeletionVectors enabled, but we never write DV files
-    // ourselves (no DML). The kernel only performs append operations.
+    // The kernel can read DV-bearing tables and install connector-authored DV descriptors via
+    // `Transaction::update_deletion_vectors`, including through the FFI
+    // `transaction_update_deletion_vectors` path.
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
@@ -510,6 +533,9 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+/// TODO: When type widening is supported on writes, restrict the allowed
+/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
+/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -523,6 +549,9 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
+/// TODO: When type widening is supported on writes, restrict the allowed
+/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg
+/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,

@@ -59,7 +59,8 @@ pub(crate) struct LastCheckpointHint {
 }
 
 impl LastCheckpointHint {
-    // Returns the path the last checkpoint file given the log root of a table.
+    /// Returns the path of the `_last_checkpoint` file given the log root of a table.
+    #[internal_api]
     pub(crate) fn path(log_root: &Url) -> DeltaResult<Url> {
         Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
     }

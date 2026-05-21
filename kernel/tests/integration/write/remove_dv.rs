@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -19,8 +18,8 @@ use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    copy_directory, create_default_engine, create_default_engine_mt_executor,
-    read_actions_from_commit, setup_test_tables,
+    begin_transaction, copy_directory, create_default_engine, create_default_engine_mt_executor,
+    load_and_begin_transaction, read_actions_from_commit, setup_test_tables,
 };
 use url::Url;
 
@@ -56,9 +55,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_data_change(true);
 
@@ -240,9 +237,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
         .build(engine.as_ref())?;
 
     // Create transaction with DV update mode enabled
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("UPDATE".to_string())
         .with_data_change(true);
@@ -538,9 +533,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
 
     // Create DV update transaction
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("UPDATE".to_string())
         .with_data_change(true);
@@ -684,9 +677,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         assert!(initial_file_count > 0);
 
         // Now create a transaction to remove files
-        let mut txn = snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
 
         // Create a new scan to get file metadata for removal
         let scan2 = snapshot.scan_builder().build()?;
@@ -780,9 +771,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         );
 
         // Create a transaction to remove files in two batches
-        let mut txn = snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
             .with_engine_info("selective remove test")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
@@ -961,9 +950,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
 
         // Pass scan metadata (which contains stats_parsed) directly to remove_files.
         // This previously failed with "Too few fields in output schema".
@@ -1061,10 +1048,8 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let engine = Arc::new(engine);
 
         // Write two partitions: country="usa" and country="japan".
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn =
+            load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
         let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::DeltaResult<_> {
             let data = RecordBatch::try_new(
                 Arc::new(data_schema.as_ref().try_into_arrow()?),
@@ -1089,9 +1074,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
             txn.remove_files(scan_metadata?.scan_files);
         }

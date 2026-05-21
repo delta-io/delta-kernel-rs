@@ -346,6 +346,13 @@ impl<S> Transaction<S> {
             num_remove_files = self.remove_files_metadata.len(),
             num_dv_updates = self.dv_matched_files.len(),
         );
+
+        // Some table features don't yet support removeFiles. Reject here.
+        if !self.remove_files_metadata.is_empty() {
+            self.effective_table_config
+                .validate_feature_support_for_remove()?;
+        }
+
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -857,6 +864,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let table_config = &self.effective_table_config;
+            let props = table_config.table_properties();
+            let randomize_file_prefixes = props.should_randomize_file_prefixes();
+            let random_prefix_length = props.random_prefix_length();
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),
@@ -865,6 +875,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
                 logical_partition_columns: table_config.partition_columns().to_vec(),
+                randomize_file_prefixes,
+                random_prefix_length,
             })
         })
     }
@@ -1545,7 +1557,6 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
-    use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -1636,6 +1647,44 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
         (engine, snapshot)
+    }
+
+    fn setup_dv_supported_but_disabled_table() -> DeltaResult<(Arc<dyn Engine>, Arc<Snapshot>)> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        let engine =
+            Arc::new(crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build());
+        let schema_json = serde_json::json!({
+            "type": "struct",
+            "fields": [{
+                "name": "id",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {}
+            }]
+        });
+        let actions = [
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#.to_string(),
+            serde_json::json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": schema_json.to_string(),
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1234567890
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(storage.put(&commit_path, actions.into()))?;
+        let engine: Arc<dyn Engine> = engine;
+        let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+        Ok((engine, snapshot))
     }
 
     /// Creates a test deletion vector descriptor with default values (the DV might not exist on
@@ -1963,6 +2012,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_update_deletion_vectors_requires_enablement_property(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_dv_supported_but_disabled_table()?;
+        let mut txn = create_dv_transaction(snapshot, engine.as_ref())?;
+
+        let err = txn
+            .update_deletion_vectors(HashMap::new(), std::iter::empty())
+            .expect_err("DV updates should require delta.enableDeletionVectors=true");
+
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("delta.enableDeletionVectors"),
+            "error should mention the enablement property, got: {err}"
+        );
+        Ok(())
+    }
+
     /// Tests that update_deletion_vectors validates DV descriptors match scan files.
     /// Validates detection of mismatch between provided DV descriptors and actual files.
     #[test]
@@ -1984,6 +2054,99 @@ mod tests {
         assert!(
             err_msg.contains("matched") && err_msg.contains("does not match"),
             "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}");
+        Ok(())
+    }
+
+    /// Tests that a mismatch after scanning some files does not leave staged DV updates behind.
+    #[test]
+    fn test_update_deletion_vectors_mismatch_does_not_mutate_transaction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_dv_enabled_table();
+        let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
+        let scan = snapshot.scan_builder().build()?;
+        let scan_metadata = scan
+            .scan_metadata(&engine)?
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        let mut paths = Vec::new();
+        for metadata in &scan_metadata {
+            paths =
+                metadata.visit_scan_files(paths, |paths, scan_file| paths.push(scan_file.path))?;
+        }
+        let existing_path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::generic("expected at least one scan file"))?;
+
+        let mut dv_map = HashMap::new();
+        dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
+        dv_map.insert(
+            "non_existent_file.parquet".to_string(),
+            create_test_dv_descriptor("missing"),
+        );
+
+        let result = txn.update_deletion_vectors(
+            dv_map,
+            scan_metadata
+                .into_iter()
+                .map(|metadata| Ok(metadata.scan_files)),
+        );
+
+        assert!(
+            result.is_err(),
+            "Should fail when only some DV descriptors match scan files"
+        );
+        assert!(
+            txn.dv_matched_files.is_empty(),
+            "Failed DV update should not leave staged file updates"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_dv_enabled_table();
+        let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
+        txn.dv_matched_files
+            .push(FilteredEngineData::with_all_rows_selected(
+                string_array_to_engine_data(StringArray::from(vec!["sentinel"])),
+            ));
+        let staged_len_before = txn.dv_matched_files.len();
+        let scan = snapshot.scan_builder().build()?;
+        let scan_metadata = scan
+            .scan_metadata(&engine)?
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        let mut paths = Vec::new();
+        for metadata in &scan_metadata {
+            paths =
+                metadata.visit_scan_files(paths, |paths, scan_file| paths.push(scan_file.path))?;
+        }
+        let existing_path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::generic("expected at least one scan file"))?;
+
+        let mut dv_map = HashMap::new();
+        dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
+
+        let result = txn.update_deletion_vectors(
+            dv_map,
+            scan_metadata
+                .into_iter()
+                .map(|metadata| Ok(metadata.scan_files))
+                .chain(std::iter::once(Err(Error::generic(
+                    "simulated scan metadata failure",
+                )))),
+        );
+
+        assert!(result.is_err(), "iterator error should propagate");
+        assert_eq!(
+            txn.dv_matched_files.len(),
+            staged_len_before,
+            "Failed DV update should not stage additional file updates"
+        );
         Ok(())
     }
 
@@ -2084,8 +2247,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+        let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
             schema,
@@ -2523,7 +2685,7 @@ mod tests {
     fn disallow_catalog_committer_for_non_catalog_managed_table() {
         let storage = Arc::new(InMemory::new());
         let table_root = url::Url::parse("memory:///").unwrap();
-        let engine = crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = crate::engine::sync::SyncEngine::new_with_store(storage.clone());
 
         // Create a non-catalog-managed table (no catalogManaged feature)
         let actions = [
@@ -2555,7 +2717,7 @@ mod tests {
     #[test]
     fn disallow_catalog_committer_for_non_catalog_managed_create_table() {
         let storage = Arc::new(InMemory::new());
-        let engine = crate::engine::default::DefaultEngineBuilder::new(storage).build();
+        let engine = crate::engine::sync::SyncEngine::new_with_store(storage);
 
         // Create a non-catalog-managed table using a catalog committer
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![

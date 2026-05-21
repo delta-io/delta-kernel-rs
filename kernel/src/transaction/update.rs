@@ -215,12 +215,17 @@ impl Transaction {
     ///   new deletion vector descriptor for that file.
     /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
     ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`.
+    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
+    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The transaction targets table creation instead of an existing table
+    /// - The table does not have deletion vectors enabled via protocol support and the
+    ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
+    /// - A matched file's scan metadata is missing or has invalid `stats.numRecords`
     ///
     /// # Examples
     ///
@@ -260,17 +265,10 @@ impl Transaction {
                 "Deletion vector operations require an existing table",
             ));
         }
-        if !self
-            .effective_table_config
-            .is_feature_supported(&TableFeature::DeletionVectors)
-        {
-            return Err(Error::unsupported(
-                "Deletion vector operations require reader version 3, writer version 7, \
-                 and the 'deletionVectors' feature in both reader and writer features",
-            ));
-        }
+        self.ensure_deletion_vectors_enabled()?;
 
         let mut matched_dv_files = 0;
+        let mut matched_files = Vec::new();
         let mut visitor = DvMatchVisitor::new(&new_dv_descriptors);
 
         // Process each batch of scan file metadata to prepare for DV updates:
@@ -293,8 +291,10 @@ impl Transaction {
                     if visitor.matched_file_indexes[current_matched_index] != i {
                         *selected = false;
                     } else {
+                        // `matched_file_indexes` is populated from a FilteredRowVisitor, so every
+                        // matched row was selected in the original scan metadata.
                         current_matched_index += 1;
-                        matched_dv_files += if *selected { 1 } else { 0 };
+                        matched_dv_files += 1;
                     }
                 } else {
                     // Deselect any files after the last matched file
@@ -306,7 +306,7 @@ impl Transaction {
                 struct_deletion_vector_schema().clone(),
                 visitor.new_dv_entries.clone(),
             )?];
-            self.dv_matched_files.push(FilteredEngineData::try_new(
+            matched_files.push(FilteredEngineData::try_new(
                 data.append_columns(new_dv_column_schema().clone(), new_columns)?,
                 selection_vector,
             )?);
@@ -320,6 +320,23 @@ impl Transaction {
             )));
         }
 
+        self.dv_matched_files.extend(matched_files);
+        Ok(())
+    }
+
+    /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
+    /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
+    fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::DeletionVectors)
+        {
+            return Err(Error::unsupported(
+                "Deletion vector writes require reader version 3, writer version 7, the \
+                 'deletionVectors' feature in both reader and writer features, and the \
+                 `delta.enableDeletionVectors` table property set to `true`",
+            ));
+        }
         Ok(())
     }
 }
@@ -355,10 +372,6 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 
 /// Schema for scan row data with nullable statistics fields.
 /// Used when generating remove actions to ensure statistics can be null if missing.
-// Safety: The panic here is acceptable because scan_row_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
 static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| schema_with_all_fields_nullable(scan_row_schema().as_ref()).into());
 
@@ -369,10 +382,6 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 
 /// Schema for restored add actions with nullable statistics fields.
 /// Used when transforming scan data back to add actions with potentially missing statistics.
-// Safety: The panic here is acceptable because restored_add_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
 static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| schema_with_all_fields_nullable(restored_add_schema()).into());
 
@@ -383,10 +392,6 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 
 /// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues
 /// with null values in required fields that aren't selected.
-// Safety: The panic here is acceptable because add_log_schema is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| schema_with_all_fields_nullable(get_log_add_schema()).into());
 
@@ -428,7 +433,7 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 // These methods are generic over the transaction state `S` because they are called from the
 // shared `commit()` path in `mod.rs` (`impl<S> Transaction<S>`). DV updates can only be
 // populated on `ExistingTableTransaction`, so the `is_create_table()` guard below is
-// defence-in-depth against future misuse.
+// defense-in-depth against future misuse.
 impl<S> Transaction<S> {
     /// Generate remove/add action pairs for files with DV updates.
     ///
@@ -537,6 +542,8 @@ struct DvMatchVisitor<'a> {
 impl<'a> DvMatchVisitor<'a> {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     const PATH_INDEX: usize = 0;
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    const STATS_INDEX: usize = 1;
 
     /// Creates a new DvMatchVisitor that will match file paths against the provided DV updates map.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -553,8 +560,8 @@ impl<'a> DvMatchVisitor<'a> {
 impl FilteredRowVisitor for DvMatchVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
-            let names = vec![column_name!("path")];
-            let types = vec![DataType::STRING];
+            let names = vec![column_name!("path"), column_name!("stats")];
+            let types = vec![DataType::STRING, DataType::STRING];
             (names, types)
         });
         (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
@@ -588,6 +595,30 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 continue;
             };
             if let Some(dv_result) = self.dv_updates.get(&path) {
+                // DVs require an accurate numRecords stat per the Delta protocol.
+                let stats: Option<String> =
+                    getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
+                let stats = stats.ok_or_else(|| {
+                    Error::generic(format!(
+                        "update_deletion_vectors: file {path} has no stats; \
+                         deletion vectors require an accurate numRecords"
+                    ))
+                })?;
+                let parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
+                    Error::generic(format!(
+                        "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
+                    ))
+                })?;
+                if parsed
+                    .get("numRecords")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+                {
+                    return Err(Error::generic(format!(
+                        "update_deletion_vectors: stats for {path} is missing numRecords \
+                         or it is not a non-negative integer"
+                    )));
+                }
                 self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
                     DV_SCHEMA_FIELDS.clone(),
                     vec![
@@ -607,5 +638,96 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         self.new_dv_entries
             .resize_with(num_rows, || NULL_DV.clone());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
+    use crate::arrow::array::{ArrayRef, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
+
+    const TEST_PATH: &str = "data/file.parquet";
+
+    /// Build a single-row scan-metadata-like batch. `path` and `stats` are addressed by name
+    /// (matching `DvMatchVisitor::selected_column_names_and_types`), so the surrounding
+    /// `extra_columns` and their positions deliberately exercise name-based getter binding.
+    fn make_scan_metadata_row(
+        path: &str,
+        stats: Option<&str>,
+        extra_columns: &[&str],
+    ) -> FilteredEngineData {
+        let mut fields = vec![
+            ArrowField::new("path", ArrowDataType::Utf8, true),
+            ArrowField::new("stats", ArrowDataType::Utf8, true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some(path)])),
+            Arc::new(StringArray::from(vec![stats])),
+        ];
+        for name in extra_columns {
+            fields.push(ArrowField::new(*name, ArrowDataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![Some("ignored")])));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    fn dv_updates_for(path: &str) -> HashMap<String, DeletionVectorDescriptor> {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            "AAAAAAAA".to_string(),
+            None,
+            8,
+            0,
+        )
+        .unwrap();
+        HashMap::from([(path.to_string(), descriptor)])
+    }
+
+    #[rstest]
+    #[case::null_stats(None, &[], true)]
+    #[case::stats_missing_num_records(Some("{}"), &[], true)]
+    #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], false)]
+    #[case::extra_columns_dont_shift_indexes(
+        Some(r#"{"numRecords":10}"#),
+        &["size", "modificationTime"],
+        false,
+    )]
+    fn dv_match_visitor_validates_matched_row_stats(
+        #[case] stats: Option<&str>,
+        #[case] extra_columns: &[&str],
+        #[case] expect_error: bool,
+    ) {
+        let dv_updates = dv_updates_for(TEST_PATH);
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, stats, extra_columns);
+
+        let result = visitor.visit_rows_of(&data);
+        if expect_error {
+            let msg = result.expect_err("expected error").to_string();
+            assert!(msg.contains("numRecords"), "message was: {msg}");
+            assert!(msg.contains(TEST_PATH), "message was: {msg}");
+        } else {
+            result.expect("validation should pass");
+            assert_eq!(visitor.matched_file_indexes, vec![0]);
+        }
+    }
+
+    #[test]
+    fn dv_match_visitor_skips_validation_for_unmatched_rows() {
+        let dv_updates = dv_updates_for("other/file.parquet");
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, None, &[]);
+
+        visitor
+            .visit_rows_of(&data)
+            .expect("unmatched rows must not trigger stats validation");
+        assert!(visitor.matched_file_indexes.is_empty());
     }
 }

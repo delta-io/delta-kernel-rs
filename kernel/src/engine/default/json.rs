@@ -946,4 +946,18 @@ mod tests {
 
         Ok(())
     }
+
+    // === JsonHandler contract tests ===
+    //
+    // Calls the shared contract helper in `engine::tests` against `DefaultJsonHandler` (the
+    // matching `SyncJsonHandler` invocation lives in `engine/sync/json.rs`).
+
+    #[test]
+    fn json_handler_file_path_contract() {
+        let handler = DefaultJsonHandler::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        crate::engine::tests::test_json_handler_file_path_contract(&handler);
+    }
 }

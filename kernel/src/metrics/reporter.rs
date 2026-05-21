@@ -69,15 +69,38 @@ impl ReportGeneratorLayer {
     pub fn new(reporter: Arc<dyn MetricsReporter>) -> Self {
         ReportGeneratorLayer { reporter }
     }
+
+    fn drain_into_visitor<S>(
+        span: Option<tracing_subscriber::registry::SpanRef<'_, S>>,
+        record: impl FnOnce(&mut EventVisitor),
+    ) where
+        S: Subscriber + for<'l> tracing_subscriber::registry::LookupSpan<'l>,
+    {
+        let warnings = span.and_then(|span| {
+            let mut extensions = span.extensions_mut();
+            let visitor = extensions.get_mut::<EventVisitor>()?;
+            record(visitor);
+            Some(std::mem::take(&mut visitor.pending_warnings))
+        });
+        for warn in warnings.unwrap_or_default() {
+            warn!("{warn}");
+        }
+    }
 }
 
 struct EventVisitor {
     event: Option<MetricEvent>,
+    // We store any warnings so they can be emitted after the caller releases any span extension
+    // locks. Calling warn!() while holding extensions_mut() would re-enter on_event and deadlock.
+    pending_warnings: Vec<String>,
 }
 
 impl EventVisitor {
     fn new(event: Option<MetricEvent>) -> Self {
-        Self { event }
+        Self {
+            event,
+            pending_warnings: vec![],
+        }
     }
 
     fn set_duration(&mut self, target_duration: std::time::Duration) {
@@ -90,35 +113,65 @@ impl EventVisitor {
                 *total_duration = target_duration
             }
             Some(MetricEvent::SnapshotFailed { duration, .. }) => *duration = target_duration,
+            Some(MetricEvent::CrcReadCompleted { duration, .. }) => *duration = target_duration,
             _ => {}
         }
+    }
+
+    fn record_invalid_field_warning(&mut self, field: &Field, span_name: &str) {
+        self.pending_warnings.push(format!(
+            "Invalid field '{}' recorded on {span_name} span",
+            field.name()
+        ));
     }
 }
 
 impl Visit for EventVisitor {
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if let Some(MetricEvent::LogSegmentLoaded {
-            ref mut num_commit_files,
-            ref mut num_checkpoint_files,
-            ref mut num_compaction_files,
-            ..
-        }) = self.event
-        {
-            match field.name() {
+        match &mut self.event {
+            Some(MetricEvent::LogSegmentLoaded {
+                ref mut num_commit_files,
+                ref mut num_checkpoint_files,
+                ref mut num_compaction_files,
+                ..
+            }) => match field.name() {
                 "num_commit_files" => *num_commit_files = value,
                 "num_checkpoint_files" => *num_checkpoint_files = value,
                 "num_compaction_files" => *num_compaction_files = value,
-                _ => warn!("Invalid field recorded on {SEGMENT_FOR_SNAPSHOT_SPAN} span"),
+                _ => self.record_invalid_field_warning(field, SEGMENT_FOR_SNAPSHOT_SPAN),
+            },
+            Some(MetricEvent::SnapshotCompleted {
+                ref mut version, ..
+            }) => {
+                if field.name() == "version" {
+                    *version = value;
+                } else {
+                    self.record_invalid_field_warning(field, SNAP_BUILD_SPAN);
+                }
             }
+            Some(MetricEvent::CrcReadCompleted {
+                ref mut bytes_read, ..
+            }) => {
+                if field.name() == "bytes_read" {
+                    *bytes_read = value;
+                } else {
+                    self.record_invalid_field_warning(field, CRC_READ_COMPLETED_SPAN);
+                }
+            }
+            _ => {}
         }
+    }
 
-        if let Some(MetricEvent::SnapshotCompleted {
-            ref mut version, ..
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if let Some(MetricEvent::LogSegmentLoaded {
+            ref mut has_latest_crc_file,
+            ..
         }) = self.event
         {
-            match field.name() {
-                "version" => *version = value,
-                _ => warn!("Invalid field recorded on {SNAP_BUILD_SPAN} span"),
+            if field.name() == "has_latest_crc_file" {
+                *has_latest_crc_file = value;
+            } else {
+                self.record_invalid_field_warning(field, SEGMENT_FOR_SNAPSHOT_SPAN);
             }
         }
     }
@@ -139,13 +192,16 @@ impl Visit for EventVisitor {
     }
 }
 
+#[derive(Default)]
 enum StorageEventType {
+    #[default]
     None,
     Copy,
     List,
     Read,
 }
 
+#[derive(Default)]
 struct StorageEventTypeVisitor {
     typ: StorageEventType,
     num_files: u64,
@@ -165,6 +221,7 @@ pub(crate) const SEGMENT_FOR_SNAPSHOT_SPAN: &str = "segment.for_snapshot";
 pub(crate) const SEGMENT_READ_METADATA_SPAN: &str = "segment.read_metadata";
 pub(crate) const SNAP_BUILD_SPAN: &str = "snap.build";
 pub(crate) const STORAGE_SPAN: &str = "storage";
+pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 const JSON_READ_COMPLETED_SPAN: &str = "json_read_completed";
 const PARQUET_READ_COMPLETED_SPAN: &str = "parquet_read_completed";
 const SCAN_METADATA_COMPLETED_SPAN: &str = "scan.metadata_completed";
@@ -370,9 +427,7 @@ impl Visit for NewSpanVisitor {
             let s = format!("{:?}", value);
             match Uuid::from_str(&s) {
                 Ok(u) => self.uuid = u,
-                Err(e) => {
-                    warn!("Invalid uuid recorded to span: {value:?}. {e}. Using a default")
-                }
+                Err(e) => warn!("Invalid uuid recorded to span: {value:?}. {e}. Using a default"),
             }
         }
     }
@@ -396,6 +451,7 @@ where
                 num_commit_files: 0,
                 num_checkpoint_files: 0,
                 num_compaction_files: 0,
+                has_latest_crc_file: false,
             }),
             SEGMENT_READ_METADATA_SPAN => Some(MetricEvent::ProtocolMetadataLoaded {
                 operation_id: MetricId(new_span_visitor.uuid),
@@ -407,12 +463,7 @@ where
                 total_duration: std::time::Duration::default(),
             }),
             STORAGE_SPAN => {
-                let mut storage_visitor = StorageEventTypeVisitor {
-                    typ: StorageEventType::None,
-                    num_files: 0,
-                    bytes_read: 0,
-                    duration: 0,
-                };
+                let mut storage_visitor = StorageEventTypeVisitor::default();
                 attrs.record(&mut storage_visitor);
                 match storage_visitor.typ {
                     StorageEventType::None => None,
@@ -446,6 +497,10 @@ where
                     bytes_read: v.bytes_read,
                 })
             }
+            CRC_READ_COMPLETED_SPAN => Some(MetricEvent::CrcReadCompleted {
+                duration: std::time::Duration::default(),
+                bytes_read: 0,
+            }),
             SCAN_METADATA_COMPLETED_SPAN => {
                 let mut v = ScanMetadataVisitor::default();
                 attrs.record(&mut v);
@@ -456,6 +511,11 @@ where
 
         let mut visitor = EventVisitor::new(event);
         attrs.record(&mut visitor);
+        // emit warnings before taking the extensions lock. No lock is held here, so
+        // warn!() is safe to call directly, unlike in on_event/on_record.
+        for w in std::mem::take(&mut visitor.pending_warnings) {
+            warn!("{w}");
+        }
         if let Some(span) = ctx.span(id) {
             let mut extensions = span.extensions_mut();
             extensions.insert(visitor);
@@ -463,21 +523,11 @@ where
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
-        if let Some(span) = ctx.event_span(event) {
-            let mut extensions = span.extensions_mut();
-            if let Some(visitor) = extensions.get_mut::<EventVisitor>() {
-                event.record(visitor);
-            }
-        }
+        Self::drain_into_visitor(ctx.event_span(event), |v| event.record(v));
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        if let Some(span) = ctx.span(id) {
-            let mut extensions = span.extensions_mut();
-            if let Some(visitor) = extensions.get_mut::<EventVisitor>() {
-                values.record(visitor);
-            }
-        }
+        Self::drain_into_visitor(ctx.span(id), |v| values.record(v));
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
@@ -498,15 +548,19 @@ where
         };
         if metadata.fields().field("report").is_some() {
             let Some(span) = ctx.span(&id) else { return };
-            let mut extensions = span.extensions_mut();
-            let duration = extensions.get_mut::<Instant>().map(|start| start.elapsed());
-            if let Some(event_visitor) = extensions.get_mut::<EventVisitor>() {
-                if let Some(duration) = duration {
-                    event_visitor.set_duration(duration);
+            let event = {
+                let mut extensions = span.extensions_mut();
+                let duration = extensions.get_mut::<Instant>().map(|start| start.elapsed());
+                let Some(event_visitor) = extensions.get_mut::<EventVisitor>() else {
+                    return;
+                };
+                if let Some(d) = duration {
+                    event_visitor.set_duration(d);
                 }
-                if let Some(event) = event_visitor.event.take() {
-                    self.reporter.report(event);
-                }
+                event_visitor.event.take()
+            }; // unlock the extensions before reporting so the reporter itself is safe to warn! etc
+            if let Some(event) = event {
+                self.reporter.report(event);
             }
         }
     }
