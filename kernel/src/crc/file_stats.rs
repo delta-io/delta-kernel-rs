@@ -68,30 +68,30 @@ pub(crate) struct FileStatsDelta {
     pub(crate) net_histogram: Option<FileSizeHistogram>,
 }
 
+const INCREMENTAL_SAFE_OPS: &[&str] = &[
+    "WRITE",
+    "MERGE",
+    "UPDATE",
+    "DELETE",
+    "OPTIMIZE",
+    "CREATE TABLE",
+    "REPLACE TABLE",
+    "CREATE TABLE AS SELECT",
+    "REPLACE TABLE AS SELECT",
+    "CREATE OR REPLACE TABLE AS SELECT",
+];
+
+/// Returns `true` if the given operation can be safely tracked by incremental file stats.
+///
+/// Incremental-safe operations produce add/remove actions whose net counts give correct file
+/// stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE STATS
+/// re-adds existing files with updated statistics; naively counting those adds would
+/// double-count file stats.
+pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
+    INCREMENTAL_SAFE_OPS.contains(&operation)
+}
+
 impl FileStatsDelta {
-    /// Returns `true` if the given operation can be safely tracked by incremental file stats.
-    ///
-    /// Incremental-safe operations produce add/remove actions whose net counts give correct
-    /// file stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE
-    /// STATS re-adds existing files with updated statistics -- if we naively counted those
-    /// adds, we'd double count file stats.
-    const INCREMENTAL_SAFE_OPS: &[&str] = &[
-        "WRITE",
-        "MERGE",
-        "UPDATE",
-        "DELETE",
-        "OPTIMIZE",
-        "CREATE TABLE",
-        "REPLACE TABLE",
-        "CREATE TABLE AS SELECT",
-        "REPLACE TABLE AS SELECT",
-        "CREATE OR REPLACE TABLE AS SELECT",
-    ];
-
-    pub(crate) fn is_incremental_safe(operation: &str) -> bool {
-        Self::INCREMENTAL_SAFE_OPS.contains(&operation)
-    }
-
     /// Compute file stats and a delta histogram from a transaction's staged add and remove
     /// metadata.
     ///
