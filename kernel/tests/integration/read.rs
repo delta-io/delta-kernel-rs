@@ -2063,6 +2063,57 @@ fn checkpoint_stats_skipping(
     Ok(())
 }
 
+// Verifies ScanFile.stats is populated from struct stats in checkpoints.
+// Tables have writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
+// schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
+// include_all_stats_columns() forces stats_parsed into the scan output so the COALESCE
+// fallback (ToJson(stats_parsed)) produces a JSON stats string for ScanFile.stats.
+#[rstest::rstest]
+#[test]
+fn struct_stats_surfaced_in_scan_file(
+    #[values(
+        "v1-single-part",
+        "v1-multi-part",
+        "v2-parquet-sidecars",
+        "v2-json-sidecars",
+        "v2-classic-parquet"
+    )]
+    checkpoint_type: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_path = format!("./tests/data/{checkpoint_type}-struct-stats-only/");
+    let path = std::fs::canonicalize(PathBuf::from(table_path))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .include_all_stats_columns()
+        .build()?;
+
+    let mut scan_files = vec![];
+    for res in scan.scan_metadata(engine.as_ref())? {
+        let scan_metadata = res?;
+        scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
+    }
+
+    assert_eq!(scan_files.len(), 5, "expected 5 files in checkpoint");
+    for scan_file in &scan_files {
+        assert!(
+            scan_file.stats.is_some(),
+            "ScanFile.stats should be populated from struct stats, path: {}",
+            scan_file.path
+        );
+        assert_eq!(
+            scan_file.stats.as_ref().unwrap().num_records,
+            1,
+            "each file has exactly 1 row, path: {}",
+            scan_file.path
+        );
+    }
+    Ok(())
+}
+
 // Multi-part V1 checkpoint with partitionValues_parsed on a partitioned table.
 // Schema: (id: long, value: string, part: int) partitioned by part.
 // Each commit inserts one row with part = i % 3 (parts 0, 1, 2).
