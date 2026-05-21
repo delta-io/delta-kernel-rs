@@ -112,24 +112,20 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 /// Engine-side row-level evaluation is always required: kernel has no way to
 /// evaluate the op itself. For kernel-side pruning, if the engine has
 /// registered [`OpaquePruningCallbacks`] via [`create_opaque_pruning_context`],
-/// kernel invokes the appropriate callback once per partition value set during
-/// partition pruning, once per parquet row group during row-group skipping,
-/// and once per metadata-batch row during stats-based file pruning. The
-/// indirect rewrite preserves the opaque branch so the file-pruning pass can
-/// dispatch back to the engine.
-///
-/// With the `default-engine-base` feature, this type also implements
-/// `ArrowOpaquePredicateOp` so the default engine's batch evaluator drives
-/// `eval_pred` per metadata-batch row directly. Without the feature, the FFI
-/// builder wraps via `Predicate::opaque` and the engine's own
-/// `EvaluationHandler` is responsible for evaluating the opaque op against
-/// per-file stats -- typically by recognizing `Predicate::Opaque` and
-/// dispatching to the callbacks itself.
+/// kernel invokes the appropriate callback during partition pruning,
+/// parquet row-group skipping, and stats-based file pruning. The indirect
+/// rewrite preserves the opaque branch so the file-pruning pass can dispatch
+/// back to the engine; under `default-engine-base` this type also implements
+/// `ArrowOpaquePredicateOp` and the default engine's batch evaluator drives
+/// `eval_pred` per metadata-batch row. See
+/// [`visit_predicate_opaque_with_pruning`] for how the FFI builder picks
+/// between `Predicate::arrow_opaque` and `Predicate::opaque`.
 ///
 /// If no callbacks are registered, the op opts out of every pruning pass and
 /// the engine is responsible for filtering at row time.
 ///
 /// [`create_opaque_pruning_context`]: pruning::create_opaque_pruning_context
+/// [`visit_predicate_opaque_with_pruning`]: kernel_visitor::visit_predicate_opaque_with_pruning
 #[derive(Debug, Clone)]
 pub struct NamedOpaquePredicateOp {
     name: String,
@@ -164,7 +160,6 @@ impl NamedOpaquePredicateOp {
     }
 
     /// `true` if engine callbacks are registered.
-    #[cfg(feature = "default-engine-base")]
     pub(crate) fn has_callbacks(&self) -> bool {
         self.callbacks.is_some()
     }
@@ -228,15 +223,13 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
-        // Preserve the opaque branch through the indirect rewrite so file
-        // pruning can dispatch back to the engine. This impl is only reached
-        // when the predicate was built via `Predicate::opaque` (i.e. without
-        // the `default-engine-base` arrow adaptor); the engine's own
-        // `EvaluationHandler` must then recognize `Predicate::Opaque` and run
-        // the callback against per-file stats. Returning `None` (when no
-        // callbacks are registered) suppresses the branch at rewrite time so
-        // engines never see an op they can't evaluate.
-        self.callbacks.as_ref()?;
+        // Keep the opaque branch through the indirect rewrite so the engine's
+        // EvaluationHandler can evaluate it against per-file stats. Drop it
+        // when no callbacks are registered -- the engine has nothing to
+        // dispatch to.
+        if !self.has_callbacks() {
+            return None;
+        }
         let pred = Predicate::opaque(self.clone(), exprs.iter().cloned());
         Some(if inverted { Predicate::not(pred) } else { pred })
     }

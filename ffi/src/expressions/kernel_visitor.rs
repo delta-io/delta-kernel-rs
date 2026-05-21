@@ -717,15 +717,11 @@ fn visit_predicate_opaque_with_pruning_impl(
     children: &mut EngineIterator,
     callbacks: Arc<OpaquePruningCallbacks>,
 ) -> DeltaResult<usize> {
-    // With `default-engine-base`, wrap via `arrow_opaque` so the default
-    // engine recovers the `ArrowOpaquePredicateOp` impl during batch
-    // evaluation. Without it, hand the op through as plain `Opaque` -- the
-    // engine's own `EvaluationHandler` must recognize the variant to drive
-    // file pruning.
+    // Wrap so the default engine recovers the `ArrowOpaquePredicateOp` impl
+    // during batch evaluation; otherwise hand through as plain `Opaque` for
+    // the engine's own `EvaluationHandler` to dispatch.
     #[cfg(feature = "default-engine-base")]
-    let wrap = |op: NamedOpaquePredicateOp, exprs: Vec<Expression>| -> Predicate {
-        Predicate::arrow_opaque(op, exprs)
-    };
+    let wrap = Predicate::arrow_opaque;
     #[cfg(not(feature = "default-engine-base"))]
     let wrap = Predicate::opaque;
     build_opaque_predicate(

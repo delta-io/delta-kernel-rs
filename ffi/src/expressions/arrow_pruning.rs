@@ -219,9 +219,8 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
     ) -> Option<Predicate> {
         // Keep the op live across the indirect rewrite so the default engine's
         // `evaluate_predicate` can drive `eval_pred` per metadata-batch row.
-        // When `inverted`, wrap in `Not`; the batch evaluator pushes that down
-        // into the `eval_pred` call with `inverted=true` so the engine sees a
-        // single (un-doubled) inversion.
+        // The Not wrap when inverted is pushed back down by the batch
+        // evaluator so the engine sees a single (un-doubled) inversion.
         if !self.has_callbacks() {
             return None;
         }
