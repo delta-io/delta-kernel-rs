@@ -9,7 +9,7 @@ use crate::Version;
 #[derive(Debug, thiserror::Error)]
 pub enum LogHistoryError {
     /// No published commit files were found in the log directory.
-    #[error("no published commits found in log directory {log_root}")]
+    #[error("No published commits found in log directory {log_root}")]
     NoPublishedCommits {
         /// The log directory URL that was searched.
         log_root: Url,
