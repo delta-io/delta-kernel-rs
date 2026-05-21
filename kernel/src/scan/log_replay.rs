@@ -13,6 +13,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+    UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
@@ -612,7 +613,9 @@ fn scan_row_schema_with_parsed_columns(
 /// # Parameters
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
 ///   names), or None if stats should not be included in output.
-/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true, stats
+///   output uses COALESCE(add.stats, ToJson(add.stats_parsed)) so that ScanFile.stats is populated
+///   even when the checkpoint lacks JSON stats (writeStatsAsJson=false).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
@@ -632,6 +635,16 @@ fn get_add_transform_expr(
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+    } else if has_stats_parsed {
+        // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
+        // serializing stats_parsed so ScanFile.stats is populated either way.
+        Arc::new(Expression::coalesce([
+            Expression::column(["add", "stats"]),
+            Expression::unary(
+                UnaryExpressionOp::ToJson,
+                Expression::column(["add", "stats_parsed"]),
+            ),
+        ]))
     } else {
         column_expr_ref!("add.stats")
     };
