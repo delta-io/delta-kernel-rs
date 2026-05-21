@@ -146,6 +146,8 @@ mod tests {
     use super::*;
     use crate::schema::{ArrayType, MapType, MetadataValue, StructType};
 
+    // === LegacyNestedIdsVisitor: parquet.field.nested.ids detection ===
+
     fn field_with_metadata(name: &str, dtype: DataType, key: &str) -> StructField {
         let mut f = StructField::nullable(name, dtype);
         f.metadata.insert(
