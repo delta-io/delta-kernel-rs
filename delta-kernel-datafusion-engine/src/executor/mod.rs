@@ -36,8 +36,7 @@ use delta_kernel::plans::state_machines::framework::state_machine::{AdvanceResul
 use delta_kernel::plans::state_machines::scan::FullState;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::StructType;
-use delta_kernel::Engine;
-use delta_kernel::Error as KernelError;
+use delta_kernel::{Engine, Error as KernelError};
 use futures::TryStreamExt;
 use url::Url;
 use uuid::Uuid;
@@ -225,21 +224,18 @@ impl DataFusionExecutor {
     /// the gap this method wraps the raw provider DataFrame in a per-top-level-field
     /// projection built by [`build_logical_projection`]:
     ///
-    /// - Primitive top-level fields pass through bare; the [`StampFieldUdf`] declares
-    ///   the projection's output [`FieldRef`] so metadata flows into the schema.
-    /// - Nested struct fields are reshaped into a `named_struct(get_field(...))` tree
-    ///   that emits logical names at every depth.
-    /// - `List<Struct>` / `Map<*, Struct>` (where supported) get an `array_transform`
-    ///   lambda that recursively reshapes the element struct.
+    /// - Primitive top-level fields pass through bare; the [`StampFieldUdf`] declares the
+    ///   projection's output [`FieldRef`] so metadata flows into the schema.
+    /// - Nested struct fields are reshaped into a `named_struct(get_field(...))` tree that emits
+    ///   logical names at every depth.
+    /// - `List<Struct>` / `Map<*, Struct>` (where supported) get an `array_transform` lambda that
+    ///   recursively reshapes the element struct.
     ///
     /// This path replaces the historical post-collect `stamp_batch_metadata` shim --
     /// every reshape happens inside the logical plan so the projection is composable
     /// with downstream `df.filter` / `df.select` / coalesce ops without schema
     /// mismatches.
-    pub async fn read_relation(
-        &self,
-        handle: &RelationHandle,
-    ) -> Result<DataFrame, DeltaError> {
+    pub async fn read_relation(&self, handle: &RelationHandle) -> Result<DataFrame, DeltaError> {
         let provider = self
             .providers_lock()
             .and_then(|g| {
@@ -456,15 +452,14 @@ impl DataFusionExecutor {
 /// Builds one projection [`Expr`] per top-level kernel field by combining:
 ///
 /// 1. The recursive rename walker (`build_logical_projection`) which emits
-///    `named_struct(get_field(...))` for nested struct renames and
-///    `array_transform(_, lambda)` for `List<Struct>` element renames.
-/// 2. A per-top-level [`StampFieldUdf`] wrapper that declares the kernel's logical
-///    Arrow [`FieldRef`] (name, datatype, recursive field metadata including
-///    `delta.columnMapping.*` / `parquet.field.id`) on the projection's output schema.
-/// 3. An `Expr::alias(target_name)` so the projection's column name matches the
-///    kernel logical name even for primitive fields (where
-///    [`ScalarUDFImpl::return_field_from_args`] discards the top-level field name per
-///    its rustdoc).
+///    `named_struct(get_field(...))` for nested struct renames and `array_transform(_, lambda)` for
+///    `List<Struct>` element renames.
+/// 2. A per-top-level [`StampFieldUdf`] wrapper that declares the kernel's logical Arrow
+///    [`FieldRef`] (name, datatype, recursive field metadata including `delta.columnMapping.*` /
+///    `parquet.field.id`) on the projection's output schema.
+/// 3. An `Expr::alias(target_name)` so the projection's column name matches the kernel logical name
+///    even for primitive fields (where [`ScalarUDFImpl::return_field_from_args`] discards the
+///    top-level field name per its rustdoc).
 ///
 /// Returns one `Expr` per top-level kernel field in declared order, ready to feed
 /// directly to [`DataFrame::select`].

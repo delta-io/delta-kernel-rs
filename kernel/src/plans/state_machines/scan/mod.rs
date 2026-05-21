@@ -11,9 +11,5 @@ mod plans;
 mod retention;
 mod schemas;
 
-pub use checkpoint_shape::{
-    checkpoint_shape_from_last_checkpoint, checkpoint_shape_from_schema, first_checkpoint_url,
-    snapshot_has_checkpoint_files, CheckpointShape,
-};
 pub use full_state::{FullState, FullStateBuilder};
 pub use plans::CommitFileMeta;

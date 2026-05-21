@@ -2,11 +2,11 @@
 //!
 //! Thin wrappers over [`DataFusionExecutor::read_relation`] and
 //! [`DataFusionExecutor::execute_plans`] that drain into a `Vec<RecordBatch>`. Since
-//! [`DataFusionExecutor::read_relation`] now returns a [`DataFrame`](datafusion::dataframe::DataFrame)
-//! whose logical schema matches `handle.schema` byte-for-byte (logical names + Delta
-//! field metadata, recursively into nested struct / list / map types), no post-collect
-//! stamping is required -- the returned batches already carry the kernel-declared
-//! schema.
+//! [`DataFusionExecutor::read_relation`] now returns a
+//! [`DataFrame`](datafusion::dataframe::DataFrame) whose logical schema matches `handle.schema`
+//! byte-for-byte (logical names + Delta field metadata, recursively into nested struct / list / map
+//! types), no post-collect stamping is required -- the returned batches already carry the
+//! kernel-declared schema.
 //!
 //! The production API returns DataFrames; eager-materialization callers in non-test
 //! code can just call `.collect()` on the returned DataFrame directly.
@@ -27,11 +27,11 @@ use crate::error::DfResultIntoDelta;
 use crate::DataFusionExecutor;
 
 /// Drain every batch of a registered relation into a `Vec`. Thin wrapper over
-/// [`DataFusionExecutor::read_relation`] + [`DataFrame::collect`](datafusion::dataframe::DataFrame::collect).
-/// The resulting batches' schemas already match `handle.schema` byte-for-byte (logical
-/// names + `delta.columnMapping.*` / `parquet.field.id` metadata) because
-/// [`DataFusionExecutor::read_relation`] performs the rename + stamp inside the logical
-/// plan; no post-collect cast pass is needed.
+/// [`DataFusionExecutor::read_relation`] +
+/// [`DataFrame::collect`](datafusion::dataframe::DataFrame::collect). The resulting batches'
+/// schemas already match `handle.schema` byte-for-byte (logical names + `delta.columnMapping.*` /
+/// `parquet.field.id` metadata) because [`DataFusionExecutor::read_relation`] performs the rename +
+/// stamp inside the logical plan; no post-collect cast pass is needed.
 pub async fn collect_relation(
     executor: &DataFusionExecutor,
     handle: &RelationHandle,

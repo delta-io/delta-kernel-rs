@@ -1,31 +1,34 @@
-//! Checkpoint shape resolution.
+//! Scan-shape resolution.
 //!
-//! [`resolve_checkpoint_shape`] is the canonical entry: an SM-driven async coroutine that
-//! turns a [`Snapshot`]'s log segment + `_last_checkpoint` hint into a fully-populated
-//! [`CheckpointShape`] (including `requested_stats_schema`, `has_stats_parsed`, and
-//! `manifest_relation` for V2 multipart). The function prefers the `_last_checkpoint`
-//! hint and falls back to engine-yielded
+//! [`ScanShapeInfo::resolve`] is the canonical entry: an SM-driven async coroutine that turns
+//! a [`Snapshot`]'s log segment + `_last_checkpoint` hint into a fully-populated
+//! [`ScanShapeInfo`] (checkpoint topology + stats config + partition schema). The function
+//! prefers the `_last_checkpoint` hint and falls back to engine-yielded
 //! [`SchemaQuery`](crate::plans::state_machines::framework::phase_operation::PhaseOperation::SchemaQuery)
 //! / [`Plans`](crate::plans::state_machines::framework::phase_operation::PhaseOperation::Plans)
-//! phases only when the hint is insufficient.
+//! phases only when the hint can't answer.
 //!
-//! Sync helpers ([`checkpoint_shape_from_last_checkpoint`],
-//! [`checkpoint_shape_from_schema`]) populate the cheap shape fields and leave
-//! `(requested_stats_schema, has_stats_parsed, manifest_relation)` at their defaults; the
-//! resolver enriches them.
+//! ### Hint semantics (load-bearing)
+//!
+//! `_last_checkpoint`'s `checkpointSchema` describes the **leaf** file (the classic checkpoint, or
+//! the V2 sidecar). It never carries layout info — a hint with `SIDECAR_NAME` would be meaningless
+//! (sidecars contain pure `add`/`remove`, not sidecar pointers). Two consequences:
+//!
+//! - A hint-based stats probe is authoritative whenever it fires. The hint IS the leaf, so the
+//!   sidecar SchemaQuery is redundant when the hint already answered (and we elide it).
+//! - Layout (classic vs V2 manifest) is **not** in the hint. We must read the file: a top-level
+//!   `SchemaQuery` for parquet; for JSON we assume manifest and let the `SIDECAR_NAME IS NOT NULL`
+//!   filter in `register_reconciliation` sort out classic-JSON-with-inline-rows.
 
 use std::sync::Arc;
 
 use super::plans::CHECKPOINT_TOP;
-use super::schemas::{action_schema, fsr_action_schema};
-use crate::actions::{
-    Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
-};
+use super::schemas::action_schema;
+use crate::actions::{Sidecar, SIDECAR_NAME};
 use crate::expressions::col;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
+use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::plans::ir::nodes::{FileFormat, RelationHandle};
 use crate::plans::ir::PlanBuilder;
 use crate::plans::kdf::SidecarCollector;
@@ -35,28 +38,176 @@ use crate::schema::{arc_schema, SchemaRef, StructField, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::{delta_error, FileMeta};
 
-/// Resolved checkpoint encoding + schema hints. Drives FSR / Scan plan composition:
-/// - `file_format`, `has_sidecars`, `actions_schema_subset`: top-level scan / sidecar Load.
-/// - `requested_stats_schema`: per-scan physical stats schema for projection.
-/// - `has_stats_parsed`: leaf parquet has compatible native `add.stats_parsed` -> plan builders
-///   prefer `col(["add", "stats_parsed"])` over `parse_json(col(["add", "stats"]))`.
-/// - `manifest_relation`: V2 multipart manifest handle published by [`resolve_checkpoint_shape`];
-///   downstream `RelationRef`s it instead of re-scanning.
+// === Public types ========================================================================
+
+/// Topology of a snapshot's checkpoint(s), if any. Drives the checkpoint half of
+/// [`super::plans::register_reconciliation`].
+///
+/// Variants are mutually exclusive and exhaustive — invariants that today's struct shape
+/// has to defend at the call site (e.g. "sidecars present but manifest missing") are simply
+/// unrepresentable here.
 #[derive(Clone, Debug)]
-pub struct CheckpointShape {
-    pub file_format: FileFormat,
-    pub has_sidecars: bool,
-    pub actions_schema_subset: SchemaRef,
-    pub requested_stats_schema: Option<SchemaRef>,
-    pub has_stats_parsed: bool,
-    pub manifest_relation: Option<RelationHandle>,
+pub(super) enum CheckpointShape {
+    /// No checkpoint files in the segment. The reconciliation pipeline degenerates to
+    /// commit-only replay.
+    NoCheckpoint,
+    /// Classic single- or multipart checkpoint with `add`/`remove` rows inline. The
+    /// reconciliation pipeline scans `files` directly with the
+    /// [`super::plans::CHECKPOINT_TOP`] schema.
+    Scan {
+        files: Vec<FileMeta>,
+        file_format: FileFormat,
+    },
+    /// V2 multipart: the manifest is already published as a relation, with sidecar URLs
+    /// extracted in the same `Plans` phase. `register_reconciliation` `RelationRef`s the
+    /// manifest and derives the sidecar load declaratively.
+    Manifest { manifest_relation: RelationHandle },
 }
 
-pub fn snapshot_has_checkpoint_files(snapshot: &Snapshot) -> bool {
-    !snapshot.log_segment().listed.checkpoint_parts.is_empty()
+/// Stats wiring for the action pipeline.
+#[derive(Clone, Debug)]
+pub(super) struct StatsInfo {
+    pub stats_schema: Option<SchemaRef>,
+    /// `true` when the checkpoint leaf (classic checkpoint or first V2 sidecar) carries a
+    /// compatible `add.stats_parsed` column — so `augment_add` can pass the column through
+    /// instead of running `parse_json(add.stats, stats_schema)` per row.
+    pub has_parsed_stats: bool,
 }
 
-pub fn first_checkpoint_url(snapshot: &Snapshot) -> Result<String, DeltaError> {
+/// Configured shape of a scan/FSR pipeline: checkpoint topology + stats wiring +
+/// partition schema. Resolved once per pipeline via [`Self::resolve`].
+#[derive(Clone, Debug)]
+pub(super) struct ScanShapeInfo {
+    pub checkpoint: CheckpointShape,
+    pub stats: StatsInfo,
+    /// Union of (predicate partition columns) and (projection partition columns). When
+    /// `Some`, `augment_add` always derives `partitionValues_parsed` via
+    /// `map_to_struct(add.partitionValues)` — there's no native form to probe for (Delta
+    /// checkpoint files never carry `partitionValues_parsed`), so no `has_parsed_partitions`
+    /// flag exists.
+    pub partition_schema: Option<SchemaRef>,
+}
+
+impl ScanShapeInfo {
+    /// Canonical SM-driven scan-shape resolver shared by FSR and Scan plan builders.
+    ///
+    /// Yields at most:
+    /// - one top-level [`PhaseOperation::SchemaQuery`] (parquet only, for layout detection),
+    /// - one [`PhaseOperation::Plans`] (V2 multipart: publishes the manifest as [`CHECKPOINT_TOP`]
+    ///   and extracts sidecar URLs in the same phase, so downstream stages reuse the relation
+    ///   instead of re-scanning),
+    /// - one [`PhaseOperation::SchemaQuery`] (sidecar probe — elided when the `_last_checkpoint`
+    ///   hint already answered, since the hint IS the leaf and the sidecar IS the leaf for V2).
+    pub(super) async fn resolve(
+        ctx: &mut Context<'_>,
+        snapshot: &Snapshot,
+        stats_schema: Option<&SchemaRef>,
+        partition_schema: Option<SchemaRef>,
+    ) -> Result<Self, DeltaError> {
+        let seg = snapshot.log_segment();
+        let checkpoint_parts = &seg.listed.checkpoint_parts;
+
+        // (1) Empty -> NoCheckpoint, zero engine round-trips.
+        if checkpoint_parts.is_empty() {
+            return Ok(Self {
+                checkpoint: CheckpointShape::NoCheckpoint,
+                stats: StatsInfo {
+                    stats_schema: stats_schema.cloned(),
+                    has_parsed_stats: false,
+                },
+                partition_schema,
+            });
+        }
+
+        let file_format = checkpoint_format_from_path(&checkpoint_parts[0]);
+        let checkpoint_files: Vec<FileMeta> = checkpoint_parts
+            .iter()
+            .map(|p| p.location.clone())
+            .collect();
+
+        // (2) Hint probe -- leaf-level, hence authoritative whenever it fires.
+        let mut parsed_stats: Option<bool> =
+            stats_probe(seg.checkpoint_schema().as_ref(), stats_schema);
+
+        // (3) Layout detection. The hint doesn't carry layout info; for parquet we
+        //     SchemaQuery the checkpoint file, for JSON (no parquet footer) we assume manifest.
+        //     If the parquet schema query happens to land on a classic leaf AND the hint
+        //     didn't already answer, we refine the stats probe from the live schema.
+        let is_manifest = match file_format {
+            FileFormat::Parquet => {
+                let url = first_checkpoint_url(snapshot)?;
+                let state = ctx
+                    .execute(
+                        PhaseOperation::SchemaQuery(SchemaQueryNode::new(url)),
+                        "ScanShapeInfo::resolve::checkpoint_schema",
+                    )
+                    .await
+                    .map_err(|e| e.into_delta_typed())?;
+                let cp_schema: SchemaRef = state.take_schema()?;
+                let is_mfst = cp_schema.contains(SIDECAR_NAME);
+                if !is_mfst && parsed_stats.is_none() {
+                    parsed_stats = stats_probe(Some(&cp_schema), stats_schema);
+                }
+                is_mfst
+            }
+            FileFormat::Json => true,
+        };
+
+        // (4) Scan variant -- done.
+        if !is_manifest {
+            return Ok(Self {
+                checkpoint: CheckpointShape::Scan {
+                    files: checkpoint_files,
+                    file_format,
+                },
+                stats: StatsInfo {
+                    stats_schema: stats_schema.cloned(),
+                    has_parsed_stats: parsed_stats.unwrap_or(false),
+                },
+                partition_schema,
+            });
+        }
+
+        // (5) Manifest variant: always publish the manifest as `CHECKPOINT_TOP`. The relation
+        //     handle is required by `register_reconciliation`, which derives sidecar URLs
+        //     declaratively from it.
+        let (manifest_relation, sidecar_files) =
+            publish_v2_manifest_and_extract_sidecars(ctx, snapshot, file_format, &checkpoint_files)
+                .await?;
+
+        // (6) Sidecar stats probe -- ONLY when the hint hasn't already answered. The hint IS
+        //     the leaf, and the sidecar IS the leaf for V2, so re-querying would be redundant.
+        if parsed_stats.is_none() {
+            if let (Some(reqd), Some(first)) = (stats_schema, sidecar_files.first()) {
+                let state = ctx
+                    .execute(
+                        PhaseOperation::SchemaQuery(SchemaQueryNode::new(first.location.as_str())),
+                        "ScanShapeInfo::resolve::sidecar_schema",
+                    )
+                    .await
+                    .map_err(|e| e.into_delta_typed())?;
+                let side_schema = state.take_schema()?;
+                parsed_stats = Some(LogSegment::schema_has_compatible_stats_parsed(
+                    side_schema.as_ref(),
+                    reqd.as_ref(),
+                ));
+            }
+        }
+
+        Ok(Self {
+            checkpoint: CheckpointShape::Manifest { manifest_relation },
+            stats: StatsInfo {
+                stats_schema: stats_schema.cloned(),
+                has_parsed_stats: parsed_stats.unwrap_or(false),
+            },
+            partition_schema,
+        })
+    }
+}
+
+// === Module-private helpers ==============================================================
+
+fn first_checkpoint_url(snapshot: &Snapshot) -> Result<String, DeltaError> {
     snapshot
         .log_segment()
         .listed
@@ -66,49 +217,10 @@ pub fn first_checkpoint_url(snapshot: &Snapshot) -> Result<String, DeltaError> {
         .ok_or_else(|| {
             delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                "fsr::first_checkpoint_url: snapshot has no checkpoint parts but schema prelude \
-                 was requested",
+                "ScanShapeInfo::resolve::first_checkpoint_url: snapshot has no checkpoint parts \
+                 but layout probing was requested",
             )
         })
-}
-
-pub fn checkpoint_shape_from_schema(schema: &SchemaRef) -> Result<CheckpointShape, DeltaError> {
-    // SchemaQuery is executed against an on-disk checkpoint part today — treat as Parquet-shaped
-    // reads.
-    let subset = checkpoint_actions_schema_projection(schema)?;
-    Ok(CheckpointShape {
-        file_format: FileFormat::Parquet,
-        has_sidecars: schema.contains(SIDECAR_NAME),
-        actions_schema_subset: subset,
-        requested_stats_schema: None,
-        has_stats_parsed: false,
-        manifest_relation: None,
-    })
-}
-
-pub fn checkpoint_shape_from_last_checkpoint(
-    snapshot: &Snapshot,
-) -> Result<CheckpointShape, DeltaError> {
-    let seg = snapshot.log_segment();
-    let has_checkpoint_parts = !seg.listed.checkpoint_parts.is_empty();
-    let fmt = seg
-        .listed
-        .checkpoint_parts
-        .first()
-        .map(checkpoint_format_from_path)
-        .unwrap_or(FileFormat::Json);
-
-    let full_schema = seg.checkpoint_schema().unwrap_or_else(action_schema);
-    let subset = checkpoint_actions_schema_projection(&full_schema)?;
-    Ok(CheckpointShape {
-        file_format: fmt,
-        has_sidecars: full_schema.contains(SIDECAR_NAME)
-            || (has_checkpoint_parts && matches!(fmt, FileFormat::Json)),
-        actions_schema_subset: subset,
-        requested_stats_schema: None,
-        has_stats_parsed: false,
-        manifest_relation: None,
-    })
 }
 
 fn checkpoint_format_from_path(cp: &ParsedLogPath<FileMeta>) -> FileFormat {
@@ -118,143 +230,51 @@ fn checkpoint_format_from_path(cp: &ParsedLogPath<FileMeta>) -> FileFormat {
     }
 }
 
-fn checkpoint_actions_schema_projection(full: &SchemaRef) -> Result<SchemaRef, DeltaError> {
-    const WANT: &[&str] = &[
-        ADD_NAME,
-        REMOVE_NAME,
-        PROTOCOL_NAME,
-        METADATA_NAME,
-        DOMAIN_METADATA_NAME,
-        SET_TRANSACTION_NAME,
-    ];
-    let names: Vec<_> = WANT.iter().copied().filter(|n| full.contains(*n)).collect();
-    if names.is_empty() {
-        Ok(action_schema())
-    } else {
-        full.project(names.as_slice())
-            .map_err(|e| e.into_delta_default())
+/// Pure helper: `Some(true|false)` when both `leaf` (a checkpoint-leaf schema, e.g. from the
+/// `_last_checkpoint` hint or a live `SchemaQuery`) and `requested` are present; `None` when
+/// either is missing (i.e. "not yet known").
+fn stats_probe(leaf: Option<&SchemaRef>, requested: Option<&SchemaRef>) -> Option<bool> {
+    match (leaf, requested) {
+        (Some(l), Some(r)) => Some(LogSegment::schema_has_compatible_stats_parsed(
+            l.as_ref(),
+            r.as_ref(),
+        )),
+        _ => None,
     }
 }
 
-fn sidecar_only_schema() -> SchemaRef {
-    arc_schema([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])
-}
-
-pub(super) fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
-    checkpoint_manifest_scan_schema_with_stats(include_sidecar, None)
-}
-
-/// Like [`checkpoint_manifest_scan_schema`] but optionally augments `add` with a typed
-/// `stats_parsed` sub-field. Used when [`CheckpointShape::has_stats_parsed`] is `true` so the
-/// leaf parquet's native `add.stats_parsed` column is read directly into the relation rather
-/// than re-parsed from JSON downstream.
-pub(super) fn checkpoint_manifest_scan_schema_with_stats(
-    include_sidecar: bool,
-    stats_parsed_schema: Option<&SchemaRef>,
-) -> SchemaRef {
-    let base = fsr_action_schema(stats_parsed_schema);
-    let mut fields: Vec<StructField> = base.fields().cloned().collect();
-    if include_sidecar {
-        fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-    }
+/// Manifest scan schema used when publishing a V2 manifest as `CHECKPOINT_TOP`. Combines the
+/// six action slots (so any inline `add`/`remove` rows in the manifest are still read) with
+/// a top-level `sidecar` field so the sidecar filter in `register_reconciliation` can extract
+/// sidecar URLs declaratively.
+pub(super) fn checkpoint_manifest_scan_schema() -> SchemaRef {
+    let mut fields: Vec<StructField> = action_schema().fields().cloned().collect();
+    fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
     arc_schema(fields)
 }
 
-/// Canonical SM-driven checkpoint shape resolver shared by FSR and Scan plan builders.
-///
-/// Yields at most one [`PhaseOperation::SchemaQuery`] (when `_last_checkpoint` lacks a
-/// schema) and at most one [`PhaseOperation::Plans`] (V2 multipart: publishes the manifest
-/// as `CHECKPOINT_TOP` and extracts sidecar URLs in the same phase, so
-/// [`super::plans::register_reconciliation`] reuses the relation instead of re-scanning).
-pub(super) async fn resolve_checkpoint_shape(
+/// V2 multipart: publish the manifest scan as [`CHECKPOINT_TOP`] and extract sidecar URLs in
+/// one `Plans` phase. Returns `(manifest_handle, sidecar_files)`. Caller is responsible for
+/// any follow-up sidecar SchemaQuery (e.g. the stats probe).
+async fn publish_v2_manifest_and_extract_sidecars(
     ctx: &mut Context<'_>,
     snapshot: &Snapshot,
-    physical_stats_schema: Option<&SchemaRef>,
-) -> Result<CheckpointShape, DeltaError> {
-    let mut shape = checkpoint_shape_from_last_checkpoint(snapshot)?;
-    shape.requested_stats_schema = physical_stats_schema.cloned();
-
-    let seg = snapshot.log_segment();
-    let hint_schema = seg.checkpoint_schema();
-
-    // Hint-first stats detection: zero engine round-trips when `_last_checkpoint` carries the
-    // schema. The hint reflects what the writer recorded for this checkpoint's actions, so a
-    // compatible `add.stats_parsed` here means the leaf parquet has it too.
-    if let (Some(hint), Some(reqd)) = (hint_schema.as_ref(), physical_stats_schema) {
-        shape.has_stats_parsed =
-            LogSegment::schema_has_compatible_stats_parsed(hint.as_ref(), reqd.as_ref());
-    }
-
-    // Fall back to a top-level SchemaQuery when the hint is missing but checkpoint files
-    // exist. JSON checkpoints have no parquet footer to probe, so we skip the query and
-    // conservatively assume sidecar-aware replay.
-    let needs_top_level_query = snapshot_has_checkpoint_files(snapshot) && hint_schema.is_none();
-    if needs_top_level_query {
-        if shape.file_format == FileFormat::Json {
-            // JSON checkpoints are ambiguous; treat as possibly-manifest.
-            shape.has_sidecars = true;
-        } else {
-            let checkpoint_url = first_checkpoint_url(snapshot)?;
-            let checkpoint_state = ctx
-                .execute(
-                    PhaseOperation::SchemaQuery(SchemaQueryNode::new(checkpoint_url)),
-                    "fsr::resolve_checkpoint_shape::checkpoint_schema",
-                )
-                .await
-                .map_err(|e| e.into_delta_typed())?;
-            let checkpoint_schema = checkpoint_state.take_schema()?;
-            shape.has_sidecars = checkpoint_schema.contains(SIDECAR_NAME);
-            shape.actions_schema_subset = checkpoint_actions_schema_projection(&checkpoint_schema)?;
-            if let Some(reqd) = physical_stats_schema {
-                shape.has_stats_parsed = LogSegment::schema_has_compatible_stats_parsed(
-                    checkpoint_schema.as_ref(),
-                    reqd.as_ref(),
-                );
-            }
-        }
-    }
-
-    // V2 multipart: publish the manifest as a reusable relation, extract sidecar URLs in the
-    // same phase, then probe the first sidecar for `add.stats_parsed` when stats requested.
-    if shape.has_sidecars {
-        let manifest_handle =
-            publish_v2_manifest_and_probe_sidecar(ctx, snapshot, &mut shape, physical_stats_schema)
-                .await?;
-        shape.manifest_relation = Some(manifest_handle);
-    }
-
-    Ok(shape)
-}
-
-/// V2 multipart: publish manifest scan + sidecar extraction in one `Plans` phase, then
-/// probe the first (always-parquet) sidecar via `SchemaQuery` when stats are requested.
-async fn publish_v2_manifest_and_probe_sidecar(
-    ctx: &mut Context<'_>,
-    snapshot: &Snapshot,
-    shape: &mut CheckpointShape,
-    physical_stats_schema: Option<&SchemaRef>,
-) -> Result<RelationHandle, DeltaError> {
-    let checkpoint_files: Vec<FileMeta> = snapshot
-        .log_segment()
-        .listed
-        .checkpoint_parts
-        .iter()
-        .map(|p| p.location.clone())
-        .collect();
-    let manifest_schema = checkpoint_manifest_scan_schema(true);
-    let manifest_scan = match shape.file_format {
+    file_format: FileFormat,
+    checkpoint_files: &[FileMeta],
+) -> Result<(RelationHandle, Vec<FileMeta>), DeltaError> {
+    let manifest_schema = checkpoint_manifest_scan_schema();
+    let manifest_scan = match file_format {
         FileFormat::Parquet => {
-            PlanBuilder::scan_parquet(checkpoint_files.clone(), manifest_schema.clone())
+            PlanBuilder::scan_parquet(checkpoint_files.to_vec(), manifest_schema.clone())
         }
         FileFormat::Json => {
-            PlanBuilder::scan_json(checkpoint_files.clone(), manifest_schema.clone())
+            PlanBuilder::scan_json(checkpoint_files.to_vec(), manifest_schema.clone())
         }
     };
-    // Register the manifest scan as a side effect; the plan is accumulated in ctx's registry.
     let manifest_handle = manifest_scan.into_relation(CHECKPOINT_TOP, &mut *ctx)?;
 
     // Sidecar extraction reads from the just-registered manifest relation. `consume_phase`
-    // drains the registry's accumulated plans (the manifest publish plan) + the consume
+    // drains the registry's accumulated plans (the manifest publish plan) plus the consume
     // plan into a `PhaseOperation::Plans`, yields it, and extracts the typed output.
     let sidecar_chain = ctx
         .relation_ref(CHECKPOINT_TOP)?
@@ -263,25 +283,26 @@ async fn publish_v2_manifest_and_probe_sidecar(
         .consume_phase(
             sidecar_chain,
             SidecarCollector::new(snapshot.log_segment().log_root.clone()),
-            "fsr::resolve_checkpoint_shape::publish_manifest_and_extract",
+            "ScanShapeInfo::resolve::publish_manifest_and_extract",
         )
         .await?;
 
-    // Probe the first sidecar parquet for `add.stats_parsed` if stats requested. Sidecars
-    // override the manifest's stats-parsed assessment because the actual `add` rows live
-    // there for V2 multipart.
-    if let (Some(reqd), Some(first_sidecar)) = (physical_stats_schema, sidecar_files.first()) {
-        let sidecar_state = ctx
-            .execute(
-                PhaseOperation::SchemaQuery(SchemaQueryNode::new(first_sidecar.location.as_str())),
-                "fsr::resolve_checkpoint_shape::sidecar_schema",
-            )
-            .await
-            .map_err(|e| e.into_delta_typed())?;
-        let sidecar_schema = sidecar_state.take_schema()?;
-        shape.has_stats_parsed =
-            LogSegment::schema_has_compatible_stats_parsed(sidecar_schema.as_ref(), reqd.as_ref());
-    }
+    Ok((manifest_handle, sidecar_files))
+}
 
-    Ok(manifest_handle)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_probe_requires_both_inputs() {
+        assert_eq!(stats_probe(None, None), None);
+        // Missing requested -> None.
+        let schema = crate::schema::arc_schema([crate::schema::StructField::not_null(
+            "x",
+            crate::schema::DataType::LONG,
+        )]);
+        assert_eq!(stats_probe(Some(&schema), None), None);
+        assert_eq!(stats_probe(None, Some(&schema)), None);
+    }
 }

@@ -3,27 +3,27 @@
 //!
 //! ```text
 //! commit_load(Values -> Load) -> commit_dedup(filter -> project -> window -> filter -> project)
-//!     -> checkpoint_top(scan, optional)
-//!     -> sidecar_load(filter -> project -> Load, optional)
+//!     -> [checkpoint view, per CheckpointShape variant]
 //!     -> checkpoint_keyed(filter(identity) + project(+dedup_key))
 //!     -> LEFTANTI(commit_keys) -> survivors
-//!     -> UNION(commit_dedup, survivors) -> Filter(retention) -> Project(action_pair)
+//!     -> UNION(commit_dedup, survivors) -> Filter(retention) -> Project(checkpoint_pair)
 //!     -> RECONCILED
 //! ```
 //!
-//! Terminates at [`RECONCILED`] with the `action_pair` shape (FSR_JOIN_KEY dropped). Callers
+//! Terminates at [`RECONCILED`] in the (augmented) `add`/`remove`-shaped row stream — `JOIN_KEY`
+//! dropped, optional `stats_parsed` / `partitionValues_parsed` sub-fields materialized. Callers
 //! layer their own terminal projection (and optional data phase) on top.
 //!
-//! [`register_reconciliation`] is sync (caller supplies [`CheckpointShape`]);
+//! [`register_reconciliation`] is sync (caller supplies a resolved [`ScanShapeInfo`]);
 //! [`execute_reconciliation`] is async and resolves the shape itself via
-//! [`resolve_checkpoint_shape`](super::checkpoint_shape::resolve_checkpoint_shape).
+//! [`ScanShapeInfo::resolve`].
 
 use std::sync::Arc;
 
 use url::Url;
 
-use super::action_pair::{with_partition_values, with_stats, JOIN_KEY_FIELD, VERSION_FIELD};
-use super::checkpoint_shape::{resolve_checkpoint_shape, CheckpointShape};
+use super::action_pair::{augment_add, Pair, JOIN_KEY_FIELD, VERSION_FIELD};
+use super::checkpoint_shape::{CheckpointShape, ScanShapeInfo};
 use super::dedup::FSR_JOIN_KEY_COL;
 use super::retention::retention_filter;
 use crate::action_reconciliation::{
@@ -38,10 +38,10 @@ use crate::plans::ir::nodes::{
 };
 use crate::plans::ir::{PlanBuilder, RelationRegistry};
 use crate::plans::state_machines::framework::coroutine::context::Context;
-use crate::schema::{arc_schema, ArrayType, DataType, SchemaRef, StructField, ToSchema};
+use crate::schema::{arc_schema, ArrayType, DataType, SchemaRef, StructField};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
-use crate::{delta_error, FileMeta, Version};
+use crate::{delta_error, Version};
 
 // === Stage relation names ===
 //
@@ -68,42 +68,58 @@ pub struct CommitFileMeta {
 // === Sync reconciliation pipeline (registry-only, no yields) ==============================
 
 /// Sync core of the reconciliation pipeline. Builds every stage into `registry` without
-/// yielding phases; caller is responsible for resolving the [`CheckpointShape`] beforehand
-/// (typically via [`resolve_checkpoint_shape`] inside an async wrapper — see
+/// yielding phases; caller is responsible for resolving the [`ScanShapeInfo`] beforehand
+/// (typically via [`ScanShapeInfo::resolve`] inside an async wrapper — see
 /// [`execute_reconciliation`]).
 ///
-/// `base` selects the action-slot set (`SCAN_BASE` for `{add, remove}`, `FSR_BASE` for the
-/// full six slots). `dedup_key` MUST evaluate to NULL on rows that match no known slot — the
-/// pipeline's identity filter is `dedup_key IS NOT NULL`.
+/// `base` selects the action-slot set (`SCAN_BASE` for `{add, remove}`, `FSR_BASE` for the full
+/// six slots). `dedup_key` MUST evaluate to NULL on rows that match no known slot — the pipeline's
+/// identity filter is `dedup_key IS NOT NULL`.
+///
+/// Two parallel action-stream pairs drive the projections:
+///
+/// - `commit_pair`: `augment_add(base, stats (has_parsed_stats=false), parts)`. Commit log rows
+///   never carry native `add.stats_parsed`, so `stats_parsed` is always derived via
+///   `parse_json(add.stats, ..)` on the commit side.
+/// - `checkpoint_pair`: `augment_add(base, stats (has_parsed_stats=shape.stats.has_parsed_stats),
+///   parts)`. When the checkpoint leaf (classic or V2 sidecar) carries native `add.stats_parsed`,
+///   the projection is a passthrough column reference instead of `parse_json` per row. Used for
+///   every projection downstream of the initial commit augmentation, including the post-union keyed
+///   and terminal steps, so the natively-materialized stats survive into `RECONCILED`.
 pub(super) fn register_reconciliation(
     registry: &mut RelationRegistry,
     snapshot: &Snapshot,
-    shape: &CheckpointShape,
-    base: &'static std::sync::LazyLock<(SchemaRef, Vec<Arc<Expression>>)>,
-    stats: Option<SchemaRef>,
-    parts: Option<SchemaRef>,
+    shape: &ScanShapeInfo,
+    base: &'static std::sync::LazyLock<Pair>,
     dedup_key: Arc<Expression>,
 ) -> Result<(), DeltaError> {
-    let action_pair = with_partition_values(
-        with_stats((**base).clone(), stats.clone(), /* native= */ false),
-        parts.clone(),
+    let commit_pair = augment_add(
+        (**base).clone(),
+        shape
+            .stats
+            .stats_schema
+            .as_ref()
+            .map(|s| (s.clone(), /* has_parsed_stats= */ false)),
+        shape.partition_schema.clone(),
     );
+    let checkpoint_pair = augment_add(
+        (**base).clone(),
+        shape
+            .stats
+            .stats_schema
+            .as_ref()
+            .map(|s| (s.clone(), shape.stats.has_parsed_stats)),
+        shape.partition_schema.clone(),
+    );
+
     // Reused twice (commit filter + checkpoint-side filter); hold as Arc<Expression> so
     // each `.filter(...)` call is a cheap Arc clone instead of a Predicate clone + Arc alloc.
     let identity_not_null: Arc<Expression> =
         Arc::new(dedup_key.as_ref().clone().is_not_null().into());
 
     let commits = commit_cover_rows(snapshot.log_segment())?;
-    let checkpoint_files: Vec<FileMeta> = snapshot
-        .log_segment()
-        .listed
-        .checkpoint_parts
-        .iter()
-        .map(|p| p.location.clone())
-        .collect();
     let log_root = snapshot.log_segment().log_root.clone();
     let (min_file_ts, txn_expiry) = retention_timestamps(snapshot)?;
-    let has_checkpoint = !checkpoint_files.is_empty();
 
     // === Stage 1: commit_load ============================================================
     // VALUES(commits) → Load(JSON) → COMMIT_RAW. The Load broadcasts the per-commit
@@ -132,13 +148,13 @@ pub(super) fn register_reconciliation(
         )?;
 
     // === Stage 2: commit_dedup ============================================================
-    // filter(identity) → project(action_pair + JOIN_KEY + VERSION) → window(row_number) →
-    // filter(rn <= 1) → project(action_pair + JOIN_KEY) → COMMIT_DEDUP.
+    // filter(identity) → project(commit_pair + JOIN_KEY + VERSION) → window(row_number) →
+    // filter(rn <= 1) → project(commit_pair + JOIN_KEY) → COMMIT_DEDUP.
     const COMMIT_DEDUP_RN_COL: &str = "__kernel_commit_dedup_rn";
     registry
         .relation_ref(COMMIT_RAW)?
         .filter(identity_not_null.clone())
-        .project_pair(action_pair.clone())
+        .project_pair(commit_pair.clone())
         .add_column(JOIN_KEY_FIELD.clone(), dedup_key.clone())
         .add_column(VERSION_FIELD.clone(), Arc::new(col("version")))
         .window(
@@ -154,94 +170,117 @@ pub(super) fn register_reconciliation(
                 .le(Expression::literal(1i64))
                 .into(),
         ))
-        .project_pair(action_pair.clone())
+        .project_pair(commit_pair)
         .add_column(JOIN_KEY_FIELD.clone(), dedup_key.clone())
         .into_relation(COMMIT_DEDUP, registry)?;
 
-    // === Stage 3: checkpoint_top scan (optional) ==========================================
-    // When the resolver already published the V2 manifest under CHECKPOINT_TOP, skip the
-    // scan and reuse the existing relation. Otherwise scan with the action_pair shape
-    // (plus the sidecar slot if V2-multipart needs sidecar discovery).
-    if has_checkpoint && shape.manifest_relation.is_none() {
-        let mut scan_fields: Vec<StructField> = action_pair.0.fields().cloned().collect();
-        if shape.has_sidecars {
-            scan_fields.push(StructField::nullable(
-                SIDECAR_NAME,
-                crate::actions::Sidecar::to_schema(),
-            ));
-        }
-        let scan_schema = arc_schema(scan_fields);
-        match shape.file_format {
-            FileFormat::Parquet => PlanBuilder::scan_parquet(checkpoint_files.clone(), scan_schema),
-            FileFormat::Json => PlanBuilder::scan_json(checkpoint_files.clone(), scan_schema),
-        }
-        .into_relation(CHECKPOINT_TOP, registry)?;
-    }
+    // === Stages 3-5a: build the checkpoint view per CheckpointShape variant ==============
+    // Returns `Some(PlanBuilder)` aligned to `checkpoint_pair.0` (= the post-union schema),
+    // or `None` when the snapshot has no checkpoint at all. The view is the union of the
+    // checkpoint-side actions (top + optional sidecars) projected to the augmented action shape,
+    // ready to be keyed and antijoined in stage 5b.
+    let checkpoint_view: Option<PlanBuilder> = match &shape.checkpoint {
+        CheckpointShape::NoCheckpoint => None,
+        CheckpointShape::Scan { files, file_format } => {
+            // Scan the checkpoint files directly into `checkpoint_pair.0` so the engine can
+            // surface native `add.stats_parsed` / `add.partitionValues_parsed` when present.
+            let scan_schema = checkpoint_pair.0.clone();
+            let scan = match file_format {
+                FileFormat::Parquet => PlanBuilder::scan_parquet(files.clone(), scan_schema),
+                FileFormat::Json => PlanBuilder::scan_json(files.clone(), scan_schema),
+            };
+            scan.into_relation(CHECKPOINT_TOP, registry)?;
 
-    // === Stage 4: sidecar_load (V2-multipart only) =======================================
-    if shape.has_sidecars {
-        if !has_checkpoint && shape.manifest_relation.is_none() {
-            return Err(delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "register_reconciliation: has_sidecars=true but no checkpoint relation present",
-            ));
+            // Reproject to checkpoint_pair shape — turns native `add.stats_parsed` into the
+            // passthrough column when `has_parsed_stats=true`, runs `parse_json` otherwise.
+            // Elision: when augment_add was identity (no stats AND no parts, OR
+            // partition_schema=None AND has_parsed_stats=true), the projection is a bare
+            // passthrough so we skip the project_pair node entirely.
+            let project_is_identity = shape.partition_schema.is_none()
+                && (shape.stats.stats_schema.is_none() || shape.stats.has_parsed_stats);
+            let top = registry.relation_ref(CHECKPOINT_TOP)?;
+            Some(if project_is_identity {
+                top
+            } else {
+                top.project_pair(checkpoint_pair.clone())
+            })
         }
-        let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
-            delta_error!(
-                DeltaErrorCode::DeltaStateRecoverError,
-                "register_reconciliation::join_sidecar_base: join _sidecars base URL: {e}",
+        CheckpointShape::Manifest { .. } => {
+            // The resolver already published the manifest as `CHECKPOINT_TOP` (schema:
+            // `action_schema + sidecar`, no `stats_parsed` field). Sidecars carry the actual
+            // `add`/`remove` rows; the manifest's own rows are mostly sidecar pointers (with
+            // `add IS NULL`) and are filtered out by `identity_not_null` downstream.
+            let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
+                delta_error!(
+                    DeltaErrorCode::DeltaStateRecoverError,
+                    "register_reconciliation::join_sidecar_base: join _sidecars base URL: {e}",
+                )
+            })?;
+            registry
+                .relation_ref(CHECKPOINT_TOP)?
+                .filter(Arc::new(col(SIDECAR_NAME).is_not_null().into()))
+                .project(
+                    [
+                        col([SIDECAR_NAME, "path"]).into(),
+                        col([SIDECAR_NAME, "sizeInBytes"]).into(),
+                    ],
+                    path_size_schema(/* with_version= */ false),
+                )
+                .load(
+                    SIDECAR_ACTIONS,
+                    checkpoint_pair.0.clone(),
+                    FileType::Parquet,
+                    Some(sidecar_base),
+                    vec![],
+                    default_scan_file_columns(),
+                    None,
+                    registry,
+                )?;
+
+            // Top (manifest): the manifest schema lacks `add.stats_parsed`, so we can't use
+            // checkpoint_pair (which would `col(add.stats_parsed)` under `has_parsed_stats=true`).
+            // Use commit_pair-style `parse_json` instead. Manifest rows that actually carry
+            // `add`/`remove` get a real `stats_parsed` from parse_json; sidecar-pointer rows
+            // get NULL and are filtered out by `identity_not_null` in stage 5b.
+            let manifest_pair = augment_add(
+                (**base).clone(),
+                shape
+                    .stats
+                    .stats_schema
+                    .as_ref()
+                    .map(|s| (s.clone(), false)),
+                shape.partition_schema.clone(),
+            );
+            let top = registry
+                .relation_ref(CHECKPOINT_TOP)?
+                .project_pair(manifest_pair);
+
+            // Side (sidecars): identity-elide checkpoint_pair when augment_add is a passthrough.
+            let project_is_identity = shape.partition_schema.is_none()
+                && (shape.stats.stats_schema.is_none() || shape.stats.has_parsed_stats);
+            let side = if project_is_identity {
+                registry.relation_ref(SIDECAR_ACTIONS)?
+            } else {
+                registry
+                    .relation_ref(SIDECAR_ACTIONS)?
+                    .project_pair(checkpoint_pair.clone())
+            };
+
+            Some(
+                PlanBuilder::union(vec![top, side], /* ordered= */ false)
+                    .map_err(|e| e.into_delta_default())?,
             )
-        })?;
-        registry
-            .relation_ref(CHECKPOINT_TOP)?
-            .filter(Arc::new(col(SIDECAR_NAME).is_not_null().into()))
-            .project(
-                [
-                    col([SIDECAR_NAME, "path"]).into(),
-                    col([SIDECAR_NAME, "sizeInBytes"]).into(),
-                ],
-                path_size_schema(/* with_version= */ false),
-            )
-            .load(
-                SIDECAR_ACTIONS,
-                action_pair.0.clone(),
-                FileType::Parquet,
-                Some(sidecar_base),
-                vec![],
-                default_scan_file_columns(),
-                None,
-                registry,
-            )?;
-    }
+        }
+    };
 
-    // === Stage 5: antijoin + union + retention -> RECONCILED ==============================
-    // Compute the upstream feeding the terminal `Filter(retention) -> Project(action_pair) ->
-    // RECONCILED` pipe. Without a checkpoint, commit_dedup IS the live snapshot. With one,
-    // the checkpoint side is aligned to `action_pair`, anti-joined against commit keys, and
-    // unioned with commit_dedup.
-    let terminal_input = if !has_checkpoint {
-        registry.relation_ref(COMMIT_DEDUP)?
-    } else {
-        // Align the checkpoint side (top + optional sidecar) to action_pair shape so the
-        // union is well-formed.
-        let (align_schema, align_proj) = action_pair.clone();
-        let top = registry
-            .relation_ref(CHECKPOINT_TOP)?
-            .project(align_proj.clone(), align_schema.clone());
-        let full = if shape.has_sidecars {
-            let side = registry
-                .relation_ref(SIDECAR_ACTIONS)?
-                .project(align_proj, align_schema);
-            PlanBuilder::union(vec![top, side], /* ordered= */ false)
-                .map_err(|e| e.into_delta_default())?
-        } else {
-            top
-        };
-
+    // === Stage 5b: antijoin + union + retention -> RECONCILED ============================
+    // Without a checkpoint, commit_dedup IS the live snapshot. With one, the unified checkpoint
+    // view is anti-joined against commit keys, unioned with commit_dedup, and retention-filtered.
+    let terminal_input = if let Some(view) = checkpoint_view {
         // Filter to valid action rows + add the dedup key column for the antijoin.
-        let keyed = full
-            .filter(identity_not_null.clone())
-            .project_pair(action_pair.clone())
+        let keyed = view
+            .filter(identity_not_null)
+            .project_pair(checkpoint_pair.clone())
             .add_column(JOIN_KEY_FIELD.clone(), dedup_key.clone());
 
         // Build side of the antijoin: just the dedup keys from commit winners.
@@ -260,28 +299,30 @@ pub(super) fn register_reconciliation(
             /* ordered= */ false,
         )
         .map_err(|e| e.into_delta_default())?
+    } else {
+        registry.relation_ref(COMMIT_DEDUP)?
     };
 
     terminal_input
         .filter(Arc::new(retention_filter(min_file_ts, txn_expiry).into()))
-        .project_pair(action_pair)
+        .project_pair(checkpoint_pair)
         .into_relation(RECONCILED, registry)?;
 
     Ok(())
 }
 
-/// Async wrapper: resolve the checkpoint shape (yielding `SchemaQuery` / `Plans` phases as
-/// needed) and then delegate to [`register_reconciliation`].
+/// Async wrapper: resolve the scan shape (yielding `SchemaQuery` / `Plans` phases as needed)
+/// and then delegate to [`register_reconciliation`].
 pub(super) async fn execute_reconciliation(
     ctx: &mut Context<'_>,
     snapshot: &Snapshot,
-    base: &'static std::sync::LazyLock<(SchemaRef, Vec<Arc<Expression>>)>,
+    base: &'static std::sync::LazyLock<Pair>,
     stats: Option<SchemaRef>,
     parts: Option<SchemaRef>,
     dedup_key: Arc<Expression>,
 ) -> Result<(), DeltaError> {
-    let shape = resolve_checkpoint_shape(ctx, snapshot, stats.as_ref()).await?;
-    register_reconciliation(&mut *ctx, snapshot, &shape, base, stats, parts, dedup_key)
+    let shape = ScanShapeInfo::resolve(ctx, snapshot, stats.as_ref(), parts).await?;
+    register_reconciliation(&mut *ctx, snapshot, &shape, base, dedup_key)
 }
 
 // === Helpers ==============================================================================

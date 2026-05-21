@@ -2,25 +2,25 @@
 //! metadata + nested struct/list/map field names + per-level metadata) onto a single
 //! input column.
 //!
-//! Sits at the top of [`DataFusionExecutor::read_relation`](crate::DataFusionExecutor::read_relation)'s
-//! projection: at runtime it casts the input array to the target [`DataType`] via
-//! [`arrow::compute::cast`] (positional, metadata-preserving -- the same primitive the
-//! historical `stamp_batch_metadata` used post-collect); at plan time
-//! [`return_field_from_args`] declares the target [`FieldRef`] verbatim so DataFusion's
-//! projection output schema carries the full nested metadata declaration too.
+//! Sits at the top of
+//! [`DataFusionExecutor::read_relation`](crate::DataFusionExecutor::read_relation)'s projection: at
+//! runtime it casts the input array to the target [`DataType`] via [`arrow::compute::cast`]
+//! (positional, metadata-preserving -- the same primitive the historical `stamp_batch_metadata`
+//! used post-collect); at plan time [`return_field_from_args`] declares the target [`FieldRef`]
+//! verbatim so DataFusion's projection output schema carries the full nested metadata declaration
+//! too.
 //!
 //! Why a UDF instead of `Expr::Cast` or `Expr::Alias`:
-//! - `Expr::Cast(_, ArrowDataType)` carries only the data type, no metadata, and
-//!   DataFusion's logical-cast validation rejects struct-to-struct casts whose source
-//!   and target field names don't overlap (column-mapping renames trip this).
+//! - `Expr::Cast(_, ArrowDataType)` carries only the data type, no metadata, and DataFusion's
+//!   logical-cast validation rejects struct-to-struct casts whose source and target field names
+//!   don't overlap (column-mapping renames trip this).
 //! - `Expr::Alias(_, name)` carries only the name, no metadata.
-//! - `Expr::ScalarFunction(udf)` with [`ScalarUDFImpl::return_field_from_args`]
-//!   overridden can declare the projection's output [`FieldRef`] verbatim. Per the
-//!   `return_field_from_args` doc (`datafusion/expr/src/udf.rs:644`) the top-level
-//!   field name is ignored for primitives (callers must `.alias(...)`) but is honored
-//!   for structured types and the field's metadata flows through to the projection's
-//!   output schema in either case. The runtime `cast` keeps the materialized batch's
-//!   schema byte-for-byte aligned with the declaration so DataFusion's projection
+//! - `Expr::ScalarFunction(udf)` with [`ScalarUDFImpl::return_field_from_args`] overridden can
+//!   declare the projection's output [`FieldRef`] verbatim. Per the `return_field_from_args` doc
+//!   (`datafusion/expr/src/udf.rs:644`) the top-level field name is ignored for primitives (callers
+//!   must `.alias(...)`) but is honored for structured types and the field's metadata flows through
+//!   to the projection's output schema in either case. The runtime `cast` keeps the materialized
+//!   batch's schema byte-for-byte aligned with the declaration so DataFusion's projection
 //!   `result_data_type == expected_type` assertion holds.
 
 use std::sync::Arc;
@@ -32,8 +32,8 @@ use datafusion_common::arrow::datatypes::{
 use datafusion_common::Result as DfResult;
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{
-    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility,
+    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
 };
 
 /// A no-op [`ScalarUDF`] whose only job is to re-declare its argument's output [`Field`]
@@ -88,17 +88,16 @@ impl ScalarUDFImpl for StampFieldUdf {
     /// Build the projection's output [`FieldRef`] by merging the kernel target's
     /// names + metadata with the input's runtime nullability via [`merge_field`]:
     ///
-    /// - The outer field name + metadata + nested field names + nested metadata
-    ///   come from `self.target_field` so the projection's schema carries the full
-    ///   kernel logical declaration (recursively).
+    /// - The outer field name + metadata + nested field names + nested metadata come from
+    ///   `self.target_field` so the projection's schema carries the full kernel logical declaration
+    ///   (recursively).
     /// - Nullability at every level comes from the input field so the cast in
-    ///   [`Self::invoke_with_args`] -- which respects the *outer* target type but
-    ///   does NOT tighten the nullability of the array's actual null buffer -- can
-    ///   produce an output whose `data_type()` matches what we declare here. The
-    ///   alternative (claim target's non-null promises) trips DataFusion's
-    ///   projection-executor `result_data_type == expected_type` assertion when the
-    ///   runtime data has nulls (e.g. `named_struct(...)` always produces nullable
-    ///   fields).
+    ///   [`Self::invoke_with_args`] -- which respects the *outer* target type but does NOT tighten
+    ///   the nullability of the array's actual null buffer -- can produce an output whose
+    ///   `data_type()` matches what we declare here. The alternative (claim target's non-null
+    ///   promises) trips DataFusion's projection-executor `result_data_type == expected_type`
+    ///   assertion when the runtime data has nulls (e.g. `named_struct(...)` always produces
+    ///   nullable fields).
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> DfResult<FieldRef> {
         let input = args.arg_fields.first().ok_or_else(|| {
             datafusion_common::DataFusionError::Internal(format!(
@@ -116,13 +115,12 @@ impl ScalarUDFImpl for StampFieldUdf {
     /// (positional, metadata-preserving -- the same primitive the historical
     /// `stamp_batch_metadata` used post-collect):
     ///
-    /// - Primitive cast: type coercion (`Int64` -> `Long` is a noop) with the
-    ///   outer projection [`Expr::alias`](datafusion_expr::Expr::alias) supplying
-    ///   the column name.
-    /// - Struct cast: positional rebuild of the struct array with the target's
-    ///   field names + metadata (matches by position, NOT by name -- this is the
-    ///   whole reason we use [`arrow::compute::cast`] over DataFusion's logical
-    ///   `Expr::Cast`, which name-validates and rejects column-mapping renames).
+    /// - Primitive cast: type coercion (`Int64` -> `Long` is a noop) with the outer projection
+    ///   [`Expr::alias`](datafusion_expr::Expr::alias) supplying the column name.
+    /// - Struct cast: positional rebuild of the struct array with the target's field names +
+    ///   metadata (matches by position, NOT by name -- this is the whole reason we use
+    ///   [`arrow::compute::cast`] over DataFusion's logical `Expr::Cast`, which name-validates and
+    ///   rejects column-mapping renames).
     /// - List / Map cast: recursive descent that stamps each nested element field.
     ///
     /// Scalar inputs flow through unchanged: cast on a length-1 array reshapes the
@@ -150,16 +148,14 @@ impl ScalarUDFImpl for StampFieldUdf {
 /// recursively into nested struct / list / large-list / fixed-size-list / map
 /// types. The merge is asymmetric on purpose:
 ///
-/// - **Names + metadata come from `target`.** This is the kernel's logical schema
-///   declaration (`delta.columnMapping.*` / `parquet.field.id`) that the projection
-///   needs to surface on its output schema and on every batch downstream.
-/// - **Nullability comes from `input`.** DataFusion's projection executor asserts
-///   that the runtime array's `data_type()` matches what
-///   [`ScalarUDFImpl::return_field_from_args`] declared. The runtime cast in
-///   [`StampFieldUdf::invoke_with_args`] preserves the array's actual null buffer
-///   without re-checking it against tighter nullability promises, so claiming
-///   `non-null` on a level where the runtime can carry nulls would trip the
-///   assertion.
+/// - **Names + metadata come from `target`.** This is the kernel's logical schema declaration
+///   (`delta.columnMapping.*` / `parquet.field.id`) that the projection needs to surface on its
+///   output schema and on every batch downstream.
+/// - **Nullability comes from `input`.** DataFusion's projection executor asserts that the runtime
+///   array's `data_type()` matches what [`ScalarUDFImpl::return_field_from_args`] declared. The
+///   runtime cast in [`StampFieldUdf::invoke_with_args`] preserves the array's actual null buffer
+///   without re-checking it against tighter nullability promises, so claiming `non-null` on a level
+///   where the runtime can carry nulls would trip the assertion.
 ///
 /// When source and target arities don't line up at a particular level (only
 /// possible if upstream rename is buggy), the merge falls back to the input field

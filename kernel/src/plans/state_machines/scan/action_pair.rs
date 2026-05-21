@@ -4,20 +4,22 @@
 //! `Pair = (SchemaRef, Vec<Arc<Expression>>)` values that the reconciliation pipeline projects
 //! through at each stage. Both scan and FSR pipelines start from one of two compile-time bases
 //! ([`SCAN_BASE`] for add/remove only, [`FSR_BASE`] for the full six-slot action set), and
-//! optionally apply nested `add`-struct augmentations ([`with_stats`], [`with_partition_values`])
-//! before the pair is handed to `PlanBuilder::project_pair(...)`.
+//! optionally apply an [`augment_add`] augmentation (typed `stats_parsed` and / or
+//! `partitionValues_parsed` sub-fields) before the pair is handed to
+//! `PlanBuilder::project_pair(...)`.
 //!
-//! Zero new types beyond the [`Pair`] tuple alias. The macro-free design keeps the public
-//! surface a flat list of `LazyLock` statics + plain functions.
+//! Zero new types beyond the [`Pair`] tuple alias. The augmentation uses [`Expression::Transform`]
+//! for sparse projection over the nested `add` struct (so each augmented field is one
+//! `with_inserted_field` call) and [`StructType`] fluent builders for the matching schema mutation
+//! (so schema and projection stay in sync field-by-field).
 //!
 //! ## Why pairs (not separate schema + projection helpers)?
 //!
-//! The schema and the projection must agree, field-by-field, at every projecting stage of
-//! the IR. Carrying them as one value built by a single helper makes schema-projection drift
-//! impossible: every augmentation function takes a `Pair` and returns a `Pair`, so the two
-//! halves stay in lockstep by construction.
+//! The schema and the projection must agree, field-by-field, at every projecting stage of the IR.
+//! Carrying them as one value built by a single helper makes schema-projection drift impossible:
+//! [`augment_add`] mutates the `add` slot of both halves in lockstep.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use super::dedup::FSR_JOIN_KEY_COL;
 use crate::actions::{
@@ -37,11 +39,12 @@ pub(super) type Pair = (SchemaRef, Vec<Arc<Expression>>);
 //
 // Both bases are `LazyLock<Pair>` built once on first access and then cheaply cloned (the
 // `Arc<SchemaRef>` + `Vec<Arc<Expression>>` clones are O(small)). All the augmentation helpers
-// below take a `Pair` by value, so the typical call shape is `with_stats(SCAN_BASE.clone(), ..)`.
+// below take a `Pair` by value, so the typical call shape is
+// `augment_add(SCAN_BASE.clone(), ..)`.
 
 /// Scan pipeline base: `{add, remove}` only. The scan path never reconciles
 /// protocol/metaData/txn/domainMetadata (the snapshot reads those separately).
-pub(super) static SCAN_BASE: LazyLock<Pair> = LazyLock::new(|| {
+pub(super) static SCAN_BASE: std::sync::LazyLock<Pair> = std::sync::LazyLock::new(|| {
     (
         arc_schema([
             StructField::nullable(ADD_NAME, Add::to_schema()),
@@ -52,7 +55,7 @@ pub(super) static SCAN_BASE: LazyLock<Pair> = LazyLock::new(|| {
 });
 
 /// FSR pipeline base: all six action slots.
-pub(super) static FSR_BASE: LazyLock<Pair> = LazyLock::new(|| {
+pub(super) static FSR_BASE: std::sync::LazyLock<Pair> = std::sync::LazyLock::new(|| {
     (
         arc_schema([
             StructField::nullable(ADD_NAME, Add::to_schema()),
@@ -76,107 +79,142 @@ pub(super) static FSR_BASE: LazyLock<Pair> = LazyLock::new(|| {
 // === Extra-column field constants =========================================================
 
 /// Synthetic dedup-key column added before windowing and re-projected through the antijoin.
-pub(super) static JOIN_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
-    StructField::nullable(
-        FSR_JOIN_KEY_COL,
-        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-    )
-});
+pub(super) static JOIN_KEY_FIELD: std::sync::LazyLock<StructField> =
+    std::sync::LazyLock::new(|| {
+        StructField::nullable(
+            FSR_JOIN_KEY_COL,
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+        )
+    });
 
 /// Per-commit `version` column broadcast through the commit-load LoadSink and used as the
 /// window's order-by key. Dropped after the post-window projection.
-pub(super) static VERSION_FIELD: LazyLock<StructField> =
-    LazyLock::new(|| StructField::not_null("version", DataType::LONG));
+pub(super) static VERSION_FIELD: std::sync::LazyLock<StructField> =
+    std::sync::LazyLock::new(|| StructField::not_null("version", DataType::LONG));
 
-// === Augmentation helpers =================================================================
+// === Add augmentation =====================================================================
 
-/// Augment the nested `add` struct with a typed `stats_parsed` sub-field.
+/// Augment the nested `add` struct of `pair` with optional `stats_parsed` and / or
+/// `partitionValues_parsed` sub-fields.
 ///
-/// - When `stats` is `None`: no-op.
-/// - When `stats` is `Some(schema)`:
-///   - The `add` slot's struct gains a nullable `stats_parsed` field with the requested schema.
-///   - The `add` projection expression is rebuilt as `struct_from(add.path, ..., stats_expr)` where
-///     `stats_expr` is either the native `col(["add", "stats_parsed"])` (when `native` is true,
-///     e.g. when the leaf parquet has `add.stats_parsed` and we want to passthrough) or
-///     `parse_json(col(["add", "stats"]), schema)` otherwise.
-pub(super) fn with_stats(pair: Pair, stats: Option<SchemaRef>, native: bool) -> Pair {
-    let Some(stats) = stats else {
+/// Returns `pair` unchanged when both `stats` and `parts` are `None`. Otherwise:
+///
+/// - The `add` slot's struct gains a nullable `stats_parsed` field (after `stats`) and / or a
+///   nullable `partitionValues_parsed` field (after `partitionValues`).
+/// - `projection[0]` is rewritten as an [`Expression::struct_from`] over the nested `add` struct
+///   with one expression per inner field:
+///   - existing inner fields: passthrough `col(["add", <field>])`.
+///   - `stats_parsed`: `col(["add", "stats_parsed"])` if `has_parsed_stats` (the leaf already
+///     materializes the column), otherwise `parse_json(col(["add", "stats"]), stats_schema)`.
+///   - `partitionValues_parsed`: always `map_to_struct(col(["add", "partitionValues"]))` — Delta
+///     checkpoint files never carry `add.partitionValues_parsed` natively, so there is no
+///     passthrough variant.
+///
+/// Inner `add` fields are normalized to `nullable=true`. The outer `add` slot is nullable —
+/// any row may have `add IS NULL`, which makes every inner field transitively nullable in
+/// downstream evaluators. Declaring strict here would force a `Cast(nullable -> non-null)`
+/// between project / union / anti-join / sink that DataFusion rejects at planning time.
+///
+/// Implementation note: we build the projection with `struct_from` (rather than the sparser
+/// [`Expression::Transform::with_inserted_field`](Transform::with_inserted_field)) because the
+/// `delta-kernel-datafusion-engine` translator does not yet support non-identity transforms;
+/// switching the projection to a Transform here is a future optimization gated on engine
+/// support.
+pub(super) fn augment_add(
+    pair: Pair,
+    stats: Option<(SchemaRef, /* has_parsed_stats= */ bool)>,
+    parts: Option<SchemaRef>,
+) -> Pair {
+    if stats.is_none() && parts.is_none() {
         return pair;
+    }
+    let (schema, mut projection) = pair;
+
+    let Some(add_field) = schema.field(ADD_NAME) else {
+        unreachable!("bases always place an `add` slot at index 0");
     };
-    rewrite_add(pair, |inner_fields, inner_exprs| {
-        inner_fields.push(StructField::nullable(
-            "stats_parsed",
-            stats.as_ref().clone(),
-        ));
-        let stats_expr = if native {
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        unreachable!("bases always declare `add` as a struct");
+    };
+
+    // Schema: start from the base `add` struct with all inner fields normalized to nullable.
+    // The fluent `with_field_inserted_after` builders thread the augmentations through.
+    let mut augmented = normalize_to_nullable(add_struct);
+
+    // Projection: one expression per inner field of the augmented `add` struct. Existing
+    // fields are bare column refs; the augmented fields are the typed expressions described in
+    // the doc-comment. We mirror `with_field_inserted_after`'s positional semantics by tracking
+    // the inserted field's index and splicing the matching expression at the same position.
+    let mut inner_exprs: Vec<Arc<Expression>> = augmented
+        .fields()
+        .map(|f| Arc::new(col([ADD_NAME, f.name()])))
+        .collect();
+
+    if let Some((stats_schema, has_parsed_stats)) = &stats {
+        let Ok(next) = augmented.with_field_inserted_after(
+            Some("stats"),
+            StructField::nullable("stats_parsed", stats_schema.as_ref().clone()),
+        ) else {
+            unreachable!("Add::to_schema() carries a `stats` field by Delta protocol invariant");
+        };
+        augmented = next;
+        let Some(stats_idx) = augmented.fields().position(|f| f.name() == "stats_parsed") else {
+            unreachable!("with_field_inserted_after(stats_parsed) succeeded above");
+        };
+        let stats_expr: Expression = if *has_parsed_stats {
             col([ADD_NAME, "stats_parsed"])
         } else {
-            Expression::parse_json(col([ADD_NAME, "stats"]), stats.clone())
+            Expression::parse_json(col([ADD_NAME, "stats"]), stats_schema.clone())
         };
-        inner_exprs.push(stats_expr.into());
-    })
-}
+        inner_exprs.insert(stats_idx, Arc::new(stats_expr));
+    }
+    if let Some(parts_schema) = &parts {
+        let Ok(next) = augmented.with_field_inserted_after(
+            Some("partitionValues"),
+            StructField::nullable("partitionValues_parsed", parts_schema.as_ref().clone()),
+        ) else {
+            unreachable!(
+                "Add::to_schema() carries a `partitionValues` field by Delta protocol invariant",
+            );
+        };
+        augmented = next;
+        let Some(parts_idx) = augmented
+            .fields()
+            .position(|f| f.name() == "partitionValues_parsed")
+        else {
+            unreachable!("with_field_inserted_after(partitionValues_parsed) succeeded above");
+        };
+        let parts_expr = Expression::map_to_struct(col([ADD_NAME, "partitionValues"]));
+        inner_exprs.insert(parts_idx, Arc::new(parts_expr));
+    }
 
-/// Augment the nested `add` struct with a typed `partitionValues_parsed` sub-field built by
-/// `map_to_struct(add.partitionValues)`. No-op when `parts` is `None`.
-pub(super) fn with_partition_values(pair: Pair, parts: Option<SchemaRef>) -> Pair {
-    let Some(parts) = parts else {
-        return pair;
-    };
-    rewrite_add(pair, |inner_fields, inner_exprs| {
-        inner_fields.push(StructField::nullable(
-            "partitionValues_parsed",
-            parts.as_ref().clone(),
-        ));
-        inner_exprs.push(Expression::map_to_struct(col([ADD_NAME, "partitionValues"])).into());
-    })
-}
-
-/// Internal: rewrite the `add` slot of `pair` by destructuring its struct and letting the
-/// caller mutate the inner `(fields, exprs)` lists before reassembling. The `add` slot is at
-/// index 0 in every base (and in every output of this helper), so we index directly.
-///
-/// Each inner field is normalized to `nullable=true` because the outer `add` slot itself is
-/// nullable — any row may have `add IS NULL`, which makes every inner field transitively
-/// nullable in downstream evaluators.
-fn rewrite_add(
-    (schema, mut projection): Pair,
-    augment: impl FnOnce(&mut Vec<StructField>, &mut Vec<Arc<Expression>>),
-) -> Pair {
-    let mut fields: Vec<StructField> = schema.fields().cloned().collect();
-    let DataType::Struct(add_struct) = fields[0].data_type() else {
-        unreachable!("bases place `add` as a struct at index 0");
-    };
-    let mut inner_fields: Vec<StructField> = add_struct
-        .fields()
-        .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
-        .collect();
-    // Two shapes: a fresh base passes `add` through as `col([add])` — bootstrap by
-    // re-projecting every inner field explicitly. An already-augmented pair carries
-    // `struct_from([...])` here — reuse its children.
-    let mut inner_exprs: Vec<Arc<Expression>> = match projection[0].as_ref() {
-        Expression::Struct(children, _) => children.clone(),
-        _ => inner_fields
-            .iter()
-            .map(|f| col([ADD_NAME, f.name().as_str()]).into())
-            .collect(),
-    };
-
-    augment(&mut inner_fields, &mut inner_exprs);
-    fields[0] = StructField::nullable(ADD_NAME, StructType::new_unchecked(inner_fields));
+    let mut new_fields: Vec<StructField> = schema.fields().cloned().collect();
+    new_fields[0] = StructField::nullable(ADD_NAME, augmented);
     projection[0] = Arc::new(Expression::struct_from(inner_exprs));
-    (arc_schema(fields), projection)
+    (arc_schema(new_fields), projection)
+}
+
+/// Rebuild `add_struct` as a `StructType` whose top-level fields are all `nullable`. See the
+/// `augment_add` doc comment for why this normalization is load-bearing.
+fn normalize_to_nullable(add_struct: &StructType) -> StructType {
+    StructType::new_unchecked(
+        add_struct
+            .fields()
+            .map(|f| StructField::nullable(f.name(), f.data_type().clone())),
+    )
 }
 
 // === Scan-specific terminal builder =======================================================
 
 /// Post-FSR flat file row built by the scan terminal: `{path, size, deletionVector,
 /// fileConstantValues: {...}}`. When `partition_values_parsed_schema` is `Some(parts)`, an
-/// extra `partitionValues_parsed: parts` field is appended INSIDE `fileConstantValues` and
-/// the projection emits `map_to_struct(add.partitionValues)` for it.
+/// extra `partitionValues_parsed: parts` field is appended inside `fileConstantValues`.
 ///
-/// Returns the paired `(schema, projection)` for the terminal project that converts a
-/// (post-reconciliation) action-stream row with an `add` slot into a flat file row.
+/// **Invariant:** when `partition_values_parsed_schema` is `Some`, the upstream reconciliation
+/// pipeline must have already augmented `add` with a matching `partitionValues_parsed` via
+/// [`augment_add`]. The terminal projection therefore reads `col(["add",
+/// "partitionValues_parsed"])` directly instead of re-deriving the struct via `map_to_struct` per
+/// row.
 pub(super) fn scan_file_row_pair(partition_values_parsed_schema: Option<&SchemaRef>) -> Pair {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
@@ -189,19 +227,22 @@ pub(super) fn scan_file_row_pair(partition_values_parsed_schema: Option<&SchemaR
         StructField::nullable("tags", tags),
         StructField::nullable("clusteringProvider", DataType::STRING),
     ];
-    let mut file_constant_exprs = vec![
-        col(["add", "partitionValues"]),
-        col(["add", "baseRowId"]),
-        col(["add", "defaultRowCommitVersion"]),
-        col(["add", "tags"]),
-        col(["add", "clusteringProvider"]),
+    let mut file_constant_exprs: Vec<Arc<Expression>> = vec![
+        col(["add", "partitionValues"]).into(),
+        col(["add", "baseRowId"]).into(),
+        col(["add", "defaultRowCommitVersion"]).into(),
+        col(["add", "tags"]).into(),
+        col(["add", "clusteringProvider"]).into(),
     ];
     if let Some(parts) = partition_values_parsed_schema {
         file_constant_fields.push(StructField::nullable(
             "partitionValues_parsed",
             parts.as_ref().clone(),
         ));
-        file_constant_exprs.push(Expression::map_to_struct(col(["add", "partitionValues"])));
+        // Passthrough: the upstream `augment_add(.., Some(parts))` already materialized this
+        // sub-field on every row. Re-deriving via `map_to_struct(add.partitionValues)` here
+        // would be a wasted per-row map walk.
+        file_constant_exprs.push(col(["add", "partitionValues_parsed"]).into());
     }
     let schema = Arc::new(StructType::new_unchecked([
         StructField::not_null("path", DataType::STRING),
@@ -212,11 +253,11 @@ pub(super) fn scan_file_row_pair(partition_values_parsed_schema: Option<&SchemaR
             StructType::new_unchecked(file_constant_fields),
         ),
     ]));
-    let projection = vec![
+    let projection: Vec<Arc<Expression>> = vec![
         col(["add", "path"]).into(),
         col(["add", "size"]).into(),
         col(["add", "deletionVector"]).into(),
-        Expression::struct_from(file_constant_exprs).into(),
+        Arc::new(Expression::struct_from(file_constant_exprs)),
     ];
     (schema, projection)
 }
@@ -228,6 +269,11 @@ mod tests {
     /// Helper: extract field names from a schema.
     fn field_names(schema: &SchemaRef) -> Vec<String> {
         schema.fields().map(|f| f.name().clone()).collect()
+    }
+
+    /// Helper: extract field names from a StructType.
+    fn struct_field_names(s: &StructType) -> Vec<String> {
+        s.fields().map(|f| f.name().clone()).collect()
     }
 
     /// Pin the canonical top-level action lists for both pipelines. These shapes are
@@ -249,33 +295,128 @@ mod tests {
         );
     }
 
-    /// Both add-side augmentations compose without clobbering each other: `stats_parsed`
-    /// and `partitionValues_parsed` both land inside `add`, the original `add`/`remove`
-    /// slots remain. This single test replaces the per-helper sanity checks because the
-    /// `None` branches are trivial `if` guards on the helper's input.
+    /// `augment_add(_, None, None)` is the identity.
     #[test]
-    fn with_helpers_compose_into_one_pair() {
-        let stats = arc_schema([StructField::not_null("numRecords", DataType::LONG)]);
-        let parts = arc_schema([StructField::nullable("p", DataType::STRING)]);
-        let pair = with_partition_values(
-            with_stats(SCAN_BASE.clone(), Some(stats), /* native= */ false),
-            Some(parts),
-        );
-        assert_eq!(field_names(&pair.0), [ADD_NAME, REMOVE_NAME]);
-        let DataType::Struct(add_struct) = pair.0.field(ADD_NAME).unwrap().data_type() else {
+    fn augment_add_identity_when_no_args() {
+        let pair = augment_add(SCAN_BASE.clone(), None, None);
+        assert_eq!(field_names(&pair.0), field_names(&SCAN_BASE.0));
+        // Projection[0] is still a bare column reference, not a Transform.
+        assert!(matches!(pair.1[0].as_ref(), Expression::Column(_)));
+    }
+
+    /// Helper: extract the per-inner-field projection from `augment_add`'s `projection[0]`
+    /// (a `struct_from` expression).
+    fn add_inner_exprs(pair: &Pair) -> &[Arc<Expression>] {
+        let Expression::Struct(exprs, _) = pair.1[0].as_ref() else {
+            panic!(
+                "projection[0] must be a struct_from over add when augment_add is non-identity; \
+                 got {:?}",
+                pair.1[0]
+            );
+        };
+        exprs
+    }
+
+    /// Lookup an inner expression by the augmented add struct's field index.
+    fn inner_expr_for_field<'a>(pair: &'a Pair, field_name: &str) -> &'a Expression {
+        let DataType::Struct(add) = pair.0.field(ADD_NAME).unwrap().data_type() else {
             panic!("add slot must be a struct");
         };
-        assert!(add_struct.contains("stats_parsed"));
-        assert!(add_struct.contains("partitionValues_parsed"));
-        // Non-native stats must rebuild the add expression (parse_json wrap); only assert
-        // it's no longer a bare column.
-        assert!(!matches!(pair.1[0].as_ref(), Expression::Column(_)));
+        let idx = add
+            .fields()
+            .position(|f| f.name() == field_name)
+            .unwrap_or_else(|| panic!("field {field_name} not present"));
+        add_inner_exprs(pair)[idx].as_ref()
+    }
+
+    /// With stats only, `add` gains `stats_parsed` and the projection's matching inner slot
+    /// is a `parse_json(add.stats, schema)` expression.
+    #[test]
+    fn augment_add_stats_inserts_into_add_struct() {
+        let stats = arc_schema([StructField::not_null("numRecords", DataType::LONG)]);
+        let pair = augment_add(
+            SCAN_BASE.clone(),
+            Some((stats, /* has_parsed_stats= */ false)),
+            None,
+        );
+        let DataType::Struct(add) = pair.0.field(ADD_NAME).unwrap().data_type() else {
+            panic!("add slot must be a struct");
+        };
+        assert!(struct_field_names(add).contains(&"stats_parsed".to_string()));
+        assert!(matches!(
+            inner_expr_for_field(&pair, "stats_parsed"),
+            Expression::ParseJson(_)
+        ));
+    }
+
+    /// With native stats (`has_parsed_stats=true`) the stats_parsed slot is a bare column
+    /// reference (passthrough) instead of `parse_json`.
+    #[test]
+    fn augment_add_stats_native_passthrough() {
+        let stats = arc_schema([StructField::not_null("numRecords", DataType::LONG)]);
+        let pair = augment_add(
+            SCAN_BASE.clone(),
+            Some((stats, /* has_parsed_stats= */ true)),
+            None,
+        );
+        assert!(matches!(
+            inner_expr_for_field(&pair, "stats_parsed"),
+            Expression::Column(_)
+        ));
+    }
+
+    /// Partition values are always derived (no `has_parsed` variant) — the matching inner
+    /// slot is `map_to_struct(add.partitionValues)` regardless of any other flag.
+    #[test]
+    fn augment_add_parts_always_derived() {
+        let parts = arc_schema([StructField::nullable("p", DataType::STRING)]);
+        let pair = augment_add(SCAN_BASE.clone(), None, Some(parts));
+        let DataType::Struct(add) = pair.0.field(ADD_NAME).unwrap().data_type() else {
+            panic!("add slot must be a struct");
+        };
+        assert!(struct_field_names(add).contains(&"partitionValues_parsed".to_string()));
+        assert!(matches!(
+            inner_expr_for_field(&pair, "partitionValues_parsed"),
+            Expression::MapToStruct(_)
+        ));
+    }
+
+    /// Stats and parts compose into a single `add` struct, both inner-field exprs present.
+    #[test]
+    fn augment_add_composes_stats_and_parts() {
+        let stats = arc_schema([StructField::not_null("numRecords", DataType::LONG)]);
+        let parts = arc_schema([StructField::nullable("p", DataType::STRING)]);
+        let pair = augment_add(
+            SCAN_BASE.clone(),
+            Some((stats, /* has_parsed_stats= */ false)),
+            Some(parts),
+        );
+        // Top-level slots are unchanged.
+        assert_eq!(field_names(&pair.0), [ADD_NAME, REMOVE_NAME]);
+        let DataType::Struct(add) = pair.0.field(ADD_NAME).unwrap().data_type() else {
+            panic!("add slot must be a struct");
+        };
+        let names = struct_field_names(add);
+        assert!(names.contains(&"stats_parsed".to_string()));
+        assert!(names.contains(&"partitionValues_parsed".to_string()));
+        // Inner-projection length matches the augmented struct's field count.
+        assert_eq!(add_inner_exprs(&pair).len(), add.num_fields());
+        // Spot-check the two augmented slots.
+        assert!(matches!(
+            inner_expr_for_field(&pair, "stats_parsed"),
+            Expression::ParseJson(_)
+        ));
+        assert!(matches!(
+            inner_expr_for_field(&pair, "partitionValues_parsed"),
+            Expression::MapToStruct(_)
+        ));
     }
 
     /// `scan_file_row_pair(None)` is the four-column flat row; `Some(parts)` only changes
-    /// the *inner* `fileConstantValues` struct, never the top-level shape.
+    /// the *inner* `fileConstantValues` struct, never the top-level shape. With `Some`, the
+    /// `partitionValues_parsed` slot is a passthrough column, not a `map_to_struct` re-derivation.
     #[test]
-    fn scan_file_row_pair_shape_is_stable_across_parts() {
+    fn scan_file_row_pair_passes_parsed_partition_values_through() {
         let plain = scan_file_row_pair(None);
         assert_eq!(
             field_names(&plain.0),
@@ -296,5 +437,18 @@ mod tests {
             panic!("fileConstantValues must be a struct");
         };
         assert!(fc.contains("partitionValues_parsed"));
+
+        // The terminal projection must read partitionValues_parsed as a passthrough column.
+        let Expression::Struct(fc_exprs, _) = with_parts.1[3].as_ref() else {
+            panic!("projection[3] must be a Struct expression");
+        };
+        // partitionValues_parsed is the last entry pushed when parts is Some.
+        let last = fc_exprs.last().unwrap();
+        assert!(
+            matches!(last.as_ref(), Expression::Column(_)),
+            "partitionValues_parsed must be a bare column ref (passthrough), not a derived \
+             expression; got {:?}",
+            last,
+        );
     }
 }

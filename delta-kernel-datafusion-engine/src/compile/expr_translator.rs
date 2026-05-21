@@ -602,17 +602,15 @@ fn rebuild_struct_with_target_names(
 /// physical values intact. The recursion mirrors the kernel's column-mapping rename
 /// shape:
 ///
-/// - Struct -> Struct: recurse via [`rebuild_struct_with_target_names`] (which emits
-///   `CASE WHEN parent IS NOT NULL THEN named_struct(...) ELSE NULL END` over the
-///   children).
+/// - Struct -> Struct: recurse via [`rebuild_struct_with_target_names`] (which emits `CASE WHEN
+///   parent IS NOT NULL THEN named_struct(...) ELSE NULL END` over the children).
 /// - List / LargeList / FixedSizeList of any element -> Array: dispatch to
-///   [`rebuild_list_with_target_element`] which wraps the list in an `array_transform`
-///   lambda that recursively reshapes the element.
-/// - Everything else (primitive, Map, mismatched outer kinds): pass `base_expr` through
-///   unchanged. Primitive names flow through the parent's `named_struct` literal; Map
-///   reshape isn't implemented yet (no kernel schema in the current test corpus needs
-///   it; the engine's outer projection still produces the right top-level name via
-///   `Expr::alias`).
+///   [`rebuild_list_with_target_element`] which wraps the list in an `array_transform` lambda that
+///   recursively reshapes the element.
+/// - Everything else (primitive, Map, mismatched outer kinds): pass `base_expr` through unchanged.
+///   Primitive names flow through the parent's `named_struct` literal; Map reshape isn't
+///   implemented yet (no kernel schema in the current test corpus needs it; the engine's outer
+///   projection still produces the right top-level name via `Expr::alias`).
 fn rebuild_field_for_target(
     base_expr: Expr,
     source_dt: &ArrowDataType,
@@ -651,10 +649,7 @@ fn rebuild_list_with_target_element(
         src_elem.data_type().clone(),
         src_elem.is_nullable(),
     ));
-    let lambda_var = Expr::LambdaVariable(LambdaVariable::new(
-        "x".to_string(),
-        Some(lambda_field),
-    ));
+    let lambda_var = Expr::LambdaVariable(LambdaVariable::new("x".to_string(), Some(lambda_field)));
     let body = rebuild_field_for_target(lambda_var, src_elem.data_type(), tgt_elem_dt)?;
     Ok(array_transform(list_expr, lambda(["x"], body)))
 }
