@@ -401,7 +401,7 @@ pub(crate) mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{Metadata, Protocol, MAX_VALUES, MIN_VALUES};
     use crate::expressions::{column_expr, column_name, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
@@ -963,7 +963,7 @@ pub(crate) mod tests {
             .expect("should have physical stats schema");
 
         let min_values = stats_schema
-            .field("minValues")
+            .field(MIN_VALUES)
             .expect("should have minValues");
         if let DataType::Struct(inner) = min_values.data_type() {
             assert!(
@@ -1007,7 +1007,7 @@ pub(crate) mod tests {
 
         // Check that minValues/maxValues only contain 'value', not 'id'
         let min_values = stats_schema
-            .field("minValues")
+            .field(MIN_VALUES)
             .expect("should have minValues");
         if let DataType::Struct(inner) = min_values.data_type() {
             assert!(
@@ -1154,7 +1154,7 @@ pub(crate) mod tests {
 
         let present = ["phys_a", "phys_b"];
         let absent = ["col_a", "col_b", "phys_c"];
-        for stats_field in ["minValues", "maxValues"] {
+        for stats_field in [MIN_VALUES, MAX_VALUES] {
             let DataType::Struct(inner) = stats_schema
                 .field(stats_field)
                 .unwrap_or_else(|| panic!("should have {stats_field}"))

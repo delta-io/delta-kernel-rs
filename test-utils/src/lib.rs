@@ -10,7 +10,9 @@ pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CountingReporter, RelaxedCounter,
 };
-use delta_kernel::actions::get_log_add_schema;
+use delta_kernel::actions::{
+    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
     StringArray, StructArray,
@@ -986,12 +988,12 @@ pub fn create_add_files_metadata(
 
     let stats_struct = StructArray::from(vec![
         (
-            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
             Arc::new(num_records_array) as ArrayRef,
         ),
         (
             Arc::new(Field::new(
-                "nullCount",
+                NULL_COUNT,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -999,7 +1001,7 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "minValues",
+                MIN_VALUES,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -1007,14 +1009,14 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "maxValues",
+                MAX_VALUES,
                 ArrowDataType::Struct(empty_struct_fields),
                 true,
             )),
             Arc::new(empty_struct) as ArrayRef,
         ),
         (
-            Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+            Arc::new(Field::new(TIGHT_BOUNDS, ArrowDataType::Boolean, true)),
             Arc::new(tight_bounds_array) as ArrayRef,
         ),
     ]);

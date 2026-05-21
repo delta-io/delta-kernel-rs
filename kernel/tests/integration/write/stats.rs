@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{
     ArrayRef, BinaryArray, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
 };
@@ -199,24 +200,24 @@ async fn test_write_stats_for_complex_type_columns(
             .expect("add action should have stats"),
     )?;
 
-    assert_eq!(stats["numRecords"], 3);
+    assert_eq!(stats[NUM_RECORDS], 3);
 
     // nullCount should be present for all columns including array, map, and variant
-    assert_eq!(stats["nullCount"][&id_phys], 0);
-    assert_eq!(stats["nullCount"][&tags_phys], 1);
-    assert_eq!(stats["nullCount"][&props_phys], 1);
-    assert_eq!(stats["nullCount"][&v_phys], 1);
+    assert_eq!(stats[NULL_COUNT][&id_phys], 0);
+    assert_eq!(stats[NULL_COUNT][&tags_phys], 1);
+    assert_eq!(stats[NULL_COUNT][&props_phys], 1);
+    assert_eq!(stats[NULL_COUNT][&v_phys], 1);
 
     // minValues/maxValues should have id but NOT complex types
-    assert!(stats["minValues"][&id_phys].is_number());
-    assert!(stats["maxValues"][&id_phys].is_number());
+    assert!(stats[MIN_VALUES][&id_phys].is_number());
+    assert!(stats[MAX_VALUES][&id_phys].is_number());
     for col in [&tags_phys, &props_phys, &v_phys] {
         assert!(
-            stats["minValues"].get(col).is_none(),
+            stats[MIN_VALUES].get(col).is_none(),
             "minValues should not contain {col}"
         );
         assert!(
-            stats["maxValues"].get(col).is_none(),
+            stats[MAX_VALUES].get(col).is_none(),
             "maxValues should not contain {col}"
         );
     }
@@ -404,23 +405,23 @@ async fn test_write_stats_nested_complex_types_respect_column_limit(
             .expect("add action should have stats"),
     )?;
 
-    assert_eq!(stats["numRecords"], 3);
+    assert_eq!(stats[NUM_RECORDS], 3);
 
     // First 3 leaves: id, data.name, data.tags all get nullCount
-    assert_eq!(stats["nullCount"]["id"], 0);
-    assert_eq!(stats["nullCount"]["data"]["name"], 0);
-    assert_eq!(stats["nullCount"]["data"]["tags"], 1);
+    assert_eq!(stats[NULL_COUNT]["id"], 0);
+    assert_eq!(stats[NULL_COUNT]["data"]["name"], 0);
+    assert_eq!(stats[NULL_COUNT]["data"]["tags"], 1);
 
     // 4th leaf data.props is excluded by the column limit
     assert!(
-        stats["nullCount"]["data"].get("props").is_none(),
+        stats[NULL_COUNT]["data"].get("props").is_none(),
         "props should be excluded by numIndexedCols=3"
     );
 
     // id and data.name get min/max; data.tags does not (complex type)
-    assert!(stats["minValues"]["id"].is_number());
-    assert!(stats["minValues"]["data"]["name"].is_string());
-    assert!(stats["minValues"]["data"].get("tags").is_none());
+    assert!(stats[MIN_VALUES]["id"].is_number());
+    assert!(stats[MIN_VALUES]["data"]["name"].is_string());
+    assert!(stats[MIN_VALUES]["data"].get("tags").is_none());
 
     Ok(())
 }
