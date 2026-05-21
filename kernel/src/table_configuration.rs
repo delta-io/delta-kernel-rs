@@ -21,15 +21,15 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
-use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name,
+    column_mapping_mode, get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
     LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
     MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -204,7 +204,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
-        validate_iceberg_compat_v3_no_legacy_nested_id(&table_config)?;
+        validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
         Ok(table_config)
     }

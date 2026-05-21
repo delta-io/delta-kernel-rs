@@ -10,6 +10,8 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id, SeenColumnMappingAnnotations,
 };
 use delta_kernel_derive::internal_api;
+pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -25,6 +27,7 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+mod iceberg_compat;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
