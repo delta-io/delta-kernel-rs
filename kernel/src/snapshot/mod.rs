@@ -1135,8 +1135,8 @@ impl Snapshot {
     ///   version (e.g. a snapshot loaded from disk that has no CRC file), if the CRC's
     ///   `file_stats_state` is `Indeterminate` (a non-incremental operation like ANALYZE STATS was
     ///   encountered, or a file action had a missing size; recoverable with a full state
-    ///   reconstruction in the future), or if `inCommitTimestampOpt` presence does not match
-    ///   `delta.enableInCommitTimestamps`.
+    ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
+    ///   `inCommitTimestampOpt` is absent.
     /// - I/O errors from the engine's storage handler if the write fails.
     ///
     /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot

@@ -3,6 +3,7 @@
 use url::Url;
 
 use super::Crc;
+use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error};
 
@@ -12,7 +13,7 @@ use crate::{DeltaResult, Engine, Error};
 /// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
 /// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
 ///   representation); or
-/// - `inCommitTimestampOpt` presence does not match `delta.enableInCommitTimestamps`.
+/// - `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
 ///
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
@@ -25,18 +26,19 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
             crc.file_stats_state
         ))
     );
+    // If ICT is enabled, the CRC must carry an ICT value.
     let ict_enabled = crc
         .metadata
-        .parse_table_properties()
-        .enable_in_commit_timestamps
-        == Some(true);
+        .configuration()
+        .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+        .is_some_and(|v| v == "true");
     let ict_value_present = crc.in_commit_timestamp_opt.is_some();
     require!(
-        ict_enabled == ict_value_present,
-        Error::ChecksumWriteUnsupported(format!(
-            "Cannot write CRC file: inCommitTimestampOpt present={ict_value_present} \
-             but In-Commit Timestamps enabled={ict_enabled}"
-        ))
+        !ict_enabled || ict_value_present,
+        Error::ChecksumWriteUnsupported(
+            "Cannot write CRC file: In-Commit Timestamps enabled but inCommitTimestampOpt is absent"
+                .to_string()
+        )
     );
     let data = serde_json::to_vec(crc)?;
     engine
@@ -69,19 +71,19 @@ mod tests {
         (engine, crc_path)
     }
 
-    fn test_crc(ict_enabled: bool) -> Crc {
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::ColumnMapping],
-            [
-                TableFeature::ColumnMapping,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-                TableFeature::InCommitTimestamp,
-            ],
-        )
-        .unwrap();
+    fn test_crc(ict_supported: bool, ict_enabled: bool) -> Crc {
+        let mut writer_features = vec![
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ];
+        if ict_supported {
+            writer_features.push(TableFeature::InCommitTimestamp);
+        }
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], writer_features).unwrap();
         let metadata = if ict_enabled {
-            Metadata::default().with_configuration_entry("delta.enableInCommitTimestamps", "true")
+            Metadata::default().with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "true")
         } else {
             Metadata::default()
         };
@@ -123,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_serde_round_trip() {
-        let crc = test_crc(true);
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         let json_bytes = serde_json::to_vec(&crc).unwrap();
         let round_tripped: Crc = serde_json::from_slice(&json_bytes).unwrap();
 
@@ -133,7 +135,7 @@ mod tests {
     #[test]
     fn test_write_then_read_crc_file() {
         let (engine, crc_path) = writer_test_env();
-        let crc = test_crc(true);
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
@@ -144,7 +146,7 @@ mod tests {
     /// Verify JSON content produced by CRC serialization via serde_json::Value comparison.
     #[test]
     fn test_crc_serialized_json_content() {
-        let crc = test_crc(true);
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         let actual: serde_json::Value = serde_json::to_value(&crc).unwrap();
 
         // Verify non-histogram fields match exactly.
@@ -220,7 +222,7 @@ mod tests {
     #[test]
     fn test_write_crc_file_already_exists() {
         let (engine, crc_path) = writer_test_env();
-        let crc = test_crc(true);
+        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
@@ -232,25 +234,30 @@ mod tests {
     #[test]
     fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported() {
         let (engine, crc_path) = writer_test_env();
-        let mut crc = test_crc(true);
+        let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         crc.file_stats_state = FileStatsState::Indeterminate;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
     }
 
     #[rstest]
+    #[case::not_supported(false, false)]
+    #[case::supported_not_enabled(true, false)]
+    #[case::supported_and_enabled(true, true)]
     fn test_write_enforces_ict_enablement_value_consistency(
-        #[values(false, true)] ict_enabled: bool,
+        #[case] ict_supported: bool,
+        #[case] ict_enabled: bool,
         #[values(false, true)] ict_value_present: bool,
     ) {
         let (engine, crc_path) = writer_test_env();
 
-        let mut crc = test_crc(ict_enabled);
+        let mut crc = test_crc(ict_supported, ict_enabled);
         if !ict_value_present {
             crc.in_commit_timestamp_opt = None;
         }
 
-        let should_succeed = ict_enabled == ict_value_present;
+        // If ICT is enabled, then the ICT value must be present.
+        let should_succeed = !ict_enabled || ict_value_present;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         if should_succeed {
             result.unwrap();
