@@ -1,13 +1,10 @@
-// Snapshot wiring lands in a follow-up PR; until then there's no production caller, and
-// in-file unit tests drive the accumulator directly without going through the visitor.
 #![allow(dead_code)]
 
 //! Reverse log replay for incremental CRC construction.
 //!
 //! Reverse-replays a log segment's commit files to produce a [`CrcDelta`] covering
-//! commits `(X, Y]`. Per the incremental equation `Crc[X] + CrcDelta = Crc[Y]`,
-//! that delta is then either applied to a stale base via [`Crc::apply`]
-//! ([`LogSegment::build_incremental_crc_from_stale`]) or materialized directly as a fresh CRC.
+//! commits `(X, Y]`. Per the incremental equation `Crc[X] + CrcDelta = Crc[Y]`, that
+//! delta is applied to a stale base via [`Crc::apply`].
 //
 // TODO: see if we can support log compaction files.
 
@@ -24,7 +21,9 @@ use crate::actions::{
 };
 use crate::crc::{is_incremental_safe_operation, Crc, CrcDelta, FileSizeHistogram};
 use crate::engine_data::{GetData, TypedGetData as _};
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef};
+use crate::schema::{
+    column_name, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, RowVisitor, Version};
 
@@ -42,7 +41,10 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         ])
         .expect("project_as_struct on commit schema");
     let with_file = projected
-        .add_metadata_column("_file", MetadataColumnSpec::FilePath)
+        .add_metadata_column(
+            MetadataColumnSpec::FilePath.text_value(),
+            MetadataColumnSpec::FilePath,
+        )
         .expect("add _file metadata column");
     Arc::new(with_file)
 });
@@ -74,7 +76,6 @@ impl LogSegment {
     ///
     /// Errors if `base_version >= self.end_version` or if the segment is missing the
     /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
-    #[instrument(name = "log_seg.build_incremental_crc_delta", skip_all, err)]
     pub(crate) fn build_incremental_crc_delta(
         &self,
         engine: &dyn Engine,
@@ -89,14 +90,14 @@ impl LogSegment {
                 base_version, self.end_version,
             ))
         );
-        
+
         let deltas: Vec<_> = self
             .listed
             .ascending_commit_files
             .iter()
             .filter(|c| c.version > base_version)
             .collect();
-        
+
         let first_above = deltas.first().map(|c| c.version);
         require!(
             first_above == Some(base_version + 1),
@@ -161,13 +162,13 @@ struct CrcReplayAccumulator {
     current_file_url: Option<String>,
 
     /// True if the current commit had at least one add/remove row. Combined with
-    /// `current_commit_saw_commit_info` for the per-commit invariant check.
+    /// `current_commit_saw_safe_op` for the per-commit invariant check.
     current_commit_saw_file_action: bool,
 
-    /// True if the current commit had a commitInfo row. Without one we can't classify the
-    /// operation as incremental-safe, so the per-commit invariant defaults the delta to
-    /// non-incremental-safe.
-    current_commit_saw_commit_info: bool,
+    /// True if the current commit had a commitInfo row whose `operation` was in the
+    /// [`is_incremental_safe_operation`] safelist. If false at commit end and the commit
+    /// had file actions, we can't trust the file-stats delta and mark it unsafe.
+    current_commit_saw_safe_op: bool,
 }
 
 impl CrcReplayAccumulator {
@@ -184,7 +185,7 @@ impl CrcReplayAccumulator {
             is_first_commit: true,
             current_file_url: None,
             current_commit_saw_file_action: false,
-            current_commit_saw_commit_info: false,
+            current_commit_saw_safe_op: false,
         }
     }
 
@@ -201,27 +202,34 @@ impl CrcReplayAccumulator {
     }
 
     fn process_commit_file_end(&mut self) {
-        // File actions without a commitInfo: we can't classify the operation, so the
-        // delta is no longer incremental-safe. `is_incremental_safe` is one-way (once
-        // false, never restored).
-        if self.current_commit_saw_file_action && !self.current_commit_saw_commit_info {
+        // `is_incremental_safe` is one-way; once false, this check has nothing to set.
+        if !self.delta.is_incremental_safe {
+            return;
+        }
+        // File actions without a safe-classified operation: we can't trust file stats.
+        // Covers both "no commitInfo at all" and "commitInfo with no `operation` field".
+        if self.current_commit_saw_file_action && !self.current_commit_saw_safe_op {
             warn!(
-                "CRC reverse-replay: commit at {} carried file actions but no commitInfo; \
-                 defaulting to non-incremental-safe",
+                "CRC reverse-replay: commit at {} carried file actions but no safe-classified \
+                 operation; defaulting to non-incremental-safe",
                 self.current_file_url.as_deref().unwrap_or("?")
             );
             self.delta.is_incremental_safe = false;
         }
         self.current_commit_saw_file_action = false;
-        self.current_commit_saw_commit_info = false;
+        self.current_commit_saw_safe_op = false;
     }
 
     // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
 
+    /// Called by the visitor once per commitInfo row (gated on operation or ict being
+    /// present). Handles both pieces: `operation` drives per-commit safety classification,
+    /// `ict` is captured into the delta from the newest commit only.
     fn on_commit_info(&mut self, operation: Option<&str>, ict: Option<i64>) {
-        self.current_commit_saw_commit_info = true;
         if let Some(op) = operation {
-            if !is_incremental_safe_operation(op) {
+            if is_incremental_safe_operation(op) {
+                self.current_commit_saw_safe_op = true;
+            } else {
                 warn!("CRC reverse-replay: non-incremental op {op}");
                 self.delta.is_incremental_safe = false;
             }
@@ -233,6 +241,12 @@ impl CrcReplayAccumulator {
 
     fn on_add(&mut self, size: i64) -> DeltaResult<()> {
         self.current_commit_saw_file_action = true;
+        // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
+        // file-stats state to `Indeterminate` and discard `net_files`/`net_bytes`/histogram.
+        // Stop accumulating; further math is wasted work.
+        if !self.delta.is_incremental_safe {
+            return Ok(());
+        }
         let fs = &mut self.delta.file_stats;
         fs.net_files += 1;
         fs.net_bytes += size;
@@ -246,6 +260,12 @@ impl CrcReplayAccumulator {
     /// tracking impossible.
     fn on_remove(&mut self, path: &str, size: Option<i64>) -> DeltaResult<()> {
         self.current_commit_saw_file_action = true;
+        // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
+        // file-stats state to `Indeterminate` and discard `net_files`/`net_bytes`/histogram.
+        // Stop accumulating; further math is wasted work.
+        if !self.delta.is_incremental_safe {
+            return Ok(());
+        }
         match size {
             Some(s) => {
                 let fs = &mut self.delta.file_stats;
@@ -292,7 +312,7 @@ impl CrcReplayAccumulator {
 // ============================================================================
 
 // ===== Visitor column indices =====
-// Must match the order in `selected_column_names_and_types` below.
+// Indices into the column list returned by [`CrcReplayVisitor::selected_column_names_and_types`].
 const COL_FILE: usize = 0;
 const COL_OP: usize = 1;
 const COL_ICT: usize = 2;
@@ -315,45 +335,33 @@ struct CrcReplayVisitor<'a> {
 impl RowVisitor for CrcReplayVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            (
-                vec![
-                    ColumnName::new(["_file"]),
-                    ColumnName::new(["commitInfo", "operation"]),
-                    ColumnName::new(["commitInfo", "inCommitTimestamp"]),
-                    ColumnName::new(["add", "size"]),
-                    ColumnName::new(["remove", "path"]),
-                    ColumnName::new(["remove", "size"]),
-                    ColumnName::new(["domainMetadata", "domain"]),
-                    ColumnName::new(["domainMetadata", "configuration"]),
-                    ColumnName::new(["domainMetadata", "removed"]),
-                    ColumnName::new(["txn", "appId"]),
-                    ColumnName::new(["txn", "version"]),
-                    ColumnName::new(["txn", "lastUpdated"]),
-                ],
-                vec![
-                    DataType::STRING,
-                    DataType::STRING,
-                    DataType::LONG,
-                    DataType::LONG,
-                    DataType::STRING,
-                    DataType::LONG,
-                    DataType::STRING,
-                    DataType::STRING,
-                    DataType::BOOLEAN,
-                    DataType::STRING,
-                    DataType::LONG,
-                    DataType::LONG,
-                ],
-            )
-                .into()
+            const STRING: DataType = DataType::STRING;
+            const LONG: DataType = DataType::LONG;
+            const BOOLEAN: DataType = DataType::BOOLEAN;
+            let types_and_names = vec![
+                (STRING, column_name!("_file")),
+                (STRING, column_name!("commitInfo.operation")),
+                (LONG, column_name!("commitInfo.inCommitTimestamp")),
+                (LONG, column_name!("add.size")),
+                (STRING, column_name!("remove.path")),
+                (LONG, column_name!("remove.size")),
+                (STRING, column_name!("domainMetadata.domain")),
+                (STRING, column_name!("domainMetadata.configuration")),
+                (BOOLEAN, column_name!("domainMetadata.removed")),
+                (STRING, column_name!("txn.appId")),
+                (LONG, column_name!("txn.version")),
+                (LONG, column_name!("txn.lastUpdated")),
+            ];
+            let (types, names): (Vec<_>, Vec<_>) = types_and_names.into_iter().unzip();
+            (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 12,
-            Error::InternalError(format!(
+            getters.len() == COL_TXN_LAST_UPDATED + 1,
+            Error::internal_error(format!(
                 "Wrong number of CrcReplayVisitor getters: {}",
                 getters.len()
             ))
@@ -430,14 +438,22 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_commit_info(Some("ANALYZE STATS"), None);
         assert!(!acc.delta.is_incremental_safe);
-        assert!(acc.current_commit_saw_commit_info);
+        assert!(!acc.current_commit_saw_safe_op);
     }
 
     #[test]
-    fn on_commit_info_ict_only_no_operation_still_marks_seen() {
+    fn on_commit_info_safe_op_marks_saw_safe_op() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.on_commit_info(Some("WRITE"), None);
+        assert!(acc.current_commit_saw_safe_op);
+        assert!(acc.delta.is_incremental_safe);
+    }
+
+    #[test]
+    fn on_commit_info_ict_only_no_operation_does_not_mark_saw_safe_op() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_commit_info(None, Some(1234));
-        assert!(acc.current_commit_saw_commit_info);
+        assert!(!acc.current_commit_saw_safe_op);
         assert!(acc.delta.is_incremental_safe);
         assert_eq!(acc.delta.in_commit_timestamp, Some(1234));
     }
@@ -526,7 +542,7 @@ mod tests {
     // ===== auxiliary =====
 
     #[test]
-    fn histogram_inherits_seed_boundaries() {
+    fn accumulator_with_seed_histogram_inserts_into_seeded_bin() {
         let seed = FileSizeHistogram::create_empty_with_boundaries(vec![0, 200, 1000]).unwrap();
         let mut acc = CrcReplayAccumulator::new(Some(seed));
         acc.on_add(150).unwrap();
@@ -537,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn no_seed_histogram_means_no_delta_histogram() {
+    fn accumulator_with_no_seed_histogram_keeps_delta_histogram_none() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_add(150).unwrap();
         assert!(acc.delta.file_stats.net_histogram.is_none());
@@ -579,11 +595,21 @@ mod tests {
     }
 
     #[test]
-    fn per_commit_invariant_trips_when_file_action_has_no_commit_info_across_batches() {
+    fn per_commit_invariant_trips_when_file_action_has_no_safe_op_across_batches() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v1.json");
         acc.on_add(0).unwrap();
         acc.process_batch_start("v1.json");
+        acc.process_commit_file_end();
+        assert!(!acc.delta.is_incremental_safe);
+    }
+
+    #[test]
+    fn per_commit_invariant_trips_when_file_action_has_commit_info_but_no_operation() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v1.json");
+        acc.on_add(100).unwrap();
+        acc.on_commit_info(None, Some(42));
         acc.process_commit_file_end();
         assert!(!acc.delta.is_incremental_safe);
     }
@@ -626,8 +652,8 @@ mod tests {
         let root = "memory:///t/";
 
         // v0: bootstrap. Protocol already supports `domainMetadata` and `inCommitTimestamp`
-        // so the v1 DM action and v2 commitInfo with ICT are well-formed. Outside the
-        // replay range -- segment covers (0, 2].
+        // so the v1 DM action and v2 commitInfo with ICT are well-formed. v0 is outside
+        // the replay range; the segment covers (0, 2].
         add_commit(root, store.as_ref(), 0, r#"
 {"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["domainMetadata","inCommitTimestamp"]}}
 {"metaData":{"id":"id-0","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":0}}
@@ -657,7 +683,7 @@ mod tests {
         // new metadata, DM tombstone, second txn, one remove (bin 0), commitInfo with ICT.
         add_commit(root, store.as_ref(), 2, r#"
 {"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["domainMetadata","inCommitTimestamp","rowTracking"]}}
-{"metaData":{"id":"id-2","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":2}}
+{"metaData":{"id":"id-2","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableRowTracking":"true"},"createdTime":2}}
 {"remove":{"path":"a","deletionTimestamp":2,"dataChange":true,"size":100}}
 {"domainMetadata":{"domain":"drop","configuration":"","removed":true}}
 {"txn":{"appId":"app2","version":5,"lastUpdated":2}}
@@ -693,9 +719,7 @@ mod tests {
         // features), v2's metadata, v2's ICT.
         assert_eq!(crc.version, 2);
         assert_eq!(crc.protocol.min_writer_version(), 7);
-        assert!(crc
-            .protocol
-            .has_table_feature(&TableFeature::RowTracking));
+        assert!(crc.protocol.has_table_feature(&TableFeature::RowTracking));
         assert!(crc
             .protocol
             .has_table_feature(&TableFeature::InCommitTimestamp));
@@ -730,5 +754,45 @@ mod tests {
         assert_eq!(hist.total_bytes()[1], 10_000);
         assert_eq!(hist.file_counts()[2], 1);
         assert_eq!(hist.total_bytes()[2], 20_000);
+    }
+
+    #[tokio::test]
+    async fn build_incremental_crc_delta_errors_when_base_version_geq_end_version() {
+        use std::sync::Arc;
+
+        use test_utils::add_commit;
+
+        use crate::engine::sync::SyncEngine;
+        use crate::object_store::memory::InMemory;
+
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let root = "memory:///t/";
+        add_commit(
+            root,
+            store.as_ref(),
+            0,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#.to_string(),
+        )
+        .await
+        .unwrap();
+        let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
+        let segment = LogSegment::for_snapshot_impl(
+            engine.storage_handler().as_ref(),
+            log_root,
+            vec![],
+            None,
+            Some(0),
+        )
+        .unwrap();
+        for base in [0, 5] {
+            let err = segment
+                .build_incremental_crc_delta(&engine, base, None)
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InternalError(_)),
+                "base={base}: {err:?}"
+            );
+        }
     }
 }
