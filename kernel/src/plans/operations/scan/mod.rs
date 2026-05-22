@@ -10,6 +10,7 @@ pub mod full_state;
 mod plans;
 mod retention;
 mod schemas;
+mod ssa_reconciliation;
 
 pub use full_state::{FullState, FullStateBuilder};
 pub use plans::CommitFileMeta;

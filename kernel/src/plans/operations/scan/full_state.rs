@@ -30,10 +30,13 @@ use super::dedup::fsr_dedup_key;
 // Re-export for callers that need a stable type for the FSR commit-file row.
 pub use super::plans::CommitFileMeta;
 use super::plans::{execute_reconciliation, RECONCILED};
+use super::ssa_reconciliation::execute_reconciliation_ssa;
 use crate::plans::errors::{DeltaError, KernelErrAsDelta};
+use crate::plans::ir::ssa::ResultPlan as SsaResultPlan;
 use crate::plans::ir::{RelationRegistry, ResultPlan};
 use crate::plans::operations::framework::coroutine::context::Context;
 use crate::plans::operations::framework::coroutine::driver::Coroutine;
+use crate::plans::operations::framework::plan_context::Context as SsaContext;
 use crate::scan::state_info::StateInfo;
 use crate::scan::StatsOutputMode;
 use crate::snapshot::Snapshot;
@@ -95,6 +98,39 @@ impl FullState {
             // to FSR_RESULTS so the terminal handle's logical full-name reads `fsr.results`.
             ctx.relation_ref(RECONCILED)?
                 .into_result_plan(FSR_RESULTS, &mut ctx)
+        })
+    }
+
+    /// SSA-flavored coroutine SM. Runs the same FSR semantics as [`Self::state_machine`]
+    /// but builds against [`crate::plans::operations::framework::plan_context::Context`]
+    /// (SSA / Cursor API) and yields a single
+    /// [`SsaResultPlan`](crate::plans::ir::ssa::ResultPlan) containing the entire
+    /// reconciliation as one flat SSA program. Engines drive this through
+    /// `drive_ssa_to_dataframe` (no relation registry, no per-stage `Step::Plans`).
+    ///
+    /// Both flavors stay live during the migration: the legacy SM is consumed by
+    /// `engine.full_state(&fsr)` callers today, and the SSA SM is the target for PR6's
+    /// engine-side roll-up. After PR7 migrates Scan and PR8 deletes the legacy
+    /// `RelationRegistry` / `Step::Plans` plumbing, [`Self::state_machine`] retires.
+    pub fn state_machine_ssa(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
+        let snapshot = self.snapshot.clone();
+        let state_info = self.state_info.clone();
+        Coroutine::new("fsr_ssa", move |mut co, _sm_id| async move {
+            let ctx = SsaContext::new();
+            let stats = state_info
+                .as_ref()
+                .and_then(|si| si.physical_stats_schema.clone());
+            let reconciled = execute_reconciliation_ssa(
+                &ctx,
+                &mut co,
+                snapshot.as_ref(),
+                &FSR_BASE,
+                stats,
+                /* parts= */ None,
+                Arc::new(fsr_dedup_key()),
+            )
+            .await?;
+            ctx.into_result_plan(reconciled)
         })
     }
 }

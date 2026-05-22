@@ -421,6 +421,39 @@ impl Cursor {
         self.project(pairs)
     }
 
+    /// Append a caller-typed `(field, expr)` after the existing fields. Use when the
+    /// expression's output type can't be derived by [narrow
+    /// inference](crate::plans::ir::schema_inference) (e.g. a `CaseWhen` returning an
+    /// `Array`, where inference returns an error and forces the caller into
+    /// [`Self::project_with_schema`]). The supplied [`StructField`] declares both the
+    /// new column's name and its full nullability + data type.
+    pub fn append_col_typed(
+        self,
+        field: StructField,
+        expr: impl Into<ExpressionRef>,
+    ) -> Result<Self, DeltaError> {
+        let expr = expr.into();
+        let input_schema = self.schema()?;
+        let mut named_exprs: Vec<(String, ExpressionRef)> = input_schema
+            .fields()
+            .map(|f| {
+                let name = f.name().clone();
+                (name.clone(), Arc::new(Expression::column([name])) as ExpressionRef)
+            })
+            .collect();
+        let mut fields: Vec<StructField> = input_schema.fields().cloned().collect();
+        let new_name = field.name().clone();
+        named_exprs.push((new_name, expr));
+        fields.push(field);
+        let output_schema: SchemaRef = arc_struct_or_invariant(fields)?;
+        push_unary(
+            &self.state,
+            &self,
+            Node::Project { named_exprs },
+            output_schema,
+        )
+    }
+
     /// Insert `(name, expr)` before all existing fields.
     pub fn prepend_col(
         self,
