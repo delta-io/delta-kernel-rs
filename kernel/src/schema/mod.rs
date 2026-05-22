@@ -2174,7 +2174,7 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
-struct MakePhysical<'a> {
+pub(crate) struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
     logical_path: Vec<&'a str>,
@@ -2186,6 +2186,9 @@ struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
+    /// When `true`, skips the physical-name + metadata rewrite, only validates the column
+    /// mapping annotations.
+    validation_only: bool,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -2194,7 +2197,20 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
+            validation_only: false,
         }
+    }
+
+    /// Walks `schema` and validates its column-mapping annotations.
+    pub(crate) fn validate_struct(
+        mode: ColumnMappingMode,
+        schema: &'a StructType,
+    ) -> DeltaResult<()> {
+        let mut walker = Self {
+            validation_only: true,
+            ..Self::new(mode)
+        };
+        walker.transform_struct(schema).map(|_| ())
     }
 
     fn transform_inner<T>(
@@ -2245,10 +2261,11 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
         self.transform_inner(field.name(), |this| {
             let field = this.recurse_into_struct_field(field)?;
-
+            if this.validation_only {
+                return Ok(field);
+            }
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
             let name = physical_name.to_owned();
-
             Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
         })
     }
