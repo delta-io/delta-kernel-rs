@@ -16,7 +16,7 @@ use crate::{FileMeta, FileSlice, PredicateRef};
 pub enum Plan {
     /// A singular I/O operation that returns concretely typed data such as bytes or file metadata.
     IOOperation(IOOperation),
-    /// A data-intensive query on relational data, expressed through a SQL-like plan algebra.
+    /// A query on relational-like data, expressed through a plan algebra.
     QueryPlan(QueryPlan),
 }
 
@@ -26,12 +26,12 @@ pub enum Plan {
 /// is documented on the variant in terms of [`PlanResult`](super::PlanResult).
 #[derive(Debug)]
 pub enum IOOperation {
-    /// List files at the given URL.
+    /// Recursively list files at the given URL.
     ///
     /// Should return a [`PlanResult::FileMetaIter`](super::PlanResult::FileMetaIter) with one
     /// entry per file. Files are returned sorted lexicographically by path. If the URL is
-    /// directory-like (ends with '/'), all files in that directory are listed. Otherwise,
-    /// files lexicographically greater than the given path are listed.
+    /// directory-like (ends with '/'), all files (recursively)in that directory are listed.
+    /// Otherwise, files lexicographically greater than the given path are listed.
     FileListing {
         /// The URL to list from.
         url: Url,
@@ -113,7 +113,7 @@ impl IOOperation {
     }
 }
 
-/// Representation of a SQL-like query on relational data.
+/// Representation of a query on relational data.
 ///
 /// TODO: We expect this to evolve as we flesh out the plan algebra (e.g. towards SSA form
 /// with multiple linked nodes), but for now a [`QueryPlan`] holds a single [`QueryPlanNode`].

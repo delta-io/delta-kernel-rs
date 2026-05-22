@@ -31,8 +31,8 @@ pub enum PlanResult {
     FileMeta(FileMeta),
     /// An unbounded iterator of file metadata entries.
     FileMetaIter(DeltaResultIterator<FileMeta>),
-    /// An unbounded iterator of raw byte buffers
+    /// An unbounded iterator of raw byte buffers.
     BytesIter(DeltaResultIterator<Bytes>),
-    /// Represents the successful completion of a plan, but with no return value
+    /// Represents the successful completion of a plan, but with no return value.
     Unit,
 }
