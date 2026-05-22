@@ -36,7 +36,7 @@ pub enum IoOperation {
     /// Read raw bytes from one or more files (or byte ranges within files).
     ///
     /// Each [`FileSlice`] specifies a file URL and an optional byte range. Results are returned
-    /// as [`PlanResult::BytesIter`](super::PlanResult::BytesIter) in the same order as the
+    /// as [`PlanResult::Bytes`](super::PlanResult::Bytes) in the same order as the
     /// input slices, with one Bytes buffer per file slice.
     ReadBytes { files: Vec<FileSlice> },
     /// Write raw bytes to a file at the given URL.
