@@ -796,8 +796,8 @@ impl Snapshot {
     /// Approximate owned heap size in bytes for this snapshot.
     ///
     /// Includes the two dominant per-snapshot heap contributors:
-    /// 1. Listed file metadatas (file name, location, ...).
-    /// 2. The raw `schemaString` JSON(raw string for the schema).
+    /// 1. Listed file metadata (e.g., file name, location).
+    /// 2. The raw `schemaString` JSON(raw string of the schema).
     ///
     /// Excludes shared schemas (the logical and physical schemas on `TableConfiguration`):
     /// these are `Arc`-shared across snapshots.
@@ -829,11 +829,13 @@ impl Snapshot {
             bytes += per_path_heap(p);
         }
         if let Some(p) = &files.latest_crc_file {
-            bytes += size_of::<ParsedLogPath>() + per_path_heap(p);
+            bytes += per_path_heap(p);
         }
         if let Some(p) = &files.latest_commit_file {
-            bytes += size_of::<ParsedLogPath>() + per_path_heap(p);
+            bytes += per_path_heap(p);
         }
+
+        bytes += self.log_segment.log_root.as_str().len();
 
         bytes += self.table_configuration().metadata().schema_string().len();
 
@@ -3830,7 +3832,7 @@ mod tests {
     // === approximate_heap_size ===
 
     #[test]
-    fn approximate_heap_size_on_table_with_many_log_files() {
+    fn approximate_owned_heap_size_on_table_with_many_log_files() {
         // Test table with 100 commits.
         let (_engine, snap, _table) = test_utils::test_context!(
             LogState::with_latest_version(100),
@@ -3853,7 +3855,7 @@ mod tests {
     /// Two tables that differ only in schema width: the wider schema should bump
     /// approximate_owned_heap_size by approximately the schemaString delta.
     #[test]
-    fn approximate_heap_size_reflects_schema_string() {
+    fn approximate_owned_heap_size_reflects_schema_string() {
         fn snap_with_schema(schema: SchemaRef) -> SnapshotRef {
             let store = Arc::new(InMemory::new());
             let engine = SyncEngine::new_with_store(store);
@@ -3903,7 +3905,7 @@ mod tests {
     }
 
     #[test]
-    fn approximate_heap_size_for_version_zero() {
+    fn approximate_owned_heap_size_for_version_zero() {
         let table = TestTableBuilder::new().build().unwrap();
         let engine = SyncEngine::new_with_store(table.store().clone());
         let snapshot = Snapshot::builder_for(table.table_root())
