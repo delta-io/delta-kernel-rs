@@ -11,13 +11,16 @@ use std::sync::Arc;
 use super::action_pair::scan_file_row_pair;
 use super::dedup::scan_file_dedup_key;
 use super::plans::{execute_reconciliation, RECONCILED};
+use super::ssa_scan::build_scan_ssa;
 use crate::delta_error;
 use crate::expressions::{col, ColumnName, Expression, Transform};
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns};
+use crate::plans::ir::ssa::ResultPlan as SsaResultPlan;
 use crate::plans::ir::{RelationRegistry, ResultPlan};
 use crate::plans::operations::framework::coroutine::context::Context;
 use crate::plans::operations::framework::coroutine::driver::Coroutine;
+use crate::plans::operations::framework::plan_context::Context as SsaContext;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{row_id_coalesce_expr, FieldTransformSpec};
@@ -154,6 +157,41 @@ impl Scan {
         Coroutine::new("scan", move |mut co, sm_id| async move {
             let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, "scan"));
             scan.build_plans(&mut ctx, /* with_data= */ true).await
+        })
+    }
+
+    /// SSA-flavored coroutine SM for metadata-only scan execution.
+    ///
+    /// Counterpart to [`Self::scan_metadata_state_machine`] -- runs the same scan
+    /// semantics (live-actions stream after FSR reconciliation + flat
+    /// `scan_file_row` projection) but builds the entire pipeline as a single SSA
+    /// program against the cursor API and yields a single
+    /// [`SsaResultPlan`](crate::plans::ir::ssa::ResultPlan). Engines drive this
+    /// through `drive_ssa_to_dataframe` (no relation registry, no per-stage
+    /// `Step::Plans`).
+    ///
+    /// Both flavors stay live during the migration; PR8 retires the legacy SM.
+    pub fn scan_metadata_state_machine_ssa(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
+        let scan = self.clone();
+        Coroutine::new("scan_metadata_ssa", move |mut co, _sm_id| async move {
+            let ctx = SsaContext::new();
+            let live_actions = build_scan_ssa(&ctx, &mut co, &scan, /* with_data= */ false).await?;
+            ctx.into_result_plan(live_actions)
+        })
+    }
+
+    /// SSA-flavored coroutine SM for combined metadata + data scan execution.
+    ///
+    /// Counterpart to [`Self::scan_state_machine`]. Pipeline matches the legacy SM:
+    /// shape-resolution yields, then the entire reconciliation + flat scan-file
+    /// projection + per-file Load + logical projection are appended into a single
+    /// SSA program.
+    pub fn scan_state_machine_ssa(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
+        let scan = self.clone();
+        Coroutine::new("scan_ssa", move |mut co, _sm_id| async move {
+            let ctx = SsaContext::new();
+            let data = build_scan_ssa(&ctx, &mut co, &scan, /* with_data= */ true).await?;
+            ctx.into_result_plan(data)
         })
     }
 }

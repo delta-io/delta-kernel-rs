@@ -11,6 +11,7 @@ mod plans;
 mod retention;
 mod schemas;
 mod ssa_reconciliation;
+mod ssa_scan;
 
 pub use full_state::{FullState, FullStateBuilder};
 pub use plans::CommitFileMeta;
