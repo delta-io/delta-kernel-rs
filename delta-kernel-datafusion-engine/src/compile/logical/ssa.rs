@@ -124,16 +124,18 @@ fn lower_stmt(
             let pred = kernel_pred_to_df(predicate.as_ref())?;
             LogicalPlanBuilder::from(child).filter(pred)?.build()
         }
-        Node::Project { named_exprs } => {
+        Node::Project {
+            named_exprs,
+            output_schema,
+        } => {
             let child = lookup(built, expect_one_input(stmt)?)?.clone();
-            // Re-derive the output kernel schema so we can reuse the legacy
-            // `compile_project_node` helper (it consumes a `ProjectNode` whose
-            // `output_schema` informs collision avoidance + name canonicalization).
-            let input_kernel = kernel_schema_from_logical(&child)?;
-            let output_schema = derive_project_output_schema(named_exprs, &input_kernel)?;
+            // SSA `Node::Project` carries its declared output schema; the engine
+            // does not re-infer it. Reuse the legacy `compile_project_node` helper
+            // (it consumes a `ProjectNode` whose `output_schema` informs collision
+            // avoidance + name canonicalization).
             let project_node = ProjectNode {
                 columns: named_exprs.iter().map(|(_, e)| Arc::clone(e)).collect(),
-                output_schema,
+                output_schema: Arc::clone(output_schema),
             };
             compile_project_node(child, &project_node)
         }
@@ -216,51 +218,6 @@ fn kernel_schema_from_logical(plan: &LogicalPlan) -> Result<StructType, DataFusi
             "compile_ssa: arrow -> kernel schema conversion failed: {e}",
         ))
     })
-}
-
-/// Build the Project output kernel schema by inferring each `(name, expr)` pair's output
-/// type against `input_schema`. Falls back to `DataType::STRING` (with `nullable: true`)
-/// when narrow inference can't resolve the type -- the cursor would have already validated
-/// the expression at construction time, so this is a defense-in-depth path.
-fn derive_project_output_schema(
-    named_exprs: &[(String, Arc<Expression>)],
-    input_schema: &StructType,
-) -> Result<SchemaRef, DataFusionError> {
-    use delta_kernel::schema::StructField;
-    let mut fields = Vec::with_capacity(named_exprs.len());
-    for (name, expr) in named_exprs {
-        // Best-effort: prefer kernel inference, fall back to walking the arrow schema for
-        // simple column references. The cursor already validated this; failures here only
-        // happen for hand-built SSA plans.
-        let ty = infer_expression_type_or_walk(expr.as_ref(), input_schema)?;
-        fields.push(StructField::nullable(name.clone(), ty));
-    }
-    StructType::try_new(fields)
-        .map(Arc::new)
-        .map_err(|e| plan_compilation(format!("compile_ssa: project output schema invalid: {e}",)))
-}
-
-/// Engine-side fallback expression type inference (column refs only). Anything more
-/// complex must have been validated by the cursor builder already; if a hand-built SSA
-/// plan slips through with a non-column expression, surface a typed error so the caller
-/// fixes their construction.
-fn infer_expression_type_or_walk(
-    expr: &Expression,
-    input_schema: &StructType,
-) -> Result<delta_kernel::schema::DataType, DataFusionError> {
-    use delta_kernel::expressions::Expression as E;
-    match expr {
-        E::Column(col) => walk_column_type(input_schema, col).ok_or_else(|| {
-            plan_compilation(format!(
-                "compile_ssa: project column {col:?} not found in input schema",
-            ))
-        }),
-        E::Literal(scalar) => Ok(scalar.data_type()),
-        other => Err(plan_compilation(format!(
-            "compile_ssa: hand-built SSA plan used unsupported project expression {other:?}; \
-             cursor builders should have validated this at construction time",
-        ))),
-    }
 }
 
 /// Walk a kernel struct schema for a (possibly nested) column path, returning the leaf

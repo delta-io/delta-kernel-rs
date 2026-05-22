@@ -327,13 +327,19 @@ impl DataFusionExecutor {
 
     /// Drive a Full State Reconstruction and return the reconciled-actions DataFrame.
     ///
-    /// Sugar for `self.drive_to_dataframe(fsr.state_machine()?)`. The result rows are
-    /// the dedup'd action union (`Add` / `Remove` / `Metadata` / `Protocol` / `Txn` /
-    /// `CDC` / `DomainMetadata`) that survives `_last_checkpoint` resolution plus
-    /// commit-tail dedup. Useful for snapshot inspection and protocol/metadata
-    /// queries.
+    /// Sugar for `self.drive_ssa_to_dataframe(fsr.state_machine_ssa()?)`. The result
+    /// rows are the dedup'd action union (`Add` / `Remove` / `Metadata` / `Protocol`
+    /// / `Txn` / `CDC` / `DomainMetadata`) that survives `_last_checkpoint`
+    /// resolution plus commit-tail dedup. Useful for snapshot inspection and
+    /// protocol/metadata queries.
+    ///
+    /// Drives the SSA-flavored FSR pipeline (kernel-side
+    /// [`FullState::state_machine_ssa`]) -- the legacy registry-based
+    /// [`FullState::state_machine`] is no longer the engine's preferred entry point.
+    /// PR7 will migrate Scan over the same way and PR8 will delete the legacy
+    /// pipeline.
     pub async fn full_state(&self, fsr: &FullState) -> Result<DataFrame, DeltaError> {
-        self.drive_to_dataframe(fsr.state_machine()?).await
+        self.drive_ssa_to_dataframe(fsr.state_machine_ssa()?).await
     }
 
     /// Execute a single [`Step`] against the executor and return the resulting

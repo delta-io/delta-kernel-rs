@@ -47,9 +47,8 @@ use crate::{delta_error, FileMeta};
 /// Topology of a snapshot's checkpoint(s) in SSA terms.
 ///
 /// Differs from the legacy [`super::checkpoint_shape::CheckpointShape`] in two ways:
-/// - The manifest variant carries the manifest `files` directly (SSA re-scans on
-///   demand), not a [`crate::plans::ir::nodes::RelationHandle`] (SSA has no relation
-///   registry).
+/// - The manifest variant carries the manifest `files` directly (SSA re-scans on demand), not a
+///   [`crate::plans::ir::nodes::RelationHandle`] (SSA has no relation registry).
 /// - All variants are `pub(super)` only; this is a local IR for the SSA migration.
 #[derive(Clone, Debug)]
 pub(super) enum SsaCheckpointShape {
@@ -157,8 +156,7 @@ pub(super) async fn resolve_shape_ssa(
         FileFormat::Parquet => ctx.scan_parquet(files.clone(), manifest_schema)?,
         FileFormat::Json => ctx.scan_json(files.clone(), manifest_schema)?,
     };
-    let sidecar_chain =
-        manifest_chain.filter(Arc::new(col([SIDECAR_NAME]).is_not_null()))?;
+    let sidecar_chain = manifest_chain.filter(Arc::new(col([SIDECAR_NAME]).is_not_null()))?;
     let sidecar_files = ctx
         .consume(
             co,
@@ -228,8 +226,7 @@ pub(super) fn build_reconciliation_ssa(
         && (shape.stats.stats_schema.is_none() || shape.stats.has_parsed_stats);
 
     // Reused by commit dedup and the antijoin path.
-    let identity_not_null: Arc<Predicate> =
-        Arc::new(dedup_key.as_ref().clone().is_not_null());
+    let identity_not_null: Arc<Predicate> = Arc::new(dedup_key.as_ref().clone().is_not_null());
 
     let commits = commit_cover_rows(snapshot.log_segment())?;
     let log_root = snapshot.log_segment().log_root.clone();
@@ -260,24 +257,26 @@ pub(super) fn build_reconciliation_ssa(
         })?;
 
     // === Stage 2: commit_dedup ===========================================================
-    // filter(identity) -> project(commit_pair) -> append(JOIN_KEY, dedup_key) ->
-    // append(VERSION, col("version")) -> max_by_version(group_by=[JOIN_KEY],
-    // version_column=col("version"), value_columns = commit_pair_fields ++ [JOIN_KEY]).
-    // The narrowed output is `commit_pair + JOIN_KEY` (no VERSION).
-    let mut value_columns: Vec<String> = commit_pair
-        .0
-        .fields()
-        .map(|f| f.name().clone())
-        .collect();
+    // filter(identity) -> single project that emits commit_pair + JOIN_KEY + VERSION
+    // (all expressions reference `commit_raw`'s schema, which carries `version` as a
+    // passthrough column) -> max_by_version. The narrowed output is `commit_pair +
+    // JOIN_KEY` (VERSION dropped). We must fold the three column additions into one
+    // Project so that `col("version")` is still in scope when it is referenced --
+    // splitting them would lose `version` after the first Project.
+    let commit_pair_with_keys_schema: SchemaRef = {
+        let mut fields: Vec<StructField> = commit_pair.0.fields().cloned().collect();
+        fields.push(JOIN_KEY_FIELD.clone());
+        fields.push(VERSION_FIELD.clone());
+        arc_schema(fields)
+    };
+    let mut commit_pair_with_keys_exprs: Vec<ExpressionRef> = commit_pair.1.clone();
+    commit_pair_with_keys_exprs.push(Arc::clone(&dedup_key));
+    commit_pair_with_keys_exprs.push(Arc::new(col("version")) as ExpressionRef);
+    let mut value_columns: Vec<String> = commit_pair.0.fields().map(|f| f.name().clone()).collect();
     value_columns.push(FSR_JOIN_KEY_COL.to_string());
     let commit_dedup = commit_raw
         .filter(Arc::clone(&identity_not_null))?
-        .project_with_schema(commit_pair.1.clone(), commit_pair.0.clone())?
-        .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?
-        .append_col_typed(
-            VERSION_FIELD.clone(),
-            Arc::new(col("version")) as ExpressionRef,
-        )?
+        .project_with_schema(commit_pair_with_keys_exprs, commit_pair_with_keys_schema)?
         .max_by_version(
             vec![Arc::new(col(FSR_JOIN_KEY_COL)) as ExpressionRef],
             Arc::new(col("version")),
@@ -316,19 +315,26 @@ pub(super) fn build_reconciliation_ssa(
                     "build_reconciliation_ssa: join _sidecars base URL: {e}",
                 )
             })?;
-            // Sidecar branch: filter -> project (path/sizeInBytes) -> Load.
+            // Sidecar branch: filter -> project (path/sizeInBytes) -> Load. The Load's
+            // `file_schema` must be `checkpoint_pair.0` (not `base.0`) so the engine
+            // surfaces native `add.stats_parsed` / `add.partitionValues_parsed` from the
+            // sidecar parquet directly. With identity checkpoint projection the loaded
+            // schema is the union arm shape; otherwise it is reprojected below.
             let sidecar_load = manifest
                 .clone()
                 .filter(Arc::new(col([SIDECAR_NAME]).is_not_null()))?
                 .project([
-                    ("path", Arc::new(col([SIDECAR_NAME, "path"])) as ExpressionRef),
+                    (
+                        "path",
+                        Arc::new(col([SIDECAR_NAME, "path"])) as ExpressionRef,
+                    ),
                     (
                         "sizeInBytes",
                         Arc::new(col([SIDECAR_NAME, "sizeInBytes"])) as ExpressionRef,
                     ),
                 ])?
                 .load(LoadSpec {
-                    file_schema: base.0.clone(),
+                    file_schema: checkpoint_pair.0.clone(),
                     file_type: FileType::Parquet,
                     base_url: Some(sidecar_base),
                     passthrough_columns: vec![],
@@ -385,7 +391,10 @@ pub(super) fn build_reconciliation_ssa(
     };
 
     let reconciled = terminal_input
-        .filter(Arc::new(retention_filter_predicate(min_file_ts, txn_expiry)))?
+        .filter(Arc::new(retention_filter_predicate(
+            min_file_ts,
+            txn_expiry,
+        )))?
         .project_with_schema(checkpoint_pair.1.clone(), checkpoint_pair.0.clone())?;
 
     Ok(reconciled)

@@ -124,6 +124,7 @@ fn project_renames_columns() {
                 ("y".to_string(), Arc::new(Expression::column(["b"]))),
                 ("x".to_string(), Arc::new(Expression::column(["a"]))),
             ],
+            output_schema: long_schema(&["y", "x"]),
         },
         vec![src],
     );

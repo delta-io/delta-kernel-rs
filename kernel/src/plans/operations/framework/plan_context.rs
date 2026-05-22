@@ -307,7 +307,10 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project { named_exprs: pairs },
+            Node::Project {
+                named_exprs: pairs,
+                output_schema: Arc::clone(&output_schema),
+            },
             output_schema,
         )
     }
@@ -337,7 +340,10 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project { named_exprs: pairs },
+            Node::Project {
+                named_exprs: pairs,
+                output_schema: Arc::clone(&schema),
+            },
             schema,
         )
     }
@@ -372,7 +378,10 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project { named_exprs: pairs },
+            Node::Project {
+                named_exprs: pairs,
+                output_schema: Arc::clone(&schema),
+            },
             schema,
         )
     }
@@ -402,7 +411,10 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project { named_exprs: pairs },
+            Node::Project {
+                named_exprs: pairs,
+                output_schema: Arc::clone(&output_schema),
+            },
             output_schema,
         )
     }
@@ -438,7 +450,10 @@ impl Cursor {
             .fields()
             .map(|f| {
                 let name = f.name().clone();
-                (name.clone(), Arc::new(Expression::column([name])) as ExpressionRef)
+                (
+                    name.clone(),
+                    Arc::new(Expression::column([name])) as ExpressionRef,
+                )
             })
             .collect();
         let mut fields: Vec<StructField> = input_schema.fields().cloned().collect();
@@ -449,7 +464,10 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project { named_exprs },
+            Node::Project {
+                named_exprs,
+                output_schema: Arc::clone(&output_schema),
+            },
             output_schema,
         )
     }

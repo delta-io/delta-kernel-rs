@@ -192,10 +192,16 @@ pub enum Node {
     },
 
     // === Transforms (1+ inputs) ==============================================
-    /// Project the single input through `named_exprs`. Output schema has one
-    /// field per pair: `(name, infer_type(expr, input_schema))`.
+    /// Project the single input through `named_exprs`, producing rows of
+    /// `output_schema`. The schema is supplied by the cursor builder (either
+    /// inferred for narrow projections via the kernel's expression-type
+    /// inference, or declared explicitly via
+    /// [`Cursor::project_with_schema`](crate::plans::operations::framework::plan_context::Cursor::project_with_schema)
+    /// when inference is insufficient). Engines compile against the declared
+    /// schema directly and do not re-derive it from the expressions.
     Project {
         named_exprs: Vec<(String, Arc<Expression>)>,
+        output_schema: SchemaRef,
     },
 
     /// Keep input rows where `predicate` evaluates true (SQL null semantics).
@@ -308,6 +314,7 @@ mod tests {
         let _dead_b = plan.push(
             Node::Project {
                 named_exprs: vec![("y".to_string(), Arc::new(Expression::column(["x"])))],
+                output_schema: schema(),
             },
             vec![Ref(1)],
         ); // Ref(3) - dead
