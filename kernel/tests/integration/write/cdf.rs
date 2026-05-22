@@ -103,8 +103,11 @@ async fn test_cdf_write_all_adds_succeeds() -> Result<(), Box<dyn std::error::Er
 }
 
 #[tokio::test]
-async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error::Error>> {
-    // This test verifies that remove-only transactions work with CDF enabled
+async fn test_cdf_write_all_removes_fails_with_data_change(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A remove-only commit with `data_change=true` is a DELETE. A CDF-enabled table requires
+    // a CDC file to record the deleted rows, and kernel cannot generate one yet, so the
+    // commit is rejected.
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -115,7 +118,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     // First, add some data
     write_data_to_table(&table_url, &engine, schema, vec![1, 2, 3]).await?;
 
-    // Now remove the files
+    // Now remove the files with data_change=true.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("cdf remove test")
@@ -126,14 +129,10 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     let (data, selection_vector) = scan_metadata.scan_files.into_parts();
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
-    // This should succeed - remove-only transactions are allowed with CDF
-    let result = txn.commit(engine.as_ref())?;
-    match result {
-        CommitResult::CommittedTransaction(committed) => {
-            assert_eq!(committed.commit_version(), 2);
-        }
-        _ => panic!("Transaction should be committed"),
-    }
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref()),
+        "CDF writes not yet supported for UPDATE/DELETE/MERGE-shaped commits",
+    );
 
     Ok(())
 }
@@ -209,12 +208,9 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     let (data, selection_vector) = scan_metadata.scan_files.into_parts();
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
-    // This should fail with our new error message
     assert_result_error_with_message(
         txn.commit(engine.as_ref()),
-        "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
-         This would require writing CDC files for DML operations, which is not yet supported. \
-         Consider using separate transactions: one to add files, another to remove files."
+        "CDF writes not yet supported for UPDATE/DELETE/MERGE-shaped commits",
     );
 
     Ok(())
