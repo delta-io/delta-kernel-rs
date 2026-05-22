@@ -21,7 +21,9 @@ pub mod traits;
 pub mod typed;
 
 pub use handle::{FinishedHandle, Handle};
-pub use state::consumer::{CheckpointHintReader, MetadataProtocolReader, SidecarCollector};
+pub use state::consumer::{
+    CheckpointHintReader, CheckpointHintRecord, MetadataProtocolReader, SidecarCollector,
+};
 pub use token::{KernelConsumerKind, KernelConsumerToken};
 pub use traits::{KdfControl, KernelConsumer};
 pub use typed::{Extractor, KernelConsumerOutput};

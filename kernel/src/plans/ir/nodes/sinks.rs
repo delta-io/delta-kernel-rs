@@ -215,8 +215,10 @@ impl LoadSink {
     }
 }
 
-/// Default file-meta column hints: `path` + `size`.
-fn default_scan_file_columns() -> ScanFileColumns {
+/// Default file-meta column hints: `path` + `size` (no `record_count`). Shared by
+/// [`LoadSink::new`] and any scan-pipeline `LoadSpec` that consumes the canonical
+/// `{path, size}` upstream shape produced by the reconciliation builder.
+pub(crate) fn default_scan_file_columns() -> ScanFileColumns {
     ScanFileColumns {
         path: ColumnName::new(["path"]),
         size: Some(ColumnName::new(["size"])),

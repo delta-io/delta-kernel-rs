@@ -20,5 +20,4 @@
 pub mod errors;
 pub mod ir;
 pub mod kernel_consumers;
-pub mod record_types;
 pub mod state_machines;

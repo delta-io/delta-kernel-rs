@@ -2,8 +2,7 @@
 //!
 //! Builds the canonical *window-on-commits + anti-join-on-checkpoint* pipeline against the
 //! [`super::super::framework::plan_context`] (`Context` / `PlanBuilder`) API and SSA IR. Consumed
-//! by [`super::full_state::FullState::state_machine_ssa`] and
-//! [`super::ssa_scan::build_scan_ssa`].
+//! by [`super::full_state::FullState::state_machine`] and [`super::ssa_scan::build_scan_ssa`].
 //!
 //! Pipeline shape:
 //!
@@ -19,31 +18,216 @@
 //!
 //! Returns a [`PlanBuilder`] terminating on the reconciled stream; the caller drains it via
 //! [`Context::into_result_plan`].
+//!
+//! The pipeline-shared schemas ([`SCAN_BASE`] / [`FSR_BASE`]), dedup-key expressions
+//! ([`fsr_dedup_key`] / [`scan_file_dedup_key`]), and tombstone/txn retention predicate
+//! ([`retention_filter`]) all live here -- they are inputs to the same canonical pipeline and
+//! share its lifetime.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
-use super::action_pair::JOIN_KEY_FIELD;
-use super::dedup::FSR_JOIN_KEY_COL;
 use crate::action_reconciliation::{
     calculate_transaction_expiration_timestamp, deleted_file_retention_timestamp_with_time,
 };
-use crate::actions::{Sidecar, ADD_NAME, SIDECAR_NAME};
+use crate::actions::{
+    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
+    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME,
+};
 use crate::expressions::{
     col, column_expr, ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
 };
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
-use crate::plans::ir::nodes::{FileFormat, FileType, ScanFileColumns};
+use crate::plans::ir::nodes::{default_scan_file_columns, FileFormat, FileType, ScanFileColumns};
 use crate::plans::kernel_consumers::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::context::Engine;
 use crate::plans::state_machines::framework::plan_context::{Context, LoadSpec, PlanBuilder};
-use crate::schema::{arc_schema, DataType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{
+    arc_schema, ArrayType, DataType, SchemaRef, StructField, StructType, ToSchema,
+};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
 use crate::{delta_error, FileMeta, Version};
+
+// ============================================================================
+// Pipeline base schemas
+// ============================================================================
+
+/// Scan pipeline base: `{add, remove}` only. The scan path never reconciles
+/// protocol/metaData/txn/domainMetadata (the snapshot reads those separately).
+pub(super) static SCAN_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
+    arc_schema([
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+    ])
+});
+
+/// FSR pipeline base: all six action slots.
+pub(super) static FSR_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
+    arc_schema([
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+    ])
+});
+
+// ============================================================================
+// Synthetic dedup-key column (name + typed field)
+// ============================================================================
+
+/// Synthetic column carrying the materialized dedup key array so hash joins only need top-level
+/// column keys.
+pub(super) const FSR_JOIN_KEY_COL: &str = "__fsr_join_k";
+
+/// Typed `StructField` for [`FSR_JOIN_KEY_COL`], appended before windowing and re-projected
+/// through the antijoin.
+static JOIN_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(
+        FSR_JOIN_KEY_COL,
+        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+    )
+});
+
+// ============================================================================
+// Dedup-key expressions
+// ============================================================================
+//
+// [`fsr_dedup_key`] keys the full six-slot action set; [`scan_file_dedup_key`] keys
+// `{add, remove}` only. Both evaluate to NULL on rows that match no known slot, so the
+// pipeline's identity filter is simply `dedup_key IS NOT NULL`.
+
+const ADD_PATH: &[&str] = &["add", "path"];
+const REMOVE_PATH: &[&str] = &["remove", "path"];
+const METADATA_ID: &[&str] = &["metaData", "id"];
+
+/// For file rows, the identity components come from either `add.<suffix>` or
+/// `remove.<suffix>` (one is non-null per row); coalesce picks whichever side carries the
+/// value. Shared by both dedup-key builders.
+fn file_field(suffix: &[&str]) -> Expression {
+    let add_path = ["add"].into_iter().chain(suffix.iter().copied());
+    let remove_path = ["remove"].into_iter().chain(suffix.iter().copied());
+    Expression::column(add_path).or_else(Expression::column(remove_path))
+}
+
+/// `Array<String?>?` NULL -- the fallback returned by both dedup-key `CASE` expressions when
+/// no arm matches.
+fn null_string_array() -> Expression {
+    Expression::literal(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+        DataType::STRING,
+        true,
+    )))))
+}
+
+/// Predicate that selects rows whose `add.path` OR `remove.path` is non-null.
+fn is_file_row() -> Predicate {
+    Predicate::or(col(ADD_PATH).is_not_null(), col(REMOVE_PATH).is_not_null())
+}
+
+/// `["file", path_coalesce, dv_storage_coalesce, dv_inline_coalesce]` -- the file-row arm of
+/// both dedup keys.
+fn file_arm() -> Expression {
+    Expression::array(vec![
+        Expression::literal("file"),
+        file_field(&["path"]),
+        file_field(&["deletionVector", "storageType"]),
+        file_field(&["deletionVector", "pathOrInlineDv"]),
+    ])
+}
+
+/// FSR pipeline dedup key: identity over all six action slots.
+///
+/// Returns an `ARRAY<STRING?>?` expression keyed by `[kind, id1, id2, id3]`, evaluating to
+/// NULL on rows that match no known slot so `dedup_key IS NOT NULL` doubles as the identity
+/// filter.
+pub(super) fn fsr_dedup_key() -> Expression {
+    let null_str = || Expression::literal(Scalar::Null(DataType::STRING));
+    let arm = |kind: &str, id1: Expression, id2: Expression, id3: Expression| {
+        Expression::array(vec![Expression::literal(kind), id1, id2, id3])
+    };
+    Expression::case_when(
+        vec![
+            (is_file_row(), file_arm()),
+            (
+                col(["protocol"]).is_not_null(),
+                arm(PROTOCOL_NAME, null_str(), null_str(), null_str()),
+            ),
+            // Metadata is a singleton table state action: latest row wins regardless of prior id.
+            (
+                col(METADATA_ID).is_not_null(),
+                arm("metadata", null_str(), null_str(), null_str()),
+            ),
+            // Domain metadata is keyed by domain; newer rows replace older configs for that
+            // domain.
+            (
+                col(["domainMetadata"]).is_not_null(),
+                arm(
+                    DOMAIN_METADATA_NAME,
+                    col(["domainMetadata", "domain"]),
+                    null_str(),
+                    null_str(),
+                ),
+            ),
+            (
+                col(["txn"]).is_not_null(),
+                arm(
+                    SET_TRANSACTION_NAME,
+                    col(["txn", "appId"]),
+                    null_str(),
+                    null_str(),
+                ),
+            ),
+        ],
+        null_string_array(),
+    )
+}
+
+/// Scan-pipeline dedup key: file-path identity over `{add, remove}` only.
+///
+/// Returns an `ARRAY<STRING?>?` of the form `[kind, file_path, dv_storage, dv_inline_dv]`
+/// when the row carries an `add` or `remove` action; otherwise NULL. `dedup_key IS NOT NULL`
+/// serves as both the dedup partition key and the "is this a valid scan-side action row"
+/// identity filter.
+pub(super) fn scan_file_dedup_key() -> Expression {
+    Expression::case_when(vec![(is_file_row(), file_arm())], null_string_array())
+}
+
+// ============================================================================
+// Tombstone / txn-expiration retention predicate
+// ============================================================================
+
+const REMOVE_DELETION_TIMESTAMP: &[&str] = &["remove", "deletionTimestamp"];
+const TXN_LAST_UPDATED: &[&str] = &["txn", "lastUpdated"];
+
+/// Tombstone / txn expiration predicate aligned with
+/// [`crate::action_reconciliation::log_replay::ActionReconciliationVisitor::is_expired_tombstone`]
+/// and txn retention checks in the same visitor (`kernel/src/action_reconciliation/log_replay.rs`).
+///
+/// `txn_expiry` is `None` when `delta.setTransactionRetentionDuration` is unset -- txn rows
+/// are not filtered by age.
+fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
+    let remove_ok = Predicate::or(
+        col(["remove"]).is_null(),
+        col(REMOVE_DELETION_TIMESTAMP)
+            .or_lit(0i64)
+            .gt(Expression::literal(min_file_ts)),
+    );
+    let txn_ok = match txn_expiry {
+        None => Predicate::literal(true),
+        Some(cutoff) => Predicate::or_from([
+            col(["txn"]).is_null(),
+            col(TXN_LAST_UPDATED).is_null(),
+            col(TXN_LAST_UPDATED).gt(Expression::literal(cutoff)),
+        ]),
+    };
+    Predicate::and(remove_ok, txn_ok)
+}
 
 // ============================================================================
 // Shape resolution (SSA flavor)
@@ -148,7 +332,7 @@ pub(super) async fn resolve_shape_ssa(
 
     let is_manifest = match file_format {
         FileFormat::Parquet => {
-            let url = first_checkpoint_url(snapshot)?;
+            let url = checkpoint_parts[0].location.location.as_str().to_string();
             let cp_schema = ctx
                 .schema_query(engine, url, "ScanShapeInfoSsa::resolve::checkpoint_schema")
                 .await?;
@@ -241,7 +425,7 @@ pub(super) fn build_reconciliation_ssa(
         })
         .collect();
     let commit_raw = ctx
-        .values(path_size_schema(/* with_version= */ true), commit_rows)?
+        .values(commit_load_schema(), commit_rows)?
         .load(LoadSpec {
             file_schema: Arc::clone(base),
             file_type: FileType::Json,
@@ -355,7 +539,7 @@ pub(super) fn build_reconciliation_ssa(
     };
 
     terminal_input
-        .filter(retention_filter_predicate(min_file_ts, txn_expiry))?
+        .filter(retention_filter(min_file_ts, txn_expiry))?
         .drop_col(FSR_JOIN_KEY_COL)
 }
 
@@ -444,21 +628,6 @@ impl ReconciliationPlanBuilder for PlanBuilder {
 // Helpers
 // ============================================================================
 
-fn first_checkpoint_url(snapshot: &Snapshot) -> Result<String, DeltaError> {
-    snapshot
-        .log_segment()
-        .listed
-        .checkpoint_parts
-        .first()
-        .map(|p| p.location.location.as_str().to_string())
-        .ok_or_else(|| {
-            delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "first_checkpoint_url: no checkpoint parts",
-            )
-        })
-}
-
 fn checkpoint_format_from_path(cp: &ParsedLogPath<FileMeta>) -> FileFormat {
     if cp.extension == "json" {
         FileFormat::Json
@@ -536,25 +705,17 @@ fn stats_parsed_file_schema(base: &SchemaRef, stats_schema: &SchemaRef) -> Schem
     arc_schema(new_fields)
 }
 
-/// `{path, size, version?}` Values upstream schema for commit_load.
-fn path_size_schema(with_version: bool) -> SchemaRef {
-    let mut fields = vec![
+/// `{path, size, version}` Values upstream schema for commit_load.
+fn commit_load_schema() -> SchemaRef {
+    arc_schema([
         StructField::not_null("path", DataType::STRING),
         StructField::not_null("size", DataType::LONG),
-    ];
-    if with_version {
-        fields.push(StructField::not_null("version", DataType::LONG));
-    }
-    arc_schema(fields)
-}
-
-/// Bridge to [`super::retention::retention_filter`] returning a [`Predicate`].
-fn retention_filter_predicate(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
-    super::retention::retention_filter(min_file_ts, txn_expiry)
+        StructField::not_null("version", DataType::LONG),
+    ])
 }
 
 // ============================================================================
-// Shared scan-pipeline helpers (moved from the deleted legacy `plans` module)
+// Shared scan-pipeline helpers
 // ============================================================================
 
 /// One literal row describing a Delta JSON commit file. Public so external tools that
@@ -566,18 +727,8 @@ pub struct CommitFileMeta {
     pub version: Version,
 }
 
-/// File-meta column hints shared by every Load: `path` column, optional `size` column,
-/// no record-count column.
-pub(super) fn default_scan_file_columns() -> ScanFileColumns {
-    ScanFileColumns {
-        path: ColumnName::new(["path"]),
-        size: Some(ColumnName::new(["size"])),
-        record_count: None,
-    }
-}
-
 /// Resolve the (deleted-file retention, txn expiry) timestamps for `snapshot`.
-pub(super) fn retention_timestamps(snapshot: &Snapshot) -> Result<(i64, Option<i64>), DeltaError> {
+fn retention_timestamps(snapshot: &Snapshot) -> Result<(i64, Option<i64>), DeltaError> {
     let now = current_time_duration().map_err(|e| e.into_delta_default())?;
     let min_file_ts = deleted_file_retention_timestamp_with_time(
         snapshot.table_properties().deleted_file_retention_duration,
@@ -593,7 +744,7 @@ pub(super) fn retention_timestamps(snapshot: &Snapshot) -> Result<(i64, Option<i
 /// preferring compactions over the commits they subsume. Delegates the cover-selection logic
 /// to [`crate::log_segment::LogSegment::find_commit_cover`] and re-parses each file's
 /// [`ParsedLogPath`] to recover the version.
-pub(super) fn commit_cover_rows(seg: &LogSegment) -> Result<Vec<CommitFileMeta>, DeltaError> {
+fn commit_cover_rows(seg: &LogSegment) -> Result<Vec<CommitFileMeta>, DeltaError> {
     seg.find_commit_cover()
         .into_iter()
         .map(|file| {
@@ -621,4 +772,228 @@ fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError>
     let full = file.path();
     let suffix = full.strip_prefix(base).unwrap_or(full);
     Ok(suffix.trim_start_matches('/').to_string())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::arrow::array::{AsArray, StringArray};
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_expression::evaluate_expression::evaluate_expression;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::UnaryExpressionOp;
+    use crate::utils::test_utils::{parse_json_to_record_batch, string_array_to_engine_data};
+    use crate::Engine as KernelEngine;
+
+    fn names(fields: impl Iterator<Item = &'static str>) -> Vec<String> {
+        fields.map(String::from).collect()
+    }
+
+    /// Pin canonical top-level action lists -- load-bearing for every downstream stage.
+    #[test]
+    fn bases_pin_canonical_action_slots() {
+        let scan: Vec<_> = SCAN_BASE.fields().map(|f| f.name().clone()).collect();
+        let fsr: Vec<_> = FSR_BASE.fields().map(|f| f.name().clone()).collect();
+        assert_eq!(scan, names([ADD_NAME, REMOVE_NAME].into_iter()));
+        assert_eq!(
+            fsr,
+            names(
+                [
+                    ADD_NAME,
+                    REMOVE_NAME,
+                    PROTOCOL_NAME,
+                    METADATA_NAME,
+                    DOMAIN_METADATA_NAME,
+                    SET_TRANSACTION_NAME,
+                ]
+                .into_iter()
+            )
+        );
+    }
+
+    // === Dedup-key tests ==================================================================
+
+    #[test]
+    fn fsr_dedup_key_eval_add_row_carries_path_and_dv_components() {
+        // dv_unique_id is now `ToJson(Array(storageType, pathOrInlineDv))` rather than a
+        // Plus-concatenated `unique_id_from_parts` string. Assert the encoded JSON carries the
+        // path and DV identity components verbatim (any consumer that reduces over equality of
+        // full JSON strings still dedups identical DVs).
+        let line = r#"{"add":{"path":"p1.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dvpath","offset":7,"sizeInBytes":1,"cardinality":2}}}"#;
+        let batch = parse_json_to_record_batch(StringArray::from(vec![line]), FSR_BASE.clone());
+
+        let out = evaluate_expression(
+            &Expression::unary(UnaryExpressionOp::ToJson, fsr_dedup_key()),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let s = out.as_string::<i32>().value(0);
+        // Outer Array(["file", path_coalesce, dv_coalesce]) JSON-encodes to a JSON array; the dv
+        // arm is itself a JSON-encoded array string `["u","dvpath"]` embedded as a JSON string.
+        assert!(
+            s.contains("p1.parquet"),
+            "expected `p1.parquet` in json={s}"
+        );
+        assert!(s.contains("dvpath"), "expected `dvpath` in json={s}");
+        // The Plus-as-concat byte form must not appear (regression guard).
+        let stringy_concat = DeletionVectorDescriptor::unique_id_from_parts("u", "dvpath", Some(7));
+        assert!(
+            !s.contains(&stringy_concat),
+            "json contains the legacy concat form `{stringy_concat}` -- dv_unique_id must use \
+             ToJson(Array(...)), not Plus-as-string-concat: json={s}"
+        );
+    }
+
+    #[test]
+    fn fsr_dedup_key_eval_various_action_types() {
+        let schema = FSR_BASE.clone();
+        let check = |line: &str, subs: &[&str]| {
+            let batch = parse_json_to_record_batch(StringArray::from(vec![line]), schema.clone());
+            let out = evaluate_expression(
+                &Expression::unary(UnaryExpressionOp::ToJson, fsr_dedup_key()),
+                &batch,
+                Some(&DataType::STRING),
+            )
+            .unwrap();
+            let s = out.as_string::<i32>().value(0);
+            for sub in subs {
+                assert!(s.contains(sub), "line={line} json={s} missing {sub}");
+            }
+        };
+
+        check(
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            &["protocol"],
+        );
+        check(
+            r#"{"metaData":{"id":"mid-9","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{},"createdTime":null}}"#,
+            &["metadata"],
+        );
+        check(
+            r#"{"domainMetadata":{"domain":"dom-z","configuration":"conf-z","removed":false}}"#,
+            &["dom-z"],
+        );
+        check(
+            r#"{"txn":{"appId":"app-z","version":1,"lastUpdated":100}}"#,
+            &["app-z"],
+        );
+        check(
+            r#"{"remove":{"path":"r1.parquet","deletionTimestamp":1,"dataChange":true,"partitionValues":{}}}"#,
+            &["r1.parquet"],
+        );
+    }
+
+    #[test]
+    fn fsr_dedup_key_is_null_for_unknown_rows() {
+        // The pipeline's identity filter is `dedup_key IS NOT NULL`, so the dedup-key MUST
+        // evaluate to NULL on rows that match no known slot. This is the load-bearing
+        // contract.
+        let rows = StringArray::from(vec![
+            r#"{"add":{"path":"a.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true}}"#,
+            r#"{"remove":{"path":"r.parquet","deletionTimestamp":1,"dataChange":true,"partitionValues":{}}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"mid-1","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{},"createdTime":null}}"#,
+            r#"{"domainMetadata":{"domain":"d1","configuration":"cfg","removed":false}}"#,
+            r#"{"txn":{"appId":"app-1","version":7,"lastUpdated":100}}"#,
+            r#"{}"#,
+        ]);
+        let batch = parse_json_to_record_batch(rows, FSR_BASE.clone());
+        let out = evaluate_expression(
+            &fsr_dedup_key().is_not_null().into(),
+            &batch,
+            Some(&DataType::BOOLEAN),
+        )
+        .unwrap();
+        let b = out.as_boolean();
+        assert!(b.value(0), "add row should produce non-NULL dedup key");
+        assert!(b.value(1), "remove row should produce non-NULL dedup key");
+        assert!(b.value(2), "protocol row should produce non-NULL dedup key");
+        assert!(b.value(3), "metaData row should produce non-NULL dedup key");
+        assert!(
+            b.value(4),
+            "domainMetadata row should produce non-NULL dedup key"
+        );
+        assert!(b.value(5), "txn row should produce non-NULL dedup key");
+        assert!(!b.value(6), "empty row should produce NULL dedup key");
+    }
+
+    #[test]
+    fn scan_file_dedup_key_is_null_for_non_file_rows() {
+        // The scan pipeline only cares about add/remove rows; everything else should be
+        // filtered out via `dedup_key IS NOT NULL`.
+        let rows = StringArray::from(vec![
+            r#"{"add":{"path":"a.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true}}"#,
+            r#"{"remove":{"path":"r.parquet","deletionTimestamp":1,"dataChange":true,"partitionValues":{}}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"mid-1","name":null,"description":null,"format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{},"createdTime":null}}"#,
+            r#"{"domainMetadata":{"domain":"d1","configuration":"cfg","removed":false}}"#,
+            r#"{"txn":{"appId":"app-1","version":7,"lastUpdated":100}}"#,
+            r#"{}"#,
+        ]);
+        let batch = parse_json_to_record_batch(rows, FSR_BASE.clone());
+        let out = evaluate_expression(
+            &scan_file_dedup_key().is_not_null().into(),
+            &batch,
+            Some(&DataType::BOOLEAN),
+        )
+        .unwrap();
+        let b = out.as_boolean();
+        assert!(b.value(0), "add row should produce non-NULL scan dedup key");
+        assert!(
+            b.value(1),
+            "remove row should produce non-NULL scan dedup key"
+        );
+        assert!(
+            !b.value(2),
+            "protocol row should produce NULL scan dedup key"
+        );
+        assert!(
+            !b.value(3),
+            "metaData row should produce NULL scan dedup key"
+        );
+        assert!(
+            !b.value(4),
+            "domainMetadata row should produce NULL scan dedup key"
+        );
+        assert!(!b.value(5), "txn row should produce NULL scan dedup key");
+        assert!(!b.value(6), "empty row should produce NULL scan dedup key");
+    }
+
+    // === Retention tests ==================================================================
+
+    #[test]
+    fn retention_filter_keeps_and_drops_tombstones() {
+        let p = retention_filter(100, None);
+        let engine = SyncEngine::new();
+        let schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+                StructField::nullable("txn", SetTransaction::to_schema()),
+            ])
+            .unwrap(),
+        );
+        let rows = StringArray::from(vec![
+            r#"{"remove":{"path":"old","deletionTimestamp":101,"dataChange":true,"partitionValues":{}}}"#
+                .to_string(),
+            r#"{"remove":{"path":"gone","deletionTimestamp":99,"dataChange":true,"partitionValues":{}}}"#
+                .to_string(),
+        ]);
+        let parsed = engine
+            .json_handler()
+            .parse_json(string_array_to_engine_data(rows), schema)
+            .unwrap();
+        let arrow = ArrowEngineData::try_from_engine_data(parsed).unwrap();
+        let batch = arrow.record_batch();
+
+        let arr = evaluate_expression(&p.into(), batch, Some(&DataType::BOOLEAN)).unwrap();
+        let b = arr.as_boolean();
+        assert!(b.value(0));
+        assert!(!b.value(1));
+    }
 }

@@ -8,14 +8,33 @@
 
 use std::sync::LazyLock;
 
+use delta_kernel_derive::ToSchema;
+use serde::{Deserialize, Serialize};
+
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::plans::errors::DeltaError;
 use crate::plans::kernel_consumers::{
     KdfControl, KernelConsumer, KernelConsumerKind, KernelConsumerOutput,
 };
-use crate::plans::record_types::CheckpointHintRecord;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
 use crate::{DeltaResult, EngineData};
+
+/// `_last_checkpoint` JSON hint file record. Parsed by [`CheckpointHintReader`] from
+/// the single-row hint file; deriving [`ToSchema`] lets the reader source the row
+/// visitor's column schema from the struct definition.
+#[derive(ToSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointHintRecord {
+    /// Commit version the checkpoint covers.
+    pub version: i64,
+    /// Total logical size of the checkpoint (bytes), if known.
+    pub size: Option<i64>,
+    /// Number of parts for multipart checkpoints, if any.
+    pub parts: Option<i32>,
+    /// Total on-disk size of the checkpoint (bytes), if known.
+    pub size_in_bytes: Option<i64>,
+    /// Count of add-file actions in the checkpoint, if tracked.
+    pub num_of_add_files: Option<i64>,
+}
 
 /// Reader state: holds the extracted record (or `None` if no row has been
 /// seen yet) plus a flag to short-circuit subsequent batches.

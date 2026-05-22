@@ -7,7 +7,7 @@
 //! a method chain:
 //!
 //! ```ignore
-//! let augmented = action_schema()
+//! let augmented = FSR_BASE
 //!     .build_on()
 //!     .with_nullable(FSR_JOIN_KEY_COL, DataType::Array(Box::new(ArrayType::new(
 //!         DataType::STRING, true))))

@@ -100,4 +100,5 @@ pub struct ProjectNode {
 
 mod sinks;
 
+pub(crate) use sinks::default_scan_file_columns;
 pub use sinks::{ConsumeSink, DvRef, LoadSink, RelationHandle, ScanFileColumns};

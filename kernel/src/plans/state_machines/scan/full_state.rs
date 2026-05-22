@@ -25,11 +25,7 @@
 
 use std::sync::Arc;
 
-use super::action_pair::FSR_BASE;
-use super::dedup::fsr_dedup_key;
-use super::ssa_reconciliation::execute_reconciliation_ssa;
-// Re-export for callers that need a stable type for the FSR commit-file row.
-pub use super::ssa_reconciliation::CommitFileMeta;
+use super::ssa_reconciliation::{execute_reconciliation_ssa, fsr_dedup_key, FSR_BASE};
 use crate::plans::errors::{DeltaError, KernelErrAsDelta};
 use crate::plans::ir::plan::ResultPlan;
 use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
