@@ -2,6 +2,7 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -790,6 +791,53 @@ impl Snapshot {
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {
         self.table_configuration.logical_schema()
+    }
+
+    /// Approximate owned heap size in bytes for this snapshot.
+    ///
+    /// Includes the two dominant per-snapshot heap contributors:
+    /// 1. Delta log file metadata (file name, location, ...).
+    /// 2. The raw `schemaString` JSON(raw string for the schema).
+    ///
+    /// Excludes shared schemas (the logical and physical schemas on `TableConfiguration`):
+    /// these are `Arc`-shared across snapshots.
+    ///
+    /// This is an estimate, not an authoritative measurement.
+    ///
+    /// Runs in O(n) where n is the number of files in the log segment.
+    pub fn approximate_owned_heap_size(&self) -> usize {
+        let mut bytes = 0;
+
+        let files = &self.log_segment.listed;
+
+        // Sum each Vec's heap buffer (capacity * element size).
+        let parsed_log_path_count = files.ascending_commit_files.capacity()
+            + files.ascending_compaction_files.capacity()
+            + files.checkpoint_parts.capacity();
+        bytes += parsed_log_path_count * size_of::<ParsedLogPath>();
+
+        // Plus the per-element heap (strings inside each ParsedLogPath).
+        let per_path_heap = |p: &ParsedLogPath| {
+            p.filename.capacity() + p.extension.capacity() + p.location.location.as_str().len()
+        };
+        for p in files
+            .ascending_commit_files
+            .iter()
+            .chain(&files.ascending_compaction_files)
+            .chain(&files.checkpoint_parts)
+        {
+            bytes += per_path_heap(p);
+        }
+        if let Some(p) = &files.latest_crc_file {
+            bytes += size_of::<ParsedLogPath>() + per_path_heap(p);
+        }
+        if let Some(p) = &files.latest_commit_file {
+            bytes += size_of::<ParsedLogPath>() + per_path_heap(p);
+        }
+
+        bytes += self.table_configuration().metadata().schema_string().len();
+
+        bytes
     }
 
     /// Get the [`TableProperties`] for this [`Snapshot`].
@@ -3777,5 +3825,97 @@ mod tests {
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
         let result = snapshot.get_logical_clustering_columns(&engine).unwrap();
         assert_eq!(result, expected);
+    }
+
+    // === approximate_heap_size ===
+
+    #[test]
+    fn approximate_heap_size_on_table_with_many_log_files() {
+        // Test table with 100 commits.
+        let (_engine, snap, _table) = test_utils::test_context!(
+            LogState::with_latest_version(100),
+            FeatureSet::empty(),
+            VersionTarget::Latest,
+            SyncEngine::new_with_store
+        );
+
+        let heap = snap.approximate_owned_heap_size();
+        let struct_size = std::mem::size_of::<Snapshot>();
+        eprintln!("approximate_owned_heap_size = {heap}, sizeof(Snapshot) = {struct_size}");
+        // Heap size should be at least 5 times the stack size, to account for
+        // the 100 commits file metadata.
+        assert!(
+            heap > 5 * struct_size,
+            "heap size {heap} should exceed 5 * sizeof(Snapshot)={}",
+            5 * struct_size
+        );
+    }
+
+    /// Two tables that differ only in schema width: the wider schema should bump
+    /// approximate_owned_heap_size by approximately the schemaString delta.
+    #[test]
+    fn approximate_heap_size_reflects_schema_string() {
+        fn snap_with_schema(schema: SchemaRef) -> SnapshotRef {
+            let store = Arc::new(InMemory::new());
+            let engine = SyncEngine::new_with_store(store);
+            create_table("memory:///", schema, "test")
+                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .unwrap()
+                .commit(&engine)
+                .unwrap()
+                .unwrap_committed();
+            Snapshot::builder_for("memory:///").build(&engine).unwrap()
+        }
+
+        let small_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)]).unwrap(),
+        );
+        let wide_schema = Arc::new(
+            StructType::try_new(
+                (0..50)
+                    .map(|i| StructField::nullable(format!("field_{i:03}"), DataType::STRING))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+
+        let snap_small = snap_with_schema(small_schema);
+        let snap_wide = snap_with_schema(wide_schema);
+
+        let schema_str_delta = snap_wide
+            .table_configuration()
+            .metadata()
+            .schema_string()
+            .len()
+            - snap_small
+                .table_configuration()
+                .metadata()
+                .schema_string()
+                .len();
+        let heap_delta =
+            snap_wide.approximate_owned_heap_size() - snap_small.approximate_owned_heap_size();
+        // Tables differ only in schemaString, so heap_delta should be approximately the
+        // schema_str_delta.
+        let ratio = heap_delta as f64 / schema_str_delta as f64;
+        assert!(
+            (0.8..=1.2).contains(&ratio),
+            "heap_delta {heap_delta} should be within 20% of schema_str_delta {schema_str_delta} (ratio = {ratio:.3})"
+        );
+    }
+
+    #[test]
+    fn approximate_heap_size_for_version_zero() {
+        let table = TestTableBuilder::new().build().unwrap();
+        let engine = SyncEngine::new_with_store(table.store().clone());
+        let snapshot = Snapshot::builder_for(table.table_root())
+            .build(&engine)
+            .unwrap();
+
+        let heap = snapshot.approximate_owned_heap_size();
+        assert!(heap > 0, "heap size should be nonzero");
+        assert!(
+            heap < 10000,
+            "heap size {heap} unexpectedly large for v0 snapshot"
+        );
     }
 }
