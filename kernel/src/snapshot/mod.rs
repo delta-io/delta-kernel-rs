@@ -588,11 +588,7 @@ impl Snapshot {
         let crc = self
             .lazy_crc
             .get_if_loaded_at_version(self.version())
-            .map(|base| {
-                let mut crc = base.as_ref().clone();
-                crc.apply(crc_delta);
-                crc
-            });
+            .map(|base| base.as_ref().clone().apply(crc_delta, new_version));
 
         match crc {
             Some(c) => Arc::new(LazyCrc::new_precomputed(c, new_version)),

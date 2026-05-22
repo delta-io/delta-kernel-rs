@@ -13,6 +13,7 @@ use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
+use crate::Version;
 
 /// CRC-relevant changes aggregated over commits `(X, Y]`.
 #[derive(Debug, Clone, Default)]
@@ -68,6 +69,7 @@ impl CrcDelta {
                 .ok()
         });
         Some(Crc {
+            version: 0,
             file_stats_state: FileStatsState::Complete(FileStats {
                 num_files: self.file_stats.net_files,
                 table_size_bytes: self.file_stats.net_bytes,
@@ -85,14 +87,21 @@ impl CrcDelta {
 
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
-    /// Apply a commit delta.
+    /// Apply a commit delta and advance to `new_version`.
+    ///
     /// - Protocol / metadata: replaced when present in the delta, kept otherwise.
     /// - ICT: unconditional replace; the delta carries ICT at `Y` (whether `Some` or `None`).
     /// - Domain metadata: tombstones (`is_removed()`) drop the key from the base map; all others
     ///   upsert by domain. Set transactions: upsert by app_id. The `Complete`/`Partial` variant is
     ///   preserved in both cases.
     /// - File stats: governed by the [`FileStatsState`] state machine.
-    pub(crate) fn apply(&mut self, delta: CrcDelta) {
+    pub(crate) fn apply(mut self, delta: CrcDelta, new_version: Version) -> Self {
+        debug_assert!(
+            new_version > self.version,
+            "Crc::apply must advance version: self.version={}, new_version={}",
+            self.version,
+            new_version
+        );
         // Protocol and metadata: replace if present.
         if let Some(p) = delta.protocol {
             self.protocol = p;
@@ -132,6 +141,9 @@ impl Crc {
             &delta.file_stats,
             delta.is_incremental_safe,
         );
+
+        self.version = new_version;
+        self
     }
 }
 
@@ -288,57 +300,56 @@ mod tests {
 
     #[test]
     fn test_apply_updates_file_stats() {
-        let mut crc = base_crc();
-        crc.apply(write_delta(3, 600));
+        let crc = base_crc().apply(write_delta(3, 600), 1);
         let stats = crc.file_stats().unwrap();
         assert_eq!(stats.num_files(), 13); // 10 + 3
         assert_eq!(stats.table_size_bytes(), 1600); // 1000 + 600
         assert!(crc.file_stats_state.is_complete());
+        assert_eq!(crc.version, 1);
     }
 
     /// Applies multiple commit deltas sequentially.
     #[test]
     fn test_apply_multiple_deltas() {
-        let mut crc = base_crc();
-        crc.apply(write_delta(3, 600));
-        crc.apply(write_delta(-2, -400));
+        let crc = base_crc()
+            .apply(write_delta(3, 600), 1)
+            .apply(write_delta(-2, -400), 2);
         let stats = crc.file_stats().unwrap();
         assert_eq!(stats.num_files(), 11); // 10 + 3 - 2
         assert_eq!(stats.table_size_bytes(), 1200); // 1000 + 600 - 400
         assert!(crc.file_stats_state.is_complete());
+        assert_eq!(crc.version, 2);
     }
 
     #[test]
     fn test_apply_not_incremental_safe_transitions_to_indeterminate() {
-        let mut crc = base_crc();
         let unsafe_change = CrcDelta {
             is_incremental_safe: false,
             ..write_delta(1, 100)
         };
-        crc.apply(unsafe_change);
+        let crc = base_crc().apply(unsafe_change, 1);
         assert!(crc.file_stats_state.is_indeterminate());
     }
 
     #[test]
     fn test_indeterminate_stays_indeterminate() {
-        let mut crc = base_crc();
         let unsafe_change = CrcDelta {
             is_incremental_safe: false,
             ..write_delta(1, 100)
         };
-        crc.apply(unsafe_change);
+        let crc = base_crc().apply(unsafe_change, 1);
         assert!(crc.file_stats_state.is_indeterminate());
 
-        // Subsequent safe op doesn't recover the state.
-        crc.apply(write_delta(5, 500));
+        // Subsequent safe op doesn't recover the state. Version still advances.
+        let crc = crc.apply(write_delta(5, 500), 2);
         assert!(crc.file_stats_state.is_indeterminate());
+        assert_eq!(crc.version, 2);
     }
 
     // ===== apply: non-file-stats field updates =====
 
     #[test]
     fn test_apply_replaces_protocol() {
-        let mut crc = base_crc();
         let new_protocol = Protocol::try_new(
             2,
             5,
@@ -350,7 +361,7 @@ mod tests {
             protocol: Some(new_protocol.clone()),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        let crc = base_crc().apply(delta, 1);
         assert_eq!(crc.protocol, new_protocol);
         assert_eq!(crc.metadata, Metadata::default()); // unchanged
     }
@@ -363,8 +374,6 @@ mod tests {
     #[case::partial(DomainMetadataState::Partial(seed_dm_map()))]
     fn test_apply_dm_upserts_inserts_and_removes(#[case] base: DomainMetadataState) {
         let was_complete = matches!(base, DomainMetadataState::Complete(_));
-        let mut crc = base_crc();
-        crc.domain_metadata_state = base;
         let delta = CrcDelta {
             domain_metadata: HashMap::from([
                 dm_entry("keep", "new"),
@@ -373,7 +382,11 @@ mod tests {
             ]),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        let crc = Crc {
+            domain_metadata_state: base,
+            ..base_crc()
+        }
+        .apply(delta, 1);
 
         // Bind the inner map AND panic if the variant flipped during apply.
         let map = match &crc.domain_metadata_state {
@@ -389,24 +402,25 @@ mod tests {
 
     #[test]
     fn test_apply_replaces_in_commit_timestamp() {
-        let mut crc = base_crc();
         let delta = CrcDelta {
             in_commit_timestamp: Some(9999),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        let crc = base_crc().apply(delta, 1);
         assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
     }
 
     #[test]
     fn test_apply_clears_in_commit_timestamp_when_delta_is_none() {
-        let mut crc = base_crc();
-        crc.in_commit_timestamp_opt = Some(1000);
         let delta = CrcDelta {
             in_commit_timestamp: None,
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        let crc = Crc {
+            in_commit_timestamp_opt: Some(1000),
+            ..base_crc()
+        }
+        .apply(delta, 1);
         assert_eq!(crc.in_commit_timestamp_opt, None);
     }
 
@@ -433,6 +447,7 @@ mod tests {
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         let stats = crc.file_stats().unwrap();
+        assert_eq!(crc.version, 0);
         assert_eq!(crc.protocol, protocol);
         assert_eq!(crc.metadata, metadata);
         assert_eq!(stats.num_files(), 5);
@@ -508,8 +523,6 @@ mod tests {
     #[case::partial(SetTransactionState::Partial(seed_txn_map()))]
     fn test_apply_upserts_and_inserts_set_transactions(#[case] base: SetTransactionState) {
         let was_complete = matches!(base, SetTransactionState::Complete(_));
-        let mut crc = base_crc();
-        crc.set_transaction_state = base;
         let delta = CrcDelta {
             set_transactions: HashMap::from([
                 txn_entry("existing", 2, Some(2000)),
@@ -517,7 +530,11 @@ mod tests {
             ]),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        let crc = Crc {
+            set_transaction_state: base,
+            ..base_crc()
+        }
+        .apply(delta, 1);
 
         let map = match &crc.set_transaction_state {
             SetTransactionState::Complete(m) if was_complete => m,
@@ -622,9 +639,8 @@ mod tests {
         #[case] remove: &[i64],
         #[case] expected_bins: &[(usize, i64, i64)],
     ) {
-        let mut crc = base_crc_with_histogram(base);
         let delta = write_delta_with_histograms(add, remove);
-        crc.apply(delta);
+        let crc = base_crc_with_histogram(base).apply(delta, 1);
 
         let stats = crc.file_stats().unwrap();
         let hist = stats.file_size_histogram().unwrap();
@@ -638,7 +654,7 @@ mod tests {
     #[case::base_none_delta_none(None)]
     #[case::base_some_delta_none(Some(vec![100i64, 200]))]
     fn apply_drops_histogram_when_delta_missing_histogram(#[case] base_files: Option<Vec<i64>>) {
-        let mut crc = match &base_files {
+        let base = match &base_files {
             Some(sizes) => base_crc_with_histogram(sizes),
             None => base_crc(),
         };
@@ -651,7 +667,7 @@ mod tests {
             is_incremental_safe: true,
             ..Default::default()
         };
-        crc.apply(delta);
+        let crc = base.apply(delta, 1);
         let stats = crc.file_stats().unwrap();
         assert!(
             stats.file_size_histogram().is_none(),
@@ -661,12 +677,11 @@ mod tests {
 
     #[test]
     fn apply_drops_histogram_on_indeterminate() {
-        let mut crc = base_crc_with_histogram(&[100, 200]);
         let unsafe_delta = CrcDelta {
             is_incremental_safe: false,
             ..write_delta(1, 100)
         };
-        crc.apply(unsafe_delta);
+        let crc = base_crc_with_histogram(&[100, 200]).apply(unsafe_delta, 1);
         // Indeterminate has no histogram field; the histogram data is gone.
         assert!(crc.file_stats_state.is_indeterminate());
         assert!(crc.file_stats().is_none());
@@ -717,7 +732,7 @@ mod tests {
             vec![300, 500, 0],
         )
         .unwrap();
-        let mut crc = Crc {
+        let base = Crc {
             file_stats_state: FileStatsState::Complete(FileStats {
                 num_files: 3,
                 table_size_bytes: 800,
@@ -742,7 +757,7 @@ mod tests {
             ..Default::default()
         };
 
-        crc.apply(delta);
+        let crc = base.apply(delta, 1);
 
         // Histogram should be preserved (boundaries match)
         let stats = crc.file_stats().unwrap();
