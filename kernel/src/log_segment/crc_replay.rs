@@ -41,10 +41,7 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         ])
         .expect("project_as_struct on commit schema");
     let with_file = projected
-        .add_metadata_column(
-            MetadataColumnSpec::FilePath.text_value(),
-            MetadataColumnSpec::FilePath,
-        )
+        .add_metadata_column("_file", MetadataColumnSpec::FilePath)
         .expect("add _file metadata column");
     Arc::new(with_file)
 });
