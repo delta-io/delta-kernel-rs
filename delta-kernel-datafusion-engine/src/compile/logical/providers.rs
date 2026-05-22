@@ -1,6 +1,6 @@
 //! [`TableProvider`] for
-//! [`DeclarativePlanNode::FileListing`](delta_kernel::plans::ir::DeclarativePlanNode::FileListing)
-//! nodes, emitting one `(path, size, modification_time)` row per object under a URL prefix.
+//! [`Node::FileListing`](delta_kernel::plans::ir::ssa::Node::FileListing) nodes, emitting
+//! one `(path, size, modification_time)` row per object under a URL prefix.
 
 use std::sync::Arc;
 
@@ -15,8 +15,7 @@ use delta_kernel::plans::ir::nodes::FileListingNode;
 
 use crate::exec::FileListingExec;
 
-/// [`TableProvider`] for
-/// [`DeclarativePlanNode::FileListing`](delta_kernel::plans::ir::DeclarativePlanNode::FileListing):
+/// [`TableProvider`] for [`Node::FileListing`](delta_kernel::plans::ir::ssa::Node::FileListing):
 /// enumerates a storage prefix via the object store registered for the path's scheme/host and
 /// emits a `(path, size, modification_time)` row per object. The actual listing happens inside
 /// the returned [`ExecutionPlan`] at execute time; planning is fast.

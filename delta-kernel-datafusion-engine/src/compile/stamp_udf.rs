@@ -2,13 +2,12 @@
 //! metadata + nested struct/list/map field names + per-level metadata) onto a single
 //! input column.
 //!
-//! Sits at the top of
-//! [`DataFusionExecutor::read_relation`](crate::DataFusionExecutor::read_relation)'s projection: at
-//! runtime it casts the input array to the target [`DataType`] via [`arrow::compute::cast`]
-//! (positional, metadata-preserving -- the same primitive the historical `stamp_batch_metadata`
-//! used post-collect); at plan time [`return_field_from_args`] declares the target [`FieldRef`]
-//! verbatim so DataFusion's projection output schema carries the full nested metadata declaration
-//! too.
+//! Sits at the top of the SSA scan compile path's stamping projection: at runtime it casts
+//! the input array to the target arrow `DataType` via `arrow::compute::cast` (positional,
+//! metadata-preserving -- the same primitive the historical `stamp_batch_metadata` used
+//! post-collect); at plan time `return_field_from_args` declares the target `FieldRef`
+//! verbatim so DataFusion's projection output schema carries the full nested metadata
+//! declaration too.
 //!
 //! Why a UDF instead of `Expr::Cast` or `Expr::Alias`:
 //! - `Expr::Cast(_, ArrowDataType)` carries only the data type, no metadata, and DataFusion's
@@ -111,7 +110,7 @@ impl ScalarUDFImpl for StampFieldUdf {
 
     /// Cast the input array to the merged target data type carried on
     /// `args.return_field` (the same field we built in
-    /// [`Self::return_field_from_args`]). The cast uses [`arrow::compute::cast`]
+    /// [`Self::return_field_from_args`]). The cast uses `arrow::compute::cast`
     /// (positional, metadata-preserving -- the same primitive the historical
     /// `stamp_batch_metadata` used post-collect):
     ///
@@ -119,7 +118,7 @@ impl ScalarUDFImpl for StampFieldUdf {
     ///   [`Expr::alias`](datafusion_expr::Expr::alias) supplying the column name.
     /// - Struct cast: positional rebuild of the struct array with the target's field names +
     ///   metadata (matches by position, NOT by name -- this is the whole reason we use
-    ///   [`arrow::compute::cast`] over DataFusion's logical `Expr::Cast`, which name-validates and
+    ///   `arrow::compute::cast` over DataFusion's logical `Expr::Cast`, which name-validates and
     ///   rejects column-mapping renames).
     /// - List / Map cast: recursive descent that stamps each nested element field.
     ///

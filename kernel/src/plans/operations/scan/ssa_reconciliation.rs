@@ -48,12 +48,9 @@ use crate::{delta_error, FileMeta, Version};
 // Shape resolution (SSA flavor)
 // ============================================================================
 
-/// Topology of a snapshot's checkpoint(s) in SSA terms.
+/// Topology of a snapshot's checkpoint(s).
 ///
-/// Differs from the legacy [`super::checkpoint_shape::CheckpointShape`] in two ways:
-/// - The manifest variant carries the manifest `files` directly (SSA re-scans on demand), not a
-///   [`crate::plans::ir::nodes::RelationHandle`] (SSA has no relation registry).
-/// - All variants are `pub(super)` only; this is a local IR for the SSA migration.
+/// All variants are `pub(super)` only; this is a local IR for the SSA reconciliation pipeline.
 #[derive(Clone, Debug)]
 pub(super) enum SsaCheckpointShape {
     /// No checkpoint files: reconciliation degenerates to commit-only replay.
@@ -73,8 +70,7 @@ pub(super) enum SsaCheckpointShape {
     },
 }
 
-/// Configured SSA pipeline shape. Mirrors the legacy
-/// [`super::checkpoint_shape::ScanShapeInfo`] but threads SSA-only types.
+/// Configured SSA reconciliation shape: checkpoint topology + stats + partitioning.
 #[derive(Clone, Debug)]
 pub(super) struct SsaScanShape {
     pub(super) checkpoint: SsaCheckpointShape,
@@ -82,8 +78,8 @@ pub(super) struct SsaScanShape {
     pub(super) partition_schema: Option<SchemaRef>,
 }
 
-/// Stats wiring. Identical contract to the legacy
-/// [`super::checkpoint_shape::StatsInfo`].
+/// Stats wiring: the optional projected stats schema and whether the checkpoint stores
+/// parsed (struct-typed) stats vs. JSON-string stats that need parsing.
 #[derive(Clone, Debug)]
 pub(super) struct SsaStatsInfo {
     pub(super) stats_schema: Option<SchemaRef>,
@@ -93,10 +89,11 @@ pub(super) struct SsaStatsInfo {
 /// Resolve the scan shape via a sequence of `Step::Consume` (sidecar URL extraction)
 /// and `Step::SchemaQuery` (layout / stats probes) yields against `co`.
 ///
-/// Mirrors [`super::checkpoint_shape::ScanShapeInfo::resolve`] but yields through the
-/// SSA dispatch surface ([`Context::consume`] / [`Context::schema_query`]) rather than
-/// the legacy `Step::Plans` pipeline. Yields at most one top-level `SchemaQuery`, one
-/// `Consume` (V2 manifest sidecar URL extraction), and one sidecar `SchemaQuery`.
+/// Yields through the SSA dispatch surface
+/// ([`Context::consume`](crate::plans::operations::framework::plan_context::Context::consume) /
+/// [`Context::schema_query`](crate::plans::operations::framework::plan_context::Context::schema_query)).
+/// At most one top-level `SchemaQuery`, one `Consume` (V2 manifest sidecar URL extraction),
+/// and one sidecar `SchemaQuery` are emitted.
 pub(super) async fn resolve_shape_ssa(
     ctx: &Context,
     co: &mut StepCo,

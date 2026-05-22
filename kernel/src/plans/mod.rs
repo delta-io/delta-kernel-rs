@@ -1,34 +1,21 @@
-//! Declarative plan IR and construction API.
+//! SSA plan IR and execution framework.
 //!
-//! The `plans` module defines a typed, engine-agnostic intermediate representation
-//! for the work an engine must perform on behalf of the kernel: scan files, apply
-//! filters, project columns, collect results. See [`crate::plans::ir::DeclarativePlanNode`] for
-//! the tree representation, [`crate::plans::ir::Plan`] for the envelope the kernel hands to the
-//! engine, and [`crate::plans::ir::PlanBuilder`] for the fluent building API that produces these
-//! trees with their cumulative output schema.
+//! The `plans` module defines an engine-agnostic intermediate representation for the work an
+//! engine must perform on behalf of the kernel (scan files, apply filters, project columns,
+//! collect results) along with the state-machine framework that drives execution.
+//!
+//! Entry points:
+//! - [`crate::plans::ir::ssa`] -- SSA `Plan` / `Stmt` / `Node` / `Ref` and the terminal
+//!   `ResultPlan` the engine compiles to a single dataflow DAG.
+//! - [`crate::plans::operations::framework::plan_context`] -- the SSA `Context` / `Cursor` API SM
+//!   bodies use to construct plans.
+//! - [`crate::plans::operations::framework::coroutine`] -- coroutine-backed `StateMachine`
+//!   implementation.
 //!
 //! # Feature gate
 //!
 //! This module is opt-in behind `declarative-plans`. The kernel's existing
 //! `Scan`/`Snapshot`/`Transaction` APIs continue to work without it.
-//!
-//! # Overview
-//!
-//! A [`crate::plans::ir::Plan`] is `{ root: DeclarativePlanNode, sink: SinkType }`: a
-//! transforms-only tree terminated by a sink describing how the engine should
-//! consume the row stream. Trees are built bottom-up with chain methods:
-//!
-//! ```ignore
-//! use delta_kernel::plans::ir::PlanBuilder;
-//! use delta_kernel::plans::ir::RelationRegistry;
-//! use uuid::Uuid;
-//!
-//! let mut registry = RelationRegistry::new(Uuid::new_v4(), "");
-//! let plan = PlanBuilder::scan_json(files, schema.clone())
-//!     .filter(predicate)
-//!     .project(projection, output_schema)
-//!     .into_relation("results", &mut registry)?;
-//! ```
 
 pub mod errors;
 pub mod ir;

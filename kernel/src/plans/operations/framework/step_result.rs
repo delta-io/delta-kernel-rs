@@ -4,8 +4,8 @@
 //! on the next `submit` call. It holds two payload kinds:
 //!
 //! - **KDF outputs** -- [`FinishedHandle`]s from drained
-//!   [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume) pipelines and executor
-//!   telemetry, keyed by [`KernelConsumerToken`].
+//!   [`Step::Consume`](super::step::Step::Consume) pipelines and executor telemetry, keyed by
+//!   [`KernelConsumerToken`].
 //! - **Schema** -- a single [`SchemaRef`] from a `SchemaQuery` phase.
 //!
 //! Submission is infallible. Each consume sink is single-partition, so duplicate submits are

@@ -3,8 +3,8 @@
 //! Adding a new KDF: declare the struct, derive `Clone`, write
 //! `impl KernelConsumer for T { ... }` with `kind`, `apply`, `finish`. No
 //! enum to edit, no registry to update, no serde wiring — KDFs ride on
-//! the [`SinkType::Consume`](crate::plans::ir::nodes::SinkType::Consume)
-//! sink, which is dispatched in-process and never serialized.
+//! the [`Step::Consume`](crate::plans::operations::framework::step::Step::Consume)
+//! step, which is dispatched in-process and never serialized.
 //!
 //! # Object-safety notes
 //!

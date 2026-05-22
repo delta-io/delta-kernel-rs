@@ -1,4 +1,5 @@
-//! Sink IR types — relation piping, consumer drains, and file-reader [`LoadSink`].
+//! Helper IR types referenced by the SSA IR's `Node::Load` and `Step::Consume`, and by the
+//! engine's compile path (file-reader sink, deletion-vector hints, consumer drain template).
 
 use url::Url;
 use uuid::Uuid;
@@ -8,7 +9,8 @@ use crate::expressions::ColumnName;
 use crate::plans::kernel_consumers::{Handle, KernelConsumer, KernelConsumerToken};
 use crate::schema::SchemaRef;
 
-/// Template for draining a row stream into a [`KernelConsumer`] via [`SinkType::Consume`].
+/// Template for draining a row stream into a [`KernelConsumer`] via
+/// [`Step::Consume`](crate::plans::operations::framework::step::Step::Consume).
 ///
 /// - `initial_state`: cloned per partition via [`DynClone`](dyn_clone::DynClone) into a
 ///   [`Handle`](crate::plans::kernel_consumers::Handle).
@@ -59,23 +61,10 @@ impl PartialEq for ConsumeSink {
 
 impl Eq for ConsumeSink {}
 
-/// Identifier for a relation produced by one plan and consumed by another in
-/// the same `Step::Plans(...)`. Created via [`RelationHandle::fresh`];
-/// each handle is unique across all kernel plans for the lifetime of the
-/// process (id-based comparison).
-///
-/// Handles connect a [`SinkType::Relation`] in one plan to a
-/// [`crate::plans::ir::declarative::DeclarativePlanNode::RelationRef`] leaf in another.
-/// The executor allocates a bounded channel per handle, the producing plan's
-/// sink writes to it, and the consuming plan's source reads from it —
-/// streaming end-to-end, not materialized.
-///
-/// The handle also carries the producing plan's output [`SchemaRef`] so that
-/// consuming sources (`RelationRef` / `HashJoin` / `Union`) can publish
-/// a static output schema during pipeline construction; that unblocks
-/// operators like `FilterByExpression` and `Select` that need an input
-/// schema to build their evaluators. Schema is metadata, not identity:
-/// equality and hashing key on `id` only.
+/// Diagnostic + arrow-output handle synthesized by the engine when lowering an SSA
+/// `Node::Load`. Carries a unique id, a diagnostic name, and the kernel-typed output schema
+/// the load materializes; the engine's `LoadTableProvider` reads `schema` to publish its
+/// arrow output. Equality / hashing key on `id` only — `name` and `schema` are metadata.
 #[derive(Debug, Clone)]
 pub struct RelationHandle {
     /// Diagnostic name (used in tracing spans, error messages); not part of
@@ -152,20 +141,17 @@ impl DvRef {
     }
 }
 
-/// File-reader sink. For each upstream row, opens the resolved file in
+/// File-reader sink template consumed by the engine's `LoadTableProvider` when lowering an
+/// SSA `Node::Load`. For each upstream row, the engine opens the resolved file in
 /// [`Self::file_type`], reads [`Self::file_schema`] columns, and broadcasts the row's
 /// [`Self::passthrough_columns`] alongside each emitted file row.
 ///
-/// The materialized result is named via [`Self::output_relation`] so that
-/// downstream plans in the same phase can consume it through
-/// [`crate::plans::ir::RelationRegistry::relation_ref`].
-///
-/// An optional [`Self::dv_ref`] column hint enables per-row deletion-vector
-/// masking against a descriptor column on the upstream relation.
+/// An optional [`Self::dv_ref`] column hint enables per-row deletion-vector masking against
+/// a descriptor column on the upstream relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadSink {
-    /// Where Load's output is materialized. Downstream plans reference this
-    /// handle via [`crate::plans::ir::RelationRegistry::relation_ref`].
+    /// Synthetic handle the engine attaches so its `LoadTableProvider` can publish a stable
+    /// arrow output schema (id-based identity, schema-only consumption).
     pub output_relation: RelationHandle,
     /// Desired per-file output columns (nullability follows
     /// [`crate::ParquetHandler::read_parquet_files`] semantics).
@@ -228,36 +214,7 @@ impl LoadSink {
     }
 }
 
-/// What the engine does with the terminal row stream.
-///
-/// Sink shapes: `Relation` (pipe into another plan or expose to the caller via
-/// a [`ResultPlan`](crate::plans::ir::ResultPlan)), `Consume` (drain into
-/// a [`KernelConsumer`]), and `Load` (per-row file read).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SinkType {
-    /// Stream every output batch to the named [`RelationHandle`]. Another
-    /// plan in the same phase consumes via
-    /// [`crate::plans::ir::RelationRegistry::relation_ref`],
-    /// or a [`ResultPlan`](crate::plans::ir::ResultPlan) names this relation
-    /// as its caller-facing output.
-    Relation(RelationHandle),
-    /// Drain every output batch through the wrapped consumer KDF. The KDF's
-    /// finalized state is harvested by the engine into the
-    /// phase's `StepResult` (and recovered by the typed
-    /// [`Extractor`](crate::plans::kernel_consumers::Extractor) that yields
-    /// `O = KernelConsumer::Output`).
-    Consume(ConsumeSink),
-    /// File-reader sink — for each upstream row, read a file and materialize
-    /// the result under [`LoadSink::output_relation`]. See [`LoadSink`].
-    ///
-    /// Boxed because `LoadSink` is substantially larger than the other variants
-    /// (`output_relation` + `file_schema` + `file_meta` + `passthrough_columns` +
-    /// `dv_ref` + `base_url`); unboxed it dragged every `SinkType` instance up to
-    /// the same footprint.
-    Load(Box<LoadSink>),
-}
-
-/// Default file-meta column hints: `path` + `size`, matching the FSR plan-builder convention.
+/// Default file-meta column hints: `path` + `size`.
 fn default_scan_file_columns() -> ScanFileColumns {
     ScanFileColumns {
         path: ColumnName::new(["path"]),

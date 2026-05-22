@@ -1,7 +1,7 @@
 //! SSA-plan -> DataFusion [`datafusion_expr::LogicalPlan`] lowering.
 //!
-//! See [`ssa::compile_ssa`] for the entry point. The submodules host the per-shape lowering
-//! helpers shared with the (deleted) legacy compile path.
+//! See [`ssa::compile_ssa`] for the entry point. The submodules host per-shape lowering
+//! helpers (file listings, scans, projections, ordered union, output canonicalization).
 
 mod canonicalize;
 mod ordered_union;

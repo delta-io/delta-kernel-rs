@@ -97,12 +97,12 @@ pub fn build_scan_for_spec(
 /// metadata isn't consistent across the parquet-read and partition-broadcast paths
 /// (see `partitionValues_parsed.col-<uuid>`); pushing a filter into the DataFusion
 /// plan triggers an arrow-side `coalesce_batches` assertion when these mixed-metadata
-/// batches need to be combined. The outer projection installed by
-/// [`DataFusionExecutor::read_relation`] makes the *output* schema consistent
-/// (logical names + Delta metadata everywhere), but the *input-side* coalesce inside
-/// the scan plan still sees the unstamped variants. Until those upstream operators
-/// stamp consistent metadata too, predicate pushdown stays disabled here. The
-/// post-collect path runs on already-stamped batches, sidestepping the mismatch.
+/// batches need to be combined. The outer projection installed by the SSA scan compile
+/// path makes the *output* schema consistent (logical names + Delta metadata everywhere),
+/// but the *input-side* coalesce inside the scan plan still sees the unstamped variants.
+/// Until those upstream operators stamp consistent metadata too, predicate pushdown stays
+/// disabled here. The post-collect path runs on already-stamped batches, sidestepping the
+/// mismatch.
 pub async fn execute_read_via_datafusion(
     executor: &DataFusionExecutor,
     scan: &Scan,

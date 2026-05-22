@@ -1,10 +1,8 @@
-//! Node payload types for the declarative plan IR.
-//!
-//! The recursive tree shape lives in [`super::declarative::DeclarativePlanNode`].
+//! Node payload types referenced by the SSA IR ([`super::ssa`]) and the engine compile path.
 
 use std::sync::Arc;
 
-use crate::expressions::{ColumnName, Expression, Scalar};
+use crate::expressions::{Expression, Scalar};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta};
 
@@ -87,14 +85,9 @@ impl ValuesNode {
 }
 
 // ============================================================================
-// Unary transforms
+// Project node payload (consumed by both SSA `Node::Project` lowering and the
+// engine's `compile_project_node` helper)
 // ============================================================================
-
-/// Keep rows where `predicate` is `true` (SQL null semantics).
-#[derive(Debug, Clone)]
-pub struct FilterNode {
-    pub predicate: Arc<Expression>,
-}
 
 /// Project rows through expressions into `output_schema`.
 ///
@@ -105,114 +98,6 @@ pub struct ProjectNode {
     pub output_schema: SchemaRef,
 }
 
-// ============================================================================
-// N-ary
-// ============================================================================
-
-/// Concatenate child streams.
-///
-/// `ordered=true` preserves child order; `ordered=false` allows reordering.
-#[derive(Debug, Clone)]
-pub struct UnionNode {
-    pub ordered: bool,
-}
-
-// Binary — equi-join
-// ============================================================================
-
-/// SQL join semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinType {
-    /// Emit `(left, right)` pairs whose join keys match.
-    Inner,
-    /// Emit each right row whose key does not match any left row.
-    LeftAnti,
-}
-
-/// Equi-join with composite keys.
-///
-/// `left_keys` map to left child rows; `right_keys` map to right child rows.
-/// For [`JoinType::LeftAnti`], output schema mirrors the right child.
-#[derive(Debug, Clone)]
-pub struct JoinNode {
-    /// Key expressions evaluated on left input batches.
-    pub left_keys: Vec<Arc<Expression>>,
-    /// Key expressions evaluated on right input batches.
-    pub right_keys: Vec<Arc<Expression>>,
-    /// Join output semantics.
-    pub join_type: JoinType,
-    /// Output schema of this join.
-    pub output_schema: SchemaRef,
-}
-
-// ============================================================================
-
-// ============================================================================
-// Ordering
-// ============================================================================
-
-/// Single-column sort specification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrderingSpec {
-    pub column: ColumnName,
-    pub descending: bool,
-}
-
-impl OrderingSpec {
-    /// Ascending order.
-    pub fn asc(column: ColumnName) -> Self {
-        Self {
-            column,
-            descending: false,
-        }
-    }
-
-    /// Descending order.
-    pub fn desc(column: ColumnName) -> Self {
-        Self {
-            column,
-            descending: true,
-        }
-    }
-}
-
-// ============================================================================
-// Window
-// ============================================================================
-
-/// One window function in a [`WindowNode`].
-///
-/// Only `row_number()` is supported.
-#[derive(Debug, Clone)]
-pub struct WindowFunction {
-    pub output_col: String,
-}
-
-/// Window functions over `partition_by` + `order_by`.
-///
-/// Output schema is child schema plus one LONG column per function.
-#[derive(Debug, Clone)]
-pub struct WindowNode {
-    pub functions: Vec<WindowFunction>,
-    pub partition_by: Vec<Arc<Expression>>,
-    pub order_by: Vec<OrderingSpec>,
-}
-
-impl WindowNode {
-    /// Construct a [`WindowNode`] and validate invariants.
-    pub fn try_new(
-        functions: Vec<WindowFunction>,
-        partition_by: Vec<Arc<Expression>>,
-        order_by: Vec<OrderingSpec>,
-    ) -> DeltaResult<Self> {
-        Ok(Self {
-            functions,
-            partition_by,
-            order_by,
-        })
-    }
-}
-
 mod sinks;
 
-pub use sinks::{ConsumeSink, DvRef, LoadSink, RelationHandle, ScanFileColumns, SinkType};
+pub use sinks::{ConsumeSink, DvRef, LoadSink, RelationHandle, ScanFileColumns};

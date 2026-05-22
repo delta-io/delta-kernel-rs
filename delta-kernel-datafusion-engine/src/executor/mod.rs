@@ -1,10 +1,11 @@
 //! [`DataFusionExecutor`]: drives kernel SSA coroutine state machines and compiles their
-//! [`Step::Consume`] / `ResultPlan` payloads to DataFusion plans.
+//! step payloads to DataFusion plans.
 //!
-//! Every step the SM yields is either a [`Step::SchemaQuery`] (parquet footer read) or a
-//! [`Step::Consume`] (SSA dataflow drained into a
-//! [`ConsumeSink`](delta_kernel::plans::ir::nodes::ConsumeSink)). Terminal `ResultPlan`s
-//! describe a single self-contained dataflow DAG that compiles to a [`LogicalPlan`].
+//! Every step the SM yields is either a `Step::SchemaQuery` (parquet footer read) or a
+//! `Step::Consume` (SSA dataflow drained into a [`ConsumeSink`]). Terminal `ResultPlan`s
+//! describe a single self-contained dataflow DAG that compiles to a `LogicalPlan`.
+//!
+//! [`ConsumeSink`]: delta_kernel::plans::ir::nodes::ConsumeSink
 
 use std::sync::Arc;
 
@@ -194,7 +195,8 @@ impl DataFusionExecutor {
     ///
     /// Sugar for `self.drive_ssa_to_dataframe(scan.scan_state_machine()?)`.
     pub async fn scan_data(&self, scan: &Scan) -> Result<DataFrame, DeltaError> {
-        self.drive_ssa_to_dataframe(scan.scan_state_machine()?).await
+        self.drive_ssa_to_dataframe(scan.scan_state_machine()?)
+            .await
     }
 
     /// Drive a metadata-only scan and return the live-actions DataFrame.
@@ -309,4 +311,3 @@ impl DataFusionExecutor {
         Ok(())
     }
 }
-

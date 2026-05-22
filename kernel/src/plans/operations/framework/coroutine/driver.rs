@@ -180,7 +180,7 @@ impl<R: 'static> StateMachine for Coroutine<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plans::operations::framework::coroutine::context::{StepResume, StepYield};
+    use crate::plans::operations::framework::coroutine::context::StepYield;
     use crate::plans::operations::framework::engine_error::{EngineError, EngineErrorKind};
     use crate::plans::operations::framework::step::SchemaQueryNode;
 

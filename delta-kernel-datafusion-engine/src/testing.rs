@@ -1,7 +1,8 @@
 //! Test-only buffered collectors for [`DataFusionExecutor`].
 //!
-//! Thin wrappers around the SSA result-plan APIs that drain a [`DataFrame`] into a
-//! `Vec<RecordBatch>`. Returned batches carry whatever schema the SSA plan terminates at;
+//! Thin wrappers around the SSA result-plan APIs that drain a
+//! [`DataFrame`](datafusion::dataframe::DataFrame) into a `Vec<RecordBatch>`. Returned batches
+//! carry whatever schema the SSA plan terminates at;
 //! plans that need column-mapping renames / Delta field metadata bake those into the
 //! terminal projection upstream of `Context::into_result_plan`.
 //!

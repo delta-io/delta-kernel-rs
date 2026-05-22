@@ -4,9 +4,9 @@
 //! [`super::KernelConsumer`] runtime impl. It declares the typed output callers
 //! receive and how the finalized state reduces into that output.
 //!
-//! The bridge from state → plan-tree insertion → typed `Extractor<O>` lives
-//! on [`crate::plans::ir::PlanBuilder::consume`] — SM authors call
-//! it directly on a state instance; no intermediate factory wrapper is exposed.
+//! The bridge from state -> plan-tree insertion -> typed `Extractor<O>` lives on
+//! `Cursor::consume` (see [`crate::plans::operations::framework::plan_context`]) -- SM
+//! authors call it directly on a state instance; no intermediate factory wrapper is exposed.
 
 use std::any::Any;
 
@@ -73,15 +73,6 @@ impl<O: Send + 'static> Extractor<O> {
             })
         };
         Self { token, extract }
-    }
-
-    /// Token identifying the entry this extractor will pull from a [`StepResult`].
-    ///
-    /// Test-only: production code receives the typed payload through
-    /// [`Extractor::extract`] and does not need direct access to the token.
-    #[cfg(test)]
-    pub(crate) fn token(&self) -> &KernelConsumerToken {
-        &self.token
     }
 
     /// Pull this extractor's payload from `state` and decode it.

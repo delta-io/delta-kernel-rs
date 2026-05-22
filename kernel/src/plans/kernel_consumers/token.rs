@@ -1,11 +1,11 @@
 //! [`KernelConsumerToken`] — semantic identifier that joins a kernel-consumer node with its
 //! extracted state.
 //!
-//! Tokens are stamped at plan-build time when a [`SinkType::Consume`]
-//! sink is constructed. Each token carries the consumer kind and a UUID string id.
+//! Tokens are stamped at plan-build time when a [`Step::Consume`]
+//! step is constructed. Each token carries the consumer kind and a UUID string id.
 //! `Display` emits `<kind>#<id>`.
 //!
-//! [`SinkType::Consume`]: crate::plans::ir::nodes::SinkType::Consume
+//! [`Step::Consume`]: crate::plans::operations::framework::step::Step::Consume
 
 use strum::Display as StrumDisplay;
 use uuid::Uuid;
@@ -20,14 +20,14 @@ pub enum KernelConsumerKind {
 
 /// Identity for a kernel-consumer entry in [`StepResult`].
 ///
-/// Stamped at plan-build time when a [`SinkType::Consume`] sink is
-/// constructed. The fresh UUID `id` ensures stale handles from a prior
-/// plan can't be confused with current ones — a token from a dead plan
-/// won't match any live `StepResult` entry, so old handles can't be
-/// used incorrectly to read from or write into the current plan's state.
+/// Stamped at plan-build time when a [`Step::Consume`] step is constructed. The fresh
+/// UUID `id` ensures stale handles from a prior plan can't be confused with current
+/// ones — a token from a dead plan won't match any live `StepResult` entry, so old
+/// handles can't be used incorrectly to read from or write into the current plan's
+/// state.
 ///
 /// [`StepResult`]: crate::plans::operations::framework::step_result::StepResult
-/// [`SinkType::Consume`]: crate::plans::ir::nodes::SinkType::Consume
+/// [`Step::Consume`]: crate::plans::operations::framework::step::Step::Consume
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KernelConsumerToken {
     pub kind: KernelConsumerKind,
