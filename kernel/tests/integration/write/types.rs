@@ -113,8 +113,13 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[rstest]
+#[case::shredding_preview(vec!["variantType", "variantShredding-preview"])]
+#[case::shredding(vec!["variantType", "variantShredding"])]
 #[tokio::test]
-async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_variant(
+    #[case] features: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     fn unshredded_variant_schema_flipped() -> DataType {
@@ -162,8 +167,8 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         table_schema.clone(),
         &[],
         true,
-        vec!["variantType", "variantShredding-preview"],
-        vec!["variantType", "variantShredding-preview"],
+        features.clone(),
+        features,
     )
     .await?;
 

@@ -155,6 +155,7 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantType-preview")]
     #[serde(rename = "variantType-preview")]
     VariantTypePreview,
+    VariantShredding,
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
@@ -597,6 +598,14 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -635,6 +644,7 @@ impl TableFeature {
             | TableFeature::VacuumProtocolCheck
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
+            | TableFeature::VariantShredding
             | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
@@ -698,6 +708,7 @@ impl TableFeature {
             TableFeature::VacuumProtocolCheck => &VACUUM_PROTOCOL_CHECK_INFO,
             TableFeature::VariantType => &VARIANT_TYPE_INFO,
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
+            TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
@@ -835,6 +846,7 @@ mod tests {
                 TableFeature::VacuumProtocolCheck => "vacuumProtocolCheck",
                 TableFeature::VariantType => "variantType",
                 TableFeature::VariantTypePreview => "variantType-preview",
+                TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
