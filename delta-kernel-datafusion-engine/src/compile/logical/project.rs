@@ -1,4 +1,4 @@
-//! Lowering for [`Node::Project`](delta_kernel::plans::ir::ssa::Node::Project) plus the
+//! Lowering for [`NodeKind::Project`](delta_kernel::plans::ir::plan::NodeKind::Project) plus the
 //! root-rename visitor that handles input/output name collisions.
 
 use std::borrow::Cow;
@@ -83,7 +83,7 @@ fn rewrite_expressions<'a, R: ExpressionTransform<'a>>(
         .collect()
 }
 
-/// Lower a [`Node::Project`](delta_kernel::plans::ir::ssa::Node::Project) arm to a
+/// Lower a [`NodeKind::Project`](delta_kernel::plans::ir::plan::NodeKind::Project) arm to a
 /// DataFusion [`LogicalPlan`]. `child_plan` is the already-compiled child plan; this helper
 /// handles input/output name collision avoidance, pre-CSE hoisting, and the final projection
 /// expression construction.

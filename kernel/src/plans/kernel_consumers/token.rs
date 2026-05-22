@@ -1,11 +1,11 @@
 //! [`KernelConsumerToken`] — semantic identifier that joins a kernel-consumer node with its
 //! extracted state.
 //!
-//! Tokens are stamped at plan-build time when a [`Step::Consume`]
+//! Tokens are stamped at plan-build time when a [`EngineRequest::Consume`]
 //! step is constructed. Each token carries the consumer kind and a UUID string id.
 //! `Display` emits `<kind>#<id>`.
 //!
-//! [`Step::Consume`]: crate::plans::operations::framework::step::Step::Consume
+//! [`EngineRequest::Consume`]: crate::plans::state_machines::framework::step::EngineRequest::Consume
 
 use strum::Display as StrumDisplay;
 use uuid::Uuid;
@@ -20,12 +20,12 @@ pub enum KernelConsumerKind {
 
 /// Identity for a kernel-consumer entry on a finished handle.
 ///
-/// Stamped at plan-build time when a [`Step::Consume`] step is constructed. The fresh
+/// Stamped at plan-build time when a [`EngineRequest::Consume`] step is constructed. The fresh
 /// UUID `id` ensures stale handles from a prior plan can't be confused with current
 /// ones -- a [`FinishedHandle`] arriving with a token from a dead plan fails the
 /// [`Extractor`] sanity check at decode time.
 ///
-/// [`Step::Consume`]: crate::plans::operations::framework::step::Step::Consume
+/// [`EngineRequest::Consume`]: crate::plans::state_machines::framework::step::EngineRequest::Consume
 /// [`FinishedHandle`]: super::handle::FinishedHandle
 /// [`Extractor`]: super::typed::Extractor
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

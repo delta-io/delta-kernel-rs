@@ -2,7 +2,7 @@
 //!
 //! [`SCAN_BASE`] and [`FSR_BASE`] pin the per-pipeline `Add`/`Remove`/... slot list as a
 //! `SchemaRef`, used by reconciliation as the JSON commit-load file schema.
-//! [`project_scan_file_row`] folds a reconciled [`Cursor`] into the flat post-FSR
+//! [`project_scan_file_row`] folds a reconciled [`PlanBuilder`] into the flat post-FSR
 //! `scan_file_row` shape that the data stage consumes.
 
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use crate::actions::{
 };
 use crate::expressions::{col, Expression};
 use crate::plans::errors::DeltaError;
-use crate::plans::operations::framework::plan_context::Cursor;
+use crate::plans::state_machines::framework::plan_context::PlanBuilder;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::schema::{
     arc_schema, ArrayType, DataType, SchemaRef, StructField, StructType, ToSchema,
@@ -54,7 +54,7 @@ pub(super) static JOIN_KEY_FIELD: std::sync::LazyLock<StructField> =
         )
     });
 
-// === Scan terminal: reconciled cursor -> flat scan_file_row ===============================
+// === Scan terminal: reconciled builder -> flat scan_file_row ===============================
 
 /// Project the reconciled action stream into the flat `scan_file_row` shape consumed by
 /// the SSA scan data stage:
@@ -76,15 +76,15 @@ pub(super) static JOIN_KEY_FIELD: std::sync::LazyLock<StructField> =
 ///
 /// **Invariant:** when `partitions` is `Some(parts)`, the upstream reconciliation pipeline
 /// must have already replaced `add.partitionValues` with `add.partitionValues_parsed`
-/// (see `ssa_reconciliation::ReconciliationCursor::with_partitions_parsed`). The terminal
+/// (see `ssa_reconciliation::ReconciliationPlanBuilder::with_partitions_parsed`). The terminal
 /// reads `col(["add", "partitionValues_parsed"])` directly -- no per-row
 /// `map_to_struct(add.partitionValues)` here. The raw Map form has no downstream consumer
 /// in the SSA path, so it is omitted from `fileConstantValues` entirely (parsing happens
 /// once upstream, not per file row in the data phase).
 pub(super) fn project_scan_file_row(
-    cursor: Cursor,
+    builder: PlanBuilder,
     partitions: Option<&SchemaRef>,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
 
     let tags = crate::schema::MapType::new(DataType::STRING, DataType::STRING, true);
@@ -123,13 +123,13 @@ pub(super) fn project_scan_file_row(
         col([ADD_NAME, "deletionVector"]).into(),
         Arc::new(Expression::struct_from(file_constant_exprs)),
     ];
-    cursor.project_with_schema(exprs, schema)
+    builder.project_with_schema(exprs, schema)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plans::operations::framework::plan_context::Context;
+    use crate::plans::state_machines::framework::plan_context::Context;
 
     fn names(fields: impl Iterator<Item = &'static str>) -> Vec<String> {
         fields.map(String::from).collect()
@@ -157,12 +157,12 @@ mod tests {
         );
     }
 
-    /// Build a synthetic input cursor whose schema mimics the reconciled action stream
+    /// Build a synthetic input builder whose schema mimics the reconciled action stream
     /// (post-`with_partitions_parsed`): `add` carries `path`/`size`/`deletionVector`/
     /// `baseRowId`/etc., plus `partitionValues_parsed` when partitions are present. The
     /// terminal projection reads only those field names regardless of how the rest of the
     /// upstream looks.
-    fn make_input_cursor(parts: Option<&SchemaRef>) -> (Context, Cursor) {
+    fn make_input_cursor(parts: Option<&SchemaRef>) -> (Context, PlanBuilder) {
         use crate::actions::deletion_vector::DeletionVectorDescriptor;
         let tags = crate::schema::MapType::new(DataType::STRING, DataType::STRING, true);
         let mut add_fields = vec![
@@ -185,10 +185,10 @@ mod tests {
             StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         ]);
         let ctx = Context::new();
-        let cursor = ctx
+        let builder = ctx
             .values(schema, Vec::<Vec<crate::expressions::Scalar>>::new())
             .unwrap();
-        (ctx, cursor)
+        (ctx, builder)
     }
 
     /// Without partitions: the terminal emits the four-field `fileConstantValues` and
@@ -196,8 +196,8 @@ mod tests {
     /// Map-typed slot here.
     #[test]
     fn project_scan_file_row_drops_partition_values_map_when_no_parts() {
-        let (_ctx, cursor) = make_input_cursor(None);
-        let out = project_scan_file_row(cursor, None).unwrap();
+        let (_ctx, builder) = make_input_cursor(None);
+        let out = project_scan_file_row(builder, None).unwrap();
         let schema = out.schema().unwrap();
         let fields: Vec<_> = schema.fields().map(|f| f.name().clone()).collect();
         assert_eq!(
@@ -226,8 +226,8 @@ mod tests {
     #[test]
     fn project_scan_file_row_appends_partitions_parsed_when_some() {
         let parts = arc_schema([StructField::nullable("p", DataType::STRING)]);
-        let (_ctx, cursor) = make_input_cursor(Some(&parts));
-        let out = project_scan_file_row(cursor, Some(&parts)).unwrap();
+        let (_ctx, builder) = make_input_cursor(Some(&parts));
+        let out = project_scan_file_row(builder, Some(&parts)).unwrap();
         let schema = out.schema().unwrap();
         let DataType::Struct(fcv) = schema.field(FILE_CONSTANT_VALUES_NAME).unwrap().data_type()
         else {

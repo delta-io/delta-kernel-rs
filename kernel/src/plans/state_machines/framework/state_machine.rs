@@ -17,8 +17,8 @@
 //! ```
 
 use super::engine_error::EngineError;
-use super::step::Step;
-use super::step_payload::StepPayload;
+use super::step::EngineRequest;
+use super::step_payload::EngineResponse;
 use crate::plans::errors::DeltaError;
 
 /// Result of submitting a step result to a state machine.
@@ -36,7 +36,7 @@ pub enum NextStep<R> {
 ///
 /// Each SM-visible "step" is one tick of this loop: the executor asks
 /// [`StateMachine::get_step`] for what to run, executes it, then calls
-/// [`StateMachine::submit`] with the outcome ([`StepPayload`] on success, an
+/// [`StateMachine::submit`] with the outcome ([`EngineResponse`] on success, an
 /// [`EngineError`] on engine failure).
 ///
 /// # Error layering
@@ -59,21 +59,21 @@ pub trait StateMachine {
     /// *building* the next step (plan construction can fail on e.g. a
     /// malformed schema projection). These are typically tagged
     /// [`DeltaErrorCode::DeltaCommandInvariantViolation`](crate::plans::errors::DeltaErrorCode::DeltaCommandInvariantViolation).
-    fn get_step(&mut self) -> Result<Step, DeltaError>;
+    fn get_step(&mut self) -> Result<EngineRequest, DeltaError>;
 
     /// Receive the step outcome from the driver.
     ///
-    /// - `Ok(StepPayload)` — the executor ran the step and produced its single typed payload (a
+    /// - `Ok(EngineResponse)` — the executor ran the step and produced its single typed payload (a
     ///   finished consumer handle, a schema, or
-    ///   [`StepPayload::Empty`](super::step_payload::StepPayload::Empty) for the driver-internal
-    ///   priming case). The SM body destructures the variant matching its preceding yield; any
-    ///   other variant is an executor bug surfaced as an internal error.
+    ///   [`EngineResponse::Empty`](super::step_payload::EngineResponse::Empty) for the
+    ///   driver-internal priming case). The SM body destructures the variant matching its preceding
+    ///   yield; any other variant is an executor bug surfaced as an internal error.
     /// - `Err(EngineError)` — a typed engine-side failure; the SM matches on
     ///   [`EngineError::kind`](super::engine_error::EngineError::kind) and decides how to surface
     ///   it.
     fn submit(
         &mut self,
-        result: Result<StepPayload, EngineError>,
+        result: Result<EngineResponse, EngineError>,
     ) -> Result<NextStep<Self::Result>, DeltaError>;
 
     /// Static label for logging / diagnostics. Drivers use this in span

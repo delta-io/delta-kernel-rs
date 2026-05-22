@@ -1,5 +1,5 @@
-//! Helper IR types referenced by the SSA IR's `Node::Load` and `Step::Consume`, and by the
-//! engine's compile path (file-reader sink, deletion-vector hints, consumer drain template).
+//! Helper IR types referenced by the SSA IR's `NodeKind::Load` and `EngineRequest::Consume`, and by
+//! the engine's compile path (file-reader sink, deletion-vector hints, consumer drain template).
 
 use url::Url;
 use uuid::Uuid;
@@ -10,7 +10,7 @@ use crate::plans::kernel_consumers::{Handle, KernelConsumer, KernelConsumerToken
 use crate::schema::SchemaRef;
 
 /// Template for draining a row stream into a [`KernelConsumer`] via
-/// [`Step::Consume`](crate::plans::operations::framework::step::Step::Consume).
+/// [`EngineRequest::Consume`](crate::plans::state_machines::framework::step::EngineRequest::Consume).
 ///
 /// - `initial_state`: cloned per partition via [`DynClone`](dyn_clone::DynClone) into a
 ///   [`Handle`](crate::plans::kernel_consumers::Handle).
@@ -63,7 +63,7 @@ impl PartialEq for ConsumeSink {
 impl Eq for ConsumeSink {}
 
 /// Diagnostic + arrow-output handle synthesized by the engine when lowering an SSA
-/// `Node::Load`. Carries a unique id, a diagnostic name, and the kernel-typed output schema
+/// `NodeKind::Load`. Carries a unique id, a diagnostic name, and the kernel-typed output schema
 /// the load materializes; the engine's `LoadTableProvider` reads `schema` to publish its
 /// arrow output. Equality / hashing key on `id` only — `name` and `schema` are metadata.
 #[derive(Debug, Clone)]
@@ -143,7 +143,7 @@ impl DvRef {
 }
 
 /// File-reader sink template consumed by the engine's `LoadTableProvider` when lowering an
-/// SSA `Node::Load`. For each upstream row, the engine opens the resolved file in
+/// SSA `NodeKind::Load`. For each upstream row, the engine opens the resolved file in
 /// [`Self::file_type`], reads [`Self::file_schema`] columns, and broadcasts the row's
 /// [`Self::passthrough_columns`] alongside each emitted file row.
 ///

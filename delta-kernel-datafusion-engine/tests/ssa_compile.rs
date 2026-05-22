@@ -1,7 +1,7 @@
-//! Round-trip integration tests for the SSA `compile_ssa` lowering. Each test builds an
-//! [`ssa::Plan`] directly via [`Plan::push`], wraps it in an [`ssa::ResultPlan`], and runs
-//! it through [`DataFusionExecutor::ssa_result_to_dataframe`] -- exercising the per-Node
-//! lowerings without requiring a state machine.
+//! Round-trip integration tests for the SSA `compile_ssa` lowering. Each test builds a
+//! [`Plan`](delta_kernel::plans::ir::plan::Plan) via the SSA [`Context`] builder, wraps it in
+//! a [`ResultPlan`], and runs it through [`DataFusionExecutor::ssa_result_to_dataframe`] --
+//! exercising the per-`NodeKind` lowerings without requiring a state machine.
 
 mod common;
 
@@ -12,15 +12,18 @@ use common::SumRowsConsumer;
 use delta_kernel::arrow::array::{AsArray, RecordBatch};
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::Int64Type;
-use delta_kernel::expressions::{ColumnName, Expression, Predicate, Scalar};
+use delta_kernel::expressions::{
+    ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
+};
 use delta_kernel::plans::ir::nodes::{ConsumeSink, FileType, ScanFileColumns};
-use delta_kernel::plans::ir::ssa::{JoinKind, Node, Plan as SsaPlan, ResultPlan as SsaResultPlan};
-use delta_kernel::plans::operations::framework::step::Step;
-use delta_kernel::plans::operations::framework::step_payload::StepPayload;
+use delta_kernel::plans::ir::plan::ResultPlan;
+use delta_kernel::plans::state_machines::framework::plan_context::{Context, LoadSpec};
+use delta_kernel::plans::state_machines::framework::step::EngineRequest;
+use delta_kernel::plans::state_machines::framework::step_payload::EngineResponse;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 
-fn run_to_one_batch(rp: SsaResultPlan) -> RecordBatch {
+fn run_to_one_batch(rp: ResultPlan) -> RecordBatch {
     let exec = DataFusionExecutor::try_new().expect("executor");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -59,20 +62,14 @@ fn long_col(batch: &RecordBatch, name: &str) -> Vec<i64> {
 /// `Values` rows lower to a `LogicalPlan::Values` whose batches preserve row order.
 #[test]
 fn values_round_trip_preserves_rows() {
-    let mut plan = SsaPlan::new();
     let rows = vec![
         vec![Scalar::Long(1), Scalar::Long(10)],
         vec![Scalar::Long(2), Scalar::Long(20)],
         vec![Scalar::Long(3), Scalar::Long(30)],
     ];
-    let result = plan.push(
-        Node::Values {
-            schema: long_schema(&["a", "b"]),
-            rows,
-        },
-        vec![],
-    );
-    let rp = SsaResultPlan { plan, result };
+    let ctx = Context::new();
+    let builder = ctx.values(long_schema(&["a", "b"]), rows).unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let batch = run_to_one_batch(rp);
     assert_eq!(long_col(&batch, "a"), vec![1, 2, 3]);
@@ -82,25 +79,24 @@ fn values_round_trip_preserves_rows() {
 /// `Filter` keeps rows where the predicate evaluates true.
 #[test]
 fn filter_drops_rows_where_predicate_is_false() {
-    let mut plan = SsaPlan::new();
-    let src = plan.push(
-        Node::Values {
-            schema: long_schema(&["x"]),
-            rows: vec![
+    let ctx = Context::new();
+    let src = ctx
+        .values(
+            long_schema(&["x"]),
+            vec![
                 vec![Scalar::Long(1)],
                 vec![Scalar::Long(2)],
                 vec![Scalar::Long(3)],
                 vec![Scalar::Long(4)],
             ],
-        },
-        vec![],
-    );
-    let predicate = Arc::new(Predicate::gt(
+        )
+        .unwrap();
+    let predicate: PredicateRef = Arc::new(Predicate::gt(
         Expression::column(["x"]),
         Expression::literal(Scalar::Long(2)),
     ));
-    let result = plan.push(Node::Filter { predicate }, vec![src]);
-    let rp = SsaResultPlan { plan, result };
+    let builder = src.filter(predicate).unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let batch = run_to_one_batch(rp);
     let kept = long_col(&batch, "x");
@@ -111,25 +107,21 @@ fn filter_drops_rows_where_predicate_is_false() {
 /// `Project` renames + reorders columns; the output schema honors the named expression list.
 #[test]
 fn project_renames_columns() {
-    let mut plan = SsaPlan::new();
-    let src = plan.push(
-        Node::Values {
-            schema: long_schema(&["a", "b"]),
-            rows: vec![vec![Scalar::Long(11), Scalar::Long(22)]],
-        },
-        vec![],
-    );
-    let result = plan.push(
-        Node::Project {
-            named_exprs: vec![
-                ("y".to_string(), Arc::new(Expression::column(["b"]))),
-                ("x".to_string(), Arc::new(Expression::column(["a"]))),
-            ],
-            output_schema: long_schema(&["y", "x"]),
-        },
-        vec![src],
-    );
-    let rp = SsaResultPlan { plan, result };
+    let ctx = Context::new();
+    let src = ctx
+        .values(
+            long_schema(&["a", "b"]),
+            vec![vec![Scalar::Long(11), Scalar::Long(22)]],
+        )
+        .unwrap();
+    let exprs: Vec<ExpressionRef> = vec![
+        Arc::new(Expression::column(["b"])),
+        Arc::new(Expression::column(["a"])),
+    ];
+    let builder = src
+        .project_with_schema(exprs, long_schema(&["y", "x"]))
+        .unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let batch = run_to_one_batch(rp);
     assert_eq!(long_col(&batch, "y"), vec![22]);
@@ -140,23 +132,21 @@ fn project_renames_columns() {
 /// constant so the order is observable post-collect.
 #[test]
 fn ordered_union_preserves_input_order() {
-    let mut plan = SsaPlan::new();
-    let left = plan.push(
-        Node::Values {
-            schema: long_schema(&["v"]),
-            rows: vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]],
-        },
-        vec![],
-    );
-    let right = plan.push(
-        Node::Values {
-            schema: long_schema(&["v"]),
-            rows: vec![vec![Scalar::Long(3)], vec![Scalar::Long(4)]],
-        },
-        vec![],
-    );
-    let result = plan.push(Node::Union { ordered: true }, vec![left, right]);
-    let rp = SsaResultPlan { plan, result };
+    let ctx = Context::new();
+    let left = ctx
+        .values(
+            long_schema(&["v"]),
+            vec![vec![Scalar::Long(1)], vec![Scalar::Long(2)]],
+        )
+        .unwrap();
+    let right = ctx
+        .values(
+            long_schema(&["v"]),
+            vec![vec![Scalar::Long(3)], vec![Scalar::Long(4)]],
+        )
+        .unwrap();
+    let builder = left.union_ordered(&[right]).unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let batch = run_to_one_batch(rp);
     assert_eq!(long_col(&batch, "v"), vec![1, 2, 3, 4]);
@@ -165,40 +155,33 @@ fn ordered_union_preserves_input_order() {
 /// `EquiJoin { kind: Inner }` emits matching `(left, right)` rows.
 #[test]
 fn inner_equi_join_emits_matching_rows() {
-    let mut plan = SsaPlan::new();
-    let left = plan.push(
-        Node::Values {
-            schema: long_schema(&["k", "v_left"]),
-            rows: vec![
+    let ctx = Context::new();
+    let left = ctx
+        .values(
+            long_schema(&["k", "v_left"]),
+            vec![
                 vec![Scalar::Long(1), Scalar::Long(10)],
                 vec![Scalar::Long(2), Scalar::Long(20)],
                 vec![Scalar::Long(3), Scalar::Long(30)],
             ],
-        },
-        vec![],
-    );
-    let right = plan.push(
-        Node::Values {
-            schema: long_schema(&["rk", "v_right"]),
-            rows: vec![
+        )
+        .unwrap();
+    let right = ctx
+        .values(
+            long_schema(&["rk", "v_right"]),
+            vec![
                 vec![Scalar::Long(2), Scalar::Long(200)],
                 vec![Scalar::Long(3), Scalar::Long(300)],
                 vec![Scalar::Long(4), Scalar::Long(400)],
             ],
-        },
-        vec![],
-    );
-    let result = plan.push(
-        Node::EquiJoin {
-            kind: JoinKind::Inner,
-            key_pairs: vec![(
-                Arc::new(Expression::column(["k"])),
-                Arc::new(Expression::column(["rk"])),
-            )],
-        },
-        vec![left, right],
-    );
-    let rp = SsaResultPlan { plan, result };
+        )
+        .unwrap();
+    let keys: Vec<(ExpressionRef, ExpressionRef)> = vec![(
+        Arc::new(Expression::column(["k"])),
+        Arc::new(Expression::column(["rk"])),
+    )];
+    let builder = left.inner_join(right, keys).unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let batch = run_to_one_batch(rp);
     let mut tuples: Vec<(i64, i64, i64, i64)> = (0..batch.num_rows())
@@ -218,83 +201,74 @@ fn inner_equi_join_emits_matching_rows() {
 /// `EquiJoin { kind: LeftAnti }` emits each left row whose key matches no right row.
 #[test]
 fn left_anti_join_drops_matched_left_rows() {
-    let mut plan = SsaPlan::new();
-    let left = plan.push(
-        Node::Values {
-            schema: long_schema(&["k"]),
-            rows: vec![
+    let ctx = Context::new();
+    let left = ctx
+        .values(
+            long_schema(&["k"]),
+            vec![
                 vec![Scalar::Long(1)],
                 vec![Scalar::Long(2)],
                 vec![Scalar::Long(3)],
             ],
-        },
-        vec![],
-    );
-    let right = plan.push(
-        Node::Values {
-            schema: long_schema(&["k"]),
-            rows: vec![vec![Scalar::Long(2)]],
-        },
-        vec![],
-    );
-    let result = plan.push(
-        Node::EquiJoin {
-            kind: JoinKind::LeftAnti,
-            key_pairs: vec![(
-                Arc::new(Expression::column(["k"])),
-                Arc::new(Expression::column(["k"])),
-            )],
-        },
-        vec![left, right],
-    );
-    let rp = SsaResultPlan { plan, result };
+        )
+        .unwrap();
+    let right = ctx
+        .values(long_schema(&["k"]), vec![vec![Scalar::Long(2)]])
+        .unwrap();
+    let keys: Vec<(ExpressionRef, ExpressionRef)> = vec![(
+        Arc::new(Expression::column(["k"])),
+        Arc::new(Expression::column(["k"])),
+    )];
+    let builder = left.left_anti_join(right, keys).unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let batch = run_to_one_batch(rp);
     let kept: HashSet<i64> = long_col(&batch, "k").into_iter().collect();
     assert_eq!(kept, HashSet::from([1, 3]));
 }
 
-/// `Step::Consume` drains an SSA dataflow into a [`KernelConsumer`]
+/// `EngineRequest::Consume` drains an SSA dataflow into a [`KernelConsumer`]
 /// (`KernelConsumer::finish` -> `usize` row count) and the executor returns the finalized
-/// handle as `StepPayload::Consumer`, keyed by the sink's token.
+/// handle as `EngineResponse::Consumer`, keyed by the sink's token.
 #[tokio::test]
 async fn step_consume_drains_ssa_into_consumer_handle() {
-    let mut plan = SsaPlan::new();
-    let src = plan.push(
-        Node::Values {
-            schema: long_schema(&["v"]),
-            rows: vec![
+    let ctx = Context::new();
+    let src = ctx
+        .values(
+            long_schema(&["v"]),
+            vec![
                 vec![Scalar::Long(1)],
                 vec![Scalar::Long(2)],
                 vec![Scalar::Long(3)],
                 vec![Scalar::Long(4)],
             ],
-        },
-        vec![],
-    );
-    let predicate = Arc::new(Predicate::gt(
+        )
+        .unwrap();
+    let predicate: PredicateRef = Arc::new(Predicate::gt(
         Expression::column(["v"]),
         Expression::literal(Scalar::Long(2)),
     ));
-    let terminal = plan.push(Node::Filter { predicate }, vec![src]);
+    let builder = src.filter(predicate).unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
+    let terminal = rp.result;
+    let stmts = rp.plan.stmts;
 
     let sink = ConsumeSink::new_consumer(SumRowsConsumer::new("ssa.consume_test"));
     let token = sink.token.clone();
-    let stmts = plan.stmts;
 
     let executor = DataFusionExecutor::try_new().unwrap();
     let payload = executor
-        .execute_step(Step::Consume {
+        .execute_step(EngineRequest::Consume {
             stmts,
             terminal,
             sink,
         })
         .await
-        .expect("Step::Consume execution");
+        .expect("EngineRequest::Consume execution");
 
     let handle = match payload {
-        StepPayload::Consumer(h) => h,
-        other => panic!("expected StepPayload::Consumer, got {other:?}"),
+        EngineResponse::Consumer(h) => h,
+        other => panic!("expected EngineResponse::Consumer, got {other:?}"),
     };
     assert_eq!(
         handle.token, token,
@@ -307,7 +281,7 @@ async fn step_consume_drains_ssa_into_consumer_handle() {
     assert_eq!(total, 2, "filter keeps rows with v > 2 (i.e., 3 and 4)");
 }
 
-/// `Node::Load` reads each upstream row's path-column file in `file_type`, broadcasts the
+/// `NodeKind::Load` reads each upstream row's path-column file in `file_type`, broadcasts the
 /// `passthrough_columns` onto every emitted file row, and lifts the `file_schema` columns
 /// alongside. Verifies the engine-side ephemeral-`RelationHandle` plumbing (synthesized
 /// inside `compile_ssa` so we don't have to refactor `LoadTableProvider`).
@@ -337,22 +311,21 @@ async fn load_node_reads_files_and_broadcasts_passthrough() {
     let file_schema =
         Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap());
 
-    let mut plan = SsaPlan::new();
-    let upstream = plan.push(
-        Node::Values {
-            schema: upstream_schema,
-            rows: vec![
+    let ctx = Context::new();
+    let upstream = ctx
+        .values(
+            upstream_schema,
+            vec![
                 vec![
                     Scalar::String(rel_path.clone()),
                     Scalar::String("alpha".into()),
                 ],
                 vec![Scalar::String(rel_path), Scalar::String("beta".into())],
             ],
-        },
-        vec![],
-    );
-    let result = plan.push(
-        Node::Load {
+        )
+        .unwrap();
+    let builder = upstream
+        .load(LoadSpec {
             file_schema,
             file_type: FileType::Parquet,
             base_url: Some(base_url),
@@ -363,10 +336,9 @@ async fn load_node_reads_files_and_broadcasts_passthrough() {
                 record_count: None,
             },
             dv_ref: None,
-        },
-        vec![upstream],
-    );
-    let rp = SsaResultPlan { plan, result };
+        })
+        .unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let exec = DataFusionExecutor::try_new().unwrap();
     let batches = testing::collect_ssa_result(&exec, rp).await.unwrap();
@@ -386,29 +358,25 @@ async fn load_node_reads_files_and_broadcasts_passthrough() {
 /// the output).
 #[test]
 fn max_by_version_keeps_top_row_per_group_and_narrows_to_value_columns() {
-    let mut plan = SsaPlan::new();
-    let src = plan.push(
-        Node::Values {
-            schema: long_schema(&["k", "version", "payload"]),
-            rows: vec![
+    let ctx = Context::new();
+    let src = ctx
+        .values(
+            long_schema(&["k", "version", "payload"]),
+            vec![
                 vec![Scalar::Long(1), Scalar::Long(1), Scalar::Long(100)],
                 vec![Scalar::Long(1), Scalar::Long(3), Scalar::Long(300)],
                 vec![Scalar::Long(1), Scalar::Long(2), Scalar::Long(200)],
                 vec![Scalar::Long(2), Scalar::Long(5), Scalar::Long(500)],
                 vec![Scalar::Long(2), Scalar::Long(7), Scalar::Long(700)],
             ],
-        },
-        vec![],
-    );
-    let result = plan.push(
-        Node::MaxByVersion {
-            group_by: vec![Arc::new(Expression::column(["k"]))],
-            version_column: Arc::new(Expression::column(["version"])),
-            value_columns: vec!["payload".to_string()],
-        },
-        vec![src],
-    );
-    let rp = SsaResultPlan { plan, result };
+        )
+        .unwrap();
+    let group_by: Vec<ExpressionRef> = vec![Arc::new(Expression::column(["k"]))];
+    let version_column: ExpressionRef = Arc::new(Expression::column(["version"]));
+    let builder = src
+        .max_by_version(group_by, version_column, vec!["payload".to_string()])
+        .unwrap();
+    let rp = ctx.into_result_plan(builder).unwrap();
 
     let batch = run_to_one_batch(rp);
     // Output is `value_columns` only.

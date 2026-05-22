@@ -31,9 +31,9 @@ use super::ssa_reconciliation::execute_reconciliation_ssa;
 // Re-export for callers that need a stable type for the FSR commit-file row.
 pub use super::ssa_reconciliation::CommitFileMeta;
 use crate::plans::errors::{DeltaError, KernelErrAsDelta};
-use crate::plans::ir::ssa::ResultPlan as SsaResultPlan;
-use crate::plans::operations::framework::coroutine::driver::Coroutine;
-use crate::plans::operations::framework::plan_context::Context as SsaContext;
+use crate::plans::ir::plan::ResultPlan;
+use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
+use crate::plans::state_machines::framework::plan_context::Context as SsaContext;
 use crate::scan::state_info::StateInfo;
 use crate::scan::StatsOutputMode;
 use crate::snapshot::Snapshot;
@@ -66,24 +66,24 @@ impl FullState {
         }
     }
 
-    /// Coroutine SM driving the FSR pipeline end-to-end.
+    /// CoroutineSM SM driving the FSR pipeline end-to-end.
     ///
-    /// Builds against the [`crate::plans::operations::framework::plan_context::Context`]
-    /// (SSA / Cursor API) and yields a single
-    /// [`SsaResultPlan`](crate::plans::ir::ssa::ResultPlan) containing the entire
+    /// Builds against the [`crate::plans::state_machines::framework::plan_context::Context`]
+    /// (SSA / PlanBuilder API) and yields a single
+    /// [`ResultPlan`](crate::plans::ir::plan::ResultPlan) containing the entire
     /// reconciliation as one flat SSA program. Engines drive this through
     /// `drive_ssa_to_dataframe`.
-    pub fn state_machine(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
+    pub fn state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
         let snapshot = self.snapshot.clone();
         let state_info = self.state_info.clone();
-        Coroutine::new("fsr_ssa", move |mut co, _sm_id| async move {
+        CoroutineSM::new("fsr_ssa", move |mut engine, _sm_id| async move {
             let ctx = SsaContext::new();
             let stats = state_info
                 .as_ref()
                 .and_then(|si| si.physical_stats_schema.clone());
             let reconciled = execute_reconciliation_ssa(
                 &ctx,
-                &mut co,
+                &mut engine,
                 snapshot.as_ref(),
                 &FSR_BASE,
                 stats,

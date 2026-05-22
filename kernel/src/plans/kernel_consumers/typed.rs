@@ -5,7 +5,7 @@
 //! receive and how the finalized state reduces into that output.
 //!
 //! The bridge from state -> plan-tree insertion -> typed `Extractor<O>` lives on
-//! `Cursor::consume` (see [`crate::plans::operations::framework::plan_context`]) -- SM
+//! `PlanBuilder::consume` (see [`crate::plans::state_machines::framework::plan_context`]) -- SM
 //! authors call it directly on a state instance; no intermediate factory wrapper is exposed.
 
 use std::any::Any;
@@ -15,7 +15,7 @@ use super::token::KernelConsumerToken;
 use super::traits::KernelConsumer;
 use crate::delta_error;
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
-use crate::plans::operations::framework::engine_error::EngineError;
+use crate::plans::state_machines::framework::engine_error::EngineError;
 
 /// Typed-output companion. Each KDF state impls this once, declaring the
 /// typed output callers receive and how the finalized state reduces to it.
@@ -48,11 +48,11 @@ pub(crate) type ExtractFn<O> =
 /// A typed adapter for pulling the typed output of a single consume sink
 /// out of a [`FinishedHandle`].
 ///
-/// SM bodies build an `Extractor` while planting a [`Step::Consume`] (via
-/// [`Cursor::consume`](crate::plans::operations::framework::plan_context::Context::consume))
+/// SM bodies build an `Extractor` while planting a [`EngineRequest::Consume`] (via
+/// [`PlanBuilder::consume`](crate::plans::state_machines::framework::plan_context::Context::consume))
 /// and feed the engine's [`FinishedHandle`] back through [`Self::extract`] on resume.
 ///
-/// [`Step::Consume`]: crate::plans::operations::framework::step::Step::Consume
+/// [`EngineRequest::Consume`]: crate::plans::state_machines::framework::step::EngineRequest::Consume
 pub struct Extractor<O> {
     token: KernelConsumerToken,
     extract: ExtractFn<O>,

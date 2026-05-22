@@ -1,9 +1,9 @@
 //! SSA-flavored scan plan builder.
 //!
 //! Mirrors [`super::file_scan::Scan::build_plans`] / [`super::file_scan::Scan::do_data_stage`]
-//! but builds against the [`super::super::framework::plan_context`] (`Context` / `Cursor`) API
+//! but builds against the [`super::super::framework::plan_context`] (`Context` / `PlanBuilder`) API
 //! and the SSA IR. The scan-side terminal projection (action_pair -> flat `scan_file_row`) and
-//! the data-phase Load + logical projection are expressed as cursor chains; reconciliation
+//! the data-phase Load + logical projection are expressed as builder chains; reconciliation
 //! upstream of the terminal is shared with FSR via [`super::ssa_reconciliation`].
 //!
 //! After PR8 deletes the legacy registry-based pipeline, the SMs in [`super::file_scan`]
@@ -18,8 +18,8 @@ use super::ssa_reconciliation::execute_reconciliation_ssa;
 use crate::expressions::ColumnName;
 use crate::plans::errors::DeltaError;
 use crate::plans::ir::nodes::{DvRef, FileType, ScanFileColumns};
-use crate::plans::operations::framework::coroutine::context::StepCo;
-use crate::plans::operations::framework::plan_context::{Context, Cursor, LoadSpec};
+use crate::plans::state_machines::framework::coroutine::context::Engine;
+use crate::plans::state_machines::framework::plan_context::{Context, LoadSpec, PlanBuilder};
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
 use crate::scan::Scan;
 
@@ -31,18 +31,18 @@ use crate::scan::Scan;
 /// shared SSA reconciliation, then projects to the flat scan-file row shape and (when
 /// `with_data`) appends the data phase.
 ///
-/// Returns a [`Cursor`] terminating on either:
+/// Returns a [`PlanBuilder`] terminating on either:
 /// - the live-actions stream (`with_data == false`), or
 /// - the per-row data stream after parquet Load + logical-schema projection (`with_data == true`).
 ///
-/// The caller wraps the returned cursor with [`Context::into_result_plan`] to mint the
+/// The caller wraps the returned builder with [`Context::into_result_plan`] to mint the
 /// SM's terminal value.
 pub(super) async fn build_scan_ssa(
     ctx: &Context,
-    co: &mut StepCo,
+    engine: &mut Engine,
     scan: &Scan,
     with_data: bool,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     let stats = scan.physical_stats_schema();
     // The data stage needs the full partition schema (see `data_stage_partition_schema`
     // doc on [`Scan`]); the predicate-narrowed `physical_partition_schema()` only works
@@ -53,10 +53,10 @@ pub(super) async fn build_scan_ssa(
         scan.physical_partition_schema()
     };
 
-    // === Stages 1-5: shared reconciliation -> reconciled cursor =========================
+    // === Stages 1-5: shared reconciliation -> reconciled builder =========================
     let reconciled = execute_reconciliation_ssa(
         ctx,
-        co,
+        engine,
         scan.snapshot().as_ref(),
         &SCAN_BASE,
         stats,
@@ -76,15 +76,15 @@ pub(super) async fn build_scan_ssa(
     }
 }
 
-/// Append the SSA data stage onto the live-actions cursor and return the data-stream
-/// cursor. Mirrors [`Scan::do_data_stage`].
+/// Append the SSA data stage onto the live-actions builder and return the data-stream
+/// builder. Mirrors [`Scan::do_data_stage`].
 ///
-/// Splits per-file: the upstream cursor emits one row per surviving file (flat
-/// `scan_file_row` shape), and [`Cursor::load`] expands each row into the file's
+/// Splits per-file: the upstream builder emits one row per surviving file (flat
+/// `scan_file_row` shape), and [`PlanBuilder::load`] expands each row into the file's
 /// per-record stream while broadcasting `path` and the `fileConstantValues` struct via
 /// `passthrough_columns`. The trailing projection translates physical -> logical column
 /// names per the scan's column-mapping mode.
-fn do_data_stage_ssa(scan: &Scan, live_actions: Cursor) -> Result<Cursor, DeltaError> {
+fn do_data_stage_ssa(scan: &Scan, live_actions: PlanBuilder) -> Result<PlanBuilder, DeltaError> {
     let logical_schema = scan.logical_schema().clone();
     let logical_projection = scan_data_projection(scan.state_info())?;
 

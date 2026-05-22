@@ -1,7 +1,7 @@
-//! Narrow expression-type inference for cursor schema derivation.
+//! Narrow expression-type inference for builder schema derivation.
 //!
-//! Used by the SSA cursor builder ([`super::ssa`] consumers) to derive a [`DataType`] for
-//! each named expression in a `Project` so the cursor knows the output schema without the
+//! Used by the SSA plan builder ([`super::plan`] consumers) to derive a [`DataType`] for
+//! each named expression in a `Project` so the plan builder knows the output schema without the
 //! caller spelling it out. Coverage is intentionally minimal -- the variants exercised by
 //! the FSR / Scan / CDF builders today (`Literal`, `Column`, `Predicate`, `Variadic::Array`,
 //! `Variadic::Coalesce`, `If`, `Unary::ToJson`, `ParseJson`, plus boolean predicates).
@@ -88,7 +88,7 @@ pub(crate) fn infer_expression_type(
         | Expression::Opaque(_)
         | Expression::Unknown(_) => Err(delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
-            "expression variant cannot be inferred by the cursor builder; use \
+            "expression variant cannot be inferred by the plan builder; use \
              project_with_schema with an explicit output schema",
         )),
     }

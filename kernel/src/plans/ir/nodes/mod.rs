@@ -1,4 +1,4 @@
-//! Node payload types referenced by the SSA IR ([`super::ssa`]) and the engine compile path.
+//! NodeKind payload types referenced by the SSA IR ([`super::plan`]) and the engine compile path.
 
 use std::sync::Arc;
 
@@ -85,7 +85,7 @@ impl ValuesNode {
 }
 
 // ============================================================================
-// Project node payload (consumed by both SSA `Node::Project` lowering and the
+// Project node payload (consumed by both SSA `NodeKind::Project` lowering and the
 // engine's `compile_project_node` helper)
 // ============================================================================
 

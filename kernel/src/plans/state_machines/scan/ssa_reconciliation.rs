@@ -1,7 +1,7 @@
 //! Shared FSR / Scan reconciliation pipeline (SSA flavor).
 //!
 //! Builds the canonical *window-on-commits + anti-join-on-checkpoint* pipeline against the
-//! [`super::super::framework::plan_context`] (`Context` / `Cursor`) API and SSA IR. Consumed
+//! [`super::super::framework::plan_context`] (`Context` / `PlanBuilder`) API and SSA IR. Consumed
 //! by [`super::full_state::FullState::state_machine_ssa`] and
 //! [`super::ssa_scan::build_scan_ssa`].
 //!
@@ -17,7 +17,7 @@
 //!     -> reconciled
 //! ```
 //!
-//! Returns a [`Cursor`] terminating on the reconciled stream; the caller drains it via
+//! Returns a [`PlanBuilder`] terminating on the reconciled stream; the caller drains it via
 //! [`Context::into_result_plan`].
 
 use std::sync::Arc;
@@ -38,8 +38,8 @@ use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{FileFormat, FileType, ScanFileColumns};
 use crate::plans::kernel_consumers::SidecarCollector;
-use crate::plans::operations::framework::coroutine::context::StepCo;
-use crate::plans::operations::framework::plan_context::{Context, Cursor, LoadSpec};
+use crate::plans::state_machines::framework::coroutine::context::Engine;
+use crate::plans::state_machines::framework::plan_context::{Context, LoadSpec, PlanBuilder};
 use crate::schema::{arc_schema, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
@@ -64,7 +64,7 @@ pub(super) enum SsaCheckpointShape {
     },
     /// V2 multipart manifest: `files` are the manifest parts. The reconciliation
     /// re-scans them, filters down to sidecar pointer rows, and lazily loads the
-    /// referenced sidecar parquet files via `Node::Load`.
+    /// referenced sidecar parquet files via `NodeKind::Load`.
     Manifest {
         files: Vec<FileMeta>,
         file_format: FileFormat,
@@ -101,17 +101,17 @@ pub(super) enum CheckpointStatsLayout {
     StatsJson,
 }
 
-/// Resolve the scan shape via a sequence of `Step::Consume` (sidecar URL extraction)
-/// and `Step::SchemaQuery` (layout / stats probes) yields against `co`.
+/// Resolve the scan shape via a sequence of `EngineRequest::Consume` (sidecar URL extraction)
+/// and `EngineRequest::SchemaQuery` (layout / stats probes) yields against `engine`.
 ///
 /// Yields through the SSA dispatch surface
-/// ([`Context::consume`](crate::plans::operations::framework::plan_context::Context::consume) /
-/// [`Context::schema_query`](crate::plans::operations::framework::plan_context::Context::schema_query)).
+/// ([`Context::consume`](crate::plans::state_machines::framework::plan_context::Context::consume) /
+/// [`Context::schema_query`](crate::plans::state_machines::framework::plan_context::Context::schema_query)).
 /// At most one top-level `SchemaQuery`, one `Consume` (V2 manifest sidecar URL extraction),
 /// and one sidecar `SchemaQuery` are emitted.
 pub(super) async fn resolve_shape_ssa(
     ctx: &Context,
-    co: &mut StepCo,
+    engine: &mut Engine,
     snapshot: &Snapshot,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<SchemaRef>,
@@ -150,7 +150,7 @@ pub(super) async fn resolve_shape_ssa(
         FileFormat::Parquet => {
             let url = first_checkpoint_url(snapshot)?;
             let cp_schema = ctx
-                .schema_query(co, url, "ScanShapeInfoSsa::resolve::checkpoint_schema")
+                .schema_query(engine, url, "ScanShapeInfoSsa::resolve::checkpoint_schema")
                 .await?;
             let is_mfst = cp_schema.contains(SIDECAR_NAME);
             if !is_mfst && parsed_stats.is_none() {
@@ -175,7 +175,7 @@ pub(super) async fn resolve_shape_ssa(
     let sidecar_chain = manifest_chain.filter(col([SIDECAR_NAME]).is_not_null())?;
     let sidecar_files = ctx
         .consume(
-            co,
+            engine,
             sidecar_chain,
             SidecarCollector::new(snapshot.log_segment().log_root.clone()),
             "ScanShapeInfoSsa::resolve::sidecar_extract",
@@ -187,7 +187,7 @@ pub(super) async fn resolve_shape_ssa(
         if let (Some(reqd), Some(first)) = (stats_schema, sidecar_files.first()) {
             let side_schema = ctx
                 .schema_query(
-                    co,
+                    engine,
                     first.location.as_str().to_string(),
                     "ScanShapeInfoSsa::resolve::sidecar_schema",
                 )
@@ -210,7 +210,7 @@ pub(super) async fn resolve_shape_ssa(
 // ============================================================================
 
 /// Sync core of the SSA reconciliation. Builds against the supplied `ctx` and returns a
-/// [`Cursor`] terminating on the reconciled action stream. Caller wraps the result in
+/// [`PlanBuilder`] terminating on the reconciled action stream. Caller wraps the result in
 /// [`Context::into_result_plan`].
 pub(super) fn build_reconciliation_ssa(
     ctx: &Context,
@@ -218,7 +218,7 @@ pub(super) fn build_reconciliation_ssa(
     shape: &SsaScanShape,
     base: &SchemaRef,
     dedup_key: ExpressionRef,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     let stats = shape.stats.as_ref().map(|s| &s.schema);
     let parts = shape.partition_schema.as_ref();
     let identity_not_null: PredicateRef = Arc::new(dedup_key.as_ref().clone().is_not_null());
@@ -274,9 +274,9 @@ pub(super) fn build_reconciliation_ssa(
         )?;
 
     // === Stages 3-5a: build the checkpoint view per shape variant =======================
-    // Returns `Some(Cursor)` aligned to `commit_dedup`'s schema minus JOIN_KEY (i.e. ready
+    // Returns `Some(PlanBuilder)` aligned to `commit_dedup`'s schema minus JOIN_KEY (i.e. ready
     // for the antijoin's union arm), or `None` when the snapshot has no checkpoint at all.
-    let checkpoint_view: Option<Cursor> = match &shape.checkpoint {
+    let checkpoint_view: Option<PlanBuilder> = match &shape.checkpoint {
         SsaCheckpointShape::None => None,
         SsaCheckpointShape::Inline { files, file_format } => Some(load_checkpoint_files(
             ctx,
@@ -288,7 +288,7 @@ pub(super) fn build_reconciliation_ssa(
         SsaCheckpointShape::Manifest { files, file_format } => {
             // Re-scan the manifest with `base + sidecar` so that `drop_col(SIDECAR_NAME)`
             // recovers the action stream regardless of pipeline base width (scan = 2,
-            // FSR = 6). The cursor branches: one chases sidecars; the other selects
+            // FSR = 6). The builder branches: one chases sidecars; the other selects
             // manifest-resident action rows directly.
             let manifest = ctx.scan(*file_format, files.clone(), manifest_action_schema(base))?;
             let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
@@ -342,7 +342,7 @@ pub(super) fn build_reconciliation_ssa(
         let keyed = view
             .filter(identity_not_null)?
             .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?;
-        // `Node::EquiJoin { kind: LeftAnti }` produces left-schema output regardless of the
+        // `NodeKind::EquiJoin { kind: LeftAnti }` produces left-schema output regardless of the
         // right side's shape. Pass `commit_dedup` as-is and let the engine's projection
         // pushdown prune unused right-side columns.
         let survivors = keyed.left_anti_join(
@@ -363,14 +363,14 @@ pub(super) fn build_reconciliation_ssa(
 /// needed) and then delegate to [`build_reconciliation_ssa`].
 pub(super) async fn execute_reconciliation_ssa(
     ctx: &Context,
-    co: &mut StepCo,
+    engine: &mut Engine,
     snapshot: &Snapshot,
     base: &SchemaRef,
     stats: Option<SchemaRef>,
     parts: Option<SchemaRef>,
     dedup_key: ExpressionRef,
-) -> Result<Cursor, DeltaError> {
-    let shape = resolve_shape_ssa(ctx, co, snapshot, stats.as_ref(), parts).await?;
+) -> Result<PlanBuilder, DeltaError> {
+    let shape = resolve_shape_ssa(ctx, engine, snapshot, stats.as_ref(), parts).await?;
     build_reconciliation_ssa(ctx, snapshot, &shape, base, dedup_key)
 }
 
@@ -384,7 +384,7 @@ fn load_checkpoint_files(
     shape: &SsaScanShape,
     file_format: FileFormat,
     files: Vec<FileMeta>,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     let parts = shape.partition_schema.as_ref();
     let stats = shape.stats.as_ref().map(|s| &s.schema);
     let scan = match shape.stats.as_ref() {
@@ -402,14 +402,14 @@ fn load_checkpoint_files(
 }
 
 // ============================================================================
-// Reconciliation cursor extension
+// Reconciliation builder extension
 // ============================================================================
 
 /// Module-scoped extension trait providing fluent point-edits for the reconciliation
 /// pipeline. Both methods *replace* (not append) -- the JSON / Map source columns have no
 /// downstream consumer once their parsed form exists, so keeping both would just bloat
 /// the projection.
-pub(super) trait ReconciliationCursor: Sized {
+pub(super) trait ReconciliationPlanBuilder: Sized {
     /// Replace `add.stats: STRING` with `add.stats_parsed: STRUCT<stats>` via
     /// [`Expression::parse_json`]. No-op when `stats` is `None`.
     fn with_json_stats_parsed(self, stats: Option<&SchemaRef>) -> Result<Self, DeltaError>;
@@ -419,7 +419,7 @@ pub(super) trait ReconciliationCursor: Sized {
     fn with_partitions_parsed(self, parts: Option<&SchemaRef>) -> Result<Self, DeltaError>;
 }
 
-impl ReconciliationCursor for Cursor {
+impl ReconciliationPlanBuilder for PlanBuilder {
     fn with_json_stats_parsed(self, stats: Option<&SchemaRef>) -> Result<Self, DeltaError> {
         let Some(stats_schema) = stats else {
             return Ok(self);

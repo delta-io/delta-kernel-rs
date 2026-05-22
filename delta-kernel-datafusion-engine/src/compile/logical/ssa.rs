@@ -1,27 +1,27 @@
-//! SSA [`Plan`](delta_kernel::plans::ir::ssa::Plan) -> DataFusion [`LogicalPlan`] lowering.
+//! SSA [`Plan`](delta_kernel::plans::ir::plan::Plan) -> DataFusion [`LogicalPlan`] lowering.
 //!
-//! Topological walk over [`Stmt`](delta_kernel::plans::ir::ssa::Stmt)s. Each statement's
-//! output [`Ref`](delta_kernel::plans::ir::ssa::Ref) is mapped to a freshly built
+//! Topological walk over [`PlanNode`](delta_kernel::plans::ir::plan::PlanNode)s. Each statement's
+//! output [`Ref`](delta_kernel::plans::ir::plan::Ref) is mapped to a freshly built
 //! [`LogicalPlan`]. Inputs are guaranteed to be earlier in `plan.stmts` than outputs by
-//! [`Plan::push`](delta_kernel::plans::ir::ssa::Plan::push), so a single forward pass works.
+//! [`Plan::push`](delta_kernel::plans::ir::plan::Plan::push), so a single forward pass works.
 //!
-//! All [`Node`](delta_kernel::plans::ir::ssa::Node) variants compile to a `LogicalPlan` --
-//! sources, transforms, and the per-row file reader [`Node::Load`]. Cross-statement data
+//! All [`NodeKind`](delta_kernel::plans::ir::plan::NodeKind) variants compile to a `LogicalPlan` --
+//! sources, transforms, and the per-row file reader [`NodeKind::Load`]. Cross-statement data
 //! flow happens entirely through DataFusion's logical-plan tree (no relation registry,
 //! no named handles).
 //!
 //! # Schema policy
 //!
 //! SSA `Plan`s do not carry per-Ref kernel schemas (those live on the
-//! [`ContextState`](crate::plans::operations::framework::plan_context) only during
+//! [`ContextState`](crate::plans::state_machines::framework::plan_context) only during
 //! construction). DataFusion derives output schemas from `LogicalPlan` shape and arrow
 //! types; the only place a kernel [`SchemaRef`] is reconstructed engine-side is
-//! [`Node::Load`], which feeds into [`LoadTableProvider`] (legacy plumbing still needs the
+//! [`NodeKind::Load`], which feeds into [`LoadTableProvider`] (legacy plumbing still needs the
 //! `RelationHandle.schema` for its arrow-output materialization). The compiled
 //! kernel schema is rebuilt from the upstream's arrow schema on the fly via
 //! [`StructType::try_from_arrow`].
 //!
-//! [`Node::Load`]: delta_kernel::plans::ir::ssa::Node::Load
+//! [`NodeKind::Load`]: delta_kernel::plans::ir::plan::NodeKind::Load
 //! [`SchemaRef`]: delta_kernel::schema::SchemaRef
 //! [`StructType::try_from_arrow`]: delta_kernel::engine::arrow_conversion::TryFromArrow
 //! [`LoadTableProvider`]: crate::exec::LoadTableProvider
@@ -42,7 +42,7 @@ use delta_kernel::expressions::{ColumnName, Expression};
 use delta_kernel::plans::ir::nodes::{
     FileListingNode, FileType, LoadSink, ProjectNode, RelationHandle, ScanFileColumns, ScanNode,
 };
-use delta_kernel::plans::ir::ssa::{JoinKind, Node, Ref, Stmt};
+use delta_kernel::plans::ir::plan::{JoinKind, NodeKind, PlanNode, Ref};
 use delta_kernel::schema::{SchemaRef, StructType};
 
 use super::canonicalize::canonicalize_output_to_kernel_schema;
@@ -57,21 +57,21 @@ use crate::compile::CompileContext;
 use crate::error::plan_compilation;
 use crate::exec::LoadTableProvider;
 
-/// Compile a slice of SSA [`Stmt`]s to a DataFusion [`LogicalPlan`] rooted at `terminal`.
+/// Compile a slice of SSA [`PlanNode`]s to a DataFusion [`LogicalPlan`] rooted at `terminal`.
 ///
 /// Walks `stmts` in order, lowering each statement and threading the resulting `LogicalPlan`
 /// into a `Ref`-keyed map. The plan returned for `terminal` is then handed back. Statements
-/// unreachable from `terminal` are still compiled (DCE is the cursor's job, not the engine's);
+/// unreachable from `terminal` are still compiled (DCE is the builder's job, not the engine's);
 /// engines relying on dead-code elimination should call
-/// [`Plan::reachable_from`](delta_kernel::plans::ir::ssa::Plan::reachable_from) before passing
-/// the stmts in. Taking `&[Stmt]` rather than `&Plan` avoids needing a `Plan::from_stmts`
-/// constructor; both the [`ResultPlan`](delta_kernel::plans::ir::ssa::ResultPlan)-returning
-/// drive path (where the caller already has a `Plan`) and the [`Step::Consume`] dispatch
+/// [`Plan::reachable_from`](delta_kernel::plans::ir::plan::Plan::reachable_from) before passing
+/// the stmts in. Taking `&[PlanNode]` rather than `&Plan` avoids needing a `Plan::from_stmts`
+/// constructor; both the [`ResultPlan`](delta_kernel::plans::ir::plan::ResultPlan)-returning
+/// drive path (where the caller already has a `Plan`) and the [`EngineRequest::Consume`] dispatch
 /// (where the executor only sees raw stmts) share this entry point.
 ///
-/// [`Step::Consume`]: delta_kernel::plans::operations::framework::step::Step::Consume
+/// [`EngineRequest::Consume`]: delta_kernel::plans::state_machines::framework::step::EngineRequest::Consume
 pub fn compile_ssa(
-    stmts: &[Stmt],
+    stmts: &[PlanNode],
     terminal: Ref,
     ctx: &CompileContext,
 ) -> Result<LogicalPlan, DataFusionError> {
@@ -97,16 +97,16 @@ fn lookup(built: &HashMap<Ref, LogicalPlan>, r: Ref) -> Result<&LogicalPlan, Dat
 }
 
 fn lower_stmt(
-    stmt: &Stmt,
+    stmt: &PlanNode,
     built: &HashMap<Ref, LogicalPlan>,
     ctx: &CompileContext,
 ) -> Result<LogicalPlan, DataFusionError> {
-    match &stmt.node {
+    match &stmt.kind {
         // === Sources ====================================================================
-        Node::ListFiles { start_from } => file_listing_to_logical_plan(&FileListingNode {
+        NodeKind::ListFiles { start_from } => file_listing_to_logical_plan(&FileListingNode {
             path: start_from.clone(),
         }),
-        Node::Scan {
+        NodeKind::Scan {
             file_type,
             files,
             schema,
@@ -115,20 +115,20 @@ fn lower_stmt(
             files.clone(),
             Arc::clone(schema),
         )),
-        Node::Values { schema, rows } => lower_values(schema, rows),
+        NodeKind::Values { schema, rows } => lower_values(schema, rows),
 
         // === Unary transforms ===========================================================
-        Node::Filter { predicate } => {
+        NodeKind::Filter { predicate } => {
             let child = lookup(built, expect_one_input(stmt)?)?.clone();
             let pred = kernel_pred_to_df(predicate.as_ref())?;
             LogicalPlanBuilder::from(child).filter(pred)?.build()
         }
-        Node::Project {
+        NodeKind::Project {
             named_exprs,
             output_schema,
         } => {
             let child = lookup(built, expect_one_input(stmt)?)?.clone();
-            // SSA `Node::Project` carries its declared output schema; the engine
+            // SSA `NodeKind::Project` carries its declared output schema; the engine
             // does not re-infer it. Reuse the legacy `compile_project_node` helper
             // (it consumes a `ProjectNode` whose `output_schema` informs collision
             // avoidance + name canonicalization).
@@ -138,7 +138,7 @@ fn lower_stmt(
             };
             compile_project_node(child, &project_node)
         }
-        Node::Load {
+        NodeKind::Load {
             file_schema,
             file_type,
             base_url,
@@ -156,7 +156,7 @@ fn lower_stmt(
             dv_ref.as_ref(),
             ctx,
         ),
-        Node::MaxByVersion {
+        NodeKind::MaxByVersion {
             group_by,
             version_column,
             value_columns,
@@ -168,7 +168,7 @@ fn lower_stmt(
         ),
 
         // === N-ary ======================================================================
-        Node::Union { ordered } => {
+        NodeKind::Union { ordered } => {
             if stmt.inputs.is_empty() {
                 return Err(plan_compilation(
                     "compile_ssa: Union with zero inputs is not a valid SSA shape",
@@ -192,16 +192,16 @@ fn lower_stmt(
                 })
             }
         }
-        Node::EquiJoin { kind, key_pairs } => lower_equi_join(stmt, built, *kind, key_pairs),
+        NodeKind::EquiJoin { kind, key_pairs } => lower_equi_join(stmt, built, *kind, key_pairs),
     }
 }
 
-fn expect_one_input(stmt: &Stmt) -> Result<Ref, DataFusionError> {
+fn expect_one_input(stmt: &PlanNode) -> Result<Ref, DataFusionError> {
     match stmt.inputs.as_slice() {
         [r] => Ok(*r),
         other => Err(plan_compilation(format!(
             "compile_ssa: {:?} expects exactly one input, got {}",
-            stmt.node,
+            stmt.kind,
             other.len()
         ))),
     }
@@ -314,7 +314,7 @@ fn lower_load(
     LogicalPlanBuilder::scan("ssa_load", provider_as_source(provider), None)?.build()
 }
 
-/// Build the kernel-typed output schema for an SSA `Node::Load`: the file_schema fields
+/// Build the kernel-typed output schema for an SSA `NodeKind::Load`: the file_schema fields
 /// followed by one field per passthrough column whose type is looked up by walking the
 /// upstream's kernel schema.
 fn build_load_output_kernel_schema(
@@ -342,7 +342,7 @@ fn build_load_output_kernel_schema(
     })
 }
 
-/// Lower SSA `Node::MaxByVersion` to `row_number() OVER (PARTITION BY ... ORDER BY
+/// Lower SSA `NodeKind::MaxByVersion` to `row_number() OVER (PARTITION BY ... ORDER BY
 /// version DESC)` followed by `WHERE rn = 1` and a final projection narrowing to the
 /// `value_columns`. DataFusion mints a long version-dependent schema name for the window
 /// column (e.g. `row_number() PARTITION BY [...] ROWS BETWEEN ...`); rather than try to
@@ -387,7 +387,7 @@ fn lower_max_by_version(
 }
 
 fn lower_equi_join(
-    stmt: &Stmt,
+    stmt: &PlanNode,
     built: &HashMap<Ref, LogicalPlan>,
     kind: JoinKind,
     key_pairs: &[(Arc<Expression>, Arc<Expression>)],
@@ -437,7 +437,7 @@ fn lower_equi_join(
         .join_with_expr_keys(probe_plan, df_kind, (build_keys, probe_keys), None)?
         .build()?;
 
-    // Canonicalize column order for `Inner` joins to match the cursor's declared output
+    // Canonicalize column order for `Inner` joins to match the builder's declared output
     // (`left.fields ++ right.fields`). DataFusion may produce a different physical
     // ordering depending on join build/probe choice. For `LeftAnti`, the output mirrors
     // the left input -- DataFusion's natural output ordering matches.

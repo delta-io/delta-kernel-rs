@@ -18,12 +18,12 @@ pub use logical::compile_ssa;
 /// Carries only static / shared bits -- there is no per-phase mutable accumulator
 /// here. Drained consumer state for `Consume` steps flows directly out of
 /// [`DataFusionExecutor::run_phase`](crate::executor::DataFusionExecutor) as a
-/// [`StepPayload::Consumer`](delta_kernel::plans::operations::framework::step_payload::StepPayload::Consumer)
+/// [`EngineResponse::Consumer`](delta_kernel::plans::state_machines::framework::step_payload::EngineResponse::Consumer)
 /// after the executor finishes the sink locally.
 #[derive(Clone)]
 pub struct CompileContext {
     /// Kernel [`Engine`] for sinks that delegate IO to parquet/json handlers
-    /// (`Node::Load`).
+    /// (`NodeKind::Load`).
     pub engine: Arc<dyn Engine>,
     /// Owning state machine's identity. Stamped onto any `Consume` handle drained during the
     /// phase. Synthesized to `("standalone", "execute")` with a fresh `sm_id` for tests and

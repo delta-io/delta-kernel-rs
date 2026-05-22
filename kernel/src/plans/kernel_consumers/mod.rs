@@ -5,7 +5,7 @@
 //!
 //! The IR exposes one KDF shape: [`traits::KernelConsumer`], an observer over batches
 //! returning `Continue` / `Break`. It's wired into a plan via
-//! [`Step::Consume`](crate::plans::operations::framework::step::Step::Consume); the consumer drains
+//! [`EngineRequest::Consume`](crate::plans::state_machines::framework::step::EngineRequest::Consume); the consumer drains
 //! the terminal row stream and accumulates finalized state for the engine to harvest.
 //!
 //! KDFs dispatch in-process and never cross a serialization boundary.

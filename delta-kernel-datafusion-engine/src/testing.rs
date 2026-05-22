@@ -15,17 +15,17 @@
 
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::ssa::ResultPlan as SsaResultPlan;
+use delta_kernel::plans::ir::plan::ResultPlan;
 
 use crate::error::DfResultIntoDelta;
 use crate::DataFusionExecutor;
 
-/// Compile an [`SsaResultPlan`] to a [`DataFrame`](datafusion::dataframe::DataFrame) via
+/// Compile an [`ResultPlan`] to a [`DataFrame`](datafusion::dataframe::DataFrame) via
 /// [`DataFusionExecutor::ssa_result_to_dataframe`] and drain it into a `Vec`. Suitable for
 /// SSA plans constructed directly in tests (no coroutine required).
 pub async fn collect_ssa_result(
     executor: &DataFusionExecutor,
-    rp: SsaResultPlan,
+    rp: ResultPlan,
 ) -> Result<Vec<RecordBatch>, DeltaError> {
     executor
         .ssa_result_to_dataframe(&rp)?

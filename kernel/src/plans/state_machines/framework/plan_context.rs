@@ -1,32 +1,32 @@
-//! Plan-construction context and cursor (SSA builder).
+//! Plan-construction context and builder (SSA builder).
 //!
-//! [`Context`] owns the in-flight SSA program and a per-Ref schema table. [`Cursor`] is a
-//! shared handle to a specific [`Ref`] in that program; cursor methods append new
-//! [`Stmt`]s and return new [`Cursor`]s threading the freshly minted Refs. Cursors are
+//! [`Context`] owns the in-flight SSA program and a per-Ref schema table. [`PlanBuilder`] is a
+//! shared handle to a specific [`Ref`] in that program; builder methods append new
+//! [`PlanNode`]s and return new [`PlanBuilder`]s threading the freshly minted Refs. Cursors are
 //! [`Clone`] (cheap `Rc` clone) so branching is explicit.
 //!
 //! State is shared via `Rc<RefCell<ContextState>>` so transform methods can mutate without
 //! requiring `&mut Context`. SMs are CPU-only sequencers and never need to cross thread
 //! boundaries, so `Rc` (vs. `Arc`) is the right shape. See the
-//! [`Coroutine`](crate::plans::operations::framework::coroutine::driver::Coroutine) module
+//! [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM) module
 //! docs for the `!Send` rationale.
 //!
-//! # Stale-cursor protection
+//! # Stale-builder protection
 //!
-//! Each cursor captures the context's `session_id` at mint time. Dispatch methods
+//! Each builder captures the context's `session_id` at mint time. Dispatch methods
 //! ([`Context::consume`], [`Context::schema_query`]) bump the id to invalidate cursors
 //! held across yields; [`Context::into_result_plan`] consumes `self`, which moots the
 //! concern for terminal dispatch.
 //!
 //! # `RefCell` discipline
 //!
-//! Cursor methods borrow_mut, mutate state, and drop the guard before returning. Dispatch
-//! methods drop the borrow before any `co.yield_(...).await`. Holding a `Ref` / `RefMut`
+//! PlanBuilder methods borrow_mut, mutate state, and drop the guard before returning. Dispatch
+//! methods drop the borrow before any `engine.yield_(...).await`. Holding a `Ref` / `RefMut`
 //! across an await would panic at runtime; this is structurally avoided by every method
 //! in this module.
 //!
-//! [`Stmt`]: crate::plans::ir::ssa::Stmt
-//! [`Ref`]: crate::plans::ir::ssa::Ref
+//! [`PlanNode`]: crate::plans::ir::plan::PlanNode
+//! [`Ref`]: crate::plans::ir::plan::Ref
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -39,12 +39,12 @@ use crate::expressions::{
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, DeltaResultExt};
 use crate::plans::ir::nodes::{ConsumeSink, DvRef, FileType, ScanFileColumns};
+use crate::plans::ir::plan::{JoinKind, NodeKind, Plan, PlanNode, Ref, ResultPlan};
 use crate::plans::ir::schema_inference::infer_expression_type;
-use crate::plans::ir::ssa::{JoinKind, Node, Plan, Ref, ResultPlan};
 use crate::plans::kernel_consumers::{Extractor, KernelConsumer, KernelConsumerOutput};
-use crate::plans::operations::framework::coroutine::context::{StepCo, StepResume, StepYield};
-use crate::plans::operations::framework::step::{SchemaQueryNode, Step};
-use crate::plans::operations::framework::step_payload::StepPayload;
+use crate::plans::state_machines::framework::coroutine::context::{Engine, StepResume, StepYield};
+use crate::plans::state_machines::framework::step::{EngineRequest, SchemaQuery};
+use crate::plans::state_machines::framework::step_payload::EngineResponse;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{delta_error, FileMeta};
 
@@ -52,15 +52,36 @@ use crate::{delta_error, FileMeta};
 // Shared state
 // ============================================================================
 
-/// In-flight SSA being built, the per-Ref schema table, and a session counter.
+/// In-flight SSA being built, the per-Ref schema table, the Ref counter, and a
+/// session counter.
 #[derive(Debug)]
 struct ContextState {
     plan: Plan,
     /// Per-Ref output schemas. Indexed by `Ref.0` during construction (Refs are
-    /// minted sequentially by [`Plan::push`]).
+    /// minted sequentially by `mint_ref`).
     ref_schemas: Vec<SchemaRef>,
+    /// Next Ref id to mint. Owned by Context (not Plan) so the IR stays a pure
+    /// data container. Reset to 0 by `consume` when the in-flight plan is taken.
+    next_ref: u32,
     /// Bumped by dispatch methods to invalidate cursors held across yields.
     session_id: u32,
+}
+
+impl ContextState {
+    /// Append a node to the in-flight plan, mint its output Ref, and record
+    /// `schema` for the new Ref.
+    fn push_node(&mut self, kind: NodeKind, inputs: Vec<Ref>, schema: SchemaRef) -> Ref {
+        let output = Ref(self.next_ref);
+        self.next_ref += 1;
+        self.plan.stmts.push(PlanNode {
+            kind,
+            inputs,
+            output,
+        });
+        self.ref_schemas.push(schema);
+        debug_assert_eq!(self.ref_schemas.len(), self.plan.stmts.len());
+        output
+    }
 }
 
 // ============================================================================
@@ -69,7 +90,7 @@ struct ContextState {
 
 /// Plan-construction context.
 ///
-/// Source methods mint root [`Cursor`]s, dispatch methods
+/// Source methods mint root [`PlanBuilder`]s, dispatch methods
 /// ([`Self::consume`] / [`Self::schema_query`]) yield steps through a coroutine, and
 /// [`Self::into_result_plan`] is the terminal sync drain (backward-reachability DCE).
 pub struct Context {
@@ -89,34 +110,39 @@ impl Context {
             state: Rc::new(RefCell::new(ContextState {
                 plan: Plan::new(),
                 ref_schemas: Vec::new(),
+                next_ref: 0,
                 session_id: 0,
             })),
         }
     }
 
-    /// Append a [`Node::ListFiles`] source. Output schema is the engine-canonical listing
+    /// Append a [`NodeKind::ListFiles`] source. Output schema is the engine-canonical listing
     /// shape supplied by the caller (the kernel does not pin it; consumers wire to the
     /// engine's listing schema).
     pub fn list_files(
         &self,
         start_from: Url,
         listing_schema: SchemaRef,
-    ) -> Result<Cursor, DeltaError> {
-        push_source(&self.state, Node::ListFiles { start_from }, listing_schema)
+    ) -> Result<PlanBuilder, DeltaError> {
+        push_source(
+            &self.state,
+            NodeKind::ListFiles { start_from },
+            listing_schema,
+        )
     }
 
-    /// Append a [`Node::Scan`] source over `files` of the given [`FileType`]. Output schema
+    /// Append a [`NodeKind::Scan`] source over `files` of the given [`FileType`]. Output schema
     /// is the caller-declared `schema`.
     pub fn scan(
         &self,
         file_type: FileType,
         files: Vec<FileMeta>,
         schema: SchemaRef,
-    ) -> Result<Cursor, DeltaError> {
+    ) -> Result<PlanBuilder, DeltaError> {
         let s = Arc::clone(&schema);
         push_source(
             &self.state,
-            Node::Scan {
+            NodeKind::Scan {
                 file_type,
                 files,
                 schema,
@@ -125,17 +151,21 @@ impl Context {
         )
     }
 
-    /// Append a [`Node::Values`] source.
-    pub fn values(&self, schema: SchemaRef, rows: Vec<Vec<Scalar>>) -> Result<Cursor, DeltaError> {
+    /// Append a [`NodeKind::Values`] source.
+    pub fn values(
+        &self,
+        schema: SchemaRef,
+        rows: Vec<Vec<Scalar>>,
+    ) -> Result<PlanBuilder, DeltaError> {
         let s = Arc::clone(&schema);
-        push_source(&self.state, Node::Values { schema, rows }, s)
+        push_source(&self.state, NodeKind::Values { schema, rows }, s)
     }
 
-    /// Drain the accumulator into a [`Step::Consume`] yielded through `co` and recover
+    /// Drain the accumulator into a [`EngineRequest::Consume`] yielded through `engine` and recover
     /// the consumer's typed output via [`Extractor`].
     ///
     /// Backward-reachability DCE narrows the SSA program to stmts transitively reachable
-    /// from `cursor`. After the yield resumes, the accumulator is reset (empty plan +
+    /// from `builder`. After the yield resumes, the accumulator is reset (empty plan +
     /// empty schema table) and `session_id` is bumped so any cursors held across the
     /// boundary fail at runtime.
     ///
@@ -145,8 +175,8 @@ impl Context {
     #[allow(dead_code)]
     pub(crate) async fn consume<S>(
         &self,
-        co: &mut StepCo,
-        cursor: Cursor,
+        engine: &mut Engine,
+        builder: PlanBuilder,
         consumer: S,
         step_name: &'static str,
     ) -> Result<S::Output, DeltaError>
@@ -155,21 +185,26 @@ impl Context {
     {
         let sink = ConsumeSink::new_consumer(consumer);
         let extractor = Extractor::for_consumer::<S>(sink.token.clone());
-        let terminal = cursor.ref_id;
-        let stmts: Vec<crate::plans::ir::ssa::Stmt> = {
+        let terminal = builder.ref_id;
+        let stmts: Vec<crate::plans::ir::plan::PlanNode> = {
             let mut s = borrow_state_mut(&self.state);
-            ensure_fresh(&s, &cursor)?;
+            ensure_fresh(&s, &builder)?;
             let plan = std::mem::take(&mut s.plan);
             s.ref_schemas.clear();
+            // Reset the Ref counter alongside the plan/schema reset: no Refs
+            // survive the consume boundary (the plan ships to the engine and the
+            // session id bump invalidates any held PlanBuilders), so restarting
+            // from 0 is safe and keeps subsequent Refs compact.
+            s.next_ref = 0;
             s.session_id = s.session_id.wrapping_add(1);
             plan.reachable_from(terminal).stmts
         };
-        // Drop the cursor handle so the only remaining Rc on `state` is `self`'s.
-        drop(cursor);
+        // Drop the builder handle so the only remaining Rc on `state` is `self`'s.
+        drop(builder);
 
-        let StepResume(result) = co
+        let StepResume(result) = engine
             .yield_(StepYield {
-                operation: Step::Consume {
+                operation: EngineRequest::Consume {
                     stmts,
                     terminal,
                     sink,
@@ -179,19 +214,19 @@ impl Context {
             .await;
         let payload = result.map_err(|e| e.into_delta_typed())?;
         let handle = match payload {
-            StepPayload::Consumer(h) => h,
+            EngineResponse::Consumer(h) => h,
             other => {
                 return Err(delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
                     "consume: executor returned non-Consumer payload `{other:?}` for \
-                     Step::Consume",
+                     EngineRequest::Consume",
                 ));
             }
         };
         extractor.extract(handle).map_err(|e| e.into_delta_typed())
     }
 
-    /// Yield a [`Step::SchemaQuery`] and return the schema delivered by the engine.
+    /// Yield a [`EngineRequest::SchemaQuery`] and return the schema delivered by the engine.
     ///
     /// Bumps `session_id` so any cursors held across the boundary fail at runtime.
     /// The accumulator is preserved -- callers typically use the returned schema to
@@ -201,7 +236,7 @@ impl Context {
     #[allow(dead_code)]
     pub(crate) async fn schema_query(
         &self,
-        co: &mut StepCo,
+        engine: &mut Engine,
         path: impl Into<String>,
         step_name: &'static str,
     ) -> Result<SchemaRef, DeltaError> {
@@ -209,45 +244,45 @@ impl Context {
             let mut s = borrow_state_mut(&self.state);
             s.session_id = s.session_id.wrapping_add(1);
         }
-        let StepResume(result) = co
+        let StepResume(result) = engine
             .yield_(StepYield {
-                operation: Step::SchemaQuery(SchemaQueryNode::new(path.into())),
+                operation: EngineRequest::SchemaQuery(SchemaQuery::new(path.into())),
                 step_name,
             })
             .await;
         let payload = result.map_err(|e| e.into_delta_typed())?;
         match payload {
-            StepPayload::Schema(s) => Ok(s),
+            EngineResponse::Schema(s) => Ok(s),
             other => Err(delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
                 "schema_query: executor returned non-Schema payload `{other:?}` for \
-                 Step::SchemaQuery",
+                 EngineRequest::SchemaQuery",
             )),
         }
     }
 
-    /// Drain the accumulator into a [`ResultPlan`] keyed at `cursor`. Performs
+    /// Drain the accumulator into a [`ResultPlan`] keyed at `builder`. Performs
     /// backward-reachability DCE; only stmts transitively reachable from
-    /// `cursor.ref_id()` survive.
+    /// `builder.ref_id()` survive.
     ///
-    /// Returns an error if `cursor` is from a different context (or stale across a
+    /// Returns an error if `builder` is from a different context (or stale across a
     /// dispatch). All cursors must be dropped before this call -- the context state is
     /// solely owned at terminal time.
-    pub fn into_result_plan(self, cursor: Cursor) -> Result<ResultPlan, DeltaError> {
+    pub fn into_result_plan(self, builder: PlanBuilder) -> Result<ResultPlan, DeltaError> {
         // Validate session before tearing down. Drop the borrow before `Rc::try_unwrap`.
         {
             let s = borrow_state(&self.state);
-            ensure_fresh(&s, &cursor)?;
+            ensure_fresh(&s, &builder)?;
         }
-        // Drop the cursor's Rc handle so try_unwrap can succeed.
-        drop(cursor.state);
-        let result = cursor.ref_id;
+        // Drop the builder's Rc handle so try_unwrap can succeed.
+        drop(builder.state);
+        let result = builder.ref_id;
         let inner = Rc::try_unwrap(self.state)
             .map(|cell| cell.into_inner())
             .map_err(|_| {
                 delta_error!(
                     DeltaErrorCode::DeltaCommandInvariantViolation,
-                    "into_result_plan: outstanding Cursor handles -- drop other Cursors before \
+                    "into_result_plan: outstanding PlanBuilder handles -- drop other Cursors before \
                      calling this method",
                 )
             })?;
@@ -257,27 +292,27 @@ impl Context {
 }
 
 // ============================================================================
-// Cursor
+// PlanBuilder
 // ============================================================================
 
-/// Handle to a Ref in the in-flight SSA program. Cursor methods append further
+/// Handle to a Ref in the in-flight SSA program. PlanBuilder methods append further
 /// stmts and return new Cursors threading the minted Refs.
 #[derive(Clone, Debug)]
-pub struct Cursor {
+pub struct PlanBuilder {
     state: Rc<RefCell<ContextState>>,
     ref_id: Ref,
     session_id: u32,
 }
 
-impl Cursor {
-    /// The SSA Ref this cursor points at.
+impl PlanBuilder {
+    /// The SSA Ref this builder points at.
     pub fn ref_id(&self) -> Ref {
         self.ref_id
     }
 
     /// The schema of the value at this Ref.
     ///
-    /// Returns an error if the cursor is stale.
+    /// Returns an error if the builder is stale.
     pub fn schema(&self) -> Result<SchemaRef, DeltaError> {
         let state = borrow_state(&self.state);
         ensure_fresh(&state, self)?;
@@ -296,14 +331,14 @@ impl Cursor {
 
     // === Filter / Project ====================================================
 
-    /// Append a [`Node::Filter`]. Output schema is unchanged.
+    /// Append a [`NodeKind::Filter`]. Output schema is unchanged.
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> Result<Self, DeltaError> {
         let predicate = predicate.into();
         let schema = self.schema()?;
-        push_unary(&self.state, &self, Node::Filter { predicate }, schema)
+        push_unary(&self.state, &self, NodeKind::Filter { predicate }, schema)
     }
 
-    /// Append a [`Node::Project`] with inferred output schema.
+    /// Append a [`NodeKind::Project`] with inferred output schema.
     ///
     /// Each pair becomes one output field `(name, infer_type(expr))`. Inference is
     /// narrow -- unsupported expressions error out and direct callers to
@@ -328,7 +363,7 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project {
+            NodeKind::Project {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&output_schema),
             },
@@ -336,7 +371,7 @@ impl Cursor {
         )
     }
 
-    /// Append a [`Node::Project`] with caller-supplied output schema. Positional:
+    /// Append a [`NodeKind::Project`] with caller-supplied output schema. Positional:
     /// `exprs[i]` becomes `schema.fields()[i]`. No type inference -- the schema declares
     /// names and types directly. Use when both lists are produced together (e.g. physical
     /// to logical column mapping).
@@ -362,7 +397,7 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project {
+            NodeKind::Project {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&schema),
             },
@@ -400,7 +435,7 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project {
+            NodeKind::Project {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&schema),
             },
@@ -433,7 +468,7 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project {
+            NodeKind::Project {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&output_schema),
             },
@@ -486,7 +521,7 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Project {
+            NodeKind::Project {
                 named_exprs,
                 output_schema: Arc::clone(&output_schema),
             },
@@ -683,7 +718,7 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::Load {
+            NodeKind::Load {
                 file_schema,
                 file_type,
                 base_url,
@@ -739,7 +774,7 @@ impl Cursor {
         push_unary(
             &self.state,
             &self,
-            Node::MaxByVersion {
+            NodeKind::MaxByVersion {
                 group_by,
                 version_column,
                 value_columns,
@@ -750,7 +785,7 @@ impl Cursor {
 
     /// Inner join. Output schema is the left fields followed by the right fields.
     /// Caller is responsible for renaming any name collisions ahead of the join.
-    pub fn inner_join<I, L, R>(self, other: Cursor, key_pairs: I) -> Result<Self, DeltaError>
+    pub fn inner_join<I, L, R>(self, other: PlanBuilder, key_pairs: I) -> Result<Self, DeltaError>
     where
         I: IntoIterator<Item = (L, R)>,
         L: Into<ExpressionRef>,
@@ -770,7 +805,7 @@ impl Cursor {
             &self.state,
             &self,
             &other,
-            Node::EquiJoin {
+            NodeKind::EquiJoin {
                 kind: JoinKind::Inner,
                 key_pairs,
             },
@@ -780,7 +815,11 @@ impl Cursor {
 
     /// Left-anti join: rows of `self` whose key matches no row of `other`. Output schema
     /// mirrors `self`.
-    pub fn left_anti_join<I, L, R>(self, other: Cursor, key_pairs: I) -> Result<Self, DeltaError>
+    pub fn left_anti_join<I, L, R>(
+        self,
+        other: PlanBuilder,
+        key_pairs: I,
+    ) -> Result<Self, DeltaError>
     where
         I: IntoIterator<Item = (L, R)>,
         L: Into<ExpressionRef>,
@@ -796,7 +835,7 @@ impl Cursor {
             &self.state,
             &self,
             &other,
-            Node::EquiJoin {
+            NodeKind::EquiJoin {
                 kind: JoinKind::LeftAnti,
                 key_pairs,
             },
@@ -806,13 +845,13 @@ impl Cursor {
 
     /// Unordered union with one or more other cursors. All inputs must share the same
     /// schema (strict equality).
-    pub fn union_all(self, others: &[Cursor]) -> Result<Self, DeltaError> {
+    pub fn union_all(self, others: &[PlanBuilder]) -> Result<Self, DeltaError> {
         push_union(&self.state, &self, others, /* ordered= */ false)
     }
 
     /// Order-preserving union with one or more other cursors. All inputs must share the
     /// same schema.
-    pub fn union_ordered(self, others: &[Cursor]) -> Result<Self, DeltaError> {
+    pub fn union_ordered(self, others: &[PlanBuilder]) -> Result<Self, DeltaError> {
         push_union(&self.state, &self, others, /* ordered= */ true)
     }
 }
@@ -821,7 +860,7 @@ impl Cursor {
 // LoadSpec
 // ============================================================================
 
-/// Configuration for [`Cursor::load`]. Mirrors the fields of [`Node::Load`].
+/// Configuration for [`PlanBuilder::load`]. Mirrors the fields of [`NodeKind::Load`].
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
     pub file_schema: SchemaRef,
@@ -844,12 +883,12 @@ fn borrow_state_mut(state: &Rc<RefCell<ContextState>>) -> std::cell::RefMut<'_, 
     state.borrow_mut()
 }
 
-fn ensure_fresh(state: &ContextState, cursor: &Cursor) -> Result<(), DeltaError> {
-    if state.session_id != cursor.session_id {
+fn ensure_fresh(state: &ContextState, builder: &PlanBuilder) -> Result<(), DeltaError> {
+    if state.session_id != builder.session_id {
         return Err(delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
-            "stale cursor: cursor session={cs} expected {ss}",
-            cs = cursor.session_id,
+            "stale builder: builder session={cs} expected {ss}",
+            cs = builder.session_id,
             ss = state.session_id,
         ));
     }
@@ -858,15 +897,13 @@ fn ensure_fresh(state: &ContextState, cursor: &Cursor) -> Result<(), DeltaError>
 
 fn push_source(
     state: &Rc<RefCell<ContextState>>,
-    node: Node,
+    kind: NodeKind,
     schema: SchemaRef,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     let mut s = borrow_state_mut(state);
-    let r = s.plan.push(node, vec![]);
-    s.ref_schemas.push(schema);
-    debug_assert_eq!(s.ref_schemas.len(), s.plan.stmts.len());
+    let r = s.push_node(kind, vec![], schema);
     let session_id = s.session_id;
-    Ok(Cursor {
+    Ok(PlanBuilder {
         state: Rc::clone(state),
         ref_id: r,
         session_id,
@@ -875,27 +912,26 @@ fn push_source(
 
 fn push_unary(
     state: &Rc<RefCell<ContextState>>,
-    cursor: &Cursor,
-    node: Node,
+    builder: &PlanBuilder,
+    kind: NodeKind,
     schema: SchemaRef,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     let mut s = borrow_state_mut(state);
-    ensure_fresh(&s, cursor)?;
-    let r = s.plan.push(node, vec![cursor.ref_id]);
-    s.ref_schemas.push(schema);
+    ensure_fresh(&s, builder)?;
+    let r = s.push_node(kind, vec![builder.ref_id], schema);
     let session_id = s.session_id;
-    Ok(Cursor {
+    Ok(PlanBuilder {
         state: Rc::clone(state),
         ref_id: r,
         session_id,
     })
 }
 
-fn ensure_same_context(left: &Cursor, right: &Cursor) -> Result<(), DeltaError> {
+fn ensure_same_context(left: &PlanBuilder, right: &PlanBuilder) -> Result<(), DeltaError> {
     if !Rc::ptr_eq(&left.state, &right.state) {
         return Err(delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
-            "cursor from a different context cannot be combined",
+            "builder from a different context cannot be combined",
         ));
     }
     Ok(())
@@ -903,24 +939,23 @@ fn ensure_same_context(left: &Cursor, right: &Cursor) -> Result<(), DeltaError> 
 
 fn push_binary(
     state: &Rc<RefCell<ContextState>>,
-    left: &Cursor,
-    right: &Cursor,
-    node: Node,
+    left: &PlanBuilder,
+    right: &PlanBuilder,
+    kind: NodeKind,
     schema: SchemaRef,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     if !Rc::ptr_eq(state, &right.state) {
         return Err(delta_error!(
             DeltaErrorCode::DeltaCommandInvariantViolation,
-            "cursor from a different context cannot be combined",
+            "builder from a different context cannot be combined",
         ));
     }
     let mut s = borrow_state_mut(state);
     ensure_fresh(&s, left)?;
     ensure_fresh(&s, right)?;
-    let r = s.plan.push(node, vec![left.ref_id, right.ref_id]);
-    s.ref_schemas.push(schema);
+    let r = s.push_node(kind, vec![left.ref_id, right.ref_id], schema);
     let session_id = s.session_id;
-    Ok(Cursor {
+    Ok(PlanBuilder {
         state: Rc::clone(state),
         ref_id: r,
         session_id,
@@ -929,10 +964,10 @@ fn push_binary(
 
 fn push_union(
     state: &Rc<RefCell<ContextState>>,
-    first: &Cursor,
-    others: &[Cursor],
+    first: &PlanBuilder,
+    others: &[PlanBuilder],
     ordered: bool,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     let first_schema = first.schema()?;
     let mut inputs = Vec::with_capacity(1 + others.len());
     inputs.push(first.ref_id);
@@ -940,7 +975,7 @@ fn push_union(
         if !Rc::ptr_eq(state, &o.state) {
             return Err(delta_error!(
                 DeltaErrorCode::DeltaCommandInvariantViolation,
-                "union: cursor from a different context cannot be combined",
+                "union: builder from a different context cannot be combined",
             ));
         }
         let other_schema = o.schema()?;
@@ -957,10 +992,9 @@ fn push_union(
     for o in others {
         ensure_fresh(&s, o)?;
     }
-    let r = s.plan.push(Node::Union { ordered }, inputs);
-    s.ref_schemas.push(first_schema);
+    let r = s.push_node(NodeKind::Union { ordered }, inputs, first_schema);
     let session_id = s.session_id;
-    Ok(Cursor {
+    Ok(PlanBuilder {
         state: Rc::clone(state),
         ref_id: r,
         session_id,
@@ -1047,23 +1081,23 @@ fn split_parent_leaf<'a>(
 }
 
 /// Apply a field-level edit at the struct identified by `parent_path` within
-/// `input_schema`, then push a top-level [`Node::Project`] that materializes the result.
+/// `input_schema`, then push a top-level [`NodeKind::Project`] that materializes the result.
 ///
 /// Walks the schema down `parent_path`, identity-projecting siblings via `col(...)`
 /// references, then applies `op` at the targeted struct. Each ancestor struct above the
 /// edit is rebuilt with [`Expression::struct_from`].
 fn apply_field_op(
-    cursor: Cursor,
+    builder: PlanBuilder,
     input_schema: &StructType,
     parent_path: &[String],
     op: FieldOp,
-) -> Result<Cursor, DeltaError> {
+) -> Result<PlanBuilder, DeltaError> {
     let (named_exprs, fields) = rewrite_at(input_schema, &[], parent_path, &op)?;
     let output_schema = arc_struct_or_invariant(fields)?;
     push_unary(
-        &cursor.state,
-        &cursor,
-        Node::Project {
+        &builder.state,
+        &builder,
+        NodeKind::Project {
             named_exprs,
             output_schema: Arc::clone(&output_schema),
         },
@@ -1246,13 +1280,13 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, Predicate};
-    use crate::plans::ir::ssa::JoinKind;
+    use crate::plans::ir::plan::JoinKind;
     use crate::plans::kernel_consumers::{
         FinishedHandle, KdfControl, KernelConsumerKind, KernelConsumerOutput,
     };
-    use crate::plans::operations::framework::coroutine::driver::Coroutine;
-    use crate::plans::operations::framework::state_machine::{NextStep, StateMachine};
-    use crate::plans::operations::framework::step_payload::StepPayload;
+    use crate::plans::state_machines::framework::coroutine::driver::CoroutineSM;
+    use crate::plans::state_machines::framework::state_machine::{NextStep, StateMachine};
+    use crate::plans::state_machines::framework::step_payload::EngineResponse;
     use crate::schema::DataType;
     use crate::DeltaResult;
 
@@ -1649,7 +1683,10 @@ mod tests {
         let src = ctx.values(id_ts_schema(), vec![]).unwrap();
         let _other = ctx.values(id_ts_schema(), vec![]).unwrap();
         let err = ctx.into_result_plan(src).unwrap_err();
-        assert!(err.to_string().contains("outstanding Cursor"), "got: {err}",);
+        assert!(
+            err.to_string().contains("outstanding PlanBuilder"),
+            "got: {err}",
+        );
     }
 
     /// `max_by_version` output schema is exactly `value_columns` lifted from the input
@@ -1686,7 +1723,7 @@ mod tests {
         assert!(err.to_string().contains("missing"), "got: {err}");
     }
 
-    // === Coroutine dispatch tests ============================================
+    // === CoroutineSM dispatch tests ============================================
 
     /// Test KernelConsumer that echoes its constructor input as the output value.
     #[derive(Debug, Clone)]
@@ -1713,20 +1750,20 @@ mod tests {
         }
     }
 
-    /// `consume` yields a `Step::Consume` with the DCE'd stmts and the cursor's terminal
+    /// `consume` yields a `EngineRequest::Consume` with the DCE'd stmts and the builder's terminal
     /// Ref, the engine resumes with the consumer's finished handle, and the SM body
     /// recovers the typed output.
     #[test]
     fn consume_yields_step_consume_and_recovers_typed_output() {
-        let mut sm = Coroutine::<i64>::new("test", |mut co, _sm_id| async move {
+        let mut sm = CoroutineSM::<i64>::new("test", |mut engine, _sm_id| async move {
             let ctx = Context::new();
             let _dead = ctx.values(id_ts_schema(), vec![]).unwrap();
-            let cursor = ctx
+            let builder = ctx
                 .values(id_ts_schema(), vec![])
                 .unwrap()
                 .filter(Arc::new(col("id").is_not_null()))
                 .unwrap();
-            ctx.consume(&mut co, cursor, EchoConsumer { value: 7 }, "drain")
+            ctx.consume(&mut engine, builder, EchoConsumer { value: 7 }, "drain")
                 .await
         })
         .unwrap();
@@ -1734,7 +1771,7 @@ mod tests {
         // First yielded step is the Consume.
         assert_eq!(sm.step_name(), "drain");
         let token = match sm.get_step().unwrap() {
-            Step::Consume {
+            EngineRequest::Consume {
                 stmts,
                 terminal,
                 sink,
@@ -1745,11 +1782,11 @@ mod tests {
                 assert_eq!(terminal, Ref(2));
                 sink.token.clone()
             }
-            other => panic!("expected Step::Consume, got {other:?}"),
+            other => panic!("expected EngineRequest::Consume, got {other:?}"),
         };
 
         // Engine drains the sink and resumes with a finished handle.
-        let payload = StepPayload::Consumer(FinishedHandle {
+        let payload = EngineResponse::Consumer(FinishedHandle {
             token,
             sm_id: Uuid::new_v4(),
             sm_kind: "test",
@@ -1764,20 +1801,56 @@ mod tests {
         assert!(sm.is_done());
     }
 
-    /// Resuming a `Step::Consume` with a non-Consumer payload surfaces an internal
+    /// `Context::consume` resets the Ref counter so the next source minted after
+    /// the consume boundary starts at `Ref(0)` again. The full plan ships to the
+    /// engine and the session-id bump invalidates any held cursors, so reusing
+    /// Ref ids across the boundary is safe and keeps post-consume Refs compact.
+    #[test]
+    fn consume_resets_ref_counter() {
+        let mut sm = CoroutineSM::<u32>::new("test", |mut engine, _sm_id| async move {
+            let ctx = Context::new();
+            let v0 = ctx.values(id_ts_schema(), vec![]).unwrap();
+            let v1 = v0.filter(Arc::new(col("id").is_not_null())).unwrap();
+            assert_eq!(v1.ref_id(), Ref(1));
+            let _: i64 = ctx
+                .consume(&mut engine, v1, EchoConsumer { value: 0 }, "drain")
+                .await?;
+            let post = ctx.values(id_ts_schema(), vec![]).unwrap();
+            Ok(post.ref_id().0)
+        })
+        .unwrap();
+
+        let token = match sm.get_step().unwrap() {
+            EngineRequest::Consume { sink, .. } => sink.token.clone(),
+            other => panic!("expected EngineRequest::Consume, got {other:?}"),
+        };
+        let payload = EngineResponse::Consumer(FinishedHandle {
+            token,
+            sm_id: Uuid::new_v4(),
+            sm_kind: "test",
+            step_name: "drain",
+            erased: Box::new(EchoConsumer { value: 0 }),
+        });
+        match sm.submit(Ok(payload)).unwrap() {
+            NextStep::Done(v) => assert_eq!(v, 0, "post-consume Ref must be 0"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// Resuming a `EngineRequest::Consume` with a non-Consumer payload surfaces an internal
     /// error -- the executor produced a payload that doesn't match the yielded step.
     #[test]
     fn consume_resume_with_wrong_payload_variant_errors() {
-        let mut sm = Coroutine::<i64>::new("test", |mut co, _sm_id| async move {
+        let mut sm = CoroutineSM::<i64>::new("test", |mut engine, _sm_id| async move {
             let ctx = Context::new();
-            let cursor = ctx.values(id_ts_schema(), vec![]).unwrap();
-            ctx.consume(&mut co, cursor, EchoConsumer { value: 1 }, "drain")
+            let builder = ctx.values(id_ts_schema(), vec![]).unwrap();
+            ctx.consume(&mut engine, builder, EchoConsumer { value: 1 }, "drain")
                 .await
         })
         .unwrap();
         let _ = sm.get_step().unwrap();
         let err = sm
-            .submit(Ok(StepPayload::Schema(id_ts_schema())))
+            .submit(Ok(EngineResponse::Schema(id_ts_schema())))
             .unwrap_err();
         assert!(
             err.to_string().contains("non-Consumer payload"),
@@ -1785,43 +1858,50 @@ mod tests {
         );
     }
 
-    /// `schema_query` yields a `Step::SchemaQuery`, the engine resumes with a schema,
+    /// `schema_query` yields a `EngineRequest::SchemaQuery`, the engine resumes with a schema,
     /// and the SM body receives it.
     #[test]
     fn schema_query_yields_step_schemaquery_and_returns_schema() {
         let target_schema = id_ts_schema();
         let target_clone = Arc::clone(&target_schema);
-        let mut sm = Coroutine::<bool>::new("test", move |mut co, _sm_id| async move {
+        let mut sm = CoroutineSM::<bool>::new("test", move |mut engine, _sm_id| async move {
             let ctx = Context::new();
-            let s = ctx.schema_query(&mut co, "/cp.parquet", "footer").await?;
+            let s = ctx
+                .schema_query(&mut engine, "/cp.parquet", "footer")
+                .await?;
             Ok(s == target_clone)
         })
         .unwrap();
 
         assert_eq!(sm.step_name(), "footer");
         match sm.get_step().unwrap() {
-            Step::SchemaQuery(node) => assert_eq!(node.file_path, "/cp.parquet"),
+            EngineRequest::SchemaQuery(node) => assert_eq!(node.file_path, "/cp.parquet"),
             other => panic!("expected SchemaQuery, got {other:?}"),
         }
 
-        match sm.submit(Ok(StepPayload::Schema(target_schema))).unwrap() {
+        match sm
+            .submit(Ok(EngineResponse::Schema(target_schema)))
+            .unwrap()
+        {
             NextStep::Done(v) => assert!(v),
             _ => panic!("expected Done(true)"),
         }
     }
 
-    /// Resuming a `Step::SchemaQuery` with a non-Schema payload surfaces an internal
+    /// Resuming a `EngineRequest::SchemaQuery` with a non-Schema payload surfaces an internal
     /// error -- the executor produced a payload that doesn't match the yielded step.
     #[test]
     fn schema_query_resume_with_wrong_payload_variant_errors() {
-        let mut sm = Coroutine::<()>::new("test", move |mut co, _sm_id| async move {
+        let mut sm = CoroutineSM::<()>::new("test", move |mut engine, _sm_id| async move {
             let ctx = Context::new();
-            let _ = ctx.schema_query(&mut co, "/x.parquet", "footer").await?;
+            let _ = ctx
+                .schema_query(&mut engine, "/x.parquet", "footer")
+                .await?;
             Ok(())
         })
         .unwrap();
         let _ = sm.get_step().unwrap();
-        let err = sm.submit(Ok(StepPayload::Empty)).unwrap_err();
+        let err = sm.submit(Ok(EngineResponse::Empty)).unwrap_err();
         assert!(err.to_string().contains("non-Schema payload"), "got: {err}",);
     }
 
@@ -1830,22 +1910,27 @@ mod tests {
     #[test]
     fn schema_query_invalidates_pre_dispatch_cursors() {
         let target_schema = id_ts_schema();
-        let mut sm = Coroutine::<()>::new("test", move |mut co, _sm_id| async move {
+        let mut sm = CoroutineSM::<()>::new("test", move |mut engine, _sm_id| async move {
             let ctx = Context::new();
             let pre = ctx.values(id_ts_schema(), vec![]).unwrap();
-            let _ = ctx.schema_query(&mut co, "/x.parquet", "footer").await?;
-            // Using `pre` after dispatch must fail with a stale-cursor error.
+            let _ = ctx
+                .schema_query(&mut engine, "/x.parquet", "footer")
+                .await?;
+            // Using `pre` after dispatch must fail with a stale-builder error.
             let err = pre
                 .filter(Arc::new(Predicate::BooleanExpression(col("id"))))
                 .unwrap_err();
-            assert!(err.to_string().contains("stale cursor"), "got: {err}");
+            assert!(err.to_string().contains("stale builder"), "got: {err}");
             Ok(())
         })
         .unwrap();
 
         // Drive through the schema_query yield.
         let _ = sm.get_step().unwrap();
-        match sm.submit(Ok(StepPayload::Schema(target_schema))).unwrap() {
+        match sm
+            .submit(Ok(EngineResponse::Schema(target_schema)))
+            .unwrap()
+        {
             NextStep::Done(()) => {}
             _ => panic!("expected Done"),
         }
@@ -1871,11 +1956,11 @@ mod tests {
         let joined = left.inner_join(right, key).unwrap();
         let joined_ref = joined.ref_id();
         let plan = ctx.into_result_plan(joined).unwrap();
-        let stmt = plan.plan.stmt(joined_ref).unwrap();
+        let stmt = plan.plan.node(joined_ref).unwrap();
         assert_eq!(stmt.inputs, vec![left_ref, right_ref]);
         assert!(matches!(
-            stmt.node,
-            Node::EquiJoin {
+            stmt.kind,
+            NodeKind::EquiJoin {
                 kind: JoinKind::Inner,
                 ..
             }

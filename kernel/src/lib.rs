@@ -910,6 +910,16 @@ pub trait ParquetHandler: AsAny {
 ///
 /// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
 /// table.
+///
+/// # Naming note
+///
+/// The SSA plans/state-machines subsystem reuses the name `Engine` for an unrelated coroutine
+/// handle (see
+/// [`plans::state_machines::framework::coroutine::context::Engine`](crate::plans::state_machines::framework::coroutine::context::Engine)).
+/// That handle is the SM-internal `yield` channel; this `Engine` trait is the connector-facing
+/// I/O abstraction. The two never appear in the same scope -- the SM handle is `pub(crate)` and
+/// the trait is the public surface -- but if you ever do need both, alias one at the use site
+/// (e.g. `use crate::Engine as EngineTrait;`).
 pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;

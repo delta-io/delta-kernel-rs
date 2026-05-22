@@ -1,4 +1,4 @@
-//! Lowering for [`Node::Scan`](delta_kernel::plans::ir::ssa::Node::Scan) plus row-index
+//! Lowering for [`NodeKind::Scan`](delta_kernel::plans::ir::plan::NodeKind::Scan) plus row-index
 //! plumbing helpers shared with [`super::ordered_union`].
 
 use std::sync::Arc;

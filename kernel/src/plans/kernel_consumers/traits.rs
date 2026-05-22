@@ -3,7 +3,7 @@
 //! Adding a new KDF: declare the struct, derive `Clone`, write
 //! `impl KernelConsumer for T { ... }` with `kind`, `apply`, `finish`. No
 //! enum to edit, no registry to update, no serde wiring — KDFs ride on
-//! the [`Step::Consume`](crate::plans::operations::framework::step::Step::Consume)
+//! the [`EngineRequest::Consume`](crate::plans::state_machines::framework::step::EngineRequest::Consume)
 //! step, which is dispatched in-process and never serialized.
 //!
 //! # Object-safety notes

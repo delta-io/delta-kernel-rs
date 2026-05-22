@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::plans::operations::scan::{FullState, FullStateBuilder};
+use crate::plans::state_machines::scan::{FullState, FullStateBuilder};
 use crate::scan::ScanBuilder as KernelScanBuilder;
 use crate::snapshot::SnapshotRef;
 use crate::Snapshot;

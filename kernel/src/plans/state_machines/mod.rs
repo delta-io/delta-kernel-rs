@@ -2,11 +2,11 @@
 //!
 //! - [`framework`] -- the framework SMs are built on: the
 //!   [`StateMachine`](framework::state_machine::StateMachine) trait, the
-//!   [`Coroutine`](framework::coroutine::driver::Coroutine) driver (a thin shell over
+//!   [`CoroutineSM`](framework::coroutine::driver::CoroutineSM) driver (a thin shell over
 //!   `genawaiter2::sync::GenBoxed`), the typed [`Context`](framework::plan_context::Context) /
-//!   [`StepPayload`] surface, and the `Extractor<O>` typed adapter.
+//!   [`EngineResponse`] surface, and the `Extractor<O>` typed adapter.
 //!
-//! [`StepPayload`]: framework::step_payload::StepPayload
+//! [`EngineResponse`]: framework::step_payload::EngineResponse
 
 pub mod framework;
 pub mod scan;

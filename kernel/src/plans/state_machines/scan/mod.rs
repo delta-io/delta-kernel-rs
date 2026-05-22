@@ -1,6 +1,6 @@
 //! Declarative Full Snapshot Read (FSR): [`full_state`] builds the multi-phase
-//! [`Coroutine`](crate::plans::operations::framework::coroutine::driver::Coroutine) consumed
-//! by [`crate::snapshot::Snapshot::full_state_builder`].
+//! [`CoroutineSM`](crate::plans::state_machines::framework::coroutine::driver::CoroutineSM)
+//! consumed by [`crate::snapshot::Snapshot::full_state_builder`].
 
 mod action_pair;
 mod dedup;

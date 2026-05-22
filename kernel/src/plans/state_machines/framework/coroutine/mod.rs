@@ -1,9 +1,9 @@
-//! Coroutine-backed [`StateMachine`](super::state_machine::StateMachine) implementation.
+//! CoroutineSM-backed [`StateMachine`](super::state_machine::StateMachine) implementation.
 //!
 //! - [`context`] -- the [`StepYield`](context::StepYield) / [`StepResume`](context::StepResume)
 //!   yield/resume protocol shared by the [`driver`] and the SSA
 //!   [`Context`](super::plan_context::Context).
-//! - [`driver`] — the [`Coroutine<R>`](driver::Coroutine) driver that compiles
+//! - [`driver`] — the [`CoroutineSM<R>`](driver::CoroutineSM) driver that compiles
 //!   [`StepYield`](context::StepYield) sequences into the
 //!   [`StateMachine`](super::state_machine::StateMachine) contract.
 //!

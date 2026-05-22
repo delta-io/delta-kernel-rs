@@ -4,7 +4,7 @@
 //! phase starts, fed batches via [`Handle::apply_consumer`], finalized via [`Handle::finish`]
 //! when the child is exhausted. Type-erased into [`FinishedHandle`] and returned to the
 //! state machine as
-//! [`StepPayload::Consumer`](crate::plans::operations::framework::step_payload::StepPayload::Consumer).
+//! [`EngineResponse::Consumer`](crate::plans::state_machines::framework::step_payload::EngineResponse::Consumer).
 //!
 //! Generic over `K: KernelConsumer + ?Sized`; executor code uses `Handle<dyn KernelConsumer>`.
 //! Handles dispatch in-process and never cross a serialization boundary.
