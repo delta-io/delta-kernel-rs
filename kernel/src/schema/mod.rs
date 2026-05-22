@@ -2202,7 +2202,7 @@ impl<'a> MakePhysical<'a> {
     }
 
     /// Walks `schema` and validates its column-mapping annotations.
-    pub(crate) fn validate_struct(
+    pub(crate) fn validate_schema_column_mapping(
         mode: ColumnMappingMode,
         schema: &'a StructType,
     ) -> DeltaResult<()> {

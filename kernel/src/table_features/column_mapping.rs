@@ -109,7 +109,7 @@ pub(crate) fn column_mapping_mode(
 /// ]}
 /// ```
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
-    MakePhysical::validate_struct(mode, schema)
+    MakePhysical::validate_schema_column_mapping(mode, schema)
 }
 
 /// Validates a field's column mapping annotations and extracts the physical name and column
