@@ -11,8 +11,6 @@
 //! once at construction so per-row reads inside the callback skip the schema
 //! walk.
 
-use std::ffi::c_void;
-
 use delta_kernel::arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
     RecordBatch, StringArray, StructArray,
@@ -193,17 +191,10 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
 
         let provider = BatchedArrowStatsProvider::new(batch);
         // Export the metadata batch over the Arrow C Data Interface; engines
-        // that import it skip the scalar getters. Null on export failure
+        // that import it skip the scalar getters. None on export failure
         // (unrepresentable schema) -- engines fall back to the scalar lane.
-        // The Box must outlive `stats` (which holds a raw pointer to it);
-        // declaring it first ensures drop order is stats -> arrow_ffi.
-        let arrow_ffi: Option<Box<ArrowFFIData>> = ArrowFFIData::try_from_record_batch(batch)
-            .ok()
-            .map(Box::new);
-        let arrow_ptr: *const c_void = arrow_ffi
-            .as_deref()
-            .map_or(std::ptr::null(), |d| d as *const _ as *const c_void);
-        let stats = BatchStatsAccessor::new(&provider).with_arrow_ffi(arrow_ptr);
+        let arrow_ffi = ArrowFFIData::try_from_record_batch(batch).ok();
+        let stats = BatchStatsAccessor::new(&provider).with_arrow_ffi(arrow_ffi);
         let children = ChildAccessor::new(args);
         let mut verdicts = vec![OpaquePruneVerdict::Unknown; n_rows];
         invoke_eval_against_stats(
@@ -215,7 +206,8 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
             inverted,
             &mut verdicts,
         );
-        // arrow_ffi drops here; release is idempotent.
+        // stats drops at end of scope; ArrowFFIData::Drop runs release on the
+        // FFI structs (idempotent if the engine already imported).
 
         let bools: Vec<Option<bool>> = verdicts
             .iter()
@@ -384,13 +376,12 @@ mod tests {
             _inverted: bool,
             _verdicts: *mut crate::expressions::pruning::OpaquePruneVerdict,
         ) {
-            let p = unsafe { crate::expressions::pruning::batch_stats_as_arrow(stats) };
-            if p.is_null() {
+            let ffi = unsafe { crate::expressions::pruning::batch_stats_as_arrow(stats) };
+            if ffi.is_null() {
                 return;
             }
             SAW_NON_NULL.with(|c| c.set(true));
             // Read-only peek; full import would consume the array.
-            let ffi = p as *const crate::engine_data::ArrowFFIData;
             let len = unsafe { (*ffi).array.len() } as i64;
             SAW_ROW_COUNT.with(|c| c.set(len));
         }

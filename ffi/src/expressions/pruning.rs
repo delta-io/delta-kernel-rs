@@ -72,6 +72,8 @@ use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
 use delta_kernel::schema::DataType;
 use delta_kernel_ffi_macros::handle_descriptor;
 
+#[cfg(feature = "default-engine-base")]
+use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
 use crate::{kernel_string_slice, KernelStringSlice, TryFromStringSlice};
 
@@ -608,10 +610,11 @@ pub trait BatchStatsProvider {
 pub struct BatchStatsAccessor<'a> {
     provider: &'a dyn BatchStatsProvider,
     arena: StrArena,
-    /// Pointer to an `ArrowFFIData` (opaque here so this unconditional file
-    /// doesn't pull in the feature-gated arrow types). Null for non-Arrow
-    /// providers; exposed via [`batch_stats_as_arrow`].
-    arrow_ffi: *const c_void,
+    /// Owned `ArrowFFIData` for the Arrow lane (file pruning over an Arrow
+    /// metadata batch). Drops with the accessor; release callbacks are
+    /// idempotent so engines that imported are no-ops.
+    #[cfg(feature = "default-engine-base")]
+    arrow_ffi: Option<ArrowFFIData>,
 }
 
 impl<'a> BatchStatsAccessor<'a> {
@@ -619,12 +622,16 @@ impl<'a> BatchStatsAccessor<'a> {
         Self {
             provider,
             arena: StrArena::default(),
-            arrow_ffi: std::ptr::null(),
+            #[cfg(feature = "default-engine-base")]
+            arrow_ffi: None,
         }
     }
 
-    /// Attach an exported `ArrowFFIData` pointer; must outlive the accessor.
-    pub(crate) fn with_arrow_ffi(mut self, arrow_ffi: *const c_void) -> Self {
+    /// Attach an `ArrowFFIData` so engines that prefer the Arrow C Data
+    /// Interface can call [`batch_stats_as_arrow`] to import the batch.
+    /// `None` opts the accessor out of the Arrow lane.
+    #[cfg(feature = "default-engine-base")]
+    pub(crate) fn with_arrow_ffi(mut self, arrow_ffi: Option<ArrowFFIData>) -> Self {
         self.arrow_ffi = arrow_ffi;
         self
     }
@@ -793,11 +800,10 @@ pub unsafe extern "C" fn batch_stats_row_count(
     true
 }
 
-/// Arrow C Data Interface view of the stats batch as an `ArrowFFIData *`
-/// (see `delta_kernel_ffi::engine_data::ArrowFFIData`). Engines that prefer
-/// the Arrow import flow (`Data.importIntoVector`, `arrow::ffi::from_ffi`)
-/// can read columns directly; the scalar `batch_stats_*` getters remain
-/// available as a fallback.
+/// Arrow C Data Interface view of the stats batch as an [`ArrowFFIData`].
+/// Engines that prefer the Arrow import flow (`Data.importIntoVector`,
+/// `arrow::ffi::from_ffi`) can read columns directly; the scalar
+/// `batch_stats_*` getters remain available as a fallback.
 ///
 /// Returns null when the accessor isn't Arrow-backed or kernel couldn't
 /// export the schema. Pointer is valid for the surrounding
@@ -806,12 +812,17 @@ pub unsafe extern "C" fn batch_stats_row_count(
 ///
 /// # Safety
 /// `acc` must be a valid [`BatchStatsAccessor`] pointer if non-null.
+#[cfg(feature = "default-engine-base")]
 #[no_mangle]
-pub unsafe extern "C" fn batch_stats_as_arrow(acc: *const BatchStatsAccessor<'_>) -> *const c_void {
+pub unsafe extern "C" fn batch_stats_as_arrow(
+    acc: *const BatchStatsAccessor<'_>,
+) -> *const ArrowFFIData {
     let Some(acc) = (unsafe { acc.as_ref() }) else {
         return std::ptr::null();
     };
     acc.arrow_ffi
+        .as_ref()
+        .map_or(std::ptr::null(), |d| d as *const _)
 }
 
 // === ScalarResolver (partition pruning) ======================================
