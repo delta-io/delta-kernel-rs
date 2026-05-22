@@ -194,7 +194,8 @@ pub use snapshot::{Snapshot, SnapshotRef};
 #[cfg(any(
     feature = "default-engine-native-tls",
     feature = "default-engine-rustls",
-    feature = "arrow-conversion"
+    feature = "arrow-conversion",
+    feature = "declarative-plans"
 ))]
 pub mod engine;
 

@@ -235,6 +235,13 @@ pub enum Error {
     /// Error during log history operations (timestamp queries, version lookups)
     #[error(transparent)]
     LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
+
+    #[cfg(feature = "declarative-plans")]
+    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    PlanResultTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -329,6 +336,11 @@ impl Error {
 
     pub fn stats_validation(msg: impl ToString) -> Self {
         Self::StatsValidation(msg.to_string())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub fn plan_result_type_mismatch(expected: &'static str, actual: &'static str) -> Self {
+        Self::PlanResultTypeMismatch { expected, actual }
     }
 
     // Capture a backtrace when the error is constructed.
