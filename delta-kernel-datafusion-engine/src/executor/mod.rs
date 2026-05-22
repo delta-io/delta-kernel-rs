@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::compile::expr_translator::build_logical_projection;
 use crate::compile::stamp_udf::StampFieldUdf;
-use crate::compile::{compile_plan_logical, CompileContext};
+use crate::compile::{compile_plan_logical, compile_ssa, CompileContext};
 use crate::error::DfResultIntoDelta;
 use crate::exec::LoadTableProvider;
 
@@ -167,8 +167,8 @@ impl DataFusionExecutor {
     /// # `!Send` future
     ///
     /// The kernel state machine is a CPU-only sequencer (see
-    /// [`Coroutine`](delta_kernel::plans::operations::framework::coroutine::driver::Coroutine)
-    /// module docs); it intentionally does not implement `Send`. The future returned here
+    /// [`delta_kernel::plans::operations::framework::coroutine::driver::Coroutine`] module
+    /// docs); it intentionally does not implement `Send`. The future returned here
     /// inherits that and is therefore `!Send`. Callers needing a `Send` future drive this on a
     /// single-threaded runtime (`tokio::runtime::Builder::new_current_thread()` +
     /// `block_on`) or wrap the call in a [`tokio::task::LocalSet`].
@@ -218,6 +218,47 @@ impl DataFusionExecutor {
         let rp = self.drive_to_completion(sm).await?;
         self.execute_plans(&rp.plans).await?;
         self.read_relation(&rp.result_relation).await
+    }
+
+    /// SSA analog of [`Self::drive_to_dataframe`]: drive a coroutine that yields an
+    /// [`SsaResultPlan`] and open its terminal output as a [`DataFrame`].
+    ///
+    /// Unlike the legacy path there is no relation registry to populate -- SSA plans
+    /// describe a single self-contained dataflow DAG. The compiled `LogicalPlan` is wrapped
+    /// directly in a [`DataFrame`] for the caller; column-mapping / metadata stamping is
+    /// the cursor's responsibility (the SSA plan's `result` Ref must already terminate at
+    /// the caller-facing schema).
+    ///
+    /// [`SsaResultPlan`]: delta_kernel::plans::ir::ssa::ResultPlan
+    pub async fn drive_ssa_to_dataframe(
+        &self,
+        sm: Coroutine<delta_kernel::plans::ir::ssa::ResultPlan>,
+    ) -> Result<DataFrame, DeltaError> {
+        let rp = self.drive_to_completion(sm).await?;
+        self.ssa_result_to_dataframe(&rp)
+    }
+
+    /// Compile an [`SsaResultPlan`] to a [`DataFrame`]. Useful for callers that already hold
+    /// a `ResultPlan` (for example after driving a coroutine by hand) and don't need the
+    /// `Coroutine` wrapping that [`Self::drive_ssa_to_dataframe`] provides; also the
+    /// canonical entry point for tests that construct SSA plans directly without an SM.
+    ///
+    /// [`SsaResultPlan`]: delta_kernel::plans::ir::ssa::ResultPlan
+    pub fn ssa_result_to_dataframe(
+        &self,
+        rp: &delta_kernel::plans::ir::ssa::ResultPlan,
+    ) -> Result<DataFrame, DeltaError> {
+        let providers = Arc::new(self.providers_lock().into_delta()?.clone());
+        let ctx = CompileContext {
+            relation_providers: providers,
+            step_result: None,
+            engine: Arc::clone(&self.engine),
+            sm_id: Uuid::new_v4(),
+            sm_kind: "standalone",
+            step_name: "ssa_result_to_dataframe",
+        };
+        let logical = compile_ssa(&rp.plan.stmts, rp.result, &ctx).into_delta()?;
+        Ok(DataFrame::new(self.session_ctx.state(), logical))
     }
 
     /// Open a registered relation as a [`DataFrame`] whose logical schema matches
@@ -323,16 +364,50 @@ impl DataFusionExecutor {
                 Ok(state)
             }
             Step::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
-            // SSA `Step::Consume` lands on the executor in a follow-on PR. Until kernel
-            // SMs start emitting it (PR6+), the variant is unreachable in practice; we
-            // surface a clear engine-level error so the SM body sees an actionable
-            // failure rather than a panic if a future kernel build emits it ahead of
-            // executor support.
-            Step::Consume { .. } => Err(EngineError::internal(delta_kernel::delta_error!(
-                delta_kernel::plans::errors::DeltaErrorCode::DeltaCommandInvariantViolation,
-                "Step::Consume is not yet supported by the DataFusion executor",
-            ))),
+            Step::Consume {
+                stmts,
+                terminal,
+                sink,
+            } => {
+                let state = StepResult::empty();
+                self.run_consume(&stmts, terminal, &sink, &state, sm_id, sm_kind, step_name)
+                    .await
+                    .map_err(EngineError::internal)?;
+                Ok(state)
+            }
         }
+    }
+
+    /// Compile an SSA [`Step::Consume`] into a DataFusion physical plan and drain it
+    /// through the consume sink. Mirrors the [`SinkType::Consume`] arm of
+    /// [`Self::run_plans`] but skips the relation-registry threading -- SSA plans don't
+    /// reference live relations -- and drains directly.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_consume(
+        &self,
+        stmts: &[delta_kernel::plans::ir::ssa::Stmt],
+        terminal: delta_kernel::plans::ir::ssa::Ref,
+        sink: &ConsumeSink,
+        state: &StepResult,
+        sm_id: Uuid,
+        sm_kind: &'static str,
+        step_name: &'static str,
+    ) -> Result<(), DataFusionError> {
+        let providers = Arc::new(self.providers_lock()?.clone());
+        let ctx = CompileContext {
+            relation_providers: providers,
+            step_result: Some(state.clone()),
+            engine: Arc::clone(&self.engine),
+            sm_id,
+            sm_kind,
+            step_name,
+        };
+        let logical = compile_ssa(stmts, terminal, &ctx)?;
+        let df_state = self.session_ctx.state();
+        let physical = df_state
+            .create_physical_plan(&df_state.optimize(&logical)?)
+            .await?;
+        self.drain_consume_sink(physical, sink, &ctx).await
     }
 
     /// Walk each plan in order, dispatching on its [`SinkType`]:

@@ -16,7 +16,7 @@ mod json_parse;
 pub mod logical;
 pub mod stamp_udf;
 
-pub use logical::compile_plan_logical;
+pub use logical::{compile_plan_logical, compile_ssa};
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
 #[derive(Clone)]

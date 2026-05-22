@@ -28,12 +28,14 @@ mod ordered_union;
 mod project;
 mod providers;
 mod scan;
+mod ssa;
 
 use canonicalize::canonicalize_output_to_kernel_schema;
 use ordered_union::compile_ordered_union;
 use project::compile_project_node;
 use providers::file_listing_to_logical_plan;
 use scan::scan_to_listing_logical_plan;
+pub use ssa::compile_ssa;
 
 /// Lower an entire [`Plan`] to a DataFusion [`LogicalPlan`]. Always succeeds or surfaces a
 /// typed [`DataFusionError`].

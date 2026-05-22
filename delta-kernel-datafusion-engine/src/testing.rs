@@ -21,6 +21,7 @@
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::RelationHandle;
+use delta_kernel::plans::ir::ssa::ResultPlan as SsaResultPlan;
 use delta_kernel::plans::ir::ResultPlan;
 
 use crate::error::DfResultIntoDelta;
@@ -54,4 +55,19 @@ pub async fn collect_result(
 ) -> Result<Vec<RecordBatch>, DeltaError> {
     executor.execute_plans(&rp.plans).await?;
     collect_relation(executor, &rp.result_relation).await
+}
+
+/// SSA analog of [`collect_result`]: compile an [`SsaResultPlan`] to a [`DataFrame`] via
+/// [`DataFusionExecutor::ssa_result_to_dataframe`] and drain it into a `Vec`. The terminal
+/// `LogicalPlan` is wrapped without any relation-registry side effects, so this helper
+/// is suitable for SSA plans constructed directly in tests (no coroutine required).
+pub async fn collect_ssa_result(
+    executor: &DataFusionExecutor,
+    rp: SsaResultPlan,
+) -> Result<Vec<RecordBatch>, DeltaError> {
+    executor
+        .ssa_result_to_dataframe(&rp)?
+        .collect()
+        .await
+        .into_delta()
 }
