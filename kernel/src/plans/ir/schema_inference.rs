@@ -8,8 +8,10 @@
 //!
 //! Hard variants (`Struct`, `Transform`, `Binary`, `MapToStruct`, `Opaque`, `Unknown`) return
 //! a [`DeltaErrorCode::DeltaCommandInvariantViolation`] error directing the caller to use
-//! `project_with_schema`, which takes an explicit output schema and skips inference. See
-//! `RENAME_PROPOSAL.md` for the design rationale (option "B-narrow").
+//! `project_with_schema`, which takes an explicit output schema and skips inference. The
+//! design rationale is the "B-narrow" option: keep inference small enough that the
+//! supported set is obvious by reading [`infer_expression_type`], and force callers
+//! through the explicit-schema path the moment their expression escapes that set.
 //!
 //! Inference does NOT validate the expression -- it assumes well-formedness (e.g. `Coalesce`
 //! arms produce compatible types). The kernel evaluator validates at runtime.

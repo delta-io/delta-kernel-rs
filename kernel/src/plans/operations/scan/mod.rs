@@ -7,6 +7,7 @@ mod dedup;
 mod file_scan;
 pub mod full_state;
 mod retention;
+#[cfg(test)]
 mod schemas;
 mod ssa_reconciliation;
 mod ssa_scan;

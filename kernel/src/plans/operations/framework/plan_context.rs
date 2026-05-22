@@ -34,7 +34,9 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar};
+use crate::expressions::{
+    ColumnName, Expression, ExpressionRef, IntoColumnName, PredicateRef, Scalar,
+};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, DeltaResultExt};
 use crate::plans::ir::nodes::{ConsumeSink, DvRef, FileType, ScanFileColumns};
 use crate::plans::ir::schema_inference::infer_expression_type;
@@ -42,7 +44,7 @@ use crate::plans::ir::ssa::{JoinKind, Node, Plan, Ref, ResultPlan};
 use crate::plans::kernel_consumers::{Extractor, KernelConsumer, KernelConsumerOutput};
 use crate::plans::operations::framework::coroutine::context::{StepCo, StepResume, StepYield};
 use crate::plans::operations::framework::step::{SchemaQueryNode, Step};
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{delta_error, FileMeta};
 
 // ============================================================================
@@ -102,20 +104,24 @@ impl Context {
         push_source(&self.state, Node::ListFiles { start_from }, listing_schema)
     }
 
-    /// Append a [`Node::ReadJson`] source. Output schema is the caller-declared `schema`.
-    pub fn scan_json(&self, files: Vec<FileMeta>, schema: SchemaRef) -> Result<Cursor, DeltaError> {
-        let s = Arc::clone(&schema);
-        push_source(&self.state, Node::ReadJson { files, schema }, s)
-    }
-
-    /// Append a [`Node::ReadParquet`] source. Output schema is the caller-declared `schema`.
-    pub fn scan_parquet(
+    /// Append a [`Node::Scan`] source over `files` of the given [`FileType`]. Output schema
+    /// is the caller-declared `schema`.
+    pub fn scan(
         &self,
+        file_type: FileType,
         files: Vec<FileMeta>,
         schema: SchemaRef,
     ) -> Result<Cursor, DeltaError> {
         let s = Arc::clone(&schema);
-        push_source(&self.state, Node::ReadParquet { files, schema }, s)
+        push_source(
+            &self.state,
+            Node::Scan {
+                file_type,
+                files,
+                schema,
+            },
+            s,
+        )
     }
 
     /// Append a [`Node::Values`] source.
@@ -275,7 +281,8 @@ impl Cursor {
     // === Filter / Project ====================================================
 
     /// Append a [`Node::Filter`]. Output schema is unchanged.
-    pub fn filter(self, predicate: PredicateRef) -> Result<Self, DeltaError> {
+    pub fn filter(self, predicate: impl Into<PredicateRef>) -> Result<Self, DeltaError> {
+        let predicate = predicate.into();
         let schema = self.schema()?;
         push_unary(&self.state, &self, Node::Filter { predicate }, schema)
     }
@@ -317,11 +324,12 @@ impl Cursor {
     /// `exprs[i]` becomes `schema.fields()[i]`. No type inference -- the schema declares
     /// names and types directly. Use when both lists are produced together (e.g. physical
     /// to logical column mapping).
-    pub fn project_with_schema(
-        self,
-        exprs: Vec<ExpressionRef>,
-        schema: SchemaRef,
-    ) -> Result<Self, DeltaError> {
+    pub fn project_with_schema<I, E>(self, exprs: I, schema: SchemaRef) -> Result<Self, DeltaError>
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<ExpressionRef>,
+    {
+        let exprs: Vec<ExpressionRef> = exprs.into_iter().map(Into::into).collect();
         let field_count = schema.fields().count();
         if exprs.len() != field_count {
             return Err(delta_error!(
@@ -484,20 +492,32 @@ impl Cursor {
         self.project(pairs)
     }
 
-    /// Insert `(name, expr)` immediately after the field named `after`.
+    /// Insert `leaf` immediately after `sibling`'s position in its parent struct.
+    ///
+    /// `sibling`'s prefix (all components except the last) names the parent struct;
+    /// `leaf.name()` is the new column's name. Errors if `sibling` doesn't resolve, if
+    /// the parent isn't a struct, or if `leaf.name()` collides with an existing sibling.
+    /// `sibling` accepts any [`IntoColumnName`] value -- a `&str` for top-level fields,
+    /// a tuple/array or [`column_name!`](crate::column_name) macro for nested paths.
     pub fn insert_col_after(
         self,
-        after: impl AsRef<str>,
-        name: impl Into<String>,
+        sibling: impl IntoColumnName,
+        leaf: StructField,
         expr: impl Into<ExpressionRef>,
     ) -> Result<Self, DeltaError> {
-        let after = after.as_ref();
+        let path = sibling.into_column_name();
+        let expr = expr.into();
         let schema = self.schema()?;
-        let pairs = insert_named(&schema, after, name.into(), expr.into(), Side::After)?;
-        self.project(pairs)
+        let (parent_path, sibling_leaf) = split_parent_leaf(&path, "insert_col_after")?;
+        let op = FieldOp::InsertAfter {
+            sibling_leaf,
+            new_field: leaf,
+            new_expr: expr,
+        };
+        apply_field_op(self, &schema, parent_path, op)
     }
 
-    /// Insert `(name, expr)` immediately before the field named `before`.
+    /// Insert `(name, expr)` immediately before the field named `before`. Top-level only.
     pub fn insert_col_before(
         self,
         before: impl AsRef<str>,
@@ -506,39 +526,33 @@ impl Cursor {
     ) -> Result<Self, DeltaError> {
         let before = before.as_ref();
         let schema = self.schema()?;
-        let pairs = insert_named(&schema, before, name.into(), expr.into(), Side::Before)?;
+        let pairs = insert_before(&schema, before, name.into(), expr.into())?;
         self.project(pairs)
     }
 
-    /// Replace the existing field named `name`'s expression. Output type follows
-    /// inference of the new expression.
+    /// Replace the field at `path` with `new_field` (allowing rename + retype) and
+    /// substitute `new_expr` in its place.
+    ///
+    /// The path's leaf and `new_field.name()` may differ (rename) or match (in-place
+    /// retype). Errors if `path` doesn't resolve, if its parent isn't a struct, or if a
+    /// rename would collide with an existing sibling. `path` accepts any
+    /// [`IntoColumnName`] value.
     pub fn replace_col(
         self,
-        name: impl AsRef<str>,
-        expr: impl Into<ExpressionRef>,
+        path: impl IntoColumnName,
+        new_field: StructField,
+        new_expr: impl Into<ExpressionRef>,
     ) -> Result<Self, DeltaError> {
-        let name = name.as_ref();
-        let expr = expr.into();
+        let path = path.into_column_name();
+        let new_expr = new_expr.into();
         let schema = self.schema()?;
-        if schema.field(name).is_none() {
-            return Err(delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "replace_col: field {name:?} not in input schema",
-            ));
-        }
-        let pairs: Vec<(String, ExpressionRef)> = schema
-            .fields()
-            .map(|f| {
-                let fname = f.name().clone();
-                if fname == name {
-                    (fname, Arc::clone(&expr))
-                } else {
-                    let e = Expression::column([&fname]);
-                    (fname, Arc::new(e))
-                }
-            })
-            .collect();
-        self.project(pairs)
+        let (parent_path, target_leaf) = split_parent_leaf(&path, "replace_col")?;
+        let op = FieldOp::Replace {
+            target_leaf,
+            new_field,
+            new_expr,
+        };
+        apply_field_op(self, &schema, parent_path, op)
     }
 
     /// Rename one input field. Output type is unchanged.
@@ -571,25 +585,17 @@ impl Cursor {
         self.project(pairs)
     }
 
-    /// Drop one input field by name.
-    pub fn drop_col(self, name: impl AsRef<str>) -> Result<Self, DeltaError> {
-        let name = name.as_ref();
+    /// Remove the field at `path` from its parent struct.
+    ///
+    /// Errors if `path` doesn't resolve or if its parent isn't a struct. `path` accepts
+    /// any [`IntoColumnName`] value -- a `&str` for top-level fields, a tuple/array or
+    /// [`column_name!`](crate::column_name) macro for nested paths.
+    pub fn drop_col(self, path: impl IntoColumnName) -> Result<Self, DeltaError> {
+        let path = path.into_column_name();
         let schema = self.schema()?;
-        if schema.field(name).is_none() {
-            return Err(delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                "drop_col: field {name:?} not in input schema",
-            ));
-        }
-        let pairs: Vec<(String, ExpressionRef)> = schema
-            .fields()
-            .filter(|f| f.name() != name)
-            .map(|f| {
-                let fname = f.name().clone();
-                (fname.clone(), Arc::new(Expression::column([fname])))
-            })
-            .collect();
-        self.project(pairs)
+        let (parent_path, target_leaf) = split_parent_leaf(&path, "drop_col")?;
+        let op = FieldOp::Drop { target_leaf };
+        apply_field_op(self, &schema, parent_path, op)
     }
 
     /// Drop several input fields by name.
@@ -681,12 +687,22 @@ impl Cursor {
     /// expression types are inferred (and must therefore be supported by
     /// [`infer_expression_type`]) but do not contribute fields to the output -- they are
     /// validated for the lowering's benefit only.
-    pub fn max_by_version(
+    pub fn max_by_version<G, V, C, S>(
         self,
-        group_by: Vec<ExpressionRef>,
-        version: ExpressionRef,
-        value_columns: Vec<String>,
-    ) -> Result<Self, DeltaError> {
+        group_by: G,
+        version: V,
+        value_columns: C,
+    ) -> Result<Self, DeltaError>
+    where
+        G: IntoIterator,
+        G::Item: Into<ExpressionRef>,
+        V: Into<ExpressionRef>,
+        C: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let group_by: Vec<ExpressionRef> = group_by.into_iter().map(Into::into).collect();
+        let version_column: ExpressionRef = version.into();
+        let value_columns: Vec<String> = value_columns.into_iter().map(Into::into).collect();
         let input_schema = self.schema()?;
         for expr in &group_by {
             // Validate group expressions resolve against the input schema. Inferred type
@@ -709,7 +725,7 @@ impl Cursor {
             &self,
             Node::MaxByVersion {
                 group_by,
-                version_column: version,
+                version_column,
                 value_columns,
             },
             output_schema,
@@ -718,11 +734,16 @@ impl Cursor {
 
     /// Inner join. Output schema is the left fields followed by the right fields.
     /// Caller is responsible for renaming any name collisions ahead of the join.
-    pub fn inner_join(
-        self,
-        other: Cursor,
-        key_pairs: Vec<(ExpressionRef, ExpressionRef)>,
-    ) -> Result<Self, DeltaError> {
+    pub fn inner_join<I, L, R>(self, other: Cursor, key_pairs: I) -> Result<Self, DeltaError>
+    where
+        I: IntoIterator<Item = (L, R)>,
+        L: Into<ExpressionRef>,
+        R: Into<ExpressionRef>,
+    {
+        let key_pairs: Vec<(ExpressionRef, ExpressionRef)> = key_pairs
+            .into_iter()
+            .map(|(l, r)| (l.into(), r.into()))
+            .collect();
         ensure_same_context(&self, &other)?;
         let left_schema = self.schema()?;
         let right_schema = other.schema()?;
@@ -743,11 +764,16 @@ impl Cursor {
 
     /// Left-anti join: rows of `self` whose key matches no row of `other`. Output schema
     /// mirrors `self`.
-    pub fn left_anti_join(
-        self,
-        other: Cursor,
-        key_pairs: Vec<(ExpressionRef, ExpressionRef)>,
-    ) -> Result<Self, DeltaError> {
+    pub fn left_anti_join<I, L, R>(self, other: Cursor, key_pairs: I) -> Result<Self, DeltaError>
+    where
+        I: IntoIterator<Item = (L, R)>,
+        L: Into<ExpressionRef>,
+        R: Into<ExpressionRef>,
+    {
+        let key_pairs: Vec<(ExpressionRef, ExpressionRef)> = key_pairs
+            .into_iter()
+            .map(|(l, r)| (l.into(), r.into()))
+            .collect();
         ensure_same_context(&self, &other)?;
         let output_schema = self.schema()?;
         push_binary(
@@ -941,18 +967,11 @@ fn identity_named_exprs(schema: &StructType) -> Vec<(String, ExpressionRef)> {
         .collect()
 }
 
-#[derive(Clone, Copy)]
-enum Side {
-    Before,
-    After,
-}
-
-fn insert_named(
+fn insert_before(
     schema: &StructType,
     anchor: &str,
     new_name: String,
     new_expr: ExpressionRef,
-    side: Side,
 ) -> Result<Vec<(String, ExpressionRef)>, DeltaError> {
     if schema.field(anchor).is_none() {
         return Err(delta_error!(
@@ -963,15 +982,240 @@ fn insert_named(
     let mut pairs: Vec<(String, ExpressionRef)> = Vec::with_capacity(schema.fields().count() + 1);
     for f in schema.fields() {
         let fname = f.name().clone();
-        if matches!(side, Side::Before) && fname == anchor {
+        if fname == anchor {
             pairs.push((new_name.clone(), Arc::clone(&new_expr)));
         }
         pairs.push((fname.clone(), Arc::new(Expression::column([fname.clone()]))));
-        if matches!(side, Side::After) && fname == anchor {
-            pairs.push((new_name.clone(), Arc::clone(&new_expr)));
-        }
     }
     Ok(pairs)
+}
+
+// === Point-edit primitives over nested paths =================================
+
+/// Result of rebuilding a struct under a [`FieldOp`]: the per-field projection list
+/// (output name + expression) plus the matching output [`StructField`]s in declaration
+/// order. Pairs `0..n` of one mirror pairs `0..n` of the other.
+type RewrittenStruct = (Vec<(String, ExpressionRef)>, Vec<StructField>);
+
+/// Field-level edit applied to the parent struct identified by a path prefix.
+enum FieldOp {
+    InsertAfter {
+        sibling_leaf: String,
+        new_field: StructField,
+        new_expr: ExpressionRef,
+    },
+    Replace {
+        target_leaf: String,
+        new_field: StructField,
+        new_expr: ExpressionRef,
+    },
+    Drop {
+        target_leaf: String,
+    },
+}
+
+/// Split a path into `(parent_path, leaf)`. The leaf is the last component; the parent
+/// path is empty for top-level fields. Errors if the path is empty.
+fn split_parent_leaf<'a>(
+    path: &'a ColumnName,
+    op_name: &'static str,
+) -> Result<(&'a [String], String), DeltaError> {
+    let components = path.path();
+    let (leaf, parent) = components.split_last().ok_or_else(|| {
+        delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            "{op_name}: path is empty",
+        )
+    })?;
+    Ok((parent, leaf.clone()))
+}
+
+/// Apply a field-level edit at the struct identified by `parent_path` within
+/// `input_schema`, then push a top-level [`Node::Project`] that materializes the result.
+///
+/// Walks the schema down `parent_path`, identity-projecting siblings via `col(...)`
+/// references, then applies `op` at the targeted struct. Each ancestor struct above the
+/// edit is rebuilt with [`Expression::struct_from`].
+fn apply_field_op(
+    cursor: Cursor,
+    input_schema: &StructType,
+    parent_path: &[String],
+    op: FieldOp,
+) -> Result<Cursor, DeltaError> {
+    let (named_exprs, fields) = rewrite_at(input_schema, &[], parent_path, &op)?;
+    let output_schema = arc_struct_or_invariant(fields)?;
+    push_unary(
+        &cursor.state,
+        &cursor,
+        Node::Project {
+            named_exprs,
+            output_schema: Arc::clone(&output_schema),
+        },
+        output_schema,
+    )
+}
+
+/// Recursive worker for [`apply_field_op`].
+///
+/// `path_so_far` is the absolute path (from the root) of the struct currently being
+/// rebuilt. `remaining` is the path from the current struct down to the parent struct
+/// where the op applies; when it becomes empty, `op` is applied here.
+fn rewrite_at(
+    schema: &StructType,
+    path_so_far: &[String],
+    remaining: &[String],
+    op: &FieldOp,
+) -> Result<RewrittenStruct, DeltaError> {
+    if remaining.is_empty() {
+        return apply_op_in_struct(schema, path_so_far, op);
+    }
+    let target = &remaining[0];
+    let mut named_exprs: Vec<(String, ExpressionRef)> = Vec::with_capacity(schema.fields().count());
+    let mut fields: Vec<StructField> = Vec::with_capacity(schema.fields().count());
+    let mut found = false;
+    for f in schema.fields() {
+        let fname = f.name().clone();
+        if &fname == target {
+            let sub = match f.data_type() {
+                DataType::Struct(s) => s.as_ref(),
+                other => {
+                    return Err(delta_error!(
+                        DeltaErrorCode::DeltaCommandInvariantViolation,
+                        "rewrite_at: field {fname:?} is not a struct (found {other:?})",
+                    ));
+                }
+            };
+            let mut sub_path = path_so_far.to_vec();
+            sub_path.push(fname.clone());
+            let (sub_named, sub_fields) = rewrite_at(sub, &sub_path, &remaining[1..], op)?;
+            let sub_struct = StructType::try_new(sub_fields.clone())
+                .or_delta(DeltaErrorCode::DeltaCommandInvariantViolation)?;
+            fields.push(StructField::new(
+                fname.clone(),
+                DataType::Struct(Box::new(sub_struct)),
+                f.is_nullable(),
+            ));
+            let exprs: Vec<ExpressionRef> = sub_named.into_iter().map(|(_, e)| e).collect();
+            named_exprs.push((fname, Arc::new(Expression::struct_from(exprs))));
+            found = true;
+        } else {
+            named_exprs.push((fname.clone(), col_ref_at(path_so_far, &fname)));
+            fields.push(f.clone());
+        }
+    }
+    if !found {
+        return Err(delta_error!(
+            DeltaErrorCode::DeltaCommandInvariantViolation,
+            "rewrite_at: field {target:?} not found in schema at path {path_so_far:?}",
+        ));
+    }
+    Ok((named_exprs, fields))
+}
+
+/// Apply `op` to the fields of `schema`, treating it as the parent struct at
+/// `path_so_far`. Identity-projects siblings via `col(...)` references (for nested
+/// parents these references include the full prefix from the root).
+fn apply_op_in_struct(
+    schema: &StructType,
+    path_so_far: &[String],
+    op: &FieldOp,
+) -> Result<RewrittenStruct, DeltaError> {
+    match op {
+        FieldOp::InsertAfter {
+            sibling_leaf,
+            new_field,
+            new_expr,
+        } => {
+            if schema.field(sibling_leaf).is_none() {
+                return Err(delta_error!(
+                    DeltaErrorCode::DeltaCommandInvariantViolation,
+                    "insert_col_after: sibling field {sibling_leaf:?} not found at path \
+                     {path_so_far:?}",
+                ));
+            }
+            if schema.field(new_field.name()).is_some() {
+                return Err(delta_error!(
+                    DeltaErrorCode::DeltaCommandInvariantViolation,
+                    "insert_col_after: field {name:?} already exists at path {path_so_far:?}",
+                    name = new_field.name(),
+                ));
+            }
+            let mut named_exprs: Vec<(String, ExpressionRef)> =
+                Vec::with_capacity(schema.fields().count() + 1);
+            let mut fields: Vec<StructField> = Vec::with_capacity(schema.fields().count() + 1);
+            for f in schema.fields() {
+                let fname = f.name().clone();
+                named_exprs.push((fname.clone(), col_ref_at(path_so_far, &fname)));
+                fields.push(f.clone());
+                if &fname == sibling_leaf {
+                    named_exprs.push((new_field.name().clone(), Arc::clone(new_expr)));
+                    fields.push(new_field.clone());
+                }
+            }
+            Ok((named_exprs, fields))
+        }
+        FieldOp::Replace {
+            target_leaf,
+            new_field,
+            new_expr,
+        } => {
+            if schema.field(target_leaf).is_none() {
+                return Err(delta_error!(
+                    DeltaErrorCode::DeltaCommandInvariantViolation,
+                    "replace_col: field {target_leaf:?} not found at path {path_so_far:?}",
+                ));
+            }
+            if target_leaf != new_field.name() && schema.field(new_field.name()).is_some() {
+                return Err(delta_error!(
+                    DeltaErrorCode::DeltaCommandInvariantViolation,
+                    "replace_col: rename target {name:?} already exists at path {path_so_far:?}",
+                    name = new_field.name(),
+                ));
+            }
+            let mut named_exprs: Vec<(String, ExpressionRef)> =
+                Vec::with_capacity(schema.fields().count());
+            let mut fields: Vec<StructField> = Vec::with_capacity(schema.fields().count());
+            for f in schema.fields() {
+                let fname = f.name().clone();
+                if &fname == target_leaf {
+                    named_exprs.push((new_field.name().clone(), Arc::clone(new_expr)));
+                    fields.push(new_field.clone());
+                } else {
+                    named_exprs.push((fname.clone(), col_ref_at(path_so_far, &fname)));
+                    fields.push(f.clone());
+                }
+            }
+            Ok((named_exprs, fields))
+        }
+        FieldOp::Drop { target_leaf } => {
+            if schema.field(target_leaf).is_none() {
+                return Err(delta_error!(
+                    DeltaErrorCode::DeltaCommandInvariantViolation,
+                    "drop_col: field {target_leaf:?} not found at path {path_so_far:?}",
+                ));
+            }
+            let mut named_exprs: Vec<(String, ExpressionRef)> = Vec::new();
+            let mut fields: Vec<StructField> = Vec::new();
+            for f in schema.fields() {
+                let fname = f.name().clone();
+                if &fname == target_leaf {
+                    continue;
+                }
+                named_exprs.push((fname.clone(), col_ref_at(path_so_far, &fname)));
+                fields.push(f.clone());
+            }
+            Ok((named_exprs, fields))
+        }
+    }
+}
+
+/// Build a `col(...)` reference to `leaf` within the struct rooted at `prefix`. When
+/// `prefix` is empty this is a top-level column reference.
+fn col_ref_at(prefix: &[String], leaf: &str) -> ExpressionRef {
+    let mut path: Vec<String> = Vec::with_capacity(prefix.len() + 1);
+    path.extend(prefix.iter().cloned());
+    path.push(leaf.to_string());
+    Arc::new(Expression::column(path))
 }
 
 // ============================================================================
@@ -1011,8 +1255,8 @@ mod tests {
     fn sources_mint_refs_and_record_schemas() {
         let ctx = Context::new();
         let v = ctx.values(id_ts_schema(), vec![]).unwrap();
-        let j = ctx.scan_json(vec![], id_ts_schema()).unwrap();
-        let p = ctx.scan_parquet(vec![], id_ts_schema()).unwrap();
+        let j = ctx.scan(FileType::Json, vec![], id_ts_schema()).unwrap();
+        let p = ctx.scan(FileType::Parquet, vec![], id_ts_schema()).unwrap();
         assert_eq!(v.ref_id(), Ref(0));
         assert_eq!(j.ref_id(), Ref(1));
         assert_eq!(p.ref_id(), Ref(2));
@@ -1122,7 +1366,11 @@ mod tests {
         let src = ctx.values(id_ts_schema(), vec![]).unwrap();
         let after = src
             .clone()
-            .insert_col_after("id", "mid", Arc::new(col("id")) as ExpressionRef)
+            .insert_col_after(
+                "id",
+                StructField::nullable("mid", DataType::STRING),
+                col("id"),
+            )
             .unwrap();
         let before = src
             .insert_col_before("ts", "early", Arc::new(col("id")) as ExpressionRef)
@@ -1135,6 +1383,179 @@ mod tests {
         let before_schema = before.schema().unwrap();
         let before_names: Vec<&str> = before_schema.fields().map(|f| f.name().as_str()).collect();
         assert_eq!(before_names, ["id", "early", "ts"]);
+    }
+
+    // === Point-edit primitives over nested paths ============================
+
+    /// Schema with an `add` struct, used to exercise nested point-edits.
+    fn nested_add_schema() -> SchemaRef {
+        let add = StructType::try_new(vec![
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("stats", DataType::STRING),
+        ])
+        .unwrap();
+        Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("commitInfo", DataType::STRING),
+                StructField::nullable("add", DataType::Struct(Box::new(add))),
+                StructField::nullable("remove", DataType::STRING),
+            ])
+            .unwrap(),
+        )
+    }
+
+    /// Top-level `insert_col_after` keeps existing fields and appends the new leaf
+    /// immediately after the sibling.
+    #[test]
+    fn insert_col_after_top_level_inserts_after_sibling() {
+        let ctx = Context::new();
+        let src = ctx.values(id_ts_schema(), vec![]).unwrap();
+        let out = src
+            .insert_col_after(
+                "id",
+                StructField::nullable("mid", DataType::LONG),
+                col("ts"),
+            )
+            .unwrap();
+        let schema = out.schema().unwrap();
+        let names: Vec<&str> = schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id", "mid", "ts"]);
+        assert_eq!(schema.field("mid").unwrap().data_type(), &DataType::LONG);
+    }
+
+    /// `insert_col_after` walks into a nested struct and inserts `add.stats_parsed`
+    /// after `add.stats`.
+    #[test]
+    fn insert_col_after_nested_inserts_in_parent_struct() {
+        let ctx = Context::new();
+        let src = ctx.values(nested_add_schema(), vec![]).unwrap();
+        let stats_struct =
+            StructType::try_new(vec![StructField::nullable("numRecords", DataType::LONG)]).unwrap();
+        let parsed_field = StructField::nullable(
+            "stats_parsed",
+            DataType::Struct(Box::new(stats_struct.clone())),
+        );
+        let out = src
+            .insert_col_after(["add", "stats"], parsed_field, col(["add", "stats"]))
+            .unwrap();
+        let schema = out.schema().unwrap();
+        let add = match schema.field("add").unwrap().data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            other => panic!("expected struct, got {other:?}"),
+        };
+        let names: Vec<&str> = add.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["path", "stats", "stats_parsed"]);
+        assert_eq!(
+            add.field("stats_parsed").unwrap().data_type(),
+            &DataType::Struct(Box::new(stats_struct)),
+        );
+    }
+
+    /// `insert_col_after` errors when the sibling does not exist at the requested path.
+    #[test]
+    fn insert_col_after_rejects_missing_sibling() {
+        let ctx = Context::new();
+        let src = ctx.values(nested_add_schema(), vec![]).unwrap();
+        let err = src
+            .insert_col_after(
+                ["add", "missing"],
+                StructField::nullable("x", DataType::LONG),
+                col(["add", "stats"]),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("missing"), "got: {err}");
+    }
+
+    /// `insert_col_after` errors when the new leaf collides with an existing sibling.
+    #[test]
+    fn insert_col_after_rejects_name_collision() {
+        let ctx = Context::new();
+        let src = ctx.values(id_ts_schema(), vec![]).unwrap();
+        let err = src
+            .insert_col_after("id", StructField::nullable("ts", DataType::LONG), col("id"))
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+    }
+
+    /// `replace_col` retypes a field in place when the new field's name matches.
+    #[test]
+    fn replace_col_in_place_retypes_field() {
+        let ctx = Context::new();
+        let src = ctx.values(id_ts_schema(), vec![]).unwrap();
+        let out = src
+            .replace_col(
+                "ts",
+                StructField::nullable("ts", DataType::STRING),
+                col("id"),
+            )
+            .unwrap();
+        let schema = out.schema().unwrap();
+        let names: Vec<&str> = schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id", "ts"]);
+        assert_eq!(schema.field("ts").unwrap().data_type(), &DataType::STRING);
+    }
+
+    /// `replace_col` with a nested path renames + retypes a child field, walking the
+    /// parent struct with `col(...)` references for unchanged siblings.
+    #[test]
+    fn replace_col_nested_renames_and_retypes() {
+        let ctx = Context::new();
+        let src = ctx.values(nested_add_schema(), vec![]).unwrap();
+        let stats_struct =
+            StructType::try_new(vec![StructField::nullable("numRecords", DataType::LONG)]).unwrap();
+        let new_field = StructField::nullable(
+            "stats_parsed",
+            DataType::Struct(Box::new(stats_struct.clone())),
+        );
+        let out = src
+            .replace_col(["add", "stats"], new_field, col(["add", "stats"]))
+            .unwrap();
+        let schema = out.schema().unwrap();
+        let add = match schema.field("add").unwrap().data_type() {
+            DataType::Struct(s) => s.as_ref(),
+            other => panic!("expected struct, got {other:?}"),
+        };
+        let names: Vec<&str> = add.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["path", "stats_parsed"]);
+        assert_eq!(
+            add.field("stats_parsed").unwrap().data_type(),
+            &DataType::Struct(Box::new(stats_struct)),
+        );
+    }
+
+    /// `replace_col` errors when the path does not resolve.
+    #[test]
+    fn replace_col_rejects_missing_path() {
+        let ctx = Context::new();
+        let src = ctx.values(nested_add_schema(), vec![]).unwrap();
+        let err = src
+            .replace_col(
+                ["add", "missing"],
+                StructField::nullable("missing", DataType::STRING),
+                col(["add", "path"]),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("missing"), "got: {err}");
+    }
+
+    /// `drop_col` removes a top-level field.
+    #[test]
+    fn drop_col_top_level_removes_field() {
+        let ctx = Context::new();
+        let src = ctx.values(id_ts_schema(), vec![]).unwrap();
+        let out = src.drop_col("ts").unwrap();
+        let schema = out.schema().unwrap();
+        let names: Vec<&str> = schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id"]);
+    }
+
+    /// `drop_col` errors when the path does not resolve.
+    #[test]
+    fn drop_col_rejects_missing_path() {
+        let ctx = Context::new();
+        let src = ctx.values(id_ts_schema(), vec![]).unwrap();
+        let err = src.drop_col("missing").unwrap_err();
+        assert!(err.to_string().contains("missing"), "got: {err}");
     }
 
     /// `select` rejects target fields not in the input schema.

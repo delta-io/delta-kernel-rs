@@ -106,13 +106,12 @@ fn lower_stmt(
         Node::ListFiles { start_from } => file_listing_to_logical_plan(&FileListingNode {
             path: start_from.clone(),
         }),
-        Node::ReadJson { files, schema } => scan_to_listing_logical_plan(&ScanNode::new(
-            FileType::Json,
-            files.clone(),
-            Arc::clone(schema),
-        )),
-        Node::ReadParquet { files, schema } => scan_to_listing_logical_plan(&ScanNode::new(
-            FileType::Parquet,
+        Node::Scan {
+            file_type,
+            files,
+            schema,
+        } => scan_to_listing_logical_plan(&ScanNode::new(
+            *file_type,
             files.clone(),
             Arc::clone(schema),
         )),

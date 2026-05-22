@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use super::action_pair::{scan_file_row_pair, SCAN_BASE};
+use super::action_pair::{project_scan_file_row, SCAN_BASE};
 use super::dedup::scan_file_dedup_key;
 use super::file_scan::scan_data_projection;
 use super::ssa_reconciliation::execute_reconciliation_ssa;
@@ -65,9 +65,8 @@ pub(super) async fn build_scan_ssa(
     )
     .await?;
 
-    // === Scan-specific terminal projection: action_pair -> flat scan_file_row ==========
-    let (live_schema, live_exprs) = scan_file_row_pair(parts.as_ref());
-    let live_actions = reconciled.project_with_schema(live_exprs, live_schema)?;
+    // === Scan-specific terminal projection: reconciled -> flat scan_file_row ==========
+    let live_actions = project_scan_file_row(reconciled, parts.as_ref())?;
 
     // === Stage 6 (optional): data phase =================================================
     if with_data {

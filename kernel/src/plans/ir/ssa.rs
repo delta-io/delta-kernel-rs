@@ -19,7 +19,7 @@
 //! use delta_kernel::plans::ir::ssa::{Node, Plan};
 //!
 //! let mut plan = Plan::new();
-//! let src = plan.push(Node::ReadJson { files, schema }, vec![]);
+//! let src = plan.push(Node::Scan { file_type, files, schema }, vec![]);
 //! let filt = plan.push(Node::Filter { predicate }, vec![src]);
 //! ```
 //!
@@ -163,9 +163,9 @@ pub enum JoinKind {
 /// SSA node operators.
 ///
 /// Sources have zero inputs; transforms have one or more (per-variant doc).
-/// Schemas are stored on variants where the caller declares them (`ReadJson`,
-/// `ReadParquet`, `Values`, `Load`); for transforms the cursor builder derives
-/// the output schema from inputs and parameters.
+/// Schemas are stored on variants where the caller declares them (`Scan`,
+/// `Values`, `Load`); for transforms the cursor builder derives the output
+/// schema from inputs and parameters.
 #[derive(Debug, Clone)]
 pub enum Node {
     // === Sources (0 inputs) ==================================================
@@ -173,14 +173,9 @@ pub enum Node {
     /// schema (path / size / modificationTime / etc.).
     ListFiles { start_from: Url },
 
-    /// Read JSON files into row batches matching `schema`.
-    ReadJson {
-        files: Vec<FileMeta>,
-        schema: SchemaRef,
-    },
-
-    /// Read Parquet files into row batches matching `schema`.
-    ReadParquet {
+    /// Read `files` of the given [`FileType`] into row batches matching `schema`.
+    Scan {
+        file_type: FileType,
         files: Vec<FileMeta>,
         schema: SchemaRef,
     },

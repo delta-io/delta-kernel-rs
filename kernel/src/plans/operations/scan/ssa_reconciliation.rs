@@ -24,14 +24,15 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::action_pair::{augment_add, Pair, JOIN_KEY_FIELD, VERSION_FIELD};
+use super::action_pair::JOIN_KEY_FIELD;
 use super::dedup::FSR_JOIN_KEY_COL;
-use super::schemas::action_schema;
 use crate::action_reconciliation::{
     calculate_transaction_expiration_timestamp, deleted_file_retention_timestamp_with_time,
 };
-use crate::actions::{Sidecar, SIDECAR_NAME};
-use crate::expressions::{col, ColumnName, Expression, ExpressionRef, Predicate, Scalar};
+use crate::actions::{Sidecar, ADD_NAME, SIDECAR_NAME};
+use crate::expressions::{
+    col, column_expr, ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
+};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
@@ -39,7 +40,7 @@ use crate::plans::ir::nodes::{FileFormat, FileType, ScanFileColumns};
 use crate::plans::kernel_consumers::SidecarCollector;
 use crate::plans::operations::framework::coroutine::context::StepCo;
 use crate::plans::operations::framework::plan_context::{Context, Cursor, LoadSpec};
-use crate::schema::{arc_schema, ArrayType, DataType, SchemaRef, StructField, ToSchema};
+use crate::schema::{arc_schema, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::utils::current_time_duration;
 use crate::{delta_error, FileMeta, Version};
@@ -74,16 +75,30 @@ pub(super) enum SsaCheckpointShape {
 #[derive(Clone, Debug)]
 pub(super) struct SsaScanShape {
     pub(super) checkpoint: SsaCheckpointShape,
-    pub(super) stats: SsaStatsInfo,
+    /// Stats wiring. `None` means the caller didn't request stats. `Some` carries the
+    /// projected stats schema along with the on-disk layout the snapshot's checkpoint
+    /// uses for column stats.
+    pub(super) stats: Option<SsaStatsInfo>,
     pub(super) partition_schema: Option<SchemaRef>,
 }
 
-/// Stats wiring: the optional projected stats schema and whether the checkpoint stores
-/// parsed (struct-typed) stats vs. JSON-string stats that need parsing.
+/// Stats wiring: the projected stats schema plus the on-disk layout the snapshot's
+/// checkpoint files use for column stats.
 #[derive(Clone, Debug)]
 pub(super) struct SsaStatsInfo {
-    pub(super) stats_schema: Option<SchemaRef>,
-    pub(super) has_parsed_stats: bool,
+    pub(super) schema: SchemaRef,
+    pub(super) checkpoint_layout: CheckpointStatsLayout,
+}
+
+/// How the snapshot's checkpoint files store column stats. The variant names mirror the
+/// protocol's column names (`add.stats_parsed` for the parsed struct, `add.stats` for the
+/// JSON-string form).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CheckpointStatsLayout {
+    /// Parsed struct (parquet `add.stats_parsed`).
+    StatsParsed,
+    /// JSON string (parquet/JSON `add.stats`).
+    StatsJson,
 }
 
 /// Resolve the scan shape via a sequence of `Step::Consume` (sidecar URL extraction)
@@ -106,10 +121,14 @@ pub(super) async fn resolve_shape_ssa(
 
     let make_info = |checkpoint, has_parsed_stats| SsaScanShape {
         checkpoint,
-        stats: SsaStatsInfo {
-            stats_schema: stats_schema.cloned(),
-            has_parsed_stats,
-        },
+        stats: stats_schema.cloned().map(|schema| SsaStatsInfo {
+            schema,
+            checkpoint_layout: if has_parsed_stats {
+                CheckpointStatsLayout::StatsParsed
+            } else {
+                CheckpointStatsLayout::StatsJson
+            },
+        }),
         partition_schema: partition_schema.clone(),
     };
 
@@ -152,12 +171,8 @@ pub(super) async fn resolve_shape_ssa(
     // V2 manifest: drain a `SidecarCollector` over (manifest_scan -> filter SIDECAR not null)
     // to recover sidecar URLs. The manifest is re-scanned in the build phase; this scan is
     // for the sidecar SchemaQuery probe only.
-    let manifest_schema = checkpoint_manifest_scan_schema();
-    let manifest_chain = match file_format {
-        FileFormat::Parquet => ctx.scan_parquet(files.clone(), manifest_schema)?,
-        FileFormat::Json => ctx.scan_json(files.clone(), manifest_schema)?,
-    };
-    let sidecar_chain = manifest_chain.filter(Arc::new(col([SIDECAR_NAME]).is_not_null()))?;
+    let manifest_chain = ctx.scan(file_format, files.clone(), manifest_probe_schema())?;
+    let sidecar_chain = manifest_chain.filter(col([SIDECAR_NAME]).is_not_null())?;
     let sidecar_files = ctx
         .consume(
             co,
@@ -201,39 +216,18 @@ pub(super) fn build_reconciliation_ssa(
     ctx: &Context,
     snapshot: &Snapshot,
     shape: &SsaScanShape,
-    base: &Pair,
-    dedup_key: Arc<Expression>,
+    base: &SchemaRef,
+    dedup_key: ExpressionRef,
 ) -> Result<Cursor, DeltaError> {
-    let stats_for = |has_parsed: bool| {
-        shape
-            .stats
-            .stats_schema
-            .as_ref()
-            .map(|s| (s.clone(), has_parsed))
-    };
-    let commit_pair = augment_add(
-        base.clone(),
-        stats_for(false),
-        shape.partition_schema.clone(),
-    );
-    let checkpoint_pair = augment_add(
-        base.clone(),
-        stats_for(shape.stats.has_parsed_stats),
-        shape.partition_schema.clone(),
-    );
-    // The checkpoint-side projection is identity-equivalent to the commit-side projection
-    // when no augmentation is needed. Skip the project node entirely in that case.
-    let checkpoint_project_is_identity = shape.partition_schema.is_none()
-        && (shape.stats.stats_schema.is_none() || shape.stats.has_parsed_stats);
-
-    // Reused by commit dedup and the antijoin path.
-    let identity_not_null: Arc<Predicate> = Arc::new(dedup_key.as_ref().clone().is_not_null());
+    let stats = shape.stats.as_ref().map(|s| &s.schema);
+    let parts = shape.partition_schema.as_ref();
+    let identity_not_null: PredicateRef = Arc::new(dedup_key.as_ref().clone().is_not_null());
 
     let commits = commit_cover_rows(snapshot.log_segment())?;
     let log_root = snapshot.log_segment().log_root.clone();
     let (min_file_ts, txn_expiry) = retention_timestamps(snapshot)?;
 
-    // === Stage 1: commit_load ============================================================
+    // === Stage 1: commit_load ===========================================================
     // VALUES(commits) -> Load(JSON) broadcasts the per-commit `version` column onto every
     // emitted action row.
     let commit_rows: Vec<Vec<Scalar>> = commits
@@ -249,7 +243,7 @@ pub(super) fn build_reconciliation_ssa(
     let commit_raw = ctx
         .values(path_size_schema(/* with_version= */ true), commit_rows)?
         .load(LoadSpec {
-            file_schema: base.0.clone(),
+            file_schema: Arc::clone(base),
             file_type: FileType::Json,
             base_url: Some(log_root.clone()),
             passthrough_columns: vec![ColumnName::new(["version"])],
@@ -257,85 +251,64 @@ pub(super) fn build_reconciliation_ssa(
             dv_ref: None,
         })?;
 
-    // === Stage 2: commit_dedup ===========================================================
-    // filter(identity) -> single project that emits commit_pair + JOIN_KEY + VERSION
-    // (all expressions reference `commit_raw`'s schema, which carries `version` as a
-    // passthrough column) -> max_by_version. The narrowed output is `commit_pair +
-    // JOIN_KEY` (VERSION dropped). We must fold the three column additions into one
-    // Project so that `col("version")` is still in scope when it is referenced --
-    // splitting them would lose `version` after the first Project.
-    let commit_pair_with_keys_schema: SchemaRef = {
-        let mut fields: Vec<StructField> = commit_pair.0.fields().cloned().collect();
-        fields.push(JOIN_KEY_FIELD.clone());
-        fields.push(VERSION_FIELD.clone());
-        arc_schema(fields)
-    };
-    let mut commit_pair_with_keys_exprs: Vec<ExpressionRef> = commit_pair.1.clone();
-    commit_pair_with_keys_exprs.push(Arc::clone(&dedup_key));
-    commit_pair_with_keys_exprs.push(Arc::new(col("version")) as ExpressionRef);
-    let mut value_columns: Vec<String> = commit_pair.0.fields().map(|f| f.name().clone()).collect();
-    value_columns.push(FSR_JOIN_KEY_COL.to_string());
+    // === Stage 2: commit_dedup ==========================================================
+    // Commits never carry native parsed stats; always parse JSON. partitionValues_parsed is
+    // derived via `map_to_struct` when partitions are requested. JOIN_KEY is appended as the
+    // dedup key; `version` already lives on every row (Load broadcast it via
+    // `passthrough_columns`) and feeds `max_by_version` directly. `version` is dropped by
+    // `max_by_version` (it is not in `value_columns`).
+    let value_columns: Vec<String> = base
+        .fields()
+        .map(|f| f.name().clone())
+        .chain(std::iter::once(FSR_JOIN_KEY_COL.to_string()))
+        .collect();
     let commit_dedup = commit_raw
-        .filter(Arc::clone(&identity_not_null))?
-        .project_with_schema(commit_pair_with_keys_exprs, commit_pair_with_keys_schema)?
+        .filter(identity_not_null.clone())?
+        .with_json_stats_parsed(stats)?
+        .with_partitions_parsed(parts)?
+        .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?
         .max_by_version(
-            vec![Arc::new(col(FSR_JOIN_KEY_COL)) as ExpressionRef],
-            Arc::new(col("version")),
+            [col(FSR_JOIN_KEY_COL)],
+            column_expr!("version"),
             value_columns,
         )?;
 
-    // === Stages 3-5a: build the checkpoint view per shape variant ========================
-    // Returns `Some(Cursor)` aligned to `checkpoint_pair.0 + JOIN_KEY` (i.e. ready for the
-    // antijoin), or `None` when the snapshot has no checkpoint at all.
+    // === Stages 3-5a: build the checkpoint view per shape variant =======================
+    // Returns `Some(Cursor)` aligned to `commit_dedup`'s schema minus JOIN_KEY (i.e. ready
+    // for the antijoin's union arm), or `None` when the snapshot has no checkpoint at all.
     let checkpoint_view: Option<Cursor> = match &shape.checkpoint {
         SsaCheckpointShape::None => None,
-        SsaCheckpointShape::Inline { files, file_format } => {
-            let scan_schema = checkpoint_pair.0.clone();
-            let scan = match file_format {
-                FileFormat::Parquet => ctx.scan_parquet(files.clone(), scan_schema)?,
-                FileFormat::Json => ctx.scan_json(files.clone(), scan_schema)?,
-            };
-            let aligned = if checkpoint_project_is_identity {
-                scan
-            } else {
-                scan.project_with_schema(checkpoint_pair.1.clone(), checkpoint_pair.0.clone())?
-            };
-            Some(aligned)
-        }
+        SsaCheckpointShape::Inline { files, file_format } => Some(load_checkpoint_files(
+            ctx,
+            base,
+            shape,
+            *file_format,
+            files.clone(),
+        )?),
         SsaCheckpointShape::Manifest { files, file_format } => {
-            // Re-scan the manifest. The cursor branches: one branch chases sidecars; the
-            // other selects manifest-resident action rows directly.
-            let manifest_schema = checkpoint_manifest_scan_schema();
-            let manifest = match file_format {
-                FileFormat::Parquet => ctx.scan_parquet(files.clone(), manifest_schema)?,
-                FileFormat::Json => ctx.scan_json(files.clone(), manifest_schema)?,
-            };
+            // Re-scan the manifest with `base + sidecar` so that `drop_col(SIDECAR_NAME)`
+            // recovers the action stream regardless of pipeline base width (scan = 2,
+            // FSR = 6). The cursor branches: one chases sidecars; the other selects
+            // manifest-resident action rows directly.
+            let manifest = ctx.scan(*file_format, files.clone(), manifest_action_schema(base))?;
             let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
                 delta_error!(
                     DeltaErrorCode::DeltaStateRecoverError,
                     "build_reconciliation_ssa: join _sidecars base URL: {e}",
                 )
             })?;
-            // Sidecar branch: filter -> project (path/sizeInBytes) -> Load. The Load's
-            // `file_schema` must be `checkpoint_pair.0` (not `base.0`) so the engine
-            // surfaces native `add.stats_parsed` / `add.partitionValues_parsed` from the
-            // sidecar parquet directly. With identity checkpoint projection the loaded
-            // schema is the union arm shape; otherwise it is reprojected below.
+            // Sidecar branch: filter -> project (path/sizeInBytes) -> Load. The sidecar
+            // parquet always uses `base` shape; native parsed stats (when present) are
+            // surfaced by replacing `add.stats` with `add.stats_parsed` in the file_schema.
             let sidecar_load = manifest
                 .clone()
-                .filter(Arc::new(col([SIDECAR_NAME]).is_not_null()))?
+                .filter(col([SIDECAR_NAME]).is_not_null())?
                 .project([
-                    (
-                        "path",
-                        Arc::new(col([SIDECAR_NAME, "path"])) as ExpressionRef,
-                    ),
-                    (
-                        "sizeInBytes",
-                        Arc::new(col([SIDECAR_NAME, "sizeInBytes"])) as ExpressionRef,
-                    ),
+                    ("path", col([SIDECAR_NAME, "path"])),
+                    ("sizeInBytes", col([SIDECAR_NAME, "sizeInBytes"])),
                 ])?
                 .load(LoadSpec {
-                    file_schema: checkpoint_pair.0.clone(),
+                    file_schema: sidecar_file_schema(base, shape.stats.as_ref()),
                     file_type: FileType::Parquet,
                     base_url: Some(sidecar_base),
                     passthrough_columns: vec![],
@@ -346,59 +319,44 @@ pub(super) fn build_reconciliation_ssa(
                     },
                     dv_ref: None,
                 })?;
-            // Manifest top branch: select the action slots out of the manifest schema (drop
-            // the `sidecar` column) and then apply `commit_pair` (parse_json stats since
-            // manifest action rows never carry native stats).
-            let top = manifest
-                .select_columns(base.0.fields().map(|f| f.name().clone()))?
-                .project_with_schema(commit_pair.1.clone(), commit_pair.0.clone())?;
-            let side = if checkpoint_project_is_identity {
-                sidecar_load
-            } else {
-                sidecar_load
-                    .project_with_schema(checkpoint_pair.1.clone(), checkpoint_pair.0.clone())?
+            let sidecar_aligned = match shape.stats.as_ref() {
+                Some(s) if s.checkpoint_layout == CheckpointStatsLayout::StatsParsed => {
+                    sidecar_load.with_partitions_parsed(parts)?
+                }
+                _ => sidecar_load
+                    .with_json_stats_parsed(stats)?
+                    .with_partitions_parsed(parts)?,
             };
-            Some(top.union_all(&[side])?)
+            // Manifest top branch: drop sidecar then JSON-parse stats (manifest action rows
+            // never carry native stats).
+            let top = manifest
+                .drop_col(SIDECAR_NAME)?
+                .with_json_stats_parsed(stats)?
+                .with_partitions_parsed(parts)?;
+            Some(top.union_all(&[sidecar_aligned])?)
         }
     };
 
-    // === Stage 5b: antijoin + union + retention -> reconciled ============================
+    // === Stage 5b: antijoin + union + retention -> reconciled ===========================
     let terminal_input = if let Some(view) = checkpoint_view {
         let keyed = view
-            .filter(Arc::clone(&identity_not_null))?
-            .project_with_schema(checkpoint_pair.1.clone(), checkpoint_pair.0.clone())?
+            .filter(identity_not_null)?
             .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?;
-        let join_key_only_schema = arc_schema([StructField::nullable(
-            FSR_JOIN_KEY_COL,
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-        )]);
-        let commit_keys = commit_dedup.clone().project_with_schema(
-            vec![Arc::new(col(FSR_JOIN_KEY_COL)) as ExpressionRef],
-            join_key_only_schema,
-        )?;
-        // SSA convention: `left_anti_join` returns rows of the left whose key matches no
-        // row of the right. Left = keyed (checkpoint side), right = commit_keys. Output
-        // schema mirrors `keyed`.
+        // `Node::EquiJoin { kind: LeftAnti }` produces left-schema output regardless of the
+        // right side's shape. Pass `commit_dedup` as-is and let the engine's projection
+        // pushdown prune unused right-side columns.
         let survivors = keyed.left_anti_join(
-            commit_keys,
-            vec![(
-                Arc::new(col(FSR_JOIN_KEY_COL)) as ExpressionRef,
-                Arc::new(col(FSR_JOIN_KEY_COL)) as ExpressionRef,
-            )],
+            commit_dedup.clone(),
+            [(col(FSR_JOIN_KEY_COL), col(FSR_JOIN_KEY_COL))],
         )?;
         commit_dedup.union_all(&[survivors])?
     } else {
         commit_dedup
     };
 
-    let reconciled = terminal_input
-        .filter(Arc::new(retention_filter_predicate(
-            min_file_ts,
-            txn_expiry,
-        )))?
-        .project_with_schema(checkpoint_pair.1.clone(), checkpoint_pair.0.clone())?;
-
-    Ok(reconciled)
+    terminal_input
+        .filter(retention_filter_predicate(min_file_ts, txn_expiry))?
+        .drop_col(FSR_JOIN_KEY_COL)
 }
 
 /// Async wrapper: resolve the scan shape (yielding `SchemaQuery` / `Consume` phases as
@@ -407,13 +365,79 @@ pub(super) async fn execute_reconciliation_ssa(
     ctx: &Context,
     co: &mut StepCo,
     snapshot: &Snapshot,
-    base: &Pair,
+    base: &SchemaRef,
     stats: Option<SchemaRef>,
     parts: Option<SchemaRef>,
-    dedup_key: Arc<Expression>,
+    dedup_key: ExpressionRef,
 ) -> Result<Cursor, DeltaError> {
     let shape = resolve_shape_ssa(ctx, co, snapshot, stats.as_ref(), parts).await?;
     build_reconciliation_ssa(ctx, snapshot, &shape, base, dedup_key)
+}
+
+/// Helper: scan an inline checkpoint and align it to the expected post-checkpoint shape.
+/// `Some(StatsParsed)` declares `add.stats_parsed` directly in the scan schema (parquet
+/// surfaces the parsed struct natively); `Some(StatsJson)` and `None` scan with `base` and
+/// JSON-parse stats post-Load.
+fn load_checkpoint_files(
+    ctx: &Context,
+    base: &SchemaRef,
+    shape: &SsaScanShape,
+    file_format: FileFormat,
+    files: Vec<FileMeta>,
+) -> Result<Cursor, DeltaError> {
+    let parts = shape.partition_schema.as_ref();
+    let stats = shape.stats.as_ref().map(|s| &s.schema);
+    let scan = match shape.stats.as_ref() {
+        Some(s) if s.checkpoint_layout == CheckpointStatsLayout::StatsParsed => {
+            let scan_schema = stats_parsed_file_schema(base, &s.schema);
+            ctx.scan(file_format, files, scan_schema)?
+                .with_partitions_parsed(parts)?
+        }
+        _ => ctx
+            .scan(file_format, files, Arc::clone(base))?
+            .with_json_stats_parsed(stats)?
+            .with_partitions_parsed(parts)?,
+    };
+    Ok(scan)
+}
+
+// ============================================================================
+// Reconciliation cursor extension
+// ============================================================================
+
+/// Module-scoped extension trait providing fluent point-edits for the reconciliation
+/// pipeline. Both methods *replace* (not append) -- the JSON / Map source columns have no
+/// downstream consumer once their parsed form exists, so keeping both would just bloat
+/// the projection.
+pub(super) trait ReconciliationCursor: Sized {
+    /// Replace `add.stats: STRING` with `add.stats_parsed: STRUCT<stats>` via
+    /// [`Expression::parse_json`]. No-op when `stats` is `None`.
+    fn with_json_stats_parsed(self, stats: Option<&SchemaRef>) -> Result<Self, DeltaError>;
+    /// Replace `add.partitionValues: MAP<STRING, STRING>` with
+    /// `add.partitionValues_parsed: STRUCT<parts>` via [`Expression::map_to_struct`].
+    /// No-op when `parts` is `None`.
+    fn with_partitions_parsed(self, parts: Option<&SchemaRef>) -> Result<Self, DeltaError>;
+}
+
+impl ReconciliationCursor for Cursor {
+    fn with_json_stats_parsed(self, stats: Option<&SchemaRef>) -> Result<Self, DeltaError> {
+        let Some(stats_schema) = stats else {
+            return Ok(self);
+        };
+        let new_field = StructField::nullable("stats_parsed", stats_schema.as_ref().clone());
+        let new_expr = Expression::parse_json(col([ADD_NAME, "stats"]), Arc::clone(stats_schema));
+        self.replace_col([ADD_NAME, "stats"], new_field, new_expr)
+    }
+
+    fn with_partitions_parsed(self, parts: Option<&SchemaRef>) -> Result<Self, DeltaError> {
+        let Some(parts_schema) = parts else {
+            return Ok(self);
+        };
+        let new_field =
+            StructField::nullable("partitionValues_parsed", parts_schema.as_ref().clone());
+        let new_expr = Expression::map_to_struct(col([ADD_NAME, "partitionValues"]));
+        self.replace_col([ADD_NAME, "partitionValues"], new_field, new_expr)
+    }
 }
 
 // ============================================================================
@@ -451,10 +475,65 @@ fn stats_probe(leaf: Option<&SchemaRef>, requested: Option<&SchemaRef>) -> Optio
     ))
 }
 
-fn checkpoint_manifest_scan_schema() -> SchemaRef {
-    let mut fields: Vec<StructField> = action_schema().fields().cloned().collect();
+/// Manifest scan schema for the V2-multipart `is_manifest` probe in
+/// [`resolve_shape_ssa`]. Only the `sidecar` column is consumed downstream
+/// (`SidecarCollector` reads `sidecar.path` / `sidecar.sizeInBytes`); narrowing the scan
+/// to that one column avoids paying the read cost for the action columns.
+fn manifest_probe_schema() -> SchemaRef {
+    arc_schema([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])
+}
+
+/// Manifest scan schema used by [`build_reconciliation_ssa`]: `base + sidecar`.
+///
+/// Building the schema from `base` (rather than the full action schema) lets the caller
+/// recover the action stream by `drop_col(SIDECAR_NAME)` regardless of pipeline width
+/// (scan = 2, FSR = 6).
+fn manifest_action_schema(base: &SchemaRef) -> SchemaRef {
+    let mut fields: Vec<StructField> = base.fields().cloned().collect();
     fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
     arc_schema(fields)
+}
+
+/// File schema for the sidecar parquet Load: `base` with `add.stats` swapped for
+/// `add.stats_parsed: stats_schema` when the checkpoint advertises native parsed stats.
+/// Other arms scan with `base` and JSON-parse `add.stats` post-Load.
+fn sidecar_file_schema(base: &SchemaRef, stats: Option<&SsaStatsInfo>) -> SchemaRef {
+    match stats {
+        Some(s) if s.checkpoint_layout == CheckpointStatsLayout::StatsParsed => {
+            stats_parsed_file_schema(base, &s.schema)
+        }
+        _ => Arc::clone(base),
+    }
+}
+
+/// Build a checkpoint Load `file_schema` that swaps `add.stats: STRING` for
+/// `add.stats_parsed: stats_schema`. Parquet checkpoints with native parsed stats don't
+/// carry the JSON form, so asking the engine for both columns would be wasted I/O.
+fn stats_parsed_file_schema(base: &SchemaRef, stats_schema: &SchemaRef) -> SchemaRef {
+    let new_fields: Vec<StructField> = base
+        .fields()
+        .map(|f| {
+            if f.name() != ADD_NAME {
+                return f.clone();
+            }
+            let DataType::Struct(add) = f.data_type() else {
+                unreachable!("base places `add` as a struct slot at index 0");
+            };
+            let new_add = StructType::new_unchecked(add.fields().map(|inner| {
+                if inner.name() == "stats" {
+                    StructField::nullable("stats_parsed", stats_schema.as_ref().clone())
+                } else {
+                    inner.clone()
+                }
+            }));
+            StructField::new(
+                ADD_NAME,
+                DataType::Struct(Box::new(new_add)),
+                f.is_nullable(),
+            )
+        })
+        .collect();
+    arc_schema(new_fields)
 }
 
 /// `{path, size, version?}` Values upstream schema for commit_load.

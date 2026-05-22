@@ -376,7 +376,7 @@ async fn load_node_reads_files_and_broadcasts_passthrough() {
 
 /// `MaxByVersion` keeps the row with the largest `version` per group key, narrowed to the
 /// declared `value_columns` (group_by exprs are aggregation-internal and do NOT appear in
-/// the output -- per `RENAME_PROPOSAL.md` schema-flow table).
+/// the output).
 #[test]
 fn max_by_version_keeps_top_row_per_group_and_narrows_to_value_columns() {
     let mut plan = SsaPlan::new();
