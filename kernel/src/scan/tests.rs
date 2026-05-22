@@ -5,6 +5,7 @@ use bytes::Bytes;
 use rstest::rstest;
 
 use super::*;
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
@@ -17,7 +18,7 @@ use crate::expressions::{
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
+use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{
@@ -712,10 +713,10 @@ fn test_scan_metadata_with_stats_columns() {
 
         // Extract stats_parsed struct array
         let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
-        let num_records = get_column!(stats_parsed, "numRecords", Int64Array);
-        let min_values = get_column!(stats_parsed, "minValues", StructArray);
-        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
-        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
+        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
+        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
+        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
 
         // Extract JSON stats column
         let stats_json = get_column!(filtered_batch, "stats", StringArray);
@@ -730,7 +731,7 @@ fn test_scan_metadata_with_stats_columns() {
                 serde_json::from_str(stats_json.value(i)).expect("stats JSON should be valid");
 
             // Validate numRecords
-            if let Some(json_num) = json_stats.get("numRecords").and_then(|v| v.as_i64()) {
+            if let Some(json_num) = json_stats.get(NUM_RECORDS).and_then(|v| v.as_i64()) {
                 assert_eq!(
                     json_num,
                     num_records.value(i),
@@ -739,14 +740,14 @@ fn test_scan_metadata_with_stats_columns() {
             }
 
             // Validate minValues, maxValues, nullCount
-            if let Some(obj) = json_stats.get("minValues").and_then(|v| v.as_object()) {
-                assert_stats_struct_matches_json(min_values, obj, i, "minValues");
+            if let Some(obj) = json_stats.get(MIN_VALUES).and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(min_values, obj, i, MIN_VALUES);
             }
-            if let Some(obj) = json_stats.get("maxValues").and_then(|v| v.as_object()) {
-                assert_stats_struct_matches_json(max_values, obj, i, "maxValues");
+            if let Some(obj) = json_stats.get(MAX_VALUES).and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(max_values, obj, i, MAX_VALUES);
             }
-            if let Some(obj) = json_stats.get("nullCount").and_then(|v| v.as_object()) {
-                assert_stats_struct_matches_json(null_count, obj, i, "nullCount");
+            if let Some(obj) = json_stats.get(NULL_COUNT).and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(null_count, obj, i, NULL_COUNT);
             }
 
             total_num_records += num_records.value(i);
@@ -821,7 +822,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 
         // Verify stats_parsed has data
         let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
-        let num_records = get_column!(stats_parsed, "numRecords", Int64Array);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
         for i in 0..filtered_batch.num_rows() {
             if !stats_parsed.is_null(i) {
                 assert!(num_records.value(i) > 0, "numRecords should be positive");
@@ -942,10 +943,10 @@ impl CheckpointParquetBuilder {
     fn new() -> Self {
         let id_fields = Fields::from(vec![Field::new("id", ArrowDataType::Int64, true)]);
         let stats_fields = Fields::from(vec![
-            Field::new("maxValues", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("minValues", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("nullCount", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("numRecords", ArrowDataType::Int64, true),
+            Field::new(MAX_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(MIN_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(NULL_COUNT, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(NUM_RECORDS, ArrowDataType::Int64, true),
         ]);
         let add_fields = Fields::from(vec![Field::new(
             "stats_parsed",
@@ -986,7 +987,7 @@ impl CheckpointParquetBuilder {
         let stats_parsed = StructArray::from(vec![
             (
                 Arc::new(Field::new(
-                    "maxValues",
+                    MAX_VALUES,
                     ArrowDataType::Struct(self.id_fields.clone()),
                     true,
                 )),
@@ -994,7 +995,7 @@ impl CheckpointParquetBuilder {
             ),
             (
                 Arc::new(Field::new(
-                    "minValues",
+                    MIN_VALUES,
                     ArrowDataType::Struct(self.id_fields.clone()),
                     true,
                 )),
@@ -1002,14 +1003,14 @@ impl CheckpointParquetBuilder {
             ),
             (
                 Arc::new(Field::new(
-                    "nullCount",
+                    NULL_COUNT,
                     ArrowDataType::Struct(self.id_fields.clone()),
                     true,
                 )),
                 Arc::new(make_id_struct(null_counts)) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
                 Arc::new(Int64Array::from(num_records.to_vec())) as Arc<dyn Array>,
             ),
         ]);
@@ -1037,7 +1038,8 @@ impl CheckpointParquetBuilder {
 
 /// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
 fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
-    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[])?;
+    let stats = all_referenced_columns(pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[], &stats)?;
     let mut prefixer = PrefixColumns {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
@@ -1281,9 +1283,9 @@ fn test_scan_metadata_with_specific_stats_columns() {
             filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
 
         let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-        let min_values = get_column!(stats_parsed, "minValues", StructArray);
-        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
-        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
+        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
+        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
 
         // Check minValues/maxValues/nullCount only have "id"
         assert_eq!(
@@ -1339,9 +1341,9 @@ fn test_scan_metadata_with_multiple_stats_columns() {
             filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
 
         let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-        let min_values = get_column!(stats_parsed, "minValues", StructArray);
-        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
-        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
+        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
+        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
 
         // Check minValues/maxValues/nullCount have "id" and "name"
         let expected = vec!["id", "name"];
@@ -1412,7 +1414,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         // Should have numRecords but no minValues/maxValues/nullCount
         // (or they exist but are empty structs)
         assert!(
-            stats_parsed.column_by_name("numRecords").is_some(),
+            stats_parsed.column_by_name(NUM_RECORDS).is_some(),
             "Should still have numRecords"
         );
     }

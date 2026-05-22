@@ -583,6 +583,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -719,8 +720,8 @@ mod tests {
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
         let stats = StructArray::try_new(
             vec![
-                Field::new("numRecords", ArrowDataType::Int64, true),
-                Field::new("tightBounds", ArrowDataType::Boolean, true),
+                Field::new(NUM_RECORDS, ArrowDataType::Int64, true),
+                Field::new(TIGHT_BOUNDS, ArrowDataType::Boolean, true),
             ]
             .into(),
             vec![
@@ -844,7 +845,7 @@ mod tests {
 
         // Check numRecords from stats
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()

@@ -40,6 +40,9 @@ impl CrcLoadResult {
 ///
 /// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
 /// Can also hold a precomputed CRC (e.g. from post-commit CRC merge) without a backing file.
+// TODO: remove `LazyCrc`. We will soon be doing incremental CRC replay, in which we always
+//       read the CRC if available. Note: in the meantime, `LazyCrc` and `Crc` both duplicate
+//       the version.
 #[derive(Debug)]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.

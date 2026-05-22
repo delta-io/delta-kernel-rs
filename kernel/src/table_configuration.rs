@@ -335,6 +335,19 @@ impl TableConfiguration {
         )
     }
 
+    /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
+    /// every column reference in the rewritten predicate against this set, so the two
+    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
+    /// point to keep their gate input in lockstep.
+    pub(crate) fn physical_stats_columns_set(
+        &self,
+        required_columns: Option<&[ColumnName]>,
+    ) -> HashSet<ColumnName> {
+        self.physical_stats_column_names(required_columns)
+            .into_iter()
+            .collect()
+    }
+
     /// Returns the physical partition schema for `partitionValues_parsed`.
     ///
     /// Field names are physical column names (respecting column mapping mode),
@@ -895,7 +908,7 @@ mod test {
     use url::Url;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -1864,7 +1877,7 @@ mod test {
         // Verify field names are logical names
         let min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = min_values {
@@ -1888,7 +1901,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = physical_min_values {
@@ -1924,7 +1937,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         let DataType::Struct(inner) = physical_min_values else {
@@ -2020,7 +2033,7 @@ mod test {
 
         let DataType::Struct(inner) = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type()
         else {

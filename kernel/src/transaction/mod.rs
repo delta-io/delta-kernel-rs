@@ -9,12 +9,13 @@ use tracing::{info, instrument};
 
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    DomainMetadata, Metadata, Protocol, SetTransaction, MAX_VALUES, METADATA_NAME, MIN_VALUES,
+    NULL_COUNT, NUM_RECORDS, PROTOCOL_NAME, TIGHT_BOUNDS,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{CrcDelta, FileStatsDelta, LazyCrc};
+use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta, LazyCrc};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
@@ -112,14 +113,14 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
     let stats = StructField::nullable(
         "stats",
         DataType::struct_type_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
             // nullCount, minValues, maxValues are dynamic based on data schema.
             // Empty struct placeholders indicate these fields exist but their inner
             // structure depends on the table schema and stats column configuration.
-            StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NULL_COUNT, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(MIN_VALUES, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(MAX_VALUES, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]),
     );
 
@@ -371,6 +372,7 @@ impl<S> Transaction<S> {
         }
 
         self.validate_blind_append_semantics()?;
+        self.ensure_schema_non_empty_for_data_writes()?;
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -702,6 +704,34 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Reject data file writes (add/remove/DV) against an empty-schema table.
+    /// CREATE TABLE and metadata-only commits are exempt.
+    fn ensure_schema_non_empty_for_data_writes(&self) -> DeltaResult<()> {
+        if self.is_create_table() {
+            return Ok(());
+        }
+        if self.has_data_file_actions() {
+            self.ensure_schema_non_empty_for_write_context()?;
+        }
+        Ok(())
+    }
+
+    /// Reject `WriteContext` handouts on empty-schema tables, so engines fail
+    /// before staging any parquet. CREATE TABLE is exempt.
+    fn ensure_schema_non_empty_for_write_context(&self) -> DeltaResult<()> {
+        if self.is_create_table() {
+            return Ok(());
+        }
+        if self.effective_table_config.logical_schema().num_fields() == 0 {
+            return Err(Error::generic(
+                "Cannot write data files to a Delta table with empty schema; \
+                 use `snapshot.alter_table().add_column(...)` to add at least one \
+                 column before writing data",
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns true if this is a create-table transaction.
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
@@ -710,6 +740,13 @@ impl<S> Transaction<S> {
             "CREATE TABLE operation should not have a read snapshot"
         );
         self.read_snapshot_opt.is_none()
+    }
+
+    /// True iff this transaction stages any data-file action (add, remove, or DV update).
+    fn has_data_file_actions(&self) -> bool {
+        !self.add_files_metadata.is_empty()
+            || !self.remove_files_metadata.is_empty()
+            || !self.dv_matched_files.is_empty()
     }
 
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
@@ -921,6 +958,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
+        self.ensure_schema_non_empty_for_write_context()?;
         let shared = self.shared_write_state();
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -968,6 +1006,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
+        self.ensure_schema_non_empty_for_write_context()?;
         let shared = self.shared_write_state();
         require!(
             shared.logical_partition_columns.is_empty(),
@@ -1216,6 +1255,28 @@ impl<S> Transaction<S> {
             &self.remove_files_metadata,
             bin_boundaries,
         )?;
+        // TODO: drop these conversions by migrating the upstream chain
+        //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
+        //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
+        //       checks into the type system.
+        let domain_metadata = dm_changes
+            .into_iter()
+            .map(|dm| (dm.domain().to_string(), dm))
+            .collect();
+        let set_transactions = self
+            .set_transactions
+            .iter()
+            .map(|txn| (txn.app_id.clone(), txn.clone()))
+            .collect();
+        // Although `remove.size` is optional per the Delta protocol, the kernel write path
+        // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
+        // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
+        // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
+        // present, and only operation classification can flip `is_incremental_safe`.
+        let is_incremental_safe = self
+            .operation
+            .as_deref()
+            .is_some_and(is_incremental_safe_operation);
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1224,11 +1285,10 @@ impl<S> Transaction<S> {
             metadata: self
                 .should_emit_metadata
                 .then(|| self.effective_table_config.metadata().clone()),
-            domain_metadata_changes: dm_changes,
-            set_transaction_changes: self.set_transactions.clone(),
+            domain_metadata,
+            set_transactions,
             in_commit_timestamp,
-            operation: self.operation.clone(),
-            has_missing_file_size: false, // writes always have sizes
+            is_incremental_safe,
         })
     }
 
@@ -1739,11 +1799,11 @@ mod tests {
             StructField::nullable(
                 "stats",
                 DataType::struct_type_unchecked(vec![
-                    StructField::nullable("numRecords", DataType::LONG),
-                    StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("tightBounds", DataType::BOOLEAN),
+                    StructField::nullable(NUM_RECORDS, DataType::LONG),
+                    StructField::nullable(NULL_COUNT, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(MIN_VALUES, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(MAX_VALUES, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
                 ]),
             ),
         ]);
@@ -2512,16 +2572,16 @@ mod tests {
         let value_fields = vec![StructField::nullable("value", DataType::LONG)];
         let value_struct_type = DataType::struct_type_unchecked(value_fields.clone());
         let stats_type = DataType::struct_type_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", value_struct_type.clone()),
-            StructField::nullable("minValues", value_struct_type.clone()),
-            StructField::nullable("maxValues", value_struct_type.clone()),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, value_struct_type.clone()),
+            StructField::nullable(MIN_VALUES, value_struct_type.clone()),
+            StructField::nullable(MAX_VALUES, value_struct_type.clone()),
         ]);
         let stats_fields = vec![
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", value_struct_type.clone()),
-            StructField::nullable("minValues", value_struct_type.clone()),
-            StructField::nullable("maxValues", value_struct_type),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, value_struct_type.clone()),
+            StructField::nullable(MIN_VALUES, value_struct_type.clone()),
+            StructField::nullable(MAX_VALUES, value_struct_type),
         ];
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),

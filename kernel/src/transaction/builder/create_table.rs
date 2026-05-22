@@ -867,13 +867,15 @@ impl CreateTableTransactionBuilder {
     /// This method performs validation:
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
-    /// - Validates the schema is non-empty
     /// - Rejects schemas with `delta.invariants` metadata annotations (unsupported by kernel)
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
     /// Non-null columns (`nullable: false`) are allowed. The `invariants` writer feature is
     /// auto-added to the protocol when the schema has any non-null column.
+    ///
+    /// Empty schemas are accepted. The resulting table cannot be read or blind-appended to
+    /// until columns are added via `ALTER TABLE ADD COLUMN`.
     ///
     /// # Arguments
     ///
@@ -885,7 +887,6 @@ impl CreateTableTransactionBuilder {
     /// Returns an error if:
     /// - The table path is invalid
     /// - A table already exists at the given path
-    /// - The schema is empty
     /// - The schema has `delta.invariants` metadata on any column
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
@@ -917,7 +918,8 @@ impl CreateTableTransactionBuilder {
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
 
-        // Validate schema (non-empty, column names, duplicates, no `delta.invariants` metadata)
+        // Validate schema (column names, duplicates, no `delta.invariants` metadata).
+        // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
