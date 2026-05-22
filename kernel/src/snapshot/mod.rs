@@ -796,7 +796,7 @@ impl Snapshot {
     /// Approximate owned heap size in bytes for this snapshot.
     ///
     /// Includes the two dominant per-snapshot heap contributors:
-    /// 1. Delta log file metadata (file name, location, ...).
+    /// 1. Listed file metadatas (file name, location, ...).
     /// 2. The raw `schemaString` JSON(raw string for the schema).
     ///
     /// Excludes shared schemas (the logical and physical schemas on `TableConfiguration`):
@@ -3840,8 +3840,7 @@ mod tests {
         );
 
         let heap = snap.approximate_owned_heap_size();
-        let struct_size = std::mem::size_of::<Snapshot>();
-        eprintln!("approximate_owned_heap_size = {heap}, sizeof(Snapshot) = {struct_size}");
+        let struct_size = size_of::<Snapshot>();
         // Heap size should be at least 5 times the stack size, to account for
         // the 100 commits file metadata.
         assert!(
