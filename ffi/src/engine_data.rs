@@ -72,6 +72,17 @@ impl ArrowFFIData {
         }
     }
 
+    /// Convert a [`RecordBatch`] into Arrow C Data Interface structs. Same
+    /// ownership rules as [`Self::try_from_engine_data`]. Takes by reference;
+    /// `RecordBatch::clone()` is Arc-cheap so this stays zero-copy.
+    pub fn try_from_record_batch(batch: &RecordBatch) -> DeltaResult<Self> {
+        let sa: StructArray = batch.clone().into();
+        let array_data: ArrayData = sa.into();
+        let array = FFI_ArrowArray::new(&array_data);
+        let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
+        Ok(Self { array, schema })
+    }
+
     /// Convert opaque engine data into Arrow C Data Interface structs.
     ///
     /// The returned `ArrowFFIData` owns the exported data. The caller is responsible for

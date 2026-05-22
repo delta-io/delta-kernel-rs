@@ -603,6 +603,12 @@ pub trait BatchStatsProvider {
 pub struct BatchStatsAccessor<'a> {
     provider: &'a dyn BatchStatsProvider,
     arena: StrArena,
+    /// Optional pointer to an `ArrowFFIData` (kept opaque here so this file
+    /// stays unconditional). Set by the arrow batch evaluator before invoking
+    /// the engine callback so engines that prefer the Arrow C Data Interface
+    /// can call [`batch_stats_as_arrow`] instead of the per-row scalar
+    /// getters. Null when the underlying batch is not Arrow-backed.
+    arrow_ffi: *const c_void,
 }
 
 impl<'a> BatchStatsAccessor<'a> {
@@ -610,7 +616,17 @@ impl<'a> BatchStatsAccessor<'a> {
         Self {
             provider,
             arena: StrArena::default(),
+            arrow_ffi: std::ptr::null(),
         }
+    }
+
+    /// Attach a pointer to an exported `ArrowFFIData` (or any C-compatible
+    /// pointer; engines decode based on documented agreement with the kernel
+    /// path that constructed the accessor). The pointer must outlive the
+    /// accessor.
+    pub(crate) fn with_arrow_ffi(mut self, arrow_ffi: *const c_void) -> Self {
+        self.arrow_ffi = arrow_ffi;
+        self
     }
 
     fn intern(&self, s: String) -> &str {
@@ -775,6 +791,38 @@ pub unsafe extern "C" fn batch_stats_row_count(
     };
     unsafe { *out = v };
     true
+}
+
+/// Hand the engine an Arrow C Data Interface view of the underlying stats
+/// batch. The returned pointer (when non-null) is an `ArrowFFIData *` -- a
+/// `#[repr(C)]` struct containing inline `FFI_ArrowArray` + `FFI_ArrowSchema`,
+/// see `delta_kernel_ffi::engine_data::ArrowFFIData`. Engines that already
+/// speak the Arrow C Data Interface (arrow-java, arrow-glib, pyarrow, etc.)
+/// can import the batch in their own runtime and process the metadata-batch
+/// columns without going through the per-row scalar getters.
+///
+/// Returns null when the accessor wasn't constructed over an Arrow batch, or
+/// when kernel couldn't export the batch (some schemas don't round-trip via
+/// the Arrow C Data Interface); engines should fall back to the scalar
+/// `batch_stats_*` getters in that case.
+///
+/// The pointer is valid for the duration of the surrounding
+/// `eval_against_stats` callback. The standard Arrow import flow (e.g.
+/// arrow-java's `Data.importIntoVector`, `arrow::ffi::from_ffi`) consumes
+/// the `FFI_ArrowArray` and nulls its release callback; kernel's own Drop
+/// on the boxed struct then becomes a no-op (arrow-rs release is
+/// idempotent), so engines are free to import normally. Engines that read
+/// the struct without consuming it are also fine -- kernel's Drop will run
+/// release at callback return.
+///
+/// # Safety
+/// `acc` must be a valid [`BatchStatsAccessor`] pointer if non-null.
+#[no_mangle]
+pub unsafe extern "C" fn batch_stats_as_arrow(acc: *const BatchStatsAccessor<'_>) -> *const c_void {
+    let Some(acc) = (unsafe { acc.as_ref() }) else {
+        return std::ptr::null();
+    };
+    acc.arrow_ffi
 }
 
 // === ScalarResolver (partition pruning) ======================================

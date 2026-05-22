@@ -11,6 +11,8 @@
 //! once at construction so per-row reads inside the callback skip the schema
 //! walk.
 
+use std::ffi::c_void;
+
 use delta_kernel::arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
     RecordBatch, StringArray, StructArray,
@@ -31,6 +33,7 @@ use super::pruning::{
     OpaquePruneVerdict,
 };
 use super::NamedOpaquePredicateOp;
+use crate::engine_data::ArrowFFIData;
 
 // === BatchedArrowStatsProvider =================================================
 
@@ -189,7 +192,19 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         };
 
         let provider = BatchedArrowStatsProvider::new(batch);
-        let stats = BatchStatsAccessor::new(&provider);
+        // Export the metadata batch via the Arrow C Data Interface so engines
+        // that already speak arrow can import directly instead of looping
+        // through the scalar accessors. Box-allocated; lives for the duration
+        // of the callback. Construction can fail for unrepresentable schemas
+        // -- in that case we just skip the Arrow lane and force engines to
+        // use the scalar getters.
+        let arrow_ffi: Option<Box<ArrowFFIData>> = ArrowFFIData::try_from_record_batch(batch)
+            .ok()
+            .map(Box::new);
+        let arrow_ptr: *const c_void = arrow_ffi.as_deref().map_or(std::ptr::null(), |d| {
+            d as *const ArrowFFIData as *const c_void
+        });
+        let stats = BatchStatsAccessor::new(&provider).with_arrow_ffi(arrow_ptr);
         let children = ChildAccessor::new(args);
         let mut verdicts = vec![OpaquePruneVerdict::Unknown; n_rows];
         invoke_eval_against_stats(
@@ -201,6 +216,9 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
             inverted,
             &mut verdicts,
         );
+        // `arrow_ffi` drops at end of scope; FFI_ArrowArray / FFI_ArrowSchema
+        // run their release callbacks if the engine hasn't already imported
+        // them (release is idempotent, so no double-free if it did).
 
         let bools: Vec<Option<bool>> = verdicts
             .iter()
@@ -347,6 +365,136 @@ mod tests {
         }
         assert_eq!(provider.null_count(0, "name"), Some(0));
         assert_eq!(provider.row_count(0), Some(100));
+    }
+
+    // === Arrow C Data Interface passthrough ==================================
+
+    /// Capture the pointer kernel hands us via `batch_stats_as_arrow` and
+    /// verify it's a valid `ArrowFFIData` with the right row count. (We don't
+    /// import via arrow-rs's `from_ffi` here because that consumes the array,
+    /// which would conflict with kernel's Drop on the boxed `ArrowFFIData`
+    /// once `eval_pred` returns.)
+    #[test]
+    fn batch_stats_as_arrow_exports_a_valid_ffi_struct() {
+        thread_local! {
+            static SAW_NON_NULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            static SAW_ROW_COUNT: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+        }
+
+        extern "C" fn capture_arrow_eval(
+            _state: *mut std::ffi::c_void,
+            _op_name: crate::KernelStringSlice,
+            _children: *const ChildAccessor<'_>,
+            stats: *const BatchStatsAccessor<'_>,
+            _n_rows: usize,
+            _inverted: bool,
+            _verdicts: *mut crate::expressions::pruning::OpaquePruneVerdict,
+        ) {
+            let p = unsafe { crate::expressions::pruning::batch_stats_as_arrow(stats) };
+            if p.is_null() {
+                return;
+            }
+            SAW_NON_NULL.with(|c| c.set(true));
+            // Cast to ArrowFFIData and peek at the array length, proving the
+            // struct is layout-valid. An Arrow-Java consumer would call
+            // `Data.importIntoVector` against this same pointer instead.
+            let ffi = p as *const crate::engine_data::ArrowFFIData;
+            let len = unsafe { (*ffi).array.len() } as i64;
+            SAW_ROW_COUNT.with(|c| c.set(len));
+        }
+
+        let cb = Arc::new(OpaquePruningCallbacks {
+            engine_state: std::ptr::null_mut(),
+            eval_against_stats: capture_arrow_eval,
+            eval_on_partition_values: no_op_partition,
+            eval_on_row_group_stats: no_op_row_group,
+            free_state: no_op_free,
+        });
+        let op = NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", cb);
+        let args = vec![column_expr!("name"), Expression::literal("foo")];
+        let batch = three_file_batch();
+        let _ = ArrowOpaquePredicateOp::eval_pred(&op, &args, &batch, false).unwrap();
+
+        assert!(SAW_NON_NULL.with(std::cell::Cell::get));
+        assert_eq!(SAW_ROW_COUNT.with(std::cell::Cell::get), 3);
+    }
+
+    /// Zero-row batches: kernel must not panic when exporting an empty
+    /// metadata batch. The callback receives a valid (empty) Arrow handle.
+    #[test]
+    fn eval_pred_on_empty_batch_does_not_panic() {
+        use delta_kernel::arrow::array::Int64Array;
+
+        thread_local! {
+            static SAW_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+
+        extern "C" fn note_eval(
+            _state: *mut std::ffi::c_void,
+            _op_name: crate::KernelStringSlice,
+            _children: *const ChildAccessor<'_>,
+            _stats: *const BatchStatsAccessor<'_>,
+            _n_rows: usize,
+            _inverted: bool,
+            _verdicts: *mut crate::expressions::pruning::OpaquePruneVerdict,
+        ) {
+            SAW_CALLBACK.with(|c| c.set(true));
+        }
+
+        // Empty 0-row stats_parsed struct with a single nullCount.size column.
+        let empty_nullcount = StructArray::from(vec![(
+            Arc::new(Field::new("size", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+        )]);
+        let stats_parsed = StructArray::from(vec![(
+            Arc::new(Field::new(
+                "nullCount",
+                ArrowDataType::Struct(vec![Field::new("size", ArrowDataType::Int64, true)].into()),
+                true,
+            )),
+            Arc::new(empty_nullcount) as ArrayRef,
+        )]);
+        let schema = Schema::new(vec![Field::new(
+            "stats_parsed",
+            stats_parsed.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(stats_parsed)]).unwrap();
+
+        let cb = Arc::new(OpaquePruningCallbacks {
+            engine_state: std::ptr::null_mut(),
+            eval_against_stats: note_eval,
+            eval_on_partition_values: no_op_partition,
+            eval_on_row_group_stats: no_op_row_group,
+            free_state: no_op_free,
+        });
+        let op = NamedOpaquePredicateOp::with_callbacks("FOO", cb);
+        let result = ArrowOpaquePredicateOp::eval_pred(&op, &[], &batch, false).unwrap();
+        assert_eq!(result.len(), 0);
+        assert!(SAW_CALLBACK.with(std::cell::Cell::get));
+    }
+
+    #[test]
+    fn batch_stats_as_arrow_returns_null_for_non_arrow_provider() {
+        struct DummyProvider;
+        impl BatchStatsProvider for DummyProvider {
+            fn min(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+                None
+            }
+            fn max(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+                None
+            }
+            fn null_count(&self, _row: usize, _col: &str) -> Option<i64> {
+                None
+            }
+            fn row_count(&self, _row: usize) -> Option<i64> {
+                None
+            }
+        }
+        let p = DummyProvider;
+        let acc = BatchStatsAccessor::new(&p);
+        let ptr = unsafe { crate::expressions::pruning::batch_stats_as_arrow(&acc as *const _) };
+        assert!(ptr.is_null());
     }
 
     // === End-to-end eval_pred =================================================
