@@ -3871,7 +3871,6 @@ mod tests {
             });
         let delta_checkpoints =
             snap_extra_checkpoints.approximate_owned_heap_size() - baseline_heap;
-        eprintln!("delta_checkpoints (100 parts) = {delta_checkpoints}");
         assert!(
             delta_checkpoints >= 15_000,
             "delta_checkpoints {delta_checkpoints} should be >= 15_000 for 100 checkpoint parts"
@@ -3898,7 +3897,6 @@ mod tests {
             });
         let delta_compactions =
             snap_extra_compactions.approximate_owned_heap_size() - baseline_heap;
-        eprintln!("delta_compactions (100 files) = {delta_compactions}");
         assert!(
             delta_compactions >= 15_000,
             "delta_compactions {delta_compactions} should be >= 15_000 for 100 compaction files"
