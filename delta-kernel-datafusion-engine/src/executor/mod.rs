@@ -1,30 +1,24 @@
-//! [`DataFusionExecutor`]: compiles and runs [`delta_kernel::plans::ir::Plan`] trees.
+//! [`DataFusionExecutor`]: drives kernel SSA coroutine state machines and compiles their
+//! [`Step::Consume`] / `ResultPlan` payloads to DataFusion plans.
 //!
-//! `Relation` / `Load` sinks register lazy [`TableProvider`]s into `relation_providers`
-//! keyed by `RelationHandle.id`; downstream `RelationRef` leaves resolve through that map.
-//! `Consume` is the only sink with eager side effects -- it drains the physical plan into a
-//! [`KernelConsumer`](delta_kernel::plans::kernel_consumers::KernelConsumer) handle.
+//! Every step the SM yields is either a [`Step::SchemaQuery`] (parquet footer read) or a
+//! [`Step::Consume`] (SSA dataflow drained into a
+//! [`ConsumeSink`](delta_kernel::plans::ir::nodes::ConsumeSink)). Terminal `ResultPlan`s
+//! describe a single self-contained dataflow DAG that compiles to a [`LogicalPlan`].
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
-use datafusion::catalog::TableProvider;
 use datafusion::dataframe::DataFrame;
-use datafusion::datasource::ViewTable;
 use datafusion::execution::context::SessionContext;
-use datafusion_common::arrow::datatypes::{FieldRef, Schema as ArrowSchema};
 use datafusion_common::error::DataFusionError;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::TaskContext;
-use datafusion_expr::{Expr, LogicalPlan};
 use datafusion_physical_plan::ExecutionPlan;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{ConsumeSink, LoadSink, RelationHandle, SinkType};
-use delta_kernel::plans::ir::{Plan, ResultPlan};
+use delta_kernel::plans::ir::nodes::ConsumeSink;
 use delta_kernel::plans::kernel_consumers::{FinishedHandle, KdfControl};
 use delta_kernel::plans::operations::framework::coroutine::driver::Coroutine;
 use delta_kernel::plans::operations::framework::engine_error::{EngineError, EngineErrorKind};
@@ -33,17 +27,13 @@ use delta_kernel::plans::operations::framework::step::{SchemaQueryNode, Step};
 use delta_kernel::plans::operations::framework::step_result::StepResult;
 use delta_kernel::plans::operations::scan::FullState;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::StructType;
 use delta_kernel::{Engine, Error as KernelError};
 use futures::TryStreamExt;
 use url::Url;
 use uuid::Uuid;
 
-use crate::compile::expr_translator::build_logical_projection;
-use crate::compile::stamp_udf::StampFieldUdf;
-use crate::compile::{compile_plan_logical, compile_ssa, CompileContext};
+use crate::compile::{compile_ssa, CompileContext};
 use crate::error::DfResultIntoDelta;
-use crate::exec::LoadTableProvider;
 
 fn default_kernel_engine() -> Arc<dyn Engine> {
     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
@@ -82,16 +72,11 @@ fn execute_schema_query_phase(
 }
 
 /// Minimal executor: a [`TaskContext`] for [`ExecutionPlan::execute`] calls, a [`SessionContext`]
-/// for DataFusion compile/optimize/lower, a kernel [`Engine`] for IO helpers, and a
-/// [`Mutex`]-guarded map of lazily-registered relations the compiler resolves
-/// [`RelationRef`](delta_kernel::plans::ir::DeclarativePlanNode::RelationRef) leaves against.
-type RelationProviders = HashMap<String, Arc<dyn TableProvider>>;
-
+/// for DataFusion compile/optimize/lower, and a kernel [`Engine`] for IO helpers.
 pub struct DataFusionExecutor {
     task_ctx: Arc<TaskContext>,
     session_ctx: SessionContext,
     engine: Arc<dyn Engine>,
-    relation_providers: Mutex<RelationProviders>,
 }
 
 impl DataFusionExecutor {
@@ -120,37 +105,12 @@ impl DataFusionExecutor {
             task_ctx: Arc::new(TaskContext::default()),
             session_ctx,
             engine,
-            relation_providers: Mutex::new(HashMap::new()),
         })
     }
 
     /// Reference to the kernel [`Engine`] this executor uses for IO helpers.
     pub fn engine(&self) -> &Arc<dyn Engine> {
         &self.engine
-    }
-
-    /// Locked view of the lazy-relation map. Maps mutex poison (only possible if a previous
-    /// holder panicked) to a [`DataFusionError::Internal`] so the no-panic rule holds.
-    fn providers_lock(&self) -> Result<MutexGuard<'_, RelationProviders>, DataFusionError> {
-        self.relation_providers
-            .lock()
-            .map_err(|_| crate::error::internal_error("relation_providers mutex poisoned"))
-    }
-
-    /// Snapshot the provider registered under `handle_id`, if any. Lets callers inspect the
-    /// provider's concrete type (e.g. distinguish a [`ViewTable`] from a materialized
-    /// `MemTable`).
-    #[cfg(test)]
-    pub(crate) fn relation_provider(&self, handle_id: &str) -> Option<Arc<dyn TableProvider>> {
-        self.providers_lock().ok()?.get(handle_id).cloned()
-    }
-
-    /// Snapshot of the underlying [`SessionContext`]'s state. Exposes the
-    /// [`datafusion::execution::SessionState`] for direct
-    /// [`datafusion::catalog::TableProvider::scan`] invocation to observe pushdown.
-    #[cfg(test)]
-    pub(crate) fn session_state(&self) -> datafusion::execution::SessionState {
-        self.session_ctx.state()
     }
 
     // ================================================================
@@ -161,8 +121,8 @@ impl DataFusionExecutor {
     /// (kernel-side decision plans, schema queries) and returning the SM's terminal value.
     ///
     /// The terminal value is whatever `R` the SM was constructed for: for read-style SMs that
-    /// is typically a [`ResultPlan`] the caller opens via [`Self::drive_to_dataframe`]
-    /// (or, equivalently, by hand with [`Self::execute_plans`] + [`Self::read_relation`]).
+    /// is typically a [`SsaResultPlan`] the caller compiles via
+    /// [`Self::ssa_result_to_dataframe`].
     ///
     /// # `!Send` future
     ///
@@ -172,6 +132,8 @@ impl DataFusionExecutor {
     /// inherits that and is therefore `!Send`. Callers needing a `Send` future drive this on a
     /// single-threaded runtime (`tokio::runtime::Builder::new_current_thread()` +
     /// `block_on`) or wrap the call in a [`tokio::task::LocalSet`].
+    ///
+    /// [`SsaResultPlan`]: delta_kernel::plans::ir::ssa::ResultPlan
     pub async fn drive_to_completion<R: 'static>(
         &self,
         mut sm: Coroutine<R>,
@@ -194,40 +156,9 @@ impl DataFusionExecutor {
         }
     }
 
-    /// Execute every plan in `plans` in order. `Relation` / `Load` plans register lazy table
-    /// providers (no I/O); `Consume` plans drain physically and feed the active phase's
-    /// [`StepResult`].
-    pub async fn execute_plans(&self, plans: &[Plan]) -> Result<(), DeltaError> {
-        let state = StepResult::empty();
-        self.run_plans(plans, &state, Uuid::new_v4(), "standalone", "execute")
-            .await
-            .into_delta()
-    }
-
-    /// Drive a [`ResultPlan`]-returning SM and open its result relation as a [`DataFrame`].
-    ///
-    /// Combines [`Self::drive_to_completion`], [`Self::execute_plans`], and
-    /// [`Self::read_relation`] into one call so callers that just want a DataFrame over an
-    /// SM's output don't have to thread the intermediate [`ResultPlan`] through their own
-    /// code. Useful for read-style SMs (`scan_state_machine`, `full_state`, ...) whose
-    /// terminal value is always a `ResultPlan`.
-    pub async fn drive_to_dataframe(
-        &self,
-        sm: Coroutine<ResultPlan>,
-    ) -> Result<DataFrame, DeltaError> {
-        let rp = self.drive_to_completion(sm).await?;
-        self.execute_plans(&rp.plans).await?;
-        self.read_relation(&rp.result_relation).await
-    }
-
-    /// SSA analog of [`Self::drive_to_dataframe`]: drive a coroutine that yields an
-    /// [`SsaResultPlan`] and open its terminal output as a [`DataFrame`].
-    ///
-    /// Unlike the legacy path there is no relation registry to populate -- SSA plans
-    /// describe a single self-contained dataflow DAG. The compiled `LogicalPlan` is wrapped
-    /// directly in a [`DataFrame`] for the caller; column-mapping / metadata stamping is
-    /// the cursor's responsibility (the SSA plan's `result` Ref must already terminate at
-    /// the caller-facing schema).
+    /// Drive a coroutine that yields an [`SsaResultPlan`] and open its terminal output as a
+    /// [`DataFrame`]. SSA plans describe a single self-contained dataflow DAG; the compiled
+    /// `LogicalPlan` is wrapped directly in a [`DataFrame`] for the caller.
     ///
     /// [`SsaResultPlan`]: delta_kernel::plans::ir::ssa::ResultPlan
     pub async fn drive_ssa_to_dataframe(
@@ -248,9 +179,7 @@ impl DataFusionExecutor {
         &self,
         rp: &delta_kernel::plans::ir::ssa::ResultPlan,
     ) -> Result<DataFrame, DeltaError> {
-        let providers = Arc::new(self.providers_lock().into_delta()?.clone());
         let ctx = CompileContext {
-            relation_providers: providers,
             step_result: None,
             engine: Arc::clone(&self.engine),
             sm_id: Uuid::new_v4(),
@@ -261,96 +190,31 @@ impl DataFusionExecutor {
         Ok(DataFrame::new(self.session_ctx.state(), logical))
     }
 
-    /// Open a registered relation as a [`DataFrame`] whose logical schema matches
-    /// `handle.schema` byte-for-byte: top-level column names, nested struct field
-    /// names, *and* `delta.columnMapping.*` / `parquet.field.id` field metadata.
-    /// Callers can run `.collect()`, `.execute_stream()`, `.filter(...)`, or further
-    /// `.select(...)` directly against the kernel-logical schema without re-stamping.
-    ///
-    /// The underlying provider exposes the *physical* arrow schema (column-mapping
-    /// id-renamed `col-<uuid>` names on nested fields, no Delta metadata). To bridge
-    /// the gap this method wraps the raw provider DataFrame in a per-top-level-field
-    /// projection built by [`build_logical_projection`]:
-    ///
-    /// - Primitive top-level fields pass through bare; the [`StampFieldUdf`] declares the
-    ///   projection's output [`FieldRef`] so metadata flows into the schema.
-    /// - Nested struct fields are reshaped into a `named_struct(get_field(...))` tree that emits
-    ///   logical names at every depth.
-    /// - `List<Struct>` / `Map<*, Struct>` (where supported) get an `array_transform` lambda that
-    ///   recursively reshapes the element struct.
-    ///
-    /// This path replaces the historical post-collect `stamp_batch_metadata` shim --
-    /// every reshape happens inside the logical plan so the projection is composable
-    /// with downstream `df.filter` / `df.select` / coalesce ops without schema
-    /// mismatches.
-    pub async fn read_relation(&self, handle: &RelationHandle) -> Result<DataFrame, DeltaError> {
-        let provider = self
-            .providers_lock()
-            .and_then(|g| {
-                g.get(handle.id.as_str()).cloned().ok_or_else(|| {
-                    crate::error::plan_compilation(format!(
-                        "no relation registered for handle id {} (name `{}`); the producing \
-                         plan must run before any consumer reads",
-                        handle.id, handle.name
-                    ))
-                })
-            })
-            .into_delta()?;
-        let raw_df = self.session_ctx.read_table(provider).into_delta()?;
-        let projection =
-            build_stamped_logical_projection(&raw_df, handle.schema.as_ref()).into_delta()?;
-        raw_df.select(projection).into_delta()
-    }
-
     /// Drive a combined metadata + data scan and return the data DataFrame.
     ///
-    /// Sugar for `self.drive_ssa_to_dataframe(scan.scan_state_machine_ssa()?)`. The
-    /// returned DataFrame carries the scan's logical schema (column-mapping renames
-    /// + Delta metadata fully applied -- see [`Self::read_relation`]).
-    ///
-    /// Drives the SSA-flavored scan pipeline (kernel-side
-    /// [`Scan::scan_state_machine_ssa`]) -- the legacy registry-based
-    /// [`Scan::scan_state_machine`] is no longer the engine's preferred entry point.
-    /// PR8 will retire the legacy pipeline.
+    /// Sugar for `self.drive_ssa_to_dataframe(scan.scan_state_machine()?)`.
     pub async fn scan_data(&self, scan: &Scan) -> Result<DataFrame, DeltaError> {
-        self.drive_ssa_to_dataframe(scan.scan_state_machine_ssa()?)
-            .await
+        self.drive_ssa_to_dataframe(scan.scan_state_machine()?).await
     }
 
     /// Drive a metadata-only scan and return the live-actions DataFrame.
     ///
-    /// Sugar for `self.drive_ssa_to_dataframe(scan.scan_metadata_state_machine_ssa()?)`.
-    /// The returned DataFrame's rows are the reconciled `add` actions (path /
-    /// size / `partitionValues_parsed` / `deletionVector` / ...). Drives the
-    /// SSA-flavored scan pipeline (kernel-side
-    /// [`Scan::scan_metadata_state_machine_ssa`]).
+    /// Sugar for `self.drive_ssa_to_dataframe(scan.scan_metadata_state_machine()?)`.
     pub async fn scan_metadata(&self, scan: &Scan) -> Result<DataFrame, DeltaError> {
-        self.drive_ssa_to_dataframe(scan.scan_metadata_state_machine_ssa()?)
+        self.drive_ssa_to_dataframe(scan.scan_metadata_state_machine()?)
             .await
     }
 
     /// Drive a Full State Reconstruction and return the reconciled-actions DataFrame.
     ///
-    /// Sugar for `self.drive_ssa_to_dataframe(fsr.state_machine_ssa()?)`. The result
-    /// rows are the dedup'd action union (`Add` / `Remove` / `Metadata` / `Protocol`
-    /// / `Txn` / `CDC` / `DomainMetadata`) that survives `_last_checkpoint`
-    /// resolution plus commit-tail dedup. Useful for snapshot inspection and
-    /// protocol/metadata queries.
-    ///
-    /// Drives the SSA-flavored FSR pipeline (kernel-side
-    /// [`FullState::state_machine_ssa`]) -- the legacy registry-based
-    /// [`FullState::state_machine`] is no longer the engine's preferred entry point.
-    /// PR7 will migrate Scan over the same way and PR8 will delete the legacy
-    /// pipeline.
+    /// Sugar for `self.drive_ssa_to_dataframe(fsr.state_machine()?)`.
     pub async fn full_state(&self, fsr: &FullState) -> Result<DataFrame, DeltaError> {
-        self.drive_ssa_to_dataframe(fsr.state_machine_ssa()?).await
+        self.drive_ssa_to_dataframe(fsr.state_machine()?).await
     }
 
     /// Execute a single [`Step`] against the executor and return the resulting
     /// [`StepResult`]. Used internally by [`Self::drive_to_completion`] and exposed for
-    /// callers (typically tests) that need to drive an individual phase op directly --
-    /// for example, draining a [`Consume`](SinkType::Consume) plan and inspecting
-    /// the [`StepResult`] for its finalized handle.
+    /// callers (typically tests) that need to drive an individual phase op directly.
     pub async fn execute_step(&self, op: Step) -> Result<StepResult, EngineError> {
         self.run_phase(op, Uuid::new_v4(), "standalone", "execute")
             .await
@@ -366,13 +230,6 @@ impl DataFusionExecutor {
         step_name: &'static str,
     ) -> Result<StepResult, EngineError> {
         match op {
-            Step::Plans(plans) => {
-                let state = StepResult::empty();
-                self.run_plans(&plans, &state, sm_id, sm_kind, step_name)
-                    .await
-                    .map_err(EngineError::internal)?;
-                Ok(state)
-            }
             Step::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
             Step::Consume {
                 stmts,
@@ -389,9 +246,7 @@ impl DataFusionExecutor {
     }
 
     /// Compile an SSA [`Step::Consume`] into a DataFusion physical plan and drain it
-    /// through the consume sink. Mirrors the [`SinkType::Consume`] arm of
-    /// [`Self::run_plans`] but skips the relation-registry threading -- SSA plans don't
-    /// reference live relations -- and drains directly.
+    /// through the consume sink.
     #[allow(clippy::too_many_arguments)]
     async fn run_consume(
         &self,
@@ -403,9 +258,7 @@ impl DataFusionExecutor {
         sm_kind: &'static str,
         step_name: &'static str,
     ) -> Result<(), DataFusionError> {
-        let providers = Arc::new(self.providers_lock()?.clone());
         let ctx = CompileContext {
-            relation_providers: providers,
             step_result: Some(state.clone()),
             engine: Arc::clone(&self.engine),
             sm_id,
@@ -418,95 +271,6 @@ impl DataFusionExecutor {
             .create_physical_plan(&df_state.optimize(&logical)?)
             .await?;
         self.drain_consume_sink(physical, sink, &ctx).await
-    }
-
-    /// Walk each plan in order, dispatching on its [`SinkType`]:
-    /// - `Relation` -> compile the upstream to a `LogicalPlan`, wrap in a [`ViewTable`], and
-    ///   register under the handle id. No physical plan or execution.
-    /// - `Load`     -> compile the upstream to a `LogicalPlan`, wrap in a [`LoadTableProvider`]
-    ///   (which captures sink + engine), and register under the sink's output handle id. No
-    ///   physical plan or execution; the provider's `scan()` lowers + streams on first read.
-    /// - `Consume`  -> compile, optimize, lower to a physical plan, and drain through
-    ///   [`Self::drain_consume_sink`] (the only sink with eager side effects).
-    async fn run_plans(
-        &self,
-        plans: &[Plan],
-        state: &StepResult,
-        sm_id: Uuid,
-        sm_kind: &'static str,
-        step_name: &'static str,
-    ) -> Result<(), DataFusionError> {
-        for plan in plans {
-            // Snapshot the live relation registry into the compile context. The map is built
-            // incrementally as plans run, so plan N sees every relation produced by plans 0..N.
-            let providers = Arc::new(self.providers_lock()?.clone());
-            let ctx = CompileContext {
-                relation_providers: providers,
-                step_result: Some(state.clone()),
-                engine: Arc::clone(&self.engine),
-                sm_id,
-                sm_kind,
-                step_name,
-            };
-            let logical = compile_plan_logical(plan, &ctx)?;
-            match &plan.sink {
-                SinkType::Relation(handle) => self.register_view_relation(handle, logical)?,
-                SinkType::Load(sink) => self.register_load_relation(sink, logical, &ctx)?,
-                SinkType::Consume(sink) => {
-                    let df_state = self.session_ctx.state();
-                    let physical = df_state
-                        .create_physical_plan(&df_state.optimize(&logical)?)
-                        .await?;
-                    self.drain_consume_sink(physical, sink, &ctx).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Register `logical` as a [`ViewTable`] under `handle.id`; DataFusion's
-    /// `InlineTableScan` analyzer inlines it into consumer trees so pushdown + CSE cross
-    /// the boundary.
-    fn register_view_relation(
-        &self,
-        handle: &RelationHandle,
-        logical: datafusion_expr::LogicalPlan,
-    ) -> Result<(), DataFusionError> {
-        let provider: Arc<dyn TableProvider> = Arc::new(ViewTable::new(logical, None));
-        self.providers_lock()?.insert(handle.id.clone(), provider);
-        Ok(())
-    }
-
-    /// Bare `Values` upstream + no DV → register an eager [`EagerLoadTableProvider`] that
-    /// produces a single [`DataSourceExec`] (DataFusion's native fan-out / pushdown apply).
-    /// Anything else (non-Values upstream, DV present) → streaming [`LoadTableProvider`].
-    /// On eager-build failure we fall through to streaming so the input still gets a
-    /// diagnostic error from the same code path.
-    fn register_load_relation(
-        &self,
-        sink: &LoadSink,
-        logical: datafusion_expr::LogicalPlan,
-        ctx: &CompileContext,
-    ) -> Result<(), DataFusionError> {
-        let lazy = || -> Result<Arc<dyn TableProvider>, DataFusionError> {
-            Ok(Arc::new(LoadTableProvider::try_new(
-                logical.clone(),
-                Arc::new(sink.clone()),
-                ctx.engine.clone(),
-            )?))
-        };
-        let provider: Arc<dyn TableProvider> = match (&logical, sink.dv_ref.is_none()) {
-            (LogicalPlan::Values(values), true) => {
-                match crate::exec::EagerLoadTableProvider::try_new(sink, values) {
-                    Ok(eager) => Arc::new(eager),
-                    Err(_) => lazy()?,
-                }
-            }
-            _ => lazy()?,
-        };
-        self.providers_lock()?
-            .insert(sink.output_relation.id.clone(), provider);
-        Ok(())
     }
 
     /// Drain `physical` through a
@@ -546,45 +310,3 @@ impl DataFusionExecutor {
     }
 }
 
-/// Bridge `raw_df`'s physical arrow schema to `target`'s logical kernel schema.
-///
-/// Builds one projection [`Expr`] per top-level kernel field by combining:
-///
-/// 1. The recursive rename walker (`build_logical_projection`) which emits
-///    `named_struct(get_field(...))` for nested struct renames and `array_transform(_, lambda)` for
-///    `List<Struct>` element renames.
-/// 2. A per-top-level [`StampFieldUdf`] wrapper that declares the kernel's logical Arrow
-///    [`FieldRef`] (name, datatype, recursive field metadata including `delta.columnMapping.*` /
-///    `parquet.field.id`) on the projection's output schema.
-/// 3. An `Expr::alias(target_name)` so the projection's column name matches the kernel logical name
-///    even for primitive fields (where [`ScalarUDFImpl::return_field_from_args`] discards the
-///    top-level field name per its rustdoc).
-///
-/// Returns one `Expr` per top-level kernel field in declared order, ready to feed
-/// directly to [`DataFrame::select`].
-fn build_stamped_logical_projection(
-    raw_df: &DataFrame,
-    target: &StructType,
-) -> Result<Vec<Expr>, DataFusionError> {
-    let source_schema: &ArrowSchema = raw_df.schema().as_arrow();
-    let rename_exprs = build_logical_projection(source_schema, target)?;
-
-    // Convert the kernel target schema to an arrow schema once so each top-level field
-    // surfaces as a fully-populated `FieldRef` with `delta.columnMapping.*` /
-    // `parquet.field.id` metadata applied recursively (the kernel -> arrow conversion
-    // walks into nested struct / list / map fields and stamps each level).
-    let arrow_target: ArrowSchema = target.try_into_arrow().map_err(|e| {
-        crate::error::plan_compilation(format!(
-            "read_relation: failed to convert kernel target schema to arrow: {e}"
-        ))
-    })?;
-
-    let mut stamped: Vec<Expr> = Vec::with_capacity(rename_exprs.len());
-    for (rename, target_field) in rename_exprs.into_iter().zip(arrow_target.fields().iter()) {
-        let target_field: FieldRef = Arc::clone(target_field);
-        let logical_name = target_field.name().to_string();
-        let stamp = StampFieldUdf::new(target_field).call(rename);
-        stamped.push(stamp.alias(logical_name));
-    }
-    Ok(stamped)
-}

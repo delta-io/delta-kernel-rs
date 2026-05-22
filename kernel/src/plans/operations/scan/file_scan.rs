@@ -1,24 +1,17 @@
-//! Scan-time plan builders and state machines.
+//! Scan-time SSA state machines and the shared data-phase projection helper.
 //!
-//! Hosts the `impl Scan { ... }` block that builds the two-phase scan plans
-//! ([`Scan::build_plans`] = metadata pipeline + optional data phase,
-//! [`Scan::do_data_stage`] = data phase only). All public entry points are coroutine
-//! state machines (`*_state_machine`); there is no sync API surface for scan plan building.
+//! Hosts the `impl Scan { ... }` block that exposes the SSA-flavored coroutine state
+//! machines for metadata-only and combined metadata + data scans. The actual SSA plan
+//! body is built by [`super::ssa_scan::build_scan_ssa`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::action_pair::scan_file_row_pair;
-use super::dedup::scan_file_dedup_key;
-use super::plans::{execute_reconciliation, RECONCILED};
 use super::ssa_scan::build_scan_ssa;
 use crate::delta_error;
-use crate::expressions::{col, ColumnName, Expression, Transform};
+use crate::expressions::{col, Expression, Transform};
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
-use crate::plans::ir::nodes::{DvRef, FileType, RelationHandle, ScanFileColumns};
 use crate::plans::ir::ssa::ResultPlan as SsaResultPlan;
-use crate::plans::ir::{RelationRegistry, ResultPlan};
-use crate::plans::operations::framework::coroutine::context::Context;
 use crate::plans::operations::framework::coroutine::driver::Coroutine;
 use crate::plans::operations::framework::plan_context::Context as SsaContext;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
@@ -27,151 +20,15 @@ use crate::scan::transform_spec::{row_id_coalesce_expr, FieldTransformSpec};
 use crate::scan::Scan;
 use crate::schema::{DataType, MetadataColumnSpec, StructField};
 
-// === Scan-side stage names ================================================================
-//
-// The pipeline shares COMMIT_RAW / COMMIT_DEDUP / CHECKPOINT_TOP / SIDECAR_ACTIONS / RECONCILED
-// with the FSR pipeline via the bare-name convention; only the SM-side terminal names below
-// are scan-specific.
-/// Scan-side metadata terminal: post-reconciliation rows projected to the flat
-/// `scan_file_row_pair` shape. Read by the data phase via `relation_ref(LIVE_ACTIONS)`.
-pub(super) const LIVE_ACTIONS: &str = "live_actions";
-/// Raw per-file rows emitted by the data-phase Load sink before logical projection.
-const DATA_ROWS_RAW: &str = "data_rows_raw";
-/// Final scan-data relation in the scan's logical schema.
-const DATA: &str = "data";
-
-impl Scan {
-    /// Build the scan plans. When `with_data: false`, terminates at [`LIVE_ACTIONS`].
-    /// When `with_data: true`, appends the data phase ([`Self::do_data_stage`]) and
-    /// terminates at `data`.
-    pub(super) async fn build_plans(
-        &self,
-        ctx: &mut Context<'_>,
-        with_data: bool,
-    ) -> Result<ResultPlan, DeltaError> {
-        let stats = self.physical_stats_schema();
-        // The data stage needs the full partition schema (see `data_stage_partition_schema`
-        // doc); the predicate-narrowed `physical_partition_schema()` only works for
-        // metadata-only execution.
-        let parts = if with_data {
-            self.data_stage_partition_schema()
-        } else {
-            self.physical_partition_schema()
-        };
-
-        // === Stage 1-5: shared reconciliation -> RECONCILED ==============================
-        execute_reconciliation(
-            ctx,
-            self.snapshot().as_ref(),
-            &super::action_pair::SCAN_BASE,
-            stats,
-            parts.clone(),
-            Arc::new(scan_file_dedup_key()),
-        )
-        .await?;
-
-        // === Scan-specific terminal projection: RECONCILED -> LIVE_ACTIONS ===============
-        // Project the action_pair-shaped reconciled rows into the flat scan file row.
-        ctx.relation_ref(RECONCILED)?
-            .project_pair(scan_file_row_pair(parts.as_ref()))
-            .into_relation(LIVE_ACTIONS, &mut *ctx)?;
-
-        // === Stage 6 (optional): data phase ===============================================
-        if with_data {
-            self.do_data_stage(ctx, LIVE_ACTIONS)
-        } else {
-            ctx.into_result_plan(LIVE_ACTIONS)
-        }
-    }
-
-    /// Append the data stage: read parquet via Load, project to the scan's logical schema,
-    /// terminate at `data`. `live_actions_name` is the registered name of the materialized
-    /// live-actions relation (typically [`LIVE_ACTIONS`], or the name under which an
-    /// externally-minted handle was adopted in the data-only SM).
-    pub(super) fn do_data_stage(
-        &self,
-        ctx: &mut Context<'_>,
-        live_actions_name: &str,
-    ) -> Result<ResultPlan, DeltaError> {
-        let logical_schema = self.logical_schema().clone();
-        let logical_projection = scan_data_projection(self.state_info())?;
-
-        // Per-file parquet read; broadcasts the file-constant struct and `path` to every
-        // output row of the read.
-        ctx.relation_ref(live_actions_name)?.load(
-            DATA_ROWS_RAW,
-            self.physical_schema().clone(),
-            FileType::Parquet,
-            Some(self.snapshot().table_root().clone()),
-            vec![
-                ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
-                ColumnName::new(["path"]),
-            ],
-            ScanFileColumns {
-                path: ColumnName::new(["path"]),
-                size: Some(ColumnName::new(["size"])),
-                record_count: None,
-            },
-            Some(DvRef::skip(ColumnName::new(["deletionVector"]))),
-            &mut *ctx,
-        )?;
-        // Final projection: physical -> logical. Terminates at `DATA`.
-        ctx.relation_ref(DATA_ROWS_RAW)?
-            .project(logical_projection, logical_schema)
-            .into_result_plan(DATA, &mut *ctx)
-    }
-}
-
 // === SM entry points ======================================================================
 
 impl Scan {
-    /// Coroutine SM for metadata-only scan execution. Terminates at the live-actions
-    /// relation.
-    pub fn scan_metadata_state_machine(&self) -> Result<Coroutine<ResultPlan>, DeltaError> {
-        let scan = self.clone();
-        Coroutine::new("scan_metadata", move |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, "scan"));
-            scan.build_plans(&mut ctx, /* with_data= */ false).await
-        })
-    }
-
-    /// Coroutine SM for data-only scan execution given a materialized
-    /// `live_actions_relation` handle (typically produced by `scan_metadata_state_machine`).
-    /// Adopts the handle under [`LIVE_ACTIONS`] in the new registry, then runs the data
-    /// phase via [`Self::do_data_stage`].
-    pub fn scan_data_from_metadata_state_machine(
-        &self,
-        live_actions_relation: RelationHandle,
-    ) -> Result<Coroutine<ResultPlan>, DeltaError> {
-        let scan = self.clone();
-        Coroutine::new("scan_data", move |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, "scan"));
-            ctx.adopt(LIVE_ACTIONS, live_actions_relation)?;
-            scan.do_data_stage(&mut ctx, LIVE_ACTIONS)
-        })
-    }
-
-    /// Coroutine SM for combined metadata + data scan execution. Terminates at `data`.
-    pub fn scan_state_machine(&self) -> Result<Coroutine<ResultPlan>, DeltaError> {
-        let scan = self.clone();
-        Coroutine::new("scan", move |mut co, sm_id| async move {
-            let mut ctx = Context::new(&mut co, RelationRegistry::new(sm_id, "scan"));
-            scan.build_plans(&mut ctx, /* with_data= */ true).await
-        })
-    }
-
-    /// SSA-flavored coroutine SM for metadata-only scan execution.
+    /// Coroutine SM for metadata-only scan execution.
     ///
-    /// Counterpart to [`Self::scan_metadata_state_machine`] -- runs the same scan
-    /// semantics (live-actions stream after FSR reconciliation + flat
-    /// `scan_file_row` projection) but builds the entire pipeline as a single SSA
-    /// program against the cursor API and yields a single
-    /// [`SsaResultPlan`](crate::plans::ir::ssa::ResultPlan). Engines drive this
-    /// through `drive_ssa_to_dataframe` (no relation registry, no per-stage
-    /// `Step::Plans`).
-    ///
-    /// Both flavors stay live during the migration; PR8 retires the legacy SM.
-    pub fn scan_metadata_state_machine_ssa(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
+    /// Builds the canonical scan pipeline (FSR reconciliation + flat `scan_file_row`
+    /// projection) as a single SSA program against the cursor API and yields a single
+    /// [`SsaResultPlan`]. Engines drive this through `drive_ssa_to_dataframe`.
+    pub fn scan_metadata_state_machine(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
         let scan = self.clone();
         Coroutine::new("scan_metadata_ssa", move |mut co, _sm_id| async move {
             let ctx = SsaContext::new();
@@ -180,13 +37,12 @@ impl Scan {
         })
     }
 
-    /// SSA-flavored coroutine SM for combined metadata + data scan execution.
+    /// Coroutine SM for combined metadata + data scan execution.
     ///
-    /// Counterpart to [`Self::scan_state_machine`]. Pipeline matches the legacy SM:
-    /// shape-resolution yields, then the entire reconciliation + flat scan-file
+    /// Pipeline: shape-resolution yields, then reconciliation + flat scan-file
     /// projection + per-file Load + logical projection are appended into a single
     /// SSA program.
-    pub fn scan_state_machine_ssa(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
+    pub fn scan_state_machine(&self) -> Result<Coroutine<SsaResultPlan>, DeltaError> {
         let scan = self.clone();
         Coroutine::new("scan_ssa", move |mut co, _sm_id| async move {
             let ctx = SsaContext::new();

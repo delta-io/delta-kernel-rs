@@ -168,7 +168,6 @@ impl Context {
                     sink,
                 },
                 step_name,
-                live_relations: Vec::new(),
             })
             .await;
         let step_result = result.map_err(|e| e.into_delta_typed())?;
@@ -199,7 +198,6 @@ impl Context {
             .yield_(StepYield {
                 operation: Step::SchemaQuery(SchemaQueryNode::new(path.into())),
                 step_name,
-                live_relations: Vec::new(),
             })
             .await;
         let step_result = result.map_err(|e| e.into_delta_typed())?;

@@ -1,11 +1,7 @@
-//! Kernel [`delta_kernel::plans::ir::Plan`] → DataFusion [`datafusion_expr::LogicalPlan`]
-//! compilation. Sinks are routed by [`crate::executor::DataFusionExecutor`] (lazy
-//! `Relation` / `Load` providers; eager `Consume`).
+//! Kernel SSA plan -> DataFusion [`datafusion_expr::LogicalPlan`] compilation.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::catalog::TableProvider;
 use datafusion_common::error::DataFusionError;
 use delta_kernel::plans::operations::framework::step_result::StepResult;
 use delta_kernel::Engine;
@@ -16,24 +12,17 @@ mod json_parse;
 pub mod logical;
 pub mod stamp_udf;
 
-pub use logical::{compile_plan_logical, compile_ssa};
+pub use logical::compile_ssa;
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
 #[derive(Clone)]
 pub struct CompileContext {
-    /// Relations available to [`delta_kernel::plans::ir::DeclarativePlanNode::RelationRef`]
-    /// leaves, keyed by [`delta_kernel::plans::ir::nodes::RelationHandle`]'s `id` field. The
-    /// executor passes a snapshot of its live registry here at compile time, so every plan in
-    /// a batch sees the relations produced by its predecessors. An empty map is fine when the
-    /// plan being compiled does not reference any relations (or for inspection-only paths like
-    /// benchmark physical-plan dumps).
-    pub relation_providers: Arc<HashMap<String, Arc<dyn TableProvider>>>,
     /// Active phase's [`StepResult`] (`Some` while a phase is executing). `Consume`
     /// drains submit their finalized handles here; `None` means the executor is not inside a
     /// phase and any consume sink encountered surfaces an internal error.
     pub step_result: Option<StepResult>,
     /// Kernel [`Engine`] for sinks that delegate IO to parquet/json handlers
-    /// ([`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load)).
+    /// (`Node::Load`).
     pub engine: Arc<dyn Engine>,
     /// Owning state machine's identity. Stamped onto any `Consume` handle drained during the
     /// phase. Synthesized to `("standalone", "execute")` with a fresh `sm_id` for tests and
@@ -46,12 +35,8 @@ pub struct CompileContext {
 impl CompileContext {
     /// Build a context without an active phase state. Useful for inspection-only paths (e.g.
     /// benchmark plan printers) that do not execute a plan.
-    pub fn new(
-        relation_providers: Arc<HashMap<String, Arc<dyn TableProvider>>>,
-        engine: Arc<dyn Engine>,
-    ) -> Self {
+    pub fn new(engine: Arc<dyn Engine>) -> Self {
         Self {
-            relation_providers,
             step_result: None,
             engine,
             sm_id: Uuid::new_v4(),

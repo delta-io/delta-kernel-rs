@@ -1,12 +1,11 @@
-//! SSA-flavored counterpart of [`super::plans::register_reconciliation`].
+//! Shared FSR / Scan reconciliation pipeline (SSA flavor).
 //!
-//! Re-implements the FSR / Scan reconciliation pipeline against the new
-//! [`super::super::framework::plan_context`] (`Context` / `Cursor`) API and SSA IR. The legacy
-//! [`super::plans`] module is kept intact for the not-yet-migrated Scan path; this module is
-//! consumed by [`super::full_state::FullState::state_machine_ssa`] for now and will be the
-//! sole reconciliation backend after PR7 migrates Scan.
+//! Builds the canonical *window-on-commits + anti-join-on-checkpoint* pipeline against the
+//! [`super::super::framework::plan_context`] (`Context` / `Cursor`) API and SSA IR. Consumed
+//! by [`super::full_state::FullState::state_machine_ssa`] and
+//! [`super::ssa_scan::build_scan_ssa`].
 //!
-//! Pipeline shape (verbatim with the legacy implementation):
+//! Pipeline shape:
 //!
 //! ```text
 //! commit_load (Values -> Load)
@@ -23,22 +22,27 @@
 
 use std::sync::Arc;
 
+use url::Url;
+
 use super::action_pair::{augment_add, Pair, JOIN_KEY_FIELD, VERSION_FIELD};
 use super::dedup::FSR_JOIN_KEY_COL;
-use super::plans::{commit_cover_rows, default_scan_file_columns, retention_timestamps};
 use super::schemas::action_schema;
+use crate::action_reconciliation::{
+    calculate_transaction_expiration_timestamp, deleted_file_retention_timestamp_with_time,
+};
 use crate::actions::{Sidecar, SIDECAR_NAME};
 use crate::expressions::{col, ColumnName, Expression, ExpressionRef, Predicate, Scalar};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::plans::errors::{DeltaError, DeltaErrorCode};
+use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{FileFormat, FileType, ScanFileColumns};
 use crate::plans::kernel_consumers::SidecarCollector;
 use crate::plans::operations::framework::coroutine::context::StepCo;
 use crate::plans::operations::framework::plan_context::{Context, Cursor, LoadSpec};
 use crate::schema::{arc_schema, ArrayType, DataType, SchemaRef, StructField, ToSchema};
 use crate::snapshot::Snapshot;
-use crate::{delta_error, FileMeta};
+use crate::utils::current_time_duration;
+use crate::{delta_error, FileMeta, Version};
 
 // ============================================================================
 // Shape resolution (SSA flavor)
@@ -401,8 +405,7 @@ pub(super) fn build_reconciliation_ssa(
 }
 
 /// Async wrapper: resolve the scan shape (yielding `SchemaQuery` / `Consume` phases as
-/// needed) and then delegate to [`build_reconciliation_ssa`]. Mirrors the legacy
-/// [`super::plans::execute_reconciliation`] entry point.
+/// needed) and then delegate to [`build_reconciliation_ssa`].
 pub(super) async fn execute_reconciliation_ssa(
     ctx: &Context,
     co: &mut StepCo,
@@ -457,10 +460,7 @@ fn checkpoint_manifest_scan_schema() -> SchemaRef {
     arc_schema(fields)
 }
 
-/// `{path, size, version?}` Values upstream schema for commit_load. Mirrors the legacy
-/// helper in [`super::plans::path_size_schema`] verbatim; duplicated here so the SSA
-/// module does not depend on `pub(super)` items declared inside the legacy plans
-/// module that may be deleted after PR8.
+/// `{path, size, version?}` Values upstream schema for commit_load.
 fn path_size_schema(with_version: bool) -> SchemaRef {
     let mut fields = vec![
         StructField::not_null("path", DataType::STRING),
@@ -472,9 +472,77 @@ fn path_size_schema(with_version: bool) -> SchemaRef {
     arc_schema(fields)
 }
 
-/// Bridge to [`super::retention::retention_filter`] returning a [`Predicate`] (legacy
-/// callers wrap in `Arc<Expression>` via `.into()`; SSA cursors take `Arc<Predicate>`
-/// directly).
+/// Bridge to [`super::retention::retention_filter`] returning a [`Predicate`].
 fn retention_filter_predicate(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
     super::retention::retention_filter(min_file_ts, txn_expiry)
+}
+
+// ============================================================================
+// Shared scan-pipeline helpers (moved from the deleted legacy `plans` module)
+// ============================================================================
+
+/// One literal row describing a Delta JSON commit file. Public so external tools that
+/// consume the FSR commit file row layout can refer to it by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitFileMeta {
+    pub path: String,
+    pub size: i64,
+    pub version: Version,
+}
+
+/// File-meta column hints shared by every Load: `path` column, optional `size` column,
+/// no record-count column.
+pub(super) fn default_scan_file_columns() -> ScanFileColumns {
+    ScanFileColumns {
+        path: ColumnName::new(["path"]),
+        size: Some(ColumnName::new(["size"])),
+        record_count: None,
+    }
+}
+
+/// Resolve the (deleted-file retention, txn expiry) timestamps for `snapshot`.
+pub(super) fn retention_timestamps(snapshot: &Snapshot) -> Result<(i64, Option<i64>), DeltaError> {
+    let now = current_time_duration().map_err(|e| e.into_delta_default())?;
+    let min_file_ts = deleted_file_retention_timestamp_with_time(
+        snapshot.table_properties().deleted_file_retention_duration,
+        now,
+    )
+    .map_err(|e| e.into_delta_default())?;
+    let txn_expiry = calculate_transaction_expiration_timestamp(snapshot.table_properties())
+        .map_err(|e| e.into_delta_default())?;
+    Ok((min_file_ts, txn_expiry))
+}
+
+/// Materialize the minimal set of commit / compaction file rows that cover the log segment,
+/// preferring compactions over the commits they subsume. Delegates the cover-selection logic
+/// to [`crate::log_segment::LogSegment::find_commit_cover`] and re-parses each file's
+/// [`ParsedLogPath`] to recover the version.
+pub(super) fn commit_cover_rows(seg: &LogSegment) -> Result<Vec<CommitFileMeta>, DeltaError> {
+    seg.find_commit_cover()
+        .into_iter()
+        .map(|file| {
+            let version = ParsedLogPath::try_from(file.clone())
+                .map_err(|e| e.into_delta_default())?
+                .ok_or_else(|| {
+                    delta_error!(
+                        DeltaErrorCode::DeltaStateRecoverError,
+                        "commit_cover_rows: cover yielded a non-log-path file: {}",
+                        file.location,
+                    )
+                })?
+                .version;
+            Ok(CommitFileMeta {
+                path: path_under_log_root(&seg.log_root, &file.location)?,
+                size: file.size as i64,
+                version,
+            })
+        })
+        .collect()
+}
+
+fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError> {
+    let base = log_root.path().trim_end_matches('/');
+    let full = file.path();
+    let suffix = full.strip_prefix(base).unwrap_or(full);
+    Ok(suffix.trim_start_matches('/').to_string())
 }
