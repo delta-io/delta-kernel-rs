@@ -304,24 +304,28 @@ impl DataFusionExecutor {
 
     /// Drive a combined metadata + data scan and return the data DataFrame.
     ///
-    /// Sugar for `self.drive_to_dataframe(scan.scan_state_machine()?)`. The returned
-    /// DataFrame carries the scan's logical schema (column-mapping renames + Delta
-    /// metadata fully applied -- see [`Self::read_relation`]).
+    /// Sugar for `self.drive_ssa_to_dataframe(scan.scan_state_machine_ssa()?)`. The
+    /// returned DataFrame carries the scan's logical schema (column-mapping renames
+    /// + Delta metadata fully applied -- see [`Self::read_relation`]).
+    ///
+    /// Drives the SSA-flavored scan pipeline (kernel-side
+    /// [`Scan::scan_state_machine_ssa`]) -- the legacy registry-based
+    /// [`Scan::scan_state_machine`] is no longer the engine's preferred entry point.
+    /// PR8 will retire the legacy pipeline.
     pub async fn scan_data(&self, scan: &Scan) -> Result<DataFrame, DeltaError> {
-        self.drive_to_dataframe(scan.scan_state_machine()?).await
+        self.drive_ssa_to_dataframe(scan.scan_state_machine_ssa()?)
+            .await
     }
 
     /// Drive a metadata-only scan and return the live-actions DataFrame.
     ///
-    /// Sugar for `self.drive_to_dataframe(scan.scan_metadata_state_machine()?)`. The
-    /// returned DataFrame's rows are the reconciled `add` actions (path / size /
-    /// `partitionValues_parsed` / `deletionVector` / ...). Callers wanting to inspect
-    /// or cache the file set before opening the data scan should use this directly and
-    /// feed the resulting relation to
-    /// `scan.scan_data_from_metadata_state_machine(handle)` via
-    /// [`Self::drive_to_dataframe`].
+    /// Sugar for `self.drive_ssa_to_dataframe(scan.scan_metadata_state_machine_ssa()?)`.
+    /// The returned DataFrame's rows are the reconciled `add` actions (path /
+    /// size / `partitionValues_parsed` / `deletionVector` / ...). Drives the
+    /// SSA-flavored scan pipeline (kernel-side
+    /// [`Scan::scan_metadata_state_machine_ssa`]).
     pub async fn scan_metadata(&self, scan: &Scan) -> Result<DataFrame, DeltaError> {
-        self.drive_to_dataframe(scan.scan_metadata_state_machine()?)
+        self.drive_ssa_to_dataframe(scan.scan_metadata_state_machine_ssa()?)
             .await
     }
 
