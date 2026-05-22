@@ -25,8 +25,7 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
         .next()
         .ok_or_else(|| Error::generic("CRC file read returned no data"))??;
     tracing::Span::current().record("bytes_read", data.len() as u64);
-    let crc: Crc = serde_json::from_slice(&data)?;
-    Ok(crc)
+    Crc::try_from_json_bytes(&data, crc_path.version)
 }
 
 #[cfg(test)]

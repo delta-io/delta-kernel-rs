@@ -13,6 +13,7 @@ use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
+use crate::Version;
 
 /// CRC-relevant changes aggregated over commits `(X, Y]`.
 #[derive(Debug, Clone, Default)]
@@ -68,6 +69,7 @@ impl CrcDelta {
                 .ok()
         });
         Some(Crc {
+            version: 0,
             file_stats_state: FileStatsState::Complete(FileStats {
                 num_files: self.file_stats.net_files,
                 table_size_bytes: self.file_stats.net_bytes,
@@ -85,14 +87,21 @@ impl CrcDelta {
 
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
-    /// Apply a commit delta.
+    /// Apply a commit delta and advance to `new_version`.
+    ///
     /// - Protocol / metadata: replaced when present in the delta, kept otherwise.
     /// - ICT: unconditional replace; the delta carries ICT at `Y` (whether `Some` or `None`).
     /// - Domain metadata: tombstones (`is_removed()`) drop the key from the base map; all others
     ///   upsert by domain. Set transactions: upsert by app_id. The `Complete`/`Partial` variant is
     ///   preserved in both cases.
     /// - File stats: governed by the [`FileStatsState`] state machine.
-    pub(crate) fn apply(&mut self, delta: CrcDelta) {
+    pub(crate) fn apply(&mut self, delta: CrcDelta, new_version: Version) {
+        debug_assert!(
+            new_version > self.version,
+            "Crc::apply must advance version: self.version={}, new_version={}",
+            self.version,
+            new_version
+        );
         // Protocol and metadata: replace if present.
         if let Some(p) = delta.protocol {
             self.protocol = p;
@@ -132,6 +141,8 @@ impl Crc {
             &delta.file_stats,
             delta.is_incremental_safe,
         );
+
+        self.version = new_version;
     }
 }
 
@@ -289,23 +300,25 @@ mod tests {
     #[test]
     fn test_apply_updates_file_stats() {
         let mut crc = base_crc();
-        crc.apply(write_delta(3, 600));
+        crc.apply(write_delta(3, 600), 1);
         let stats = crc.file_stats().unwrap();
         assert_eq!(stats.num_files(), 13); // 10 + 3
         assert_eq!(stats.table_size_bytes(), 1600); // 1000 + 600
         assert!(crc.file_stats_state.is_complete());
+        assert_eq!(crc.version, 1);
     }
 
     /// Applies multiple commit deltas sequentially.
     #[test]
     fn test_apply_multiple_deltas() {
         let mut crc = base_crc();
-        crc.apply(write_delta(3, 600));
-        crc.apply(write_delta(-2, -400));
+        crc.apply(write_delta(3, 600), 1);
+        crc.apply(write_delta(-2, -400), 2);
         let stats = crc.file_stats().unwrap();
         assert_eq!(stats.num_files(), 11); // 10 + 3 - 2
         assert_eq!(stats.table_size_bytes(), 1200); // 1000 + 600 - 400
         assert!(crc.file_stats_state.is_complete());
+        assert_eq!(crc.version, 2);
     }
 
     #[test]
@@ -315,7 +328,7 @@ mod tests {
             is_incremental_safe: false,
             ..write_delta(1, 100)
         };
-        crc.apply(unsafe_change);
+        crc.apply(unsafe_change, 1);
         assert!(crc.file_stats_state.is_indeterminate());
     }
 
@@ -326,12 +339,13 @@ mod tests {
             is_incremental_safe: false,
             ..write_delta(1, 100)
         };
-        crc.apply(unsafe_change);
+        crc.apply(unsafe_change, 1);
         assert!(crc.file_stats_state.is_indeterminate());
 
-        // Subsequent safe op doesn't recover the state.
-        crc.apply(write_delta(5, 500));
+        // Subsequent safe op doesn't recover the state. Version still advances.
+        crc.apply(write_delta(5, 500), 2);
         assert!(crc.file_stats_state.is_indeterminate());
+        assert_eq!(crc.version, 2);
     }
 
     // ===== apply: non-file-stats field updates =====
@@ -350,7 +364,7 @@ mod tests {
             protocol: Some(new_protocol.clone()),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        crc.apply(delta, 1);
         assert_eq!(crc.protocol, new_protocol);
         assert_eq!(crc.metadata, Metadata::default()); // unchanged
     }
@@ -373,7 +387,7 @@ mod tests {
             ]),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        crc.apply(delta, 1);
 
         // Bind the inner map AND panic if the variant flipped during apply.
         let map = match &crc.domain_metadata_state {
@@ -394,7 +408,7 @@ mod tests {
             in_commit_timestamp: Some(9999),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        crc.apply(delta, 1);
         assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
     }
 
@@ -406,7 +420,7 @@ mod tests {
             in_commit_timestamp: None,
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        crc.apply(delta, 1);
         assert_eq!(crc.in_commit_timestamp_opt, None);
     }
 
@@ -433,6 +447,7 @@ mod tests {
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         let stats = crc.file_stats().unwrap();
+        assert_eq!(crc.version, 0);
         assert_eq!(crc.protocol, protocol);
         assert_eq!(crc.metadata, metadata);
         assert_eq!(stats.num_files(), 5);
@@ -517,7 +532,7 @@ mod tests {
             ]),
             ..write_delta(0, 0)
         };
-        crc.apply(delta);
+        crc.apply(delta, 1);
 
         let map = match &crc.set_transaction_state {
             SetTransactionState::Complete(m) if was_complete => m,
@@ -624,7 +639,7 @@ mod tests {
     ) {
         let mut crc = base_crc_with_histogram(base);
         let delta = write_delta_with_histograms(add, remove);
-        crc.apply(delta);
+        crc.apply(delta, 1);
 
         let stats = crc.file_stats().unwrap();
         let hist = stats.file_size_histogram().unwrap();
@@ -651,7 +666,7 @@ mod tests {
             is_incremental_safe: true,
             ..Default::default()
         };
-        crc.apply(delta);
+        crc.apply(delta, 1);
         let stats = crc.file_stats().unwrap();
         assert!(
             stats.file_size_histogram().is_none(),
@@ -666,7 +681,7 @@ mod tests {
             is_incremental_safe: false,
             ..write_delta(1, 100)
         };
-        crc.apply(unsafe_delta);
+        crc.apply(unsafe_delta, 1);
         // Indeterminate has no histogram field; the histogram data is gone.
         assert!(crc.file_stats_state.is_indeterminate());
         assert!(crc.file_stats().is_none());
@@ -742,7 +757,7 @@ mod tests {
             ..Default::default()
         };
 
-        crc.apply(delta);
+        crc.apply(delta, 1);
 
         // Histogram should be preserved (boundaries match)
         let stats = crc.file_stats().unwrap();

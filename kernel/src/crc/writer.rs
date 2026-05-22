@@ -64,10 +64,10 @@ mod tests {
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
 
-    fn writer_test_env() -> (SyncEngine, ParsedLogPath) {
+    fn writer_test_env(version: u64) -> (SyncEngine, ParsedLogPath) {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let table_root = Url::parse("memory:///test_table/").unwrap();
-        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
         (engine, crc_path)
     }
 
@@ -127,20 +127,25 @@ mod tests {
     fn test_serde_round_trip() {
         let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         let json_bytes = serde_json::to_vec(&crc).unwrap();
-        let round_tripped: Crc = serde_json::from_slice(&json_bytes).unwrap();
+        let round_tripped = Crc::try_from_json_bytes(&json_bytes, crc.version).unwrap();
 
         assert_eq!(round_tripped, crc);
     }
 
-    #[test]
-    fn test_write_then_read_crc_file() {
-        let (engine, crc_path) = writer_test_env();
-        let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
+    #[rstest]
+    #[case(0)]
+    #[case(7)]
+    #[case(1_000_000)]
+    fn test_write_then_read_crc_file_round_trips_version_from_filename(#[case] version: u64) {
+        let (engine, crc_path) = writer_test_env(version);
+        let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
+        crc.version = version;
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
         let read_back = try_read_crc_file(&engine, &crc_path).unwrap();
         assert_eq!(read_back, crc);
+        assert_eq!(read_back.version, version);
     }
 
     /// Verify JSON content produced by CRC serialization via serde_json::Value comparison.
@@ -221,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_write_crc_file_already_exists() {
-        let (engine, crc_path) = writer_test_env();
+        let (engine, crc_path) = writer_test_env(0);
         let crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
@@ -233,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported() {
-        let (engine, crc_path) = writer_test_env();
+        let (engine, crc_path) = writer_test_env(0);
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         crc.file_stats_state = FileStatsState::Indeterminate;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
@@ -249,7 +254,7 @@ mod tests {
         #[case] ict_enabled: bool,
         #[values(false, true)] ict_value_present: bool,
     ) {
-        let (engine, crc_path) = writer_test_env();
+        let (engine, crc_path) = writer_test_env(0);
 
         let mut crc = test_crc(ict_supported, ict_enabled);
         if !ict_value_present {

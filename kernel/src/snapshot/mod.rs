@@ -590,7 +590,7 @@ impl Snapshot {
             .get_if_loaded_at_version(self.version())
             .map(|base| {
                 let mut crc = base.as_ref().clone();
-                crc.apply(crc_delta);
+                crc.apply(crc_delta, new_version);
                 crc
             });
 
