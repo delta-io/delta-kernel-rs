@@ -1046,6 +1046,57 @@ mod tests {
         }
     }
 
+    /// Verifies `nearest_timestamp` is populated on `TimestampOutOfRange`. Covers
+    /// the three reachable populate sites: linear file-mod search out-of-range,
+    /// ICT binary-search out-of-range, and the snapshot short-circuit.
+    #[rstest::rstest]
+    // Linear file-mod GLB: timestamp below earliest commit on the standard table.
+    // nearest = commits[0].last_modified = 50.
+    #[case::linear_glb_below_earliest(
+        &[(50, None), (150, None), (250, None), (350, Some(300)), (450, Some(400))],
+        Some(3),
+        0,
+        Bound::GreatestLower,
+        Some(50),
+    )]
+    // Snapshot short-circuit LUB: timestamp above the snapshot's ICT (snap_ts = 400).
+    #[case::short_circuit_lub_after_snapshot(
+        &[(50, None), (150, None), (250, None), (350, Some(300)), (450, Some(400))],
+        Some(3),
+        1000,
+        Bound::LeastUpper,
+        Some(400),
+    )]
+    // ICT binary-search GLB: timestamp below earliest ICT on an ICT-from-creation
+    // table. nearest = ICT(v0) = 100.
+    #[case::ict_glb_below_earliest(
+        &[(0, Some(100)), (0, Some(200)), (0, Some(300))],
+        Some(0),
+        50,
+        Bound::GreatestLower,
+        Some(100),
+    )]
+    #[tokio::test]
+    async fn test_timestamp_out_of_range_nearest_timestamp(
+        #[case] timestamps: &[(Timestamp, Option<Timestamp>)],
+        #[case] ict_enablement: Option<Version>,
+        #[case] timestamp: Timestamp,
+        #[case] bound: Bound,
+        #[case] expected_nearest: Option<Timestamp>,
+    ) {
+        let (_table, engine, snapshot, _log_segment) =
+            build_test_snapshot(timestamps, ict_enablement, None).await;
+
+        let err = timestamp_to_version(&snapshot, &engine, timestamp, bound).unwrap_err();
+        let LogHistoryError::TimestampOutOfRange {
+            nearest_timestamp, ..
+        } = err
+        else {
+            panic!("expected TimestampOutOfRange, got {err:?}");
+        };
+        assert_eq!(nearest_timestamp, expected_nearest);
+    }
+
     /// ICT enabled at v3 but v4 is missing its ICT timestamp (error case).
     /// Table: v0=50, v1=150, v2=250 (file mod), v3=300 (ICT), v4=450 (missing ICT)
     #[tokio::test]
