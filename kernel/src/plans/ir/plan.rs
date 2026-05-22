@@ -25,14 +25,11 @@
 //! never any counter state.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use url::Url;
-
-use super::nodes::{DvRef, FileType, ScanFileColumns};
-use crate::expressions::{ColumnName, Expression, Predicate, Scalar};
-use crate::schema::SchemaRef;
-use crate::FileMeta;
+use super::nodes::{
+    EquiJoinNode, FilterNode, ListFilesNode, LoadNode, MaxByVersionNode, ProjectNode, ScanNode,
+    UnionNode, ValuesNode,
+};
 
 // ============================================================================
 // Refs and plan nodes
@@ -136,78 +133,25 @@ pub enum JoinKind {
 
 /// Plan node operator kinds.
 ///
-/// Sources have zero inputs; transforms have one or more (per-variant doc).
-/// Schemas are stored on variants where the caller declares them (`Scan`,
-/// `Values`, `Load`); for transforms the SSA builder derives the output schema
-/// from inputs and parameters.
+/// Each variant wraps a single payload struct defined in [`super::nodes`] that carries
+/// the variant's parameters verbatim. Sources have zero inputs; transforms have one or
+/// more (per-payload doc). Output schemas are stored on the payload structs of variants
+/// where the caller declares them (`Scan`, `Values`, `Load`, `Project`); for the rest
+/// the SSA builder derives the output schema from inputs and parameters.
 #[derive(Debug, Clone)]
 pub enum NodeKind {
     // === Sources (0 inputs) ==================================================
-    /// List files under a storage prefix. Output is a canonical file-listing
-    /// schema (path / size / modificationTime / etc.).
-    ListFiles { start_from: Url },
-
-    /// Read `files` of the given [`FileType`] into row batches matching `schema`.
-    Scan {
-        file_type: FileType,
-        files: Vec<FileMeta>,
-        schema: SchemaRef,
-    },
-
-    /// Inline literal rows. `rows[i].len() == schema.fields().count()` per row.
-    Values {
-        schema: SchemaRef,
-        rows: Vec<Vec<Scalar>>,
-    },
+    ListFiles(ListFilesNode),
+    Scan(ScanNode),
+    Values(ValuesNode),
 
     // === Transforms (1+ inputs) ==============================================
-    /// Project the single input through `named_exprs`, producing rows of
-    /// `output_schema`. The schema is supplied by the SSA builder (either
-    /// inferred for narrow projections via the kernel's expression-type
-    /// inference, or declared explicitly via
-    /// [`PlanBuilder::project_with_schema`](crate::plans::state_machines::framework::plan_context::PlanBuilder::project_with_schema)
-    /// when inference is insufficient). Engines compile against the declared
-    /// schema directly and do not re-derive it from the expressions.
-    Project {
-        named_exprs: Vec<(String, Arc<Expression>)>,
-        output_schema: SchemaRef,
-    },
-
-    /// Keep input rows where `predicate` evaluates true (SQL null semantics).
-    /// Output schema is the input schema unchanged.
-    Filter { predicate: Arc<Predicate> },
-
-    /// Concatenate N inputs (`inputs.len() >= 1`). All input schemas must agree.
-    /// `ordered=true` preserves child order; `ordered=false` permits reordering.
-    Union { ordered: bool },
-
-    /// File-reader transform. Each input row carries a path (under
-    /// `file_meta.path`); the engine opens the resolved file as `file_type`,
-    /// reads `file_schema` columns, and broadcasts each upstream row's
-    /// `passthrough_columns` onto every emitted file row.
-    Load {
-        file_schema: SchemaRef,
-        file_type: FileType,
-        base_url: Option<Url>,
-        passthrough_columns: Vec<ColumnName>,
-        file_meta: ScanFileColumns,
-        dv_ref: Option<DvRef>,
-    },
-
-    /// "Top 1 per group, ordered by version desc" -- a specialized aggregate.
-    /// Output schema is `group_by` exprs (with inferred types) followed by the
-    /// named `value_columns` lifted from input.
-    MaxByVersion {
-        group_by: Vec<Arc<Expression>>,
-        version_column: Arc<Expression>,
-        value_columns: Vec<String>,
-    },
-
-    /// Equi-join two inputs (`inputs.len() == 2`, convention `[left, right]`).
-    EquiJoin {
-        kind: JoinKind,
-        key_pairs: Vec<(Arc<Expression>, Arc<Expression>)>,
-    },
+    Project(ProjectNode),
+    Filter(FilterNode),
+    Union(UnionNode),
+    Load(LoadNode),
+    MaxByVersion(MaxByVersionNode),
+    EquiJoin(EquiJoinNode),
 }
 
 // ============================================================================
@@ -216,9 +160,11 @@ pub enum NodeKind {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::expressions::col;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::expressions::{col, Expression, Predicate};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
 
     fn schema() -> SchemaRef {
         Arc::new(StructType::try_new(vec![StructField::nullable("x", DataType::INTEGER)]).unwrap())
@@ -226,10 +172,10 @@ mod tests {
 
     fn values_node(output: u32) -> PlanNode {
         PlanNode {
-            kind: NodeKind::Values {
+            kind: NodeKind::Values(ValuesNode {
                 schema: schema(),
                 rows: vec![],
-            },
+            }),
             inputs: vec![],
             output: Ref(output),
         }
@@ -237,7 +183,7 @@ mod tests {
 
     fn filter_node(predicate: Arc<Predicate>, input: Ref, output: u32) -> PlanNode {
         PlanNode {
-            kind: NodeKind::Filter { predicate },
+            kind: NodeKind::Filter(FilterNode { predicate }),
             inputs: vec![input],
             output: Ref(output),
         }
@@ -252,7 +198,7 @@ mod tests {
         };
         assert!(matches!(
             plan.node(Ref(0)).unwrap().kind,
-            NodeKind::Values { .. }
+            NodeKind::Values(_)
         ));
         assert!(plan.node(Ref(99)).is_none());
     }
@@ -272,10 +218,10 @@ mod tests {
                 filter_node(Arc::new(col("x").is_null()), src, dead.0),
                 filter_node(Arc::new(col("x").is_not_null()), src, kept.0),
                 PlanNode {
-                    kind: NodeKind::Project {
+                    kind: NodeKind::Project(ProjectNode {
                         named_exprs: vec![("y".to_string(), Arc::new(Expression::column(["x"])))],
                         output_schema: schema(),
-                    },
+                    }),
                     inputs: vec![dead],
                     output: Ref(dead2.0),
                 },
@@ -298,13 +244,13 @@ mod tests {
                 values_node(left.0),
                 values_node(right.0),
                 PlanNode {
-                    kind: NodeKind::EquiJoin {
+                    kind: NodeKind::EquiJoin(EquiJoinNode {
                         kind: JoinKind::Inner,
                         key_pairs: vec![(
                             Arc::new(Expression::column(["x"])),
                             Arc::new(Expression::column(["x"])),
                         )],
-                    },
+                    }),
                     inputs: vec![left, right],
                     output: joined,
                 },

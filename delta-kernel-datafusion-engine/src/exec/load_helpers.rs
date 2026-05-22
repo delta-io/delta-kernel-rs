@@ -32,7 +32,7 @@ use delta_kernel::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef,
 };
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
+use delta_kernel::plans::ir::nodes::{FileType, LoadNode};
 use delta_kernel::Engine;
 use parquet::arrow::RowNumber;
 use roaring::RoaringTreemap;
@@ -46,23 +46,23 @@ const DEFAULT_OPENER_BATCH_SIZE: usize = 8192;
 
 const ROW_NUMBER_COL: &str = "_row_number";
 
-/// Resolve a `LoadSink`'s `base_url`. Scan-emitted plans always set it; the runtime check
+/// Resolve a `LoadNode`'s `base_url`. Scan-emitted plans always set it; the runtime check
 /// only catches IR-level misuse.
-pub(crate) fn sink_base_url(sink: &LoadSink) -> Result<&Url, DataFusionError> {
-    sink.base_url
+pub(crate) fn load_base_url(node: &LoadNode) -> Result<&Url, DataFusionError> {
+    node.base_url
         .as_ref()
-        .ok_or_else(|| crate::error::plan_compilation("LoadSink.base_url must be set"))
+        .ok_or_else(|| crate::error::plan_compilation("LoadNode.base_url must be set"))
 }
 
-/// Join `path_str` onto the sink's `base_url`.
+/// Join `path_str` onto the load node's `base_url`.
 pub(crate) fn resolve_file_location(
-    sink: &LoadSink,
+    node: &LoadNode,
     path_str: &str,
 ) -> Result<Url, DataFusionError> {
-    let base = sink_base_url(sink)?;
+    let base = load_base_url(node)?;
     base.join(path_str.trim()).map_err(|e| {
         crate::error::plan_compilation(format!(
-            "Load sink could not join base_url `{base}` with path `{path_str}`: {e}"
+            "LoadNode could not join base_url `{base}` with path `{path_str}`: {e}"
         ))
     })
 }
@@ -108,23 +108,23 @@ pub(crate) struct RowInputs {
 }
 
 /// Extract one upstream row into a [`RowInputs`]. `projected_passthrough` is the precomputed
-/// set of `sink.passthrough_columns` indices to materialize, in projected order.
+/// set of `node.passthrough_columns` indices to materialize, in projected order.
 pub(crate) fn extract_row_inputs(
     batch: &RecordBatch,
     row: usize,
-    sink: &LoadSink,
+    node: &LoadNode,
     projected_passthrough: &[usize],
 ) -> Result<RowInputs, DataFusionError> {
-    let path_cn = &sink.file_meta.path;
+    let path_cn = &node.file_meta.path;
     let path_arr = extract_column_array(batch, path_cn)?;
     if path_arr.is_null(row) {
         return Err(crate::error::plan_compilation(format!(
-            "Load sink path column `{path_cn}` was NULL at upstream row {row}"
+            "LoadNode path column `{path_cn}` was NULL at upstream row {row}"
         )));
     }
     // Path columns are always Utf8 per kernel's scan_live_actions_schema.
-    let url = resolve_file_location(sink, path_arr.as_string::<i32>().value(row))?;
-    let size = match sink.file_meta.size.as_ref() {
+    let url = resolve_file_location(node, path_arr.as_string::<i32>().value(row))?;
+    let size = match node.file_meta.size.as_ref() {
         Some(sz_cn) => {
             let arr = extract_column_array(batch, sz_cn)?;
             if arr.is_null(row) {
@@ -135,11 +135,11 @@ pub(crate) fn extract_row_inputs(
         }
         None => 0,
     };
-    let dv_descriptor = read_optional_dv_descriptor(batch, sink, row)?;
+    let dv_descriptor = read_optional_dv_descriptor(batch, node, row)?;
     let partition_values = projected_passthrough
         .iter()
         .map(|&i| {
-            let cn = &sink.passthrough_columns[i];
+            let cn = &node.passthrough_columns[i];
             let arr = extract_column_array(batch, cn)?;
             ScalarValue::try_from_array(arr.as_ref(), row)
         })
@@ -153,14 +153,14 @@ pub(crate) fn extract_row_inputs(
 }
 
 /// Read the optional per-row [`DeletionVectorDescriptor`] from `batch`. Returns `None` when
-/// `sink.dv_ref` is unset or the row's DV column is NULL. Field types are fixed by kernel's
+/// `node.dv_ref` is unset or the row's DV column is NULL. Field types are fixed by kernel's
 /// [`DeletionVectorDescriptor::to_schema()`] so we downcast directly via [`AsArray`].
 fn read_optional_dv_descriptor(
     batch: &RecordBatch,
-    sink: &LoadSink,
+    node: &LoadNode,
     row: usize,
 ) -> Result<Option<DeletionVectorDescriptor>, DataFusionError> {
-    let Some(ref dv_cn) = sink.dv_ref else {
+    let Some(ref dv_cn) = node.dv_ref else {
         return Ok(None);
     };
     let arr = extract_column_array(batch, &dv_cn.column)?;
@@ -169,7 +169,7 @@ fn read_optional_dv_descriptor(
     }
     let sa = arr.as_struct_opt().ok_or_else(|| {
         crate::error::internal_error(format!(
-            "Load sink dv_ref column `{}` must be a struct matching DeletionVectorDescriptor",
+            "LoadNode dv_ref column `{}` must be a struct matching DeletionVectorDescriptor",
             dv_cn.column
         ))
     })?;

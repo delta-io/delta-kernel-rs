@@ -21,12 +21,12 @@ use datafusion_physical_plan::{
 };
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
+use delta_kernel::plans::ir::nodes::{FileType, LoadNode};
 use delta_kernel::Engine;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 
 use crate::exec::load_helpers::{
-    build_file_source, build_per_file_plan, extract_row_inputs, resolve_dv_async, sink_base_url,
+    build_file_source, build_per_file_plan, extract_row_inputs, load_base_url, resolve_dv_async,
     RowInputs,
 };
 
@@ -37,7 +37,7 @@ const DEFAULT_LOAD_CONCURRENCY: usize = 8;
 const MAX_LOAD_CONCURRENCY: usize = 64;
 
 pub struct LoadExec {
-    sink: Arc<LoadSink>,
+    node: Arc<LoadNode>,
     /// Used only for deletion-vector resolution; file decoding goes through DataFusion's
     /// parquet/json sources, not this engine.
     engine: Arc<dyn Engine>,
@@ -48,14 +48,14 @@ pub struct LoadExec {
     projection: Option<Vec<usize>>,
     output_schema: ArrowSchemaRef,
     limit: Option<usize>,
-    /// Indices into `sink.passthrough_columns` to materialize, in projected order. `Arc` so
+    /// Indices into `node.passthrough_columns` to materialize, in projected order. `Arc` so
     /// per-row open futures can clone cheaply.
     projected_passthrough: Arc<Vec<usize>>,
-    /// File source without `_row_number` for rows whose DV column is null (or whole sink
-    /// has no DV).
+    /// File source without `_row_number` for rows whose DV column is null (or the whole load
+    /// node has no DV).
     file_source_no_dv: Arc<dyn datafusion_datasource::file::FileSource>,
     /// File source with `_row_number` virtual column appended for DV rows. `None` iff
-    /// `sink.dv_ref.is_none()`.
+    /// `node.dv_ref.is_none()`.
     file_source_with_dv: Option<Arc<dyn datafusion_datasource::file::FileSource>>,
     properties: Arc<PlanProperties>,
 }
@@ -63,39 +63,39 @@ pub struct LoadExec {
 impl LoadExec {
     pub fn new(
         upstream: Arc<dyn ExecutionPlan>,
-        sink: Arc<LoadSink>,
+        node: Arc<LoadNode>,
         engine: Arc<dyn Engine>,
         full_schema: ArrowSchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> DfResult<Self> {
         // JSON has no `_row_number` virtual column; delta DVs only apply to parquet anyway.
-        if matches!(sink.file_type, FileType::Json) && sink.dv_ref.is_some() {
+        if matches!(node.file_type, FileType::Json) && node.dv_ref.is_some() {
             return Err(crate::error::plan_compilation(
-                "LoadSink with FileType::Json and dv_ref set is not supported (no \
+                "LoadNode with FileType::Json and dv_ref set is not supported (no \
                  _row_number virtual column for JSON)",
             ));
         }
 
-        let file_count = sink.file_schema.fields().len();
-        let passthrough_count = sink.passthrough_columns.len();
+        let file_count = node.file_schema.fields().len();
+        let passthrough_count = node.passthrough_columns.len();
         debug_assert_eq!(full_schema.fields().len(), file_count + passthrough_count);
 
-        // Always build the no-DV variant: even when `sink.dv_ref` is set, individual rows may
+        // Always build the no-DV variant: even when `node.dv_ref` is set, individual rows may
         // have a NULL DV (no DV for that file).
         let file_source_no_dv = build_file_source(
-            sink.file_type,
+            node.file_type,
             &full_schema,
             file_count,
             projection.as_deref(),
             false,
         )?;
-        let file_source_with_dv = sink
+        let file_source_with_dv = node
             .dv_ref
             .is_some()
             .then(|| {
                 build_file_source(
-                    sink.file_type,
+                    node.file_type,
                     &full_schema,
                     file_count,
                     projection.as_deref(),
@@ -129,7 +129,7 @@ impl LoadExec {
             upstream.properties().boundedness,
         ));
         Ok(Self {
-            sink,
+            node,
             engine,
             upstream,
             full_schema,
@@ -147,8 +147,7 @@ impl LoadExec {
 impl fmt::Debug for LoadExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoadExec")
-            .field("output_relation", &self.sink.output_relation.name)
-            .field("file_type", &self.sink.file_type)
+            .field("file_type", &self.node.file_type)
             .field("projection", &self.projection)
             .field("limit", &self.limit)
             .field("output_fields", &self.output_schema.fields().len())
@@ -160,10 +159,8 @@ impl DisplayAs for LoadExec {
     fn fmt_as(&self, _: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "LoadExec(output_relation={}, file_type={:?}, projection={:?}, limit={:?}, \
-             output_fields={})",
-            self.sink.output_relation.name,
-            self.sink.file_type,
+            "LoadExec(file_type={:?}, projection={:?}, limit={:?}, output_fields={})",
+            self.node.file_type,
             self.projection,
             self.limit,
             self.output_schema.fields().len(),
@@ -209,7 +206,7 @@ impl ExecutionPlan for LoadExec {
         })?;
         Ok(Arc::new(LoadExec::new(
             upstream,
-            Arc::clone(&self.sink),
+            Arc::clone(&self.node),
             Arc::clone(&self.engine),
             Arc::clone(&self.full_schema),
             self.projection.clone(),
@@ -244,7 +241,7 @@ impl ExecutionPlan for LoadExec {
         };
         let stream = build_load_stream(
             upstream,
-            Arc::clone(&self.sink),
+            Arc::clone(&self.node),
             Arc::clone(&self.engine),
             Arc::clone(&self.file_source_no_dv),
             self.file_source_with_dv.as_ref().map(Arc::clone),
@@ -267,7 +264,7 @@ impl ExecutionPlan for LoadExec {
 #[allow(clippy::too_many_arguments)]
 fn build_load_stream(
     upstream: SendableRecordBatchStream,
-    sink: Arc<LoadSink>,
+    node: Arc<LoadNode>,
     engine: Arc<dyn Engine>,
     file_source_no_dv: Arc<dyn datafusion_datasource::file::FileSource>,
     file_source_with_dv: Option<Arc<dyn datafusion_datasource::file::FileSource>>,
@@ -288,7 +285,7 @@ fn build_load_stream(
 
     // Per row, an open future producing the per-file `RecordBatch` stream.
     let per_file_streams = row_stream.map(move |row_result: DfResult<_>| {
-        let sink = Arc::clone(&sink);
+        let node = Arc::clone(&node);
         let engine = Arc::clone(&engine);
         let task_ctx = Arc::clone(&task_context);
         let pt = Arc::clone(&projected_passthrough);
@@ -298,17 +295,17 @@ fn build_load_stream(
 
         async move {
             let (batch, row) = row_result?;
-            let inputs: RowInputs = extract_row_inputs(&batch, row, &sink, &pt)?;
+            let inputs: RowInputs = extract_row_inputs(&batch, row, &node, &pt)?;
 
             let dv = match inputs.dv_descriptor.clone() {
                 Some(desc) => {
-                    let base = sink_base_url(&sink)?.clone();
+                    let base = load_base_url(&node)?.clone();
                     Some(resolve_dv_async(desc, base, Arc::clone(&engine)).await?)
                 }
                 None => None,
             };
 
-            // `file_source_with_dv` is `Some` iff `sink.dv_ref.is_some()`, which is the only
+            // `file_source_with_dv` is `Some` iff `node.dv_ref.is_some()`, which is the only
             // way `dv` can be `Some` here.
             let file_source = match (dv.is_some(), file_source_with_dv) {
                 (true, Some(src)) => src,
@@ -319,7 +316,7 @@ fn build_load_stream(
                 inputs,
                 dv,
                 file_source,
-                sink.file_type,
+                node.file_type,
                 &output_schema,
                 task_ctx.as_ref(),
             )

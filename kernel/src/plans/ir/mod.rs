@@ -1,7 +1,9 @@
 //! Plan intermediate representation.
 //!
-//! - [`nodes`] — node payload types shared with the engine compile path ([`nodes::ConsumeSink`],
-//!   [`nodes::LoadSink`], [`nodes::ScanNode`], etc.).
+//! - [`nodes`] — per-variant payload structs that the [`plan::NodeKind`] enum wraps
+//!   ([`nodes::LoadNode`], [`nodes::ScanNode`], [`nodes::ProjectNode`], etc.) plus the shared
+//!   [`nodes::ConsumeSink`] referenced by
+//!   [`EngineRequest::Consume`](crate::plans::state_machines::framework::step::EngineRequest::Consume).
 //! - [`plan`] — typed [`plan::Plan`] / [`plan::PlanNode`] / [`plan::NodeKind`] / [`plan::Ref`] /
 //!   [`plan::ResultPlan`]. Pure compute; no sinks, no named relations, no engine state side
 //!   effects. The canonical kernel plan IR.

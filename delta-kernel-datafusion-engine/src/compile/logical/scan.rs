@@ -23,7 +23,6 @@ use delta_kernel::schema::MetadataColumnSpec;
 use parquet::arrow::RowNumber;
 
 use super::canonicalize::canonicalize_output_to_kernel_schema;
-use crate::compile::expr_translator::kernel_expr_to_df_untyped;
 use crate::error::plan_compilation;
 use crate::exec::FieldIdPhysicalExprAdapterFactory;
 
@@ -90,19 +89,7 @@ pub(super) fn scan_to_listing_logical_plan(
             let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
             LogicalPlanBuilder::scan("scan", provider_as_source(listing), None)?.build()
         };
-    let mut scan_plan = build_listing_scan(&node.files)?;
-    if let Some(predicate) = &node.predicate {
-        let pred = kernel_expr_to_df_untyped(predicate.as_ref())?;
-        // Kernel NULL semantics keep a row when the predicate references a NULL value (SQL
-        // three-valued logic would drop it). We wrap the predicate with `pred OR pred IS NULL` so
-        // the downstream Filter behaves like kernel scan-skipping. Do NOT swap this for parquet
-        // filter pushdown -- pushdown applies SQL semantics and would silently change kernel
-        // behavior on NULL.
-        let null_preserving = pred.clone().or(pred.is_null());
-        scan_plan = LogicalPlanBuilder::from(scan_plan)
-            .filter(null_preserving)?
-            .build()?;
-    }
+    let scan_plan = build_listing_scan(&node.files)?;
     canonicalize_output_to_kernel_schema(scan_plan, &node.schema)
 }
 

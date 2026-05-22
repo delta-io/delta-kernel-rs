@@ -38,7 +38,10 @@ use crate::expressions::{
     ColumnName, Expression, ExpressionRef, IntoColumnName, PredicateRef, Scalar,
 };
 use crate::plans::errors::{DeltaError, DeltaErrorCode, DeltaResultExt};
-use crate::plans::ir::nodes::{ConsumeSink, DvRef, FileType, ScanFileColumns};
+use crate::plans::ir::nodes::{
+    ConsumeSink, DvRef, EquiJoinNode, FileType, FilterNode, ListFilesNode, LoadNode,
+    MaxByVersionNode, ProjectNode, ScanFileColumns, ScanNode, UnionNode, ValuesNode,
+};
 use crate::plans::ir::plan::{JoinKind, NodeKind, Plan, PlanNode, Ref, ResultPlan};
 use crate::plans::ir::schema_inference::infer_expression_type;
 use crate::plans::kernel_consumers::{Extractor, KernelConsumer, KernelConsumerOutput};
@@ -126,7 +129,7 @@ impl Context {
     ) -> Result<PlanBuilder, DeltaError> {
         push_source(
             &self.state,
-            NodeKind::ListFiles { start_from },
+            NodeKind::ListFiles(ListFilesNode { start_from }),
             listing_schema,
         )
     }
@@ -142,11 +145,11 @@ impl Context {
         let s = Arc::clone(&schema);
         push_source(
             &self.state,
-            NodeKind::Scan {
+            NodeKind::Scan(ScanNode {
                 file_type,
                 files,
                 schema,
-            },
+            }),
             s,
         )
     }
@@ -158,7 +161,11 @@ impl Context {
         rows: Vec<Vec<Scalar>>,
     ) -> Result<PlanBuilder, DeltaError> {
         let s = Arc::clone(&schema);
-        push_source(&self.state, NodeKind::Values { schema, rows }, s)
+        push_source(
+            &self.state,
+            NodeKind::Values(ValuesNode { schema, rows }),
+            s,
+        )
     }
 
     /// Drain the accumulator into a [`EngineRequest::Consume`] yielded through `engine` and recover
@@ -335,7 +342,12 @@ impl PlanBuilder {
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> Result<Self, DeltaError> {
         let predicate = predicate.into();
         let schema = self.schema()?;
-        push_unary(&self.state, &self, NodeKind::Filter { predicate }, schema)
+        push_unary(
+            &self.state,
+            &self,
+            NodeKind::Filter(FilterNode { predicate }),
+            schema,
+        )
     }
 
     /// Append a [`NodeKind::Project`] with inferred output schema.
@@ -363,10 +375,10 @@ impl PlanBuilder {
         push_unary(
             &self.state,
             &self,
-            NodeKind::Project {
+            NodeKind::Project(ProjectNode {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&output_schema),
-            },
+            }),
             output_schema,
         )
     }
@@ -397,10 +409,10 @@ impl PlanBuilder {
         push_unary(
             &self.state,
             &self,
-            NodeKind::Project {
+            NodeKind::Project(ProjectNode {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&schema),
-            },
+            }),
             schema,
         )
     }
@@ -435,10 +447,10 @@ impl PlanBuilder {
         push_unary(
             &self.state,
             &self,
-            NodeKind::Project {
+            NodeKind::Project(ProjectNode {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&schema),
-            },
+            }),
             schema,
         )
     }
@@ -468,10 +480,10 @@ impl PlanBuilder {
         push_unary(
             &self.state,
             &self,
-            NodeKind::Project {
+            NodeKind::Project(ProjectNode {
                 named_exprs: pairs,
                 output_schema: Arc::clone(&output_schema),
-            },
+            }),
             output_schema,
         )
     }
@@ -521,10 +533,10 @@ impl PlanBuilder {
         push_unary(
             &self.state,
             &self,
-            NodeKind::Project {
+            NodeKind::Project(ProjectNode {
                 named_exprs,
                 output_schema: Arc::clone(&output_schema),
-            },
+            }),
             output_schema,
         )
     }
@@ -718,14 +730,14 @@ impl PlanBuilder {
         push_unary(
             &self.state,
             &self,
-            NodeKind::Load {
+            NodeKind::Load(LoadNode {
                 file_schema,
                 file_type,
                 base_url,
                 passthrough_columns,
                 file_meta,
                 dv_ref,
-            },
+            }),
             output_schema,
         )
     }
@@ -774,11 +786,11 @@ impl PlanBuilder {
         push_unary(
             &self.state,
             &self,
-            NodeKind::MaxByVersion {
+            NodeKind::MaxByVersion(MaxByVersionNode {
                 group_by,
                 version_column,
                 value_columns,
-            },
+            }),
             output_schema,
         )
     }
@@ -805,10 +817,10 @@ impl PlanBuilder {
             &self.state,
             &self,
             &other,
-            NodeKind::EquiJoin {
+            NodeKind::EquiJoin(EquiJoinNode {
                 kind: JoinKind::Inner,
                 key_pairs,
-            },
+            }),
             output_schema,
         )
     }
@@ -835,10 +847,10 @@ impl PlanBuilder {
             &self.state,
             &self,
             &other,
-            NodeKind::EquiJoin {
+            NodeKind::EquiJoin(EquiJoinNode {
                 kind: JoinKind::LeftAnti,
                 key_pairs,
-            },
+            }),
             output_schema,
         )
     }
@@ -992,7 +1004,7 @@ fn push_union(
     for o in others {
         ensure_fresh(&s, o)?;
     }
-    let r = s.push_node(NodeKind::Union { ordered }, inputs, first_schema);
+    let r = s.push_node(NodeKind::Union(UnionNode { ordered }), inputs, first_schema);
     let session_id = s.session_id;
     Ok(PlanBuilder {
         state: Rc::clone(state),
@@ -1097,10 +1109,10 @@ fn apply_field_op(
     push_unary(
         &builder.state,
         &builder,
-        NodeKind::Project {
+        NodeKind::Project(ProjectNode {
             named_exprs,
             output_schema: Arc::clone(&output_schema),
-        },
+        }),
         output_schema,
     )
 }
@@ -1960,10 +1972,10 @@ mod tests {
         assert_eq!(stmt.inputs, vec![left_ref, right_ref]);
         assert!(matches!(
             stmt.kind,
-            NodeKind::EquiJoin {
+            NodeKind::EquiJoin(EquiJoinNode {
                 kind: JoinKind::Inner,
                 ..
-            }
+            })
         ));
     }
 }

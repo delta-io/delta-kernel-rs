@@ -5,10 +5,11 @@
 //! [`LogicalPlan`]. Inputs are guaranteed to be earlier in `plan.stmts` than outputs by
 //! [`Plan::push`](delta_kernel::plans::ir::plan::Plan::push), so a single forward pass works.
 //!
-//! All [`NodeKind`](delta_kernel::plans::ir::plan::NodeKind) variants compile to a `LogicalPlan` --
-//! sources, transforms, and the per-row file reader [`NodeKind::Load`]. Cross-statement data
-//! flow happens entirely through DataFusion's logical-plan tree (no relation registry,
-//! no named handles).
+//! Every [`NodeKind`](delta_kernel::plans::ir::plan::NodeKind) variant wraps a payload struct
+//! defined in [`delta_kernel::plans::ir::nodes`]; engine helpers consume those payload structs
+//! by reference (`&LoadNode`, `&ScanNode`, etc.) without repacking. Cross-statement data flow
+//! happens entirely through DataFusion's logical-plan tree (no relation registry, no named
+//! handles).
 //!
 //! # Schema policy
 //!
@@ -16,10 +17,8 @@
 //! [`ContextState`](crate::plans::state_machines::framework::plan_context) only during
 //! construction). DataFusion derives output schemas from `LogicalPlan` shape and arrow
 //! types; the only place a kernel [`SchemaRef`] is reconstructed engine-side is
-//! [`NodeKind::Load`], which feeds into [`LoadTableProvider`] (legacy plumbing still needs the
-//! `RelationHandle.schema` for its arrow-output materialization). The compiled
-//! kernel schema is rebuilt from the upstream's arrow schema on the fly via
-//! [`StructType::try_from_arrow`].
+//! [`NodeKind::Load`], whose output schema is computed here from the upstream's arrow shape
+//! via [`StructType::try_from_arrow`] and threaded into [`LoadTableProvider::try_new`].
 //!
 //! [`NodeKind::Load`]: delta_kernel::plans::ir::plan::NodeKind::Load
 //! [`SchemaRef`]: delta_kernel::schema::SchemaRef
@@ -40,7 +39,7 @@ use datafusion_functions_window::row_number::row_number;
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
 use delta_kernel::expressions::{ColumnName, Expression};
 use delta_kernel::plans::ir::nodes::{
-    FileListingNode, FileType, LoadSink, ProjectNode, RelationHandle, ScanFileColumns, ScanNode,
+    EquiJoinNode, LoadNode, MaxByVersionNode, UnionNode, ValuesNode,
 };
 use delta_kernel::plans::ir::plan::{JoinKind, NodeKind, PlanNode, Ref};
 use delta_kernel::schema::{SchemaRef, StructType};
@@ -103,96 +102,58 @@ fn lower_stmt(
 ) -> Result<LogicalPlan, DataFusionError> {
     match &stmt.kind {
         // === Sources ====================================================================
-        NodeKind::ListFiles { start_from } => file_listing_to_logical_plan(&FileListingNode {
-            path: start_from.clone(),
-        }),
-        NodeKind::Scan {
-            file_type,
-            files,
-            schema,
-        } => scan_to_listing_logical_plan(&ScanNode::new(
-            *file_type,
-            files.clone(),
-            Arc::clone(schema),
-        )),
-        NodeKind::Values { schema, rows } => lower_values(schema, rows),
+        NodeKind::ListFiles(node) => file_listing_to_logical_plan(node),
+        NodeKind::Scan(node) => scan_to_listing_logical_plan(node),
+        NodeKind::Values(node) => lower_values(node),
 
         // === Unary transforms ===========================================================
-        NodeKind::Filter { predicate } => {
+        NodeKind::Filter(node) => {
             let child = lookup(built, expect_one_input(stmt)?)?.clone();
-            let pred = kernel_pred_to_df(predicate.as_ref())?;
+            let pred = kernel_pred_to_df(node.predicate.as_ref())?;
             LogicalPlanBuilder::from(child).filter(pred)?.build()
         }
-        NodeKind::Project {
-            named_exprs,
-            output_schema,
-        } => {
+        NodeKind::Project(node) => {
             let child = lookup(built, expect_one_input(stmt)?)?.clone();
-            // SSA `NodeKind::Project` carries its declared output schema; the engine
-            // does not re-infer it. Reuse the legacy `compile_project_node` helper
-            // (it consumes a `ProjectNode` whose `output_schema` informs collision
-            // avoidance + name canonicalization).
-            let project_node = ProjectNode {
-                columns: named_exprs.iter().map(|(_, e)| Arc::clone(e)).collect(),
-                output_schema: Arc::clone(output_schema),
-            };
-            compile_project_node(child, &project_node)
+            compile_project_node(child, node)
         }
-        NodeKind::Load {
-            file_schema,
-            file_type,
-            base_url,
-            passthrough_columns,
-            file_meta,
-            dv_ref,
-        } => lower_load(
-            built,
-            expect_one_input(stmt)?,
-            file_schema,
-            *file_type,
-            base_url.as_ref(),
-            passthrough_columns,
-            file_meta,
-            dv_ref.as_ref(),
-            ctx,
-        ),
-        NodeKind::MaxByVersion {
-            group_by,
-            version_column,
-            value_columns,
-        } => lower_max_by_version(
-            lookup(built, expect_one_input(stmt)?)?.clone(),
-            group_by,
-            version_column,
-            value_columns,
-        ),
+        NodeKind::Load(node) => lower_load(built, expect_one_input(stmt)?, node, ctx),
+        NodeKind::MaxByVersion(node) => {
+            let child = lookup(built, expect_one_input(stmt)?)?.clone();
+            lower_max_by_version(child, node)
+        }
 
         // === N-ary ======================================================================
-        NodeKind::Union { ordered } => {
-            if stmt.inputs.is_empty() {
-                return Err(plan_compilation(
-                    "compile_ssa: Union with zero inputs is not a valid SSA shape",
-                ));
-            }
-            let children: Vec<LogicalPlan> = stmt
-                .inputs
-                .iter()
-                .map(|r| lookup(built, *r).cloned())
-                .collect::<Result<_, _>>()?;
-            if children.len() == 1 {
-                return Ok(children.into_iter().next().unwrap());
-            }
-            if *ordered {
-                compile_ordered_union(children)
-            } else {
-                let mut iter = children.into_iter();
-                let first = iter.next().unwrap();
-                iter.try_fold(first, |acc, right| {
-                    LogicalPlanBuilder::from(acc).union(right)?.build()
-                })
-            }
-        }
-        NodeKind::EquiJoin { kind, key_pairs } => lower_equi_join(stmt, built, *kind, key_pairs),
+        NodeKind::Union(node) => lower_union(stmt, built, node),
+        NodeKind::EquiJoin(node) => lower_equi_join(stmt, built, node),
+    }
+}
+
+fn lower_union(
+    stmt: &PlanNode,
+    built: &HashMap<Ref, LogicalPlan>,
+    node: &UnionNode,
+) -> Result<LogicalPlan, DataFusionError> {
+    if stmt.inputs.is_empty() {
+        return Err(plan_compilation(
+            "compile_ssa: Union with zero inputs is not a valid SSA shape",
+        ));
+    }
+    let children: Vec<LogicalPlan> = stmt
+        .inputs
+        .iter()
+        .map(|r| lookup(built, *r).cloned())
+        .collect::<Result<_, _>>()?;
+    if children.len() == 1 {
+        return Ok(children.into_iter().next().unwrap());
+    }
+    if node.ordered {
+        compile_ordered_union(children)
+    } else {
+        let mut iter = children.into_iter();
+        let first = iter.next().unwrap();
+        iter.try_fold(first, |acc, right| {
+            LogicalPlanBuilder::from(acc).union(right)?.build()
+        })
     }
 }
 
@@ -242,11 +203,8 @@ fn walk_column_type(
     Some(current)
 }
 
-fn lower_values(
-    schema: &SchemaRef,
-    rows: &[Vec<delta_kernel::expressions::Scalar>],
-) -> Result<LogicalPlan, DataFusionError> {
-    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().map_err(|e| {
+fn lower_values(node: &ValuesNode) -> Result<LogicalPlan, DataFusionError> {
+    let arrow_schema: ArrowSchema = node.schema.as_ref().try_into_arrow().map_err(|e| {
         plan_compilation(format!(
             "compile_ssa: Values arrow schema conversion failed: {e}"
         ))
@@ -255,7 +213,8 @@ fn lower_values(
         DFSchema::try_from(arrow_schema)
             .map_err(|e| plan_compilation(format!("compile_ssa: Values DF schema: {e}")))?,
     );
-    let translated = rows
+    let translated = node
+        .rows
         .iter()
         .map(|row| {
             row.iter()
@@ -276,40 +235,24 @@ fn lower_values(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lower_load(
     built: &HashMap<Ref, LogicalPlan>,
     upstream_ref: Ref,
-    file_schema: &SchemaRef,
-    file_type: FileType,
-    base_url: Option<&url::Url>,
-    passthrough_columns: &[ColumnName],
-    file_meta: &ScanFileColumns,
-    dv_ref: Option<&delta_kernel::plans::ir::nodes::DvRef>,
+    node: &LoadNode,
     ctx: &CompileContext,
 ) -> Result<LogicalPlan, DataFusionError> {
     let upstream_logical = lookup(built, upstream_ref)?.clone();
     let upstream_kernel = kernel_schema_from_logical(&upstream_logical)?;
-    let output_schema =
-        build_load_output_kernel_schema(file_schema, passthrough_columns, &upstream_kernel)?;
-    // `LoadTableProvider` was authored against the legacy `LoadSink` shape; SSA Load has
-    // no concept of a `RelationHandle`, so we synthesize an ephemeral one purely so the
-    // provider can derive its arrow output schema. The handle's `id` and `name` are
-    // throwaway -- nothing registers it.
-    let synthetic_handle = RelationHandle::fresh("ssa_load", output_schema);
-    let mut sink = LoadSink::new(synthetic_handle, Arc::clone(file_schema), file_type);
-    if let Some(url) = base_url {
-        sink = sink.with_base_url(url.clone());
-    }
-    sink = sink.with_passthrough_columns(passthrough_columns.to_vec());
-    sink = sink.with_file_meta(file_meta.clone());
-    if let Some(dv) = dv_ref {
-        sink = sink.with_dv_ref(dv.clone());
-    }
+    let output_kernel_schema = build_load_output_kernel_schema(
+        &node.file_schema,
+        &node.passthrough_columns,
+        &upstream_kernel,
+    )?;
     let provider: Arc<dyn TableProvider> = Arc::new(LoadTableProvider::try_new(
         upstream_logical,
-        Arc::new(sink),
+        Arc::new(node.clone()),
         Arc::clone(&ctx.engine),
+        output_kernel_schema,
     )?);
     LogicalPlanBuilder::scan("ssa_load", provider_as_source(provider), None)?.build()
 }
@@ -350,17 +293,15 @@ fn build_load_output_kernel_schema(
 /// column appended by [`LogicalPlanBuilder::window_plan`]).
 fn lower_max_by_version(
     child: LogicalPlan,
-    group_by: &[Arc<Expression>],
-    version_column: &Arc<Expression>,
-    value_columns: &[String],
+    node: &MaxByVersionNode,
 ) -> Result<LogicalPlan, DataFusionError> {
-    if value_columns.is_empty() {
+    if node.value_columns.is_empty() {
         return Err(plan_compilation(
             "compile_ssa: MaxByVersion with zero value_columns is invalid",
         ));
     }
-    let partition_by = kernel_exprs_to_df_untyped(group_by)?;
-    let order_by_expr = kernel_expr_to_df_untyped(version_column.as_ref())?;
+    let partition_by = kernel_exprs_to_df_untyped(&node.group_by)?;
+    let order_by_expr = kernel_expr_to_df_untyped(node.version_column.as_ref())?;
     let row_number_expr = row_number()
         .partition_by(partition_by)
         .order_by(vec![order_by_expr.sort(false /* descending */, false)])
@@ -377,7 +318,8 @@ fn lower_max_by_version(
     let filtered = LogicalPlanBuilder::from(window_plan)
         .filter(Expr::Column(rn_column).eq(lit(1u64)))?
         .build()?;
-    let projection: Vec<Expr> = value_columns
+    let projection: Vec<Expr> = node
+        .value_columns
         .iter()
         .map(|n| Expr::Column(Column::new_unqualified(n)))
         .collect();
@@ -389,8 +331,7 @@ fn lower_max_by_version(
 fn lower_equi_join(
     stmt: &PlanNode,
     built: &HashMap<Ref, LogicalPlan>,
-    kind: JoinKind,
-    key_pairs: &[(Arc<Expression>, Arc<Expression>)],
+    node: &EquiJoinNode,
 ) -> Result<LogicalPlan, DataFusionError> {
     if stmt.inputs.len() != 2 {
         return Err(plan_compilation(format!(
@@ -398,22 +339,24 @@ fn lower_equi_join(
             stmt.inputs.len()
         )));
     }
-    if key_pairs.is_empty() {
+    if node.key_pairs.is_empty() {
         return Err(plan_compilation(
             "compile_ssa: EquiJoin requires at least one key pair",
         ));
     }
     let left_plan = lookup(built, stmt.inputs[0])?.clone();
     let right_plan = lookup(built, stmt.inputs[1])?.clone();
-    let left_keys: Vec<Expr> = key_pairs
+    let left_keys: Vec<Expr> = node
+        .key_pairs
         .iter()
         .map(|(l, _)| kernel_expr_to_df_untyped(l.as_ref()))
         .collect::<Result<_, _>>()?;
-    let right_keys: Vec<Expr> = key_pairs
+    let right_keys: Vec<Expr> = node
+        .key_pairs
         .iter()
         .map(|(_, r)| kernel_expr_to_df_untyped(r.as_ref()))
         .collect::<Result<_, _>>()?;
-    let (df_kind, build_plan, probe_plan, build_keys, probe_keys) = match kind {
+    let (df_kind, build_plan, probe_plan, build_keys, probe_keys) = match node.kind {
         // SSA `Inner`: emit `(left, right)` rows whose keys match. Build = left.
         JoinKind::Inner => (
             DfJoinType::Inner,
@@ -441,7 +384,7 @@ fn lower_equi_join(
     // (`left.fields ++ right.fields`). DataFusion may produce a different physical
     // ordering depending on join build/probe choice. For `LeftAnti`, the output mirrors
     // the left input -- DataFusion's natural output ordering matches.
-    if matches!(kind, JoinKind::Inner) {
+    if matches!(node.kind, JoinKind::Inner) {
         let kernel_left = kernel_schema_from_logical(lookup(built, stmt.inputs[0])?)?;
         let kernel_right = kernel_schema_from_logical(lookup(built, stmt.inputs[1])?)?;
         let mut combined: Vec<delta_kernel::schema::StructField> =

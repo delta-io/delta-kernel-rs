@@ -91,10 +91,13 @@ pub(super) fn compile_project_node(
     child_plan: LogicalPlan,
     node: &ProjectNode,
 ) -> Result<LogicalPlan, DataFusionError> {
-    let expanded_columns = crate::compile::expand_projection_columns(
-        &node.columns,
-        node.output_schema.fields().count(),
-    )?;
+    let columns: Vec<Arc<Expression>> = node
+        .named_exprs
+        .iter()
+        .map(|(_, e)| Arc::clone(e))
+        .collect();
+    let expanded_columns =
+        crate::compile::expand_projection_columns(&columns, node.output_schema.fields().count())?;
 
     // Insulate input names from output names to avoid DataFusion optimizer ambiguity.
     // When a kernel projection produces an output field whose name equals an unqualified

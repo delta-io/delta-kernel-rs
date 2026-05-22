@@ -283,8 +283,9 @@ async fn step_consume_drains_ssa_into_consumer_handle() {
 
 /// `NodeKind::Load` reads each upstream row's path-column file in `file_type`, broadcasts the
 /// `passthrough_columns` onto every emitted file row, and lifts the `file_schema` columns
-/// alongside. Verifies the engine-side ephemeral-`RelationHandle` plumbing (synthesized
-/// inside `compile_ssa` so we don't have to refactor `LoadTableProvider`).
+/// alongside. Verifies the `NodeKind::Load(LoadNode { ... })` lowering: the engine reads the
+/// `LoadNode` payload directly and threads a `LoadTableProvider`/`LoadExec` into the compiled
+/// `LogicalPlan`.
 #[tokio::test]
 async fn load_node_reads_files_and_broadcasts_passthrough() {
     use test_utils::parquet::write_i64_parquet;

@@ -1,5 +1,5 @@
 //! [`TableProvider`] for
-//! [`NodeKind::FileListing`](delta_kernel::plans::ir::plan::NodeKind::FileListing) nodes, emitting
+//! [`NodeKind::ListFiles`](delta_kernel::plans::ir::plan::NodeKind::ListFiles) nodes, emitting
 //! one `(path, size, modification_time)` row per object under a URL prefix.
 
 use std::sync::Arc;
@@ -11,12 +11,12 @@ use datafusion_common::error::DataFusionError;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, LogicalPlanBuilder, TableType};
 use datafusion_physical_plan::ExecutionPlan;
-use delta_kernel::plans::ir::nodes::FileListingNode;
+use delta_kernel::plans::ir::nodes::ListFilesNode;
 
 use crate::exec::FileListingExec;
 
 /// [`TableProvider`] for
-/// [`NodeKind::FileListing`](delta_kernel::plans::ir::plan::NodeKind::FileListing): enumerates a
+/// [`NodeKind::ListFiles`](delta_kernel::plans::ir::plan::NodeKind::ListFiles): enumerates a
 /// storage prefix via the object store registered for the path's scheme/host and emits a `(path,
 /// size, modification_time)` row per object. The actual listing happens inside the returned
 /// [`ExecutionPlan`] at execute time; planning is fast.
@@ -58,9 +58,9 @@ impl TableProvider for FileListingTableProvider {
 }
 
 pub(super) fn file_listing_to_logical_plan(
-    node: &FileListingNode,
+    node: &ListFilesNode,
 ) -> Result<LogicalPlan, DataFusionError> {
     let provider: Arc<dyn TableProvider> =
-        Arc::new(FileListingTableProvider::new(node.path.clone()));
+        Arc::new(FileListingTableProvider::new(node.start_from.clone()));
     LogicalPlanBuilder::scan("file_listing", provider_as_source(provider), None)?.build()
 }

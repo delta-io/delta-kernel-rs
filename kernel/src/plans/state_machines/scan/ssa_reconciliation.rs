@@ -526,9 +526,9 @@ pub(super) fn build_reconciliation_ssa(
         let keyed = view
             .filter(identity_not_null)?
             .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?;
-        // `NodeKind::EquiJoin { kind: LeftAnti }` produces left-schema output regardless of the
-        // right side's shape. Pass `commit_dedup` as-is and let the engine's projection
-        // pushdown prune unused right-side columns.
+        // `NodeKind::EquiJoin(EquiJoinNode { kind: LeftAnti, .. })` produces left-schema output
+        // regardless of the right side's shape. Pass `commit_dedup` as-is and let the
+        // engine's projection pushdown prune unused right-side columns.
         let survivors = keyed.left_anti_join(
             commit_dedup.clone(),
             [(col(FSR_JOIN_KEY_COL), col(FSR_JOIN_KEY_COL))],
