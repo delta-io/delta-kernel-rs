@@ -9,7 +9,7 @@
 
 use crate::plans::operations::framework::engine_error::EngineError;
 use crate::plans::operations::framework::step::Step;
-use crate::plans::operations::framework::step_result::StepResult;
+use crate::plans::operations::framework::step_payload::StepPayload;
 
 /// Value yielded by a coroutine at each phase boundary. Carries the operation envelope and the
 /// phase name.
@@ -20,7 +20,7 @@ pub(crate) struct StepYield {
 
 /// Value the driver passes back to the coroutine on resume. Wraps the engine outcome for the most
 /// recent [`StepYield::operation`].
-pub(crate) struct StepResume(pub Result<StepResult, EngineError>);
+pub(crate) struct StepResume(pub Result<StepPayload, EngineError>);
 
 impl std::fmt::Debug for StepResume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

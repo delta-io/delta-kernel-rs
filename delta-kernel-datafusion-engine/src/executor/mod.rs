@@ -25,7 +25,7 @@ use delta_kernel::plans::operations::framework::coroutine::driver::Coroutine;
 use delta_kernel::plans::operations::framework::engine_error::{EngineError, EngineErrorKind};
 use delta_kernel::plans::operations::framework::state_machine::{NextStep, StateMachine};
 use delta_kernel::plans::operations::framework::step::{SchemaQueryNode, Step};
-use delta_kernel::plans::operations::framework::step_result::StepResult;
+use delta_kernel::plans::operations::framework::step_payload::StepPayload;
 use delta_kernel::plans::operations::scan::FullState;
 use delta_kernel::scan::Scan;
 use delta_kernel::{Engine, Error as KernelError};
@@ -53,7 +53,7 @@ fn resolve_schema_query_url(path: &str) -> Result<Url, EngineError> {
 fn execute_schema_query_phase(
     engine: &Arc<dyn Engine>,
     node: SchemaQueryNode,
-) -> Result<StepResult, EngineError> {
+) -> Result<StepPayload, EngineError> {
     let map_kernel_err = |err: KernelError| match err {
         KernelError::FileNotFound(path) => EngineError::new(EngineErrorKind::FileNotFound { path }),
         other => EngineError::internal(other),
@@ -67,9 +67,7 @@ fn execute_schema_query_phase(
         .parquet_handler()
         .read_parquet_footer(&meta)
         .map_err(map_kernel_err)?;
-    let state = StepResult::empty();
-    state.submit_schema(footer.schema);
-    Ok(state)
+    Ok(StepPayload::Schema(footer.schema))
 }
 
 /// Minimal executor: a [`TaskContext`] for [`ExecutionPlan::execute`] calls, a [`SessionContext`]
@@ -143,12 +141,12 @@ impl DataFusionExecutor {
         let sm_kind = sm.sm_kind();
         loop {
             // Zero-yield SMs have no step to fetch; the first `submit` hands the stored
-            // terminal value back directly. Fall back to an empty `StepResult` in that case so
+            // terminal value back directly. Pass [`StepPayload::Empty`] in that case so
             // `submit` has a valid (unused) input.
             let step_name = sm.step_name();
             let phase_result = match sm.get_step() {
                 Ok(op) => self.run_phase(op, sm_id, sm_kind, step_name).await,
-                Err(_) => Ok(StepResult::empty()),
+                Err(_) => Ok(StepPayload::Empty),
             };
             match sm.submit(phase_result)? {
                 NextStep::Continue => {}
@@ -181,7 +179,6 @@ impl DataFusionExecutor {
         rp: &delta_kernel::plans::ir::ssa::ResultPlan,
     ) -> Result<DataFrame, DeltaError> {
         let ctx = CompileContext {
-            step_result: None,
             engine: Arc::clone(&self.engine),
             sm_id: Uuid::new_v4(),
             sm_kind: "standalone",
@@ -215,9 +212,9 @@ impl DataFusionExecutor {
     }
 
     /// Execute a single [`Step`] against the executor and return the resulting
-    /// [`StepResult`]. Used internally by [`Self::drive_to_completion`] and exposed for
+    /// [`StepPayload`]. Used internally by [`Self::drive_to_completion`] and exposed for
     /// callers (typically tests) that need to drive an individual phase op directly.
-    pub async fn execute_step(&self, op: Step) -> Result<StepResult, EngineError> {
+    pub async fn execute_step(&self, op: Step) -> Result<StepPayload, EngineError> {
         self.run_phase(op, Uuid::new_v4(), "standalone", "execute")
             .await
     }
@@ -230,7 +227,7 @@ impl DataFusionExecutor {
         sm_id: Uuid,
         sm_kind: &'static str,
         step_name: &'static str,
-    ) -> Result<StepResult, EngineError> {
+    ) -> Result<StepPayload, EngineError> {
         match op {
             Step::SchemaQuery(node) => execute_schema_query_phase(&self.engine, node),
             Step::Consume {
@@ -238,30 +235,27 @@ impl DataFusionExecutor {
                 terminal,
                 sink,
             } => {
-                let state = StepResult::empty();
-                self.run_consume(&stmts, terminal, &sink, &state, sm_id, sm_kind, step_name)
+                let finished = self
+                    .run_consume(&stmts, terminal, &sink, sm_id, sm_kind, step_name)
                     .await
                     .map_err(EngineError::internal)?;
-                Ok(state)
+                Ok(StepPayload::Consumer(finished))
             }
         }
     }
 
-    /// Compile an SSA [`Step::Consume`] into a DataFusion physical plan and drain it
-    /// through the consume sink.
-    #[allow(clippy::too_many_arguments)]
+    /// Compile an SSA [`Step::Consume`] into a DataFusion physical plan, drain it through
+    /// the consume sink, and return the finalized handle.
     async fn run_consume(
         &self,
         stmts: &[delta_kernel::plans::ir::ssa::Stmt],
         terminal: delta_kernel::plans::ir::ssa::Ref,
         sink: &ConsumeSink,
-        state: &StepResult,
         sm_id: Uuid,
         sm_kind: &'static str,
         step_name: &'static str,
-    ) -> Result<(), DataFusionError> {
+    ) -> Result<FinishedHandle, DataFusionError> {
         let ctx = CompileContext {
-            step_result: Some(state.clone()),
             engine: Arc::clone(&self.engine),
             sm_id,
             sm_kind,
@@ -277,14 +271,13 @@ impl DataFusionExecutor {
 
     /// Drain `physical` through a
     /// [`KernelConsumer`](delta_kernel::plans::kernel_consumers::KernelConsumer) handle
-    /// minted from `sink`. The finalized handle submits into the active phase's
-    /// [`StepResult`].
+    /// minted from `sink` and return the finalized handle.
     async fn drain_consume_sink(
         &self,
         physical: Arc<dyn ExecutionPlan>,
         sink: &ConsumeSink,
         ctx: &CompileContext,
-    ) -> Result<(), DataFusionError> {
+    ) -> Result<FinishedHandle, DataFusionError> {
         let mut handle = sink.new_handle(ctx.sm_id, ctx.sm_kind, ctx.step_name);
         // Consume sinks are single-partition by construction; read partition 0 directly without
         // coalesce.
@@ -299,15 +292,6 @@ impl DataFusionExecutor {
                 KdfControl::Break => break,
             }
         }
-        let finished = handle.finish();
-        let Some(state) = ctx.step_result.as_ref() else {
-            // Consume sink called outside of an active phase has nowhere to land its handle.
-            let _: FinishedHandle = finished;
-            return Err(crate::error::internal_error(
-                "Consume sink drained without an active phase state to submit into",
-            ));
-        };
-        state.submit_consumer_handle(finished);
-        Ok(())
+        Ok(handle.finish())
     }
 }

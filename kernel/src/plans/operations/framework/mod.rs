@@ -4,9 +4,11 @@
 //!   [`NextStep`](state_machine::NextStep) the executor drives.
 //! - [`step`] — the typed "unit of work" ([`Step`](step::Step)) handed from SM to executor each
 //!   step.
-//! - [`step_result`] — thread-safe success-payload container the executor fills
-//!   ([`KernelConsumer`](crate::plans::kernel_consumers::KernelConsumer) finished handles +
-//!   optional schema-query result) and that the SM consumes on `submit`.
+//! - [`step_payload`] — typed success payload the executor returns from one phase
+//!   ([`StepPayload::Consumer`](step_payload::StepPayload::Consumer) for drained
+//!   [`KernelConsumer`](crate::plans::kernel_consumers::KernelConsumer) handles,
+//!   [`StepPayload::Schema`](step_payload::StepPayload::Schema) for schema-query results) and that
+//!   the SM consumes on `submit`.
 //! - [`engine_error`] — [`EngineError`](engine_error::EngineError), the typed failure the engine
 //!   surfaces to the SM (distinct from [`DeltaError`](crate::plans::errors::DeltaError), which is
 //!   the kernel-to-caller error).
@@ -23,4 +25,4 @@ pub mod engine_error;
 pub mod plan_context;
 pub mod state_machine;
 pub mod step;
-pub mod step_result;
+pub mod step_payload;

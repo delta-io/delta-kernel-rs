@@ -2,14 +2,15 @@
 //!
 //! [`Handle<K>`] is the executor's working buffer for one [`ConsumeSink`]: created when a
 //! phase starts, fed batches via [`Handle::apply_consumer`], finalized via [`Handle::finish`]
-//! when the child is exhausted. Type-erased into [`FinishedHandle`] for `StepResult`
-//! submission.
+//! when the child is exhausted. Type-erased into [`FinishedHandle`] and returned to the
+//! state machine as
+//! [`StepPayload::Consumer`](crate::plans::operations::framework::step_payload::StepPayload::Consumer).
 //!
 //! Generic over `K: KernelConsumer + ?Sized`; executor code uses `Handle<dyn KernelConsumer>`.
 //! Handles dispatch in-process and never cross a serialization boundary.
 //!
 //! Every handle is stamped with its owning SM's `(sm_id, sm_kind, step_name)` triple,
-//! threaded through tracing spans and `StepResult` cross-checks.
+//! threaded through tracing spans and the [`Extractor`](super::Extractor) sanity check.
 //!
 //! [`ConsumeSink`]: crate::plans::ir::nodes::ConsumeSink
 

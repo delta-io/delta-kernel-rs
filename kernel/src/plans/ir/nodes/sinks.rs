@@ -14,7 +14,8 @@ use crate::schema::SchemaRef;
 ///
 /// - `initial_state`: cloned per partition via [`DynClone`](dyn_clone::DynClone) into a
 ///   [`Handle`](crate::plans::kernel_consumers::Handle).
-/// - `token`: joins finalized state back to the phase's `StepResult`.
+/// - `token`: keys the finished handle returned from the executor and validated at decode time by
+///   the paired [`Extractor`](crate::plans::kernel_consumers::Extractor).
 #[derive(Debug, Clone)]
 pub struct ConsumeSink {
     pub initial_state: Box<dyn KernelConsumer>,

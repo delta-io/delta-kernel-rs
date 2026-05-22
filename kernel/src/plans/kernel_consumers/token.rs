@@ -18,16 +18,16 @@ pub enum KernelConsumerKind {
     SidecarCollector,
 }
 
-/// Identity for a kernel-consumer entry in [`StepResult`].
+/// Identity for a kernel-consumer entry on a finished handle.
 ///
 /// Stamped at plan-build time when a [`Step::Consume`] step is constructed. The fresh
 /// UUID `id` ensures stale handles from a prior plan can't be confused with current
-/// ones — a token from a dead plan won't match any live `StepResult` entry, so old
-/// handles can't be used incorrectly to read from or write into the current plan's
-/// state.
+/// ones -- a [`FinishedHandle`] arriving with a token from a dead plan fails the
+/// [`Extractor`] sanity check at decode time.
 ///
-/// [`StepResult`]: crate::plans::operations::framework::step_result::StepResult
 /// [`Step::Consume`]: crate::plans::operations::framework::step::Step::Consume
+/// [`FinishedHandle`]: super::handle::FinishedHandle
+/// [`Extractor`]: super::typed::Extractor
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KernelConsumerToken {
     pub kind: KernelConsumerKind,

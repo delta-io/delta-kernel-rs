@@ -10,12 +10,12 @@
 
 use std::any::Any;
 
+use super::handle::FinishedHandle;
 use super::token::KernelConsumerToken;
 use super::traits::KernelConsumer;
 use crate::delta_error;
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
 use crate::plans::operations::framework::engine_error::EngineError;
-use crate::plans::operations::framework::step_result::StepResult;
 
 /// Typed-output companion. Each KDF state impls this once, declaring the
 /// typed output callers receive and how the finalized state reduces to it.
@@ -45,8 +45,14 @@ pub trait KernelConsumerOutput: KernelConsumer + Any + Sized + 'static {
 pub(crate) type ExtractFn<O> =
     Box<dyn FnOnce(Box<dyn Any + Send>) -> Result<O, DeltaError> + Send + 'static>;
 
-/// A typed adapter for pulling the output of a single consume sink out of a
-/// [`StepResult`].
+/// A typed adapter for pulling the typed output of a single consume sink
+/// out of a [`FinishedHandle`].
+///
+/// SM bodies build an `Extractor` while planting a [`Step::Consume`] (via
+/// [`Cursor::consume`](crate::plans::operations::framework::plan_context::Context::consume))
+/// and feed the engine's [`FinishedHandle`] back through [`Self::extract`] on resume.
+///
+/// [`Step::Consume`]: crate::plans::operations::framework::step::Step::Consume
 pub struct Extractor<O> {
     token: KernelConsumerToken,
     extract: ExtractFn<O>,
@@ -75,17 +81,23 @@ impl<O: Send + 'static> Extractor<O> {
         Self { token, extract }
     }
 
-    /// Pull this extractor's payload from `state` and decode it.
+    /// Decode `handle`'s payload into the typed output `O`.
     ///
-    /// Drains the entry under this extractor's [`KernelConsumerToken`] from
-    /// `state` (so a second call would see it absent) and runs the typed
-    /// reduction. Decoding failures are wrapped in [`EngineError::internal`]
-    /// so SM bodies can uniformly handle them on the engine-error path.
-    pub fn extract(self, state: &StepResult) -> Result<O, EngineError> {
-        let erased = state
-            .take_by_token(&self.token)
-            .map_err(EngineError::internal)?;
-        (self.extract)(erased).map_err(EngineError::internal)
+    /// Sanity-checks that `handle.token` matches this extractor's token (cross-wired
+    /// finished handles surface as an internal error) and runs the typed reduction.
+    /// Decoding failures are wrapped in [`EngineError::internal`] so SM bodies can
+    /// uniformly handle them on the engine-error path.
+    pub fn extract(self, handle: FinishedHandle) -> Result<O, EngineError> {
+        if handle.token != self.token {
+            return Err(EngineError::internal(delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "kernel_consumer::extract: token mismatch -- handle token `{handle}` vs \
+                 expected `{expected}`",
+                handle = handle.token,
+                expected = self.token,
+            )));
+        }
+        (self.extract)(handle.erased).map_err(EngineError::internal)
     }
 }
 

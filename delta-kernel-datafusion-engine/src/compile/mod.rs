@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use datafusion_common::error::DataFusionError;
-use delta_kernel::plans::operations::framework::step_result::StepResult;
 use delta_kernel::Engine;
 use uuid::Uuid;
 
@@ -15,12 +14,14 @@ pub mod stamp_udf;
 pub use logical::compile_ssa;
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
+///
+/// Carries only static / shared bits -- there is no per-phase mutable accumulator
+/// here. Drained consumer state for `Consume` steps flows directly out of
+/// [`DataFusionExecutor::run_phase`](crate::executor::DataFusionExecutor) as a
+/// [`StepPayload::Consumer`](delta_kernel::plans::operations::framework::step_payload::StepPayload::Consumer)
+/// after the executor finishes the sink locally.
 #[derive(Clone)]
 pub struct CompileContext {
-    /// Active phase's [`StepResult`] (`Some` while a phase is executing). `Consume`
-    /// drains submit their finalized handles here; `None` means the executor is not inside a
-    /// phase and any consume sink encountered surfaces an internal error.
-    pub step_result: Option<StepResult>,
     /// Kernel [`Engine`] for sinks that delegate IO to parquet/json handlers
     /// (`Node::Load`).
     pub engine: Arc<dyn Engine>,
@@ -33,11 +34,10 @@ pub struct CompileContext {
 }
 
 impl CompileContext {
-    /// Build a context without an active phase state. Useful for inspection-only paths (e.g.
-    /// benchmark plan printers) that do not execute a plan.
+    /// Build a context for SM-less inspection / standalone driving (benchmark plan printers,
+    /// integration tests that lower a `ResultPlan` directly).
     pub fn new(engine: Arc<dyn Engine>) -> Self {
         Self {
-            step_result: None,
             engine,
             sm_id: Uuid::new_v4(),
             sm_kind: "standalone",

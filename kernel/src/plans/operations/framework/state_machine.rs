@@ -18,7 +18,7 @@
 
 use super::engine_error::EngineError;
 use super::step::Step;
-use super::step_result::StepResult;
+use super::step_payload::StepPayload;
 use crate::plans::errors::DeltaError;
 
 /// Result of submitting a step result to a state machine.
@@ -36,7 +36,7 @@ pub enum NextStep<R> {
 ///
 /// Each SM-visible "step" is one tick of this loop: the executor asks
 /// [`StateMachine::get_step`] for what to run, executes it, then calls
-/// [`StateMachine::submit`] with the outcome ([`StepResult`] on success, an
+/// [`StateMachine::submit`] with the outcome ([`StepPayload`] on success, an
 /// [`EngineError`] on engine failure).
 ///
 /// # Error layering
@@ -63,14 +63,17 @@ pub trait StateMachine {
 
     /// Receive the step outcome from the driver.
     ///
-    /// - `Ok(StepResult)` — the executor ran every plan in the step and gathered any
-    ///   kernel-consumer state / schema-query result; the SM takes ownership of the accumulator.
+    /// - `Ok(StepPayload)` — the executor ran the step and produced its single typed payload (a
+    ///   finished consumer handle, a schema, or
+    ///   [`StepPayload::Empty`](super::step_payload::StepPayload::Empty) for the driver-internal
+    ///   priming case). The SM body destructures the variant matching its preceding yield; any
+    ///   other variant is an executor bug surfaced as an internal error.
     /// - `Err(EngineError)` — a typed engine-side failure; the SM matches on
     ///   [`EngineError::kind`](super::engine_error::EngineError::kind) and decides how to surface
     ///   it.
     fn submit(
         &mut self,
-        result: Result<StepResult, EngineError>,
+        result: Result<StepPayload, EngineError>,
     ) -> Result<NextStep<Self::Result>, DeltaError>;
 
     /// Static label for logging / diagnostics. Drivers use this in span

@@ -32,7 +32,7 @@ use uuid::Uuid;
 use super::super::engine_error::EngineError;
 use super::super::state_machine::{NextStep, StateMachine};
 use super::super::step::Step;
-use super::super::step_result::StepResult;
+use super::super::step_payload::StepPayload;
 use super::context::{StepCo, StepResume, StepYield};
 use crate::bail_delta;
 use crate::plans::errors::{DeltaError, DeltaErrorCode};
@@ -100,8 +100,9 @@ impl<R: 'static> Coroutine<R> {
         });
         // genawaiter2's `Gen<Y, R, F>` exposes only `resume_with(R)`; the first resume arg is
         // discarded because no future is yet awaiting it. We pass an inert
-        // `Ok(StepResult::empty())` sentinel that the body would never observe.
-        let state = match gen.resume_with(StepResume(Ok(StepResult::empty()))) {
+        // `Ok(StepPayload::Empty)` sentinel that the body never observes (a yield always
+        // precedes any awaited resume, and zero-yield bodies terminate before inspection).
+        let state = match gen.resume_with(StepResume(Ok(StepPayload::Empty))) {
             GeneratorState::Yielded(phase) => SmPosition::Yielded(phase),
             GeneratorState::Complete(result) => SmPosition::ResultReady(result),
         };
@@ -151,7 +152,7 @@ impl<R: 'static> StateMachine for Coroutine<R> {
 
     fn submit(
         &mut self,
-        result: Result<StepResult, EngineError>,
+        result: Result<StepPayload, EngineError>,
     ) -> Result<NextStep<R>, DeltaError> {
         match std::mem::replace(&mut self.state, SmPosition::Done) {
             SmPosition::ResultReady(value) => value.map(NextStep::Done),
@@ -188,7 +189,7 @@ mod tests {
         Step::SchemaQuery(SchemaQueryNode::new("/toy"))
     }
 
-    /// Drive a two-phase SM: yield op A, observe empty StepResult, yield op B, complete.
+    /// Drive a two-phase SM: yield op A, observe empty payload, yield op B, complete.
     #[test]
     fn two_phase_sm_executes_in_sequence() {
         let mut sm = Coroutine::<i64>::new("test", |mut co, _sm_id| async move {
@@ -214,14 +215,14 @@ mod tests {
         let op = sm.get_step().unwrap();
         assert!(matches!(op, Step::SchemaQuery(_)));
 
-        let r = sm.submit(Ok(StepResult::empty())).unwrap();
+        let r = sm.submit(Ok(StepPayload::Empty)).unwrap();
         assert!(matches!(r, NextStep::Continue));
         assert_eq!(sm.step_name(), "phase_b");
 
         let op = sm.get_step().unwrap();
         assert!(matches!(op, Step::SchemaQuery(_)));
 
-        let r = sm.submit(Ok(StepResult::empty())).unwrap();
+        let r = sm.submit(Ok(StepPayload::Empty)).unwrap();
         match r {
             NextStep::Done(v) => assert_eq!(v, 42),
             _ => panic!("expected Done"),
@@ -263,7 +264,7 @@ mod tests {
     fn zero_phase_coroutine_returns_value_on_first_submit() {
         let mut sm = Coroutine::<i32>::new("test", |_co, _sm_id| async move { Ok(7) }).unwrap();
         assert!(sm.get_step().is_err());
-        let r = sm.submit(Ok(StepResult::empty())).unwrap();
+        let r = sm.submit(Ok(StepPayload::Empty)).unwrap();
         match r {
             NextStep::Done(v) => assert_eq!(v, 7),
             _ => panic!("expected Done"),

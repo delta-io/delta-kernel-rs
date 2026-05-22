@@ -16,6 +16,7 @@ use delta_kernel::expressions::{ColumnName, Expression, Predicate, Scalar};
 use delta_kernel::plans::ir::nodes::{ConsumeSink, FileType, ScanFileColumns};
 use delta_kernel::plans::ir::ssa::{JoinKind, Node, Plan as SsaPlan, ResultPlan as SsaResultPlan};
 use delta_kernel::plans::operations::framework::step::Step;
+use delta_kernel::plans::operations::framework::step_payload::StepPayload;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 
@@ -254,8 +255,8 @@ fn left_anti_join_drops_matched_left_rows() {
 }
 
 /// `Step::Consume` drains an SSA dataflow into a [`KernelConsumer`]
-/// (`KernelConsumer::finish` -> `usize` row count) and the executor harvests the
-/// finalized handle into the `StepResult` keyed by the sink's token.
+/// (`KernelConsumer::finish` -> `usize` row count) and the executor returns the finalized
+/// handle as `StepPayload::Consumer`, keyed by the sink's token.
 #[tokio::test]
 async fn step_consume_drains_ssa_into_consumer_handle() {
     let mut plan = SsaPlan::new();
@@ -282,7 +283,7 @@ async fn step_consume_drains_ssa_into_consumer_handle() {
     let stmts = plan.stmts;
 
     let executor = DataFusionExecutor::try_new().unwrap();
-    let state = executor
+    let payload = executor
         .execute_step(Step::Consume {
             stmts,
             terminal,
@@ -291,11 +292,17 @@ async fn step_consume_drains_ssa_into_consumer_handle() {
         .await
         .expect("Step::Consume execution");
 
-    let payload = state
-        .take_by_token(&token)
-        .expect("SumRowsConsumer payload submitted");
-    let total = *payload
-        .downcast_ref::<usize>()
+    let handle = match payload {
+        StepPayload::Consumer(h) => h,
+        other => panic!("expected StepPayload::Consumer, got {other:?}"),
+    };
+    assert_eq!(
+        handle.token, token,
+        "finished handle carries the sink token"
+    );
+    let total = *handle
+        .erased
+        .downcast::<usize>()
         .expect("SumRowsConsumer finishes with usize");
     assert_eq!(total, 2, "filter keeps rows with v > 2 (i.e., 3 and 4)");
 }

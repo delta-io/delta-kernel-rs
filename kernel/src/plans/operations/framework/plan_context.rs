@@ -44,6 +44,7 @@ use crate::plans::ir::ssa::{JoinKind, Node, Plan, Ref, ResultPlan};
 use crate::plans::kernel_consumers::{Extractor, KernelConsumer, KernelConsumerOutput};
 use crate::plans::operations::framework::coroutine::context::{StepCo, StepResume, StepYield};
 use crate::plans::operations::framework::step::{SchemaQueryNode, Step};
+use crate::plans::operations::framework::step_payload::StepPayload;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{delta_error, FileMeta};
 
@@ -176,10 +177,18 @@ impl Context {
                 step_name,
             })
             .await;
-        let step_result = result.map_err(|e| e.into_delta_typed())?;
-        extractor
-            .extract(&step_result)
-            .map_err(|e| e.into_delta_typed())
+        let payload = result.map_err(|e| e.into_delta_typed())?;
+        let handle = match payload {
+            StepPayload::Consumer(h) => h,
+            other => {
+                return Err(delta_error!(
+                    DeltaErrorCode::DeltaCommandInvariantViolation,
+                    "consume: executor returned non-Consumer payload `{other:?}` for \
+                     Step::Consume",
+                ));
+            }
+        };
+        extractor.extract(handle).map_err(|e| e.into_delta_typed())
     }
 
     /// Yield a [`Step::SchemaQuery`] and return the schema delivered by the engine.
@@ -206,8 +215,15 @@ impl Context {
                 step_name,
             })
             .await;
-        let step_result = result.map_err(|e| e.into_delta_typed())?;
-        step_result.take_schema()
+        let payload = result.map_err(|e| e.into_delta_typed())?;
+        match payload {
+            StepPayload::Schema(s) => Ok(s),
+            other => Err(delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                "schema_query: executor returned non-Schema payload `{other:?}` for \
+                 Step::SchemaQuery",
+            )),
+        }
     }
 
     /// Drain the accumulator into a [`ResultPlan`] keyed at `cursor`. Performs
@@ -1236,7 +1252,7 @@ mod tests {
     };
     use crate::plans::operations::framework::coroutine::driver::Coroutine;
     use crate::plans::operations::framework::state_machine::{NextStep, StateMachine};
-    use crate::plans::operations::framework::step_result::StepResult;
+    use crate::plans::operations::framework::step_payload::StepPayload;
     use crate::schema::DataType;
     use crate::DeltaResult;
 
@@ -1733,20 +1749,40 @@ mod tests {
         };
 
         // Engine drains the sink and resumes with a finished handle.
-        let result = StepResult::empty();
-        result.submit_consumer_handle(FinishedHandle {
+        let payload = StepPayload::Consumer(FinishedHandle {
             token,
             sm_id: Uuid::new_v4(),
             sm_kind: "test",
             step_name: "drain",
             erased: Box::new(EchoConsumer { value: 7 }),
         });
-        let next = sm.submit(Ok(result)).unwrap();
+        let next = sm.submit(Ok(payload)).unwrap();
         match next {
             NextStep::Done(v) => assert_eq!(v, 7),
             _ => panic!("expected Done"),
         }
         assert!(sm.is_done());
+    }
+
+    /// Resuming a `Step::Consume` with a non-Consumer payload surfaces an internal
+    /// error -- the executor produced a payload that doesn't match the yielded step.
+    #[test]
+    fn consume_resume_with_wrong_payload_variant_errors() {
+        let mut sm = Coroutine::<i64>::new("test", |mut co, _sm_id| async move {
+            let ctx = Context::new();
+            let cursor = ctx.values(id_ts_schema(), vec![]).unwrap();
+            ctx.consume(&mut co, cursor, EchoConsumer { value: 1 }, "drain")
+                .await
+        })
+        .unwrap();
+        let _ = sm.get_step().unwrap();
+        let err = sm
+            .submit(Ok(StepPayload::Schema(id_ts_schema())))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-Consumer payload"),
+            "got: {err}",
+        );
     }
 
     /// `schema_query` yields a `Step::SchemaQuery`, the engine resumes with a schema,
@@ -1768,12 +1804,25 @@ mod tests {
             other => panic!("expected SchemaQuery, got {other:?}"),
         }
 
-        let result = StepResult::empty();
-        result.submit_schema(target_schema);
-        match sm.submit(Ok(result)).unwrap() {
+        match sm.submit(Ok(StepPayload::Schema(target_schema))).unwrap() {
             NextStep::Done(v) => assert!(v),
             _ => panic!("expected Done(true)"),
         }
+    }
+
+    /// Resuming a `Step::SchemaQuery` with a non-Schema payload surfaces an internal
+    /// error -- the executor produced a payload that doesn't match the yielded step.
+    #[test]
+    fn schema_query_resume_with_wrong_payload_variant_errors() {
+        let mut sm = Coroutine::<()>::new("test", move |mut co, _sm_id| async move {
+            let ctx = Context::new();
+            let _ = ctx.schema_query(&mut co, "/x.parquet", "footer").await?;
+            Ok(())
+        })
+        .unwrap();
+        let _ = sm.get_step().unwrap();
+        let err = sm.submit(Ok(StepPayload::Empty)).unwrap_err();
+        assert!(err.to_string().contains("non-Schema payload"), "got: {err}",);
     }
 
     /// After `schema_query` bumps the session, cursors built before the dispatch are
@@ -1796,9 +1845,7 @@ mod tests {
 
         // Drive through the schema_query yield.
         let _ = sm.get_step().unwrap();
-        let result = StepResult::empty();
-        result.submit_schema(target_schema);
-        match sm.submit(Ok(result)).unwrap() {
+        match sm.submit(Ok(StepPayload::Schema(target_schema))).unwrap() {
             NextStep::Done(()) => {}
             _ => panic!("expected Done"),
         }
