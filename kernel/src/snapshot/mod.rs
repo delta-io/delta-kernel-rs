@@ -808,6 +808,7 @@ impl Snapshot {
     pub fn approximate_owned_heap_size(&self) -> usize {
         let mut bytes = 0;
 
+        // === Part 1: Listed file metadata ===
         let files = &self.log_segment.listed;
 
         // Sum each Vec's heap buffer (capacity * element size).
@@ -825,18 +826,15 @@ impl Snapshot {
             .iter()
             .chain(&files.ascending_compaction_files)
             .chain(&files.checkpoint_parts)
+            .chain(&files.latest_crc_file)
+            .chain(&files.latest_commit_file)
         {
-            bytes += per_path_heap(p);
-        }
-        if let Some(p) = &files.latest_crc_file {
-            bytes += per_path_heap(p);
-        }
-        if let Some(p) = &files.latest_commit_file {
             bytes += per_path_heap(p);
         }
 
         bytes += self.log_segment.log_root.as_str().len();
 
+        // === Part 2: Raw schemaString JSON ===
         bytes += self.table_configuration().metadata().schema_string().len();
 
         bytes
@@ -3830,25 +3828,80 @@ mod tests {
     }
 
     // === approximate_heap_size ===
-
+    /// Test that the approximate_owned_heap_size is correctly considering normal commit jsons,
+    /// checkpoint parts, and log compaction files.
     #[test]
     fn approximate_owned_heap_size_on_table_with_many_log_files() {
-        // Test table with 100 commits.
-        let (_engine, snap, _table) = test_utils::test_context!(
+        // Baseline: 101 commits (v0..=v100), no checkpoint, no compactions.
+        let (_engine, baseline_snap, _table) = test_utils::test_context!(
             LogState::with_latest_version(100),
             FeatureSet::empty(),
             VersionTarget::Latest,
             SyncEngine::new_with_store
         );
 
-        let heap = snap.approximate_owned_heap_size();
+        let baseline_heap = baseline_snap.approximate_owned_heap_size();
         let struct_size = size_of::<Snapshot>();
         // Heap size should be at least 5 times the stack size, to account for
         // the 100 commits file metadata.
         assert!(
-            heap > 5 * struct_size,
-            "heap size {heap} should exceed 5 * sizeof(Snapshot)={}",
+            baseline_heap > 5 * struct_size,
+            "baseline heap {baseline_heap} should exceed 5 * sizeof(Snapshot)={}",
             5 * struct_size
+        );
+
+        // 100 extra checkpoint parts: each contributes to heap.
+        // Kernel doesn't yet support writing multi-part checkpoints, so we mannually
+        // hacks here.
+        let snap_extra_checkpoints =
+            snapshot_with_extra_files(&baseline_snap, |listed, log_root| {
+                for i in 1..=100u32 {
+                    let filename =
+                        format!("00000000000000000099.checkpoint.{i:010}.0000000100.parquet");
+                    let location = log_root.join(&filename).unwrap();
+                    let part = ParsedLogPath::try_from(crate::FileMeta {
+                        location,
+                        last_modified: 0,
+                        size: 100,
+                    })
+                    .unwrap()
+                    .unwrap();
+                    listed.checkpoint_parts.push(part);
+                }
+            });
+        let delta_checkpoints =
+            snap_extra_checkpoints.approximate_owned_heap_size() - baseline_heap;
+        eprintln!("delta_checkpoints (100 parts) = {delta_checkpoints}");
+        assert!(
+            delta_checkpoints >= 15_000,
+            "delta_checkpoints {delta_checkpoints} should be >= 15_000 for 100 checkpoint parts"
+        );
+
+        // 100 extra log compaction files: each contributes to heap.
+        // Kernel disable writing log compaction files currently, so we mannually hacks here.
+        let snap_extra_compactions =
+            snapshot_with_extra_files(&baseline_snap, |listed, log_root| {
+                for i in 0..100u64 {
+                    let start = i * 10;
+                    let end = start + 5;
+                    let filename = format!("{start:020}.{end:020}.compacted.json");
+                    let location = log_root.join(&filename).unwrap();
+                    let comp = ParsedLogPath::try_from(crate::FileMeta {
+                        location,
+                        last_modified: 0,
+                        size: 100,
+                    })
+                    .unwrap()
+                    .unwrap();
+                    listed.ascending_compaction_files.push(comp);
+                }
+            });
+        let delta_compactions =
+            snap_extra_compactions.approximate_owned_heap_size() - baseline_heap;
+        eprintln!("delta_compactions (100 files) = {delta_compactions}");
+        assert!(
+            delta_compactions >= 15_000,
+            "delta_compactions {delta_compactions} should be >= 15_000 for 100 compaction files"
         );
     }
 
@@ -3918,5 +3971,14 @@ mod tests {
             heap < 10000,
             "heap size {heap} unexpectedly large for v0 snapshot"
         );
+    }
+
+    fn snapshot_with_extra_files<F>(baseline: &SnapshotRef, mutate: F) -> Snapshot
+    where
+        F: FnOnce(&mut LogSegmentFiles, &Url),
+    {
+        let mut new_log_segment = baseline.log_segment().clone();
+        mutate(&mut new_log_segment.listed, &new_log_segment.log_root);
+        Snapshot::new(new_log_segment, baseline.table_configuration().clone())
     }
 }
