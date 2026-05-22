@@ -56,6 +56,11 @@
 //!   `Timestamp`, `Decimal`, and `Binary` are not yet wired through; engines requesting them get
 //!   `false` from the accessor.
 //!
+//! Engines that speak the Arrow C Data Interface (arrow-java, arrow-rs, etc.)
+//! can call [`batch_stats_as_arrow`] to get an `ArrowFFIData *` view of the
+//! whole metadata batch and import via their own runtime, skipping the
+//! per-row scalar getters. The scalar lane remains the fallback.
+//!
 //! [`Predicate::Opaque`]: delta_kernel::expressions::Predicate::Opaque
 //! [`visit_predicate_opaque_with_pruning`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning
 
@@ -603,11 +608,9 @@ pub trait BatchStatsProvider {
 pub struct BatchStatsAccessor<'a> {
     provider: &'a dyn BatchStatsProvider,
     arena: StrArena,
-    /// Optional pointer to an `ArrowFFIData` (kept opaque here so this file
-    /// stays unconditional). Set by the arrow batch evaluator before invoking
-    /// the engine callback so engines that prefer the Arrow C Data Interface
-    /// can call [`batch_stats_as_arrow`] instead of the per-row scalar
-    /// getters. Null when the underlying batch is not Arrow-backed.
+    /// Pointer to an `ArrowFFIData` (opaque here so this unconditional file
+    /// doesn't pull in the feature-gated arrow types). Null for non-Arrow
+    /// providers; exposed via [`batch_stats_as_arrow`].
     arrow_ffi: *const c_void,
 }
 
@@ -620,10 +623,7 @@ impl<'a> BatchStatsAccessor<'a> {
         }
     }
 
-    /// Attach a pointer to an exported `ArrowFFIData` (or any C-compatible
-    /// pointer; engines decode based on documented agreement with the kernel
-    /// path that constructed the accessor). The pointer must outlive the
-    /// accessor.
+    /// Attach an exported `ArrowFFIData` pointer; must outlive the accessor.
     pub(crate) fn with_arrow_ffi(mut self, arrow_ffi: *const c_void) -> Self {
         self.arrow_ffi = arrow_ffi;
         self
@@ -793,27 +793,16 @@ pub unsafe extern "C" fn batch_stats_row_count(
     true
 }
 
-/// Hand the engine an Arrow C Data Interface view of the underlying stats
-/// batch. The returned pointer (when non-null) is an `ArrowFFIData *` -- a
-/// `#[repr(C)]` struct containing inline `FFI_ArrowArray` + `FFI_ArrowSchema`,
-/// see `delta_kernel_ffi::engine_data::ArrowFFIData`. Engines that already
-/// speak the Arrow C Data Interface (arrow-java, arrow-glib, pyarrow, etc.)
-/// can import the batch in their own runtime and process the metadata-batch
-/// columns without going through the per-row scalar getters.
+/// Arrow C Data Interface view of the stats batch as an `ArrowFFIData *`
+/// (see `delta_kernel_ffi::engine_data::ArrowFFIData`). Engines that prefer
+/// the Arrow import flow (`Data.importIntoVector`, `arrow::ffi::from_ffi`)
+/// can read columns directly; the scalar `batch_stats_*` getters remain
+/// available as a fallback.
 ///
-/// Returns null when the accessor wasn't constructed over an Arrow batch, or
-/// when kernel couldn't export the batch (some schemas don't round-trip via
-/// the Arrow C Data Interface); engines should fall back to the scalar
-/// `batch_stats_*` getters in that case.
-///
-/// The pointer is valid for the duration of the surrounding
-/// `eval_against_stats` callback. The standard Arrow import flow (e.g.
-/// arrow-java's `Data.importIntoVector`, `arrow::ffi::from_ffi`) consumes
-/// the `FFI_ArrowArray` and nulls its release callback; kernel's own Drop
-/// on the boxed struct then becomes a no-op (arrow-rs release is
-/// idempotent), so engines are free to import normally. Engines that read
-/// the struct without consuming it are also fine -- kernel's Drop will run
-/// release at callback return.
+/// Returns null when the accessor isn't Arrow-backed or kernel couldn't
+/// export the schema. Pointer is valid for the surrounding
+/// `eval_against_stats` callback. Release is idempotent, so importing
+/// or not importing is safe.
 ///
 /// # Safety
 /// `acc` must be a valid [`BatchStatsAccessor`] pointer if non-null.

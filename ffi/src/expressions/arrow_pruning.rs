@@ -192,18 +192,17 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         };
 
         let provider = BatchedArrowStatsProvider::new(batch);
-        // Export the metadata batch via the Arrow C Data Interface so engines
-        // that already speak arrow can import directly instead of looping
-        // through the scalar accessors. Box-allocated; lives for the duration
-        // of the callback. Construction can fail for unrepresentable schemas
-        // -- in that case we just skip the Arrow lane and force engines to
-        // use the scalar getters.
+        // Export the metadata batch over the Arrow C Data Interface; engines
+        // that import it skip the scalar getters. Null on export failure
+        // (unrepresentable schema) -- engines fall back to the scalar lane.
+        // The Box must outlive `stats` (which holds a raw pointer to it);
+        // declaring it first ensures drop order is stats -> arrow_ffi.
         let arrow_ffi: Option<Box<ArrowFFIData>> = ArrowFFIData::try_from_record_batch(batch)
             .ok()
             .map(Box::new);
-        let arrow_ptr: *const c_void = arrow_ffi.as_deref().map_or(std::ptr::null(), |d| {
-            d as *const ArrowFFIData as *const c_void
-        });
+        let arrow_ptr: *const c_void = arrow_ffi
+            .as_deref()
+            .map_or(std::ptr::null(), |d| d as *const _ as *const c_void);
         let stats = BatchStatsAccessor::new(&provider).with_arrow_ffi(arrow_ptr);
         let children = ChildAccessor::new(args);
         let mut verdicts = vec![OpaquePruneVerdict::Unknown; n_rows];
@@ -216,9 +215,7 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
             inverted,
             &mut verdicts,
         );
-        // `arrow_ffi` drops at end of scope; FFI_ArrowArray / FFI_ArrowSchema
-        // run their release callbacks if the engine hasn't already imported
-        // them (release is idempotent, so no double-free if it did).
+        // arrow_ffi drops here; release is idempotent.
 
         let bools: Vec<Option<bool>> = verdicts
             .iter()
@@ -369,11 +366,8 @@ mod tests {
 
     // === Arrow C Data Interface passthrough ==================================
 
-    /// Capture the pointer kernel hands us via `batch_stats_as_arrow` and
-    /// verify it's a valid `ArrowFFIData` with the right row count. (We don't
-    /// import via arrow-rs's `from_ffi` here because that consumes the array,
-    /// which would conflict with kernel's Drop on the boxed `ArrowFFIData`
-    /// once `eval_pred` returns.)
+    /// Verify `batch_stats_as_arrow` hands back a valid `ArrowFFIData` with
+    /// the right row count.
     #[test]
     fn batch_stats_as_arrow_exports_a_valid_ffi_struct() {
         thread_local! {
@@ -395,9 +389,7 @@ mod tests {
                 return;
             }
             SAW_NON_NULL.with(|c| c.set(true));
-            // Cast to ArrowFFIData and peek at the array length, proving the
-            // struct is layout-valid. An Arrow-Java consumer would call
-            // `Data.importIntoVector` against this same pointer instead.
+            // Read-only peek; full import would consume the array.
             let ffi = p as *const crate::engine_data::ArrowFFIData;
             let len = unsafe { (*ffi).array.len() } as i64;
             SAW_ROW_COUNT.with(|c| c.set(len));
@@ -419,8 +411,6 @@ mod tests {
         assert_eq!(SAW_ROW_COUNT.with(std::cell::Cell::get), 3);
     }
 
-    /// Zero-row batches: kernel must not panic when exporting an empty
-    /// metadata batch. The callback receives a valid (empty) Arrow handle.
     #[test]
     fn eval_pred_on_empty_batch_does_not_panic() {
         use delta_kernel::arrow::array::Int64Array;
@@ -472,6 +462,12 @@ mod tests {
         let result = ArrowOpaquePredicateOp::eval_pred(&op, &[], &batch, false).unwrap();
         assert_eq!(result.len(), 0);
         assert!(SAW_CALLBACK.with(std::cell::Cell::get));
+    }
+
+    #[test]
+    fn batch_stats_as_arrow_returns_null_on_null_accessor() {
+        let p = unsafe { crate::expressions::pruning::batch_stats_as_arrow(std::ptr::null()) };
+        assert!(p.is_null());
     }
 
     #[test]

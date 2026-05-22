@@ -72,9 +72,10 @@ impl ArrowFFIData {
         }
     }
 
-    /// Convert a [`RecordBatch`] into Arrow C Data Interface structs. Same
-    /// ownership rules as [`Self::try_from_engine_data`]. Takes by reference;
-    /// `RecordBatch::clone()` is Arc-cheap so this stays zero-copy.
+    /// Convert a [`RecordBatch`] into Arrow C Data Interface structs. The
+    /// returned `ArrowFFIData` owns the exported buffers (same import/drop
+    /// contract as [`Self::try_from_engine_data`]); the input `RecordBatch`
+    /// is borrowed and only its Arc'd column buffers are referenced.
     pub fn try_from_record_batch(batch: &RecordBatch) -> DeltaResult<Self> {
         let sa: StructArray = batch.clone().into();
         let array_data: ArrayData = sa.into();
