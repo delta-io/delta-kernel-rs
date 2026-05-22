@@ -335,6 +335,19 @@ impl TableConfiguration {
         )
     }
 
+    /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
+    /// every column reference in the rewritten predicate against this set, so the two
+    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
+    /// point to keep their gate input in lockstep.
+    pub(crate) fn physical_stats_columns_set(
+        &self,
+        required_columns: Option<&[ColumnName]>,
+    ) -> HashSet<ColumnName> {
+        self.physical_stats_column_names(required_columns)
+            .into_iter()
+            .collect()
+    }
+
     /// Returns the physical partition schema for `partitionValues_parsed`.
     ///
     /// Field names are physical column names (respecting column mapping mode),

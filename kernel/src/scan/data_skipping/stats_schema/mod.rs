@@ -3,15 +3,13 @@
 mod column_filter;
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::schema::{
-    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
-    StructType,
+    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
@@ -191,31 +189,6 @@ pub(crate) fn stats_column_names(
     let mut columns = Vec::new();
     filter.collect_columns(data_schema, &mut columns);
     columns
-}
-
-/// Creates a stats schema from a referenced schema (e.g. columns from a predicate).
-/// Returns schema: `{ numRecords, nullCount, minValues, maxValues }`
-///
-/// This is used to build the schema for parsing JSON stats and for reading stats_parsed
-/// from checkpoints when only a subset of columns is needed (e.g. predicate-referenced columns).
-pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
-    let stats_schema = schema_with_all_fields_nullable(referenced_schema);
-
-    let nullcount_schema = NullCountStatsTransform
-        .transform_struct(&stats_schema)
-        .into_owned();
-
-    let schema = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(NULL_COUNT, nullcount_schema),
-        StructField::nullable(MIN_VALUES, stats_schema.clone()),
-        StructField::nullable(MAX_VALUES, stats_schema),
-    ]);
-
-    // Strip field metadata. The stats types are derived from the table schema, but the metadata on
-    // the fields should not be included in the stats fields
-    let schema = StripFieldMetadataTransform.transform_struct(&schema);
-    Some(Arc::new(schema.into_owned()))
 }
 
 /// Strips all field metadata from a schema.

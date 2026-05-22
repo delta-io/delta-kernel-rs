@@ -127,7 +127,7 @@ pub(crate) fn get_cdf_transform_expr(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use super::*;
@@ -188,6 +188,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         }
     }
 
@@ -409,6 +410,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);

@@ -46,6 +46,13 @@ struct InternalScanState {
     skip_stats: bool,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
+    /// Physical leaf paths which are expected to have stats collected. Carried alongside
+    /// `physical_stats_schema` so the distributed `DataSkippingFilter` rebuilds the same
+    /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable:
+    /// an empty set drops every data-column reference, which means no skipping but is
+    /// still correct.
+    #[serde(default)]
+    physical_stats_columns: HashSet<ColumnName>,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -224,6 +231,7 @@ impl ScanLogReplayProcessor {
                 partition_schema_for_transform.as_ref(),
                 column_expr_ref!("partitionValues_parsed"),
                 output_schema.clone(),
+                &state_info.physical_stats_columns,
                 Some(metrics.clone()),
             )
         };
@@ -295,6 +303,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             physical_partition_schema,
+            physical_stats_columns,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -313,6 +322,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema,
             skip_stats: self.skip_stats,
             physical_partition_schema,
+            physical_stats_columns,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
@@ -369,6 +379,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
+            physical_stats_columns: internal_state.physical_stats_columns,
         });
 
         Self::new_with_seen_files(
@@ -1036,6 +1047,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -1364,6 +1376,7 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
                 physical_partition_schema: None,
+                physical_stats_columns: HashSet::new(),
             });
             let checkpoint_info = test_checkpoint_info();
             let processor =
@@ -1396,6 +1409,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         });
         let processor =
             ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone(), false)
@@ -1441,6 +1455,7 @@ mod tests {
             physical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1473,6 +1488,7 @@ mod tests {
             physical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();

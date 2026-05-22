@@ -365,8 +365,10 @@ fn test_sql_where() {
 #[test]
 fn test_timestamp_stats_enabled() {
     let empty = HashSet::new();
+    let stats_columns: HashSet<ColumnName> = [column_name!("timestamp_col")].into_iter().collect();
     let creator = DataSkippingPredicateCreator {
         partition_columns: &empty,
+        stats_columns: &stats_columns,
     };
     let col = &column_name!("timestamp_col");
 
@@ -439,7 +441,8 @@ fn test_checkpoint_skipping_semantic(
     #[case] description: &str,
 ) {
     let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    let stats = all_referenced_columns(&pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
     let resolver = HashMap::from_iter([(column_name!("maxValues.x"), max_val)]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
@@ -454,7 +457,8 @@ fn test_checkpoint_skipping_null_guard_vs_regular() {
         HashMap::from_iter([(column_name!("maxValues.x"), Scalar::Null(DataType::INTEGER))]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
 
-    let guarded = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    let stats = all_referenced_columns(&pred);
+    let guarded = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
     expect_eq!(
         filter.eval(&guarded),
         TRUE,
@@ -484,7 +488,8 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
         Pred::gt(column_expr!("col_a"), Scalar::from(100)),
         Pred::lt(column_expr!("col_b"), Scalar::from(50)),
     );
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    let stats = all_referenced_columns(&pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
 
     // Both stats present and both allow pruning -> skip
     let resolver = HashMap::from_iter([
@@ -539,7 +544,8 @@ fn test_checkpoint_skipping_timestamp_adjustment(
 
     // GT: should produce OR(maxValues.ts_col IS NULL, maxValues.ts_col > 999001)
     let pred = Pred::gt(col.clone(), timestamp.clone());
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    let stats = all_referenced_columns(&pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
     assert_eq!(
         skipping_pred.to_string(),
         "OR(Column(maxValues.ts_col) IS NULL, Column(maxValues.ts_col) > 999001)"
@@ -547,7 +553,8 @@ fn test_checkpoint_skipping_timestamp_adjustment(
 
     // EQ: max stat leg should use adjusted literal
     let pred = Pred::eq(col.clone(), timestamp.clone());
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    let stats = all_referenced_columns(&pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
     assert_eq!(
         skipping_pred.to_string(),
         "AND(OR(Column(minValues.ts_col) IS NULL, NOT(Column(minValues.ts_col) > 1000000)), \
@@ -1085,7 +1092,8 @@ fn multiple_partition_columns_rewrite_and_evaluation() {
 #[test]
 fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
     let pred = Pred::and_from([Pred::unknown("unsupported")]);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]);
+    let stats = all_referenced_columns(&pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats);
     assert!(
         skipping_pred.is_none(),
         "Single unsupported predicate in a junction should disable pushdown, got: {skipping_pred:?}"
@@ -1361,4 +1369,134 @@ fn timestamp_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
 )]
 fn unsupported_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
     assert_eq!(count_selected(STATS_TABLE, Arc::new(pred)), expected);
+}
+
+// === Stats-columns gate: non-stat refs collapse to NULL ===
+//
+// Covers the predicate-rewrite half of the gate. The upstream column-selection half
+// (numIndexedCols cap, statsColumns, struct prefixes, etc.) is in
+// `stats_schema::column_filter::tests`.
+
+/// Builds a stats-column set from leaf paths spelled as dotted strings.
+fn stats_cols(cols: &[&str]) -> HashSet<ColumnName> {
+    cols.iter().map(|s| ColumnName::new(s.split('.'))).collect()
+}
+
+/// Rewrite shape for the production `DataSkippingPredicateCreator` SQL-WHERE path.
+///
+/// Each case is a `(SQL predicate, partition columns, stats_parsed contents, expected
+/// rewrite)` row. `expected` is the exact display form of the rewrite. The SQL-WHERE
+/// wrapping adds a per-column not-all-null guard (`NOT(nullCount = numRecords)`) and a
+/// `true` filler around each stat comparison; non-stat refs fold to a `null` literal
+/// inside a `AND(null, true)` 2-arg group, evaluating to NULL ("keep the file").
+///
+/// Companion semantic test: `mixed_and_non_stat_arm_still_prunes_via_stat_arm` (below)
+/// shows the rewrite from `stat_and_non_stat_folds_non_stat` actually prunes a file
+/// when the stat arm's min/max bounds rule it out.
+#[rstest]
+#[case::non_stat_only_folds_to_trivial_null(
+    Pred::gt(column_expr!("non_stat"), Scalar::from(1)),
+    HashSet::<String>::new(),
+    stats_cols(&["stat"]),
+    "AND(null, true)",
+)]
+#[case::stat_and_non_stat_folds_non_stat(
+    Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    ),
+    HashSet::<String>::new(),
+    stats_cols(&["stat"]),
+    "AND(AND(NOT(Column(stats_parsed.nullCount.stat) = Column(stats_parsed.numRecords)), \
+     true, Column(stats_parsed.maxValues.stat) > 100), AND(null, true))",
+)]
+#[case::nested_stat_leaf_kept(
+    Pred::and(
+        Pred::gt(column_expr!("user.email"), Scalar::from(100)),
+        Pred::gt(column_expr!("user.password"), Scalar::from(200)),
+    ),
+    HashSet::<String>::new(),
+    stats_cols(&["user.email"]),
+    "AND(AND(NOT(Column(stats_parsed.nullCount.user.email) = Column(stats_parsed.numRecords)), \
+     true, Column(stats_parsed.maxValues.user.email) > 100), AND(null, true))",
+)]
+#[case::partition_stat_non_stat_three_way(
+    Pred::and(
+        Pred::gt(column_expr!("part"), Scalar::from("p")),
+        Pred::and(
+            Pred::gt(column_expr!("stat"), Scalar::from(100)),
+            Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+        ),
+    ),
+    HashSet::from(["part".to_string()]),
+    stats_cols(&["stat"]),
+    "AND(AND(OR(NOT(Column(is_add)), NOT(Column(partitionValues_parsed.part) IS NULL)), \
+     true, OR(NOT(Column(is_add)), Column(partitionValues_parsed.part) > 'p')), \
+     AND(AND(NOT(Column(stats_parsed.nullCount.stat) = Column(stats_parsed.numRecords)), \
+     true, Column(stats_parsed.maxValues.stat) > 100), AND(null, true)))",
+)]
+#[case::both_in_stats_set_keeps_both_arms(
+    Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    ),
+    HashSet::<String>::new(),
+    stats_cols(&["stat", "non_stat"]),
+    "AND(AND(NOT(Column(stats_parsed.nullCount.stat) = Column(stats_parsed.numRecords)), \
+     true, Column(stats_parsed.maxValues.stat) > 100), \
+     AND(NOT(Column(stats_parsed.nullCount.non_stat) = Column(stats_parsed.numRecords)), \
+     true, Column(stats_parsed.maxValues.non_stat) > 50))",
+)]
+fn stats_columns_gate_rewrite(
+    #[case] pred: Pred,
+    #[case] partition_columns: HashSet<String>,
+    #[case] stats: HashSet<ColumnName>,
+    #[case] expected: &str,
+) {
+    let result =
+        as_sql_data_skipping_predicate_with_stats_columns(&pred, &partition_columns, &stats)
+            .expect("SQL-WHERE rewrite always returns Some for these cases");
+    assert_eq!(result.to_string(), expected);
+}
+
+/// Semantic companion to `stat_and_non_stat_folds_non_stat`. When `max(stat) < 100` the
+/// stat arm evaluates to false, the AND short-circuits, and the file is pruned despite
+/// the non-stat NULL fold.
+#[test]
+fn mixed_and_non_stat_arm_still_prunes_via_stat_arm() {
+    let pred = Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    );
+    let stats = stats_cols(&["stat"]);
+    let result =
+        as_sql_data_skipping_predicate_with_stats_columns(&pred, &Default::default(), &stats)
+            .unwrap();
+    let resolver = HashMap::from_iter([(
+        column_name!("stats_parsed.maxValues.stat"),
+        Scalar::from(50i32),
+    )]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&result),
+        FALSE,
+        "stat arm prunes despite non-stat NULL fold"
+    );
+}
+
+/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint-pushdown
+/// (NullGuarded) creator, which adds an `IS NULL` guard on each stat ref for safe parquet
+/// row-group filtering. The non-stat arm still folds to NULL.
+#[test]
+fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
+    let pred = Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    );
+    let stats = stats_cols(&["stat"]);
+    let result = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
+    assert_eq!(
+        result.to_string(),
+        "AND(OR(Column(maxValues.stat) IS NULL, Column(maxValues.stat) > 100), null)"
+    );
 }

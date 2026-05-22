@@ -858,7 +858,11 @@ impl Scan {
             .table_configuration()
             .metadata()
             .partition_columns();
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+        let skipping_pred = as_checkpoint_skipping_predicate(
+            predicate,
+            partition_columns,
+            &self.state_info.physical_stats_columns,
+        )?;
 
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),
