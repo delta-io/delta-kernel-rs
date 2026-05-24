@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{CheckpointWriter, LastCheckpointHintStats};
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
@@ -603,6 +603,24 @@ impl Snapshot {
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
+    }
+
+    /// Get the validated [`Protocol`] for this [`Snapshot`].
+    ///
+    /// This reflects the canonical protocol selected by snapshot construction
+    /// (including checkpoint/CRC-assisted reconstruction when available), not
+    /// merely the latest raw protocol action in commit JSON files.
+    pub fn protocol(&self) -> &Protocol {
+        self.table_configuration().protocol()
+    }
+
+    /// Get the validated [`Metadata`] for this [`Snapshot`].
+    ///
+    /// This reflects the canonical metadata selected by snapshot construction
+    /// (including checkpoint/CRC-assisted reconstruction when available), not
+    /// merely the latest raw metadata action in commit JSON files.
+    pub fn metadata(&self) -> &Metadata {
+        self.table_configuration().metadata()
     }
 
     /// Returns the protocol-derived table properties as a map of key-value pairs.

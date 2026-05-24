@@ -1572,6 +1572,48 @@ pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema>
     Ok(ArrowSchema::try_from_kernel(&json_fields)?)
 }
 
+/// Walks `schema` along a dot-segment column path (e.g. `["add", "stats", "minValues"]`) and
+/// returns the resolved Arrow [`crate::arrow::datatypes::FieldRef`]. Each non-terminal segment must
+/// resolve to a struct type; mismatches or missing names produce an error containing the path
+/// traversed so far. Returns an error on an empty path, a missing top-level segment, a non-struct
+/// intermediate segment, or a missing child segment.
+pub fn resolve_field_path(
+    schema: &ArrowSchema,
+    path: &[&str],
+) -> DeltaResult<crate::arrow::datatypes::FieldRef> {
+    let Some((first, rest)) = path.split_first() else {
+        return Err(Error::generic("resolve_field_path: empty path"));
+    };
+    let first_field = schema
+        .field_with_name(first)
+        .map_err(|_| Error::generic(format!("resolve_field_path: schema has no field `{first}`")))?
+        .clone();
+    let mut current_ref: crate::arrow::datatypes::FieldRef = Arc::new(first_field);
+    let mut traversed: Vec<&str> = vec![first];
+    for segment in rest {
+        let crate::arrow::datatypes::DataType::Struct(fields) = current_ref.data_type() else {
+            return Err(Error::generic(format!(
+                "resolve_field_path: segment `{}` is not a struct at path `{}`",
+                traversed.last().copied().unwrap_or(""),
+                traversed.join(".")
+            )));
+        };
+        let child = fields
+            .iter()
+            .find(|f| f.name() == segment)
+            .ok_or_else(|| {
+                Error::generic(format!(
+                    "resolve_field_path: struct at `{}` has no child `{segment}`",
+                    traversed.join(".")
+                ))
+            })?
+            .clone();
+        traversed.push(segment);
+        current_ref = child;
+    }
+    Ok(current_ref)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1691,6 +1733,61 @@ mod tests {
             .set_column_metadata(vec![column_chunk])
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_resolve_field_path_walks_struct_chain() {
+        use crate::arrow::datatypes::{DataType as ADataType, Field as AField, Fields as AFields};
+        let expected_leaf = AField::new("minValues", ADataType::Int64, true);
+        let stats_fields = AFields::from(vec![expected_leaf.clone()]);
+        let add_fields = AFields::from(vec![AField::new(
+            "stats",
+            ADataType::Struct(stats_fields),
+            true,
+        )]);
+        let schema =
+            ArrowSchema::new(vec![AField::new("add", ADataType::Struct(add_fields), true)]);
+        let resolved = resolve_field_path(&schema, &["add", "stats", "minValues"]).unwrap();
+        // Compare the full Field (name + data_type + nullability + metadata): a partial
+        // (name, type)-only check would silently miss a regression that flipped nullability
+        // or stripped metadata while walking the chain.
+        assert_eq!(resolved.as_ref(), &expected_leaf);
+    }
+
+    #[test]
+    fn test_resolve_field_path_rejects_empty_path() {
+        let schema = ArrowSchema::empty();
+        let err = resolve_field_path(&schema, &[]).unwrap_err().to_string();
+        assert!(err.contains("empty path"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_field_path_reports_missing_top_level() {
+        use crate::arrow::datatypes::{DataType as ADataType, Field as AField};
+        let schema = ArrowSchema::new(vec![AField::new("present", ADataType::Int64, true)]);
+        let err = resolve_field_path(&schema, &["missing"]).unwrap_err().to_string();
+        assert!(err.contains("no field `missing`"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_field_path_rejects_non_struct_intermediate() {
+        use crate::arrow::datatypes::{DataType as ADataType, Field as AField};
+        let schema = ArrowSchema::new(vec![AField::new("leaf", ADataType::Int64, true)]);
+        let err = resolve_field_path(&schema, &["leaf", "child"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a struct"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_field_path_reports_missing_struct_child() {
+        use crate::arrow::datatypes::{DataType as ADataType, Field as AField, Fields as AFields};
+        let inner = AFields::from(vec![AField::new("a", ADataType::Int64, true)]);
+        let schema = ArrowSchema::new(vec![AField::new("s", ADataType::Struct(inner), true)]);
+        let err = resolve_field_path(&schema, &["s", "missing"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no child `missing`"), "got: {err}");
     }
 
     #[test]

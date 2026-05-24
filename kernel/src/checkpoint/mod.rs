@@ -331,6 +331,23 @@ impl CheckpointWriter {
             checkpoint_output_schema: OnceLock::new(),
         })
     }
+
+    /// Returns the Arrow/engine checkpoint row schema after stats transforms for this snapshot.
+    ///
+    /// This matches the schema of rows yielded by [`Self::checkpoint_data`] after each batch has
+    /// [`crate::engine_data::FilteredEngineData::apply_selection_vector`] applied.
+    pub fn checkpoint_output_schema(&self, engine: &dyn Engine) -> DeltaResult<SchemaRef> {
+        let schema_context = self.checkpoint_schema_context(engine)?;
+        self.get_or_init_output_schema(|| {
+            build_checkpoint_output_schema(
+                &schema_context.stats_config,
+                &schema_context.checkpoint_base_schema,
+                &schema_context.stats_schema,
+                schema_context.partition_schema.as_deref(),
+            )
+        })
+    }
+
     /// Returns the cached output schema, initializing it with `f` on first call.
     ///
     /// `OnceLock::get_or_try_init` is unstable, so we use a custom implementation.

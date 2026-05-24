@@ -109,6 +109,24 @@ pub(crate) fn parse_partition_values(
         .try_collect()
 }
 
+/// Canonical RowId materialization shape: `coalesce(materialized_col, base_row_id +
+/// row_index_col)`. Shared by [`get_transform_expr`] (visitor path, `base_row_id` as a literal)
+/// and the scan SM data stage (`base_row_id` as a per-file file-constant column reference).
+pub(crate) fn row_id_coalesce_expr(
+    materialized_col_name: &str,
+    row_index_col_name: &str,
+    base_row_id: impl Into<Expression>,
+) -> Expression {
+    Expression::coalesce([
+        Expression::column([materialized_col_name]),
+        Expression::binary(
+            BinaryExpressionOp::Plus,
+            base_row_id.into(),
+            Expression::column([row_index_col_name]),
+        ),
+    ])
+}
+
 /// Build a transform expression that converts physical data to the logical schema.
 ///
 /// An empty `transform_spec` is valid and represents the case where only column mapping is needed.
@@ -136,14 +154,11 @@ pub(crate) fn get_transform_expr(
                 let base_row_id = base_row_id.ok_or_else(|| {
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
-                let expr = Arc::new(Expression::coalesce([
-                    Expression::column([field_name]),
-                    Expression::binary(
-                        BinaryExpressionOp::Plus,
-                        Expression::literal(base_row_id),
-                        Expression::column([row_index_field_name]),
-                    ),
-                ]));
+                let expr = Arc::new(row_id_coalesce_expr(
+                    field_name,
+                    row_index_field_name,
+                    Expression::literal(base_row_id),
+                ));
                 transform.with_replaced_field(field_name.clone(), expr)
             }
             MetadataDerivedColumn {

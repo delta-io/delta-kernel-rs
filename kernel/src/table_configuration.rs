@@ -305,6 +305,13 @@ impl TableConfiguration {
     /// Field names are physical column names (respecting column mapping mode),
     /// and field types are the actual partition column data types with their original nullability.
     /// Returns `None` if the table has no partition columns.
+    ///
+    /// Field order follows `metadata().partition_columns()` (the order Spark recorded the
+    /// partition columns in). Used by the checkpoint augmentation path, where the parquet
+    /// schema is keyed by metadata order. This differs from
+    /// [`Self::partition_schema_with_physical_names`], which preserves logical/physical
+    /// schema order and is used by the scan-side data stage; the two intentionally produce
+    /// the same set of fields but in different orders.
     pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
         let partition_columns = self.metadata().partition_columns();
         if partition_columns.is_empty() {
@@ -468,6 +475,37 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn partition_columns(&self) -> &[String] {
         self.metadata().partition_columns()
+    }
+
+    /// Partition schema with **physical** field names (and types), built from the table's
+    /// logical/physical schema pair. `None` when the table has no partition columns or none
+    /// of the declared partition columns resolve in the schema.
+    ///
+    /// Used by the scan SM data stage to materialize `partitionValues_parsed` and by the
+    /// data-skipping setup to narrow stats schemas to partition-referenced fields. Both
+    /// sites used to inline this filter+zip; consolidating here keeps the construction
+    /// (zip logical/physical fields, filter by partition column name) in one place.
+    ///
+    /// Field order follows the table's logical/physical schema (i.e. user-declared column
+    /// order). This differs from [`Self::build_partition_values_parsed_schema`], which orders
+    /// by `metadata().partition_columns()` for checkpoint-side parity. Callers needing
+    /// `partitionValues_parsed`-keyed reads must use the build_ variant; callers projecting
+    /// against the user schema (scan / data-skipping) use this variant.
+    #[internal_api]
+    pub(crate) fn partition_schema_with_physical_names(&self) -> Option<SchemaRef> {
+        let partition_columns = self.partition_columns();
+        if partition_columns.is_empty() {
+            return None;
+        }
+        let partition_fields: Vec<StructField> = self
+            .logical_schema()
+            .fields()
+            .zip(self.physical_schema().fields())
+            .filter(|(lf, _)| partition_columns.contains(lf.name()))
+            .map(|(_, pf)| pf.clone())
+            .collect();
+        (!partition_fields.is_empty())
+            .then(|| Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to

@@ -20,6 +20,7 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::utils::test_utils::{sync_engine_and_snapshot, sync_engine_arc_and_snapshot};
 use crate::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
     ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
@@ -353,12 +354,7 @@ fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String
 
 #[test]
 fn test_scan_metadata_paths() {
-    let path =
-        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (engine, snapshot) = sync_engine_and_snapshot("./tests/data/table-without-dv-small/");
     let scan = snapshot.scan_builder().build().unwrap();
     let files = get_files_for_scan(scan, &engine).unwrap();
     assert_eq!(files.len(), 1);
@@ -370,12 +366,7 @@ fn test_scan_metadata_paths() {
 
 #[test_log::test]
 fn test_scan_metadata() {
-    let path =
-        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/table-without-dv-small/");
     let scan = snapshot.scan_builder().build().unwrap();
     let files: Vec<Box<dyn EngineData>> = scan.execute(engine).unwrap().try_collect().unwrap();
 
@@ -386,12 +377,7 @@ fn test_scan_metadata() {
 
 #[test_log::test]
 fn test_scan_metadata_from_same_version() {
-    let path =
-        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/table-without-dv-small/");
     let version = snapshot.version();
     let scan = snapshot.scan_builder().build().unwrap();
     let files: Vec<_> = scan
@@ -517,11 +503,7 @@ fn test_get_partition_value() {
 
 #[test]
 fn test_replay_for_scan_metadata() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-    let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-    let engine = SyncEngine::new();
-
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (engine, snapshot) = sync_engine_and_snapshot("./tests/data/parquet_row_group_skipping/");
     let scan = snapshot.scan_builder().build().unwrap();
     let result = scan.replay_for_scan_metadata(&engine).unwrap();
     let data: Vec<_> = result.actions.try_collect().unwrap();
@@ -534,11 +516,8 @@ fn test_replay_for_scan_metadata() {
 
 #[test]
 fn test_data_row_group_skipping() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-    let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) =
+        sync_engine_arc_and_snapshot("./tests/data/parquet_row_group_skipping/");
 
     // No predicate pushdown attempted, so the one data file should be returned.
     //
@@ -577,11 +556,8 @@ fn test_data_row_group_skipping() {
 
 #[test]
 fn test_missing_column_row_group_skipping() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-    let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) =
+        sync_engine_arc_and_snapshot("./tests/data/parquet_row_group_skipping/");
 
     // Predicate over a logically valid but physically missing column. No data files should be
     // returned because the column is inferred to be all-null.
@@ -609,14 +585,8 @@ fn test_missing_column_row_group_skipping() {
 
 #[test_log::test]
 fn test_scan_with_checkpoint() -> DeltaResult<()> {
-    let path = std::fs::canonicalize(PathBuf::from(
-        "./tests/data/with_checkpoint_no_last_checkpoint/",
-    ))?;
-
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (engine, snapshot) =
+        sync_engine_and_snapshot("./tests/data/with_checkpoint_no_last_checkpoint/");
     let scan = snapshot.scan_builder().build()?;
     let files = get_files_for_scan(scan, &engine)?;
     // test case:
@@ -666,10 +636,7 @@ fn assert_stats_struct_matches_json(
 fn test_scan_metadata_with_stats_columns() {
     const STATS_PARSED_COL: &str = "stats_parsed";
 
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     let scan = snapshot
         .scan_builder()
@@ -767,11 +734,7 @@ fn test_scan_metadata_with_stats_columns() {
 fn test_scan_metadata_stats_columns_with_predicate() {
     const STATS_PARSED_COL: &str = "stats_parsed";
 
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     // Build scan with both a predicate and stats_columns
     let predicate = Arc::new(column_expr!("id").gt(Expr::literal(0i64)));
@@ -853,10 +816,7 @@ fn test_prefix_columns_simple() {
 
 #[test]
 fn test_build_actions_meta_predicate_with_predicate() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (_engine, snapshot) = sync_engine_and_snapshot("./tests/data/parsed-stats/");
 
     // Build a scan with a predicate eligible for data skipping
     let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
@@ -889,10 +849,7 @@ fn test_build_actions_meta_predicate_with_predicate() {
 
 #[test]
 fn test_build_actions_meta_predicate_no_predicate() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (_engine, snapshot) = sync_engine_and_snapshot("./tests/data/parsed-stats/");
 
     // Build a scan with no predicate
     let scan = snapshot.scan_builder().build().unwrap();
@@ -905,10 +862,7 @@ fn test_build_actions_meta_predicate_no_predicate() {
 
 #[test]
 fn test_build_actions_meta_predicate_static_skip_all() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (_engine, snapshot) = sync_engine_and_snapshot("./tests/data/parsed-stats/");
 
     // A predicate that statically evaluates to false should produce StaticSkipAll,
     // which means build_actions_meta_predicate returns None.
@@ -1143,10 +1097,7 @@ fn test_checkpoint_row_group_skipping(
 
 #[test]
 fn test_skip_stats_disables_data_skipping() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
     let scan = snapshot
@@ -1178,10 +1129,7 @@ fn test_skip_stats_disables_data_skipping() {
 fn test_skip_stats_after_include_all_stats_columns_wins() {
     // With StatsOutputMode enum, last call wins. Calling with_skip_stats(true) after
     // include_all_stats_columns() should result in stats being skipped.
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
     let scan = snapshot
@@ -1214,10 +1162,7 @@ fn test_skip_stats_after_include_all_stats_columns_wins() {
 #[test]
 fn test_with_stats_columns_empty_no_stats_output() {
     // with_stats_columns(vec![]) should produce no stats output
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     let scan = snapshot
         .scan_builder()
@@ -1254,10 +1199,7 @@ fn test_with_stats_columns_empty_no_stats_output() {
 /// Verifies that requesting `vec![col!("id")]` only includes `id` in minValues/maxValues/nullCount.
 #[test]
 fn test_scan_metadata_with_specific_stats_columns() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     // Request only "id" column stats
     let scan = snapshot
@@ -1312,10 +1254,7 @@ fn test_scan_metadata_with_specific_stats_columns() {
 /// Test that `with_stats_columns` with multiple specific columns returns stats for all of them.
 #[test]
 fn test_scan_metadata_with_multiple_stats_columns() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     // Request "id" and "name" column stats (not "age" or "salary")
     let scan = snapshot
@@ -1382,10 +1321,7 @@ fn test_scan_metadata_with_multiple_stats_columns() {
 /// column.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let (engine, snapshot) = sync_engine_arc_and_snapshot("./tests/data/parsed-stats/");
 
     let scan = snapshot
         .scan_builder()
