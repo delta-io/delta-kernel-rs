@@ -284,7 +284,9 @@ fn schema_after_field_op(
                 // Mirror the `op:` prefix that `with_field_replaced` /
                 // `with_field_inserted_after` errors carry, so `drop_col:` shows up at the
                 // top of the chain when the closure error bubbles out of with_struct_at.
-                return Err(Error::generic(format!("drop_col: field {leaf:?} not found")));
+                return Err(Error::generic(format!(
+                    "drop_col: field {leaf:?} not found"
+                )));
             }
             Ok(s.with_field_removed(leaf))
         }
@@ -478,7 +480,9 @@ mod tests {
         let op = FieldOp::Drop {
             target: col_path(&["s", "missing"]),
         };
-        let err = compile_field_op(&input, &op).err().expect("missing leaf must error");
+        let err = compile_field_op(&input, &op)
+            .err()
+            .expect("missing leaf must error");
         // `drop_col:` is the prefix the closure attaches via Error::generic(format!).
         assert!(
             err.to_string().contains("drop_col:"),

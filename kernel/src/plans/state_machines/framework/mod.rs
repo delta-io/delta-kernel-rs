@@ -11,10 +11,11 @@
 //! - [`coroutine`] -- [`CoroutineSM`](coroutine::CoroutineSM), the async-fn-backed `StateMachine`
 //!   impl. Wraps `genawaiter2::rc::Gen` to translate the typed `StepYield` / `StepResume` protocol
 //!   (both `pub(crate)`) into the `StateMachine` trait the executor drives.
-//!
-//! The `plan_context` module (Context + PlanBuilder) lives in a sibling stack and is
-//! intentionally not declared here.
+//! - [`plan_context`] -- [`Context`](plan_context::Context) and
+//!   [`PlanBuilder`](plan_context::PlanBuilder), the ergonomic surface SM bodies use to build
+//!   [`Plan`](crate::plans::ir::plan::Plan) graphs.
 
 pub mod coroutine;
 pub mod engine_error;
+pub mod plan_context;
 pub mod state_machine;

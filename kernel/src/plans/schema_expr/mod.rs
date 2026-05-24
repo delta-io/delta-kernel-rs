@@ -7,10 +7,10 @@
 //! [`PlanBuilder`][crate::plans::state_machines::framework::plan_context::PlanBuilder] *and*
 //! engine-side lowering).
 //!
-//! - `check` -- bidirectional type checker for builder schema derivation (`check_expression`
-//!   under strict structural [`DataType`][crate::schema::DataType] equality, plus the
-//!   operator-aligned helpers `infer_projection_schema`, `check_projection`, `check_select`,
-//!   `validate_exprs`). Kernel-internal.
+//! - `check` -- bidirectional type checker for builder schema derivation (`check_expression` under
+//!   strict structural [`DataType`][crate::schema::DataType] equality, plus the operator-aligned
+//!   helpers `infer_projection_schema`, `check_projection`, `check_select`, `validate_exprs`).
+//!   Kernel-internal.
 //! - [`field_op`] -- nested struct edits (`FieldOp` + `compile_field_op`) plus a small set of
 //!   schema/expression conveniences (`arc_struct_or_invariant`, `identity_named_expr`, plus the
 //!   publicly re-exported [`field_op::load_output_schema`] shared with engine-side lowering).
@@ -24,12 +24,6 @@
 //! boundary wrap that into a `DeltaError` with the appropriate code via
 //! [`DeltaResultExt::or_delta`][crate::plans::errors::DeltaResultExt::or_delta]. The boxed
 //! source is preserved through `std::error::Error::source()`.
-
-// schema_expr is the type-checker that `PlanBuilder::project` / `select` / `field_op` rely on
-// (see `state_machines::framework::plan_context`). The consumer module is intentionally not
-// declared in this slice; the module-wide allow keeps the diff quiet on its own and is
-// expected to be removed when the consumer is added.
-#![allow(dead_code)]
 
 pub(crate) mod check;
 pub mod field_op;
