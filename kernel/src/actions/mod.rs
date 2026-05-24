@@ -635,6 +635,7 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
+    #[internal_api]
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         visitor.visit_rows_of(data)?;
@@ -947,7 +948,7 @@ impl SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(ToSchema, Debug, PartialEq)]
+#[derive(ToSchema, Debug, Clone, PartialEq)]
 #[internal_api]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:

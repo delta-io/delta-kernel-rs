@@ -53,6 +53,8 @@ serde_json = "1"
 strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
 prost = { version = "0.13", optional = true }
+# Object-safe `Clone` for the `KernelReducer` trait. Gated by `declarative-plans`.
+dyn-clone = { version = "1.0", optional = true }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = "0.3"
 url = "2"
@@ -116,7 +118,7 @@ arrow-expression = ["need-arrow"]
 schema-diff = []
 
 # Declarative plan IR + proto wire format (experimental).
-declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored"]
+declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored", "dep:dyn-clone"]
 
 # Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
 # work. TODO(#2630): remove once full column-defaults support ships.
