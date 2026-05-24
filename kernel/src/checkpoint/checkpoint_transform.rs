@@ -19,7 +19,7 @@ use crate::actions::ADD_NAME;
 use crate::expressions::{Expression, ExpressionRef, Transform, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Error};
+use crate::DeltaResult;
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const STATS_PARSED_FIELD: &str = "stats_parsed";
@@ -146,36 +146,25 @@ pub(crate) fn build_checkpoint_read_schema(
     stats_schema: &StructType,
     partition_schema: Option<&StructType>,
 ) -> DeltaResult<SchemaRef> {
-    transform_add_schema(base_schema, |add_struct| {
-        // Validate fields aren't already present
-        if add_struct.field(STATS_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
-                "stats_parsed field already exists in Add schema",
-            ));
-        }
-        if partition_schema.is_some() && add_struct.field(PARTITION_VALUES_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
-                "partitionValues_parsed field already exists in Add schema",
-            ));
-        }
-        let mut result = add_struct.clone().with_field_inserted_after(
-            Some(STATS_FIELD),
+    let mut new_struct = base_schema.clone().with_nested_field_inserted_after(
+        &[ADD_NAME],
+        Some(STATS_FIELD),
+        StructField::nullable(
+            STATS_PARSED_FIELD,
+            DataType::Struct(Box::new(stats_schema.clone())),
+        ),
+    )?;
+    if let Some(pv_schema) = partition_schema {
+        new_struct = new_struct.with_nested_field_inserted_after(
+            &[ADD_NAME],
+            Some(PARTITION_VALUES_FIELD),
             StructField::nullable(
-                STATS_PARSED_FIELD,
-                DataType::Struct(Box::new(stats_schema.clone())),
+                PARTITION_VALUES_PARSED_FIELD,
+                DataType::Struct(Box::new(pv_schema.clone())),
             ),
         )?;
-        if let Some(pv_schema) = partition_schema {
-            result = result.with_field_inserted_after(
-                Some(PARTITION_VALUES_FIELD),
-                StructField::nullable(
-                    PARTITION_VALUES_PARSED_FIELD,
-                    DataType::Struct(Box::new(pv_schema.clone())),
-                ),
-            )?;
-        }
-        Ok(result)
-    })
+    }
+    Ok(Arc::new(new_struct))
 }
 
 /// Builds the output schema based on configuration.
@@ -193,9 +182,12 @@ pub(crate) fn build_checkpoint_output_schema(
     stats_schema: &StructType,
     partition_schema: Option<&StructType>,
 ) -> DeltaResult<SchemaRef> {
-    transform_add_schema(base_schema, |add_struct| {
-        build_add_output_schema(config, add_struct, stats_schema, partition_schema)
-    })
+    base_schema
+        .clone()
+        .map_struct_at(&[ADD_NAME], |add_struct| {
+            build_add_output_schema(config, &add_struct, stats_schema, partition_schema)
+        })
+        .map(Arc::new)
 }
 
 // ========================
@@ -252,48 +244,6 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
         ),
     ]))
 });
-
-/// Transforms the Add action schema within a checkpoint schema.
-///
-/// This helper applies a transformation function to the Add struct and returns
-/// a new schema with the modified Add field.
-// TODO(https://github.com/delta-io/delta-kernel-rs/issues/1820): Replace manual field
-// iteration with StructType helper methods (e.g., with_field_inserted, with_field_removed).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The `add` field is not found in the schema
-/// - The `add` field is not a struct type
-fn transform_add_schema(
-    base_schema: &StructType,
-    transform_fn: impl FnOnce(&StructType) -> DeltaResult<StructType>,
-) -> DeltaResult<SchemaRef> {
-    // Find and validate the add field
-    let add_field = base_schema
-        .field(ADD_NAME)
-        .ok_or_else(|| Error::generic("Expected 'add' field in checkpoint schema"))?;
-
-    let DataType::Struct(add_struct) = &add_field.data_type else {
-        return Err(Error::generic(format!(
-            "Expected 'add' field to be a struct type, got {:?}",
-            add_field.data_type
-        )));
-    };
-
-    let modified_add = transform_fn(add_struct)?;
-    let new_schema = base_schema.clone().with_field_replaced(
-        ADD_NAME,
-        StructField {
-            name: ADD_NAME.to_string(),
-            data_type: DataType::Struct(Box::new(modified_add)),
-            nullable: add_field.nullable,
-            metadata: add_field.metadata.clone(),
-        },
-    )?;
-
-    Ok(Arc::new(new_schema))
-}
 
 fn build_add_output_schema(
     config: &StatsTransformConfig,
