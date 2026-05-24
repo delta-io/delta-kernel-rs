@@ -377,7 +377,7 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 #[internal_api]
 pub(crate) struct SidecarVisitor {
     pub(crate) sidecars: Vec<Sidecar>,
