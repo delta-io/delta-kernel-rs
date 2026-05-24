@@ -4,6 +4,7 @@ pub mod ir;
 pub mod kernel_reducers;
 pub mod proto;
 mod query_builder;
+pub mod schema_expr;
 pub mod state_machines;
 
 use bytes::Bytes;
