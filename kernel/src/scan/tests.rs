@@ -1555,7 +1555,7 @@ mod scan_metadata_completed_tests {
         reporter
             .events()
             .into_iter()
-            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted(_)))
             .expect("expected ScanMetadataCompleted event")
     }
 
@@ -1595,24 +1595,15 @@ mod scan_metadata_completed_tests {
         #[case] expected_filtered: u64,
     ) {
         let (reporter, _guard, _) = run_scan(table, predicate);
-        let MetricEvent::ScanMetadataCompleted {
-            total_duration,
-            num_add_files_seen,
-            num_active_add_files,
-            active_add_files_bytes,
-            num_remove_files_seen,
-            num_predicate_filtered,
-            ..
-        } = get_scan_event(&reporter)
-        else {
+        let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
-        assert!(total_duration > Duration::ZERO);
-        assert_eq!(num_add_files_seen, expected_add_seen);
-        assert_eq!(num_active_add_files, expected_active);
-        assert_eq!(active_add_files_bytes, expected_active_bytes);
-        assert_eq!(num_remove_files_seen, expected_removes);
-        assert_eq!(num_predicate_filtered, expected_filtered);
+        assert!(e.duration > Duration::ZERO);
+        assert_eq!(e.num_add_files_seen, expected_add_seen);
+        assert_eq!(e.num_active_add_files, expected_active);
+        assert_eq!(e.active_add_files_bytes, expected_active_bytes);
+        assert_eq!(e.num_remove_files_seen, expected_removes);
+        assert_eq!(e.num_predicate_filtered, expected_filtered);
     }
 
     #[test]
@@ -1632,6 +1623,6 @@ mod scan_metadata_completed_tests {
         assert!(reporter
             .events()
             .iter()
-            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
+            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_))));
     }
 }

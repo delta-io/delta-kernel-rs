@@ -11,8 +11,8 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::reporter::{
-    COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME, STORAGE_SPAN,
+use crate::metrics::events::{
+    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, STORAGE_SPAN,
 };
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
@@ -173,12 +173,12 @@ async fn list_from_impl(
         // (not here on the background thread where no tracing subscriber is installed).
         let stream = MetricsIterator::new(
             stream::iter(items.into_iter().map(Ok::<FileMeta, crate::Error>)),
-            LIST_COMPLETED_NAME,
+            StorageListCompleted::NAME,
             start,
         );
         Ok(Box::pin(stream))
     } else {
-        let stream = MetricsIterator::new(stream, LIST_COMPLETED_NAME, start);
+        let stream = MetricsIterator::new(stream, StorageListCompleted::NAME, start);
         Ok(Box::pin(stream))
     }
 }
@@ -222,7 +222,7 @@ async fn read_files_impl(
     // buffer the results. This allows us to achieve async concurrency.
     Ok(Box::pin(MetricsIterator::new(
         files.buffered(readahead),
-        READ_COMPLETED_NAME,
+        StorageReadCompleted::NAME,
         start,
     )))
 }
@@ -245,9 +245,9 @@ async fn copy_atomic_impl(
     let duration = start.elapsed();
     let _span = tracing::span!(
         tracing::Level::INFO,
-        "storage",
+        STORAGE_SPAN,
         report = tracing::field::Empty,
-        name = COPY_COMPLETED_NAME,
+        name = StorageCopyCompleted::NAME,
         duration = duration.as_nanos() as u64,
     );
 

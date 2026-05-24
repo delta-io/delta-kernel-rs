@@ -9,6 +9,7 @@ use super::LogSegment;
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::{CrcLoadResult, LazyCrc};
 use crate::log_replay::ActionsBatch;
+use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
 use crate::metrics::MetricId;
 use crate::{DeltaResult, Engine, Error};
 
@@ -18,8 +19,7 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
     /// fresh snapshot creation where both Protocol and Metadata must exist.
-    // Span name must match `SEGMENT_READ_METADATA_SPAN` in `metrics::reporter`.
-    #[instrument(name = "segment.read_metadata", fields(report, operation_id = %operation_id), skip(engine))]
+    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, fields(report, operation_id = %operation_id), skip(engine))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,

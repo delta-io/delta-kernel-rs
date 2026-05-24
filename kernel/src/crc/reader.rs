@@ -3,7 +3,7 @@
 use tracing::instrument;
 
 use super::Crc;
-use crate::metrics::reporter::CRC_READ_COMPLETED_SPAN;
+use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
 use crate::{DeltaResult, Engine, Error};
 
@@ -156,12 +156,10 @@ mod tests {
         let crc_events: Vec<_> = reporter
             .events()
             .into_iter()
-            .filter(|e| matches!(e, MetricEvent::CrcReadCompleted { .. }))
+            .filter(|e| matches!(e, MetricEvent::CrcReadCompleted(_)))
             .collect();
         assert_eq!(crc_events.len(), 1);
-        assert!(
-            matches!(&crc_events[0], MetricEvent::CrcReadCompleted { bytes_read, .. } if *bytes_read > 0)
-        );
+        assert!(matches!(&crc_events[0], MetricEvent::CrcReadCompleted(e) if e.bytes_read > 0));
     }
 
     #[test]
@@ -179,11 +177,9 @@ mod tests {
         let crc_events: Vec<_> = reporter
             .events()
             .into_iter()
-            .filter(|e| matches!(e, MetricEvent::CrcReadCompleted { .. }))
+            .filter(|e| matches!(e, MetricEvent::CrcReadCompleted(_)))
             .collect();
         assert_eq!(crc_events.len(), 1);
-        assert!(
-            matches!(&crc_events[0], MetricEvent::CrcReadCompleted { bytes_read, .. } if *bytes_read > 0)
-        );
+        assert!(matches!(&crc_events[0], MetricEvent::CrcReadCompleted(e) if e.bytes_read > 0));
     }
 }
