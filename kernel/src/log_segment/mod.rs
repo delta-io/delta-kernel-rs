@@ -889,58 +889,57 @@ impl LogSegment {
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
         let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
         let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
-            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
-                (needs_add_augmentation, action_schema.field("add"))
-            {
-                let DataType::Struct(add_struct) = add_field.data_type() else {
-                    return Err(Error::internal_error(
-                        "add field in action schema must be a struct",
-                    ));
-                };
-                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-
-                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable(
-                        "stats_parsed",
-                        DataType::Struct(Box::new(ss.clone())),
-                    ));
-                }
-
-                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable(
-                        "partitionValues_parsed",
-                        DataType::Struct(Box::new(ps.clone())),
-                    ));
-                }
-
-                // Rebuild schema with modified add field
-                action_schema
-                    .fields()
-                    .map(|f| {
-                        if f.name() == "add" {
-                            StructField::new(
-                                add_field.name(),
-                                StructType::new_unchecked(add_fields.clone()),
-                                add_field.is_nullable(),
-                            )
-                            .with_metadata(add_field.metadata.clone())
-                        } else {
-                            f.clone()
+            let mut schema = action_schema.as_ref().clone();
+            // Augment the `add` child struct with parsed stats / partition values when the
+            // checkpoint advertises native typed columns. Schemas without an `add` field
+            // skip augmentation silently (sidecar still appends below). Schemas that
+            // already declare the parsed fields (e.g. the caller projected them in) reuse
+            // the existing definition rather than re-inserting; matches sidecar handling
+            // below and preserves idempotency on pre-augmented inputs.
+            if needs_add_augmentation {
+                if let Some(add_field) = action_schema.field("add") {
+                    if !matches!(add_field.data_type(), DataType::Struct(_)) {
+                        return Err(Error::internal_error(
+                            "add field in action schema must be a struct",
+                        ));
+                    }
+                    schema = schema.with_struct_at(&["add"], |mut add| {
+                        if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
+                            if add.field("stats_parsed").is_none() {
+                                add = add.with_field_inserted_after(
+                                    None,
+                                    StructField::nullable(
+                                        "stats_parsed",
+                                        DataType::Struct(Box::new(ss.clone())),
+                                    ),
+                                )?;
+                            }
                         }
-                    })
-                    .collect()
-            } else {
-                action_schema.fields().cloned().collect()
-            };
-
-            // Add sidecar column at top-level for V2 checkpoints
-            if needs_sidecar {
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+                        if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
+                            if add.field("partitionValues_parsed").is_none() {
+                                add = add.with_field_inserted_after(
+                                    None,
+                                    StructField::nullable(
+                                        "partitionValues_parsed",
+                                        DataType::Struct(Box::new(ps.clone())),
+                                    ),
+                                )?;
+                            }
+                        }
+                        Ok(add)
+                    })?;
+                }
             }
-
-            Arc::new(StructType::new_unchecked(new_fields))
+            // Schemas that already declare `sidecar` (e.g. when the caller projected
+            // it in) reuse the existing field; otherwise append it at the end.
+            if needs_sidecar && schema.field(SIDECAR_NAME).is_none() {
+                schema = schema.with_field_inserted_after(
+                    None,
+                    StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+                )?;
+            }
+            Arc::new(schema)
         } else {
-            // No modifications needed, use schema as-is
             action_schema.clone()
         };
 

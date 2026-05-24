@@ -3696,6 +3696,114 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
 }
 
 #[tokio::test]
+async fn test_checkpoint_stream_preserves_pre_augmented_add_fields() -> DeltaResult<()> {
+    // When the caller projects `add.stats_parsed` / `add.partitionValues_parsed` /
+    // `sidecar` into the read schema themselves, `create_checkpoint_stream` must
+    // reuse those fields instead of re-inserting (which would duplicate the column
+    // or last-writer-win their type definition). Pin the idempotent behavior so the
+    // augmentation loop can't regress to the pre-`with_struct_at` overwrite path.
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+    let partition_parsed_struct =
+        StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+    let stats_parsed_struct = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+    ]);
+    let add_struct = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable(
+            "partitionValues",
+            crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
+        ),
+        StructField::nullable("partitionValues_parsed", partition_parsed_struct.clone()),
+        StructField::nullable("stats_parsed", stats_parsed_struct.clone()),
+        StructField::nullable("size", DataType::LONG),
+        StructField::nullable("modificationTime", DataType::LONG),
+        StructField::nullable("dataChange", DataType::BOOLEAN),
+    ]);
+    let metadata_struct = StructType::new_unchecked([
+        StructField::nullable("id", DataType::STRING),
+        StructField::nullable(
+            "format",
+            StructType::new_unchecked([StructField::nullable("provider", DataType::STRING)]),
+        ),
+        StructField::nullable("schemaString", DataType::STRING),
+        StructField::nullable(
+            "partitionColumns",
+            crate::schema::ArrayType::new(DataType::STRING, false),
+        ),
+        StructField::nullable(
+            "configuration",
+            crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
+        ),
+        StructField::nullable("createdTime", DataType::LONG),
+    ]);
+    let checkpoint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable("add", add_struct.clone()),
+        StructField::nullable("metaData", metadata_struct),
+    ]));
+
+    add_checkpoint_to_store(
+        &store,
+        add_batch_with_partition_values_parsed(checkpoint_schema.clone()),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+
+    // Build a read schema that ALREADY contains `add.partitionValues_parsed` and
+    // `add.stats_parsed`. Augmentation must observe the pre-existing fields and
+    // skip the with_field_inserted_after call.
+    let read_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "add",
+        add_struct,
+    )]));
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        read_schema,
+        None,
+        Some(&stats_parsed_struct),
+        Some(&partition_parsed_struct),
+    )?;
+
+    let schema = &checkpoint_result.checkpoint_info.checkpoint_read_schema;
+    let add_field = schema.field("add").expect("schema should have 'add' field");
+    let DataType::Struct(out_add) = add_field.data_type() else {
+        panic!("add field should be a struct");
+    };
+    // Both parsed fields appear exactly once and keep their caller-provided definitions.
+    let parsed_partition = out_add.fields().filter(|f| f.name == "partitionValues_parsed").count();
+    let parsed_stats = out_add.fields().filter(|f| f.name == "stats_parsed").count();
+    assert_eq!(
+        parsed_partition, 1,
+        "partitionValues_parsed must be deduplicated when already present"
+    );
+    assert_eq!(
+        parsed_stats, 1,
+        "stats_parsed must be deduplicated when already present"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
