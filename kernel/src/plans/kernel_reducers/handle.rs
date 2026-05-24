@@ -74,12 +74,11 @@ pub struct FinishedHandle {
 /// A typed adapter for pulling the typed output of a single reduce sink
 /// out of a [`FinishedHandle`].
 ///
-/// SM bodies build an `Extractor` while planting an [`EngineRequest::Reduce`] (via
-/// [`Context::reduce`]) and feed the engine's [`FinishedHandle`] back through
-/// [`Self::extract`] on resume.
+/// SM bodies build an `Extractor` while planting an [`EngineRequest::Reduce`] (via the
+/// `Context::reduce` helper, added in a sibling submodule) and feed the engine's
+/// [`FinishedHandle`] back through [`Self::extract`] on resume.
 ///
 /// [`EngineRequest::Reduce`]: crate::plans::state_machines::framework::state_machine::EngineRequest::Reduce
-/// [`Context::reduce`]: crate::plans::state_machines::framework::plan_context::Context::reduce
 pub struct Extractor<O> {
     token: KernelReducerToken,
     extract: fn(Box<dyn Any + Send>) -> Result<O, DeltaError>,
@@ -88,7 +87,7 @@ pub struct Extractor<O> {
 impl<O: Send + 'static> Extractor<O> {
     /// Build an `Extractor` for KDF state `S` at `token`. The stored function pointer
     /// downcasts the erased payload back to `S` and runs `S::into_output`.
-    // Consumer (Context::reduce dispatch) lands in the StateMachine follow-up PR.
+    // Consumer (`Context::reduce` dispatch) lives in a sibling state-machine module.
     #[allow(dead_code)]
     pub(crate) fn for_reducer<S>(token: KernelReducerToken) -> Self
     where
