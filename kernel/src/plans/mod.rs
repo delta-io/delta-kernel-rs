@@ -1,7 +1,7 @@
 //! This module defines the concept of a PlanExecutor and its associated input + output types.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
-mod ir;
+pub mod ir;
 mod query_builder;
 
 use bytes::Bytes;
@@ -18,6 +18,11 @@ use crate::{
 /// declarative, relational plan algebra, without prescribing *how* to do it.
 pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
+    ///
+    /// # Errors
+    ///
+    /// Engine-defined: any failure surfaced while compiling or running `op`. Implementations
+    /// MUST surface failures as [`Error`]; the kernel does not interpret the error variants.
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult>;
 }
 
@@ -38,8 +43,12 @@ pub enum PlanResult {
 }
 
 impl PlanResult {
-    /// Consumes the PlanResult and extracts the inner iterator of EngineData (assuming that it is a
-    /// PlanResult::Data variant). Returns an error if the PlanResult is not the expected variant.
+    /// Unwrap to the [`Data`](Self::Data) iterator.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PlanResultTypeMismatch`] (`expected = "Data"`, `actual = <variant name>`)
+    /// if `self` is any other variant.
     pub fn into_data(self) -> DeltaResult<DeltaResultIteratorStatic<Box<dyn EngineData>>> {
         match self {
             Self::Data(iter) => Ok(iter),
@@ -47,9 +56,12 @@ impl PlanResult {
         }
     }
 
-    /// Consumes the PlanResult and extracts the inner iterator of FileMeta (assuming that it is a
-    /// PlanResult::FileMeta variant). Returns an error if the PlanResult is not the expected
-    /// variant.
+    /// Unwrap to the [`FileMeta`](Self::FileMeta) iterator.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PlanResultTypeMismatch`] (`expected = "FileMeta"`, `actual = <variant name>`)
+    /// if `self` is any other variant.
     pub fn into_file_meta(self) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         match self {
             Self::FileMeta(iter) => Ok(iter),
@@ -57,9 +69,12 @@ impl PlanResult {
         }
     }
 
-    /// Consumes the PlanResult and extracts the inner iterator of Bytes (assuming that it is a
-    /// PlanResult::Bytes variant). Returns an error if the PlanResult is not a PlanResult::Bytes
-    /// variant.
+    /// Unwrap to the [`Bytes`](Self::Bytes) iterator.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PlanResultTypeMismatch`] (`expected = "Bytes"`, `actual = <variant name>`)
+    /// if `self` is any other variant.
     pub fn into_bytes(self) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         match self {
             Self::Bytes(iter) => Ok(iter),
@@ -67,9 +82,12 @@ impl PlanResult {
         }
     }
 
-    /// Consumes the PlanResult and extracts the inner [`ParquetFooter`] (assuming that it is a
-    /// PlanResult::ParquetFooter variant). Returns an error if the PlanResult is not the expected
-    /// variant.
+    /// Unwrap to the [`ParquetFooter`](Self::ParquetFooter) metadata.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PlanResultTypeMismatch`] (`expected = "ParquetFooter"`, `actual = <variant name>`)
+    /// if `self` is any other variant.
     pub fn into_parquet_footer(self) -> DeltaResult<ParquetFooter> {
         match self {
             Self::ParquetFooter(footer) => Ok(footer),
@@ -77,8 +95,12 @@ impl PlanResult {
         }
     }
 
-    /// Consumes the PlanResult, verifying that it is a PlanResult::Unit variant. Returns an error
-    /// if the PlanResult is not the expected variant.
+    /// Assert that the plan completed with no result value.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PlanResultTypeMismatch`] (`expected = "Unit"`, `actual = <variant name>`)
+    /// if `self` is any other variant.
     pub fn into_unit(self) -> DeltaResult<()> {
         match self {
             Self::Unit => Ok(()),
