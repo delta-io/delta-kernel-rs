@@ -24,8 +24,9 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 /// thread.
 ///
 /// Generic over the inner stream type and item type.
-/// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate
-/// MetricEvent. Metrics are emitted either when the iterator is exhausted or when dropped.
+///
+/// Emitted in `Drop`, which fires regardless of whether the iterator was fully consumed or
+/// dropped early.
 struct MetricsIterator<I, T> {
     inner: I,
     name: &'static str,
@@ -63,6 +64,7 @@ impl<I, T> Drop for MetricsIterator<I, T> {
     }
 }
 
+// `list_from` path: counts files only (no payload bytes to measure).
 impl<I> Stream for MetricsIterator<I, FileMeta>
 where
     I: Stream<Item = DeltaResult<FileMeta>> + Unpin,
@@ -82,6 +84,7 @@ where
     }
 }
 
+// `read_files` path: counts files and payload bytes.
 impl<I> Stream for MetricsIterator<I, Bytes>
 where
     I: Stream<Item = DeltaResult<Bytes>> + Unpin,

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::metrics::{MetricEvent, MetricId, ScanMetadataCompleted, ScanType};
+use crate::metrics::{MetricId, ScanMetadataCompleted, ScanType};
 
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
@@ -103,7 +103,7 @@ impl ScanMetrics {
         self.predicate_eval_time_ns.store(0, Ordering::Relaxed);
     }
 
-    /// Snapshot all counters into a [`MetricEvent::ScanMetadataCompleted`].
+    /// Snapshot all counters into a [`ScanMetadataCompleted`] event payload.
     ///
     /// `scan_type` identifies whether this event was emitted by full scan metadata replay or by
     /// a phase of parallel scan metadata replay.
@@ -112,8 +112,8 @@ impl ScanMetrics {
         operation_id: MetricId,
         scan_type: ScanType,
         duration: Duration,
-    ) -> MetricEvent {
-        MetricEvent::ScanMetadataCompleted(ScanMetadataCompleted {
+    ) -> ScanMetadataCompleted {
+        ScanMetadataCompleted {
             operation_id,
             scan_type,
             duration,
@@ -126,7 +126,7 @@ impl ScanMetrics {
             peak_hash_set_size: self.peak_hash_set_size.load(Ordering::Relaxed),
             dedup_visitor_time_ms: self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000,
             predicate_eval_time_ms: self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000,
-        })
+        }
     }
 
     /// Log all metrics with a message in the current tracing span context.

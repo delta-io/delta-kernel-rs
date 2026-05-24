@@ -17,8 +17,8 @@ impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
     /// Returns an error if either is missing.
     ///
-    /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
-    /// fresh snapshot creation where both Protocol and Metadata must exist.
+    /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
+    /// snapshot creation where both Protocol and Metadata must exist.
     #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, fields(report, operation_id = %operation_id), skip(engine))]
     pub(crate) fn read_protocol_metadata(
         &self,
@@ -37,9 +37,9 @@ impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
     /// Returns `None` for either if not found.
     ///
-    /// This is the unchecked variant of [`Self::read_protocol_metadata_checked`], used for
-    /// incremental snapshot updates where the caller can fall back to an existing snapshot's
-    /// Protocol and Metadata.
+    /// This is the unchecked variant of [`Self::read_protocol_metadata`], used for incremental
+    /// snapshot updates where the caller can fall back to an existing snapshot's Protocol and
+    /// Metadata.
     ///
     /// The `lazy_crc` parameter allows the CRC to be loaded at most once and shared for
     /// future use (domain metadata, in-commit timestamp, etc.).

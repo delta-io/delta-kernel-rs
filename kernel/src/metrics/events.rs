@@ -66,70 +66,47 @@ impl fmt::Display for MetricId {
 }
 
 // ====================================================================
-// ScanType
-// ====================================================================
-
-/// Identifies which scan execution path produced a scan metadata metrics event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanType {
-    /// Sequential phase of [`crate::scan::Scan::parallel_scan_metadata`].
-    SequentialPhase,
-    /// Parallel phase of [`crate::scan::Scan::parallel_scan_metadata`].
-    ParallelPhase,
-    /// Scan metadata from [`crate::scan::Scan::scan_metadata`].
-    Full,
-}
-
-impl ScanType {
-    /// Parse the value of the `scan_type` span field. Unknown values map to `Full`.
-    fn parse(s: &str) -> Self {
-        match s {
-            "sequential" => Self::SequentialPhase,
-            "parallel" => Self::ParallelPhase,
-            _ => Self::Full,
-        }
-    }
-}
-
-impl fmt::Display for ScanType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::SequentialPhase => "sequential",
-            Self::ParallelPhase => "parallel",
-            Self::Full => "full",
-        })
-    }
-}
-
-// ====================================================================
 // MetricEvent
 // ====================================================================
 
 /// Metric events emitted during Delta Kernel operations.
 #[derive(Debug, Clone)]
 pub enum MetricEvent {
-    /// Log segment loading completed (listing and organizing log files).
     LogSegmentLoaded(LogSegmentLoaded),
-    /// Protocol and metadata loading completed.
     ProtocolMetadataLoaded(ProtocolMetadataLoaded),
-    /// Snapshot creation completed successfully.
     SnapshotCompleted(SnapshotCompleted),
-    /// Snapshot creation failed.
     SnapshotFailed(SnapshotFailed),
-    /// CRC file read operation completed.
     CrcReadCompleted(CrcReadCompleted),
-    /// One `JsonHandler::read_json_files` call completed.
     JsonReadCompleted(JsonReadCompleted),
-    /// One `ParquetHandler::read_parquet_files` call completed.
     ParquetReadCompleted(ParquetReadCompleted),
-    /// Scan metadata iteration completed.
     ScanMetadataCompleted(ScanMetadataCompleted),
-    /// Storage list operation completed.
     StorageListCompleted(StorageListCompleted),
-    /// Storage read operation completed.
     StorageReadCompleted(StorageReadCompleted),
-    /// Storage copy operation completed.
     StorageCopyCompleted(StorageCopyCompleted),
+}
+
+impl MetricEvent {
+    /// Set the wall-clock duration on lifecycle events. Exhaustive so adding a new variant is a
+    /// compile error here.
+    pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
+        match self {
+            // Lifecycle: duration must be set by the tracing layer on span close.
+            Self::LogSegmentLoaded(e) => e.set_duration(d),
+            Self::ProtocolMetadataLoaded(e) => e.set_duration(d),
+            Self::SnapshotCompleted(e) => e.set_duration(d),
+            Self::SnapshotFailed(e) => e.set_duration(d),
+            Self::CrcReadCompleted(e) => e.set_duration(d),
+
+            // Duration already set at construction.
+            Self::ScanMetadataCompleted(_)
+            | Self::StorageListCompleted(_)
+            | Self::StorageReadCompleted(_)
+            | Self::StorageCopyCompleted(_)
+            // No duration field.
+            | Self::JsonReadCompleted(_)
+            | Self::ParquetReadCompleted(_) => {}
+        }
+    }
 }
 
 impl fmt::Display for MetricEvent {
@@ -340,6 +317,8 @@ impl fmt::Display for SnapshotCompleted {
 // SnapshotFailed
 // ====================================================================
 
+/// Snapshot creation failed. Emitted in place of [`SnapshotCompleted`] when the `snap.build`
+/// span returns `Err`; carries the same `operation_id`.
 #[derive(Debug, Clone)]
 pub struct SnapshotFailed {
     // === Carried over from `SnapshotCompleted` when the span errors ===
@@ -374,6 +353,8 @@ impl fmt::Display for SnapshotFailed {
 
 pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 
+/// Emitted even when JSON parsing fails after a successful storage read.
+/// `bytes_read` is the raw byte count from storage (zero if the storage read itself failed).
 #[derive(Debug, Clone)]
 pub struct CrcReadCompleted {
     // === Set during span lifetime ===
@@ -423,9 +404,12 @@ impl fmt::Display for CrcReadCompleted {
 // JsonReadCompleted
 // ====================================================================
 
-/// `bytes_read` is the sum of `FileMeta::size` for the requested files (on-disk size).
+/// Emitted once per `JsonHandler::read_json_files` call when the returned iterator is fully
+/// consumed or dropped. `bytes_read` is the sum of on-disk `FileMeta::size`, not the
+/// deserialized payload size.
 #[derive(Debug, Clone)]
 pub struct JsonReadCompleted {
+    // === Set on span creation ===
     pub num_files: u64,
     pub bytes_read: u64,
 }
@@ -460,9 +444,12 @@ impl fmt::Display for JsonReadCompleted {
 // ParquetReadCompleted
 // ====================================================================
 
-/// `bytes_read` is the sum of `FileMeta::size` for the requested files (on-disk size).
+/// Emitted once per `ParquetHandler::read_parquet_files` call when the returned iterator is
+/// fully consumed or dropped. `bytes_read` is the sum of on-disk `FileMeta::size`, not the
+/// deserialized payload size.
 #[derive(Debug, Clone)]
 pub struct ParquetReadCompleted {
+    // === Set on span creation ===
     pub num_files: u64,
     pub bytes_read: u64,
 }
@@ -515,8 +502,43 @@ impl Visit for FileReadAttrs {
 // ScanMetadataCompleted
 // ====================================================================
 
+/// Identifies which scan execution path produced a scan metadata metrics event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanType {
+    /// Sequential phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    SequentialPhase,
+    /// Parallel phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    ParallelPhase,
+    /// Scan metadata from [`crate::scan::Scan::scan_metadata`].
+    Full,
+}
+
+impl ScanType {
+    /// Parse the value of the `scan_type` span field. Unknown values map to `Full`.
+    fn parse(s: &str) -> Self {
+        match s {
+            "sequential" => Self::SequentialPhase,
+            "parallel" => Self::ParallelPhase,
+            _ => Self::Full,
+        }
+    }
+}
+
+impl fmt::Display for ScanType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SequentialPhase => "sequential",
+            Self::ParallelPhase => "parallel",
+            Self::Full => "full",
+        })
+    }
+}
+
+/// A `parallel_scan_metadata` scan emits **two** events (one per phase) sharing the same
+/// `operation_id`; `scan_metadata` emits one event with [`ScanType::Full`].
 #[derive(Debug, Clone)]
 pub struct ScanMetadataCompleted {
+    // === Set on span creation ===
     /// Unique ID to correlate this scan with other events.
     pub operation_id: MetricId,
     /// Which scan execution path produced this event.
@@ -726,6 +748,7 @@ impl Visit for StorageAttrs {
 
 #[derive(Debug, Clone)]
 pub struct StorageListCompleted {
+    // === Set on span creation ===
     pub duration: Duration,
     pub num_files: u64,
 }
@@ -753,6 +776,7 @@ impl fmt::Display for StorageListCompleted {
 
 #[derive(Debug, Clone)]
 pub struct StorageReadCompleted {
+    // === Set on span creation ===
     pub duration: Duration,
     pub num_files: u64,
     pub bytes_read: u64,
@@ -782,6 +806,7 @@ impl fmt::Display for StorageReadCompleted {
 
 #[derive(Debug, Clone)]
 pub struct StorageCopyCompleted {
+    // === Set on span creation ===
     pub duration: Duration,
 }
 

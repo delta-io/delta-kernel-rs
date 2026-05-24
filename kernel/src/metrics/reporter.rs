@@ -168,15 +168,8 @@ where
             let Some(visitor) = extensions.get_mut::<EventVisitor>() else {
                 return;
             };
-            if let Some(d) = duration {
-                match visitor.event.as_mut() {
-                    Some(MetricEvent::LogSegmentLoaded(e)) => e.set_duration(d),
-                    Some(MetricEvent::ProtocolMetadataLoaded(e)) => e.set_duration(d),
-                    Some(MetricEvent::SnapshotCompleted(e)) => e.set_duration(d),
-                    Some(MetricEvent::SnapshotFailed(e)) => e.set_duration(d),
-                    Some(MetricEvent::CrcReadCompleted(e)) => e.set_duration(d),
-                    _ => {}
-                }
+            if let (Some(d), Some(event)) = (duration, visitor.event.as_mut()) {
+                event.set_duration_if_applicable(d);
             }
             visitor.event.take()
         }; // unlock the extensions before reporting; the reporter is free to warn!() etc.
@@ -292,12 +285,9 @@ pub fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
     );
 }
 
-/// Emit a [`MetricEvent::ScanMetadataCompleted`] via a tracing span. Non-matching variants are
-/// ignored. Call when the scan metadata iterator is exhausted or dropped.
-pub(crate) fn emit_scan_metadata_completed(event: &MetricEvent) {
-    let MetricEvent::ScanMetadataCompleted(e) = event else {
-        return;
-    };
+/// Emit a [`MetricEvent::ScanMetadataCompleted`] via a tracing span. Call when the scan metadata
+/// iterator is exhausted or dropped.
+pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
     let _span = tracing::span!(
         tracing::Level::INFO,
         ScanMetadataCompleted::SPAN_NAME,

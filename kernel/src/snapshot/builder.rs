@@ -144,6 +144,9 @@ impl SnapshotBuilder {
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
+        // TODO(#2605): this late `record` is silently dropped by the metrics layer, so every
+        //              `SnapshotCompleted` event carries a nil operation_id. Bind eagerly via a
+        //              `build_inner(self, engine, operation_id)` helper instead.
         tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
         // Pre-build validations for catalog-managed tables
@@ -557,7 +560,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_completed_total_duration_exceeds_log_segment_load_duration(
+    async fn snapshot_completed_duration_exceeds_log_segment_load_duration(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
