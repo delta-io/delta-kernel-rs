@@ -35,7 +35,7 @@ pub struct CheckpointHintRecord {
     /// Total logical size of the checkpoint (bytes), if known.
     pub size: Option<i64>,
     /// Number of parts for multipart checkpoints, if any. Stored as `i64` to keep the
-    /// JSON deserialization aligned with [`LastCheckpointHint::parts`] (`Option<usize>`)
+    /// JSON deserialization aligned with `LastCheckpointHint::parts` (`Option<usize>`)
     /// on 64-bit targets.
     pub parts: Option<i64>,
     /// Total on-disk size of the checkpoint (bytes), if known.
