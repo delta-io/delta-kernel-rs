@@ -234,8 +234,8 @@ uintptr_t convert_engine_to_kernel_expression_item(
       }
       return result.ok;
     }
-    case Unknown: {
-      struct Unknown* unknown = (struct Unknown*)item.ref;
+    case UnknownExpr: {
+      struct UnknownExpr* unknown = (struct UnknownExpr*)item.ref;
       KernelStringSlice str_slice = {
         .ptr = unknown->name,
         .len = strlen(unknown->name)

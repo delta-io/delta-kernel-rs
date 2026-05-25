@@ -117,8 +117,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_expression_item_list(opaque->exprs, depth + 1);
       break;
     }
-    case Unknown: {
-      struct Unknown* unknown = ref.ref;
+    case UnknownExpr: {
+      struct UnknownExpr* unknown = ref.ref;
       printf("Unknown(%s)\n", unknown->name);
       break;
     }
