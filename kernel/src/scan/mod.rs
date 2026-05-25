@@ -315,6 +315,14 @@ impl ScanBuilder {
             stats: self.stats,
         })
     }
+
+    /// Build a [`Scan`] for declarative replay, returning a kernel-plans
+    /// [`crate::plans::errors::DeltaError`] on failure.
+    #[cfg(feature = "declarative-plans")]
+    pub fn build_replay(self) -> Result<Scan, crate::plans::errors::DeltaError> {
+        use crate::plans::errors::KernelErrAsDelta;
+        self.build().map_err(|e| e.into_delta_default())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -568,6 +576,7 @@ impl HasSelectionVector for ScanMetadata {
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
+#[derive(Clone)]
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
@@ -639,6 +648,44 @@ impl Scan {
         } else {
             None
         }
+    }
+
+    /// Get the physical stats schema used for `stats_parsed` in scan metadata.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn physical_stats_schema(&self) -> Option<SchemaRef> {
+        self.state_info.physical_stats_schema.clone()
+    }
+
+    /// Get the physical partition schema used for `partitionValues_parsed` in scan metadata.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn physical_partition_schema(&self) -> Option<SchemaRef> {
+        self.state_info.physical_partition_schema.clone()
+    }
+
+    /// Internal accessor for the scan's [`StateInfo`]. The scan SM data stage uses the
+    /// precomputed transform spec to drive its physical->logical projection instead of
+    /// re-deriving partition / row-id / row-index classification from the snapshot.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn state_info(&self) -> &StateInfo {
+        &self.state_info
+    }
+
+    /// Partition schema for the scan SM's data stage projection.
+    ///
+    /// The data stage's `scan_data_projection` references
+    /// `fileConstantValues.partitionValues_parsed.<col>` for every partition column appearing
+    /// in the logical schema, regardless of predicate. `physical_partition_schema()` is gated
+    /// on predicate-driven data skipping, so it's `None` for unfiltered partitioned reads --
+    /// which would leave `partitionValues_parsed` unmaterialized and break the data-stage
+    /// projection lookup. Returns the table's full partition schema instead.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn data_stage_partition_schema(&self) -> Option<SchemaRef> {
+        // Uses the same physical-name-aware partition schema as the checkpoint writer
+        // (`TableConfiguration::build_partition_values_parsed_schema`), so the data-stage
+        // projection lookup picks up partition columns under their on-disk names.
+        self.snapshot
+            .table_configuration()
+            .build_partition_values_parsed_schema()
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
@@ -909,7 +956,7 @@ impl Scan {
     /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
     /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
     /// arms replace them with TRUE to conservatively prevent pruning.
-    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+    pub(crate) fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
@@ -1041,7 +1088,7 @@ impl Scan {
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
         let scan_files_iter = scan_metadata_iter
-            .map(|res| {
+            .map(|res: Result<ScanMetadata, Error>| {
                 let scan_metadata = res?;
                 let scan_files = vec![];
                 scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
