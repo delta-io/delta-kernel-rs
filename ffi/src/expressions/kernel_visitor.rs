@@ -2,14 +2,17 @@
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
 use std::sync::Arc;
 
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
-    UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
+    Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
 
-use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::expressions::pruning::{OpaquePruningCallbacks, SharedOpaquePruningContext};
+use crate::expressions::{NamedOpaquePredicateOp, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -593,12 +596,132 @@ pub extern "C" fn visit_predicate_in(
     visit_predicate_binary(state, BinaryPredicateOp::In, a, b)
 }
 
+/// Build an opaque predicate `Predicate::Opaque(NamedOpaquePredicateOp(name), exprs)` from a
+/// name and a list of child expression IDs. Allows engines to push engine-defined predicates
+/// (e.g. `STARTS_WITH`, `LIKE`) through the kernel without registering a native Rust-side
+/// evaluator.
+///
+/// The resulting op opts out of every kernel-side pruning pass; the engine is responsible
+/// for filtering at row time. Engines that want kernel-side pruning should use
+/// [`visit_predicate_opaque_with_pruning`], which attaches [`OpaquePruningCallbacks`] to
+/// the op. Under `default-engine-base` the predicate is built so the default engine's
+/// Arrow batch evaluator dispatches `eval_pred`; without it, engines dispatch through
+/// their own `EvaluationHandler`.
+///
+/// [`OpaquePruningCallbacks`]: crate::expressions::pruning::OpaquePruningCallbacks
+///
+/// Each child ID is consumed from the visitor state (an ID can only be used once). Predicate
+/// IDs are auto-promoted into expressions, mirroring `Expression::from_pred`. Returns 0 if
+/// any child ID is invalid (already consumed, never created, or zero), matching the invariant
+/// of the binary `visit_predicate_*` builders. Remaining valid IDs are still drained from
+/// state in that case.
+///
+/// # Safety
+/// The string slice must be valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate_opaque(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+    children: &mut EngineIterator,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name = unsafe { String::try_from_slice(&name) };
+    visit_predicate_opaque_impl(state, name, children).into_extern_result(&allocate_error)
+}
+
+fn visit_predicate_opaque_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: DeltaResult<String>,
+    children: &mut EngineIterator,
+) -> DeltaResult<usize> {
+    wrap_opaque_predicate_with_callbacks(state, name?, children.map(|child| child as usize), None)
+}
+
+/// Resolve child IDs in order and drain every one of them from the visitor
+/// state. Returns `None` if any id failed to resolve (already consumed,
+/// never created, or zero) -- opaque ops are not variadic, and silently
+/// shrinking the arity would corrupt the predicate.
+fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
+    state: &mut KernelExpressionVisitorState,
+    child_ids: I,
+) -> Option<Vec<Expression>> {
+    let resolved: Vec<Option<Expression>> = child_ids
+        .into_iter()
+        .map(|id| unwrap_kernel_expression(state, id))
+        .collect();
+    if resolved.iter().any(Option::is_none) {
+        return None;
+    }
+    Some(resolved.into_iter().flatten().collect())
+}
+
+fn wrap_opaque_predicate_with_callbacks<I: IntoIterator<Item = usize>>(
+    state: &mut KernelExpressionVisitorState,
+    name: String,
+    child_ids: I,
+    callbacks: Option<Arc<OpaquePruningCallbacks>>,
+) -> DeltaResult<usize> {
+    let Some(exprs) = resolve_opaque_children(state, child_ids) else {
+        return Ok(0);
+    };
+    let op = match callbacks {
+        Some(cb) => NamedOpaquePredicateOp::with_callbacks(name, cb),
+        None => NamedOpaquePredicateOp::new(name),
+    };
+    Ok(wrap_predicate(state, Predicate::opaque(op, exprs)))
+}
+
+/// Build an opaque predicate with engine pruning callbacks attached.
+/// Kernel invokes `eval_against_stats` once per stats metadata batch during
+/// file pruning. The context is arc-cloned; multiple opaque ops in one
+/// query can share a single context handle.
+///
+/// # Safety
+/// The string slice must be valid for the duration of the call. `ctx` must
+/// be a valid handle produced by [`create_opaque_pruning_context`].
+///
+/// [`create_opaque_pruning_context`]: crate::expressions::pruning::create_opaque_pruning_context
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate_opaque_with_pruning(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+    children: &mut EngineIterator,
+    ctx: Handle<SharedOpaquePruningContext>,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { String::try_from_slice(&name) };
+    let callbacks = unsafe { ctx.clone_as_arc() };
+    visit_predicate_opaque_with_pruning_impl(state, name_str, children, callbacks)
+        .into_extern_result(&allocate_error)
+}
+
+fn visit_predicate_opaque_with_pruning_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: DeltaResult<String>,
+    children: &mut EngineIterator,
+    callbacks: Arc<OpaquePruningCallbacks>,
+) -> DeltaResult<usize> {
+    let name = name?;
+    let child_ids: Vec<usize> = children.map(|child| child as usize).collect();
+    let Some(exprs) = resolve_opaque_children(state, child_ids) else {
+        return Ok(0);
+    };
+    let op = NamedOpaquePredicateOp::with_callbacks(name, callbacks);
+    // Default engine takes the `arrow_opaque` path so its batch evaluator can
+    // dispatch `eval_pred`; other engines fall back to plain `Opaque` and
+    // dispatch via their own `EvaluationHandler`.
+    #[cfg(feature = "default-engine-base")]
+    let pred = Predicate::arrow_opaque(op, exprs);
+    #[cfg(not(feature = "default-engine-base"))]
+    let pred = Predicate::opaque(op, exprs);
+    Ok(wrap_predicate(state, pred))
+}
+
 #[no_mangle]
 pub extern "C" fn visit_predicate_or(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
 ) -> usize {
-    use delta_kernel::expressions::JunctionPredicateOp;
     let result = Predicate::junction(
         JunctionPredicateOp::Or,
         children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
@@ -909,5 +1032,85 @@ mod tests {
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, Expression::literal(Scalar::Null(dt)));
+    }
+
+    // ============================================================================
+    // wrap_opaque_predicate_with_callbacks
+    // ============================================================================
+
+    fn wrap_opaque(
+        state: &mut KernelExpressionVisitorState,
+        name: &str,
+        child_ids: impl IntoIterator<Item = usize>,
+    ) -> usize {
+        wrap_opaque_predicate_with_callbacks(state, name.to_string(), child_ids, None).unwrap()
+    }
+
+    #[test]
+    fn opaque_predicate_round_trips_with_children() {
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = visit_expression_column_impl(&mut state, Ok("name")).unwrap();
+        let lit_id = wrap_expression(&mut state, Expression::literal("test"));
+
+        let pred_id = wrap_opaque(&mut state, "STARTS_WITH", [col_id, lit_id]);
+
+        let pred = unwrap_kernel_predicate(&mut state, pred_id).unwrap();
+        match pred {
+            Predicate::Opaque(opaque) => {
+                assert_eq!(opaque.op.name(), "STARTS_WITH");
+                assert_eq!(opaque.exprs.len(), 2);
+            }
+            other => panic!("expected Predicate::Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_predicate_returns_zero_on_invalid_child_id() {
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = visit_expression_column_impl(&mut state, Ok("name")).unwrap();
+        let bogus_id = 9999usize;
+
+        let pred_id = wrap_opaque(&mut state, "LIKE", [col_id, bogus_id]);
+        assert_eq!(
+            pred_id, 0,
+            "any invalid child must invalidate the predicate"
+        );
+    }
+
+    #[test]
+    fn opaque_predicate_accepts_empty_children() {
+        let mut state = KernelExpressionVisitorState::default();
+        let pred_id = wrap_opaque(&mut state, "ALWAYS_TRUE_OPAQUE", []);
+        let pred = unwrap_kernel_predicate(&mut state, pred_id).unwrap();
+        match pred {
+            Predicate::Opaque(opaque) => {
+                assert_eq!(opaque.op.name(), "ALWAYS_TRUE_OPAQUE");
+                assert!(opaque.exprs.is_empty());
+            }
+            other => panic!("expected Predicate::Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_predicate_promotes_predicate_typed_child_to_expression() {
+        // Mirrors unwrap_kernel_expression's Predicate -> Expression::from_pred arm: a
+        // predicate-typed child id is accepted as an expression child. We use
+        // `Predicate::eq` (a BinaryPredicate, not a BooleanExpression) so that
+        // Expression::from_pred wraps it as Expression::Predicate(Box(_)) instead of
+        // unwrapping it back to a literal.
+        let mut state = KernelExpressionVisitorState::default();
+        let inner_pred_id = wrap_predicate(
+            &mut state,
+            Predicate::eq(Expression::literal(1), Expression::literal(2)),
+        );
+        let pred_id = wrap_opaque(&mut state, "WRAPS_PRED", [inner_pred_id]);
+        let pred = unwrap_kernel_predicate(&mut state, pred_id).unwrap();
+        match pred {
+            Predicate::Opaque(opaque) => {
+                assert_eq!(opaque.exprs.len(), 1);
+                assert!(matches!(&opaque.exprs[0], Expression::Predicate(_)));
+            }
+            other => panic!("expected Predicate::Opaque, got {other:?}"),
+        }
     }
 }

@@ -63,7 +63,7 @@ enum ExpressionType {
   FieldTransform,
   OpaqueExpression,
   OpaquePredicate,
-  Unknown,
+  UnknownExpr,
   MapToStruct,
 };
 enum VariadicType {
@@ -109,7 +109,7 @@ struct OpaquePredicate {
   HandleSharedOpaquePredicateOp op;
   ExpressionItemList exprs;
 };
-struct Unknown {
+struct UnknownExpr {
   char* name;
 };
 struct MapToStructExpr {
@@ -393,9 +393,9 @@ void visit_opaque_pred(
 }
 
 void visit_unknown(void *data, uintptr_t sibling_list_id, struct KernelStringSlice name) {
-  struct Unknown* unknown = malloc(sizeof(struct Unknown));
+  struct UnknownExpr* unknown = malloc(sizeof(struct UnknownExpr));
   unknown->name = allocate_string(name);
-  put_expr_item(data, sibling_list_id, unknown, Unknown);
+  put_expr_item(data, sibling_list_id, unknown, UnknownExpr);
 }
 
 void visit_map_to_struct_expr(void* data,
@@ -611,8 +611,8 @@ void free_expression_item(ExpressionItem ref) {
       free(opaque);
       break;
     };
-    case Unknown: {
-      struct Unknown* unknown = ref.ref;
+    case UnknownExpr: {
+      struct UnknownExpr* unknown = ref.ref;
       free(unknown->name);
       free(unknown);
       break;
