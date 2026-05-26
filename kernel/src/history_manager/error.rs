@@ -38,12 +38,16 @@ pub enum LogHistoryError {
         /// Description of why the timestamp is out of range.
         reason: &'static str,
         /// The nearest retained commit's timestamp on the side of the search
-        /// bound closest to `timestamp` (e.g. the earliest commit's timestamp
-        /// for a `GreatestLower` search whose input is below retention).
+        /// bound closest to `timestamp`. Engines surface this to users so the
+        /// error message can point at a valid timestamp.
+        ///
+        /// For a `GreatestLower` search this is the earliest commit's
+        /// timestamp; for `LeastUpper` it is the latest's. For example, given a
+        /// retained range `[100, 500]` and a `GreatestLower` search at
+        /// timestamp `50`, this is `Some(100)`.
+        ///
         /// `None` when no commits were available (empty log) or when reading
         /// the boundary commit's In-Commit Timestamp failed at the error site.
-        ///
-        /// Engines surface this to users to point them at a valid timestamp.
         nearest_timestamp: Option<Timestamp>,
     },
     /// An internal error occurred during timestamp conversion.

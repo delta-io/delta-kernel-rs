@@ -23,7 +23,7 @@ use std::cmp::Ordering;
 
 use error::LogHistoryError;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -280,13 +280,22 @@ fn binary_search_ict_timestamps(
         Err(SearchError::OutOfRange) => {
             // OutOfRange under `GreatestLower` means timestamp < commits[0]'s
             // ICT; under `LeastUpper` it means timestamp > commits.last()'s
-            // ICT. Either side is read via `commit_to_ict`; on engine failure
-            // we degrade to `None` rather than mask the original error.
+            // ICT. The boundary timestamp is read via `commit_to_ict`; on
+            // engine failure we degrade to `None` so the original out-of-range
+            // error is preserved.
             let boundary = match bound {
                 Bound::GreatestLower => &commits[0],
                 Bound::LeastUpper => &commits[commits.len() - 1],
             };
-            let nearest_timestamp = commit_to_ict(boundary).ok();
+            let nearest_timestamp = commit_to_ict(boundary)
+                .inspect_err(|e| {
+                    warn!(
+                        error = ?e,
+                        version = boundary.version,
+                        "failed to read boundary ICT for nearest_timestamp hint",
+                    );
+                })
+                .ok();
             Err(LogHistoryError::TimestampOutOfRange {
                 timestamp,
                 reason: bound.out_of_range_reason(),
