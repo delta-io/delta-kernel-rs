@@ -94,7 +94,7 @@ impl FullStateBuilder {
                 StatsOutputMode::AllColumns,
                 (),
             )
-            .map_err(|e| e.into_delta_default())?;
+            .map_err(|e| e.into_delta_internal())?;
             Some(Arc::new(si))
         } else {
             None

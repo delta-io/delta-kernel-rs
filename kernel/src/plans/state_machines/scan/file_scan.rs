@@ -19,9 +19,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::scan_plan::build_scan_plan;
-use crate::delta_error;
 use crate::expressions::{col, Expression, Transform};
-use crate::plans::errors::{DeltaError, DeltaErrorCode};
+use crate::plans::errors::DeltaError;
 use crate::plans::ir::plan::ResultPlan;
 use crate::plans::state_machines::framework::coroutine::CoroutineSM;
 use crate::plans::state_machines::framework::plan_context::Context;
@@ -84,7 +83,7 @@ impl Scan {
 ///   [`Expression::Transform`] for engines to lower to struct-reshape against the projection's
 ///   declared output schema.
 ///
-/// Returns [`DeltaErrorCode::DeltaCommandInvariantViolation`] for shapes the SM data stage
+/// Returns [`DeltaCommandInvariantViolation`](crate::plans::errors::DeltaErrorCode::DeltaCommandInvariantViolation) for shapes the SM data stage
 /// does not support: [`FieldTransformSpec::DynamicColumn`] (CDF-only),
 /// [`MetadataColumnSpec::FilePath`] (no DF synthesizer), and
 /// [`MetadataColumnSpec::RowCommitVersion`] (rejected at `StateInfo::try_new`).
@@ -110,8 +109,7 @@ pub(super) fn scan_data_projection(
                 FieldTransformSpec::StaticInsert { .. } | FieldTransformSpec::StaticDrop { .. } => {
                 }
                 FieldTransformSpec::DynamicColumn { .. } => {
-                    return Err(delta_error!(
-                        DeltaErrorCode::DeltaCommandInvariantViolation,
+                    return Err(DeltaError::invariant(
                         "fsr::scan_data_projection: DynamicColumn entries are emitted only \
                          by the CDF classifier; the scan data stage does not run for CDF",
                     ));
@@ -169,12 +167,11 @@ fn row_id_expr(
         row_index_field_name,
     }) = row_id_spec
     else {
-        return Err(delta_error!(
-            DeltaErrorCode::DeltaCommandInvariantViolation,
+        return Err(DeltaError::invariant(format!(
             "fsr::scan_data_projection: RowId column `{}` has no GenerateRowId entry in \
              the transform spec",
             field.name(),
-        ));
+        )));
     };
     Ok(row_id_coalesce_expr(
         field_name,
@@ -186,13 +183,12 @@ fn row_id_expr(
 /// Typed error for metadata-column specs the scan SM data stage does not support; see
 /// [`scan_data_projection`]'s doc for the full rationale.
 fn unsupported_metadata_column(field: &StructField, spec: MetadataColumnSpec) -> DeltaError {
-    delta_error!(
-        DeltaErrorCode::DeltaCommandInvariantViolation,
+    DeltaError::invariant(format!(
         "fsr::scan_data_projection: metadata column `{}` ({:?}) is not supported in the \
          scan data stage",
         field.name(),
         spec,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -202,6 +198,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::BinaryExpressionOp;
+    use crate::plans::errors::DeltaErrorCode;
     use crate::scan::state_info::tests::{
         get_simple_state_info, get_state_info, ROW_TRACKING_FEATURES,
     };

@@ -193,7 +193,6 @@ mod tests {
     use super::*;
     use crate::actions::{Remove, REMOVE_NAME};
     use crate::expressions::Scalar;
-    use crate::schema::arc_schema;
 
     /// Build a synthetic input builder whose schema mimics the reconciled action stream
     /// (post-`with_partitions_parsed`): `add` carries `path`/`size`/`deletionVector`/
@@ -217,10 +216,10 @@ mod tests {
                 p.as_ref().clone(),
             ));
         }
-        let schema = arc_schema([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable(ADD_NAME, StructType::new_unchecked(add_fields)),
             StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        ]);
+        ]));
         let ctx = Context::new();
         let builder = ctx.values(schema, Vec::<Vec<Scalar>>::new()).unwrap();
         (ctx, builder)
@@ -247,7 +246,7 @@ mod tests {
         &["baseRowId", "defaultRowCommitVersion", "tags", "clusteringProvider"],
     )]
     #[case::with_partitions(
-        Some(arc_schema([StructField::nullable("p", DataType::STRING)])),
+        Some(Arc::new(StructType::new_unchecked([StructField::nullable("p", DataType::STRING)]))),
         &[
             "baseRowId",
             "defaultRowCommitVersion",

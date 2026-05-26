@@ -11,6 +11,8 @@
 //!
 //! All types are `pub(super)` -- this module is internal IR for the scan/FSR pipeline.
 
+use std::sync::Arc;
+
 use crate::actions::{Sidecar, SIDECAR_NAME};
 use crate::expressions::col;
 use crate::log_segment::LogSegment;
@@ -20,7 +22,7 @@ use crate::plans::ir::nodes::FileFormat;
 use crate::plans::kernel_reducers::SidecarCollector;
 use crate::plans::state_machines::framework::coroutine::Engine;
 use crate::plans::state_machines::framework::plan_context::Context;
-use crate::schema::{arc_schema, SchemaRef, StructField, ToSchema};
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::Snapshot;
 use crate::FileMeta;
 
@@ -200,5 +202,8 @@ fn stats_probe(leaf: Option<&SchemaRef>, requested: Option<&SchemaRef>) -> Optio
 /// `sidecar.path` / `sidecar.sizeInBytes`); narrowing the scan to that one column avoids
 /// paying the read cost for the action columns.
 fn manifest_probe_schema() -> SchemaRef {
-    arc_schema([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        SIDECAR_NAME,
+        Sidecar::to_schema(),
+    )]))
 }
