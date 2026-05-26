@@ -232,14 +232,10 @@ fn linear_search_file_mod_timestamps(
         // Exiting with `result == None` means either (GreatestLower) every commit
         // is after `timestamp`, so the earliest commit is the nearest, or
         // (LeastUpper) every commit is before `timestamp`, so the latest is.
-        let nearest = match bound {
-            Bound::GreatestLower => commits[0].location.last_modified,
-            Bound::LeastUpper => commits[commits.len() - 1].location.last_modified,
-        };
         LogHistoryError::TimestampOutOfRange {
             timestamp,
             reason: bound.out_of_range_reason(),
-            nearest_timestamp: Some(nearest),
+            nearest_timestamp: bound.boundary_of(commits).map(|c| c.location.last_modified),
         }
     })
 }
@@ -283,19 +279,17 @@ fn binary_search_ict_timestamps(
             // ICT. The boundary timestamp is read via `commit_to_ict`; on
             // engine failure we degrade to `None` so the original out-of-range
             // error is preserved.
-            let boundary = match bound {
-                Bound::GreatestLower => &commits[0],
-                Bound::LeastUpper => &commits[commits.len() - 1],
-            };
-            let nearest_timestamp = commit_to_ict(boundary)
-                .inspect_err(|e| {
-                    warn!(
-                        error = ?e,
-                        version = boundary.version,
-                        "failed to read boundary ICT for nearest_timestamp hint",
-                    );
-                })
-                .ok();
+            let nearest_timestamp = bound.boundary_of(commits).and_then(|boundary| {
+                commit_to_ict(boundary)
+                    .inspect_err(|e| {
+                        warn!(
+                            error = ?e,
+                            version = boundary.version,
+                            "failed to read boundary ICT for nearest_timestamp hint",
+                        );
+                    })
+                    .ok()
+            });
             Err(LogHistoryError::TimestampOutOfRange {
                 timestamp,
                 reason: bound.out_of_range_reason(),
