@@ -796,6 +796,11 @@ impl Expression {
         Self::Unary(UnaryExpression::new(op, expr))
     }
 
+    /// Serializes `self` to a JSON string. Inverse of [`Expression::parse_json`].
+    pub fn to_json(self) -> Self {
+        Self::unary(UnaryExpressionOp::ToJson, self)
+    }
+
     /// Creates a new binary expression lhs OP rhs
     pub fn binary(
         op: BinaryExpressionOp,

@@ -12,8 +12,8 @@ use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
-    UnaryExpressionOp,
+    col, column_expr, column_expr_ref, column_name, lit, ColumnName, Expression, ExpressionRef,
+    PredicateRef,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -656,16 +656,13 @@ fn get_add_transform_expr(
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
-        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+        Arc::new(lit(Scalar::Null(DataType::STRING)))
     } else if has_stats_parsed {
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
-            Expression::column(["add", "stats"]),
-            Expression::unary(
-                UnaryExpressionOp::ToJson,
-                Expression::column(["add", "stats_parsed"]),
-            ),
+            col(["add", "stats"]),
+            col(["add", "stats_parsed"]).to_json(),
         ]))
     } else {
         column_expr_ref!("add.stats")
@@ -941,7 +938,7 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        col, lit, BinaryExpressionOp, OpaquePredicateOp, Predicate, Scalar,
         ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
@@ -1600,7 +1597,7 @@ mod tests {
             StructField::new("value", DataType::INTEGER, true),
         ])),
         vec![],
-        Arc::new(Expression::column(["value"]).gt(Expression::literal(5i32))),
+        Arc::new(col("value").gt(lit(5i32))),
         false, // use batch without partition column
     )]
     #[case::partition_predicate(
@@ -1609,7 +1606,7 @@ mod tests {
             StructField::new("date", DataType::DATE, true),
         ])),
         vec!["date".to_string()],
-        Arc::new(Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510)))),
+        Arc::new(col("date").eq(lit(Scalar::Date(17_510)))),
         true, // use batch with partition column
     )]
     #[case::mixed_stats_and_partition(
@@ -1619,8 +1616,8 @@ mod tests {
         ])),
         vec!["date".to_string()],
         Arc::new(Predicate::and(
-            Expression::column(["value"]).gt(Expression::literal(5i32)),
-            Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510))),
+            col("value").gt(lit(5i32)),
+            col("date").eq(lit(Scalar::Date(17_510))),
         )),
         true, // use batch with partition column
     )]

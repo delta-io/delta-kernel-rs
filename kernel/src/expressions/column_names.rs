@@ -152,6 +152,12 @@ impl IntoColumnName for String {
     }
 }
 
+impl IntoColumnName for &String {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self.as_str()])
+    }
+}
+
 impl<A: Into<String>, const N: usize> IntoColumnName for [A; N] {
     fn into_column_name(self) -> ColumnName {
         ColumnName::new(self.into_iter().map(Into::into))

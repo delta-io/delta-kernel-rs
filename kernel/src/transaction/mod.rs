@@ -18,8 +18,7 @@ use crate::committer::{
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta, LazyCrc};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
-use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
+use crate::expressions::{col, lit, ArrayData, ColumnName, ExpressionStructPatch, Scalar};
 use crate::log_segment::LogSegment;
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
@@ -304,14 +303,8 @@ where
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
             ExpressionStructPatch::new_top_level()
-                .with_inserted_field(
-                    Some("modificationTime"),
-                    Expression::literal(data_change),
-                )
-                .with_replaced_field(
-                    "stats",
-                    Expression::unary(ToJson, Expression::column(["stats"])),
-                ),
+                .with_inserted_field(Some("modificationTime"), lit(data_change))
+                .with_replaced_field("stats", col("stats").to_json()),
         );
         let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
@@ -1404,47 +1397,39 @@ fn build_remove_struct_patch(
 ) -> ExpressionStructPatch {
     let mut patch = ExpressionStructPatch::new_top_level()
         // deletionTimestamp
-        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp))
+        .with_inserted_field(Some("path"), lit(commit_timestamp))
         // dataChange
-        .with_inserted_field(Some("path"), Expression::literal(data_change))
+        .with_inserted_field(Some("path"), lit(data_change))
         // extended_file_metadata
-        .with_inserted_field(Some("path"), Expression::literal(true))
+        .with_inserted_field(Some("path"), lit(true))
         .with_inserted_field(
             Some("path"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]),
+            col([FILE_CONSTANT_VALUES_NAME, "partitionValues"]),
         );
 
     if coalesce_stats_with_parsed {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
         // Both expressions are registered on the "stats" field_patch (is_replace=true),
         // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
-        let coalesce_stats = Expression::coalesce([
-            Expression::column(["stats"]),
-            Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
-        ]);
+        let coalesce_stats = Expression::coalesce([col("stats"), col(STATS_PARSED_NAME).to_json()]);
         patch = patch
             .with_replaced_field("stats", coalesce_stats)
-            .with_inserted_field(
-                Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]),
-            )
+            .with_inserted_field(Some("stats"), col([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]))
             .with_dropped_field_if_exists(STATS_PARSED_NAME);
     } else {
         // tags inserted after stats; stats passes through unchanged
-        patch = patch.with_inserted_field(
-            Some("stats"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]),
-        );
+        patch = patch
+            .with_inserted_field(Some("stats"), col([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]));
     }
 
     patch = patch
         .with_inserted_field(
             Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]),
+            col([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]),
         )
         .with_inserted_field(
             Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
+            col([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
         .with_dropped_field("modificationTime")

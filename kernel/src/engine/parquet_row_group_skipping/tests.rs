@@ -7,7 +7,8 @@ use super::*;
 use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::expressions::{
-    column_expr, column_name, column_pred, Expression, OpaquePredicateOp, ScalarExpressionEvaluator,
+    column_expr, column_name, column_pred, lit, Expression, OpaquePredicateOp,
+    ScalarExpressionEvaluator,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator as _, DirectDataSkippingPredicateEvaluator,
@@ -958,10 +959,7 @@ fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
 
     // OpaqueLessThanOp(x, 5) -> "x < 5". Data skipping checks min(x) < 5.
     // min(x) = 10, so 10 < 5 is false -> can skip the row group.
-    let predicate = Predicate::opaque(
-        OpaqueLessThanOp,
-        vec![column_expr!("x"), Expression::literal(5i64)],
-    );
+    let predicate = Predicate::opaque(OpaqueLessThanOp, vec![column_expr!("x"), lit(5i64)]);
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -969,10 +967,7 @@ fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
     ));
 
     // OpaqueLessThanOp(x, 50) -> "x < 50". min(x) = 10, so 10 < 50 is true -> keep.
-    let predicate = Predicate::opaque(
-        OpaqueLessThanOp,
-        vec![column_expr!("x"), Expression::literal(50i64)],
-    );
+    let predicate = Predicate::opaque(OpaqueLessThanOp, vec![column_expr!("x"), lit(50i64)]);
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -996,10 +991,7 @@ fn checkpoint_filter_opaque_predicate_with_missing_stats() {
     // OpaqueLessThanOp(x, 5) -> "x < 5". The stat column has nulls, so the null-guarded
     // provider returns None for min(x). The opaque op gets None and returns None,
     // which means the row group cannot be pruned. This is the safe behavior.
-    let predicate = Predicate::opaque(
-        OpaqueLessThanOp,
-        vec![column_expr!("x"), Expression::literal(5i64)],
-    );
+    let predicate = Predicate::opaque(OpaqueLessThanOp, vec![column_expr!("x"), lit(5i64)]);
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,

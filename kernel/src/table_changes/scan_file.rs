@@ -11,7 +11,7 @@ use itertools::Itertools;
 use super::log_replay::TableChangesScanMetadata;
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, Expression};
+use crate::expressions::{column_expr, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
@@ -255,8 +255,8 @@ pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64)
             Expression::struct_from([column_expr!("cdc.partitionValues")]),
             column_expr!("cdc.size"),
         ]),
-        Expression::literal(commit_timestamp),
-        Expression::literal(commit_number),
+        lit(commit_timestamp),
+        lit(commit_number),
     ])
 }
 

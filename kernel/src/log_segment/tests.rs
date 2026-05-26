@@ -18,7 +18,7 @@ use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::ColumnName;
+use crate::expressions::col;
 use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -37,8 +37,8 @@ use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler,
+    DeltaResult, EngineData, FileMeta, JsonHandler, ParquetHandler, Predicate, PredicateRef,
+    RowVisitor, StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -1147,11 +1147,8 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     );
 
     // Filter out sidecar files that do not contain remove actions
-    let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-        Some(Arc::new(
-            Expression::column([REMOVE_NAME, "path"]).is_not_null(),
-        ))
-    });
+    let remove_predicate: LazyLock<Option<PredicateRef>> =
+        LazyLock::new(|| Some(Arc::new(col([REMOVE_NAME, "path"]).is_not_null())));
 
     let mut iter = process_sidecars(
         engine.parquet_handler(),
@@ -4328,7 +4325,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         StructType::new_unchecked([]),
     )]),
     Some(Arc::new(
-        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
+        col([METADATA_NAME, "id"]).is_not_null(),
     )),
 )]
 #[case::protocol_field(
@@ -4337,7 +4334,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         StructType::new_unchecked([]),
     )]),
     Some(Arc::new(
-        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
+        col([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
     )),
 )]
 #[case::txn_field(
@@ -4346,7 +4343,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         StructType::new_unchecked([]),
     )]),
     Some(Arc::new(
-        Expression::column(ColumnName::new([SET_TRANSACTION_NAME, "appId"])).is_not_null(),
+        col([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
     )),
 )]
 #[case::domain_metadata_field(
@@ -4355,7 +4352,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         StructType::new_unchecked([]),
     )]),
     Some(Arc::new(
-        Expression::column(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])).is_not_null(),
+        col([DOMAIN_METADATA_NAME, "domain"]).is_not_null(),
     )),
 )]
 #[case::unknown_field_returns_none(
@@ -4368,8 +4365,8 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         StructField::nullable(PROTOCOL_NAME, StructType::new_unchecked([])),
     ]),
     Some(Arc::new(Predicate::or(
-        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
-        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
+        col([METADATA_NAME, "id"]).is_not_null(),
+        col([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
     ))),
 )]
 #[case::known_and_unknown_field_returns_none(
