@@ -130,7 +130,7 @@ impl ColumnName {
 /// [`column_name!`]: crate::expressions::column_name
 /// [`column_expr!`]: crate::expressions::column_expr
 pub trait IntoColumnName {
-    /// Consume `self` and produce the [`ColumnName`] it represents.
+    /// Consumes `self` and produces the [`ColumnName`] it represents.
     fn into_column_name(self) -> ColumnName;
 }
 
@@ -159,6 +159,12 @@ impl IntoColumnName for &String {
 }
 
 impl<A: Into<String>, const N: usize> IntoColumnName for [A; N] {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new(self.into_iter().map(Into::into))
+    }
+}
+
+impl<A: Into<String>> IntoColumnName for Vec<A> {
     fn into_column_name(self) -> ColumnName {
         ColumnName::new(self.into_iter().map(Into::into))
     }
@@ -784,14 +790,14 @@ mod test {
 
     #[test]
     fn into_column_name_str_is_single_segment_with_no_split() {
-        // Strings (`&str` / `String`) build a single segment containing the input verbatim;
-        // dots are not path separators. For dot-separated literals, callers should use the
-        // `column_name!` / `column_expr!` macros (which split via a proc macro at compile time).
+        // Strings (`&str` / `String` / `&String`) build a single segment containing the input
+        // verbatim; dots are not path separators. For dot-separated literals, callers should
+        // use the `column_name!` / `column_expr!` macros (which split via a proc macro at
+        // compile time).
         assert_eq!("a.b".into_column_name(), ColumnName::new(["a.b"]));
-        assert_eq!(
-            "name".to_string().into_column_name(),
-            ColumnName::new(["name"])
-        );
+        let owned = "name".to_string();
+        assert_eq!(owned.clone().into_column_name(), ColumnName::new(["name"]));
+        assert_eq!((&owned).into_column_name(), ColumnName::new(["name"]));
     }
 
     #[test]
@@ -800,6 +806,7 @@ mod test {
         assert_eq!(["a", "b", "c"].into_column_name(), expected);
         let slice: &[&str] = &["a", "b", "c"];
         assert_eq!(slice.into_column_name(), expected);
+        assert_eq!(vec!["a", "b", "c"].into_column_name(), expected);
         assert_eq!(("a", "b", "c").into_column_name(), expected);
         // Identity round-trip on `ColumnName` itself.
         assert_eq!(expected.clone().into_column_name(), expected);

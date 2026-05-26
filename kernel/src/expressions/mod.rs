@@ -30,10 +30,9 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 
 /// Build an [`Expression::Column`] from anything that converts into a [`ColumnName`].
 ///
-/// Concise alternative to `Expression::column([name])` for plan builders. Accepts the same
-/// shapes as [`IntoColumnName`]: a bare `&str` (single-segment, no dot splitting), an array
-/// or slice (`col(["add", "path"])`), a tuple (`col(("add", "path"))`), or a prebuilt
-/// [`ColumnName`].
+/// Concise alternative to [`Expression::column`] for plan builders. See [`IntoColumnName`]
+/// for the full set of accepted input shapes (single-segment strings, arrays, slices,
+/// vectors, tuples, and pre-built [`ColumnName`]s).
 ///
 /// Strings are **not** split on `.`. For dot-separated path literals known at compile time,
 /// prefer [`column_expr!`] which splits via a proc macro:
@@ -796,7 +795,8 @@ impl Expression {
         Self::Unary(UnaryExpression::new(op, expr))
     }
 
-    /// Serializes `self` to a JSON string. Inverse of [`Expression::parse_json`].
+    /// Serializes `self` to a JSON string. See [`Expression::parse_json`] for the parsing
+    /// direction (which also requires the output schema).
     pub fn to_json(self) -> Self {
         Self::unary(UnaryExpressionOp::ToJson, self)
     }
@@ -1242,7 +1242,7 @@ mod tests {
 
     use super::{
         col, column_expr, column_pred, lit, Expression as Expr, ExpressionStructPatch,
-        Predicate as Pred,
+        Predicate as Pred, UnaryExpressionOp,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1818,11 +1818,20 @@ mod tests {
         assert_eq!(col("name"), Expr::column(["name"]));
         assert_eq!(col(["add", "path"]), Expr::column(["add", "path"]));
         assert_eq!(col(("add", "path")), Expr::column(["add", "path"]));
+        assert_eq!(col(vec!["add", "path"]), Expr::column(["add", "path"]));
         assert_eq!(lit(0i64), Expr::literal(0i64));
         // Compose with a predicate to exercise the public surface end-to-end.
         assert_eq!(
             col(["add", "path"]).is_not_null(),
             Expr::column(["add", "path"]).is_not_null(),
+        );
+    }
+
+    #[test]
+    fn to_json_chains_unary_tojson() {
+        assert_eq!(
+            col("x").to_json(),
+            Expr::unary(UnaryExpressionOp::ToJson, col("x")),
         );
     }
 

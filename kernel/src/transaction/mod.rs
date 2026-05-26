@@ -1418,8 +1418,8 @@ fn build_remove_struct_patch(
             .with_dropped_field_if_exists(STATS_PARSED_NAME);
     } else {
         // tags inserted after stats; stats passes through unchanged
-        patch = patch
-            .with_inserted_field(Some("stats"), col([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]));
+        patch =
+            patch.with_inserted_field(Some("stats"), col([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]));
     }
 
     patch = patch

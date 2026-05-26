@@ -173,7 +173,7 @@ pub(crate) fn get_transform_expr(
                     // This ensures consistent column ordering across file types
                     patch = patch
                         .with_dropped_field(physical_name.clone())
-                        .with_inserted_field(insert_after.clone(), Arc::new(col(physical_name)));
+                        .with_inserted_field(insert_after.clone(), col(physical_name));
                     patch
                 } else {
                     // Column doesn't exist physically - treat as partition column

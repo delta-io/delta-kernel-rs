@@ -203,13 +203,10 @@ impl SidecarSplitter {
             checkpoint_data_schema.clone(),
             Arc::new(Expression::struct_patch(
                 ExpressionStructPatch::new_top_level()
-                    .with_replaced_field(
-                        ADD_NAME,
-                        Arc::new(lit(Scalar::Null(add_field.data_type.clone()))),
-                    )
+                    .with_replaced_field(ADD_NAME, lit(Scalar::Null(add_field.data_type.clone())))
                     .with_replaced_field(
                         REMOVE_NAME,
-                        Arc::new(lit(Scalar::Null(remove_field.data_type.clone()))),
+                        lit(Scalar::Null(remove_field.data_type.clone())),
                     ),
             )),
             checkpoint_data_schema.clone().into(),

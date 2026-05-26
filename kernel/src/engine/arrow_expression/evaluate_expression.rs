@@ -1189,8 +1189,8 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let patch = ExpressionStructPatch::new_top_level()
-            .with_replaced_field("missing", Expr::literal(1));
+        let patch =
+            ExpressionStructPatch::new_top_level().with_replaced_field("missing", Expr::literal(1));
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
