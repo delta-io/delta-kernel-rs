@@ -8,6 +8,7 @@
 //! as a JSON object with a `clusteringColumns` field containing an array of column paths,
 //! where each path is an array of field names (to handle nested columns).
 
+use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::actions::DomainMetadata;
@@ -36,6 +37,7 @@ struct ClusteringDomainMetadata {
 }
 
 /// The domain name for clustering metadata.
+#[internal_api]
 pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 
 /// Validates clustering columns against the table schema.

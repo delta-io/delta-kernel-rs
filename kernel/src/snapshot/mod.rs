@@ -1024,6 +1024,26 @@ impl Snapshot {
         }
     }
 
+    /// Read the raw JSON configuration of the `delta.clustering` domain.
+    ///
+    /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
+    /// the domain has no current entry. The JSON has the shape
+    /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
+    #[internal_api]
+    pub(crate) fn get_clustering_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
+        if !self
+            .table_configuration
+            .protocol()
+            .has_table_feature(&TableFeature::ClusteredTable)
+        {
+            return Ok(None);
+        }
+        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
+    }
+
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
     /// requested domain is in a Partial cache, also answer from the cache; else full log
     /// replay. `domains == None` means load all.

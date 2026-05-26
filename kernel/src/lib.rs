@@ -125,6 +125,9 @@ pub mod row_tracking;
 #[cfg(not(feature = "test-utils"))]
 pub(crate) mod row_tracking;
 
+#[cfg(feature = "internal-api")]
+pub mod clustering;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod clustering;
 
 mod arrow_compat;
