@@ -11,7 +11,7 @@ use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PhysicalPredicate, StatsOutputMode};
-use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
+use crate::schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use crate::{DeltaResult, Error, PredicateRef, StructField};
@@ -206,12 +206,19 @@ impl StateInfo {
     /// Get the state needed to process a scan.
     ///
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
+    /// `predicate_schema` - The schema predicate column references are resolved against. Should
+    /// contain every column the predicate may legitimately reference (typically the full table
+    /// schema, or full CDF-extended schema for CDF scans). The caller is responsible for this
+    /// invariant; it is not validated. Caller-applied augmentations of `logical_schema` (e.g.,
+    /// metadata columns added via `StructType::add_metadata_column`) are NOT carried into
+    /// `predicate_schema`, so predicates referencing those columns are rejected at build time.
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
     /// `stats_output_mode` - Controls how file statistics are handled during the scan
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_schema: SchemaRef,
+        predicate_schema: &Schema,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
         stats_output_mode: StatsOutputMode,
@@ -318,7 +325,7 @@ impl StateInfo {
             .unwrap_or_default();
 
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, predicate_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
@@ -487,6 +494,7 @@ pub(crate) mod tests {
 
         StateInfo::try_new(
             schema.clone(),
+            &schema,
             &table_configuration,
             predicate,
             stats_output_mode,

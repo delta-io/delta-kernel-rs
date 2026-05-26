@@ -166,14 +166,23 @@ impl ScanBuilder {
     /// 4` to return a subset of the rows in the scan which satisfy the filter. If `predicate_opt`
     /// is `None`, this is a no-op.
     ///
+    /// The predicate may reference any column in the table's schema, including columns that
+    /// [`with_schema`] narrows out of the output projection.
+    ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
+    ///
+    /// NOTE: Predicates referencing metadata columns the caller added to the projection via
+    /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
+    /// and will error at build time.
     ///
     /// This method can be combined with [`include_all_stats_columns`]. When both are used, the
     /// kernel performs data skipping internally using the predicate AND outputs parsed
     /// statistics to the engine via the `stats_parsed` column in scan metadata.
     ///
     /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
+    /// [`with_schema`]: ScanBuilder::with_schema
+    /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
@@ -240,8 +249,12 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
-        // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+        // The output schema can be narrowed by `with_schema`, but predicates may still reference
+        // any column in the full table schema (SQL semantics: projection narrows output, predicates
+        // don't). Keep the full schema separately so predicate validation doesn't reject valid
+        // references to unprojected columns.
+        let table_schema = self.snapshot.schema();
+        let logical_schema = self.schema.unwrap_or_else(|| table_schema.clone());
 
         self.snapshot
             .table_configuration()
@@ -249,6 +262,7 @@ impl ScanBuilder {
 
         let state_info = StateInfo::try_new(
             logical_schema,
+            &table_schema,
             self.snapshot.table_configuration(),
             self.predicate,
             self.stats_output_mode.clone(),
