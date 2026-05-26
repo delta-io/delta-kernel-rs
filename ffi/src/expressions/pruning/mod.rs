@@ -156,7 +156,8 @@ pub(crate) mod tests {
     use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use delta_kernel::expressions::Expression;
+    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::schema::DataType;
 
     use super::*;
     use crate::TryFromStringSlice;
@@ -194,13 +195,41 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) struct FixedBatchStats {
+        pub(crate) min: Option<Scalar>,
+        pub(crate) max: Option<Scalar>,
+        pub(crate) nulls: Option<i64>,
+        pub(crate) rows: Option<i64>,
+    }
+
+    impl BatchStatsProvider for FixedBatchStats {
+        fn min(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+            self.min.clone()
+        }
+        fn max(&self, _row: usize, _col: &str, _dtype: &DataType) -> Option<Scalar> {
+            self.max.clone()
+        }
+        fn null_count(&self, _row: usize, _col: &str) -> Option<i64> {
+            self.nulls
+        }
+        fn row_count(&self, _row: usize) -> Option<i64> {
+            self.rows
+        }
+    }
+
     fn invoke_with_verdict(
         op_name: &str,
         inverted: bool,
         n_rows: usize,
     ) -> Vec<OpaquePruneVerdict> {
         let cb = build_test_callbacks();
-        let stats = BatchStatsAccessor::new();
+        let stats_provider = FixedBatchStats {
+            min: None,
+            max: None,
+            nulls: None,
+            rows: None,
+        };
+        let stats = BatchStatsAccessor::new(&stats_provider);
         let exprs: Vec<Expression> = vec![];
         let mut verdicts = vec![OpaquePruneVerdict::Unknown; n_rows];
         invoke_eval_against_stats(

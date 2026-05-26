@@ -4,22 +4,158 @@
 //! evaluator can run an opaque op against a stats metadata batch with a
 //! single FFI upcall per batch.
 
-use delta_kernel::arrow::array::{BooleanArray, RecordBatch};
+use delta_kernel::arrow::array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    RecordBatch, StringArray, StructArray,
+};
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaquePredicate, ArrowOpaquePredicateOp,
 };
-use delta_kernel::expressions::{Expression, Predicate, ScalarExpressionEvaluator};
+use delta_kernel::expressions::{Expression, Predicate, Scalar, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
+use delta_kernel::schema::DataType;
 use delta_kernel::DeltaResult;
 
 use super::pruning::{
-    invoke_eval_against_stats, BatchStatsAccessor, ChildAccessor, OpaquePruneVerdict,
+    invoke_eval_against_stats, BatchStatsAccessor, BatchStatsProvider, ChildAccessor,
+    OpaquePruneVerdict,
 };
 use super::NamedOpaquePredicateOp;
 use crate::engine_data::ArrowFFIData;
+
+// === BatchedArrowStatsProvider =================================================
+
+/// [`BatchStatsProvider`] reading from a stats metadata batch. Resolves
+/// `stats_parsed.{minValues,maxValues,nullCount,numRecords}` at
+/// construction; missing top-level columns yield `None` from every getter.
+pub(crate) struct BatchedArrowStatsProvider<'a> {
+    min_values: Option<&'a StructArray>,
+    max_values: Option<&'a StructArray>,
+    null_count: Option<&'a StructArray>,
+    num_records: Option<&'a dyn Array>,
+}
+
+impl<'a> BatchedArrowStatsProvider<'a> {
+    pub(crate) fn new(batch: &'a RecordBatch) -> Self {
+        let stats_parsed = batch
+            .column_by_name("stats_parsed")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>());
+        let sub_struct = |name: &str| -> Option<&StructArray> {
+            stats_parsed?
+                .column_by_name(name)?
+                .as_any()
+                .downcast_ref::<StructArray>()
+        };
+        let num_records = stats_parsed
+            .and_then(|s| s.column_by_name("numRecords"))
+            .map(|c| c.as_ref());
+        Self {
+            min_values: sub_struct("minValues"),
+            max_values: sub_struct("maxValues"),
+            null_count: sub_struct("nullCount"),
+            num_records,
+        }
+    }
+
+    fn read_stat(
+        kind_struct: Option<&'a StructArray>,
+        row: usize,
+        col: &str,
+        dtype: &DataType,
+    ) -> Option<Scalar> {
+        let kind_struct = kind_struct?;
+        let value_array = kind_struct.column_by_name(col)?;
+        if value_array.is_null(row) {
+            return None;
+        }
+        scalar_from_array(value_array.as_ref(), row, dtype)
+    }
+}
+
+impl<'a> BatchStatsProvider for BatchedArrowStatsProvider<'a> {
+    fn min(&self, row: usize, col: &str, dtype: &DataType) -> Option<Scalar> {
+        Self::read_stat(self.min_values, row, col, dtype)
+    }
+
+    fn max(&self, row: usize, col: &str, dtype: &DataType) -> Option<Scalar> {
+        Self::read_stat(self.max_values, row, col, dtype)
+    }
+
+    fn null_count(&self, row: usize, col: &str) -> Option<i64> {
+        let scalar = Self::read_stat(self.null_count, row, col, &DataType::LONG)?;
+        super::pruning::scalar_as_i64(&scalar)
+    }
+
+    fn row_count(&self, row: usize) -> Option<i64> {
+        let array = self.num_records?;
+        if array.is_null(row) {
+            return None;
+        }
+        let scalar = scalar_from_array(array, row, &DataType::LONG)?;
+        super::pruning::scalar_as_i64(&scalar)
+    }
+}
+
+/// Read `array[row]` as a [`Scalar`] of `dtype`. For [`DataType::LONG`],
+/// accepts any signed integer array (`Int8`..`Int64`) and returns the
+/// matching native-width [`Scalar`] variant; callers widen via
+/// [`scalar_as_i64`](super::pruning::scalar_as_i64). For [`DataType::DOUBLE`],
+/// accepts `Float64Array` or `Float32Array` and returns the matching
+/// native-width variant.
+fn scalar_from_array(array: &dyn Array, row: usize, dtype: &DataType) -> Option<Scalar> {
+    let any = array.as_any();
+    let DataType::Primitive(prim) = dtype else {
+        return None;
+    };
+    use delta_kernel::schema::PrimitiveType::*;
+    match prim {
+        String => any
+            .downcast_ref::<StringArray>()
+            .map(|arr| Scalar::String(arr.value(row).to_string())),
+        Long => integer_scalar(any, row),
+        Integer => any
+            .downcast_ref::<Int32Array>()
+            .map(|arr| Scalar::Integer(arr.value(row))),
+        Short => any
+            .downcast_ref::<Int16Array>()
+            .map(|arr| Scalar::Short(arr.value(row))),
+        Byte => any
+            .downcast_ref::<Int8Array>()
+            .map(|arr| Scalar::Byte(arr.value(row))),
+        Double => double_scalar(any, row),
+        Float => any
+            .downcast_ref::<Float32Array>()
+            .map(|arr| Scalar::Float(arr.value(row))),
+        _ => None,
+    }
+}
+
+fn integer_scalar(any: &dyn std::any::Any, row: usize) -> Option<Scalar> {
+    if let Some(arr) = any.downcast_ref::<Int64Array>() {
+        return Some(Scalar::Long(arr.value(row)));
+    }
+    if let Some(arr) = any.downcast_ref::<Int32Array>() {
+        return Some(Scalar::Integer(arr.value(row)));
+    }
+    if let Some(arr) = any.downcast_ref::<Int16Array>() {
+        return Some(Scalar::Short(arr.value(row)));
+    }
+    any.downcast_ref::<Int8Array>()
+        .map(|arr| Scalar::Byte(arr.value(row)))
+}
+
+fn double_scalar(any: &dyn std::any::Any, row: usize) -> Option<Scalar> {
+    if let Some(arr) = any.downcast_ref::<Float64Array>() {
+        return Some(Scalar::Double(arr.value(row)));
+    }
+    any.downcast_ref::<Float32Array>()
+        .map(|arr| Scalar::Float(arr.value(row)))
+}
+
+// === ArrowOpaquePredicateOp impl ==============================================
 
 impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
     fn eval_pred(
@@ -34,10 +170,12 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
             return Ok(BooleanArray::from(vec![None; n_rows]));
         };
 
+        let provider = BatchedArrowStatsProvider::new(batch);
         // None on export failure: engines that imported successfully read
-        // stats from their own runtime; the rest leave verdicts at Unknown.
+        // stats from their own runtime; the rest fall back to the scalar
+        // lane.
         let arrow_ffi = ArrowFFIData::try_from_record_batch(batch).ok();
-        let stats = BatchStatsAccessor::new().with_arrow_ffi(arrow_ffi);
+        let stats = BatchStatsAccessor::new(&provider).with_arrow_ffi(arrow_ffi);
         let children = ChildAccessor::new(args);
         let mut verdicts = vec![OpaquePruneVerdict::Unknown; n_rows];
         invoke_eval_against_stats(
@@ -113,7 +251,7 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
 
-    use delta_kernel::arrow::array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
+    use delta_kernel::arrow::array::ArrayRef;
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::expressions::column_expr;
 
@@ -121,6 +259,9 @@ mod tests {
     use crate::expressions::pruning::OpaquePruningCallbacks;
 
     fn three_file_batch() -> RecordBatch {
+        // row 0: apple..banana  (entirely below "foo" -> SKIP)
+        // row 1: foo..foozzz    (overlaps [foo, fop) -> KEEP)
+        // row 2: zebra..zoo     (entirely above "fop" -> SKIP)
         let min = StructArray::from(vec![(
             Arc::new(Field::new("name", ArrowDataType::Utf8, true)),
             Arc::new(StringArray::from(vec!["apple", "foo", "zebra"])) as ArrayRef,
@@ -179,6 +320,45 @@ mod tests {
 
     extern "C" fn no_op_free(_state: *mut std::ffi::c_void) {}
 
+    // === BatchedArrowStatsProvider ============================================
+
+    #[test]
+    fn batched_arrow_stats_provider_reads_string_min_max() {
+        let batch = three_file_batch();
+        let provider = BatchedArrowStatsProvider::new(&batch);
+
+        let min0 = provider.min(0, "name", &DataType::STRING).unwrap();
+        let max0 = provider.max(0, "name", &DataType::STRING).unwrap();
+        match (min0, max0) {
+            (Scalar::String(min_s), Scalar::String(max_s)) => {
+                assert_eq!(min_s, "apple");
+                assert_eq!(max_s, "banana");
+            }
+            other => panic!("expected string scalars, got {other:?}"),
+        }
+        assert_eq!(provider.null_count(1, "name"), Some(0));
+        assert_eq!(provider.row_count(2), Some(30));
+    }
+
+    #[test]
+    fn batched_arrow_stats_provider_returns_none_when_stats_parsed_missing() {
+        // Build a batch with no `stats_parsed` column; every provider getter must yield None.
+        let dummy = StructArray::from(vec![(
+            Arc::new(Field::new("x", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+        )]);
+        let schema = Schema::new(vec![Field::new("other", dummy.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dummy)]).unwrap();
+
+        let provider = BatchedArrowStatsProvider::new(&batch);
+        assert!(provider.min(0, "any", &DataType::STRING).is_none());
+        assert!(provider.max(0, "any", &DataType::STRING).is_none());
+        assert!(provider.null_count(0, "any").is_none());
+        assert!(provider.row_count(0).is_none());
+    }
+
+    // === Arrow C Data Interface passthrough ===================================
+
     #[test]
     fn batch_stats_as_arrow_exports_a_valid_ffi_struct() {
         thread_local! {
@@ -224,52 +404,133 @@ mod tests {
         assert!(p.is_null());
     }
 
+    // === End-to-end eval_pred (scalar lane) ===================================
+
+    // Toy STARTS_WITH evaluator using the per-row scalar getters.
+    extern "C" fn starts_with_eval_batch(
+        _state: *mut std::ffi::c_void,
+        op_name: crate::KernelStringSlice,
+        children: *const ChildAccessor<'_>,
+        stats: *const BatchStatsAccessor<'_>,
+        n_rows: usize,
+        inverted: bool,
+        verdicts: *mut OpaquePruneVerdict,
+    ) {
+        if inverted {
+            return;
+        }
+        let name = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&op_name) }
+            .unwrap_or_default();
+        if name != "STARTS_WITH" {
+            return;
+        }
+        if unsafe { crate::expressions::pruning::child_accessor_count(children) } != 2 {
+            return;
+        }
+        let mut col_slice = crate::KernelStringSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        if !unsafe {
+            crate::expressions::pruning::child_accessor_column_name(children, 0, &mut col_slice)
+        } {
+            return;
+        }
+        let col_name = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&col_slice) }
+            .unwrap_or_default();
+
+        let mut prefix_slice = crate::KernelStringSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        if !unsafe {
+            crate::expressions::pruning::child_accessor_literal_string(
+                children,
+                1,
+                &mut prefix_slice,
+            )
+        } {
+            return;
+        }
+        let prefix =
+            unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&prefix_slice) }
+                .unwrap_or_default();
+        let upper = next_prefix(&prefix);
+        let verdicts = unsafe { std::slice::from_raw_parts_mut(verdicts, n_rows) };
+        for (row, verdict_slot) in verdicts.iter_mut().enumerate() {
+            let mut min_slice = crate::KernelStringSlice {
+                ptr: std::ptr::null(),
+                len: 0,
+            };
+            if !unsafe {
+                crate::expressions::pruning::batch_stats_min_string(
+                    stats,
+                    row,
+                    crate::kernel_string_slice!(col_name),
+                    &mut min_slice,
+                )
+            } {
+                continue;
+            }
+            let min = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&min_slice) }
+                .unwrap_or_default();
+            let mut max_slice = crate::KernelStringSlice {
+                ptr: std::ptr::null(),
+                len: 0,
+            };
+            if !unsafe {
+                crate::expressions::pruning::batch_stats_max_string(
+                    stats,
+                    row,
+                    crate::kernel_string_slice!(col_name),
+                    &mut max_slice,
+                )
+            } {
+                continue;
+            }
+            let max = unsafe { <String as crate::TryFromStringSlice>::try_from_slice(&max_slice) }
+                .unwrap_or_default();
+            let skip = max.as_str() < prefix.as_str()
+                || upper.as_ref().is_some_and(|u| min.as_str() >= u.as_str());
+            *verdict_slot = if skip {
+                OpaquePruneVerdict::Skip
+            } else {
+                OpaquePruneVerdict::Keep
+            };
+        }
+    }
+
+    fn next_prefix(prefix: &str) -> Option<String> {
+        let mut chars: Vec<char> = prefix.chars().collect();
+        while let Some(last) = chars.pop() {
+            let mut next_code = u32::from(last) + 1;
+            if (0xD800..=0xDFFF).contains(&next_code) {
+                next_code = 0xE000;
+            }
+            if let Some(c) = char::from_u32(next_code) {
+                chars.push(c);
+                return Some(chars.into_iter().collect());
+            }
+        }
+        None
+    }
+
     #[test]
-    fn eval_pred_on_empty_batch_does_not_panic() {
-        thread_local! {
-            static SAW_CALLBACK: Cell<bool> = const { Cell::new(false) };
-        }
-
-        extern "C" fn note_eval(
-            _state: *mut std::ffi::c_void,
-            _op_name: crate::KernelStringSlice,
-            _children: *const ChildAccessor<'_>,
-            _stats: *const BatchStatsAccessor<'_>,
-            _n_rows: usize,
-            _inverted: bool,
-            _verdicts: *mut OpaquePruneVerdict,
-        ) {
-            SAW_CALLBACK.with(|c| c.set(true));
-        }
-
-        let empty_nullcount = StructArray::from(vec![(
-            Arc::new(Field::new("size", ArrowDataType::Int64, true)),
-            Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-        )]);
-        let stats_parsed = StructArray::from(vec![(
-            Arc::new(Field::new(
-                "nullCount",
-                ArrowDataType::Struct(vec![Field::new("size", ArrowDataType::Int64, true)].into()),
-                true,
-            )),
-            Arc::new(empty_nullcount) as ArrayRef,
-        )]);
-        let schema = Schema::new(vec![Field::new(
-            "stats_parsed",
-            stats_parsed.data_type().clone(),
-            true,
-        )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(stats_parsed)]).unwrap();
-
+    fn eval_pred_prunes_per_row_via_engine_callback() {
         let cb = Arc::new(OpaquePruningCallbacks {
             engine_state: std::ptr::null_mut(),
-            eval_against_stats: note_eval,
+            eval_against_stats: starts_with_eval_batch,
             free_state: no_op_free,
         });
-        let op = NamedOpaquePredicateOp::with_callbacks("FOO", cb);
-        let result = ArrowOpaquePredicateOp::eval_pred(&op, &[], &batch, false).unwrap();
-        assert_eq!(result.len(), 0);
-        assert!(SAW_CALLBACK.with(Cell::get));
+        let op = NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", cb);
+        let args = vec![column_expr!("name"), Expression::literal("foo")];
+        let batch = three_file_batch();
+
+        let result = ArrowOpaquePredicateOp::eval_pred(&op, &args, &batch, false).unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(!result.value(0)); // apple..banana -> skip
+        assert!(result.value(1)); // foo..foozzz -> keep
+        assert!(!result.value(2)); // zebra..zoo -> skip
     }
 
     #[test]
@@ -284,6 +545,8 @@ mod tests {
         assert!(result.is_null(1));
         assert!(result.is_null(2));
     }
+
+    // === Inverted-flag forwarding =============================================
 
     // Records the `inverted` flag and writes Skip on every row.
     extern "C" fn inverted_recording_eval(
@@ -325,7 +588,7 @@ mod tests {
         let result = ArrowOpaquePredicateOp::eval_pred(&op, &args, &batch, true).unwrap();
         assert_eq!(result.len(), 3);
         for row in 0..3 {
-            assert!(!result.value(row), "row {row} should be skipped");
+            assert!(!result.value(row));
         }
         assert!(SAW_INVERTED.with(Cell::get));
     }
