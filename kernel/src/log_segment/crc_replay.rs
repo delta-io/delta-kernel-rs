@@ -6,7 +6,7 @@
 //! commits `(X, Y]`. Per the incremental equation `Crc[X] + CrcDelta = Crc[Y]`, that
 //! delta is applied to a stale base via [`Crc::apply`].
 //
-// TODO: see if we can support log compaction files.
+// TODO(#2615): support log compaction files.
 
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, LazyLock};
@@ -19,7 +19,7 @@ use crate::actions::{
     COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME,
 };
-use crate::crc::{is_incremental_safe_operation, Crc, CrcDelta, FileSizeHistogram};
+use crate::crc::{is_incremental_safe_operation, Crc, CrcDelta, FileSizeHistogram, FileStatsDelta};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{
     column_name, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
@@ -50,8 +50,8 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
-    #[instrument(name = "log_seg.build_incremental_crc_from_stale", skip_all, err)]
-    pub(crate) fn build_incremental_crc_from_stale(
+    #[instrument(name = "log_seg.build_incremental_crc_from_base", skip_all, err)]
+    pub(crate) fn build_incremental_crc_from_base(
         &self,
         engine: &dyn Engine,
         base_crc: &Crc,
@@ -173,7 +173,7 @@ impl CrcReplayAccumulator {
         Self {
             delta: CrcDelta {
                 is_incremental_safe: true,
-                file_stats: crate::crc::FileStatsDelta {
+                file_stats: FileStatsDelta {
                     net_histogram: seed_histogram,
                     ..Default::default()
                 },
@@ -416,34 +416,29 @@ impl RowVisitor for CrcReplayVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use test_utils::{add_commit, assert_result_error_with_message};
+
     use super::*;
-    use crate::crc::FileSizeHistogram;
+    use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
+    use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
+    use crate::table_features::TableFeature;
 
     // ===== Unit tests on `on_*` methods =====
 
     // ===== commitInfo =====
 
-    #[test]
-    fn on_commit_info_safe_op_keeps_is_incremental_safe_true() {
+    #[rstest::rstest]
+    #[case::safe("WRITE", true)]
+    #[case::unsafe_op("ANALYZE STATS", false)]
+    fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_commit_info(Some("WRITE"), None);
-        assert!(acc.delta.is_incremental_safe);
-    }
-
-    #[test]
-    fn on_commit_info_unsafe_op_trips_is_incremental_safe() {
-        let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_commit_info(Some("ANALYZE STATS"), None);
-        assert!(!acc.delta.is_incremental_safe);
-        assert!(!acc.current_commit_saw_safe_op);
-    }
-
-    #[test]
-    fn on_commit_info_safe_op_marks_saw_safe_op() {
-        let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_commit_info(Some("WRITE"), None);
-        assert!(acc.current_commit_saw_safe_op);
-        assert!(acc.delta.is_incremental_safe);
+        acc.on_commit_info(Some(op), None);
+        assert_eq!(acc.current_commit_saw_safe_op, is_safe);
+        assert_eq!(acc.delta.is_incremental_safe, is_safe);
     }
 
     #[test]
@@ -634,16 +629,6 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_smoke_full_coverage() {
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        use test_utils::add_commit;
-
-        use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
-        use crate::engine::sync::SyncEngine;
-        use crate::object_store::memory::InMemory;
-        use crate::table_features::TableFeature;
-
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let root = "memory:///t/";
@@ -709,7 +694,7 @@ mod tests {
             ..Default::default()
         };
         let crc = segment
-            .build_incremental_crc_from_stale(&engine, &base)
+            .build_incremental_crc_from_base(&engine, &base)
             .unwrap();
 
         // Newest-wins: v2's upgraded protocol (now carries `rowTracking` on top of v0's
@@ -755,13 +740,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_incremental_crc_delta_errors_when_base_version_geq_end_version() {
-        use std::sync::Arc;
-
-        use test_utils::add_commit;
-
-        use crate::engine::sync::SyncEngine;
-        use crate::object_store::memory::InMemory;
-
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let root = "memory:///t/";
@@ -783,12 +761,9 @@ mod tests {
         )
         .unwrap();
         for base in [0, 5] {
-            let err = segment
-                .build_incremental_crc_delta(&engine, base, None)
-                .unwrap_err();
-            assert!(
-                matches!(err, Error::InternalError(_)),
-                "base={base}: {err:?}"
+            assert_result_error_with_message(
+                segment.build_incremental_crc_delta(&engine, base, None),
+                "must be strictly less than end_version",
             );
         }
     }
