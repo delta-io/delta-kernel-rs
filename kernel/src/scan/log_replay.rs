@@ -15,7 +15,7 @@ use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
     UnaryExpressionOp,
 };
-use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
+use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
     ParallelLogReplayProcessor,
@@ -141,10 +141,11 @@ impl ScanLogReplayProcessor {
     // `selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
     const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
-    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
+    const ADD_SIZE_INDEX: usize = 2; // Position of "add.size" in getters
+    const ADD_DV_START_INDEX: usize = 3; // Start position of add deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 6; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 7; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 8; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(
@@ -422,17 +423,26 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(
+        &mut self,
+        row: usize,
+        getters: &[&'b dyn GetData<'b>],
+    ) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
-        // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
-        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at
-        //   indexes 6-8
+        // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
+        //   3-5
+        // - For Remove actions (in log batches only): path is at index 7, followed by DV fields at
+        //   indexes 8-10
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
-            i,
+        let Some(FileActionInfo {
+            key: file_key,
+            size,
+            is_add,
+        }) = self.deduplicator.extract_file_action(
+            row,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
@@ -453,7 +463,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(i, "add.partitionValues")?;
+                    .get(row, "add.partitionValues")?;
                 parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -469,7 +479,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             return Ok(false);
         }
         let base_row_id: Option<i64> =
-            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
+            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
         let transform = self
             .state_info
             .transform_spec
@@ -485,10 +495,10 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
-            self.row_transform_exprs.resize_with(i, Default::default);
+            self.row_transform_exprs.resize_with(row, Default::default);
             self.row_transform_exprs.push(transform);
         }
-        self.metrics.incr_active_add_files();
+        self.metrics.record_active_add_file(size);
         Ok(true)
     }
 }
@@ -504,6 +514,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (ss_map, column_name!("add.partitionValues")),
+                (LONG, column_name!("add.size")),
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
@@ -522,7 +533,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
-            (&names[..6], &types[..6])
+            (&names[..7], &types[..7])
         }
     }
 
@@ -530,7 +541,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 10 } else { 6 };
+        let expected_getters = if is_log_batch { 11 } else { 7 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -539,9 +550,9 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             ))
         );
 
-        for i in 0..row_count {
-            if self.selection_vector[i] {
-                self.selection_vector[i] = self.is_valid_add(i, getters)?;
+        for row in 0..row_count {
+            if self.selection_vector[row] {
+                self.selection_vector[row] = self.is_valid_add(row, getters)?;
             }
         }
 
@@ -779,6 +790,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
         )?;
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -857,6 +869,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &mut self.seen_file_keys,
             is_log_batch,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::REMOVE_PATH_INDEX,
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
