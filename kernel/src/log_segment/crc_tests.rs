@@ -23,7 +23,7 @@ use crate::Snapshot;
 const SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}},{"name":"val","type":"string","nullable":true,"metadata":{}}]}"#;
 
 const COMMIT_INFO_TIMESTAMP: i64 = 1587968586154;
-const DEFAULT_OPERATION: &str = "WRITE";
+const DEFAULT_OPERATION: &str = "TEST_OP";
 
 fn protocol_v2() -> Protocol {
     Protocol::try_new_modern(["v2Checkpoint"], ["v2Checkpoint"]).unwrap()
@@ -101,12 +101,12 @@ fn metadata_ict() -> Metadata {
 // Action JSON helpers
 // ============================================================================
 
-/// Default commitInfo: operation `"WRITE"`, no ICT.
+/// Default commitInfo: operation `"TEST_OP"`, no ICT.
 fn commit_info() -> serde_json::Value {
     json!({"commitInfo": {"timestamp": COMMIT_INFO_TIMESTAMP, "operation": DEFAULT_OPERATION}})
 }
 
-/// commitInfo with the default `"WRITE"` operation and an in-commit timestamp.
+/// commitInfo with the default `"TEST_OP"` operation and an in-commit timestamp.
 fn commit_info_with_ict(ict: i64) -> serde_json::Value {
     json!({"commitInfo": {
         "timestamp": COMMIT_INFO_TIMESTAMP,
@@ -123,7 +123,7 @@ fn metadata(m: Metadata) -> serde_json::Value {
     json!({"metaData": serde_json::to_value(&m).unwrap()})
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Usage coming in next PR
 fn add(path: &str, size: i64) -> serde_json::Value {
     json!({"add": {
         "path": path,
@@ -134,21 +134,21 @@ fn add(path: &str, size: i64) -> serde_json::Value {
     }})
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Usage coming in next PR
 fn remove(path: &str, size: Option<i64>) -> serde_json::Value {
-    let mut v = json!({"remove": {
+    let mut obj = json!({"remove": {
         "path": path,
         "dataChange": true,
         "deletionTimestamp": 0,
     }});
     if let Some(s) = size {
-        v["remove"]["size"] = json!(s);
+        obj["remove"]["size"] = json!(s);
     }
-    v
+    obj
 }
 
-#[allow(dead_code)]
-fn dm(domain: &str, configuration: &str, removed: bool) -> serde_json::Value {
+#[allow(dead_code)] // Usage coming in next PR
+fn domain_metadata(domain: &str, configuration: &str, removed: bool) -> serde_json::Value {
     json!({"domainMetadata": {
         "domain": domain,
         "configuration": configuration,
@@ -156,17 +156,17 @@ fn dm(domain: &str, configuration: &str, removed: bool) -> serde_json::Value {
     }})
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Usage coming in next PR
 fn set_txn(app_id: &str, version: i64, last_updated: Option<i64>) -> serde_json::Value {
-    let mut v = json!({"txn": {"appId": app_id, "version": version}});
+    let mut obj = json!({"txn": {"appId": app_id, "version": version}});
     if let Some(lu) = last_updated {
-        v["txn"]["lastUpdated"] = json!(lu);
+        obj["txn"]["lastUpdated"] = json!(lu);
     }
-    v
+    obj
 }
 
 fn crc_json(protocol: &Protocol, metadata: &Metadata, ict: Option<i64>) -> serde_json::Value {
-    let mut v = json!({
+    let mut obj = json!({
         "tableSizeBytes": 0,
         "numFiles": 0,
         "numMetadata": 1,
@@ -175,9 +175,9 @@ fn crc_json(protocol: &Protocol, metadata: &Metadata, ict: Option<i64>) -> serde
         "protocol": serde_json::to_value(protocol).unwrap(),
     });
     if let Some(ict) = ict {
-        v["inCommitTimestampOpt"] = json!(ict);
+        obj["inCommitTimestampOpt"] = json!(ict);
     }
-    v
+    obj
 }
 
 // ============================================================================
@@ -313,14 +313,17 @@ impl CrcReadTest {
         BuiltCrcTest { engine, url }
     }
 
+    /// Asserts the accumulated ops are valid before `build()` writes anything.
     fn validate_ops(ops: &[Op]) {
         let mut prev: Option<u64> = None;
         for op in ops {
             if let Op::Commit { version, actions } = op {
+                // Each commit must contain at least one action.
                 assert!(
                     !actions.is_empty(),
                     "commit(v{version}, []): a commit must contain at least one action",
                 );
+                // Commit versions must be strictly increasing (and therefore unique).
                 if let Some(p) = prev {
                     assert!(
                         *version > p,
