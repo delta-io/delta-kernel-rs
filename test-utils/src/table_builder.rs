@@ -281,6 +281,14 @@ impl LogState {
     pub(crate) fn last_checkpoint_hint(&self) -> LastCheckpointHintState {
         self.last_checkpoint_hint
     }
+
+    /// Lowest commit version still on disk. After cleanup, commits `< cleanup_before`
+    /// have been deleted, so loading a snapshot at a version below this returns
+    /// "No files in log segment". Sweep callers use this to skip invalid combinations
+    /// of `LogState` and [`VersionTarget`].
+    pub fn min_reachable_version(&self) -> u64 {
+        self.cleanup_before.unwrap_or(0)
+    }
 }
 
 // Canonical sweep rows for the LogState axis. Test case names derive from these
@@ -314,8 +322,27 @@ pub fn two_checkpoints_stale_hint() -> LogState {
         .with_last_checkpoint_hint(LastCheckpointHintState::Stale)
 }
 
-pub fn post_cleanup() -> LogState {
+// Post-cleanup variants: same shapes as above but with log cleanup applied at the
+// checkpoint version. 99% of production tables have had maintenance run on them.
+
+pub fn checkpoint_at_end_post_cleanup() -> LogState {
+    checkpoint_at_end().with_cleanup_commits_before(DEFAULT_SWEEP_LATEST_VERSION)
+}
+
+pub fn checkpoint_at_end_no_hint_post_cleanup() -> LogState {
+    checkpoint_at_end_no_hint().with_cleanup_commits_before(DEFAULT_SWEEP_LATEST_VERSION)
+}
+
+pub fn checkpoint_mid_post_cleanup() -> LogState {
     checkpoint_mid().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_mid_no_hint_post_cleanup() -> LogState {
+    checkpoint_mid_no_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn two_checkpoints_stale_hint_post_cleanup() -> LogState {
+    two_checkpoints_stale_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
 }
 
 /// Extract the version from a versioned log file. Returns `None` for unversioned
@@ -571,9 +598,9 @@ fn all_features_base() -> FeatureSet {
 /// Table configuration properties that are orthogonal to table features.
 ///
 /// These are pure runtime knobs (stats format, checkpoint interval, file sizing,
-/// etc.) that don't affect the protocol or enable features. Embedded in
-/// [`DataLayoutConfig`] so each canonical layout row carries the relevant write-time
-/// properties (e.g. stats format).
+/// etc.) that don't affect the protocol or enable features. Crossed with
+/// [`DataLayoutConfig`] in the sweep so layout shape and write-time properties
+/// vary independently.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TableConfig {
     pub(crate) table_properties: Vec<(String, String)>,
@@ -622,6 +649,26 @@ impl fmt::Display for TableConfig {
             .collect();
         write!(f, "{}", props.join(", "))
     }
+}
+
+// Canonical sweep rows for the TableConfig axis.
+
+pub fn json_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(true)
+        .write_stats_as_struct(false)
+}
+
+pub fn struct_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(false)
+        .write_stats_as_struct(true)
+}
+
+pub fn no_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(false)
+        .write_stats_as_struct(false)
 }
 
 // ===========================================================================
@@ -695,22 +742,22 @@ pub fn table_configs(
 
 /// Data layout configuration for cross-product testing.
 ///
-/// Each variant carries a [`TableConfig`] so partitioning/clustering and write-time
-/// table properties (stats format, etc.) are chosen together as a single discrete
-/// layout shape.
+/// Describes only the partitioning/clustering shape of the table. Write-time table
+/// properties (stats format, etc.) live in [`TableConfig`], which is crossed with
+/// this axis independently.
 ///
-/// Designed for rstest `#[values]` parameterization alongside [`LogState`] and
-/// [`FeatureSet`].
+/// Designed for rstest `#[values]` parameterization alongside [`LogState`],
+/// [`FeatureSet`], and [`TableConfig`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataLayoutConfig {
     /// No special data layout (default schema).
-    Unpartitioned(TableConfig),
+    Unpartitioned,
     /// Partition by every valid primitive type. Uses [`partitioned_schema`] with all columns
     /// as partition columns.
-    PartitionedAllTypes(TableConfig),
+    PartitionedAllTypes,
     /// Cluster by every stats-eligible primitive type. Uses [`clustered_schema`] with all
     /// clustering-eligible columns. Boolean and Binary are excluded (not stats-eligible).
-    ClusteredAllTypes(TableConfig),
+    ClusteredAllTypes,
 }
 
 impl DataLayoutConfig {
@@ -718,9 +765,9 @@ impl DataLayoutConfig {
     /// schema columns except the `"value"` data column.
     pub fn columns(&self) -> Vec<String> {
         let schema = match self {
-            DataLayoutConfig::Unpartitioned(_) => return vec![],
-            DataLayoutConfig::PartitionedAllTypes(_) => partitioned_schema(),
-            DataLayoutConfig::ClusteredAllTypes(_) => clustered_schema(),
+            DataLayoutConfig::Unpartitioned => return vec![],
+            DataLayoutConfig::PartitionedAllTypes => partitioned_schema(),
+            DataLayoutConfig::ClusteredAllTypes => clustered_schema(),
         };
         schema
             .fields()
@@ -732,42 +779,29 @@ impl DataLayoutConfig {
     /// The schema for this config.
     pub fn schema(&self) -> SchemaRef {
         match self {
-            DataLayoutConfig::Unpartitioned(_) => default_schema(),
-            DataLayoutConfig::PartitionedAllTypes(_) => partitioned_schema(),
-            DataLayoutConfig::ClusteredAllTypes(_) => clustered_schema(),
+            DataLayoutConfig::Unpartitioned => default_schema(),
+            DataLayoutConfig::PartitionedAllTypes => partitioned_schema(),
+            DataLayoutConfig::ClusteredAllTypes => clustered_schema(),
         }
     }
 
     /// Whether this config uses partitioning.
     pub fn is_partitioned(&self) -> bool {
-        matches!(self, DataLayoutConfig::PartitionedAllTypes(_))
+        self == &DataLayoutConfig::PartitionedAllTypes
     }
 
     /// Whether this config uses clustering.
     pub fn is_clustered(&self) -> bool {
-        matches!(self, DataLayoutConfig::ClusteredAllTypes(_))
-    }
-
-    /// Write-time table properties applied to this layout.
-    pub fn table_config(&self) -> &TableConfig {
-        match self {
-            DataLayoutConfig::Unpartitioned(c)
-            | DataLayoutConfig::PartitionedAllTypes(c)
-            | DataLayoutConfig::ClusteredAllTypes(c) => c,
-        }
+        self == &DataLayoutConfig::ClusteredAllTypes
     }
 }
 
 impl fmt::Display for DataLayoutConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DataLayoutConfig::Unpartitioned(c) => write!(f, "unpartitioned+config({c})"),
-            DataLayoutConfig::PartitionedAllTypes(c) => {
-                write!(f, "partitioned(all_types)+config({c})")
-            }
-            DataLayoutConfig::ClusteredAllTypes(c) => {
-                write!(f, "clustered(all_types)+config({c})")
-            }
+            DataLayoutConfig::Unpartitioned => write!(f, "unpartitioned"),
+            DataLayoutConfig::PartitionedAllTypes => write!(f, "partitioned(all_types)"),
+            DataLayoutConfig::ClusteredAllTypes => write!(f, "clustered(all_types)"),
         }
     }
 }
@@ -822,38 +856,18 @@ pub fn clustered_schema() -> SchemaRef {
     ]))
 }
 
-// Layout factories. Pair with the TableConfig helpers below to build sweep rows.
+// Canonical sweep rows for the DataLayoutConfig axis.
 
-pub fn unpartitioned(config: TableConfig) -> DataLayoutConfig {
-    DataLayoutConfig::Unpartitioned(config)
+pub fn unpartitioned() -> DataLayoutConfig {
+    DataLayoutConfig::Unpartitioned
 }
 
-pub fn partitioned(config: TableConfig) -> DataLayoutConfig {
-    DataLayoutConfig::PartitionedAllTypes(config)
+pub fn partitioned() -> DataLayoutConfig {
+    DataLayoutConfig::PartitionedAllTypes
 }
 
-pub fn clustered(config: TableConfig) -> DataLayoutConfig {
-    DataLayoutConfig::ClusteredAllTypes(config)
-}
-
-// TableConfig helpers. Compose into a layout factory at the sweep call site.
-
-pub fn json_stats() -> TableConfig {
-    TableConfig::new()
-        .write_stats_as_json(true)
-        .write_stats_as_struct(false)
-}
-
-pub fn struct_stats() -> TableConfig {
-    TableConfig::new()
-        .write_stats_as_json(false)
-        .write_stats_as_struct(true)
-}
-
-pub fn no_stats() -> TableConfig {
-    TableConfig::new()
-        .write_stats_as_json(false)
-        .write_stats_as_struct(false)
+pub fn clustered() -> DataLayoutConfig {
+    DataLayoutConfig::ClusteredAllTypes
 }
 
 // ===========================================================================
@@ -1005,22 +1019,17 @@ impl TestTableBuilder {
         self
     }
 
-    /// Apply a [`DataLayoutConfig`], setting the schema, layout columns, and stats-format
-    /// table config accordingly. This is the recommended way to configure partitioning or
-    /// clustering -- it sets schema, columns, and stats in one call. Use
-    /// [`with_partition_columns`](Self::with_partition_columns) or
-    /// [`with_clustering_columns`](Self::with_clustering_columns) directly only when you
-    /// need a custom schema with specific columns.
+    /// Apply a [`DataLayoutConfig`], setting the schema and layout columns. Pair with
+    /// [`with_table_config`](Self::with_table_config) to also set write-time properties
+    /// like stats format -- these axes are independent.
     ///
-    /// For `Unpartitioned`, leaves the schema and columns unchanged but still applies the
-    /// stats config.
+    /// For `Unpartitioned`, leaves the schema and columns unchanged.
     pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
-        let builder = self.with_table_config(config.table_config().clone());
         let cols = config.columns();
         if cols.is_empty() {
-            return builder;
+            return self;
         }
-        let builder = builder.with_schema(config.schema());
+        let builder = self.with_schema(config.schema());
         if config.is_clustered() {
             builder.with_clustering_columns(cols)
         } else {
@@ -1453,17 +1462,20 @@ impl fmt::Display for TestTable {
 // rstest fixtures
 // ===========================================================================
 
-/// Convenience wrapper: build a [`TestTable`] from a `log_state`, `feature_set`, and
-/// `data_layout`. Used by the `test_context!` macro and available for direct use in tests.
+/// Convenience wrapper: build a [`TestTable`] from a `log_state`, `feature_set`,
+/// `data_layout`, and `table_config`. Used by the `test_context!` macro and available
+/// for direct use in tests.
 pub fn test_table(
     log_state: LogState,
     feature_set: FeatureSet,
     data_layout: DataLayoutConfig,
+    table_config: TableConfig,
 ) -> TestTable {
     TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(feature_set)
         .with_data_layout(data_layout)
+        .with_table_config(table_config)
         .build()
         .expect("failed to build test table")
 }
@@ -1515,31 +1527,39 @@ macro_rules! build_snapshot {
 /// Expands at the call site so `Snapshot` and the engine type resolve to the caller's crate
 /// types. Returns `(engine, snapshot, table)`.
 ///
-/// The 4-argument form defaults to `DefaultEngine` and requires `DefaultEngineBuilder` to be in
-/// scope at the call site. The 5-argument form takes an explicit engine factory closure
+/// The 5-argument form defaults to `DefaultEngine` and requires `DefaultEngineBuilder` to be in
+/// scope at the call site. The 6-argument form takes an explicit engine factory closure
 /// `Fn(Arc<DynObjectStore>) -> Engine`, useful when the caller cannot construct a
 /// `DefaultEngine` (e.g. kernel-internal unit tests that depend only on `SyncEngine`).
 ///
 /// ```ignore
-/// let (engine, snap, table) =
-///     test_context!(log_state, feature_set, data_layout, version_target);
-/// let (engine, snap, table) =
-///     test_context!(log_state, feature_set, data_layout, version_target,
-///         |store| SyncEngine::new_with_store(store));
+/// let (engine, snap, table) = test_context!(
+///     log_state, feature_set, data_layout, table_config, version_target,
+/// );
+/// let (engine, snap, table) = test_context!(
+///     log_state, feature_set, data_layout, table_config, version_target,
+///     |store| SyncEngine::new_with_store(store),
+/// );
 /// ```
 #[macro_export]
 macro_rules! test_context {
-    ($log_state:expr, $feature_set:expr, $data_layout:expr, $version_target:expr) => {
+    ($log_state:expr, $feature_set:expr, $data_layout:expr, $table_config:expr, $version_target:expr $(,)?) => {
         $crate::test_context!(
             $log_state,
             $feature_set,
             $data_layout,
+            $table_config,
             $version_target,
             |store| { DefaultEngineBuilder::new(store).build() }
         )
     };
-    ($log_state:expr, $feature_set:expr, $data_layout:expr, $version_target:expr, $engine_factory:expr) => {{
-        let table = $crate::table_builder::test_table($log_state, $feature_set, $data_layout);
+    ($log_state:expr, $feature_set:expr, $data_layout:expr, $table_config:expr, $version_target:expr, $engine_factory:expr $(,)?) => {{
+        let table = $crate::table_builder::test_table(
+            $log_state,
+            $feature_set,
+            $data_layout,
+            $table_config,
+        );
         let engine = ($engine_factory)(table.store().clone());
         let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
         (engine, snap, table)
@@ -1671,7 +1691,8 @@ mod tests {
     fn test_version_targets(
         #[values(LogState::with_latest_version(4))] log_state: LogState,
         #[values(FeatureSet::empty())] feature_set: FeatureSet,
-        #[values(unpartitioned(json_stats()))] data_layout: DataLayoutConfig,
+        #[values(unpartitioned())] data_layout: DataLayoutConfig,
+        #[values(json_stats())] table_config: TableConfig,
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
@@ -1679,8 +1700,13 @@ mod tests {
         )]
         version_target: VersionTarget,
     ) {
-        let (_engine, snap, _table) =
-            test_context!(log_state, feature_set, data_layout, version_target);
+        let (_engine, snap, _table) = test_context!(
+            log_state,
+            feature_set,
+            data_layout,
+            table_config,
+            version_target
+        );
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
             VersionTarget::AtVersion(v) => *v,
@@ -1917,8 +1943,8 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::partitioned(partitioned(json_stats()), partitioned_schema())]
-    #[case::clustered(clustered(struct_stats()), clustered_schema())]
+    #[case::partitioned(partitioned(), partitioned_schema())]
+    #[case::clustered(clustered(), clustered_schema())]
     fn test_data_layout_table(
         #[case] config: DataLayoutConfig,
         #[case] expected_schema: SchemaRef,
@@ -1946,7 +1972,8 @@ mod tests {
         // v0=create, v1-v3=data commits, 10 rows each
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(3))
-            .with_data_layout(clustered(struct_stats()))
+            .with_data_layout(clustered())
+            .with_table_config(struct_stats())
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;

@@ -22,9 +22,10 @@ use table_builder::*;
 /// ```ignore
 /// #[apply(log_state_sweep)]
 /// fn my_test(
-///     log_state: LogState,                                    // 7 canonical values
+///     log_state: LogState,                                    // canonical values
 ///     #[values(no_features())] feature_set: FeatureSet,
-///     #[values(unpartitioned_json())] data_layout: DataLayoutConfig,
+///     #[values(unpartitioned())] data_layout: DataLayoutConfig,
+///     #[values(json_stats())] table_config: TableConfig,
 ///     #[values(version_latest())] version_target: VersionTarget,
 /// ) { /* ... */ }
 /// ```
@@ -36,6 +37,7 @@ macro_rules! define_sweeps {
         log_state_values = $ls:tt,
         feature_set_values = $fs:tt,
         data_layout_values = $dl:tt,
+        table_config_values = $tc:tt,
         version_target_values = $vt:tt $(,)?
     ) => {
         #[template]
@@ -45,6 +47,7 @@ macro_rules! define_sweeps {
             #[values $ls] log_state: LogState,
             #[values $fs] feature_set: FeatureSet,
             #[values $dl] data_layout: DataLayoutConfig,
+            #[values $tc] table_config: TableConfig,
             #[values $vt] version_target: VersionTarget,
         ) {
         }
@@ -67,6 +70,11 @@ macro_rules! define_sweeps {
         #[template]
         #[export]
         #[rstest]
+        pub fn table_config_sweep(#[values $tc] table_config: TableConfig) {}
+
+        #[template]
+        #[export]
+        #[rstest]
         pub fn version_target_sweep(#[values $vt] version_target: VersionTarget) {}
     };
 }
@@ -82,7 +90,11 @@ define_sweeps! {
         checkpoint_mid(),
         checkpoint_mid_no_hint(),
         two_checkpoints_stale_hint(),
-        post_cleanup()
+        checkpoint_at_end_post_cleanup(),
+        checkpoint_at_end_no_hint_post_cleanup(),
+        checkpoint_mid_post_cleanup(),
+        checkpoint_mid_no_hint_post_cleanup(),
+        two_checkpoints_stale_hint_post_cleanup()
     ),
     // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
     //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
@@ -91,19 +103,9 @@ define_sweeps! {
     // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
     // TODO: iceV3 (needs icebergCompatV3).
     feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
-    // Three layouts crossed with three stats formats. TODO: null-distribution and
-    // partition-by-timestamp-with-CM rows.
-    data_layout_values = (
-        unpartitioned(json_stats()),
-        unpartitioned(struct_stats()),
-        unpartitioned(no_stats()),
-        partitioned(json_stats()),
-        partitioned(struct_stats()),
-        partitioned(no_stats()),
-        clustered(json_stats()),
-        clustered(struct_stats()),
-        clustered(no_stats())
-    ),
+    // TODO: null-distribution and partition-by-timestamp-with-CM rows.
+    data_layout_values = (unpartitioned(), partitioned(), clustered()),
+    table_config_values = (json_stats(), struct_stats(), no_stats()),
     version_target_values = (
         version_latest(),
         version_at_mid(),
