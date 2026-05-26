@@ -21,7 +21,7 @@
 
 use std::cmp::Ordering;
 
-use error::LogHistoryError;
+use error::{LogHistoryError, NearestTimestamp};
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
 
@@ -189,11 +189,11 @@ fn linear_search_file_mod_timestamps(
     bound: Bound,
 ) -> Result<Version, LogHistoryError> {
     if commits.is_empty() {
-        return Err(LogHistoryError::TimestampOutOfRange {
+        return Err(LogHistoryError::out_of_range(
             timestamp,
-            reason: bound.out_of_range_reason(),
-            nearest_timestamp: None,
-        });
+            bound,
+            NearestTimestamp::Unknown,
+        ));
     }
 
     let lo_version = commits[0].version;
@@ -232,11 +232,11 @@ fn linear_search_file_mod_timestamps(
         // Exiting with `result == None` means either (GreatestLower) every commit
         // is after `timestamp`, so the earliest commit is the nearest, or
         // (LeastUpper) every commit is before `timestamp`, so the latest is.
-        LogHistoryError::TimestampOutOfRange {
-            timestamp,
-            reason: bound.out_of_range_reason(),
-            nearest_timestamp: bound.boundary_of(commits).map(|c| c.location.last_modified),
-        }
+        let nearest = bound
+            .boundary_of(commits)
+            .map(|c| NearestTimestamp::from_boundary(bound, c.location.last_modified))
+            .unwrap_or(NearestTimestamp::Unknown);
+        LogHistoryError::out_of_range(timestamp, bound, nearest)
     })
 }
 
@@ -250,11 +250,11 @@ fn binary_search_ict_timestamps(
     engine: &dyn Engine,
 ) -> Result<Version, LogHistoryError> {
     if commits.is_empty() {
-        return Err(LogHistoryError::TimestampOutOfRange {
+        return Err(LogHistoryError::out_of_range(
             timestamp,
-            reason: bound.out_of_range_reason(),
-            nearest_timestamp: None,
-        });
+            bound,
+            NearestTimestamp::Unknown,
+        ));
     }
 
     let lo_version = commits[0].version;
@@ -277,24 +277,24 @@ fn binary_search_ict_timestamps(
             // OutOfRange under `GreatestLower` means timestamp < commits[0]'s
             // ICT; under `LeastUpper` it means timestamp > commits.last()'s
             // ICT. The boundary timestamp is read via `commit_to_ict`; on
-            // engine failure we degrade to `None` so the original out-of-range
-            // error is preserved.
-            let nearest_timestamp = bound.boundary_of(commits).and_then(|boundary| {
-                commit_to_ict(boundary)
-                    .inspect_err(|e| {
-                        warn!(
-                            error = ?e,
-                            version = boundary.version,
-                            "failed to read boundary ICT for nearest_timestamp hint",
-                        );
-                    })
-                    .ok()
-            });
-            Err(LogHistoryError::TimestampOutOfRange {
-                timestamp,
-                reason: bound.out_of_range_reason(),
-                nearest_timestamp,
-            })
+            // engine failure we degrade to `Unknown` so the original
+            // out-of-range error is preserved.
+            let nearest = bound
+                .boundary_of(commits)
+                .and_then(|boundary| {
+                    commit_to_ict(boundary)
+                        .inspect_err(|e| {
+                            warn!(
+                                error = ?e,
+                                version = boundary.version,
+                                "failed to read boundary ICT for nearest_timestamp hint",
+                            );
+                        })
+                        .ok()
+                        .map(|ts| NearestTimestamp::from_boundary(bound, ts))
+                })
+                .unwrap_or(NearestTimestamp::Unknown);
+            Err(LogHistoryError::out_of_range(timestamp, bound, nearest))
         }
     }
 }
@@ -347,11 +347,11 @@ pub(crate) fn timestamp_to_version(
         (Ordering::Greater, Bound::GreatestLower) => return Ok(snapshot.version()),
         // Timestamp after snapshot: for LeastUpper, no version exists
         (Ordering::Greater, Bound::LeastUpper) => {
-            return Err(LogHistoryError::TimestampOutOfRange {
+            return Err(LogHistoryError::out_of_range(
                 timestamp,
-                reason: bound.out_of_range_reason(),
-                nearest_timestamp: Some(snap_ts),
-            });
+                bound,
+                NearestTimestamp::Latest(snap_ts),
+            ));
         }
         // Timestamp before snapshot: need to search the log
         _ => {}
@@ -1054,13 +1054,13 @@ mod tests {
     /// ICT binary-search out-of-range, and the snapshot short-circuit.
     #[rstest::rstest]
     // Linear file-mod GLB: timestamp below earliest commit on the standard table.
-    // nearest = commits[0].last_modified = 50.
+    // nearest = Earliest(commits[0].last_modified) = Earliest(50).
     #[case::linear_glb_below_earliest(
         &[(50, None), (150, None), (250, None), (350, Some(300)), (450, Some(400))],
         Some(3),
         0,
         Bound::GreatestLower,
-        Some(50),
+        NearestTimestamp::Earliest(50),
     )]
     // Snapshot short-circuit LUB: timestamp above the snapshot's ICT (snap_ts = 400).
     #[case::short_circuit_lub_after_snapshot(
@@ -1068,16 +1068,16 @@ mod tests {
         Some(3),
         1000,
         Bound::LeastUpper,
-        Some(400),
+        NearestTimestamp::Latest(400),
     )]
     // ICT binary-search GLB: timestamp below earliest ICT on an ICT-from-creation
-    // table. nearest = ICT(v0) = 100.
+    // table. nearest = Earliest(ICT(v0)) = Earliest(100).
     #[case::ict_glb_below_earliest(
         &[(0, Some(100)), (0, Some(200)), (0, Some(300))],
         Some(0),
         50,
         Bound::GreatestLower,
-        Some(100),
+        NearestTimestamp::Earliest(100),
     )]
     #[tokio::test]
     async fn test_timestamp_out_of_range_nearest_timestamp(
@@ -1085,7 +1085,7 @@ mod tests {
         #[case] ict_enablement: Option<Version>,
         #[case] timestamp: Timestamp,
         #[case] bound: Bound,
-        #[case] expected_nearest: Option<Timestamp>,
+        #[case] expected_nearest: NearestTimestamp,
     ) {
         let (_table, engine, snapshot, _log_segment) =
             build_test_snapshot(timestamps, ict_enablement, None).await;
