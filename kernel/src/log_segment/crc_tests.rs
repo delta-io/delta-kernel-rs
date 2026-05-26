@@ -10,7 +10,7 @@ use serde_json::json;
 use test_utils::{assert_result_error_with_message, delta_path_for_version};
 use url::Url;
 
-use crate::actions::{CommitInfo, Format, Metadata, Protocol};
+use crate::actions::{Format, Metadata, Protocol};
 use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
@@ -21,6 +21,9 @@ use crate::Snapshot;
 // ============================================================================
 
 const SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}},{"name":"val","type":"string","nullable":true,"metadata":{}}]}"#;
+
+const COMMIT_INFO_TIMESTAMP: i64 = 1587968586154;
+const DEFAULT_OPERATION: &str = "WRITE";
 
 fn protocol_v2() -> Protocol {
     Protocol::try_new_modern(["v2Checkpoint"], ["v2Checkpoint"]).unwrap()
@@ -94,38 +97,72 @@ fn metadata_ict() -> Metadata {
     )
 }
 
-fn commit_info() -> CommitInfo {
-    CommitInfo {
-        timestamp: Some(1587968586154),
-        operation: Some("WRITE".to_string()),
-        ..Default::default()
-    }
-}
-
 // ============================================================================
-// JSON builders
+// Action JSON helpers
 // ============================================================================
 
-const V2_CKPT_SUFFIX: &str = "checkpoint.00000000-0000-0000-0000-000000000000.json";
-
-fn protocol_action_json(protocol: &Protocol) -> serde_json::Value {
-    json!({"protocol": serde_json::to_value(protocol).unwrap()})
+/// Default commitInfo: operation `"WRITE"`, no ICT.
+fn commit_info() -> serde_json::Value {
+    json!({"commitInfo": {"timestamp": COMMIT_INFO_TIMESTAMP, "operation": DEFAULT_OPERATION}})
 }
 
-fn metadata_action_json(metadata: &Metadata) -> serde_json::Value {
-    json!({"metaData": serde_json::to_value(metadata).unwrap()})
-}
-
-fn commit_info_json() -> serde_json::Value {
-    json!({"commitInfo": serde_json::to_value(commit_info()).unwrap()})
-}
-
-fn commit_info_json_with_ict(ict: i64) -> serde_json::Value {
+/// commitInfo with the default `"WRITE"` operation and an in-commit timestamp.
+fn commit_info_with_ict(ict: i64) -> serde_json::Value {
     json!({"commitInfo": {
-        "timestamp": 1587968586154i64,
-        "operation": "WRITE",
+        "timestamp": COMMIT_INFO_TIMESTAMP,
+        "operation": DEFAULT_OPERATION,
         "inCommitTimestamp": ict,
     }})
+}
+
+fn protocol(p: Protocol) -> serde_json::Value {
+    json!({"protocol": serde_json::to_value(&p).unwrap()})
+}
+
+fn metadata(m: Metadata) -> serde_json::Value {
+    json!({"metaData": serde_json::to_value(&m).unwrap()})
+}
+
+#[allow(dead_code)]
+fn add(path: &str, size: i64) -> serde_json::Value {
+    json!({"add": {
+        "path": path,
+        "size": size,
+        "partitionValues": {},
+        "modificationTime": 0,
+        "dataChange": true,
+    }})
+}
+
+#[allow(dead_code)]
+fn remove(path: &str, size: Option<i64>) -> serde_json::Value {
+    let mut v = json!({"remove": {
+        "path": path,
+        "dataChange": true,
+        "deletionTimestamp": 0,
+    }});
+    if let Some(s) = size {
+        v["remove"]["size"] = json!(s);
+    }
+    v
+}
+
+#[allow(dead_code)]
+fn dm(domain: &str, configuration: &str, removed: bool) -> serde_json::Value {
+    json!({"domainMetadata": {
+        "domain": domain,
+        "configuration": configuration,
+        "removed": removed,
+    }})
+}
+
+#[allow(dead_code)]
+fn set_txn(app_id: &str, version: i64, last_updated: Option<i64>) -> serde_json::Value {
+    let mut v = json!({"txn": {"appId": app_id, "version": version}});
+    if let Some(lu) = last_updated {
+        v["txn"]["lastUpdated"] = json!(lu);
+    }
+    v
 }
 
 fn crc_json(protocol: &Protocol, metadata: &Metadata, ict: Option<i64>) -> serde_json::Value {
@@ -154,15 +191,9 @@ enum Op {
         protocol: Protocol,
         metadata: Metadata,
     },
-    Delta(u64),
-    DeltaWithPM {
+    Commit {
         version: u64,
-        protocol: Option<Protocol>,
-        metadata: Option<Metadata>,
-    },
-    DeltaWithIct {
-        version: u64,
-        ict: i64,
+        actions: Vec<serde_json::Value>,
     },
     Crc {
         version: u64,
@@ -170,7 +201,9 @@ enum Op {
         metadata: Metadata,
         ict: Option<i64>,
     },
-    CorruptCrc(u64),
+    CorruptCrc {
+        version: u64,
+    },
 }
 
 /// Declarative test builder: accumulate log operations, then build and assert.
@@ -183,7 +216,6 @@ impl CrcReadTest {
         Self { ops: vec![] }
     }
 
-    /// Write a V2 checkpoint at the given version.
     fn v2_checkpoint(mut self, version: u64, protocol: Protocol, metadata: Metadata) -> Self {
         self.ops.push(Op::V2Checkpoint {
             version,
@@ -193,34 +225,17 @@ impl CrcReadTest {
         self
     }
 
-    /// Write a plain delta (commitInfo only, no protocol or metadata).
-    fn delta(mut self, version: u64) -> Self {
-        self.ops.push(Op::Delta(version));
-        self
-    }
-
-    /// Write a delta with optional protocol and/or metadata overrides.
-    fn delta_with_p_m(
+    /// Write a commit file containing exactly the given actions, in order.
+    fn commit(
         mut self,
         version: u64,
-        protocol: impl Into<Option<Protocol>>,
-        metadata: impl Into<Option<Metadata>>,
+        actions: impl IntoIterator<Item = serde_json::Value>,
     ) -> Self {
-        self.ops.push(Op::DeltaWithPM {
-            version,
-            protocol: protocol.into(),
-            metadata: metadata.into(),
-        });
+        let actions: Vec<serde_json::Value> = actions.into_iter().collect();
+        self.ops.push(Op::Commit { version, actions });
         self
     }
 
-    /// Write a delta with an in-commit timestamp in commitInfo.
-    fn delta_with_ict(mut self, version: u64, ict: i64) -> Self {
-        self.ops.push(Op::DeltaWithIct { version, ict });
-        self
-    }
-
-    /// Write a CRC file with the given protocol, metadata, and optional ICT.
     fn crc(
         mut self,
         version: u64,
@@ -237,80 +252,85 @@ impl CrcReadTest {
         self
     }
 
-    /// Write a corrupt CRC file.
     fn corrupt_crc(mut self, version: u64) -> Self {
-        self.ops.push(Op::CorruptCrc(version));
+        self.ops.push(Op::CorruptCrc { version });
         self
     }
 
     /// Execute all operations, returning a built test that can be asserted against.
     async fn build(self) -> BuiltCrcTest {
+        Self::validate_ops(&self.ops);
+
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///").unwrap();
         let engine = SyncEngine::new_with_store(store.clone());
 
         for op in self.ops {
             match op {
-                Op::V2Checkpoint {
-                    version: v,
-                    ref protocol,
-                    ref metadata,
-                } => {
-                    let content = format!(
-                        "{}\n{}\n{}",
-                        protocol_action_json(protocol),
-                        metadata_action_json(metadata),
-                        json!({"checkpointMetadata": {"version": 2}})
-                    );
-                    put(&store, v, V2_CKPT_SUFFIX, &content).await;
-                }
-                Op::Delta(v) => {
-                    put(&store, v, "json", &commit_info_json().to_string()).await;
-                }
-                Op::DeltaWithPM {
-                    version: v,
-                    protocol,
-                    metadata,
-                } => {
-                    let mut lines = vec![commit_info_json().to_string()];
-                    if let Some(ref p) = protocol {
-                        lines.push(protocol_action_json(p).to_string());
-                    }
-                    if let Some(ref m) = metadata {
-                        lines.push(metadata_action_json(m).to_string());
-                    }
-                    put(&store, v, "json", &lines.join("\n")).await;
-                }
-                Op::DeltaWithIct { version: v, ict } => {
-                    put(
-                        &store,
-                        v,
-                        "json",
-                        &commit_info_json_with_ict(ict).to_string(),
-                    )
-                    .await;
+                Op::Commit { version, actions } => {
+                    let content = actions
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    put(&store, version, "json", &content).await;
                 }
                 Op::Crc {
-                    version: v,
+                    version,
                     ref protocol,
                     ref metadata,
                     ict,
                 } => {
                     put(
                         &store,
-                        v,
+                        version,
                         "crc",
                         &crc_json(protocol, metadata, ict).to_string(),
                     )
                     .await;
                 }
-                Op::CorruptCrc(v) => {
-                    put(&store, v, "crc", "CORRUPT_CRC_DATA").await;
+                Op::CorruptCrc { version } => {
+                    put(&store, version, "crc", "CORRUPT_CRC_DATA").await;
+                }
+                Op::V2Checkpoint {
+                    version,
+                    protocol: p,
+                    metadata: m,
+                } => {
+                    const V2_CKPT_SUFFIX: &str =
+                        "checkpoint.00000000-0000-0000-0000-000000000000.json";
+                    let content = format!(
+                        "{}\n{}\n{}",
+                        protocol(p),
+                        metadata(m),
+                        json!({"checkpointMetadata": {"version": 2}})
+                    );
+                    put(&store, version, V2_CKPT_SUFFIX, &content).await;
                 }
             }
         }
 
         BuiltCrcTest { engine, url }
+    }
+
+    fn validate_ops(ops: &[Op]) {
+        let mut prev: Option<u64> = None;
+        for op in ops {
+            if let Op::Commit { version, actions } = op {
+                assert!(
+                    !actions.is_empty(),
+                    "commit(v{version}, []): a commit must contain at least one action",
+                );
+                if let Some(p) = prev {
+                    assert!(
+                        *version > p,
+                        "commit(v{version}): commits must be added in strictly increasing \
+                         version order (previous commit was at v{p})",
+                    );
+                }
+                prev = Some(*version);
+            }
+        }
     }
 }
 
@@ -320,45 +340,42 @@ struct BuiltCrcTest {
 }
 
 impl BuiltCrcTest {
+    /// Build a snapshot at `version` (or latest if `None`) and return it
+    /// alongside a human-readable label like `"v2"` or `"latest"`.
+    fn snapshot_at(&self, version: Option<u64>) -> (crate::snapshot::SnapshotRef, String) {
+        let mut builder = Snapshot::builder_for(self.url.clone());
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+        let snapshot = builder.build(&self.engine).unwrap();
+        let label = version.map_or("latest".to_string(), |v| format!("v{v}"));
+        (snapshot, label)
+    }
+
     fn assert_p_m(
         &self,
         version: impl Into<Option<u64>>,
         expected_protocol: &Protocol,
         expected_metadata: &Metadata,
     ) {
-        let version = version.into();
-        let mut builder = Snapshot::builder_for(self.url.clone());
-        if let Some(v) = version {
-            builder = builder.at_version(v);
-        }
-        let snapshot = builder.build(&self.engine).unwrap();
+        let (snapshot, label) = self.snapshot_at(version.into());
         let table_config = snapshot.table_configuration();
-
-        let version_label = version.map_or("latest".to_string(), |v| format!("v{v}"));
         assert_eq!(
             table_config.protocol(),
             expected_protocol,
-            "Protocol mismatch at {version_label}"
+            "Protocol mismatch at {label}"
         );
-
         assert_eq!(
             table_config.metadata(),
             expected_metadata,
-            "Metadata mismatch at {version_label}"
+            "Metadata mismatch at {label}"
         );
     }
 
     fn assert_ict(&self, version: impl Into<Option<u64>>, expected_ict: Option<i64>) {
-        let version = version.into();
-        let mut builder = Snapshot::builder_for(self.url.clone());
-        if let Some(v) = version {
-            builder = builder.at_version(v);
-        }
-        let snapshot = builder.build(&self.engine).unwrap();
+        let (snapshot, label) = self.snapshot_at(version.into());
         let ict = snapshot.get_in_commit_timestamp(&self.engine).unwrap();
-
-        let version_label = version.map_or("latest".to_string(), |v| format!("v{v}"));
-        assert_eq!(ict, expected_ict, "ICT mismatch at {version_label}");
+        assert_eq!(ict, expected_ict, "ICT mismatch at {label}");
     }
 }
 
@@ -384,9 +401,16 @@ async fn put(store: &InMemory, version: u64, suffix: &str, content: &str) {
 #[tokio::test]
 async fn test_get_p_m_from_delta_no_checkpoint() {
     CrcReadTest::new()
-        .delta_with_p_m(0, protocol_v2(), metadata_a()) // <-- P & M from here
-        .delta(1)
-        .delta(2)
+        .commit(
+            0, // <-- P & M from here
+            [
+                commit_info(),
+                protocol(protocol_v2()),
+                metadata(metadata_a()),
+            ],
+        )
+        .commit(1, [commit_info()])
+        .commit(2, [commit_info()])
         .build()
         .await
         .assert_p_m(None, &protocol_v2(), &metadata_a());
@@ -396,8 +420,8 @@ async fn test_get_p_m_from_delta_no_checkpoint() {
 async fn test_get_p_and_m_from_different_deltas() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta_with_p_m(1, protocol_v2_dv(), None) // <-- P from here
-        .delta_with_p_m(2, None, metadata_b()) // <-- M from here
+        .commit(1, [commit_info(), protocol(protocol_v2_dv())]) // <-- P from here
+        .commit(2, [commit_info(), metadata(metadata_b())]) // <-- M from here
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
@@ -407,8 +431,8 @@ async fn test_get_p_and_m_from_different_deltas() {
 async fn test_get_p_m_from_checkpoint() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
-        .delta(1)
-        .delta(2)
+        .commit(1, [commit_info()])
+        .commit(2, [commit_info()])
         .build()
         .await
         .assert_p_m(None, &protocol_v2(), &metadata_a());
@@ -418,8 +442,15 @@ async fn test_get_p_m_from_checkpoint() {
 async fn test_get_p_m_from_delta_after_checkpoint() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta_with_p_m(1, protocol_v2_dv(), metadata_b()) // <-- P & M from here
-        .delta(2)
+        .commit(
+            1, // <-- P & M from here
+            [
+                commit_info(),
+                protocol(protocol_v2_dv()),
+                metadata(metadata_b()),
+            ],
+        )
+        .commit(2, [commit_info()])
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
@@ -433,8 +464,8 @@ async fn test_get_p_m_from_delta_after_checkpoint() {
 async fn test_get_p_m_from_crc_at_target() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta(1)
-        .delta(2)
+        .commit(1, [commit_info()])
+        .commit(2, [commit_info()])
         .crc(2, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
@@ -447,8 +478,15 @@ async fn test_crc_preferred_over_delta_at_target() {
     // We only do this for this test so we can differentiate which P & M is used.
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta(1)
-        .delta_with_p_m(2, protocol_v2_dv(), metadata_a())
+        .commit(1, [commit_info()])
+        .commit(
+            2,
+            [
+                commit_info(),
+                protocol(protocol_v2_dv()),
+                metadata(metadata_a()),
+            ],
+        )
         .crc(2, protocol_v2_dv_ntz(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
@@ -459,8 +497,8 @@ async fn test_crc_preferred_over_delta_at_target() {
 async fn test_corrupt_crc_at_target_falls_back() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
-        .delta(1)
-        .delta(2)
+        .commit(1, [commit_info()])
+        .commit(2, [commit_info()])
         .corrupt_crc(2) // <-- Corrupt! Fall back to replay.
         .build()
         .await
@@ -473,8 +511,8 @@ async fn test_crc_wins_over_checkpoint() {
     // We only do this for this test so we can differentiate which P & M is used.
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta(1)
-        .delta(2)
+        .commit(1, [commit_info()])
+        .commit(2, [commit_info()])
         .v2_checkpoint(2, protocol_v2(), metadata_a())
         .crc(2, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
         .build()
@@ -486,8 +524,8 @@ async fn test_crc_wins_over_checkpoint() {
 async fn test_checkpoint_on_corrupt_crc() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta(1)
-        .delta(2)
+        .commit(1, [commit_info()])
+        .commit(2, [commit_info()])
         .v2_checkpoint(2, protocol_v2(), metadata_a()) // <-- P & M from here
         .corrupt_crc(2) // <-- Corrupt! Fall back to replay.
         .build()
@@ -503,9 +541,9 @@ async fn test_checkpoint_on_corrupt_crc() {
 async fn test_crc_at_earlier_version() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta(1)
+        .commit(1, [commit_info()])
         .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
-        .delta(2)
+        .commit(2, [commit_info()])
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
@@ -515,9 +553,9 @@ async fn test_crc_at_earlier_version() {
 async fn test_get_p_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta(1)
+        .commit(1, [commit_info()])
         .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- M from here
-        .delta_with_p_m(2, protocol_v2_dv_ntz(), None) // <-- P from here
+        .commit(2, [commit_info(), protocol(protocol_v2_dv_ntz())]) // <-- P from here
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv_ntz(), &metadata_b());
@@ -527,9 +565,9 @@ async fn test_get_p_from_newer_delta_over_older_crc() {
 async fn test_get_m_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
-        .delta(1)
+        .commit(1, [commit_info()])
         .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- P from here
-        .delta_with_p_m(2, None, metadata_a()) // <-- M from here
+        .commit(2, [commit_info(), metadata(metadata_a())]) // <-- M from here
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_a());
@@ -539,9 +577,9 @@ async fn test_get_m_from_newer_delta_over_older_crc() {
 async fn test_corrupt_crc_at_non_target_version_falls_back() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
-        .delta(1)
+        .commit(1, [commit_info()])
         .corrupt_crc(1) // <-- Corrupt! Fall back to replay.
-        .delta(2)
+        .commit(2, [commit_info()])
         .build()
         .await
         .assert_p_m(None, &protocol_v2(), &metadata_a());
@@ -550,11 +588,18 @@ async fn test_corrupt_crc_at_non_target_version_falls_back() {
 #[tokio::test]
 async fn test_crc_before_checkpoint_is_ignored() {
     CrcReadTest::new()
-        .delta_with_p_m(0, protocol_v2(), metadata_a())
-        .delta(1)
+        .commit(
+            0,
+            [
+                commit_info(),
+                protocol(protocol_v2()),
+                metadata(metadata_a()),
+            ],
+        )
+        .commit(1, [commit_info()])
         .crc(1, protocol_v2_dv_ntz(), metadata_b(), None)
         .v2_checkpoint(2, protocol_v2_dv(), metadata_a()) // <-- P & M from here
-        .delta(3)
+        .commit(3, [commit_info()])
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_a());
@@ -568,7 +613,7 @@ async fn test_crc_before_checkpoint_is_ignored() {
 async fn test_ict_from_crc_at_snapshot_version() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
-        .delta_with_ict(1, 2000)
+        .commit(1, [commit_info_with_ict(2000)])
         .crc(1, protocol_v2_ict(), metadata_ict(), 1000) // <-- ICT from here
         .build()
         .await
@@ -579,19 +624,56 @@ async fn test_ict_from_crc_at_snapshot_version() {
 async fn test_ict_errors_when_crc_has_no_ict() {
     let setup = CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
-        .delta_with_ict(1, 2000)
+        .commit(1, [commit_info_with_ict(2000)])
         .crc(1, protocol_v2_ict(), metadata_ict(), None)
         .build()
         .await;
 
-    let snapshot = Snapshot::builder_for(setup.url.clone())
-        .build(&setup.engine)
-        .unwrap();
-
+    let (snapshot, _) = setup.snapshot_at(None);
     let result = snapshot.get_in_commit_timestamp(&setup.engine);
 
     assert_result_error_with_message(
         result,
         "In-Commit Timestamp not found in CRC file at version 1",
     );
+}
+
+// ============================================================================
+// Tests: CrcReadTest framework itself
+// ============================================================================
+
+/// Build a `CrcReadTest` containing one commit per version, in the given order.
+async fn build_with_commit_versions(versions: &[u64]) -> BuiltCrcTest {
+    let mut t = CrcReadTest::new();
+    for &v in versions {
+        t = t.commit(v, [commit_info()]);
+    }
+    t.build().await
+}
+
+#[rstest::rstest]
+#[case::single(&[0])]
+#[case::consecutive(&[0, 1, 2])]
+#[case::with_gaps(&[0, 5, 88, 1000])]
+#[tokio::test]
+async fn test_commit_versions_strictly_increasing_succeeds(#[case] versions: &[u64]) {
+    build_with_commit_versions(versions).await;
+}
+
+#[rstest::rstest]
+#[case::immediate_duplicate(&[0, 0])]
+#[case::later_duplicate(&[0, 1, 1])]
+#[case::immediate_decrease(&[5, 3])]
+#[case::later_decrease(&[0, 5, 4])]
+#[case::decrease_to_zero(&[2, 0])]
+#[tokio::test]
+#[should_panic(expected = "strictly increasing")]
+async fn test_commit_versions_not_increasing_panics(#[case] versions: &[u64]) {
+    build_with_commit_versions(versions).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "at least one action")]
+async fn test_commit_empty_actions_panics() {
+    CrcReadTest::new().commit(0, []).build().await;
 }
