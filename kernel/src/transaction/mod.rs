@@ -38,7 +38,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
-    Version,
+    ScopedDeltaResultIterator, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -70,8 +70,7 @@ use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
+pub(crate) type EngineDataResultIterator<'a> = ScopedDeltaResultIterator<'a, Box<dyn EngineData>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -1645,7 +1644,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             Err(Error::IOError(std::io::Error::other("simulated IO error")))
@@ -1669,7 +1668,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             // This won't be reached in tests — the validation error fires before commit.
@@ -2815,7 +2814,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
             commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());

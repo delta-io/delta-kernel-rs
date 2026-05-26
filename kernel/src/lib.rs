@@ -180,7 +180,7 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, DeltaResultIterator, Error};
+pub use error::{DeltaResult, DeltaResultIterator, Error, ScopedDeltaResultIterator};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
@@ -698,7 +698,7 @@ pub trait JsonHandler: AsAny {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: ScopedDeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }
@@ -904,7 +904,7 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        data: DeltaResultIterator<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.

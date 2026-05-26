@@ -126,7 +126,9 @@ mod tests {
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
-    use delta_kernel::{DeltaResult, Engine, FileMeta, FilteredEngineData};
+    use delta_kernel::{
+        DeltaResult, Engine, FileMeta, FilteredEngineData, ScopedDeltaResultIterator,
+    };
 
     use super::*;
 
@@ -136,7 +138,7 @@ mod tests {
         fn commit(
             &self,
             engine: &dyn Engine,
-            actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
             commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             let path = commit_metadata.published_commit_path()?;
