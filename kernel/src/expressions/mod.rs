@@ -9,7 +9,7 @@ use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::column_names::{
     column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    ColumnName, IntoColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -27,6 +27,41 @@ mod scalars;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
+
+/// Build an [`Expression::Column`] from anything that converts into a [`ColumnName`].
+///
+/// Concise alternative to `Expression::column([name])` for plan builders. Accepts the same
+/// shapes as [`IntoColumnName`]: a bare `&str` (single-segment, no dot splitting), an array
+/// or slice (`col(["add", "path"])`), a tuple (`col(("add", "path"))`), or a prebuilt
+/// [`ColumnName`].
+///
+/// Strings are **not** split on `.`. For dot-separated path literals known at compile time,
+/// prefer [`column_expr!`] which splits via a proc macro:
+/// `column_expr!("add.path")` produces a 2-segment column, while `col("add.path")` produces
+/// a 1-segment column named `"add.path"`.
+///
+/// ```
+/// use delta_kernel::expressions::col;
+/// let _ = col(["add", "path"]).is_not_null();
+/// ```
+///
+/// [`column_expr!`]: crate::expressions::column_expr
+pub fn col<N: IntoColumnName>(name: N) -> Expression {
+    Expression::Column(name.into_column_name())
+}
+
+/// Build an [`Expression::Literal`] from anything that converts into a [`Scalar`].
+///
+/// Concise alternative to [`Expression::literal`] for plan builders. Accepts the same value
+/// types [`Scalar`] does (`i32`, `i64`, `&str`, `bool`, ...).
+///
+/// ```
+/// use delta_kernel::expressions::lit;
+/// let _zero = lit(0i64);
+/// ```
+pub fn lit(value: impl Into<Scalar>) -> Expression {
+    Expression::literal(value)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -402,22 +437,30 @@ impl ExpressionStructPatch {
         self
     }
 
-    /// Specifies an expression to replace a field with.
-    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
+    /// Specifies an expression to replace a field with. `expr` accepts a bare [`Expression`]
+    /// or an existing [`ExpressionRef`] (`Arc<Expression>`); the bare form is auto-wrapped via
+    /// the std `impl<T> From<T> for Arc<T>` blanket.
+    pub fn with_replaced_field(
+        mut self,
+        name: impl Into<String>,
+        expr: impl Into<ExpressionRef>,
+    ) -> Self {
         let field_patch = self.field_patch(name);
-        field_patch.exprs.push(expr);
+        field_patch.exprs.push(expr.into());
         field_patch.is_replace = true;
         self
     }
 
     /// Specifies an expression to insert after an optional predecessor (None = prepend, emit the
     /// expression before the first input field). Multiple fields can be inserted after the same
-    /// predecessor, and they will be emitted in the same order they were registered.
+    /// predecessor, and they will be emitted in the same order they were registered. `expr`
+    /// accepts a bare [`Expression`] or an existing [`ExpressionRef`].
     pub fn with_inserted_field(
         mut self,
         after: Option<impl Into<String>>,
-        expr: ExpressionRef,
+        expr: impl Into<ExpressionRef>,
     ) -> Self {
+        let expr = expr.into();
         match after {
             Some(field_name) => self.field_patch(field_name).exprs.push(expr),
             None => self.prepended_fields.push(expr),
@@ -1187,11 +1230,15 @@ impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
+    use std::sync::Arc;
 
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+    use super::{
+        col, column_expr, column_pred, lit, Expression as Expr, ExpressionStructPatch,
+        Predicate as Pred,
+    };
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1759,5 +1806,31 @@ mod tests {
     fn empty_or_from_returns_identity_literal() {
         let result = Pred::or_from(std::iter::empty());
         assert_eq!(result, Pred::literal(false));
+    }
+
+    #[test]
+    fn col_and_lit_produce_same_shape_as_explicit_constructors() {
+        assert_eq!(col("name"), Expr::column(["name"]));
+        assert_eq!(col(["add", "path"]), Expr::column(["add", "path"]));
+        assert_eq!(col(("add", "path")), Expr::column(["add", "path"]));
+        assert_eq!(lit(0i64), Expr::literal(0i64));
+        // Compose with a predicate to exercise the public surface end-to-end.
+        assert_eq!(
+            col(["add", "path"]).is_not_null(),
+            Expr::column(["add", "path"]).is_not_null(),
+        );
+    }
+
+    #[test]
+    fn transform_field_setters_accept_expression_and_expression_ref() {
+        // `impl Into<ExpressionRef>` lets callers pass either form. Both shapes must produce
+        // structurally equivalent transforms.
+        let by_value = ExpressionStructPatch::new_top_level()
+            .with_replaced_field("a", Expr::literal(1))
+            .with_inserted_field(Some("a"), Expr::literal(2));
+        let by_ref = ExpressionStructPatch::new_top_level()
+            .with_replaced_field("a", Arc::new(Expr::literal(1)))
+            .with_inserted_field(Some("a"), Arc::new(Expr::literal(2)));
+        assert_eq!(format!("{by_value:?}"), format!("{by_ref:?}"));
     }
 }

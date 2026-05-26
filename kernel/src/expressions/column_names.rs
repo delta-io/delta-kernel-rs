@@ -119,6 +119,71 @@ impl ColumnName {
     }
 }
 
+/// Conversion into a [`ColumnName`] from common builder shapes.
+///
+/// String inputs (`&str`, `String`) produce a **single-segment** column whose name is the input
+/// verbatim. Dots are **not** path separators -- `"a.b".into_column_name()` is one segment named
+/// `"a.b"`. For dot-separated path literals known at compile time, prefer the [`column_name!`]
+/// or [`column_expr!`] macros, which split via a proc macro at compile time. For runtime
+/// multi-segment paths, pass an array, slice, or tuple: `["add", "path"].into_column_name()`.
+///
+/// [`column_name!`]: crate::expressions::column_name
+/// [`column_expr!`]: crate::expressions::column_expr
+pub trait IntoColumnName {
+    /// Consume `self` and produce the [`ColumnName`] it represents.
+    fn into_column_name(self) -> ColumnName;
+}
+
+impl IntoColumnName for ColumnName {
+    fn into_column_name(self) -> ColumnName {
+        self
+    }
+}
+
+impl IntoColumnName for &str {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self])
+    }
+}
+
+impl IntoColumnName for String {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self])
+    }
+}
+
+impl<A: Into<String>, const N: usize> IntoColumnName for [A; N] {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new(self.into_iter().map(Into::into))
+    }
+}
+
+impl IntoColumnName for &[&str] {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new(self.iter().copied())
+    }
+}
+
+impl<A: Into<String>, B: Into<String>> IntoColumnName for (A, B) {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self.0.into(), self.1.into()])
+    }
+}
+
+impl<A: Into<String>, B: Into<String>, C: Into<String>> IntoColumnName for (A, B, C) {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self.0.into(), self.1.into(), self.2.into()])
+    }
+}
+
+impl<A: Into<String>, B: Into<String>, C: Into<String>, D: Into<String>> IntoColumnName
+    for (A, B, C, D)
+{
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new([self.0.into(), self.1.into(), self.2.into(), self.3.into()])
+    }
+}
+
 /// Creates a new column name from a path of field names. Each field name is taken as-is, and may
 /// contain arbitrary characters (including periods, spaces, etc.).
 impl<A: Into<String>> FromIterator<A> for ColumnName {
@@ -709,5 +774,35 @@ mod test {
                 _ => panic!("Expected {input} to parse as {expected_output:?}, got {output:?}"),
             }
         }
+    }
+
+    #[test]
+    fn into_column_name_str_is_single_segment_with_no_split() {
+        // Strings (`&str` / `String`) build a single segment containing the input verbatim;
+        // dots are not path separators. For dot-separated literals, callers should use the
+        // `column_name!` / `column_expr!` macros (which split via a proc macro at compile time).
+        assert_eq!("a.b".into_column_name(), ColumnName::new(["a.b"]));
+        assert_eq!(
+            "name".to_string().into_column_name(),
+            ColumnName::new(["name"])
+        );
+    }
+
+    #[test]
+    fn into_column_name_multi_segment_shapes() {
+        let expected = ColumnName::new(["a", "b", "c"]);
+        assert_eq!(["a", "b", "c"].into_column_name(), expected);
+        let slice: &[&str] = &["a", "b", "c"];
+        assert_eq!(slice.into_column_name(), expected);
+        assert_eq!(("a", "b", "c").into_column_name(), expected);
+        // Identity round-trip on `ColumnName` itself.
+        assert_eq!(expected.clone().into_column_name(), expected);
+    }
+
+    #[test]
+    fn into_column_name_tuple_arity_four() {
+        // Exercises the (A, B, C, D) impl explicitly to lock down the 4-element field order.
+        let expected = ColumnName::new(["w", "x", "y", "z"]);
+        assert_eq!(("w", "x", "y", "z").into_column_name(), expected);
     }
 }

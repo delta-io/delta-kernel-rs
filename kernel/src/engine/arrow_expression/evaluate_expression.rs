@@ -1064,12 +1064,12 @@ mod tests {
         let patch = ExpressionStructPatch::new_top_level()
             .with_replaced_field("a", column_expr_ref!("b"))
             .with_dropped_field("b")
-            .with_inserted_field(None::<&str>, Expr::literal(1).into())
-            .with_inserted_field(None::<&str>, Expr::literal(2).into())
+            .with_inserted_field(None::<&str>, Expr::literal(1))
+            .with_inserted_field(None::<&str>, Expr::literal(2))
             .with_inserted_field(None::<&str>, column_expr_ref!("c"))
-            .with_inserted_field(Some("c"), Expr::literal(42).into())
+            .with_inserted_field(Some("c"), Expr::literal(42))
             .with_inserted_field(Some("c"), column_expr_ref!("a"))
-            .with_inserted_field(Some("c"), Expr::literal(99).into());
+            .with_inserted_field(Some("c"), Expr::literal(99));
 
         let output_schema = StructType::new_unchecked(vec![
             StructField::new("pre1", DataType::INTEGER, false), // prepend 1
@@ -1149,8 +1149,8 @@ mod tests {
 
         // Test 2: Modify nested struct and relocate it
         let modify_patch = ExpressionStructPatch::new_nested(["nested"])
-            .with_replaced_field("x".to_string(), Expr::literal(777).into())
-            .with_inserted_field(Some("y"), Expr::literal(555).into());
+            .with_replaced_field("x".to_string(), Expr::literal(777))
+            .with_inserted_field(Some("y"), Expr::literal(555));
 
         let modify_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
@@ -1189,7 +1189,7 @@ mod tests {
 
         // Test unused replacement keys
         let patch = ExpressionStructPatch::new_top_level()
-            .with_replaced_field("missing", Expr::literal(1).into());
+            .with_replaced_field("missing", Expr::literal(1));
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
@@ -1209,7 +1209,7 @@ mod tests {
 
         // Test unused insertion keys
         let insertion_patch = ExpressionStructPatch::new_top_level()
-            .with_inserted_field(Some("nonexistent"), Expr::literal(1).into());
+            .with_inserted_field(Some("nonexistent"), Expr::literal(1));
 
         let expr2 = Expr::StructPatch(insertion_patch);
         let result2 = evaluate_expression(
@@ -1598,10 +1598,10 @@ mod tests {
 
         // Simple nested patch - replace a field in the nested struct
         let nested_patch = ExpressionStructPatch::new_nested(["nested"])
-            .with_replaced_field("x", Expr::literal(999).into());
+            .with_replaced_field("x", Expr::literal(999));
 
         let outer_patch = ExpressionStructPatch::new_top_level()
-            .with_inserted_field(Some("a"), Expr::StructPatch(nested_patch).into());
+            .with_inserted_field(Some("a"), Expr::StructPatch(nested_patch));
 
         let nested_output_schema = StructType::new_unchecked(vec![
             StructField::not_null("x", DataType::INTEGER),
