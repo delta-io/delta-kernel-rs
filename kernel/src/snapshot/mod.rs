@@ -1108,7 +1108,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::{
-        json_stats, unpartitioned, FeatureSet, LogState, VersionTarget,
+        checkpoint_json_stats, unpartitioned, FeatureSet, LogState, VersionTarget,
     };
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -1985,7 +1985,7 @@ mod tests {
             LogState::with_latest_version(2),
             FeatureSet::empty(),
             unpartitioned(),
-            json_stats(),
+            checkpoint_json_stats(),
             VersionTarget::Latest,
             SyncEngine::new_with_store
         );

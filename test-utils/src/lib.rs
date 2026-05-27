@@ -4,10 +4,9 @@ pub mod column_mapping_fixtures;
 pub mod counting_reporter;
 pub mod table_builder;
 
-// The `#[rstest]` attribute and the `table_builder` factories below appear inside
-// the `define_sweeps!` body. They get stored as `macro_rules!` tokens in the
-// generated template macros and only resolve when a consumer applies them, so
-// rustc doesn't see them as used in this crate.
+// `rstest` and the `table_builder` factories appear inside the `define_sweeps!`
+// invocation below. Macro bodies are token streams that are only resolved when
+// consumer crates apply the emitted templates, so rustc doesn't see these uses.
 #[allow(unused_imports)]
 use rstest::rstest;
 pub use rstest_reuse;
@@ -15,23 +14,28 @@ use rstest_reuse::template;
 #[allow(unused_imports)]
 use table_builder::*;
 
-/// Emits canonical sweep templates: `default_sweep` (all axes) plus one per-axis
-/// template per axis. A per-axis template only supplies its named axis; the test
-/// supplies the rest:
+/// Emits canonical sweep templates from a single source of truth.
+///
+/// Generates one `default_sweep` template (full Cartesian product of all five axes)
+/// plus one per-axis template (`log_state_sweep`, `feature_set_sweep`,
+/// `data_layout_sweep`, `table_config_sweep`, `version_target_sweep`). Each per-axis
+/// template only supplies its own axis; the consumer test fills in the others with
+/// inline `#[values(...)]` to control combination count.
+///
+/// Templates are emitted at crate root so the generated `#[macro_export]` macros
+/// are reachable cross-crate as `test_utils::<name>` via `#[rstest_reuse::apply]`.
 ///
 /// ```ignore
+/// // Iterate only the LogState axis; fix everything else.
 /// #[apply(log_state_sweep)]
 /// fn my_test(
-///     log_state: LogState,                                    // canonical values
+///     log_state: LogState,
 ///     #[values(no_features())] feature_set: FeatureSet,
 ///     #[values(unpartitioned())] data_layout: DataLayoutConfig,
-///     #[values(json_stats())] table_config: TableConfig,
+///     #[values(checkpoint_json_stats())] table_config: TableConfig,
 ///     #[values(version_latest())] version_target: VersionTarget,
 /// ) { /* ... */ }
 /// ```
-///
-/// Defined at crate root so the `#[macro_export]`-generated macros are reachable
-/// cross-crate as `test_utils::<name>`.
 macro_rules! define_sweeps {
     (
         log_state_values = $ls:tt,
@@ -105,7 +109,11 @@ define_sweeps! {
     feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
     // TODO: null-distribution and partition-by-timestamp-with-CM rows.
     data_layout_values = (unpartitioned(), partitioned(), clustered()),
-    table_config_values = (json_stats(), struct_stats(), no_stats()),
+    table_config_values = (
+        checkpoint_json_stats(),
+        checkpoint_struct_stats(),
+        no_checkpoint_stats()
+    ),
     version_target_values = (
         version_latest(),
         version_at_mid(),

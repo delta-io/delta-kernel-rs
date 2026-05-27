@@ -8,11 +8,11 @@
 //! with [`TestTableBuilder::with_data`] when a test needs specific file/row counts.
 //!
 //! Provides five orthogonal axes for parameterized testing:
-//! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
-//! - [`FeatureSet`] -- which Delta table features are enabled
-//! - [`TableConfig`] -- runtime knobs (e.g. stats format) orthogonal to features
-//! - [`VersionTarget`] -- how the snapshot is loaded (latest, time travel, incremental)
-//! - [`DataLayoutConfig`] -- data layout (unpartitioned, partitioned, clustered)
+//! - [`LogState`]: what log files exist on disk (commits, checkpoints, CRC)
+//! - [`FeatureSet`]: which Delta table features are enabled
+//! - [`DataLayoutConfig`]: data layout (unpartitioned, partitioned, clustered)
+//! - [`TableConfig`]: runtime knobs (e.g. checkpoint stats format)
+//! - [`VersionTarget`]: how the snapshot is loaded (latest, time travel, incremental)
 //!
 //! # Quick start
 //!
@@ -30,13 +30,16 @@
 //!     log_state: LogState,
 //!     #[values(FeatureSet::empty())]
 //!     feature_set: FeatureSet,
-//!     #[values(unpartitioned(json_stats()))]
+//!     #[values(unpartitioned())]
 //!     data_layout: DataLayoutConfig,
+//!     #[values(checkpoint_json_stats())]
+//!     table_config: TableConfig,
 //!     #[values(VersionTarget::Latest, VersionTarget::IncrementalToLatest { from: 0 })]
 //!     version_target: VersionTarget,
 //! ) {
-//!     let (engine, snap, _table) =
-//!         test_context!(log_state, feature_set, data_layout, version_target);
+//!     let (engine, snap, _table) = test_context!(
+//!         log_state, feature_set, data_layout, table_config, version_target,
+//!     );
 //!     let scan = snap.scan_builder().build().unwrap();
 //!     // ...
 //! }
@@ -74,6 +77,19 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
+
+// ===========================================================================
+// Sweep constants
+// ===========================================================================
+
+/// Latest commit version used by every log state in the
+/// [`default_sweep!`](crate::default_sweep) template.
+pub const DEFAULT_SWEEP_LATEST_VERSION: u64 = 10;
+
+/// Mid version used by the [`default_sweep!`](crate::default_sweep) template for
+/// `AtVersion` and `IncrementalToLatest` targets. Must satisfy
+/// `mid <= DEFAULT_SWEEP_LATEST_VERSION`.
+pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 
 // ===========================================================================
 // Sync/async bridge
@@ -254,9 +270,10 @@ impl LogState {
         self
     }
 
-    /// Latest version on the table. After cleanup, commits below
-    /// [`min_reachable_version`](Self::min_reachable_version) are gone, but
-    /// `latest_version` still reflects the highest committed version.
+    /// Latest version on the table. The total number of commits on disk is
+    /// `latest_version + 1` (or fewer if
+    /// [`with_cleanup_commits_before`](Self::with_cleanup_commits_before) removed earlier
+    /// versions).
     pub fn latest_version(&self) -> u64 {
         self.latest_version
     }
@@ -279,14 +296,6 @@ impl LogState {
     /// State of the `_last_checkpoint` hint file on the built table.
     pub(crate) fn last_checkpoint_hint(&self) -> LastCheckpointHintState {
         self.last_checkpoint_hint
-    }
-
-    /// Lowest commit version still on disk. After cleanup, commits `< cleanup_before`
-    /// have been deleted, so loading a snapshot at a version below this returns
-    /// "No files in log segment". Sweep callers use this to skip invalid combinations
-    /// of `LogState` and [`VersionTarget`].
-    pub fn min_reachable_version(&self) -> u64 {
-        self.cleanup_before.unwrap_or(0)
     }
 }
 
@@ -321,15 +330,19 @@ pub fn two_checkpoints_stale_hint() -> LogState {
         .with_last_checkpoint_hint(LastCheckpointHintState::Stale)
 }
 
-// Post-cleanup variants: same shapes as above but with log cleanup applied at the
-// checkpoint version. 99% of production tables have had maintenance run on them.
+// Post-cleanup variants: same shapes as above but with log cleanup applied at MID.
+// 99% of production tables have had maintenance run on them. Cleanup at MID (not at
+// LATEST) keeps commits MID..=LATEST reachable, so the canonical `at_version(MID)`
+// and `incremental_to_latest { from: MID }` targets still resolve.
 
 pub fn checkpoint_at_end_post_cleanup() -> LogState {
-    checkpoint_at_end().with_cleanup_commits_before(DEFAULT_SWEEP_LATEST_VERSION)
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_MID_VERSION, DEFAULT_SWEEP_LATEST_VERSION])
+        .with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
 }
 
 pub fn checkpoint_at_end_no_hint_post_cleanup() -> LogState {
-    checkpoint_at_end_no_hint().with_cleanup_commits_before(DEFAULT_SWEEP_LATEST_VERSION)
+    checkpoint_at_end_post_cleanup().with_last_checkpoint_hint(LastCheckpointHintState::Missing)
 }
 
 pub fn checkpoint_mid_post_cleanup() -> LogState {
@@ -650,21 +663,22 @@ impl fmt::Display for TableConfig {
     }
 }
 
-// Canonical sweep rows for the TableConfig axis.
+// Canonical sweep rows for the TableConfig axis. These toggle only the *checkpoint*
+// stats encoding -- per-commit add-file stats are always written and unaffected.
 
-pub fn json_stats() -> TableConfig {
+pub fn checkpoint_json_stats() -> TableConfig {
     TableConfig::new()
         .write_stats_as_json(true)
         .write_stats_as_struct(false)
 }
 
-pub fn struct_stats() -> TableConfig {
+pub fn checkpoint_struct_stats() -> TableConfig {
     TableConfig::new()
         .write_stats_as_json(false)
         .write_stats_as_struct(true)
 }
 
-pub fn no_stats() -> TableConfig {
+pub fn no_checkpoint_stats() -> TableConfig {
     TableConfig::new()
         .write_stats_as_json(false)
         .write_stats_as_struct(false)
@@ -1479,15 +1493,6 @@ pub fn test_table(
         .expect("failed to build test table")
 }
 
-/// Latest version used by every log state in the [`default_sweep!`](crate::default_sweep)
-/// template.
-pub const DEFAULT_SWEEP_LATEST_VERSION: u64 = 10;
-
-/// Mid version used by the [`default_sweep!`](crate::default_sweep) template for
-/// `AtVersion` and `IncrementalToLatest` targets. Must satisfy
-/// `mid <= DEFAULT_SWEEP_LATEST_VERSION`.
-pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
-
 // ===========================================================================
 // Macros
 // ===========================================================================
@@ -1691,7 +1696,7 @@ mod tests {
         #[values(LogState::with_latest_version(4))] log_state: LogState,
         #[values(FeatureSet::empty())] feature_set: FeatureSet,
         #[values(unpartitioned())] data_layout: DataLayoutConfig,
-        #[values(json_stats())] table_config: TableConfig,
+        #[values(checkpoint_json_stats())] table_config: TableConfig,
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
@@ -1972,7 +1977,7 @@ mod tests {
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(3))
             .with_data_layout(clustered())
-            .with_table_config(struct_stats())
+            .with_table_config(checkpoint_struct_stats())
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
