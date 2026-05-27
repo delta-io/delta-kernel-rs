@@ -8,7 +8,7 @@ use bytes::Bytes;
 pub use ir::{IoOperation, Plan, QueryPlan, QueryPlanNode};
 pub use query_builder::QueryPlanBuilder;
 
-use crate::{AsAny, DeltaResult, DeltaResultIterator, EngineData, FileMeta};
+use crate::{AsAny, DeltaResult, DeltaResultIterator, EngineData, Error, FileMeta};
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
 ///
@@ -31,4 +31,48 @@ pub enum PlanResult {
     Bytes(DeltaResultIterator<Bytes>),
     /// Represents the successful completion of a plan, but with no return value.
     Unit,
+}
+
+impl PlanResult {
+    pub fn into_data(self) -> DeltaResult<DeltaResultIterator<Box<dyn EngineData>>> {
+        match self {
+            Self::Data(iter) => Ok(iter),
+            other => Err(other.type_mismatch("Data")),
+        }
+    }
+
+    pub fn into_file_meta(self) -> DeltaResult<DeltaResultIterator<FileMeta>> {
+        match self {
+            Self::FileMeta(iter) => Ok(iter),
+            other => Err(other.type_mismatch("FileMeta")),
+        }
+    }
+
+    pub fn into_bytes(self) -> DeltaResult<DeltaResultIterator<Bytes>> {
+        match self {
+            Self::Bytes(iter) => Ok(iter),
+            other => Err(other.type_mismatch("Bytes")),
+        }
+    }
+
+    pub fn into_unit(self) -> DeltaResult<()> {
+        match self {
+            Self::Unit => Ok(()),
+            other => Err(other.type_mismatch("Unit")),
+        }
+    }
+
+    fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Data(_) => "Data",
+            Self::FileMeta(_) => "FileMeta",
+            Self::Bytes(_) => "Bytes",
+            Self::Unit => "Unit",
+        }
+    }
+
+    /// Build an [`Error::PlanResultTypeMismatch`] reporting `self`'s variant as the actual one.
+    fn type_mismatch(&self, expected: &'static str) -> Error {
+        Error::plan_result_type_mismatch(expected, self.variant_name())
+    }
 }
