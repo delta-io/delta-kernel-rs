@@ -276,6 +276,8 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer `StructField::nullable` / `StructField::not_null` over
   `StructField::new(name, type, bool)` when nullability is known at compile time.
   Reserve `StructField::new` for cases where nullability is a runtime value.
+- Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
+  hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 

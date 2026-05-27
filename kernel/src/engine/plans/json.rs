@@ -7,8 +7,8 @@ use url::Url;
 use crate::plans::{Plan, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilteredEngineData,
-    JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -51,7 +51,7 @@ impl JsonHandler for PlanBasedJsonHandler {
     fn write_json_file(
         &self,
         _path: &Url,
-        _data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        _data: DeltaResultIterator<'_, FilteredEngineData>,
         _overwrite: bool,
     ) -> DeltaResult<()> {
         Err(Error::unsupported(
