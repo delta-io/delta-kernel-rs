@@ -5,7 +5,7 @@ mod ir;
 mod query_builder;
 
 use bytes::Bytes;
-pub use ir::{IoOperation, Plan, QueryPlan, QueryPlanNode};
+pub use ir::{IoOperation, Operation, QueryPlan, QueryPlanNode};
 pub use query_builder::QueryPlanBuilder;
 
 use crate::{AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta};
@@ -15,11 +15,11 @@ use crate::{AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, Fi
 /// This gives the kernel the ability to execute data-intensive operations by constructing a
 /// declarative, relational plan algebra, without prescribing *how* to do it.
 pub trait PlanExecutor: AsAny {
-    /// Executes the given declarative plan and return the result.
-    fn execute_plan(&self, plan: Plan) -> DeltaResult<PlanResult>;
+    /// Executes the given declarative plan and returns the result.
+    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult>;
 }
 
-/// The result of executing a [`Plan`].
+/// The result of executing an [`Operation`].
 ///
 /// Each variant describes a different shape of output that a plan can possibly produce.
 pub enum PlanResult {

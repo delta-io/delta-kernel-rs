@@ -2,7 +2,7 @@
 //!
 //! [`SyncEngine`]: super::SyncEngine
 //
-// TODO: Not used yet, but will eventually be used to replace SyncEngine with a
+// TODO: Not used yet, but will eventually be used to replace SyncEngine with an
 // PlanBasedEngine (backed by this PlanExecutor)
 #![allow(dead_code)]
 
@@ -14,7 +14,7 @@ use super::json::SyncJsonHandler;
 use super::parquet::SyncParquetHandler;
 use super::storage::SyncStorageHandler;
 use crate::object_store::DynObjectStore;
-use crate::plans::{IoOperation, Plan, PlanExecutor, PlanResult, QueryPlanNode};
+use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanNode};
 use crate::{DeltaResult, FileMeta, JsonHandler as _, ParquetHandler as _, StorageHandler as _};
 
 /// A synchronous, test-only [`PlanExecutor`] that delegates to [`SyncStorageHandler`],
@@ -49,10 +49,10 @@ impl SyncPlanExecutor {
 }
 
 impl PlanExecutor for SyncPlanExecutor {
-    fn execute_plan(&self, plan: Plan) -> DeltaResult<PlanResult> {
-        match plan {
-            Plan::IoOperation(op) => self.execute_io(op),
-            Plan::QueryPlan(query) => self.execute_query(query),
+    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+        match op {
+            Operation::IoOperation(io_op) => self.execute_io(io_op),
+            Operation::QueryPlan(query) => self.execute_query(query),
         }
     }
 }

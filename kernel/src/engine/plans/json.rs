@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::plans::{Plan, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
@@ -44,7 +44,7 @@ impl JsonHandler for PlanBasedJsonHandler {
         let query =
             QueryPlanBuilder::scan_json(files.to_vec(), physical_schema, predicate).build()?;
         self.executor
-            .execute_plan(Plan::QueryPlan(query))?
+            .execute_op(Operation::QueryPlan(query))?
             .into_data()
     }
 
