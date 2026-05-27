@@ -23,8 +23,9 @@ across the requested range.
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
@@ -42,8 +43,9 @@ table at the time of the call.
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
@@ -86,9 +88,10 @@ project columns with `with_schema` and filter rows with `with_predicate`.
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{column_expr, Scalar};
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::{DeltaResult, Predicate};
@@ -143,9 +146,10 @@ after building the scan), use `scan_builder` on an `Arc<TableChanges>` instead o
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {

@@ -10,17 +10,19 @@ cargo new delta_read_example
 cd delta_read_example
 ```
 
-Add the kernel dependency (see [Installation](./installation.md) for details):
+Add the Kernel and default-engine dependencies (see [Installation](./installation.md) for details):
 
 ```sh
-cargo add delta_kernel -F default-engine-rustls -F arrow -F internal-api
+cargo add delta_kernel -F internal-api
+cargo add delta_kernel_default_engine -F rustls
 ```
 
 Your `Cargo.toml` should look like:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "0.21", features = ["default-engine-rustls", "arrow", "internal-api"] }
+delta_kernel = { version = "0.23", features = ["internal-api"] }
+delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
 ```
 
 > [!NOTE]
@@ -36,12 +38,13 @@ Filename: src/main.rs
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 use std::sync::Arc;
 
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel_default_engine::storage::store_from_url;
+use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::{DeltaResult, Snapshot};
 
 fn main() -> DeltaResult<()> {
