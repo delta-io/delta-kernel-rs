@@ -12,15 +12,20 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
-use delta_kernel::arrow::array::{make_array, Array, ArrayRef, BooleanArray, RecordBatch};
-use delta_kernel::arrow::datatypes::{Field, Schema};
+use delta_kernel::arrow::array::{
+    make_array, Array, ArrayRef, BooleanArray, RecordBatch, StructArray,
+};
+use delta_kernel::arrow::datatypes::{Field, Fields, Schema};
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
-use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp;
-use delta_kernel::expressions::{Expression, ScalarExpressionEvaluator};
+use delta_kernel::engine::arrow_expression::opaque::{
+    ArrowOpaquePredicate as _, ArrowOpaquePredicateOp,
+};
+use delta_kernel::expressions::{Expression, ExpressionRef, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
-    IndirectDataSkippingPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
+use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
 use super::opaque_eval::OpaqueEvalCallbacks;
@@ -31,10 +36,18 @@ use crate::kernel_string_slice;
 /// Evaluate each arg using kernel's standard evaluator, then bundle the
 /// resulting `ArrayRef`s as a single-batch `RecordBatch` keyed by
 /// `arg0..argN`.
+///
+/// `Expression::Struct` args produced by `as_data_skipping_predicate` are pre-evaluated
+/// field-by-field and assembled into a `StructArray` here, since kernel's evaluator requires a
+/// `DataType::Struct` result type for struct expressions and we don't know the field types
+/// upfront (they depend on the underlying stats schema).
 fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<RecordBatch> {
     let arrays: Vec<ArrayRef> = args
         .iter()
-        .map(|arg| evaluate_expression(arg, batch, None))
+        .map(|arg| match arg {
+            Expression::Struct(fields, _nullability) => evaluate_struct_arg(fields, batch),
+            _ => evaluate_expression(arg, batch, None),
+        })
         .collect::<DeltaResult<_>>()?;
 
     let fields: Vec<Field> = arrays
@@ -58,6 +71,24 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
 
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| Error::Generic(format!("opaque eval batch construction: {e}")))
+}
+
+/// Build a `StructArray` from a `Expression::Struct`'s child expressions, naming fields
+/// positionally (`f0`, `f1`, ...). Engine callbacks crack the resulting struct by index, not
+/// by name, so the names are just placeholders that satisfy Arrow's schema requirements.
+fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaResult<ArrayRef> {
+    let arrays: Vec<ArrayRef> = fields
+        .iter()
+        .map(|f| evaluate_expression(f, batch, None))
+        .collect::<DeltaResult<_>>()?;
+    let arrow_fields: Fields = arrays
+        .iter()
+        .enumerate()
+        .map(|(i, a)| Field::new(format!("f{i}"), a.data_type().clone(), a.is_nullable()))
+        .collect();
+    let sa = StructArray::try_new(arrow_fields, arrays, None)
+        .map_err(|e| Error::Generic(format!("struct arg construction: {e}")))?;
+    Ok(Arc::new(sa))
 }
 
 /// Import an `ArrowFFIData` written by the engine back into an `ArrayRef`.
@@ -165,17 +196,13 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
 
     fn eval_as_data_skipping_predicate(
         &self,
-        evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
-        exprs: &[Expression],
-        inverted: bool,
+        _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expression],
+        _inverted: bool,
     ) -> Option<bool> {
-        // Defer to the kernel-side OpaquePredicateOp impl on Self so that
-        // ops constructed via `Predicate::arrow_opaque` (i.e. wrapped in the
-        // ArrowOpaquePredicateOpAdaptor) still consult the skipping_decomp
-        // facet through the Adaptor's delegating impl.
-        <Self as delta_kernel::expressions::OpaquePredicateOp>::eval_as_data_skipping_predicate(
-            self, evaluator, exprs, inverted,
-        )
+        // The scalar-bool skipping path can't drive engine callbacks, so we always abstain;
+        // file pruning happens via `as_data_skipping_predicate` instead.
+        None
     }
 
     fn as_data_skipping_predicate(
@@ -184,9 +211,44 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
-        <Self as delta_kernel::expressions::OpaquePredicateOp>::as_data_skipping_predicate(
-            self, evaluator, exprs, inverted,
-        )
+        // Per-op negation semantics aren't expressible without engine input. Abstain to keep
+        // pruning sound: kernel will fall back to "keep the file".
+        if inverted {
+            return None;
+        }
+        // Without callbacks the rewritten predicate would error at evaluation time (the
+        // arrow eval_pred above requires callbacks). Abstain so the surrounding junction
+        // logic correctly drops this branch from the stats predicate.
+        self.callbacks_clone()?;
+
+        // SENTINEL: kernel's `get_min_stat`/`get_max_stat` use the requested type only as a
+        // gate against the stats schema -- columns whose min/max stats don't carry LONG
+        // silently abstain. A follow-up commit will plumb the real per-column type through
+        // the FFI so non-numeric columns (string, decimal, etc.) become prunable too.
+        const SENTINEL_TYPE: DataType = DataType::LONG;
+
+        let mut rewritten = Vec::with_capacity(exprs.len());
+        for arg in exprs {
+            let new_arg = match arg {
+                Expression::Column(col) => {
+                    let min = evaluator.get_min_stat(col, &SENTINEL_TYPE)?;
+                    let max = evaluator.get_max_stat(col, &SENTINEL_TYPE)?;
+                    // Positional struct: field 0 = min, field 1 = max. Field names come from
+                    // the result schema at evaluation time, so engines crack by index.
+                    Expression::struct_from([min, max])
+                }
+                Expression::Literal(_) => arg.clone(),
+                Expression::Predicate(p) => {
+                    let rw = evaluator.eval_pred(p, false)?;
+                    Expression::Predicate(Box::new(rw))
+                }
+                _ => return None,
+            };
+            rewritten.push(new_arg);
+        }
+        // arrow_opaque (not bare opaque) so runtime dispatch reaches our callback via the
+        // ArrowOpaquePredicateOpAdaptor.
+        Some(Predicate::arrow_opaque(self.clone(), rewritten))
     }
 }
 
@@ -492,5 +554,333 @@ mod tests {
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result.len(), 5);
         assert!((0..5).all(|i| result.value(i)));
+    }
+
+    // === Data-skipping rewrite ==================================================
+
+    mod rewrite {
+        use std::cmp::Ordering;
+
+        use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp as _;
+        use delta_kernel::expressions::{
+            column_expr, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
+            OpaquePredicateOpRef, Scalar,
+        };
+        use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
+        use delta_kernel::schema::DataType;
+        use delta_kernel::Predicate;
+
+        use super::*;
+
+        /// Stub evaluator that mirrors the real `DataSkippingPredicateCreator`:
+        /// `get_min_stat`/`get_max_stat` return `stats_parsed.minValues.<col>` /
+        /// `maxValues.<col>` references. Other methods are wired well enough for the
+        /// `eval_pred(Predicate)` recursion the rewrite exercises.
+        struct StatsRewriter {
+            has_stats: bool,
+        }
+
+        fn stats_col(prefix: &str, col: &ColumnName) -> Expression {
+            let mut name = ColumnName::new(["stats_parsed", prefix]);
+            name = name.join(col);
+            Expression::from(name)
+        }
+
+        impl DataSkippingPredicateEvaluator for StatsRewriter {
+            type Output = Predicate;
+            type ColumnStat = Expression;
+
+            fn get_min_stat(&self, col: &ColumnName, _: &DataType) -> Option<Expression> {
+                self.has_stats.then(|| stats_col("minValues", col))
+            }
+            fn get_max_stat(&self, col: &ColumnName, _: &DataType) -> Option<Expression> {
+                self.has_stats.then(|| stats_col("maxValues", col))
+            }
+            fn get_nullcount_stat(&self, _: &ColumnName) -> Option<Expression> {
+                None
+            }
+            fn get_rowcount_stat(&self) -> Option<Expression> {
+                None
+            }
+            fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Predicate> {
+                if let Scalar::Boolean(b) = val {
+                    Some(Predicate::literal(*b != inverted))
+                } else {
+                    None
+                }
+            }
+            fn eval_pred_scalar_is_null(&self, _: &Scalar, _: bool) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_is_null(&self, _: &ColumnName, _: bool) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_binary_scalars(
+                &self,
+                _: BinaryPredicateOp,
+                _: &Scalar,
+                _: &Scalar,
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_opaque(
+                &self,
+                _: &OpaquePredicateOpRef,
+                _: &[Expression],
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
+            fn finish_eval_pred_junction(
+                &self,
+                op: JunctionPredicateOp,
+                preds: &mut dyn Iterator<Item = Option<Predicate>>,
+                inverted: bool,
+            ) -> Option<Predicate> {
+                let collected: Vec<Predicate> = preds.collect::<Option<Vec<_>>>()?;
+                let pred = Predicate::junction(op, collected);
+                Some(if inverted { Predicate::not(pred) } else { pred })
+            }
+            fn eval_partial_cmp(
+                &self,
+                ord: Ordering,
+                col: Expression,
+                val: &Scalar,
+                inverted: bool,
+            ) -> Option<Predicate> {
+                let base_op = match ord {
+                    Ordering::Less => BinaryPredicateOp::LessThan,
+                    Ordering::Greater => BinaryPredicateOp::GreaterThan,
+                    Ordering::Equal => BinaryPredicateOp::Equal,
+                };
+                let pred = Predicate::binary(base_op, col, Expression::literal(val.clone()));
+                Some(if inverted { Predicate::not(pred) } else { pred })
+            }
+        }
+
+        fn rewriter() -> StatsRewriter {
+            StatsRewriter { has_stats: true }
+        }
+
+        fn no_stats_rewriter() -> StatsRewriter {
+            StatsRewriter { has_stats: false }
+        }
+
+        fn op_with_callbacks(name: &str) -> NamedOpaquePredicateOp {
+            NamedOpaquePredicateOp::with_callbacks(name, callbacks_for(engine_starts_with))
+        }
+
+        fn rewrite(
+            op: &NamedOpaquePredicateOp,
+            args: &[Expression],
+            rewriter: &StatsRewriter,
+            inverted: bool,
+        ) -> Option<Predicate> {
+            op.as_data_skipping_predicate(
+                rewriter
+                    as &dyn DataSkippingPredicateEvaluator<
+                        Output = Predicate,
+                        ColumnStat = Expression,
+                    >,
+                args,
+                inverted,
+            )
+        }
+
+        #[test]
+        fn abstains_when_inverted() {
+            let op = op_with_callbacks("STARTS_WITH");
+            let args = [column_expr!("col")];
+            assert!(rewrite(&op, &args, &rewriter(), true).is_none());
+        }
+
+        #[test]
+        fn abstains_when_no_callbacks() {
+            let op = NamedOpaquePredicateOp::new("STARTS_WITH");
+            let args = [column_expr!("col")];
+            assert!(rewrite(&op, &args, &rewriter(), false).is_none());
+        }
+
+        #[test]
+        fn wraps_column_in_min_max_struct() {
+            let op = op_with_callbacks("STARTS_WITH");
+            let args = [column_expr!("col")];
+            let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+
+            let Predicate::Opaque(opaque) = pred else {
+                panic!("expected Opaque, got {pred:?}");
+            };
+            assert_eq!(opaque.exprs.len(), 1);
+            let Expression::Struct(fields, _) = &opaque.exprs[0] else {
+                panic!("expected Struct arg, got {:?}", opaque.exprs[0]);
+            };
+            assert_eq!(fields.len(), 2, "struct should have [min, max] fields");
+            assert_eq!(
+                *fields[0],
+                stats_col("minValues", &ColumnName::new(["col"]))
+            );
+            assert_eq!(
+                *fields[1],
+                stats_col("maxValues", &ColumnName::new(["col"]))
+            );
+        }
+
+        #[test]
+        fn passes_literals_through_unchanged() {
+            let op = op_with_callbacks("OP");
+            let args = [Expression::literal("foo")];
+            let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+            let Predicate::Opaque(opaque) = pred else {
+                panic!("expected Opaque");
+            };
+            assert_eq!(opaque.exprs.len(), 1, "arity preserved");
+            assert_eq!(opaque.exprs[0], Expression::literal("foo"));
+        }
+
+        #[test]
+        fn recursively_rewrites_predicate_child() {
+            let op = op_with_callbacks("OP");
+            let inner = Predicate::lt(column_expr!("col"), Expression::literal(5i64));
+            let args = [Expression::Predicate(Box::new(inner))];
+
+            let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+            let Predicate::Opaque(opaque) = pred else {
+                panic!("expected Opaque");
+            };
+            let Expression::Predicate(rewritten) = &opaque.exprs[0] else {
+                panic!("expected Predicate arg, got {:?}", opaque.exprs[0]);
+            };
+            // The inner `col < 5` rewrites through `eval_partial_cmp` to a stats column ref.
+            let serialized = format!("{rewritten:?}");
+            assert!(
+                serialized.contains("minValues") || serialized.contains("maxValues"),
+                "predicate child should reference stats columns; got: {serialized}"
+            );
+        }
+
+        #[test]
+        fn abstains_on_unsupported_expr_kinds() {
+            use delta_kernel::expressions::BinaryExpressionOp;
+            let op = op_with_callbacks("OP");
+            let args = [Expression::binary(
+                BinaryExpressionOp::Plus,
+                column_expr!("col"),
+                Expression::literal(1i64),
+            )];
+            assert!(rewrite(&op, &args, &rewriter(), false).is_none());
+        }
+
+        #[test]
+        fn abstains_when_column_has_no_stats() {
+            let op = op_with_callbacks("OP");
+            let args = [column_expr!("col")];
+            assert!(rewrite(&op, &args, &no_stats_rewriter(), false).is_none());
+        }
+
+        #[test]
+        fn preserves_arity_for_mixed_args() {
+            let op = op_with_callbacks("OP");
+            let inner = Predicate::lt(column_expr!("y"), Expression::literal(5i64));
+            let args = [
+                column_expr!("col"),
+                Expression::literal(1i64),
+                Expression::Predicate(Box::new(inner)),
+            ];
+
+            let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+            let Predicate::Opaque(opaque) = pred else {
+                panic!("expected Opaque");
+            };
+            assert_eq!(
+                opaque.exprs.len(),
+                3,
+                "arity should be preserved (3 in, 3 out)"
+            );
+            assert!(matches!(opaque.exprs[0], Expression::Struct(_, _)));
+            assert!(matches!(opaque.exprs[1], Expression::Literal(_)));
+            assert!(matches!(opaque.exprs[2], Expression::Predicate(_)));
+        }
+
+        /// End-to-end: rewrite produces a predicate that evaluates against a synthesized
+        /// stats batch -- proves the rewrite wraps via `arrow_opaque` (a bare opaque would
+        /// fail the downcast inside the arrow evaluator and never invoke the callback).
+        #[test]
+        fn rewritten_predicate_dispatches_to_engine_callback() {
+            use std::ffi::c_void;
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+            use delta_kernel::arrow::array::{Int64Array, StructArray};
+            use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+
+            static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+            unsafe extern "C" fn engine_count(
+                _state: *mut c_void,
+                _op_name: KernelStringSlice,
+                args_in: *mut ArrowFFIData,
+                _inverted: bool,
+                result_out: *mut ArrowFFIData,
+            ) -> bool {
+                let batch = unsafe { take_ffi_record_batch(args_in) };
+                CALL_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+                let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; batch.num_rows()]));
+                write_result(result_out, arr);
+                true
+            }
+
+            let op = NamedOpaquePredicateOp::with_callbacks("OP", callbacks_for(engine_count));
+            let args = [column_expr!("col")];
+            let rewritten =
+                rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+
+            // Build a stats batch matching the column refs produced by `StatsRewriter`:
+            //   stats_parsed: { minValues: { col }, maxValues: { col } }
+            let col_field = Arc::new(Field::new("col", ArrowDataType::Int64, true));
+            let min_struct = StructArray::from(vec![(
+                col_field.clone(),
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            )]);
+            let max_struct = StructArray::from(vec![(
+                col_field,
+                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+            )]);
+            let stats_parsed = StructArray::from(vec![
+                (
+                    Arc::new(Field::new(
+                        "minValues",
+                        min_struct.data_type().clone(),
+                        true,
+                    )),
+                    Arc::new(min_struct) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "maxValues",
+                        max_struct.data_type().clone(),
+                        true,
+                    )),
+                    Arc::new(max_struct) as ArrayRef,
+                ),
+            ]);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "stats_parsed",
+                stats_parsed.data_type().clone(),
+                true,
+            )]));
+            let stats_batch =
+                RecordBatch::try_new(schema, vec![Arc::new(stats_parsed) as ArrayRef]).unwrap();
+
+            CALL_COUNT.store(0, AtomicOrdering::SeqCst);
+            let result = evaluate_predicate(&rewritten, &stats_batch, false).unwrap();
+            assert_eq!(result.len(), 1);
+            assert!(result.value(0));
+            assert_eq!(
+                CALL_COUNT.load(AtomicOrdering::SeqCst),
+                1,
+                "callback must fire exactly once"
+            );
+        }
     }
 }

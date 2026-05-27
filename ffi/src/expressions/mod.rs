@@ -7,7 +7,7 @@ use std::sync::Arc;
 use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
-    IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator,
 };
 use delta_kernel::{DeltaResult, Expression, Predicate};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -107,26 +107,32 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 
 // === NamedOpaquePredicateOp ===================================================
 
-/// Engine-defined opaque predicate identified by a name (e.g. `STARTS_WITH`,
-/// `LIKE`). Two independent optional facets:
+/// Engine-defined opaque predicate identified by a name (e.g. `STARTS_WITH`, `LIKE`). Optionally
+/// carries an [`OpaqueEvalCallbacks`] reference; when attached, kernel routes row-time evaluation
+/// through the engine's `eval_pred` callback (engine receives pre-evaluated args as Arrow arrays).
 ///
-/// - `callbacks`: an [`OpaqueEvalCallbacks`] reference. When attached, kernel routes row-time
-///   evaluation through the engine's `eval_pred` callback (engine receives pre-evaluated args as
-///   Arrow arrays). Available under `default-engine-base` only.
-/// - `skipping_decomp`: a kernel-native [`Predicate`] using LOGICAL column refs that's structurally
-///   equivalent (or a coarse over-approximation) to this op for data-skipping purposes. When
-///   attached, `as_data_skipping_predicate` runs it through the
-///   `IndirectDataSkippingPredicateEvaluator` -- kernel rewrites `col` ->
-///   `stats_parsed.maxValues.col` / `minValues.col` automatically.
+/// # Data skipping
 ///
-/// Both facets are independent. Engines can attach either or both:
-/// - eval only: row-time eval works, file pruning abstains
-/// - skipping only: kernel-side file pruning works, row-time eval errors
-/// - both: full coverage (row-time + file pruning)
-/// - neither: opaque op is opaque end-to-end; kernel keeps every file and the engine must filter on
-///   its side
+/// When wrapped via `Predicate::arrow_opaque`, `as_data_skipping_predicate` rewrites each
+/// `Column` argument into a positional `Expression::struct_from([min_ref, max_ref])` so the
+/// engine's callback receives a `StructArray` it can crack to get min/max per file. Literal args
+/// pass through unchanged. The op's identity and arity are preserved, so the same engine
+/// callback handles both row-time and stats-time evaluation -- it inspects each arg's runtime
+/// data type (struct = stats mode, primitive = row mode).
+///
+/// File pruning is only possible when callbacks are attached -- without them, the rewritten
+/// predicate would error at runtime. Bare ops
+/// (`Predicate::opaque(NamedOpaquePredicateOp::new(...))`) abstain from file pruning.
 ///
 /// The scalar/partition-pruning paths always abstain (`Ok(None)`).
+///
+/// # Known limitations
+///
+/// - Min/max lookup uses a sentinel `DataType::LONG`; columns whose stats schema doesn't carry
+///   LONG-typed min/max (strings, decimals not matching, etc.) silently abstain. A follow-up commit
+///   will plumb the real column type through.
+/// - Inversion (`inverted == true`) abstains -- per-op negation semantics aren't expressed.
+/// - Expression kinds other than `Column`, `Literal`, and `Predicate` abstain.
 ///
 /// [`OpaqueEvalCallbacks`]: opaque_eval::OpaqueEvalCallbacks
 #[derive(Debug, Clone)]
@@ -135,10 +141,6 @@ pub struct NamedOpaquePredicateOp {
     #[cfg(feature = "default-engine-base")]
     #[allow(dead_code)] // read via callbacks_clone() under default-engine-base
     callbacks: Option<Arc<OpaqueEvalCallbacks>>,
-    /// Optional kernel-native decomposition used for data-skipping. Uses
-    /// LOGICAL column refs; kernel's data-skipping evaluator rewrites them
-    /// to `stats_parsed.minValues.*` / `maxValues.*` at evaluation time.
-    skipping_decomp: Option<Predicate>,
 }
 
 impl NamedOpaquePredicateOp {
@@ -149,7 +151,6 @@ impl NamedOpaquePredicateOp {
             name: name.into(),
             #[cfg(feature = "default-engine-base")]
             callbacks: None,
-            skipping_decomp: None,
         }
     }
 
@@ -163,32 +164,6 @@ impl NamedOpaquePredicateOp {
         Self {
             name: name.into(),
             callbacks: Some(callbacks),
-            skipping_decomp: None,
-        }
-    }
-
-    /// Build an op with a data-skipping decomposition only (no row-time eval).
-    pub(crate) fn with_skipping_decomp(name: impl Into<String>, decomp: Predicate) -> Self {
-        Self {
-            name: name.into(),
-            #[cfg(feature = "default-engine-base")]
-            callbacks: None,
-            skipping_decomp: Some(decomp),
-        }
-    }
-
-    /// Build an op with both row-time eval callbacks AND a data-skipping
-    /// decomposition.
-    #[cfg(feature = "default-engine-base")]
-    pub(crate) fn with_callbacks_and_skipping(
-        name: impl Into<String>,
-        callbacks: Arc<OpaqueEvalCallbacks>,
-        decomp: Predicate,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            callbacks: Some(callbacks),
-            skipping_decomp: Some(decomp),
         }
     }
 
@@ -237,15 +212,15 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
 
     fn as_data_skipping_predicate(
         &self,
-        evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
         _exprs: &[Expression],
-        inverted: bool,
+        _inverted: bool,
     ) -> Option<Predicate> {
-        // Engines that want file pruning provide a kernel-native
-        // decomposition using LOGICAL column refs (e.g. `col >= "foo"`).
-        // Kernel's evaluator rewrites those to `stats_parsed.maxValues.col`
-        // automatically while walking the decomposition.
-        evaluator.eval_pred(self.skipping_decomp.as_ref()?, inverted)
+        // The real rewrite lives on the `ArrowOpaquePredicateOp` impl in `arrow_eval.rs` -- it
+        // wraps the output via `Predicate::arrow_opaque` so runtime dispatch can reach the
+        // engine callback. Ops built via `Predicate::opaque(NamedOpaquePredicateOp::new(...))`
+        // have no callback to dispatch to, so file pruning is impossible regardless: abstain.
+        None
     }
 }
 
@@ -268,15 +243,7 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
-    use std::cmp::Ordering;
-
-    use delta_kernel::expressions::{
-        BinaryPredicateOp, ColumnName, Expression as Expr, JunctionPredicateOp,
-        OpaquePredicateOpRef,
-    };
-    use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
-    use delta_kernel::schema::DataType as SchemaDataType;
-    use delta_kernel::Predicate as Pred;
+    use delta_kernel::expressions::OpaquePredicateOp as _;
 
     use super::*;
 
@@ -295,193 +262,89 @@ mod tests {
         assert_ne!(a, c);
     }
 
-    // === Data-skipping decomposition rewrite =================================
+    /// The kernel-trait impl always abstains -- the real rewrite lives on the
+    /// `ArrowOpaquePredicateOp` impl in `arrow_eval.rs`.
+    #[test]
+    fn kernel_trait_as_data_skipping_predicate_always_returns_none() {
+        use std::cmp::Ordering;
 
-    /// Minimal `DataSkippingPredicateEvaluator` impl that rewrites column refs
-    /// to a stats-shaped column path, similar to the real kernel
-    /// `DataSkippingPredicateCreator`. Used only by tests in this module to
-    /// observe the rewrite that kernel performs when our op hands back its
-    /// decomposition.
-    struct StatsRewriter;
+        use delta_kernel::expressions::{
+            BinaryPredicateOp, ColumnName, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+        };
+        use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
+        use delta_kernel::schema::DataType as SchemaDataType;
 
-    fn stats_col(prefix: &str, col: &ColumnName) -> Expr {
-        let mut name = ColumnName::new([prefix]);
-        name = name.join(col);
-        Expr::from(name)
-    }
-
-    impl DataSkippingPredicateEvaluator for StatsRewriter {
-        type Output = Pred;
-        type ColumnStat = Expr;
-
-        fn get_min_stat(&self, col: &ColumnName, _: &SchemaDataType) -> Option<Expr> {
-            Some(stats_col("minValues", col))
-        }
-        fn get_max_stat(&self, col: &ColumnName, _: &SchemaDataType) -> Option<Expr> {
-            Some(stats_col("maxValues", col))
-        }
-        fn get_nullcount_stat(&self, _: &ColumnName) -> Option<Expr> {
-            None
-        }
-        fn get_rowcount_stat(&self) -> Option<Expr> {
-            None
-        }
-
-        fn eval_pred_scalar(
-            &self,
-            val: &delta_kernel::expressions::Scalar,
-            inverted: bool,
-        ) -> Option<Pred> {
-            use delta_kernel::expressions::Scalar;
-            match val {
-                Scalar::Boolean(b) => Some(Pred::literal(*b != inverted)),
-                _ => None,
+        // Minimal evaluator stub -- the trait impl ignores its evaluator argument, so the body
+        // is never exercised.
+        struct NeverCalled;
+        impl DataSkippingPredicateEvaluator for NeverCalled {
+            type Output = Predicate;
+            type ColumnStat = Expression;
+            fn get_min_stat(&self, _: &ColumnName, _: &SchemaDataType) -> Option<Expression> {
+                None
+            }
+            fn get_max_stat(&self, _: &ColumnName, _: &SchemaDataType) -> Option<Expression> {
+                None
+            }
+            fn get_nullcount_stat(&self, _: &ColumnName) -> Option<Expression> {
+                None
+            }
+            fn get_rowcount_stat(&self) -> Option<Expression> {
+                None
+            }
+            fn eval_pred_scalar(&self, _: &Scalar, _: bool) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_scalar_is_null(&self, _: &Scalar, _: bool) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_is_null(&self, _: &ColumnName, _: bool) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_binary_scalars(
+                &self,
+                _: BinaryPredicateOp,
+                _: &Scalar,
+                _: &Scalar,
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_opaque(
+                &self,
+                _: &OpaquePredicateOpRef,
+                _: &[Expression],
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
+            fn finish_eval_pred_junction(
+                &self,
+                _: JunctionPredicateOp,
+                _: &mut dyn Iterator<Item = Option<Predicate>>,
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
+            fn eval_partial_cmp(
+                &self,
+                _: Ordering,
+                _: Expression,
+                _: &Scalar,
+                _: bool,
+            ) -> Option<Predicate> {
+                None
             }
         }
-        fn eval_pred_scalar_is_null(
-            &self,
-            _: &delta_kernel::expressions::Scalar,
-            _: bool,
-        ) -> Option<Pred> {
-            None
-        }
-        fn eval_pred_is_null(&self, _: &ColumnName, _: bool) -> Option<Pred> {
-            None
-        }
-        fn eval_pred_binary_scalars(
-            &self,
-            _: BinaryPredicateOp,
-            _: &delta_kernel::expressions::Scalar,
-            _: &delta_kernel::expressions::Scalar,
-            _: bool,
-        ) -> Option<Pred> {
-            None
-        }
-        fn eval_pred_opaque(
-            &self,
-            _: &OpaquePredicateOpRef,
-            _: &[Expression],
-            _: bool,
-        ) -> Option<Pred> {
-            None
-        }
-        fn finish_eval_pred_junction(
-            &self,
-            op: JunctionPredicateOp,
-            preds: &mut dyn Iterator<Item = Option<Pred>>,
-            inverted: bool,
-        ) -> Option<Pred> {
-            let collected: Vec<Pred> = preds.collect::<Option<Vec<_>>>()?;
-            let pred = Pred::junction(op, collected);
-            Some(if inverted { Pred::not(pred) } else { pred })
-        }
-        fn eval_partial_cmp(
-            &self,
-            ord: Ordering,
-            col: Expr,
-            val: &delta_kernel::expressions::Scalar,
-            inverted: bool,
-        ) -> Option<Pred> {
-            let base_op = match ord {
-                Ordering::Less => BinaryPredicateOp::LessThan,
-                Ordering::Greater => BinaryPredicateOp::GreaterThan,
-                Ordering::Equal => BinaryPredicateOp::Equal,
-            };
-            let pred = Pred::binary(base_op, col, Expr::literal(val.clone()));
-            Some(if inverted { Pred::not(pred) } else { pred })
-        }
-    }
 
-    #[test]
-    fn skipping_decomp_field_is_stored() {
-        let decomp = Pred::literal(true);
-        let op = NamedOpaquePredicateOp::with_skipping_decomp("STARTS_WITH", decomp.clone());
-        assert_eq!(op.skipping_decomp.as_ref(), Some(&decomp));
-    }
-
-    #[test]
-    fn as_data_skipping_predicate_returns_none_when_no_decomp() {
-        use delta_kernel::expressions::OpaquePredicateOp;
         let op = NamedOpaquePredicateOp::new("ANY");
-        let rewriter = StatsRewriter;
+        let evaluator = NeverCalled;
         let result = op.as_data_skipping_predicate(
-            &rewriter as &dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>,
+            &evaluator
+                as &dyn DataSkippingPredicateEvaluator<Output = Predicate, ColumnStat = Expression>,
             &[],
             false,
         );
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn decomposition_is_rewritten_to_stats_column_refs() {
-        use delta_kernel::expressions::{column_expr, OpaquePredicateOp};
-
-        // Engine-side decomposition for STARTS_WITH(col, "foo"):
-        //   col >= "foo" AND col < "fop"
-        // (built as: NOT(col < "foo") AND col < "fop")
-        let lo = Pred::not(Pred::lt(column_expr!("col"), Expr::literal("foo")));
-        let hi = Pred::lt(column_expr!("col"), Expr::literal("fop"));
-        let decomp = Pred::and_from([lo, hi]);
-
-        let op = NamedOpaquePredicateOp::with_skipping_decomp("STARTS_WITH", decomp);
-
-        // Kernel's evaluator walks the decomp and rewrites column refs.
-        let rewriter = StatsRewriter;
-        let stats_pred = op
-            .as_data_skipping_predicate(
-                &rewriter as &dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>,
-                &[],
-                false,
-            )
-            .expect("decomp should rewrite to a non-empty stats predicate");
-
-        // Verify the rewrite touched stats columns. After the walk, the
-        // predicate should mention "maxValues" and "minValues" instead of
-        // raw "col".
-        let serialized = format!("{stats_pred:?}");
-        assert!(
-            serialized.contains("maxValues"),
-            "expected maxValues in rewritten predicate, got: {serialized}"
-        );
-        assert!(
-            serialized.contains("minValues"),
-            "expected minValues in rewritten predicate, got: {serialized}"
-        );
-        assert!(
-            !serialized.contains("Column(ColumnName { path: [\"col\"] })"),
-            "raw `col` ref should have been rewritten, got: {serialized}"
-        );
-    }
-
-    #[test]
-    fn decomposition_handles_inverted_flag() {
-        use delta_kernel::expressions::{column_expr, OpaquePredicateOp};
-
-        let decomp = Pred::lt(column_expr!("col"), Expr::literal("foo"));
-        let op = NamedOpaquePredicateOp::with_skipping_decomp("OP", decomp);
-        let rewriter = StatsRewriter;
-
-        let non_inverted = op
-            .as_data_skipping_predicate(
-                &rewriter as &dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>,
-                &[],
-                false,
-            )
-            .expect("non-inverted decomp should rewrite to a stats predicate");
-        let inverted = op
-            .as_data_skipping_predicate(
-                &rewriter as &dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>,
-                &[],
-                true,
-            )
-            .expect("inverted decomp should rewrite to a stats predicate");
-
-        // Inversion must produce a structurally different stats predicate
-        // (the rewriter applies different bounds for col < val vs col >= val).
-        assert_ne!(
-            format!("{non_inverted:?}"),
-            format!("{inverted:?}"),
-            "inverted flag should change the rewritten predicate"
-        );
     }
 }
