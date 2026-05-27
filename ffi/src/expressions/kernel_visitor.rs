@@ -829,6 +829,103 @@ fn visit_predicate_opaque_with_eval_impl(
     Ok(wrap_predicate(state, Predicate::arrow_opaque(op, exprs)))
 }
 
+/// Build an opaque predicate carrying a data-skipping decomposition (no
+/// row-time eval). `skipping_decomp_id` references a kernel-native
+/// `Predicate` constructed via the standard `visit_predicate_*` builders;
+/// it should use LOGICAL column refs (e.g. `col`, not `stats_parsed.minValues.col`).
+/// Kernel's data-skipping evaluator rewrites column refs automatically.
+///
+/// Use when kernel-side file pruning matters but row-time evaluation is
+/// handled engine-side (e.g., the engine applies the predicate after
+/// reading rows).
+///
+/// Returns 0 if any child ID is invalid OR if `skipping_decomp_id` is invalid.
+///
+/// # Safety
+/// `name` must be valid UTF-8 for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate_opaque_with_skipping(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+    children: &mut EngineIterator,
+    skipping_decomp_id: usize,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name = unsafe { String::try_from_slice(&name) };
+    visit_predicate_opaque_with_skipping_impl(state, name, children, skipping_decomp_id)
+        .into_extern_result(&allocate_error)
+}
+
+fn visit_predicate_opaque_with_skipping_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: DeltaResult<String>,
+    children: &mut EngineIterator,
+    skipping_decomp_id: usize,
+) -> DeltaResult<usize> {
+    let name = name?;
+    let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
+        return Ok(0);
+    };
+    let Some(decomp) = unwrap_kernel_predicate(state, skipping_decomp_id) else {
+        return Ok(0);
+    };
+    let op = NamedOpaquePredicateOp::with_skipping_decomp(name, decomp);
+    Ok(wrap_predicate(state, Predicate::opaque(op, exprs)))
+}
+
+/// Build an opaque predicate with BOTH row-time eval callbacks AND a
+/// data-skipping decomposition. See [`visit_predicate_opaque_with_eval`]
+/// and [`visit_predicate_opaque_with_skipping`] for the individual
+/// semantics.
+///
+/// Returns 0 if any child ID or `skipping_decomp_id` is invalid.
+///
+/// # Safety
+/// `name` must be valid UTF-8 for the duration of the call; `ctx` must
+/// be a valid handle from [`create_opaque_eval_context`].
+///
+/// [`create_opaque_eval_context`]: crate::expressions::opaque_eval::create_opaque_eval_context
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate_opaque_with_eval_and_skipping(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+    children: &mut EngineIterator,
+    ctx: Handle<SharedOpaqueEvalContext>,
+    skipping_decomp_id: usize,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name = unsafe { String::try_from_slice(&name) };
+    let callbacks = unsafe { ctx.clone_as_arc() };
+    visit_predicate_opaque_with_eval_and_skipping_impl(
+        state,
+        name,
+        children,
+        callbacks,
+        skipping_decomp_id,
+    )
+    .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn visit_predicate_opaque_with_eval_and_skipping_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: DeltaResult<String>,
+    children: &mut EngineIterator,
+    callbacks: Arc<crate::expressions::opaque_eval::OpaqueEvalCallbacks>,
+    skipping_decomp_id: usize,
+) -> DeltaResult<usize> {
+    let name = name?;
+    let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
+        return Ok(0);
+    };
+    let Some(decomp) = unwrap_kernel_predicate(state, skipping_decomp_id) else {
+        return Ok(0);
+    };
+    let op = NamedOpaquePredicateOp::with_callbacks_and_skipping(name, callbacks, decomp);
+    Ok(wrap_predicate(state, Predicate::arrow_opaque(op, exprs)))
+}
+
 /// Build `Expression::Opaque(NamedOpaqueExpressionOp(name, callbacks), children)`
 /// and route it through the default engine's Arrow batch evaluator (mirrors
 /// [`visit_predicate_opaque_with_eval`]).
