@@ -73,15 +73,12 @@ pub(crate) mod reporter;
 use std::sync::Arc;
 
 pub use events::{
-    CrcReadCompleted, JsonReadCompleted, LogSegmentLoaded, MetricEvent, MetricId,
-    ParquetReadCompleted, ProtocolMetadataLoaded, ScanMetadataCompleted, ScanType,
-    SnapshotCompleted, SnapshotFailed, StorageCopyCompleted, StorageListCompleted,
-    StorageReadCompleted,
+    emit_json_read_completed, emit_parquet_read_completed, CrcReadCompleted, JsonReadCompleted,
+    LogSegmentLoaded, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoaded,
+    ScanMetadataCompleted, ScanType, SnapshotCompleted, SnapshotFailed, StorageCopyCompleted,
+    StorageListCompleted, StorageReadCompleted,
 };
-pub use reporter::{
-    emit_json_read_completed, emit_parquet_read_completed, LoggingMetricsReporter, MetricsReporter,
-    ReportGeneratorLayer,
-};
+pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;

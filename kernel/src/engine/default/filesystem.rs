@@ -18,15 +18,13 @@ use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-/// Stream wrapper that emits a storage metric span when dropped.
+/// Stream wrapper that emits a storage metric span when dropped. Drop fires regardless of
+/// whether the iterator was fully consumed or dropped early.
 ///
 /// The span is always emitted on the thread that drops this iterator, which is the caller's
 /// thread.
 ///
 /// Generic over the inner stream type and item type.
-///
-/// Emitted in `Drop`, which fires regardless of whether the iterator was fully consumed or
-/// dropped early.
 struct MetricsIterator<I, T> {
     inner: I,
     name: &'static str,
@@ -64,7 +62,7 @@ impl<I, T> Drop for MetricsIterator<I, T> {
     }
 }
 
-// `list_from` path: counts files only (no payload bytes to measure).
+// Iterator over file metadata (e.g. for `list_from`). Counts num_files only.
 impl<I> Stream for MetricsIterator<I, FileMeta>
 where
     I: Stream<Item = DeltaResult<FileMeta>> + Unpin,
@@ -84,7 +82,7 @@ where
     }
 }
 
-// `read_files` path: counts files and payload bytes.
+// Iterator over byte buffers (e.g. for `read_files`). Counts num_files and total bytes_read.
 impl<I> Stream for MetricsIterator<I, Bytes>
 where
     I: Stream<Item = DeltaResult<Bytes>> + Unpin,

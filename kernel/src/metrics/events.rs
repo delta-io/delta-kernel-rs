@@ -869,3 +869,61 @@ impl fmt::Display for StorageCopyCompleted {
         write!(f, "StorageCopyCompleted(duration={duration:?})")
     }
 }
+
+// ====================================================================
+// emit_* helpers
+// ====================================================================
+//
+// Fire a tracing span carrying a pre-built event payload. Used by the scan metadata emission
+// site (which constructs the event up front) and by connector-side `JsonHandler` /
+// `ParquetHandler` implementations that want to report read metrics.
+
+/// Emit a [`MetricEvent::JsonReadCompleted`] via a tracing span.
+///
+/// Call once per [`crate::JsonHandler::read_json_files`] invocation, after the file list is known
+/// but before the iterator is consumed (i.e. at iterator exhaustion or drop).
+pub fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        JsonReadCompleted::SPAN_NAME,
+        report = tracing::field::Empty,
+        num_files,
+        bytes_read,
+    );
+}
+
+/// Emit a [`MetricEvent::ParquetReadCompleted`] via a tracing span.
+///
+/// Call once per [`crate::ParquetHandler::read_parquet_files`] invocation, after the file list is
+/// known but before the iterator is consumed (i.e. at iterator exhaustion or drop).
+pub fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        ParquetReadCompleted::SPAN_NAME,
+        report = tracing::field::Empty,
+        num_files,
+        bytes_read,
+    );
+}
+
+/// Emit a [`MetricEvent::ScanMetadataCompleted`] via a tracing span. Call when the scan metadata
+/// iterator is exhausted or dropped.
+pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        ScanMetadataCompleted::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %e.operation_id,
+        scan_type = %e.scan_type,
+        duration_ns = e.duration.as_nanos() as u64,
+        num_add_files_seen = e.num_add_files_seen,
+        num_active_add_files = e.num_active_add_files,
+        active_add_files_bytes = e.active_add_files_bytes,
+        num_remove_files_seen = e.num_remove_files_seen,
+        num_non_file_actions = e.num_non_file_actions,
+        num_predicate_filtered = e.num_predicate_filtered,
+        peak_hash_set_size = e.peak_hash_set_size as u64,
+        dedup_visitor_time_ms = e.dedup_visitor_time_ms,
+        predicate_eval_time_ms = e.predicate_eval_time_ms,
+    );
+}
