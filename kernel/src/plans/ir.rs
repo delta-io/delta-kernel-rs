@@ -62,6 +62,14 @@ pub enum IoOperation {
     /// [`Error::FileAlreadyExists`](crate::Error::FileAlreadyExists) without modifying it.
     /// Returns [`PlanResult::Unit`](super::PlanResult::Unit) on success.
     AtomicCopy { source: Url, destination: Url },
+    /// Read the schema from the footer of a Parquet file.
+    ///
+    /// Returns [`PlanResult::Schema`](super::PlanResult::Schema) containing the file's schema
+    /// converted to Delta Kernel's format. See [`ParquetHandler::read_parquet_footer`] for the
+    /// full contract.
+    ///
+    /// [`ParquetHandler::read_parquet_footer`]: crate::ParquetHandler::read_parquet_footer
+    ParquetSchema { file: FileMeta },
 }
 
 impl IoOperation {
@@ -90,6 +98,10 @@ impl IoOperation {
             source,
             destination,
         }
+    }
+
+    pub fn parquet_schema(file: FileMeta) -> Self {
+        Self::ParquetSchema { file }
     }
 }
 

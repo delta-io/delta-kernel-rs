@@ -8,6 +8,7 @@ use bytes::Bytes;
 pub use ir::{IoOperation, Operation, QueryPlan, QueryPlanNode};
 pub use query_builder::QueryPlanBuilder;
 
+use crate::schema::SchemaRef;
 use crate::{AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta};
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
@@ -29,6 +30,8 @@ pub enum PlanResult {
     FileMeta(DeltaResultIteratorStatic<FileMeta>),
     /// A stream of raw byte buffers.
     Bytes(DeltaResultIteratorStatic<Bytes>),
+    /// The schema of a file (e.g. a Parquet footer schema).
+    Schema(SchemaRef),
     /// Represents the successful completion of a plan, but with no return value.
     Unit,
 }
@@ -55,6 +58,13 @@ impl PlanResult {
         }
     }
 
+    pub fn into_schema(self) -> DeltaResult<SchemaRef> {
+        match self {
+            Self::Schema(schema) => Ok(schema),
+            other => Err(other.type_mismatch("Schema")),
+        }
+    }
+
     pub fn into_unit(self) -> DeltaResult<()> {
         match self {
             Self::Unit => Ok(()),
@@ -67,6 +77,7 @@ impl PlanResult {
             Self::Data(_) => "Data",
             Self::FileMeta(_) => "FileMeta",
             Self::Bytes(_) => "Bytes",
+            Self::Schema(_) => "Schema",
             Self::Unit => "Unit",
         }
     }
