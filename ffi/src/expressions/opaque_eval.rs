@@ -45,8 +45,8 @@ use crate::KernelStringSlice;
 pub enum EvalMode {
     /// Per-row evaluation against a data batch. Each arg slot carries one value per row.
     RowMode = 0,
-    /// Per-file evaluation against a stats batch. `Column` args arrive as `Struct[min, max]`;
-    /// literals pass through.
+    /// Per-file evaluation against a stats batch. `Column` args arrive as
+    /// `Struct[min, max, nullcount, rowcount]`; literals pass through.
     StatsMode = 1,
 }
 
@@ -74,11 +74,19 @@ pub enum EvalMode {
 ///
 /// In `StatsMode`, each arg slot carries one value per file, shaped by the original expression:
 ///
-/// - `Column` (primitive): `StructArray[min, max]`. Crack by index; inner field names are not part
-///   of the contract.
-/// - `Column` (struct): `StructArray[min, max]` where each side mirrors the column's nested schema.
-///   Delta tracks min/max per leaf only.
-/// - `Column` (map/array): Delta has no min/max for these; slot is NULL and the file is kept.
+/// - `Column` (primitive): `StructArray[min, max, nullcount, rowcount]`. Crack by index:
+///   - 0 = min, 1 = max (column's eligible type)
+///   - 2 = nullcount (`Int64`; all-null if the column has no nullcount stats)
+///   - 3 = rowcount (`Int64`; all-null only in checkpoint-only batches that lack it)
+///
+///   Inner field names are not part of the contract.
+/// - `Column` (struct): same 4-field shape; min/max mirror the column's nested schema. Delta tracks
+///   min/max per leaf only.
+/// - `Column` (map/array): not stats-eligible; the rewrite abstains and the engine never sees a
+///   wrapper for this slot (the entire predicate is dropped from the stats predicate).
+/// - `Column` (partition): same 4-field shape; min and max are the partition value (exact),
+///   nullcount is NULL (Delta doesn't carry nullcount for partition columns), rowcount is NULL
+///   because partition-only stats batches omit `stats_parsed`.
 /// - `Literal`: broadcast array, same as row mode.
 /// - `Predicate`: `BooleanArray` of per-file verdicts (nulls = keep).
 ///

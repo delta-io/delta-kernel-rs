@@ -20,7 +20,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expres
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaquePredicate as _, ArrowOpaquePredicateOp,
 };
-use delta_kernel::expressions::{Expression, ExpressionRef, ScalarExpressionEvaluator};
+use delta_kernel::expressions::{Expression, ExpressionRef, Scalar, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
@@ -67,6 +67,18 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
 
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| Error::Generic(format!("opaque eval batch construction: {e}")))
+}
+
+/// Detects whether an expression returned by `get_min_stat`/`get_max_stat` is a partition-column
+/// reference. Kernel's `DataSkippingPredicateCreator` returns a `partitionValues_parsed.<col>`
+/// ref for partition columns and a `stats_parsed.{min,max}Values.<col>` ref for data columns.
+/// We use the prefix to decide whether `stats_parsed` exists in the batch we'll be evaluated
+/// against -- partition-only batches omit it entirely.
+fn is_partition_column_ref(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Column(name) if name.path().first().is_some_and(|p| p == "partitionValues_parsed")
+    )
 }
 
 /// Build a `StructArray` from a struct expression's children, naming fields positionally
@@ -230,9 +242,26 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         for arg in exprs {
             let new_arg = match arg {
                 Expression::Column(col) => {
+                    // Min/max are mandatory: if kernel can't produce them, the whole rewrite
+                    // abstains. Nullcount/rowcount are best-effort -- substitute a typed-null
+                    // literal when the stat is absent (partition columns, schema-trimmed
+                    // nullcount, checkpoint-only batches).
+                    //
+                    // Partition columns get a typed-null rowcount even when kernel offers one:
+                    // partition-only predicates run against batches that omit `stats_parsed`
+                    // entirely (see `build_unified_schema_and_expr`), so a
+                    // `stats_parsed.numRecords` reference would fail to resolve at eval time.
                     let min = evaluator.get_min_stat(col, &SENTINEL_TYPE)?;
                     let max = evaluator.get_max_stat(col, &SENTINEL_TYPE)?;
-                    Expression::struct_from([min, max])
+                    let is_partition_col = is_partition_column_ref(&min);
+                    let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
+                    let nullcount = evaluator.get_nullcount_stat(col).unwrap_or_else(null_long);
+                    let rowcount = if is_partition_col {
+                        null_long()
+                    } else {
+                        evaluator.get_rowcount_stat().unwrap_or_else(null_long)
+                    };
+                    Expression::struct_from([min, max, nullcount, rowcount])
                 }
                 Expression::Literal(_) => arg.clone(),
                 Expression::Predicate(p) => {
@@ -580,10 +609,11 @@ mod tests {
 
         /// Stub evaluator that mirrors the real `DataSkippingPredicateCreator`:
         /// `get_min_stat`/`get_max_stat` return `stats_parsed.minValues.<col>` /
-        /// `maxValues.<col>` references. Other methods are wired well enough for the
-        /// `eval_pred(Predicate)` recursion the rewrite exercises.
+        /// `maxValues.<col>` references for data columns, and `partitionValues_parsed.<col>`
+        /// for partition columns (matching kernel's actual shape).
         struct StatsRewriter {
             has_stats: bool,
+            partition: bool,
         }
 
         fn stats_col(prefix: &str, col: &ColumnName) -> Expression {
@@ -592,21 +622,40 @@ mod tests {
             Expression::from(name)
         }
 
+        fn partition_col(col: &ColumnName) -> Expression {
+            let mut name = ColumnName::new(["partitionValues_parsed"]);
+            name = name.join(col);
+            Expression::from(name)
+        }
+
+        fn stats_col_numrecords() -> Expression {
+            Expression::from(ColumnName::new(["stats_parsed", "numRecords"]))
+        }
+
         impl DataSkippingPredicateEvaluator for StatsRewriter {
             type Output = Predicate;
             type ColumnStat = Expression;
 
             fn get_min_stat(&self, col: &ColumnName, _: &DataType) -> Option<Expression> {
+                if self.partition {
+                    return Some(partition_col(col));
+                }
                 self.has_stats.then(|| stats_col("minValues", col))
             }
             fn get_max_stat(&self, col: &ColumnName, _: &DataType) -> Option<Expression> {
+                if self.partition {
+                    return Some(partition_col(col));
+                }
                 self.has_stats.then(|| stats_col("maxValues", col))
             }
             fn get_nullcount_stat(&self, _: &ColumnName) -> Option<Expression> {
                 None
             }
             fn get_rowcount_stat(&self) -> Option<Expression> {
-                None
+                // Match kernel: rowcount is unconditionally present in the data-column case.
+                // (For our tests, the rewrite null-substitutes it on the partition-column path,
+                // so this Some(...) only fires for data columns.)
+                Some(stats_col_numrecords())
             }
             fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Predicate> {
                 if let Scalar::Boolean(b) = val {
@@ -666,11 +715,24 @@ mod tests {
         }
 
         fn rewriter() -> StatsRewriter {
-            StatsRewriter { has_stats: true }
+            StatsRewriter {
+                has_stats: true,
+                partition: false,
+            }
         }
 
         fn no_stats_rewriter() -> StatsRewriter {
-            StatsRewriter { has_stats: false }
+            StatsRewriter {
+                has_stats: false,
+                partition: false,
+            }
+        }
+
+        fn partition_rewriter() -> StatsRewriter {
+            StatsRewriter {
+                has_stats: true,
+                partition: true,
+            }
         }
 
         fn op_with_callbacks(name: &str) -> NamedOpaquePredicateOp {
@@ -709,7 +771,7 @@ mod tests {
         }
 
         #[test]
-        fn wraps_column_in_min_max_struct() {
+        fn wraps_column_in_min_max_nullcount_rowcount_struct() {
             let op = op_with_callbacks("STARTS_WITH");
             let args = [column_expr!("col")];
             let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
@@ -721,7 +783,11 @@ mod tests {
             let Expression::Struct(fields, _) = &opaque.exprs[0] else {
                 panic!("expected Struct arg, got {:?}", opaque.exprs[0]);
             };
-            assert_eq!(fields.len(), 2, "struct should have [min, max] fields");
+            assert_eq!(
+                fields.len(),
+                4,
+                "struct should have [min, max, nullcount, rowcount] fields"
+            );
             assert_eq!(
                 *fields[0],
                 stats_col("minValues", &ColumnName::new(["col"]))
@@ -730,6 +796,13 @@ mod tests {
                 *fields[1],
                 stats_col("maxValues", &ColumnName::new(["col"]))
             );
+            // Nullcount: stub returns None -> typed-null fallback.
+            assert_eq!(
+                *fields[2],
+                Expression::literal(Scalar::Null(DataType::LONG))
+            );
+            // Rowcount: stub mirrors kernel and returns `stats_parsed.numRecords`.
+            assert_eq!(*fields[3], stats_col_numrecords());
         }
 
         #[test]
@@ -853,6 +926,7 @@ mod tests {
                 col_field,
                 Arc::new(Int64Array::from(vec![10])) as ArrayRef,
             )]);
+            let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
             let stats_parsed = StructArray::from(vec![
                 (
                     Arc::new(Field::new(
@@ -869,6 +943,10 @@ mod tests {
                         true,
                     )),
                     Arc::new(max_struct) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                    num_records,
                 ),
             ]);
             let schema = Arc::new(Schema::new(vec![Field::new(
@@ -887,6 +965,142 @@ mod tests {
                 CALL_COUNT.load(AtomicOrdering::SeqCst),
                 1,
                 "callback must fire exactly once"
+            );
+        }
+
+        /// Verifies the engine can read nullcount/rowcount from the struct wrapper and prune
+        /// "all-null" files. Stub rewriter substitutes literal-null for nullcount/rowcount
+        /// (the default `StatsRewriter` returns None for both), so the engine sees per-arg
+        /// `Struct[min, max, null_long, null_long]`. The engine in this test deliberately
+        /// checks slot 2 and falls back to keep-the-file when nullcount is unavailable --
+        /// exercising the "stat unavailable" branch.
+        #[test]
+        fn engine_handles_missing_nullcount_via_null_placeholder() {
+            use std::ffi::c_void;
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+            use delta_kernel::arrow::array::{Int64Array, StructArray};
+            use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+
+            static SAW_NULLCOUNT: AtomicUsize = AtomicUsize::new(0);
+
+            unsafe extern "C" fn engine_check_nullcount(
+                _state: *mut c_void,
+                _op_name: KernelStringSlice,
+                args_in: *mut ArrowFFIData,
+                mode: EvalMode,
+                _inverted: bool,
+                result_out: *mut ArrowFFIData,
+            ) -> bool {
+                assert_eq!(mode, EvalMode::StatsMode);
+                let batch = unsafe { take_ffi_record_batch(args_in) };
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("arg0 should be StructArray");
+                assert_eq!(
+                    col.num_columns(),
+                    4,
+                    "wrapper must be [min, max, nullcount, rowcount]"
+                );
+                let nullcount = col.column(2);
+                let usable = (0..nullcount.len()).any(|i| !nullcount.is_null(i));
+                if !usable {
+                    SAW_NULLCOUNT.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                // Without nullcount, we can't prune -- keep every file.
+                let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; batch.num_rows()]));
+                write_result(result_out, arr);
+                true
+            }
+
+            let op = NamedOpaquePredicateOp::with_callbacks(
+                "NEEDS_NULLCOUNT",
+                callbacks_for(engine_check_nullcount),
+            );
+            let args = [column_expr!("col")];
+            let rewritten =
+                rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+
+            // Stats batch only carries min/max; the rewriter's literal-null nullcount/rowcount
+            // resolves entirely in-expression without needing schema columns for them.
+            let col_field = Arc::new(Field::new("col", ArrowDataType::Int64, true));
+            let min_struct = StructArray::from(vec![(
+                col_field.clone(),
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            )]);
+            let max_struct = StructArray::from(vec![(
+                col_field,
+                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+            )]);
+            let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
+            let stats_parsed = StructArray::from(vec![
+                (
+                    Arc::new(Field::new(
+                        "minValues",
+                        min_struct.data_type().clone(),
+                        true,
+                    )),
+                    Arc::new(min_struct) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "maxValues",
+                        max_struct.data_type().clone(),
+                        true,
+                    )),
+                    Arc::new(max_struct) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                    num_records,
+                ),
+            ]);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "stats_parsed",
+                stats_parsed.data_type().clone(),
+                true,
+            )]));
+            let stats_batch =
+                RecordBatch::try_new(schema, vec![Arc::new(stats_parsed) as ArrayRef]).unwrap();
+
+            SAW_NULLCOUNT.store(0, AtomicOrdering::SeqCst);
+            let result = evaluate_predicate(&rewritten, &stats_batch, false).unwrap();
+            assert!(result.value(0));
+            assert_eq!(
+                SAW_NULLCOUNT.load(AtomicOrdering::SeqCst),
+                1,
+                "engine should observe nullcount as all-null and fall back to keep"
+            );
+        }
+
+        /// Partition columns get a typed-null rowcount (slot 3), not a
+        /// `stats_parsed.numRecords` ref. Partition-only stats batches omit `stats_parsed`
+        /// entirely (see kernel `build_unified_schema_and_expr`), so a column ref would fail
+        /// to resolve at eval time. Regression guard.
+        #[test]
+        fn partition_column_rewrites_with_null_rowcount() {
+            let op = op_with_callbacks("OP");
+            let args = [column_expr!("part_col")];
+            let pred = rewrite(&op, &args, &partition_rewriter(), false)
+                .expect("rewrite should succeed for partition column");
+            let Predicate::Opaque(opaque) = pred else {
+                panic!("expected Opaque");
+            };
+            let Expression::Struct(fields, _) = &opaque.exprs[0] else {
+                panic!("expected Struct arg, got {:?}", opaque.exprs[0]);
+            };
+            assert_eq!(fields.len(), 4);
+            assert_eq!(*fields[0], partition_col(&ColumnName::new(["part_col"])));
+            assert_eq!(*fields[1], partition_col(&ColumnName::new(["part_col"])));
+            // Slot 3 (rowcount) MUST be a typed-null literal, not a column ref into
+            // stats_parsed -- otherwise partition-only stats batches blow up at eval time.
+            assert_eq!(
+                *fields[3],
+                Expression::literal(Scalar::Null(DataType::LONG)),
+                "rowcount slot must be typed-null for partition columns"
             );
         }
     }
