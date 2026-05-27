@@ -242,19 +242,42 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         for arg in exprs {
             let new_arg = match arg {
                 Expression::Column(col) => {
-                    // Min/max mandatory; nullcount/rowcount fall back to typed-null. Partition
-                    // columns force rowcount to null since partition-only stats batches omit
-                    // `stats_parsed.numRecords` and the ref would fail to resolve.
-                    let ty = type_hint.as_ref()?;
-                    let min = evaluator.get_min_stat(col, ty)?;
-                    let max = evaluator.get_max_stat(col, ty)?;
                     let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
+
+                    // Probe with LONG to detect partition columns (kernel returns Some regardless
+                    // of type for partition cols; the prefix reveals which kind). For partition
+                    // cols we reuse the probe for min/max since the type is ignored. For data
+                    // cols we need the type hint and fall back to null when unavailable --
+                    // nullcount/rowcount still flow through so ops like IS_DEFINED can prune on
+                    // null density alone.
+                    let probe = evaluator.get_min_stat(col, &DataType::LONG);
+                    let (min, max, is_partition_col) = match probe.filter(is_partition_column_ref) {
+                        Some(partition_min) => {
+                            let mx = evaluator
+                                .get_max_stat(col, &DataType::LONG)
+                                .unwrap_or_else(null_long);
+                            (partition_min, mx, true)
+                        }
+                        None => {
+                            let (m, mx) = type_hint
+                                .as_ref()
+                                .and_then(|ty| {
+                                    let m = evaluator.get_min_stat(col, ty)?;
+                                    let mx = evaluator.get_max_stat(col, ty)?;
+                                    Some((m, mx))
+                                })
+                                .unwrap_or_else(|| (null_long(), null_long()));
+                            (m, mx, false)
+                        }
+                    };
+
                     let nullcount = evaluator.get_nullcount_stat(col).unwrap_or_else(null_long);
-                    let rowcount = if is_partition_column_ref(&min) {
+                    let rowcount = if is_partition_col {
                         null_long()
                     } else {
                         evaluator.get_rowcount_stat().unwrap_or_else(null_long)
                     };
+
                     Expression::struct_from([min, max, nullcount, rowcount])
                 }
                 Expression::Literal(_) => arg.clone(),
@@ -790,11 +813,35 @@ mod tests {
             assert_eq!(opaque.exprs[1], Expression::literal("foo"));
         }
 
+        /// Single Column arg with no literal: min/max null out (no type hint), but nullcount
+        /// and rowcount still flow through. Enables IS_DEFINED-style ops to prune.
         #[test]
-        fn abstains_when_column_arg_has_no_type_hint() {
-            let op = op_with_callbacks("OP");
+        fn column_without_type_hint_emits_partial_wrapper() {
+            let op = op_with_callbacks("IS_DEFINED");
             let args = [column_expr!("col")];
-            assert!(rewrite(&op, &args, &rewriter(), false).is_none());
+            let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+            let Predicate::Opaque(opaque) = pred else {
+                panic!("expected Opaque");
+            };
+            let Expression::Struct(fields, _) = &opaque.exprs[0] else {
+                panic!("expected Struct arg");
+            };
+            assert_eq!(fields.len(), 4);
+            assert_eq!(
+                *fields[0],
+                Expression::literal(Scalar::Null(DataType::LONG))
+            );
+            assert_eq!(
+                *fields[1],
+                Expression::literal(Scalar::Null(DataType::LONG))
+            );
+            // Nullcount: stub returns None -> typed-null fallback.
+            assert_eq!(
+                *fields[2],
+                Expression::literal(Scalar::Null(DataType::LONG))
+            );
+            // Rowcount: stub returns Some(stats_parsed.numRecords).
+            assert_eq!(*fields[3], stats_col_numrecords());
         }
 
         #[test]
@@ -842,11 +889,33 @@ mod tests {
             assert!(rewrite(&op, &args, &rewriter(), false).is_none());
         }
 
+        /// Column with no min/max stats still produces a wrapper -- the engine sees nulls for
+        /// min/max but can still reason about rowcount (e.g. small-file filtering).
         #[test]
-        fn abstains_when_column_has_no_stats() {
+        fn column_without_stats_falls_back_to_rowcount_only() {
             let op = op_with_callbacks("OP");
             let args = [column_expr!("col"), Expression::literal(1i64)];
-            assert!(rewrite(&op, &args, &no_stats_rewriter(), false).is_none());
+            let pred =
+                rewrite(&op, &args, &no_stats_rewriter(), false).expect("rewrite should succeed");
+            let Predicate::Opaque(opaque) = pred else {
+                panic!("expected Opaque");
+            };
+            let Expression::Struct(fields, _) = &opaque.exprs[0] else {
+                panic!("expected Struct arg");
+            };
+            assert_eq!(
+                *fields[0],
+                Expression::literal(Scalar::Null(DataType::LONG))
+            );
+            assert_eq!(
+                *fields[1],
+                Expression::literal(Scalar::Null(DataType::LONG))
+            );
+            assert_eq!(
+                *fields[2],
+                Expression::literal(Scalar::Null(DataType::LONG))
+            );
+            assert_eq!(*fields[3], stats_col_numrecords());
         }
 
         #[test]
