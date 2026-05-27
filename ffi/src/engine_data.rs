@@ -79,7 +79,12 @@ impl ArrowFFIData {
     /// `FFI_ArrowArray`/`FFI_ArrowSchema` call their release callbacks).
     pub fn try_from_engine_data(data: Box<dyn EngineData>) -> DeltaResult<Self> {
         let record_batch = data.try_into_record_batch()?;
-        let sa: StructArray = record_batch.into();
+        Self::try_from_record_batch(&record_batch)
+    }
+
+    /// Export a `RecordBatch` as Arrow C Data Interface structs.
+    pub fn try_from_record_batch(batch: &RecordBatch) -> DeltaResult<Self> {
+        let sa: StructArray = batch.clone().into();
         let array_data: ArrayData = sa.into();
         let array = FFI_ArrowArray::new(&array_data);
         let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
