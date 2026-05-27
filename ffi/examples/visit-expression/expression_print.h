@@ -80,6 +80,12 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case StructExpression:
           printf("StructExpression\n");
           break;
+        case Coalesce:
+          printf("Coalesce\n");
+          break;
+        case ArrayConstructor:
+          printf("ArrayConstructor\n");
+          break;
       }
       print_expression_item_list(var->exprs, depth + 1);
       break;
