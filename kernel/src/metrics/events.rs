@@ -66,6 +66,7 @@ pub enum MetricEvent {
         num_commit_files: u64,
         num_checkpoint_files: u64,
         num_compaction_files: u64,
+        has_latest_crc_file: bool,
     },
 
     /// Protocol and metadata loading completed.
@@ -118,6 +119,13 @@ pub enum MetricEvent {
     /// [`ParquetHandler::read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     ParquetReadCompleted { num_files: u64, bytes_read: u64 },
 
+    /// CRC file read operation completed (one event per CRC file read).
+    ///
+    /// Emitted when CRC read completes. The `duration` covers the entire function
+    /// including storage IO and JSON deserialization. `bytes_read` is the raw byte count from
+    /// storage (zero if the storage read failed before bytes were returned).
+    CrcReadCompleted { duration: Duration, bytes_read: u64 },
+
     /// Scan metadata iteration completed.
     ///
     /// Emitted when the scan metadata iterator is exhausted. This event captures metrics about the
@@ -138,6 +146,8 @@ pub enum MetricEvent {
         num_add_files_seen: u64,
         /// Add files that survived log replay (files to read).
         num_active_add_files: u64,
+        /// Size in bytes of the files that survived log replay (files to read).
+        active_add_files_bytes: u64,
         /// Remove files seen (from delta/commit files only).
         num_remove_files_seen: u64,
         /// Non-file actions seen (protocol, metadata, etc.).
@@ -162,9 +172,12 @@ impl fmt::Display for MetricEvent {
                 num_commit_files,
                 num_checkpoint_files,
                 num_compaction_files,
+                has_latest_crc_file,
             } => write!(
                 f,
-                "LogSegmentLoaded(id={operation_id}, duration={duration:?}, commits={num_commit_files}, checkpoints={num_checkpoint_files}, compactions={num_compaction_files})"
+                "LogSegmentLoaded(id={operation_id}, duration={duration:?}, \
+                 commits={num_commit_files}, checkpoints={num_checkpoint_files}, \
+                 compactions={num_compaction_files}, has_latest_crc={has_latest_crc_file})"
             ),
             MetricEvent::ProtocolMetadataLoaded {
                 operation_id,
@@ -221,12 +234,20 @@ impl fmt::Display for MetricEvent {
                 f,
                 "ParquetReadCompleted(files={num_files}, bytes={bytes_read})"
             ),
+            MetricEvent::CrcReadCompleted {
+                duration,
+                bytes_read,
+            } => write!(
+                f,
+                "CrcReadCompleted(duration={duration:?}, bytes={bytes_read})"
+            ),
             MetricEvent::ScanMetadataCompleted {
                 operation_id,
                 scan_type,
                 total_duration,
                 num_add_files_seen,
                 num_active_add_files,
+                active_add_files_bytes,
                 num_remove_files_seen,
                 num_non_file_actions,
                 num_predicate_filtered,
@@ -236,7 +257,7 @@ impl fmt::Display for MetricEvent {
             } => write!(
                 f,
                 "ScanMetadataCompleted(id={operation_id}, scan_type={scan_type}, duration={total_duration:?}, \
-                 add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, \
+                 add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, active_add_files_bytes={active_add_files_bytes}, \
                  remove_files_seen={num_remove_files_seen}, non_file_actions={num_non_file_actions}, \
                  predicate_filtered={num_predicate_filtered}, peak_hash_set_size={peak_hash_set_size}, \
                  dedup_visitor_time_ms={dedup_visitor_time_ms}, predicate_eval_time_ms={predicate_eval_time_ms})"

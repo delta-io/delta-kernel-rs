@@ -113,41 +113,65 @@ impl EventVisitor {
                 *total_duration = target_duration
             }
             Some(MetricEvent::SnapshotFailed { duration, .. }) => *duration = target_duration,
+            Some(MetricEvent::CrcReadCompleted { duration, .. }) => *duration = target_duration,
             _ => {}
         }
+    }
+
+    fn record_invalid_field_warning(&mut self, field: &Field, span_name: &str) {
+        self.pending_warnings.push(format!(
+            "Invalid field '{}' recorded on {span_name} span",
+            field.name()
+        ));
     }
 }
 
 impl Visit for EventVisitor {
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if let Some(MetricEvent::LogSegmentLoaded {
-            ref mut num_commit_files,
-            ref mut num_checkpoint_files,
-            ref mut num_compaction_files,
-            ..
-        }) = self.event
-        {
-            match field.name() {
+        match &mut self.event {
+            Some(MetricEvent::LogSegmentLoaded {
+                ref mut num_commit_files,
+                ref mut num_checkpoint_files,
+                ref mut num_compaction_files,
+                ..
+            }) => match field.name() {
                 "num_commit_files" => *num_commit_files = value,
                 "num_checkpoint_files" => *num_checkpoint_files = value,
                 "num_compaction_files" => *num_compaction_files = value,
-                _ => self.pending_warnings.push(format!(
-                    "Invalid field '{}' recorded on {SEGMENT_FOR_SNAPSHOT_SPAN} span",
-                    field.name()
-                )),
+                _ => self.record_invalid_field_warning(field, SEGMENT_FOR_SNAPSHOT_SPAN),
+            },
+            Some(MetricEvent::SnapshotCompleted {
+                ref mut version, ..
+            }) => {
+                if field.name() == "version" {
+                    *version = value;
+                } else {
+                    self.record_invalid_field_warning(field, SNAP_BUILD_SPAN);
+                }
             }
+            Some(MetricEvent::CrcReadCompleted {
+                ref mut bytes_read, ..
+            }) => {
+                if field.name() == "bytes_read" {
+                    *bytes_read = value;
+                } else {
+                    self.record_invalid_field_warning(field, CRC_READ_COMPLETED_SPAN);
+                }
+            }
+            _ => {}
         }
+    }
 
-        if let Some(MetricEvent::SnapshotCompleted {
-            ref mut version, ..
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if let Some(MetricEvent::LogSegmentLoaded {
+            ref mut has_latest_crc_file,
+            ..
         }) = self.event
         {
-            match field.name() {
-                "version" => *version = value,
-                _ => self.pending_warnings.push(format!(
-                    "Invalid field '{}' recorded on {SNAP_BUILD_SPAN} span",
-                    field.name()
-                )),
+            if field.name() == "has_latest_crc_file" {
+                *has_latest_crc_file = value;
+            } else {
+                self.record_invalid_field_warning(field, SEGMENT_FOR_SNAPSHOT_SPAN);
             }
         }
     }
@@ -197,6 +221,7 @@ pub(crate) const SEGMENT_FOR_SNAPSHOT_SPAN: &str = "segment.for_snapshot";
 pub(crate) const SEGMENT_READ_METADATA_SPAN: &str = "segment.read_metadata";
 pub(crate) const SNAP_BUILD_SPAN: &str = "snap.build";
 pub(crate) const STORAGE_SPAN: &str = "storage";
+pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 const JSON_READ_COMPLETED_SPAN: &str = "json_read_completed";
 const PARQUET_READ_COMPLETED_SPAN: &str = "parquet_read_completed";
 const SCAN_METADATA_COMPLETED_SPAN: &str = "scan.metadata_completed";
@@ -252,6 +277,7 @@ pub(crate) fn emit_scan_metadata_completed(event: &MetricEvent) {
         total_duration,
         num_add_files_seen,
         num_active_add_files,
+        active_add_files_bytes,
         num_remove_files_seen,
         num_non_file_actions,
         num_predicate_filtered,
@@ -271,6 +297,7 @@ pub(crate) fn emit_scan_metadata_completed(event: &MetricEvent) {
         total_duration_ns = total_duration.as_nanos() as u64,
         num_add_files_seen = *num_add_files_seen,
         num_active_add_files = *num_active_add_files,
+        active_add_files_bytes = *active_add_files_bytes,
         num_remove_files_seen = *num_remove_files_seen,
         num_non_file_actions = *num_non_file_actions,
         num_predicate_filtered = *num_predicate_filtered,
@@ -287,6 +314,7 @@ struct ScanMetadataVisitor {
     total_duration_ns: u64,
     num_add_files_seen: u64,
     num_active_add_files: u64,
+    active_add_files_bytes: u64,
     num_remove_files_seen: u64,
     num_non_file_actions: u64,
     num_predicate_filtered: u64,
@@ -309,6 +337,7 @@ impl ScanMetadataVisitor {
             total_duration: std::time::Duration::from_nanos(self.total_duration_ns),
             num_add_files_seen: self.num_add_files_seen,
             num_active_add_files: self.num_active_add_files,
+            active_add_files_bytes: self.active_add_files_bytes,
             num_remove_files_seen: self.num_remove_files_seen,
             num_non_file_actions: self.num_non_file_actions,
             num_predicate_filtered: self.num_predicate_filtered,
@@ -325,6 +354,7 @@ impl Visit for ScanMetadataVisitor {
             "total_duration_ns" => self.total_duration_ns = value,
             "num_add_files_seen" => self.num_add_files_seen = value,
             "num_active_add_files" => self.num_active_add_files = value,
+            "active_add_files_bytes" => self.active_add_files_bytes = value,
             "num_remove_files_seen" => self.num_remove_files_seen = value,
             "num_non_file_actions" => self.num_non_file_actions = value,
             "num_predicate_filtered" => self.num_predicate_filtered = value,
@@ -426,6 +456,7 @@ where
                 num_commit_files: 0,
                 num_checkpoint_files: 0,
                 num_compaction_files: 0,
+                has_latest_crc_file: false,
             }),
             SEGMENT_READ_METADATA_SPAN => Some(MetricEvent::ProtocolMetadataLoaded {
                 operation_id: MetricId(new_span_visitor.uuid),
@@ -471,6 +502,10 @@ where
                     bytes_read: v.bytes_read,
                 })
             }
+            CRC_READ_COMPLETED_SPAN => Some(MetricEvent::CrcReadCompleted {
+                duration: std::time::Duration::default(),
+                bytes_read: 0,
+            }),
             SCAN_METADATA_COMPLETED_SPAN => {
                 let mut v = ScanMetadataVisitor::default();
                 attrs.record(&mut v);

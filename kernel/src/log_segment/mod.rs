@@ -10,8 +10,8 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME,
-    PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, MAX_VALUES,
+    METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -304,7 +304,7 @@ impl LogSegment {
         name = "segment.for_snapshot",
         err,
         skip(storage, time_travel_version),
-        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
+        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(
@@ -337,6 +337,10 @@ impl LogSegment {
                 tracing::Span::current().record(
                     "num_compaction_files",
                     log_segment.listed.ascending_compaction_files.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "has_latest_crc_file",
+                    log_segment.listed.latest_crc_file.is_some(),
                 );
                 Ok(log_segment)
             }
@@ -1241,7 +1245,7 @@ impl LogSegment {
         // Check type compatibility for both minValues and maxValues structs.
         // While these typically have the same schema, the protocol doesn't guarantee it,
         // so we check both to be safe.
-        for field_name in ["minValues", "maxValues"] {
+        for field_name in [MIN_VALUES, MAX_VALUES] {
             let Some(checkpoint_values_field) = stats_struct.field(field_name) else {
                 // stats_parsed exists but no minValues/maxValues - unusual but valid
                 continue;

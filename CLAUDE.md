@@ -228,7 +228,8 @@ is the source of truth. Key concepts:
   `clustering`, `inCommitTimestamp`
 - Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
   `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
-  `variantType`, `variantType-preview`, `typeWidening`
+  `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
+  `typeWidening`
 
 Keep this list updated when new protocol features are added to kernel.
 

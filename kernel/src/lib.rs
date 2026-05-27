@@ -104,6 +104,8 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -178,10 +180,14 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, Error};
+pub use error::{DeltaResult, DeltaResultIterator, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+#[cfg(feature = "declarative-plans")]
+pub use plans::{
+    IoOperation, Plan, PlanExecutor, PlanResult, QueryPlan, QueryPlanBuilder, QueryPlanNode,
+};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -205,8 +211,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+pub type FileDataReadResultIterator = DeltaResultIterator<Box<dyn EngineData>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -956,6 +961,15 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`PlanExecutor`].
+    ///
+    /// The default implementation panics for now because the feature is still under development.
+    #[cfg(feature = "declarative-plans")]
+    #[allow(clippy::panic)]
+    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
+        unimplemented!("this engine does not provide a PlanExecutor")
+    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

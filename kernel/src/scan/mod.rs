@@ -254,6 +254,18 @@ impl ScanBuilder {
         // don't). Keep the full schema separately so predicate validation doesn't reject valid
         // references to unprojected columns.
         let table_schema = self.snapshot.schema();
+        // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
+        // a transient state, but a scan over zero columns has no way to derive row
+        // counts downstream and panics in the arrow layer. Users must populate the
+        // schema with ALTER TABLE ADD COLUMN before scanning.
+        if table_schema.num_fields() == 0 {
+            return Err(Error::generic(
+                "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
+                 to add at least one column before scanning",
+            ));
+        }
+
+        // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| table_schema.clone());
 
         self.snapshot
@@ -872,7 +884,11 @@ impl Scan {
             .table_configuration()
             .metadata()
             .partition_columns();
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+        let skipping_pred = as_checkpoint_skipping_predicate(
+            predicate,
+            partition_columns,
+            &self.state_info.physical_stats_columns,
+        )?;
 
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),

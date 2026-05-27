@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
@@ -345,11 +346,11 @@ pub fn assert_min_max_stats(
     expected_max: impl Into<serde_json::Value>,
 ) {
     assert_eq!(
-        *resolve_json_path(&stats["minValues"], physical_path),
+        *resolve_json_path(&stats[MIN_VALUES], physical_path),
         expected_min.into()
     );
     assert_eq!(
-        *resolve_json_path(&stats["maxValues"], physical_path),
+        *resolve_json_path(&stats[MAX_VALUES], physical_path),
         expected_max.into()
     );
 }

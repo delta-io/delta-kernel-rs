@@ -16,6 +16,12 @@ use crate::Version;
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
+/// A boxed, `Send` iterator of [`DeltaResult<T>`] items.
+///
+/// Convenience alias for the common pattern of returning a streaming, fallible iterator from
+/// kernel APIs.
+pub type DeltaResultIterator<T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send>;
+
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]

@@ -8,6 +8,7 @@
 mod common;
 
 mod create_table;
+mod data_skipping;
 mod features;
 mod golden_tables;
 mod hdfs;

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
@@ -220,7 +221,7 @@ async fn test_clustered_table_write_has_stats(
             assert_min_max_stats(&stats, &physical_paths[1], *min_st, *max_st);
 
             // Non-clustering column "name" should NOT have stats
-            let non_cluster_min = resolve_json_path(&stats["minValues"], &non_clustering_physical);
+            let non_cluster_min = resolve_json_path(&stats[MIN_VALUES], &non_clustering_physical);
             assert!(
                 non_cluster_min.is_null(),
                 "v{version}: non-clustering column 'name' should not have stats"
@@ -307,8 +308,8 @@ async fn test_clustered_table_write_has_stats_parsed(
     let file = std::fs::File::open(&ckpt_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
 
-    let min_path = |field: &[String]| -> Vec<String> { [&["minValues".into()], field].concat() };
-    let max_path = |field: &[String]| -> Vec<String> { [&["maxValues".into()], field].concat() };
+    let min_path = |field: &[String]| -> Vec<String> { [&[MIN_VALUES.into()], field].concat() };
+    let max_path = |field: &[String]| -> Vec<String> { [&[MAX_VALUES.into()], field].concat() };
 
     let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
     for batch in reader {
@@ -318,7 +319,7 @@ async fn test_clustered_table_write_has_stats_parsed(
         let stats_parsed: &StructArray = resolve_struct_field(add, &["stats_parsed".into()]);
 
         // Non-clustering column should not appear in stats_parsed
-        let min_values: &StructArray = resolve_struct_field(stats_parsed, &["minValues".into()]);
+        let min_values: &StructArray = resolve_struct_field(stats_parsed, &[MIN_VALUES.into()]);
         assert!(
             min_values
                 .column_by_name(&non_clustering_physical[0])
