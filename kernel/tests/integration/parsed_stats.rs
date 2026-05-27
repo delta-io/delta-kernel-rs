@@ -1,10 +1,14 @@
-//! Integration tests for `Scan::include_all_stats_columns` output across schema shapes.
+//! Integration test for `Scan::include_all_stats_columns` covering nested-struct schemas.
 //!
 //! Builds a table at runtime via kernel APIs with
 //! `delta.checkpoint.writeStatsAsStruct=true` so the checkpoint carries `stats_parsed`,
 //! then verifies the parsed-stats struct column matches the JSON `stats` string row-by-row.
-//! Parameterized over flat-primitive and nested-struct schemas to exercise both the
-//! top-level and recursive paths.
+//! Parameterized over flat-primitive and nested-struct schemas, where the nested case is
+//! the new coverage added for issue #1766 (paths like `minValues.info.age`).
+//!
+//! Complementary to the unit test `test_scan_metadata_with_stats_columns` in
+//! `kernel/src/scan/tests.rs`, which exercises a different code path: reading a
+//! pre-existing Spark-written checkpoint with `stats_parsed` already on disk.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -141,7 +145,7 @@ fn assert_stats_struct_matches_json(
 #[case::flat_schema(flat_fixture)]
 #[case::nested_struct(nested_struct_fixture)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scan_metadata_with_stats_columns(
+async fn scan_metadata_with_nested_stats_struct_columns(
     #[case] fixture: fn() -> (SchemaRef, Vec<RecordBatch>),
 ) -> Result<(), Box<dyn std::error::Error>> {
     const STATS_PARSED_COL: &str = "stats_parsed";
