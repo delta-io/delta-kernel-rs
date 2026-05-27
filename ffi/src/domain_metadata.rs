@@ -93,9 +93,9 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use serde_json::json;
     use test_utils::add_commit;
 

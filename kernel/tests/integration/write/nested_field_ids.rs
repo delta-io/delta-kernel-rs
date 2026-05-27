@@ -6,13 +6,13 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
 use delta_kernel::{EngineData, ParquetHandler};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::parquet::DefaultParquetHandler;
 use test_utils::nested_ids_json;
 use url::Url;
 
