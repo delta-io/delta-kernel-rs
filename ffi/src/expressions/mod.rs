@@ -6,7 +6,7 @@ use std::sync::Arc;
 use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
-    IndirectDataSkippingPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
 use delta_kernel::{DeltaResult, Expression, Predicate};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -244,7 +244,6 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
         // decomposition using LOGICAL column refs (e.g. `col >= "foo"`).
         // Kernel's evaluator rewrites those to `stats_parsed.maxValues.col`
         // automatically while walking the decomposition.
-        use delta_kernel::kernel_predicates::KernelPredicateEvaluator;
         evaluator.eval_pred(self.skipping_decomp.as_ref()?, inverted)
     }
 }
@@ -322,7 +321,8 @@ impl OpaqueExpressionOp for NamedOpaqueExpressionOp {
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expression],
     ) -> DeltaResult<delta_kernel::expressions::Scalar> {
-        // Spec-defined "unsupported"; kernel callers swallow with warn!().
+        // Returning Err signals "unsupported"; kernel callers log and treat the
+        // partition-pruning branch as abstaining.
         Err(delta_kernel::Error::generic(format!(
             "opaque FFI expression `{}` does not support scalar evaluation",
             self.name,
@@ -534,6 +534,53 @@ mod tests {
         assert!(
             !serialized.contains("Column(ColumnName { path: [\"col\"] })"),
             "raw `col` ref should have been rewritten, got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn decomposition_handles_inverted_flag() {
+        use delta_kernel::expressions::{column_expr, OpaquePredicateOp};
+
+        let decomp = Pred::lt(column_expr!("col"), Expr::literal("foo"));
+        let op = NamedOpaquePredicateOp::with_skipping_decomp("OP", decomp);
+        let rewriter = StatsRewriter;
+
+        let non_inverted = op
+            .as_data_skipping_predicate(
+                &rewriter as &dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>,
+                &[],
+                false,
+            )
+            .expect("non-inverted decomp should rewrite to a stats predicate");
+        let inverted = op
+            .as_data_skipping_predicate(
+                &rewriter as &dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>,
+                &[],
+                true,
+            )
+            .expect("inverted decomp should rewrite to a stats predicate");
+
+        // Inversion must produce a structurally different stats predicate
+        // (the rewriter applies different bounds for col < val vs col >= val).
+        assert_ne!(
+            format!("{non_inverted:?}"),
+            format!("{inverted:?}"),
+            "inverted flag should change the rewritten predicate"
+        );
+    }
+
+    #[test]
+    fn named_opaque_expression_op_scalar_eval_returns_err() {
+        use delta_kernel::expressions::OpaqueExpressionOp;
+
+        let op = NamedOpaqueExpressionOp::new("FANCY_UDF");
+        let eval: &delta_kernel::expressions::ScalarExpressionEvaluator<'_> = &|_| None;
+        let result = op.eval_expr_scalar(eval, &[]);
+        assert!(result.is_err(), "scalar eval should signal unsupported");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("does not support scalar evaluation"),
+            "unexpected error message: {msg}"
         );
     }
 }
