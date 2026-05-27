@@ -3,6 +3,8 @@
 mod append;
 mod cdf;
 mod clustered;
+#[cfg(feature = "column-defaults")]
+mod column_defaults;
 mod column_mapping;
 mod commit_info;
 mod domain_metadata;

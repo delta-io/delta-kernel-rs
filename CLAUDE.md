@@ -69,6 +69,9 @@ cargo +nightly fmt \
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
+- `column-defaults` -- column defaults read/write support (experimental). Gates the
+  `allowColumnDefaults` `TableFeature` variant; with the cargo feature off, any table
+  listing this feature parses as `TableFeature::Unknown` and writes are blocked.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)

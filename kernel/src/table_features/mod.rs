@@ -122,6 +122,20 @@ pub(crate) enum TableFeature {
     ClusteredTable,
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
+    /// Default values for table columns. The presence of `CURRENT_DEFAULT` in a column's
+    /// metadata instructs writers to substitute the default expression's value whenever a
+    /// row omits a value for that column or has the `DEFAULT` sentinel. See the protocol's
+    /// "Default Columns" section.
+    ///
+    /// Gated by the `column-defaults` cargo feature: when the cargo feature is off, this
+    /// variant does not exist and `allowColumnDefaults` is parsed as
+    /// `TableFeature::Unknown`, which blocks writes. The cargo gate exists so connectors
+    /// cannot use partial column-defaults support before the feature is fully implemented.
+    ///
+    /// TODO(#2630): full column-defaults support. remaining work: finish write implementation
+    /// and remove the `#[cfg(feature = "column-defaults")]` gate.
+    #[cfg(feature = "column-defaults")]
+    AllowColumnDefaults,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -476,6 +490,19 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// `allowColumnDefaults` is writer-only and requires writer version 7.
+//
+// TODO(#2630): The cargo feature gate keeps connectors off this code path until the full
+// implementation ships.
+#[cfg(feature = "column-defaults")]
+static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -660,6 +687,8 @@ impl TableFeature {
             | TableFeature::IcebergCompatV3
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
+            #[cfg(feature = "column-defaults")]
+            TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -695,6 +724,8 @@ impl TableFeature {
             TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
+            #[cfg(feature = "column-defaults")]
+            TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -848,6 +879,8 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                #[cfg(feature = "column-defaults")]
+                TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 
