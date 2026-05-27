@@ -29,10 +29,11 @@ impl ParquetHandler for PlanBasedParquetHandler {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
+        _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let query =
-            QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema, predicate).build()?;
+        // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
+        // single-node executor can then match the filter -> scan shape.
+        let query = QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema).build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()

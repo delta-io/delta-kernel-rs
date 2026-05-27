@@ -9,4 +9,4 @@ pub mod nodes;
 pub mod operation;
 pub mod plan;
 
-pub use operation::{IoOperation, Operation, QueryPlan, QueryPlanNode};
+pub use operation::{IoOperation, Operation};
