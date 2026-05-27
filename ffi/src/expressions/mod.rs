@@ -1,6 +1,7 @@
 //! This module holds functionality for moving expressions across the FFI boundary, both from
 //! engine to kernel, and from kernel to engine.
 use std::ffi::c_void;
+#[cfg(feature = "default-engine-base")]
 use std::sync::Arc;
 
 use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp, ScalarExpressionEvaluator};
@@ -248,87 +249,20 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
     }
 }
 
-// === NamedOpaqueExpressionOp ===================================================
-
-/// Engine-defined opaque expression identified by a name (e.g. `LOWER`,
-/// `UPPER`). Optionally carries an [`OpaqueEvalCallbacks`] reference so the
-/// engine can implement row-time evaluation via the `default-engine-base`
-/// Arrow batch evaluator.
-///
-/// Scalar evaluation abstains via `Err`, the spec-defined "unsupported"
-/// shape; this disqualifies the op from partition-level scalar pruning but
-/// kernel swallows the error with a `warn!`, so it doesn't propagate as a
-/// query failure.
-///
-/// [`OpaqueEvalCallbacks`]: opaque_eval::OpaqueEvalCallbacks
-#[derive(Debug, Clone)]
-pub struct NamedOpaqueExpressionOp {
-    name: String,
-    #[cfg(feature = "default-engine-base")]
-    #[allow(dead_code)] // read via callbacks_clone() under default-engine-base
-    callbacks: Option<Arc<OpaqueEvalCallbacks>>,
-}
-
-impl NamedOpaqueExpressionOp {
-    /// Build an op identified by `name`, without engine callbacks.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            #[cfg(feature = "default-engine-base")]
-            callbacks: None,
-        }
-    }
-
-    /// Build an op that consults `callbacks` during row-time expression
-    /// evaluation through the Arrow batch evaluator.
-    #[cfg(feature = "default-engine-base")]
-    pub(crate) fn with_callbacks(
-        name: impl Into<String>,
-        callbacks: Arc<OpaqueEvalCallbacks>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            callbacks: Some(callbacks),
-        }
-    }
-
-    #[cfg(feature = "default-engine-base")]
-    pub(crate) fn op_name(&self) -> &str {
-        &self.name
-    }
-
-    #[cfg(feature = "default-engine-base")]
-    pub(crate) fn callbacks_clone(&self) -> Option<Arc<OpaqueEvalCallbacks>> {
-        self.callbacks.clone()
-    }
-}
-
-impl PartialEq for NamedOpaqueExpressionOp {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-
-impl Eq for NamedOpaqueExpressionOp {}
-
-impl OpaqueExpressionOp for NamedOpaqueExpressionOp {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn eval_expr_scalar(
-        &self,
-        _eval_expr: &ScalarExpressionEvaluator<'_>,
-        _exprs: &[Expression],
-    ) -> DeltaResult<delta_kernel::expressions::Scalar> {
-        // Returning Err signals "unsupported"; kernel callers log and treat the
-        // partition-pruning branch as abstaining.
-        Err(delta_kernel::Error::generic(format!(
-            "opaque FFI expression `{}` does not support scalar evaluation",
-            self.name,
-        )))
-    }
-}
+// === Note on opaque expressions ===============================================
+//
+// This FFI deliberately exposes only opaque PREDICATES, not opaque expressions. Engine-defined
+// expression-level functions (e.g. `LOWER`, `UPPER`) can always be represented by folding them
+// into a composite opaque predicate. For `STARTS_WITH(LOWER(col), "foo")`, the engine names a
+// composite op and builds:
+//
+//     Predicate::Opaque("STARTS_WITH_LOWER", [Column("col"), Literal("foo")])
+//
+// Kernel pre-evaluates each arg natively (col -> column data, literal -> broadcast column) and
+// hands them to the engine's `eval_pred` callback, which applies LOWER then STARTS_WITH
+// internally. The combinator only fails for engine-defined expressions appearing inside
+// kernel-native predicates (e.g. `Eq(LOWER(col), "FOO")`); engines can always re-shape such
+// queries as a single opaque predicate.
 
 #[cfg(test)]
 mod tests {
@@ -361,25 +295,7 @@ mod tests {
         assert_ne!(a, c);
     }
 
-    #[test]
-    fn named_opaque_expression_op_carries_name() {
-        let op = NamedOpaqueExpressionOp::new("LOWER");
-        assert_eq!(op.name(), "LOWER");
-    }
-
-    #[test]
-    fn named_opaque_expression_op_equality_by_name_only() {
-        let a = NamedOpaqueExpressionOp::new("LOWER");
-        let b = NamedOpaqueExpressionOp::new("LOWER");
-        let c = NamedOpaqueExpressionOp::new("UPPER");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    // ============================================================================
-    // Data-skipping decomposition: verifies that the stored decomp is run through
-    // the evaluator and that column refs get rewritten to stats refs.
-    // ============================================================================
+    // === Data-skipping decomposition rewrite =================================
 
     /// Minimal `DataSkippingPredicateEvaluator` impl that rewrites column refs
     /// to a stats-shaped column path, similar to the real kernel
@@ -566,21 +482,6 @@ mod tests {
             format!("{non_inverted:?}"),
             format!("{inverted:?}"),
             "inverted flag should change the rewritten predicate"
-        );
-    }
-
-    #[test]
-    fn named_opaque_expression_op_scalar_eval_returns_err() {
-        use delta_kernel::expressions::OpaqueExpressionOp;
-
-        let op = NamedOpaqueExpressionOp::new("FANCY_UDF");
-        let eval: &delta_kernel::expressions::ScalarExpressionEvaluator<'_> = &|_| None;
-        let result = op.eval_expr_scalar(eval, &[]);
-        assert!(result.is_err(), "scalar eval should signal unsupported");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("does not support scalar evaluation"),
-            "unexpected error message: {msg}"
         );
     }
 }

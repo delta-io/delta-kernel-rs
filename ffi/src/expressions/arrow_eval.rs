@@ -1,15 +1,13 @@
-//! `ArrowOpaque*Op` impls for the FFI's `Named*` opaque ops.
+//! `ArrowOpaquePredicateOp` impl for `NamedOpaquePredicateOp`.
 //!
-//! Kernel's `evaluate_expression` / `evaluate_predicate` already recurse
-//! through compound shapes (Binary, Junction, etc.) and produce
-//! `ArrayRef`s natively. This module is the leaf: when kernel hits an
-//! opaque node, we evaluate each arg recursively, bundle the resulting
-//! `ArrayRef`s as a `RecordBatch`, export through Arrow C Data Interface,
-//! and hand them to the engine's callback. Engine only ever sees
-//! pre-computed columns -- never the AST.
+//! Kernel's `evaluate_predicate` recurses through compound shapes (Binary, Junction, etc.)
+//! natively. This module is the leaf: when kernel hits an opaque predicate, we evaluate each arg
+//! via `evaluate_expression`, bundle the resulting `ArrayRef`s as a `RecordBatch`, export through
+//! Arrow C Data Interface, and hand them to the engine's callback. Engine receives pre-computed
+//! columns, never the AST.
 //!
-//! Available only under `default-engine-base` (requires the kernel-side
-//! arrow expression evaluator).
+//! Available only under `default-engine-base` (requires the kernel-side arrow expression
+//! evaluator).
 
 use std::sync::Arc;
 
@@ -17,19 +15,16 @@ use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema}
 use delta_kernel::arrow::array::{make_array, Array, ArrayRef, BooleanArray, RecordBatch};
 use delta_kernel::arrow::datatypes::{Field, Schema};
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
-use delta_kernel::engine::arrow_expression::opaque::{
-    ArrowOpaqueExpressionOp, ArrowOpaquePredicateOp,
-};
+use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp;
 use delta_kernel::expressions::{Expression, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
 use super::opaque_eval::OpaqueEvalCallbacks;
-use super::{NamedOpaqueExpressionOp, NamedOpaquePredicateOp};
+use super::NamedOpaquePredicateOp;
 use crate::engine_data::ArrowFFIData;
 use crate::kernel_string_slice;
 
@@ -110,12 +105,6 @@ fn call_eval_pred(
     batch: &RecordBatch,
     inverted: bool,
 ) -> DeltaResult<BooleanArray> {
-    let eval_pred = cb.eval_pred.ok_or_else(|| {
-        Error::Generic(format!(
-            "opaque predicate `{op_name}` has no engine eval_pred callback registered"
-        ))
-    })?;
-
     let args_batch = evaluate_args(args, batch)?;
     let mut args_ffi = ArrowFFIData::try_from_record_batch(&args_batch)?;
     let mut result_ffi = ArrowFFIData::empty();
@@ -124,7 +113,7 @@ fn call_eval_pred(
     // args slot (engine takes ownership of the Arrow FFI handles) and a
     // writable result slot (engine writes its output handles here).
     let ok = unsafe {
-        eval_pred(
+        (cb.eval_pred)(
             cb.engine_state,
             kernel_string_slice!(op_name),
             &mut args_ffi,
@@ -140,39 +129,6 @@ fn call_eval_pred(
 
     let arr = import_ffi_array(&mut result_ffi)?;
     require_boolean_array(arr)
-}
-
-fn call_eval_expr(
-    cb: &OpaqueEvalCallbacks,
-    op_name: &str,
-    args: &[Expression],
-    batch: &RecordBatch,
-) -> DeltaResult<ArrayRef> {
-    let eval_expr = cb.eval_expr.ok_or_else(|| {
-        Error::Generic(format!(
-            "opaque expression `{op_name}` has no engine eval_expr callback registered"
-        ))
-    })?;
-
-    let args_batch = evaluate_args(args, batch)?;
-    let mut args_ffi = ArrowFFIData::try_from_record_batch(&args_batch)?;
-    let mut result_ffi = ArrowFFIData::empty();
-
-    let ok = unsafe {
-        eval_expr(
-            cb.engine_state,
-            kernel_string_slice!(op_name),
-            &mut args_ffi,
-            &mut result_ffi,
-        )
-    };
-    if !ok {
-        return Err(Error::Generic(format!(
-            "engine eval_expr reported failure for `{op_name}`"
-        )));
-    }
-
-    import_ffi_array(&mut result_ffi)
 }
 
 // === ArrowOpaquePredicateOp ====================================================
@@ -234,40 +190,6 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
     }
 }
 
-// === ArrowOpaqueExpressionOp ===================================================
-
-impl ArrowOpaqueExpressionOp for NamedOpaqueExpressionOp {
-    fn name(&self) -> &str {
-        self.op_name()
-    }
-
-    fn eval_expr(
-        &self,
-        args: &[Expression],
-        batch: &RecordBatch,
-        _result_type: Option<&DataType>,
-    ) -> DeltaResult<ArrayRef> {
-        let cb = self.callbacks_clone().ok_or_else(|| {
-            Error::Generic(format!(
-                "opaque expression `{}` has no eval context attached",
-                self.op_name()
-            ))
-        })?;
-        call_eval_expr(&cb, self.op_name(), args, batch)
-    }
-
-    fn eval_expr_scalar(
-        &self,
-        _eval_expr: &ScalarExpressionEvaluator<'_>,
-        _exprs: &[Expression],
-    ) -> DeltaResult<delta_kernel::expressions::Scalar> {
-        Err(Error::Generic(format!(
-            "opaque FFI expression `{}` does not support scalar evaluation",
-            self.op_name()
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
@@ -278,32 +200,26 @@ mod tests {
 
     use delta_kernel::arrow::array::ffi::from_ffi;
     use delta_kernel::arrow::array::{
-        ArrayRef, BooleanArray, RecordBatch, StringArray, StructArray,
+        ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-    use delta_kernel::engine::arrow_expression::opaque::{
-        ArrowOpaqueExpression as _, ArrowOpaquePredicate as _,
-    };
+    use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate as _;
     use delta_kernel::expressions::{column_expr, Expression, Predicate};
 
     use super::*;
     use crate::expressions::opaque_eval::OpaqueEvalCallbacks;
     use crate::KernelStringSlice;
 
-    // ============================================================================
-    // Engine-side test stubs: a tiny "engine" written in Rust that does row-time
-    // STARTS_WITH(args[0], args[1]) and LOWER(args[0]) by walking the
-    // pre-evaluated arg columns. No AST involved.
-    // ============================================================================
+    // === Engine-side test stubs ===================================================
+    //
+    // Tiny "engine" written in Rust that demonstrates composite opaque predicates.
+    // `STARTS_WITH_LOWER(col, prefix)` folds the LOWER step into the predicate
+    // callback, so no `Expression::Opaque` ever appears in the tree.
 
-    /// Take ownership of the FFI handles in `args_in`, leaving the slot empty,
-    /// then import as a `RecordBatch`. Mirrors how a real engine consumes
-    /// kernel-produced FFI args (move out -> from_ffi -> array import).
+    /// Take ownership of args FFI handles, leaving the slot empty so kernel's
+    /// drop is a no-op.
     unsafe fn take_ffi_record_batch(args_in: *mut ArrowFFIData) -> RecordBatch {
-        // SAFETY: kernel exported a valid ArrowFFIData via try_from_record_batch
-        // and handed us a writable slot; we replace the live handles with empties
-        // so kernel's Drop on the slot is a no-op (no double-free).
         let array = std::mem::replace(unsafe { &mut (*args_in).array }, FFI_ArrowArray::empty());
         let schema = std::mem::replace(unsafe { &mut (*args_in).schema }, FFI_ArrowSchema::empty());
         let array_data = unsafe { from_ffi(array, &schema) }.unwrap();
@@ -311,27 +227,23 @@ mod tests {
         sa.into()
     }
 
-    /// Write a result `ArrayRef` back into the engine's `result_out` slot,
-    /// exporting it through Arrow C Data Interface.
+    /// Write a result `ArrayRef` back into `result_out` as a top-level array.
     fn write_result(result_out: *mut ArrowFFIData, arr: ArrayRef) {
-        // Convert ArrayRef directly to FFI struct, NOT struct-wrapped, since our
-        // import path in arrow_eval expects a top-level array shape.
         let array_data = arr.to_data();
         let array_ffi = delta_kernel::arrow::array::ffi::FFI_ArrowArray::new(&array_data);
         let schema_ffi =
             delta_kernel::arrow::array::ffi::FFI_ArrowSchema::try_from(array_data.data_type())
                 .unwrap();
-        // SAFETY: result_out is a writable slot kernel handed to the engine.
         unsafe {
             (*result_out).array = array_ffi;
             (*result_out).schema = schema_ffi;
         }
     }
 
-    /// Engine eval_pred stub: implements `STARTS_WITH(args[0], args[1])`.
-    /// Both args arrive as pre-evaluated String columns. Engine produces a
-    /// `BooleanArray` of n_rows.
-    unsafe extern "C" fn engine_starts_with(
+    /// Composite opaque predicate: `STARTS_WITH(LOWER(args[0]), args[1])`. Both
+    /// args arrive as pre-evaluated String columns; the engine applies LOWER
+    /// then prefix-match per row.
+    unsafe extern "C" fn engine_starts_with_lower(
         _state: *mut c_void,
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
@@ -340,16 +252,50 @@ mod tests {
     ) -> bool {
         let batch = unsafe { take_ffi_record_batch(args_in) };
         assert_eq!(batch.num_columns(), 2);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("arg0 should be StringArray");
+        let prefix = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("arg1 should be StringArray");
+        let out: BooleanArray = (0..batch.num_rows())
+            .map(|i| match (col.is_valid(i), prefix.is_valid(i)) {
+                (true, true) => {
+                    let m = col.value(i).to_lowercase().starts_with(prefix.value(i));
+                    Some(if inverted { !m } else { m })
+                }
+                _ => None,
+            })
+            .collect();
+        write_result(result_out, Arc::new(out));
+        true
+    }
+
+    /// Simpler opaque predicate: `STARTS_WITH(args[0], args[1])` with no LOWER.
+    /// Used by the composition test where we need two ops sharing the same op
+    /// name function.
+    unsafe extern "C" fn engine_starts_with(
+        _state: *mut c_void,
+        _op_name: KernelStringSlice,
+        args_in: *mut ArrowFFIData,
+        inverted: bool,
+        result_out: *mut ArrowFFIData,
+    ) -> bool {
+        let batch = unsafe { take_ffi_record_batch(args_in) };
         let lhs = batch
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("arg0 should be StringArray after kernel pre-eval");
+            .expect("arg0 should be StringArray");
         let rhs = batch
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("arg1 should be StringArray after kernel pre-eval");
+            .expect("arg1 should be StringArray");
         let out: BooleanArray = (0..batch.num_rows())
             .map(|i| match (lhs.is_valid(i), rhs.is_valid(i)) {
                 (true, true) => {
@@ -363,34 +309,20 @@ mod tests {
         true
     }
 
-    /// Engine eval_expr stub: implements `LOWER(args[0])` on String inputs.
-    unsafe extern "C" fn engine_lower(
-        _state: *mut c_void,
-        _op_name: KernelStringSlice,
-        args_in: *mut ArrowFFIData,
-        result_out: *mut ArrowFFIData,
-    ) -> bool {
-        let batch = unsafe { take_ffi_record_batch(args_in) };
-        assert_eq!(batch.num_columns(), 1);
-        let col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("LOWER arg0 should be StringArray");
-        let out: StringArray = (0..col.len())
-            .map(|i| col.is_valid(i).then(|| col.value(i).to_lowercase()))
-            .collect();
-        write_result(result_out, Arc::new(out));
-        true
-    }
-
     unsafe extern "C" fn noop_free(_state: *mut c_void) {}
 
-    fn lower_starts_with_callbacks() -> Arc<OpaqueEvalCallbacks> {
+    fn callbacks_for(
+        eval_pred: unsafe extern "C" fn(
+            *mut c_void,
+            KernelStringSlice,
+            *mut ArrowFFIData,
+            bool,
+            *mut ArrowFFIData,
+        ) -> bool,
+    ) -> Arc<OpaqueEvalCallbacks> {
         Arc::new(OpaqueEvalCallbacks {
             engine_state: ptr::null_mut(),
-            eval_pred: Some(engine_starts_with),
-            eval_expr: Some(engine_lower),
+            eval_pred,
             free_state: noop_free,
         })
     }
@@ -405,24 +337,16 @@ mod tests {
         RecordBatch::try_new(schema, vec![arr]).unwrap()
     }
 
-    // ============================================================================
-    // End-to-end: kernel pre-evaluates LOWER(col), hands engine the lowercased
-    // column + the literal, engine does STARTS_WITH.
-    // ============================================================================
+    // === End-to-end: STARTS_WITH(LOWER(col), "foo") as one composite op =========
 
     #[test]
-    fn end_to_end_starts_with_lower_col_foo() {
-        let cb = lower_starts_with_callbacks();
-        let lower_op = NamedOpaqueExpressionOp::with_callbacks("LOWER", cb.clone());
-        let starts_with_op = NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", cb);
-
-        // STARTS_WITH(LOWER(col), "foo")
+    fn composite_starts_with_lower_predicate_round_trips() {
         let pred = Predicate::arrow_opaque(
-            starts_with_op,
-            [
-                Expression::arrow_opaque(lower_op, [column_expr!("col")]),
-                Expression::literal("foo"),
-            ],
+            NamedOpaquePredicateOp::with_callbacks(
+                "STARTS_WITH_LOWER",
+                callbacks_for(engine_starts_with_lower),
+            ),
+            [column_expr!("col"), Expression::literal("foo")],
         );
 
         let batch = batch_with_col(vec![Some("FOOBAR"), Some("Apple"), None, Some("foozzz")]);
@@ -436,33 +360,25 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_inversion_flips_verdicts() {
-        let cb = lower_starts_with_callbacks();
-        let lower_op = NamedOpaqueExpressionOp::with_callbacks("LOWER", cb.clone());
-        let starts_with_op = NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", cb);
-
+    fn inversion_flips_verdicts() {
         let pred = Predicate::arrow_opaque(
-            starts_with_op,
-            [
-                Expression::arrow_opaque(lower_op, [column_expr!("col")]),
-                Expression::literal("foo"),
-            ],
+            NamedOpaquePredicateOp::with_callbacks(
+                "STARTS_WITH_LOWER",
+                callbacks_for(engine_starts_with_lower),
+            ),
+            [column_expr!("col"), Expression::literal("foo")],
         );
-
         let batch = batch_with_col(vec![Some("FOOBAR"), Some("Apple")]);
         let result = evaluate_predicate(&pred, &batch, true).unwrap();
-        assert!(!result.value(0), "inverted: FOOBAR now does not match");
+        assert!(!result.value(0), "inverted: FOOBAR no longer matches");
         assert!(result.value(1), "inverted: Apple now matches");
     }
 
-    // ============================================================================
-    // Composability: kernel handles AND of two opaque predicates natively. Engine
-    // gets two independent callbacks, kernel combines via standard Arrow boolean AND.
-    // ============================================================================
+    // === Composition: AND of two opaque predicates ==============================
 
     #[test]
     fn composition_and_of_two_opaque_predicates() {
-        let cb = lower_starts_with_callbacks();
+        let cb = callbacks_for(engine_starts_with);
         let lhs = Predicate::arrow_opaque(
             NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", cb.clone()),
             [column_expr!("col"), Expression::literal("F")],
@@ -480,30 +396,7 @@ mod tests {
         assert!(!result.value(2), "BAR starts with neither");
     }
 
-    // ============================================================================
-    // Negative paths: missing callback errors cleanly.
-    // ============================================================================
-
-    #[test]
-    fn missing_eval_pred_callback_errors() {
-        // Callbacks struct provides eval_expr but not eval_pred.
-        let cb = Arc::new(OpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
-            eval_pred: None,
-            eval_expr: Some(engine_lower),
-            free_state: noop_free,
-        });
-        let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("MISSING_PRED", cb),
-            [column_expr!("col")],
-        );
-        let batch = batch_with_col(vec![Some("x")]);
-        let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
-        assert!(
-            format!("{err}").contains("has no engine eval_pred callback"),
-            "expected eval_pred missing error, got: {err}"
-        );
-    }
+    // === Negative paths ==========================================================
 
     #[test]
     fn engine_returning_false_surfaces_error() {
@@ -516,14 +409,8 @@ mod tests {
         ) -> bool {
             false
         }
-        let cb = Arc::new(OpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
-            eval_pred: Some(engine_fail),
-            eval_expr: None,
-            free_state: noop_free,
-        });
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("ALWAYS_FAIL", cb),
+            NamedOpaquePredicateOp::with_callbacks("ALWAYS_FAIL", callbacks_for(engine_fail)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
@@ -531,99 +418,59 @@ mod tests {
         assert!(format!("{err}").contains("engine eval_pred reported failure"));
     }
 
-    // ============================================================================
-    // Symmetric error paths for the expression flavor + result-shape checks.
-    // ============================================================================
-
-    #[test]
-    fn missing_eval_expr_callback_errors() {
-        use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
-
-        let cb = Arc::new(OpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
-            eval_pred: Some(engine_starts_with),
-            eval_expr: None,
-            free_state: noop_free,
-        });
-        let expr = Expression::arrow_opaque(
-            NamedOpaqueExpressionOp::with_callbacks("MISSING_EXPR", cb),
-            [column_expr!("col")],
-        );
-        let batch = batch_with_col(vec![Some("x")]);
-        let err = evaluate_expression(&expr, &batch, None).unwrap_err();
-        assert!(
-            format!("{err}").contains("has no engine eval_expr callback"),
-            "expected eval_expr missing error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn engine_eval_expr_returning_false_surfaces_error() {
-        use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
-
-        unsafe extern "C" fn engine_fail(
-            _state: *mut c_void,
-            _op_name: KernelStringSlice,
-            _args_in: *mut ArrowFFIData,
-            _result_out: *mut ArrowFFIData,
-        ) -> bool {
-            false
-        }
-        let cb = Arc::new(OpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
-            eval_pred: None,
-            eval_expr: Some(engine_fail),
-            free_state: noop_free,
-        });
-        let expr = Expression::arrow_opaque(
-            NamedOpaqueExpressionOp::with_callbacks("ALWAYS_FAIL_EXPR", cb),
-            [column_expr!("col")],
-        );
-        let batch = batch_with_col(vec![Some("x")]);
-        let err = evaluate_expression(&expr, &batch, None).unwrap_err();
-        assert!(format!("{err}").contains("engine eval_expr reported failure"));
-    }
-
     #[test]
     fn engine_returning_non_boolean_array_errors() {
-        use delta_kernel::arrow::array::Int32Array;
-
         unsafe extern "C" fn engine_int(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            _args_in: *mut ArrowFFIData,
+            args_in: *mut ArrowFFIData,
             _inverted: bool,
             result_out: *mut ArrowFFIData,
         ) -> bool {
-            // Pretend to evaluate but return an Int32Array, violating the
-            // BooleanArray contract for predicate results.
-            let out: Int32Array = (0..1).map(Some).collect();
-            write_result(result_out, Arc::new(out));
+            let _ = unsafe { take_ffi_record_batch(args_in) };
+            let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+            write_result(result_out, arr);
             true
         }
-        let cb = Arc::new(OpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
-            eval_pred: Some(engine_int),
-            eval_expr: None,
-            free_state: noop_free,
-        });
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("WRONG_SHAPE", cb),
+            NamedOpaquePredicateOp::with_callbacks("RETURNS_INT", callbacks_for(engine_int)),
+            [column_expr!("col")],
+        );
+        let batch = batch_with_col(vec![Some("x"), Some("y"), Some("z")]);
+        let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
+        assert!(format!("{err}").contains("non-boolean array"), "got: {err}");
+    }
+
+    #[test]
+    fn engine_returning_success_without_result_errors() {
+        unsafe extern "C" fn engine_empty(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _inverted: bool,
+            _result_out: *mut ArrowFFIData,
+        ) -> bool {
+            // Consume args but never populate result_out.
+            let _ = unsafe { take_ffi_record_batch(args_in) };
+            true
+        }
+        let pred = Predicate::arrow_opaque(
+            NamedOpaquePredicateOp::with_callbacks("EMPTY", callbacks_for(engine_empty)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
         assert!(
-            format!("{err}").contains("non-boolean array"),
-            "expected non-boolean array error, got: {err}"
+            format!("{err}").contains("wrote no result array"),
+            "got: {err}"
         );
     }
 
+    // === Zero-arg opaque predicate ===============================================
+
     #[test]
     fn zero_arg_opaque_predicate_propagates_row_count() {
-        // Zero-arg ops (e.g. NOW(), RAND()): engine sees an empty-schema
-        // batch but must still emit `num_rows` results.
-        unsafe extern "C" fn engine_zero_arg(
+        unsafe extern "C" fn engine_always_true(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
@@ -631,25 +478,19 @@ mod tests {
             result_out: *mut ArrowFFIData,
         ) -> bool {
             let batch = unsafe { take_ffi_record_batch(args_in) };
-            assert_eq!(batch.num_columns(), 0, "expected zero-column batch");
+            assert_eq!(batch.num_columns(), 0, "zero-arg => no columns");
             let n = batch.num_rows();
-            let out: BooleanArray = (0..n).map(|_| Some(true)).collect();
-            write_result(result_out, Arc::new(out));
+            let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));
+            write_result(result_out, arr);
             true
         }
-        let cb = Arc::new(OpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
-            eval_pred: Some(engine_zero_arg),
-            eval_expr: None,
-            free_state: noop_free,
-        });
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("CONST_TRUE", cb),
+            NamedOpaquePredicateOp::with_callbacks("ZERO_ARG", callbacks_for(engine_always_true)),
             [] as [Expression; 0],
         );
-        let batch = batch_with_col(vec![Some("a"), Some("b"), Some("c")]);
+        let batch = batch_with_col(vec![Some("a"); 5]);
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
-        assert_eq!(result.len(), 3);
-        assert!(result.value(0) && result.value(1) && result.value(2));
+        assert_eq!(result.len(), 5);
+        assert!((0..5).all(|i| result.value(i)));
     }
 }
