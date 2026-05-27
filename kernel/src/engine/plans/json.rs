@@ -7,8 +7,8 @@ use url::Url;
 use crate::plans::{Plan, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, FileDataReadResultIterator, FileMeta, FilteredEngineData, JsonHandler,
-    PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilteredEngineData,
+    JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -30,7 +30,9 @@ impl JsonHandler for PlanBasedJsonHandler {
         _json_strings: Box<dyn EngineData>,
         _output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        todo!("PlanBasedJsonHandler does not support parse_json yet");
+        Err(Error::unsupported(
+            "PlanBasedJsonHandler does not support parse_json yet",
+        ))
     }
 
     fn read_json_files(
@@ -52,7 +54,9 @@ impl JsonHandler for PlanBasedJsonHandler {
         _data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         _overwrite: bool,
     ) -> DeltaResult<()> {
-        todo!("PlanBasedJsonHandler does not support write_json_file yet");
+        Err(Error::unsupported(
+            "PlanBasedJsonHandler does not support write_json_file yet",
+        ))
     }
 }
 

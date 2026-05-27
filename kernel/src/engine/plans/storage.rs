@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use itertools::Itertools;
+use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Plan, PlanExecutor, PlanResult};
@@ -29,20 +29,18 @@ impl StorageHandler for PlanBasedStorageHandler {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let iter = self
+        Ok(self
             .execute_io(IoOperation::file_listing(path.clone()))?
-            .into_file_meta()?;
-        Ok(iter)
+            .into_file_meta()?)
     }
 
     fn read_files(
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let iter = self
+        Ok(self
             .execute_io(IoOperation::read_bytes(files))?
-            .into_bytes()?;
-        Ok(iter)
+            .into_bytes()?)
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
