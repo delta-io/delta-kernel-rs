@@ -19,8 +19,7 @@ use crate::checkpoint::tests::{
 use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
-use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use crate::engine::default::DefaultEngineBuilder;
+use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
@@ -92,14 +91,9 @@ fn generate_checkpoint_parts(
     })
 }
 
-/// Helper to build a DefaultEngine with multi-thread executor.
+/// Helper to build a SyncEngine backed by an in-memory store.
 fn new_multi_thread_engine(store: Arc<InMemory>) -> impl Engine {
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    DefaultEngineBuilder::new(store)
-        .with_task_executor(executor)
-        .build()
+    SyncEngine::new_with_store(store)
 }
 
 struct ExpectedNonFileContent<'a> {

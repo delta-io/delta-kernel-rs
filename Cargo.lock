@@ -9,6 +9,7 @@ dependencies = [
  "datatest-stable",
  "delta_kernel",
  "delta_kernel_benchmarks",
+ "delta_kernel_default_engine",
  "flate2",
  "futures",
  "itertools 0.14.0",
@@ -884,6 +885,7 @@ dependencies = [
  "clap",
  "common",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "env_logger",
  "futures",
  "tokio",
@@ -1033,7 +1035,7 @@ version = "0.24.0"
 dependencies = [
  "clap",
  "delta_kernel",
- "tracing",
+ "delta_kernel_default_engine",
  "url",
 ]
 
@@ -1249,6 +1251,7 @@ name = "delta-kernel-unity-catalog"
 version = "0.24.0"
 dependencies = [
  "delta_kernel",
+ "delta_kernel_default_engine",
  "itertools 0.14.0",
  "serde",
  "serde_json",
@@ -1314,6 +1317,7 @@ dependencies = [
  "criterion",
  "delta-kernel-unity-catalog",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "flate2",
  "itertools 0.14.0",
  "object_store 0.12.5",
@@ -1329,6 +1333,28 @@ dependencies = [
  "unity-catalog-delta-rest-client",
  "ureq",
  "url",
+]
+
+[[package]]
+name = "delta_kernel_default_engine"
+version = "0.24.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "delta_kernel",
+ "futures",
+ "hdfs-native-object-store",
+ "itertools 0.14.0",
+ "reqwest 0.13.2",
+ "rstest",
+ "serde_json",
+ "tempfile",
+ "test_utils",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1348,6 +1374,7 @@ dependencies = [
  "cbindgen",
  "delta-kernel-unity-catalog",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "delta_kernel_ffi_macros",
  "itertools 0.14.0",
  "libc",
@@ -1523,6 +1550,7 @@ name = "feature_tests"
 version = "0.24.0"
 dependencies = [
  "delta_kernel",
+ "delta_kernel_default_engine",
  "reqwest 0.13.2",
  "rustls",
 ]
@@ -2210,6 +2238,7 @@ dependencies = [
  "clap",
  "common",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "env_logger",
  "tracing",
  "tracing-subscriber",
@@ -2534,6 +2563,7 @@ name = "mem-test"
 version = "0.24.0"
 dependencies = [
  "delta_kernel",
+ "delta_kernel_default_engine",
  "dhat",
  "rayon",
  "serde_json",
@@ -3283,6 +3313,7 @@ dependencies = [
  "clap",
  "common",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "itertools 0.14.0",
 ]
 
@@ -3293,6 +3324,7 @@ dependencies = [
  "clap",
  "common",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "env_logger",
  "spmc",
  "url",
@@ -3305,6 +3337,7 @@ dependencies = [
  "clap",
  "common",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "env_logger",
  "itertools 0.14.0",
 ]
@@ -4110,6 +4143,7 @@ name = "test_utils"
 version = "0.24.0"
 dependencies = [
  "delta_kernel",
+ "delta_kernel_default_engine",
  "itertools 0.14.0",
  "rstest",
  "rstest_reuse",
@@ -5299,6 +5333,7 @@ dependencies = [
  "clap",
  "common",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "env_logger",
  "itertools 0.14.0",
  "serde_json",

@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr as _;
 use std::time::Duration;
 
+use delta_kernel_derive::internal_api;
 use tracing::field::{Field, Visit};
 use tracing::span::Attributes;
 use tracing::warn;
@@ -851,6 +852,7 @@ impl Visit for ScanMetadataCompletedAttrs {
 // a `name=` field carrying one of `<event>::NAME`. The shared [`storage_metric_from_attrs`]
 // helper inspects the `name` value and constructs the matching variant.
 
+#[internal_api]
 pub(crate) const STORAGE_SPAN: &str = "storage";
 
 /// Build the appropriate storage `MetricEvent` from the span attributes. Returns `None` if the
