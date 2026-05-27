@@ -146,8 +146,8 @@ impl ScanBuilder {
     ///
     /// [`Schema`]: crate::schema::Schema
     /// [`Snapshot`]: crate::snapshot::Snapshot
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
+    pub fn with_schema(mut self, logical_read_schema: SchemaRef) -> Self {
+        self.schema = Some(logical_read_schema);
         self
     }
 
@@ -166,10 +166,7 @@ impl ScanBuilder {
     /// 4` to return a subset of the rows in the scan which satisfy the filter. If `predicate_opt`
     /// is `None`, this is a no-op.
     ///
-    /// The predicate may reference any column in the table's schema, including columns that
-    /// [`with_schema`] narrows out of the output projection.
-    ///
-    /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
+    /// NOTE: The filtering is best-effort and can produce false positives (rows that should
     /// have been filtered out but were kept).
     ///
     /// NOTE: Predicates referencing metadata columns the caller added to the projection via
@@ -249,10 +246,8 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
-        // The output schema can be narrowed by `with_schema`, but predicates may still reference
-        // any column in the full table schema (SQL semantics: projection narrows output, predicates
-        // don't). Keep the full schema separately so predicate validation doesn't reject valid
-        // references to unprojected columns.
+        // Predicates may reference columns outside with_schema, so resolve against the full table
+        // schema
         let table_schema = self.snapshot.schema();
         // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
         // a transient state, but a scan over zero columns has no way to derive row
@@ -266,15 +261,15 @@ impl ScanBuilder {
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self.schema.unwrap_or_else(|| table_schema.clone());
+        let logical_read_schema = self.schema.unwrap_or_else(|| table_schema.clone());
 
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
         let state_info = StateInfo::try_new(
-            logical_schema,
-            &table_schema,
+            logical_read_schema,
+            table_schema,
             self.snapshot.table_configuration(),
             self.predicate,
             self.stats_output_mode.clone(),

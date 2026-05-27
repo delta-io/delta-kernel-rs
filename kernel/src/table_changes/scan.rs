@@ -111,7 +111,7 @@ impl TableChangesScanBuilder {
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
         // so valid references to unprojected columns aren't rejected.
-        let predicate_schema = self.table_changes.schema();
+        let predicate_schema = self.table_changes.schema().clone().into();
         // If no projection is supplied, default to the full CDF-extended schema (SELECT *).
         let logical_schema = self
             .schema

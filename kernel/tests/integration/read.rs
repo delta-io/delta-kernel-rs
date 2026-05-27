@@ -797,6 +797,27 @@ fn predicate_on_letter_and_number(
     .map(String::from)
     .collect()
 )]
+#[case::mixed_projected_and_unprojected(
+    // Combines the projected data column `a_float` with the unprojected data column
+    // `number`. Both refs must resolve: `a_float` via the projected output schema and
+    // `number` via the full table schema. Matching rows are (4.4, 4, letter=a) and
+    // (5.5, 5, letter=b); files for letter=c are pruned by the `number < 6` bound.
+    Pred::and(
+        column_expr!("a_float").gt(Expr::literal(4.0)),
+        column_expr!("number").lt(Expr::literal(6i64)),
+    ),
+    vec![
+        "+---------+",
+        "| a_float |",
+        "+---------+",
+        "| 4.4     |",
+        "| 5.5     |",
+        "+---------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
 fn predicate_on_unprojected_column(
     #[case] pred: Pred,
     #[case] expected: Vec<String>,
@@ -1011,11 +1032,6 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
 /// column "category" has physical name "phys_category". With column mapping, `partitionValues`
 /// in the log uses physical column names, and the partition schema + predicate must also use
 /// physical names for `MapToStruct` extraction and data skipping to work correctly.
-///
-/// The `predicate_on_unprojected_*` cases also exercise issue #2468: when `with_schema`
-/// narrows the projection but the predicate references a column outside that projection
-/// (and column mapping is on), kernel must still resolve the column's physical name from
-/// the full table schema for stats- and partition-based skipping to work.
 #[rstest::rstest]
 #[case::partition_only(
     // Partition-only predicate: category = 'A' prunes the category=B file
@@ -1099,7 +1115,7 @@ async fn partition_pruning_with_column_mapping(
 
     // Predicates use logical column names -- kernel must map to physical names. The
     // optional projection narrows the output schema; when set, the predicate may still
-    // reference columns outside it (issue #2468 contract).
+    // reference columns outside it
     let projection = select_cols
         .as_ref()
         .map(|cols| snapshot.schema().project(cols))

@@ -11,7 +11,7 @@ use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PhysicalPredicate, StatsOutputMode};
-use crate::schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructType};
+use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use crate::{DeltaResult, Error, PredicateRef, StructField};
@@ -222,20 +222,18 @@ impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
-    /// `logical_schema` - The logical schema of the scan output, which includes partition columns
-    /// `predicate_schema` - The schema predicate column references are resolved against. Should
-    /// contain every column the predicate may legitimately reference (typically the full table
-    /// schema, or full CDF-extended schema for CDF scans). The caller is responsible for this
-    /// invariant; it is not validated. Caller-applied augmentations of `logical_schema` (e.g.,
-    /// metadata columns added via `StructType::add_metadata_column`) are NOT carried into
-    /// `predicate_schema`, so predicates referencing those columns are rejected at build time.
-    /// `table_configuration` - The TableConfiguration for this table
+    /// `logical_read_schema` - The logical schema of the scan output, which includes partition
+    /// columns `table_schema` - The schema predicate column references are resolved against.
+    /// Should contain every column the predicate may legitimately reference (typically the full
+    /// table schema, or full CDF-extended schema for CDF scans). Currently, we do not carry
+    /// over any metadata columns from the `logical_read_schema` to the `table_schema` (issue
+    /// 2633). `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
     /// `stats_output_mode` - Controls how file statistics are handled during the scan
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
-        logical_schema: SchemaRef,
-        predicate_schema: &Schema,
+        logical_read_schema: SchemaRef,
+        table_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
         stats_output_mode: StatsOutputMode,
@@ -243,14 +241,14 @@ impl StateInfo {
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
-        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut transform_spec = Vec::with_capacity(logical_schema.num_fields());
+        let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
+        let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
 
-        let metadata_info = validate_metadata_columns(&logical_schema, table_configuration)?;
+        let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
 
         // Loop over all selected fields and build both the physical schema and transform spec
-        for (index, logical_field) in logical_schema.fields().enumerate() {
+        for (index, logical_field) in logical_read_schema.fields().enumerate() {
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
             {
@@ -276,7 +274,7 @@ impl StateInfo {
                                 // ensure we have a column name that isn't already in our schema
                                 let index_column_name = (0..)
                                     .map(|i| format!("row_indexes_for_row_id_{i}"))
-                                    .find(|name| logical_schema.field(name).is_none())
+                                    .find(|name| logical_read_schema.field(name).is_none())
                                     .ok_or(Error::generic(
                                         "Couldn't generate row index column name",
                                     ))?;
@@ -341,7 +339,7 @@ impl StateInfo {
             .unwrap_or_default();
 
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, predicate_schema, column_mapping_mode)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &table_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
@@ -356,7 +354,7 @@ impl StateInfo {
             let dropped: Vec<&ColumnName> = predicate_column_names
                 .iter()
                 .filter(|c| {
-                    get_any_level_column_physical_name(&logical_schema, c, column_mapping_mode)
+                    get_any_level_column_physical_name(&table_schema, c, column_mapping_mode)
                         .ok()
                         .is_some_and(|physical| !physical_stats_columns.contains(&physical))
                 })
@@ -412,7 +410,7 @@ impl StateInfo {
             };
 
         Ok(StateInfo {
-            logical_schema,
+            logical_schema: logical_read_schema,
             physical_schema,
             physical_predicate,
             transform_spec,
@@ -536,7 +534,7 @@ pub(crate) mod tests {
 
         StateInfo::try_new(
             schema.clone(),
-            &schema,
+            table_configuration.logical_schema(),
             &table_configuration,
             predicate,
             stats_output_mode,

@@ -20,7 +20,7 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
-use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType};
 use crate::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
     ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
@@ -336,6 +336,44 @@ fn test_physical_predicate_case_insensitive_unknown_column() {
         ColumnMappingMode::None,
     );
     assert!(result.is_err());
+}
+
+/// `ScanBuilder` decouples the projection (`with_schema`) from the schema predicate
+/// references resolve against (the snapshot's table schema). A caller-added metadata
+/// column lives only in the projection: it is not mirrored into the table schema. A
+/// predicate referencing such a column therefore has no resolution target and must be
+/// rejected at build time. This pins that contract on the public API surface so future
+/// refactors to the wiring inside `ScanBuilder::build` cannot silently regress it.
+#[test]
+fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    // Augment the projection with a `RowIndex` metadata column. The snapshot's
+    // `schema()` -- which `ScanBuilder::build` passes as the predicate-resolution
+    // schema -- is untouched, so `my_row_index` exists only in the projection.
+    let projection = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)
+            .unwrap(),
+    );
+    let predicate = Arc::new(column_expr!("my_row_index").gt(Expr::literal(5_i64)));
+
+    let err = snapshot
+        .scan_builder()
+        .with_schema(projection)
+        .with_predicate(predicate)
+        .build()
+        .expect_err("build should reject predicate referencing a projection-only metadata column");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Predicate references unknown column") && msg.contains("my_row_index"),
+        "unexpected error: {msg}"
+    );
 }
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
