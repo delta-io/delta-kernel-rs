@@ -1151,14 +1151,29 @@ mod tests {
         id as *const c_void
     }
 
-    fn make_iter(ids: Vec<usize>) -> (Box<IterState>, EngineIterator) {
-        let mut boxed = Box::new(IterState { ids, idx: 0 });
-        let data_ptr: *mut IterState = &mut *boxed;
+    /// RAII wrapper that owns the heap-allocated `IterState` referenced by an
+    /// `EngineIterator::data` pointer. Using `Box::into_raw` here (rather than
+    /// returning the `Box<IterState>` directly) avoids a stacked-borrows
+    /// violation: returning `(boxed, it)` would move `boxed`, which retags its
+    /// contents and invalidates the `*mut IterState` we stored inside `it`.
+    /// `Box::into_raw` decouples ownership from the borrow tag so the pointer
+    /// stays valid for the lifetime of the iterator.
+    struct IterStateBox(*mut IterState);
+
+    impl Drop for IterStateBox {
+        fn drop(&mut self) {
+            // SAFETY: produced by Box::into_raw in make_iter; reclaimed exactly once on drop.
+            drop(unsafe { Box::from_raw(self.0) });
+        }
+    }
+
+    fn make_iter(ids: Vec<usize>) -> (IterStateBox, EngineIterator) {
+        let raw = Box::into_raw(Box::new(IterState { ids, idx: 0 }));
         let it = EngineIterator {
-            data: NonNull::new(data_ptr as *mut c_void).unwrap(),
+            data: NonNull::new(raw as *mut c_void).unwrap(),
             get_next: iter_next_direct,
         };
-        (boxed, it)
+        (IterStateBox(raw), it)
     }
 
     fn make_two_literal_ids(state: &mut KernelExpressionVisitorState) -> (usize, usize) {
