@@ -254,9 +254,7 @@ mod tests {
         ));
 
         let batches = vec![Ok(batch1), Ok(batch2), Ok(batch3)];
-        let data_iter: Box<
-            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
-        > = Box::new(batches.into_iter());
+        let data_iter: DeltaResultIterator<Box<dyn EngineData>> = Box::new(batches.into_iter());
 
         handler.write_parquet_file(url.clone(), data_iter).unwrap();
         assert!(file_path.exists());

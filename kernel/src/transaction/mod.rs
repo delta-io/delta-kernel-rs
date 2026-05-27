@@ -38,7 +38,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
-    ScopedDeltaResultIterator, Version,
+    Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -70,7 +70,8 @@ use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> = ScopedDeltaResultIterator<'a, Box<dyn EngineData>>;
+pub(crate) type EngineDataResultIterator<'a> =
+    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -1626,7 +1627,7 @@ mod tests {
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
     };
-    use crate::{EvaluationHandler, Snapshot};
+    use crate::{EvaluationHandler, ScopedDeltaResultIterator, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
