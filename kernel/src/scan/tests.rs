@@ -20,10 +20,10 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
-use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{self, ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{
-    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
-    ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
+    DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
+    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
 };
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
@@ -1428,21 +1428,21 @@ impl ParquetHandler for EmptyParquetHandler {
     fn read_parquet_files(
         &self,
         _files: &[FileMeta],
-        _schema: crate::schema::SchemaRef,
+        _schema: schema::SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> crate::DeltaResult<FileDataReadResultIterator> {
+    ) -> DeltaResult<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> crate::DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
         unimplemented!()
     }
 
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: Box<dyn Iterator<Item = crate::DeltaResult<Box<dyn EngineData>>> + Send>,
-    ) -> crate::DeltaResult<()> {
+        _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
         unimplemented!()
     }
 }

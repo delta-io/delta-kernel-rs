@@ -20,11 +20,11 @@ pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 ///
 /// Convenience alias for the common pattern of returning a streaming, fallible iterator from
 /// kernel APIs.
-pub type DeltaResultIterator<T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send>;
+pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send + 'a>;
 
-/// Lifetime-bounded counterpart to [`DeltaResultIterator`] for cases where the iterator may
+/// `'static` counterpart to [`DeltaResultIterator`] for cases where the iterator does not
 /// reference borrowed data.
-pub type ScopedDeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send + 'a>;
+pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
 
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]

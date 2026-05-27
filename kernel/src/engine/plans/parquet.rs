@@ -7,8 +7,8 @@ use url::Url;
 use crate::plans::{Plan, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
+    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -41,7 +41,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
     fn write_parquet_file(
         &self,
         _location: Url,
-        _data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         Err(Error::unsupported(
             "PlanBasedParquetHandler does not support write_parquet_file yet",

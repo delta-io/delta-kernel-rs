@@ -22,8 +22,8 @@ use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatc
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
+    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 pub(crate) struct SyncParquetHandler {
@@ -99,7 +99,7 @@ impl ParquetHandler for SyncParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        mut data: DeltaResultIterator<Box<dyn EngineData>>,
+        mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         let first_batch = data.next().ok_or_else(|| {
             crate::Error::generic("Cannot write parquet file with empty data iterator")
@@ -148,7 +148,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::EngineData;
 
-    fn test_data_iter() -> DeltaResultIterator<Box<dyn EngineData>> {
+    fn test_data_iter() -> DeltaResultIteratorStatic<Box<dyn EngineData>> {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
                 (
@@ -254,7 +254,8 @@ mod tests {
         ));
 
         let batches = vec![Ok(batch1), Ok(batch2), Ok(batch3)];
-        let data_iter: DeltaResultIterator<Box<dyn EngineData>> = Box::new(batches.into_iter());
+        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
+            Box::new(batches.into_iter());
 
         handler.write_parquet_file(url.clone(), data_iter).unwrap();
         assert!(file_path.exists());
