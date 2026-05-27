@@ -2,13 +2,14 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    MapToStructExpression, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate,
-    Scalar, Transform, UnaryExpression, UnaryPredicate, VariadicExpression,
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, IfExpression,
+    JunctionPredicate, MapToStructExpression, OpaqueExpression, OpaquePredicate,
+    ParseJsonExpression, Predicate, Scalar, Transform, UnaryExpression, UnaryPredicate,
+    VariadicExpression,
 };
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
-    Carrier,
+    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, map_owned_trio_or_else,
+    transform_output_type, Carrier,
 };
 use crate::{DeltaResult, Error};
 
@@ -37,6 +38,10 @@ use crate::{DeltaResult, Error};
 ///
 /// * Binary (two children) - If either child was filtered out, filter out the parent. If at least
 ///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
+///
+/// * Ternary (three children) - If any child was filtered out, filter out the parent. If at least
+///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
+///   Children may have heterogeneous types (e.g. `If(Predicate, Expression, Expression)`).
 ///
 /// * Variadic (0+ children) - If no children remain (all filtered out), filter out the parent.
 ///   Otherwise, if at least one child changed or was filtered out, build a new parent around the
@@ -186,6 +191,12 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_variadic(expr)
     }
 
+    /// Called for each conditional `If` expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_if`].
+    fn transform_expr_if(&mut self, expr: &'a IfExpression) -> Self::Output<IfExpression> {
+        self.recurse_into_expr_if(expr)
+    }
+
     /// Called for each junction predicate encountered during the traversal. The provided
     /// implementation just forwards to [`Self::recurse_into_pred_junction`].
     fn transform_pred_junction(
@@ -245,6 +256,10 @@ pub trait ExpressionTransform<'a> {
             Expression::Variadic(v) => {
                 let child = self.transform_expr_variadic(v);
                 map_owned_or_else(expr, child, Expression::Variadic)
+            }
+            Expression::If(i) => {
+                let child = self.transform_expr_if(i);
+                map_owned_or_else(expr, child, Expression::If)
             }
             Expression::Opaque(o) => {
                 let child = self.transform_expr_opaque(o);
@@ -394,6 +409,15 @@ pub trait ExpressionTransform<'a> {
     ) -> Self::Output<VariadicExpression> {
         let children = v.exprs.iter().map(|e| self.transform_expr(e));
         map_owned_children_or_else(v, children, |exprs| VariadicExpression::new(v.op, exprs))
+    }
+
+    /// Recursively transforms an `If` expression's three children (ternary). If any child is
+    /// filtered out the whole expression is filtered out -- a partial `If` is not meaningful.
+    fn recurse_into_expr_if(&mut self, i: &'a IfExpression) -> Self::Output<IfExpression> {
+        let condition = self.transform_pred(&i.condition);
+        let then_expr = self.transform_expr(&i.then_expr);
+        let else_expr = self.transform_expr(&i.else_expr);
+        map_owned_trio_or_else(i, condition, then_expr, else_expr, IfExpression::new)
     }
 
     /// Recursively transforms a junction predicate's children (variadic).
@@ -632,6 +656,92 @@ mod tests {
         if let Cow::Borrowed(result_expr) = result {
             assert_eq!(result_expr, &variadic_expr);
         }
+    }
+
+    // Pin the contract that `If` recurses into condition / then / else arms and that each arm
+    // participates in the column rewrite. Without this guard, a transform pass that handles
+    // `Variadic` but forgets `If` would silently leave references un-rewritten in the
+    // conditional, which is a real footgun for FSR-style filter-out semantics.
+    #[rstest::rstest]
+    #[case::no_match_returns_borrowed(
+        Expr::if_then_else(column_pred!("x"), column_expr!("y"), Expr::literal(42)),
+        Expr::if_then_else(column_pred!("x"), column_expr!("y"), Expr::literal(42)),
+        true,
+    )]
+    #[case::all_arms_rewritten(
+        Expr::if_then_else(
+            column_pred!("old_col"),
+            column_expr!("old_col"),
+            column_expr!("old_col"),
+        ),
+        Expr::if_then_else(
+            column_pred!("new_col"),
+            column_expr!("new_col"),
+            column_expr!("new_col"),
+        ),
+        false,
+    )]
+    #[case::condition_arm_only(
+        Expr::if_then_else(column_pred!("old_col"), Expr::literal(1), Expr::literal(0)),
+        Expr::if_then_else(column_pred!("new_col"), Expr::literal(1), Expr::literal(0)),
+        false,
+    )]
+    #[case::then_arm_only(
+        Expr::if_then_else(column_pred!("flag"), column_expr!("old_col"), Expr::literal(0)),
+        Expr::if_then_else(column_pred!("flag"), column_expr!("new_col"), Expr::literal(0)),
+        false,
+    )]
+    #[case::else_arm_only(
+        Expr::if_then_else(column_pred!("flag"), Expr::literal(1), column_expr!("old_col")),
+        Expr::if_then_else(column_pred!("flag"), Expr::literal(1), column_expr!("new_col")),
+        false,
+    )]
+    fn test_transform_expr_if_recursion(
+        #[case] input: Expr,
+        #[case] expected: Expr,
+        #[case] expect_borrowed: bool,
+    ) {
+        let result = ColumnReplacer.transform_expr(&input);
+        if expect_borrowed {
+            assert!(matches!(result, Cow::Borrowed(_)));
+        } else {
+            assert!(matches!(result, Cow::Owned(_)));
+        }
+        assert_eq!(result.into_owned(), expected);
+    }
+
+    // The "any child filtered out drops the parent" contract must hold for any of the three
+    // arms -- condition, then, or else. A filtering carrier that drops column references
+    // verifies this independent of arm position.
+    #[rstest::rstest]
+    #[case::dropped_in_condition(Expr::if_then_else(
+        column_pred!("dropped_col"),
+        Expr::literal(1),
+        Expr::literal(0),
+    ))]
+    #[case::dropped_in_then(Expr::if_then_else(
+        column_pred!("flag"),
+        column_expr!("dropped_col"),
+        Expr::literal(0),
+    ))]
+    #[case::dropped_in_else(Expr::if_then_else(
+        column_pred!("flag"),
+        Expr::literal(1),
+        column_expr!("dropped_col"),
+    ))]
+    fn test_transform_expr_if_arm_filter_drops_expression(#[case] if_expr: Expr) {
+        struct ColumnRemover;
+        impl<'a> ExpressionTransform<'a> for ColumnRemover {
+            transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+            fn transform_expr_column(
+                &mut self,
+                _name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                None
+            }
+        }
+        let result = ColumnRemover.transform_expr(&if_expr);
+        assert!(result.is_none());
     }
 
     #[test]

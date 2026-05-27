@@ -261,6 +261,12 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_expression_item_list(m2s->child_expr, depth + 1);
       break;
     }
+    case If: {
+      struct IfExpr* if_expr = ref.ref;
+      printf("If\n");
+      print_expression_item_list(if_expr->branches, depth + 1);
+      break;
+    }
   }
 }
 

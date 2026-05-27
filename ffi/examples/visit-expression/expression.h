@@ -65,6 +65,7 @@ enum ExpressionType {
   OpaquePredicate,
   Unknown,
   MapToStruct,
+  If,
 };
 enum VariadicType {
   And,
@@ -114,6 +115,10 @@ struct Unknown {
 };
 struct MapToStructExpr {
   ExpressionItemList child_expr;
+};
+struct IfExpr {
+  // Three-element list: [condition, then_expr, else_expr].
+  ExpressionItemList branches;
 };
 struct BinaryData {
   uint8_t* buf;
@@ -310,6 +315,12 @@ DEFINE_VARIADIC(visit_expr_and, And)
 DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 #undef DEFINE_VARIADIC
+
+void visit_expr_if(void* data, uintptr_t sibling_list_id, uintptr_t child_list_id) {
+  struct IfExpr* if_expr = malloc(sizeof(struct IfExpr));
+  if_expr->branches = get_expr_list(data, child_list_id);
+  put_expr_item(data, sibling_list_id, if_expr, If);
+}
 
 // Sort by field name, breaking ties by pointer address to ensure stability.
 int transform_op_cmp(const void* a, const void* b) {
@@ -514,6 +525,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
     .visit_map_to_struct = visit_map_to_struct_expr,
+    .visit_if = visit_expr_if,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -561,6 +573,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
     .visit_map_to_struct = visit_map_to_struct_expr,
+    .visit_if = visit_expr_if,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -677,6 +690,12 @@ void free_expression_item(ExpressionItem ref) {
       struct MapToStructExpr* m2s = ref.ref;
       free_expression_list(m2s->child_expr);
       free(m2s);
+      break;
+    }
+    case If: {
+      struct IfExpr* if_expr = ref.ref;
+      free_expression_list(if_expr->branches);
+      free(if_expr);
       break;
     }
   }

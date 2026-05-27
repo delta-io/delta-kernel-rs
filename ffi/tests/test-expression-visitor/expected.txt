@@ -68,6 +68,10 @@ StructExpression
   Unknown(mystery)
   MapToStruct
     Column(pv)
+  If
+    Column(flag)
+    Integer(10)
+    Integer(20)
   Divide
     Integer(0)
     Integer(0)
