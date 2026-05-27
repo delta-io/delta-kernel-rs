@@ -122,17 +122,9 @@ pub(crate) enum TableFeature {
     ClusteredTable,
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
-    /// Default values for table columns. The presence of `CURRENT_DEFAULT` in a column's
-    /// metadata instructs writers to substitute the default expression's value whenever a
-    /// row omits a value for that column or has the `DEFAULT` sentinel. See the protocol's
-    /// "Default Columns" section.
+    /// Column Default Values
     ///
-    /// Gated by the `column-defaults` cargo feature: when the cargo feature is off, this
-    /// variant does not exist and `allowColumnDefaults` is parsed as
-    /// `TableFeature::Unknown`, which blocks writes. The cargo gate exists so connectors
-    /// cannot use partial column-defaults support before the feature is fully implemented.
-    ///
-    /// TODO(#2630): full column-defaults support. remaining work: finish write implementation
+    /// TODO(#2630): Full column-defaults support. Remaining work: Finish write implementation
     /// and remove the `#[cfg(feature = "column-defaults")]` gate.
     #[cfg(feature = "column-defaults")]
     AllowColumnDefaults,
