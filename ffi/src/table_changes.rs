@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{DeltaResult, EngineData, Error, Version};
+use delta_kernel::{DeltaResult, DeltaResultIterator, EngineData, Error, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>>;
+type TableChangesData = Mutex<DeltaResultIterator<Box<dyn EngineData>>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,

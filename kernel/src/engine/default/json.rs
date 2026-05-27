@@ -23,7 +23,8 @@ use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler,
+    PredicateRef, ScopedDeltaResultIterator,
 };
 
 #[derive(Debug)]
@@ -185,7 +186,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: ScopedDeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         self.task_executor.block_on(write_json_file_impl(

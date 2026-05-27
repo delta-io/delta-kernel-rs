@@ -91,7 +91,7 @@ pub trait JsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: ScopedDeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }
@@ -131,7 +131,7 @@ pub trait ParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        data: DeltaResultIterator<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;

@@ -22,6 +22,10 @@ pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 /// kernel APIs.
 pub type DeltaResultIterator<T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send>;
 
+/// Lifetime-bounded counterpart to [`DeltaResultIterator`] for cases where the iterator may
+/// reference borrowed data.
+pub type ScopedDeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send + 'a>;
+
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]

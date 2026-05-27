@@ -3,7 +3,9 @@ use std::sync::Arc;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
-use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
+use delta_kernel::{
+    DeltaResult, Engine, Error as DeltaError, FilteredEngineData, ScopedDeltaResultIterator,
+};
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
 
@@ -123,7 +125,7 @@ impl<C: CommitClient> UCCommitter<C> {
     fn commit_version_0(
         &self,
         engine: &dyn Engine,
-        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: &CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         debug_assert!(
@@ -156,7 +158,7 @@ impl<C: CommitClient> UCCommitter<C> {
     fn commit_version_non_zero(
         &self,
         engine: &dyn Engine,
-        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>
     where
@@ -237,7 +239,7 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         if commit_metadata.version() == 0 {

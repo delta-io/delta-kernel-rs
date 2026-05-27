@@ -1627,7 +1627,7 @@ mod tests {
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
     };
-    use crate::{EvaluationHandler, Snapshot};
+    use crate::{EvaluationHandler, ScopedDeltaResultIterator, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1645,7 +1645,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             Err(Error::IOError(std::io::Error::other("simulated IO error")))
@@ -1669,7 +1669,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             // This won't be reached in tests — the validation error fires before commit.
@@ -2815,7 +2815,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
             commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());

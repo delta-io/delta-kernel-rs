@@ -125,7 +125,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta, Version,
+    DeltaResult, DeltaResultIterator, Engine, EngineData, Error, EvaluationHandlerExtension,
+    FileMeta, Version,
 };
 
 mod checkpoint_transform;
@@ -662,7 +663,7 @@ impl CheckpointWriter {
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let main_data: DeltaResultIterator<Box<dyn EngineData>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         engine
             .parquet_handler()
