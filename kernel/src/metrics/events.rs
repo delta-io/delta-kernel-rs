@@ -32,7 +32,7 @@ impl MetricId {
     }
 
     /// Extract the `operation_id` field from span attributes. Returns a nil id if the field is
-    /// absent; warns if the value is present but malformed.
+    /// absent, or warns and returns nil if the value is present but malformed.
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         #[derive(Default)]
         struct V(Uuid);
@@ -86,8 +86,7 @@ pub enum MetricEvent {
 }
 
 impl MetricEvent {
-    /// Set the wall-clock duration on lifecycle events. Exhaustive so adding a new variant is a
-    /// compile error here.
+    /// Set the wall-clock duration on lifecycle events.
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {
             // Lifecycle: duration must be set by the tracing layer on span close.
@@ -108,8 +107,6 @@ impl MetricEvent {
         }
     }
 
-    /// Dispatch a u64 field update to the inner struct. `Err(span_name)` if `name` is unknown
-    /// for the matched variant, so the caller can warn with context. Exhaustive.
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
         match self {
             // Variants with u64 fields set during span lifetime.
@@ -117,36 +114,34 @@ impl MetricEvent {
             Self::SnapshotCompleted(e) => e.record_u64(name, value),
             Self::CrcReadCompleted(e) => e.record_u64(name, value),
 
-            // No u64 fields set during span lifetime.
-            Self::ProtocolMetadataLoaded(_)
-            | Self::SnapshotFailed(_)
-            | Self::ScanMetadataCompleted(_)
-            | Self::StorageListCompleted(_)
+            // No u64 fields set during span lifetime — a runtime record() on these is a bug.
+            Self::ProtocolMetadataLoaded(_) => Err(ProtocolMetadataLoaded::SPAN_NAME),
+            Self::SnapshotFailed(_) => Err(SnapshotCompleted::SPAN_NAME),
+            Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
+            Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
+            Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_)
-            | Self::JsonReadCompleted(_)
-            | Self::ParquetReadCompleted(_) => Ok(()),
+            | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
         }
     }
 
-    /// Dispatch a bool field update to the inner struct. `Err(span_name)` if `name` is unknown
-    /// for the matched variant, so the caller can warn with context. Exhaustive.
     pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
         match self {
             // Variants with bool fields set during span lifetime.
             Self::LogSegmentLoaded(e) => e.record_bool(name, value),
 
-            // No bool fields set during span lifetime.
-            Self::ProtocolMetadataLoaded(_)
-            | Self::SnapshotCompleted(_)
-            | Self::SnapshotFailed(_)
-            | Self::CrcReadCompleted(_)
-            | Self::ScanMetadataCompleted(_)
-            | Self::StorageListCompleted(_)
+            // No bool fields set during span lifetime — a runtime record() on these is a bug.
+            Self::ProtocolMetadataLoaded(_) => Err(ProtocolMetadataLoaded::SPAN_NAME),
+            Self::SnapshotCompleted(_) => Err(SnapshotCompleted::SPAN_NAME),
+            Self::SnapshotFailed(_) => Err(SnapshotCompleted::SPAN_NAME),
+            Self::CrcReadCompleted(_) => Err(CrcReadCompleted::SPAN_NAME),
+            Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
+            Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
+            Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_)
-            | Self::JsonReadCompleted(_)
-            | Self::ParquetReadCompleted(_) => Ok(()),
+            | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
         }
     }
 }
@@ -783,7 +778,7 @@ impl Visit for StorageAttrs {
         match field.name() {
             "num_files" => self.num_files = value,
             "bytes_read" => self.bytes_read = value,
-            "duration" => self.duration_ns = value,
+            "duration_ns" => self.duration_ns = value,
             _ => {}
         }
     }
@@ -880,8 +875,8 @@ impl fmt::Display for StorageCopyCompleted {
 
 /// Emit a [`MetricEvent::JsonReadCompleted`] via a tracing span.
 ///
-/// Call once per [`crate::JsonHandler::read_json_files`] invocation, after the file list is known
-/// but before the iterator is consumed (i.e. at iterator exhaustion or drop).
+/// Call once per [`crate::JsonHandler::read_json_files`] invocation, at iterator exhaustion or
+/// drop.
 pub fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
     let _span = tracing::span!(
         tracing::Level::INFO,
@@ -894,8 +889,8 @@ pub fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
 
 /// Emit a [`MetricEvent::ParquetReadCompleted`] via a tracing span.
 ///
-/// Call once per [`crate::ParquetHandler::read_parquet_files`] invocation, after the file list is
-/// known but before the iterator is consumed (i.e. at iterator exhaustion or drop).
+/// Call once per [`crate::ParquetHandler::read_parquet_files`] invocation, at iterator exhaustion
+/// or drop.
 pub fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
     let _span = tracing::span!(
         tracing::Level::INFO,

@@ -138,7 +138,8 @@ where
 
     // RUNTIME CHANNEL. Both on_event and on_record route Span::current().record(...) updates
     // (and info!() events within a span) through EventVisitor -> MetricEvent::record_u64 /
-    // record_bool.
+    // record_bool. The visitor's record_debug also handles `#[instrument(err)]`'s `error` field,
+    // flipping SnapshotCompleted into SnapshotFailed.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         Self::drain_into_visitor(ctx.event_span(event), |v| event.record(v));
     }

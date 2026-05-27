@@ -11,7 +11,6 @@
 //! # Example: Implementing a Custom MetricsReporter
 //!
 //! ```
-//! use std::sync::Arc;
 //! use delta_kernel::metrics::{MetricsReporter, MetricEvent};
 //!
 //! #[derive(Debug)]

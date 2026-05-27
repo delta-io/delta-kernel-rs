@@ -57,7 +57,7 @@ impl<I, T> Drop for MetricsIterator<I, T> {
             name = self.name,
             num_files = self.num_files,
             bytes_read = self.bytes_read,
-            duration = duration.as_nanos() as u64,
+            duration_ns = duration.as_nanos() as u64,
         );
     }
 }
@@ -249,7 +249,7 @@ async fn copy_atomic_impl(
         STORAGE_SPAN,
         report = tracing::field::Empty,
         name = StorageCopyCompleted::NAME,
-        duration = duration.as_nanos() as u64,
+        duration_ns = duration.as_nanos() as u64,
     );
 
     result.map_err(|e| match e {
