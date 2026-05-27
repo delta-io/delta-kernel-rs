@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::engine::arrow_expression::opaque::{ArrowOpaqueExpression, ArrowOpaquePredicate};
+use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
     BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
     UnaryPredicateOp,
@@ -13,9 +13,7 @@ use delta_kernel::DeltaResult;
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::opaque_eval::SharedOpaqueEvalContext;
-use crate::expressions::{
-    NamedOpaqueExpressionOp, NamedOpaquePredicateOp, SharedExpression, SharedPredicate,
-};
+use crate::expressions::{NamedOpaquePredicateOp, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -756,40 +754,6 @@ fn visit_predicate_opaque_impl(
     ))
 }
 
-/// Build `Expression::Opaque(NamedOpaqueExpressionOp(name), children)`
-/// without an engine eval context. See [`visit_predicate_opaque`] for the
-/// without-callbacks semantics.
-///
-/// Returns 0 if any child ID is invalid.
-///
-/// # Safety
-/// `name` must be valid UTF-8 for the duration of the call.
-#[no_mangle]
-pub unsafe extern "C" fn visit_expression_opaque(
-    state: &mut KernelExpressionVisitorState,
-    name: KernelStringSlice,
-    children: &mut EngineIterator,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<usize> {
-    let name = unsafe { String::try_from_slice(&name) };
-    visit_expression_opaque_impl(state, name, children).into_extern_result(&allocate_error)
-}
-
-fn visit_expression_opaque_impl(
-    state: &mut KernelExpressionVisitorState,
-    name: DeltaResult<String>,
-    children: &mut EngineIterator,
-) -> DeltaResult<usize> {
-    let name = name?;
-    let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
-        return Ok(0);
-    };
-    Ok(wrap_expression(
-        state,
-        Expression::opaque(NamedOpaqueExpressionOp::new(name), exprs),
-    ))
-}
-
 /// Build `Predicate::Opaque(NamedOpaquePredicateOp(name, callbacks), children)`
 /// and route it through the default engine's Arrow batch evaluator. Kernel
 /// pre-evaluates each child arg recursively via its standard
@@ -933,47 +897,6 @@ fn visit_predicate_opaque_with_eval_and_skipping_impl(
     };
     let op = NamedOpaquePredicateOp::with_callbacks_and_skipping(name, callbacks, decomp);
     Ok(wrap_predicate(state, Predicate::arrow_opaque(op, exprs)))
-}
-
-/// Build `Expression::Opaque(NamedOpaqueExpressionOp(name, callbacks), children)`
-/// and route it through the default engine's Arrow batch evaluator (mirrors
-/// [`visit_predicate_opaque_with_eval`]).
-///
-/// Returns 0 if any child ID is invalid.
-///
-/// # Safety
-/// `name` must be valid UTF-8 for the duration of the call; `ctx` must be
-/// a valid handle from [`create_opaque_eval_context`].
-///
-/// [`create_opaque_eval_context`]: crate::expressions::opaque_eval::create_opaque_eval_context
-#[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn visit_expression_opaque_with_eval(
-    state: &mut KernelExpressionVisitorState,
-    name: KernelStringSlice,
-    children: &mut EngineIterator,
-    ctx: Handle<SharedOpaqueEvalContext>,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<usize> {
-    let name = unsafe { String::try_from_slice(&name) };
-    let callbacks = unsafe { ctx.clone_as_arc() };
-    visit_expression_opaque_with_eval_impl(state, name, children, callbacks)
-        .into_extern_result(&allocate_error)
-}
-
-#[cfg(feature = "default-engine-base")]
-fn visit_expression_opaque_with_eval_impl(
-    state: &mut KernelExpressionVisitorState,
-    name: DeltaResult<String>,
-    children: &mut EngineIterator,
-    callbacks: Arc<crate::expressions::opaque_eval::OpaqueEvalCallbacks>,
-) -> DeltaResult<usize> {
-    let name = name?;
-    let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
-        return Ok(0);
-    };
-    let op = NamedOpaqueExpressionOp::with_callbacks(name, callbacks);
-    Ok(wrap_expression(state, Expression::arrow_opaque(op, exprs)))
 }
 
 #[cfg(test)]
@@ -1262,37 +1185,15 @@ mod tests {
     }
 
     #[test]
-    fn visit_expression_opaque_impl_wraps_as_expression_not_predicate() {
-        let mut state = KernelExpressionVisitorState::default();
-        let (a, b) = make_two_literal_ids(&mut state);
-        let (_keep, mut it) = make_iter(vec![a, b]);
-        let id =
-            visit_expression_opaque_impl(&mut state, Ok("MY_EXPR".to_string()), &mut it).unwrap();
-        assert_ne!(id, 0);
-        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        let Expression::Opaque(opaque) = expr else {
-            panic!("expected Expression::Opaque, got {expr:?}");
-        };
-        assert_eq!(opaque.op.name(), "MY_EXPR");
-        assert_eq!(opaque.exprs.len(), 2);
-    }
-
-    #[rstest]
-    #[case::predicate(true)]
-    #[case::expression(false)]
-    fn visit_opaque_returns_zero_on_invalid_child(#[case] is_predicate: bool) {
-        // 9999 is a never-issued ReferenceSet ID, so `unwrap_kernel_*`
+    fn visit_predicate_opaque_returns_zero_on_invalid_child() {
+        // 9999 is a never-issued ReferenceSet ID, so `unwrap_kernel_expression`
         // returns None and the builder must bail out without wrapping.
         // (Id=0 is conflated with null/end-of-iteration by the FFI
         // EngineIterator contract, so it manifests as "no children" rather
         // than "invalid child" -- not a useful test for this code path.)
         let mut state = KernelExpressionVisitorState::default();
         let (_keep, mut it) = make_iter(vec![9999usize]);
-        let id = if is_predicate {
-            visit_predicate_opaque_impl(&mut state, Ok("OP".to_string()), &mut it).unwrap()
-        } else {
-            visit_expression_opaque_impl(&mut state, Ok("OP".to_string()), &mut it).unwrap()
-        };
+        let id = visit_predicate_opaque_impl(&mut state, Ok("OP".to_string()), &mut it).unwrap();
         assert_eq!(id, 0, "invalid child should produce id=0 (no node created)");
     }
 
@@ -1341,7 +1242,7 @@ mod tests {
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
 
-        use crate::expressions::opaque_eval::tests::{noop_eval_expr, noop_eval_pred};
+        use crate::expressions::opaque_eval::tests::noop_eval_pred;
         use crate::expressions::opaque_eval::OpaqueEvalCallbacks;
 
         // Local free-state stub: avoid the shared TEST_FREES counter so we
@@ -1350,8 +1251,7 @@ mod tests {
 
         let cb = Arc::new(OpaqueEvalCallbacks {
             engine_state: std::ptr::null_mut(),
-            eval_pred: Some(noop_eval_pred),
-            eval_expr: Some(noop_eval_expr),
+            eval_pred: noop_eval_pred,
             free_state: local_free_state,
         });
 
