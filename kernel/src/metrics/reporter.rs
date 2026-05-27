@@ -98,6 +98,8 @@ impl<S> Layer<S> for ReportGeneratorLayer
 where
     S: Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
 {
+    // CONSTRUCTION-TIME CHANNEL. Each Type::from_attrs(attrs) extracts fields bound at span
+    // creation.
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let Some(metadata) = ctx.metadata(id) else {
             return;
@@ -134,6 +136,9 @@ where
         }
     }
 
+    // RUNTIME CHANNEL. Both on_event and on_record route Span::current().record(...) updates
+    // (and info!() events within a span) through EventVisitor -> MetricEvent::record_u64 /
+    // record_bool.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         Self::drain_into_visitor(ctx.event_span(event), |v| event.record(v));
     }
@@ -235,9 +240,12 @@ impl Visit for EventVisitor {
             "error" => {
                 // `#[instrument(err)]` records `error` when the wrapped function returns Err.
                 // Flip SnapshotCompleted into SnapshotFailed.
-                if let Some(MetricEvent::SnapshotCompleted(snap)) = self.event.take() {
-                    self.event = Some(MetricEvent::SnapshotFailed(snap.into_failed()));
-                }
+                self.event = match self.event.take() {
+                    Some(MetricEvent::SnapshotCompleted(snap)) => {
+                        Some(MetricEvent::SnapshotFailed(snap.into_failed()))
+                    }
+                    other => other,
+                };
             }
             _ => {}
         }

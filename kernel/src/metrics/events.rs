@@ -172,6 +172,9 @@ impl fmt::Display for MetricEvent {
 // ====================================================================
 // LogSegmentLoaded
 // ====================================================================
+//
+// Canonical example for the per-event block pattern. Other events below follow the same
+// shape; detailed `///` docs on `from_attrs` and `record_*` live here only.
 
 // Module-scope span name. `#[instrument(name = ...)]` only accepts a bare identifier here,
 // not a multi-segment path like `Type::SPAN_NAME`.
@@ -195,6 +198,8 @@ pub struct LogSegmentLoaded {
 impl LogSegmentLoaded {
     pub(crate) const SPAN_NAME: &'static str = LOG_SEGMENT_LOADED_SPAN;
 
+    /// Construction-time channel. Extracts fields bound at span creation via
+    /// `#[instrument(fields(X = expr))]` or `tracing::span!(..., X = expr)`.
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
             operation_id: MetricId::from_attrs(attrs),
@@ -206,6 +211,8 @@ impl LogSegmentLoaded {
         }
     }
 
+    /// Runtime channel. Dispatches a u64 field update from `Span::current().record(name, value)`
+    /// to the matching field.
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
         match name {
             "num_commit_files" => self.num_commit_files = value,
