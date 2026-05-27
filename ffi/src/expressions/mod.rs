@@ -3,12 +3,14 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp, ScalarExpressionEvaluator};
+use delta_kernel::expressions::{
+    OpaqueExpressionOp, OpaquePredicateOp, Scalar, ScalarExpressionEvaluator,
+};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use delta_kernel::{DeltaResult, Expression, Predicate};
+use delta_kernel::{DeltaResult, Error, Expression, Predicate};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::handle::Handle;
@@ -206,6 +208,54 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
     }
 }
 
+// === NamedOpaqueExpressionOp ===================================================
+
+/// An [`OpaqueExpressionOp`] that carries an engine-defined function name
+/// (e.g. `LOWER`, `UPPER`). Engines build these to push function calls
+/// through to their pruning callback, where the recursive
+/// [`OpaqueExpressionView`] accessor exposes the op's name and args.
+///
+/// `eval_expr_scalar` always returns `Err`, which is the spec-defined
+/// "abstain" shape per the [`OpaqueExpressionOp`] trait doc: kernel
+/// disqualifies the op from partition-level scalar evaluation, logs a
+/// `warn!`, and treats the expression as unknown. Row-time evaluation
+/// still routes through the engine's `EvaluationHandler`. Engines that
+/// need partition-level pruning for such functions must pre-evaluate on
+/// their side before handing the predicate to kernel.
+///
+/// [`OpaqueExpressionView`]: pruning::OpaqueExpressionView
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedOpaqueExpressionOp {
+    name: String,
+}
+
+impl NamedOpaqueExpressionOp {
+    /// Build an op identified by `name`.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl OpaqueExpressionOp for NamedOpaqueExpressionOp {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn eval_expr_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _exprs: &[Expression],
+    ) -> DeltaResult<Scalar> {
+        // Trait spec: `Err` disqualifies the op from partition pruning.
+        // Callers (kernel_predicates::mod) swallow this with `warn!`, so it
+        // does not propagate as a query error.
+        Err(Error::generic(format!(
+            "opaque FFI expression `{}` does not support scalar evaluation",
+            self.name,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -286,5 +336,54 @@ mod tests {
 
         let captured = CAPTURED.with(|c| c.borrow().clone());
         assert_eq!(captured.as_deref(), Some("STARTS_WITH"));
+    }
+
+    #[test]
+    fn named_opaque_expression_op_carries_name() {
+        let op = NamedOpaqueExpressionOp::new("LOWER");
+        assert_eq!(op.name(), "LOWER");
+    }
+
+    #[test]
+    fn named_opaque_expression_op_equality() {
+        let a = NamedOpaqueExpressionOp::new("LOWER");
+        let b = NamedOpaqueExpressionOp::new("LOWER");
+        let c = NamedOpaqueExpressionOp::new("UPPER");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn named_opaque_expression_op_round_trips_in_expression() {
+        let expr = Expression::opaque(
+            NamedOpaqueExpressionOp::new("LOWER"),
+            [Expression::column(["col"])],
+        );
+        let op_ref = match expr {
+            Expression::Opaque(opaque) => opaque.op.clone(),
+            other => panic!("expected Expression::Opaque, got {other:?}"),
+        };
+        let handle: Handle<SharedOpaqueExpressionOp> = op_ref.into();
+
+        thread_local! {
+            static CAPTURED: RefCell<Option<String>> = const { RefCell::new(None) };
+        }
+        extern "C" fn capture(_data: *mut c_void, name: KernelStringSlice) {
+            // SAFETY: kernel guarantees `name` is valid for the duration of this call.
+            let s = unsafe { String::try_from_slice(&name) }.unwrap();
+            CAPTURED.with(|c| *c.borrow_mut() = Some(s));
+        }
+
+        // SAFETY: the handle is a valid SharedOpaqueExpressionOp built above.
+        // `clone_handle` bumps the Arc so the visitor can consume one handle
+        // while we retain another to free.
+        unsafe {
+            let visit_copy = handle.clone_handle();
+            visit_kernel_opaque_expression_op_name(visit_copy, std::ptr::null_mut(), capture);
+            free_kernel_opaque_expression_op(handle);
+        }
+
+        let captured = CAPTURED.with(|c| c.borrow().clone());
+        assert_eq!(captured.as_deref(), Some("LOWER"));
     }
 }

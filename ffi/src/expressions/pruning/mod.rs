@@ -13,7 +13,7 @@
 //!   schema must resolve to physical names before constructing the children, otherwise lookups
 //!   silently miss.
 //! - **Single-segment columns only.** [`ChildAccessor`] reports nested column refs (`a.b.c`) as
-//!   [`OpaqueChildKind::Unsupported`].
+//!   [`ExpressionKind::Unsupported`].
 //!
 //! [`visit_predicate_opaque_with_pruning`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_pruning
 
@@ -26,9 +26,11 @@ use crate::handle::Handle;
 use crate::{kernel_string_slice, KernelStringSlice};
 
 mod child;
+mod expression;
 mod stats;
 
 pub use child::*;
+pub use expression::*;
 pub use stats::*;
 
 // === Verdict =================================================================

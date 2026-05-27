@@ -12,7 +12,9 @@ use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
 
 use crate::expressions::pruning::{OpaquePruningCallbacks, SharedOpaquePruningContext};
-use crate::expressions::{NamedOpaquePredicateOp, SharedExpression, SharedPredicate};
+use crate::expressions::{
+    NamedOpaqueExpressionOp, NamedOpaquePredicateOp, SharedExpression, SharedPredicate,
+};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -717,6 +719,44 @@ fn visit_predicate_opaque_with_pruning_impl(
     Ok(wrap_predicate(state, pred))
 }
 
+/// Build an opaque expression `Expression::Opaque(NamedOpaqueExpressionOp(name), exprs)`
+/// from a name and a list of child expression IDs. See [`NamedOpaqueExpressionOp`] for
+/// the partition-pruning / row-time evaluation contract.
+///
+/// Each child ID is consumed from the visitor state (an ID can only be used once).
+/// Predicate IDs are auto-promoted into expressions via `Expression::from_pred`.
+/// Returns 0 if any child ID is invalid (already consumed, never created, or zero);
+/// remaining valid IDs are still drained from state in that case.
+///
+/// # Safety
+/// `state`, `children`, and `allocate_error` must all be valid for the duration of the
+/// call. The `name` slice must be valid UTF-8 and live for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_opaque(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+    children: &mut EngineIterator,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name = unsafe { String::try_from_slice(&name) };
+    visit_expression_opaque_impl(state, name, children).into_extern_result(&allocate_error)
+}
+
+fn visit_expression_opaque_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: DeltaResult<String>,
+    children: &mut EngineIterator,
+) -> DeltaResult<usize> {
+    let name = name?;
+    let Some(exprs) = resolve_opaque_children(state, children.map(|child| child as usize)) else {
+        return Ok(0);
+    };
+    Ok(wrap_expression(
+        state,
+        Expression::opaque(NamedOpaqueExpressionOp::new(name), exprs),
+    ))
+}
+
 #[no_mangle]
 pub extern "C" fn visit_predicate_or(
     state: &mut KernelExpressionVisitorState,
@@ -1109,6 +1149,130 @@ mod tests {
             Predicate::Opaque(opaque) => {
                 assert_eq!(opaque.exprs.len(), 1);
                 assert!(matches!(&opaque.exprs[0], Expression::Predicate(_)));
+            }
+            other => panic!("expected Predicate::Opaque, got {other:?}"),
+        }
+    }
+
+    // ============================================================================
+    // visit_expression_opaque_impl
+    // ============================================================================
+
+    fn wrap_opaque_expression(
+        state: &mut KernelExpressionVisitorState,
+        name: &str,
+        child_ids: impl IntoIterator<Item = usize>,
+    ) -> usize {
+        let Some(exprs) = resolve_opaque_children(state, child_ids) else {
+            return 0;
+        };
+        wrap_expression(
+            state,
+            Expression::opaque(NamedOpaqueExpressionOp::new(name), exprs),
+        )
+    }
+
+    #[test]
+    fn opaque_expression_round_trips_with_children() {
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = visit_expression_column_impl(&mut state, Ok("name")).unwrap();
+        let expr_id = wrap_opaque_expression(&mut state, "LOWER", [col_id]);
+
+        let expr = unwrap_kernel_expression(&mut state, expr_id).unwrap();
+        match expr {
+            Expression::Opaque(opaque) => {
+                assert_eq!(opaque.op.name(), "LOWER");
+                assert_eq!(opaque.exprs.len(), 1);
+            }
+            other => panic!("expected Expression::Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_expression_returns_zero_on_invalid_child_id() {
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = visit_expression_column_impl(&mut state, Ok("name")).unwrap();
+        let bogus_id = 9999usize;
+
+        let expr_id = wrap_opaque_expression(&mut state, "LOWER", [col_id, bogus_id]);
+        assert_eq!(
+            expr_id, 0,
+            "any invalid child must invalidate the expression"
+        );
+    }
+
+    #[test]
+    fn opaque_expression_accepts_empty_children() {
+        let mut state = KernelExpressionVisitorState::default();
+        let expr_id = wrap_opaque_expression(&mut state, "NOW", []);
+        let expr = unwrap_kernel_expression(&mut state, expr_id).unwrap();
+        match expr {
+            Expression::Opaque(opaque) => {
+                assert_eq!(opaque.op.name(), "NOW");
+                assert!(opaque.exprs.is_empty());
+            }
+            other => panic!("expected Expression::Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_expression_promotes_predicate_typed_child_to_expression() {
+        let mut state = KernelExpressionVisitorState::default();
+        let inner_pred_id = wrap_predicate(
+            &mut state,
+            Predicate::eq(Expression::literal(1), Expression::literal(2)),
+        );
+        let expr_id = wrap_opaque_expression(&mut state, "IF_TRUE_ELSE", [inner_pred_id]);
+        let expr = unwrap_kernel_expression(&mut state, expr_id).unwrap();
+        match expr {
+            Expression::Opaque(opaque) => {
+                assert_eq!(opaque.exprs.len(), 1);
+                assert!(matches!(&opaque.exprs[0], Expression::Predicate(_)));
+            }
+            other => panic!("expected Expression::Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_expression_nests_inside_opaque_expression() {
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = visit_expression_column_impl(&mut state, Ok("name")).unwrap();
+        let inner_id = wrap_opaque_expression(&mut state, "LOWER", [col_id]);
+        let outer_id = wrap_opaque_expression(&mut state, "LOWER", [inner_id]);
+
+        let expr = unwrap_kernel_expression(&mut state, outer_id).unwrap();
+        match expr {
+            Expression::Opaque(outer) => {
+                assert_eq!(outer.op.name(), "LOWER");
+                assert_eq!(outer.exprs.len(), 1);
+                match &outer.exprs[0] {
+                    Expression::Opaque(inner) => {
+                        assert_eq!(inner.op.name(), "LOWER");
+                        assert_eq!(inner.exprs.len(), 1);
+                        assert!(matches!(&inner.exprs[0], Expression::Column(_)));
+                    }
+                    other => panic!("expected inner Expression::Opaque, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer Expression::Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_expression_can_nest_inside_opaque_predicate() {
+        // STARTS_WITH(LOWER(col), "foo")
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = visit_expression_column_impl(&mut state, Ok("name")).unwrap();
+        let lower_id = wrap_opaque_expression(&mut state, "LOWER", [col_id]);
+        let lit_id = wrap_expression(&mut state, Expression::literal("foo"));
+
+        let pred_id = wrap_opaque(&mut state, "STARTS_WITH", [lower_id, lit_id]);
+        let pred = unwrap_kernel_predicate(&mut state, pred_id).unwrap();
+        match pred {
+            Predicate::Opaque(opaque) => {
+                assert_eq!(opaque.op.name(), "STARTS_WITH");
+                assert_eq!(opaque.exprs.len(), 2);
+                assert!(matches!(&opaque.exprs[0], Expression::Opaque(_)));
             }
             other => panic!("expected Predicate::Opaque, got {other:?}"),
         }
