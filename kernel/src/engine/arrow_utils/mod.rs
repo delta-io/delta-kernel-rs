@@ -2,6 +2,7 @@
 
 pub(crate) mod apply_schema;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -13,10 +14,11 @@ use tracing::debug;
 use self::apply_schema::apply_schema_to_struct;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray, OffsetSizeTrait,
-    PrimitiveArray, RecordBatch, StringArray, StructArray,
+    make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
+use crate::arrow::compute::{cast_with_options, CastOptions};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -31,9 +33,10 @@ use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
 use crate::schema::{
-    ColumnMetadataKey, DataType, MetadataColumnSpec, MetadataValue, Schema, SchemaRef, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+    PrimitiveType, Schema, SchemaRef, StructField, StructType,
 };
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error};
 
@@ -1143,36 +1146,30 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
-/// Raw arrow implementation of the json parsing. Separate from the public function for testing.
+/// Raw implementation of the JSON parsing. Separate from the public function for testing.
 /// Also used by ParseJson expression evaluation.
 ///
 /// Accepts any string array type (`StringArray`, `LargeStringArray`, `StringViewArray`) to avoid
 /// narrowing casts that could overflow (e.g. `LargeStringArray` -> `StringArray`).
 pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
-    schema: ArrowSchemaRef,
+    schema: SchemaRef,
 ) -> DeltaResult<RecordBatch> {
+    let num_rows = json_strings.len();
     match json_strings.data_type() {
-        ArrowDataType::Utf8 => parse_json_inner(
-            json_strings.as_string::<i32>().iter(),
-            json_strings.len(),
-            schema,
-        ),
-        ArrowDataType::LargeUtf8 => parse_json_inner(
-            json_strings.as_string::<i64>().iter(),
-            json_strings.len(),
-            schema,
-        ),
-        ArrowDataType::Utf8View => parse_json_inner(
-            json_strings.as_string_view().iter(),
-            json_strings.len(),
-            schema,
-        ),
+        ArrowDataType::Utf8 => {
+            parse_json_inner(json_strings.as_string::<i32>().iter(), num_rows, schema)
+        }
+        ArrowDataType::LargeUtf8 => {
+            parse_json_inner(json_strings.as_string::<i64>().iter(), num_rows, schema)
+        }
+        ArrowDataType::Utf8View => {
+            parse_json_inner(json_strings.as_string_view().iter(), num_rows, schema)
+        }
         dt => Err(Error::generic(format!(
             "Expected string array for JSON parsing, got {dt}"
         ))),
@@ -1182,13 +1179,41 @@ pub(crate) fn parse_json_impl(
 fn parse_json_inner<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
+    schema: SchemaRef,
+) -> DeltaResult<RecordBatch> {
+    // arrow-json's typed Timestamp/Date/Decimal decoders fail the entire batch on a single
+    // bad cell. `StringifyFailureProneLeaves` rewrites those leaves to `String` so the
+    // typed decode accepts any well-formed JSON string; `safe_cast_back` then casts each
+    // string cell back to the target type with `safe: true`, producing per-cell NULL on
+    // parse failure. `Cow::Borrowed` from the transform means no failure-prone leaves
+    // were present, so we can skip the safe-cast pass entirely.
+    match StringifyFailureProneLeaves.transform_struct(schema.as_ref()) {
+        Cow::Borrowed(_) => {
+            let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
+            decode_with_arrow_json(json_strings, num_rows, arrow_target)
+        }
+        Cow::Owned(relaxed) => {
+            let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
+            let arrow_relaxed = Arc::new(ArrowSchema::try_from_kernel(&relaxed)?);
+            let decoded = decode_with_arrow_json(json_strings, num_rows, arrow_relaxed)?;
+            safe_cast_back(decoded, &arrow_target)
+        }
+    }
+}
+
+/// Runs arrow-json's typed `Decoder` against the given schema and returns the resulting
+/// `RecordBatch`. Each input string must contain exactly one JSON object; missing inputs
+/// (`None`) decode as `{}` so the row stays present with all-NULL fields.
+fn decode_with_arrow_json<'a>(
+    json_strings: impl Iterator<Item = Option<&'a str>>,
+    num_rows: usize,
     schema: ArrowSchemaRef,
 ) -> DeltaResult<RecordBatch> {
     if num_rows == 0 {
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    let mut decoder = ReaderBuilder::new(schema.clone())
+    let mut decoder = ReaderBuilder::new(schema)
         .with_batch_size(num_rows)
         .with_coerce_primitive(true)
         .build_decoder()?;
@@ -1223,6 +1248,100 @@ fn parse_json_inner<'a>(
     Err(Error::generic(
         "Malformed JSON: exited parse_json_impl without deserializing anything useful",
     ))
+}
+
+/// Rewrites the four arrow-json-failure-prone primitive types (`Timestamp`, `TimestampNtz`,
+/// `Date`, `Decimal`) to `String` so the typed decoder will accept any well-formed JSON
+/// string instead of failing the whole batch on cells the typed parsers reject. The
+/// post-decode safe-cast pass converts each string cell back to the original type,
+/// producing per-cell NULL on parse failure.
+///
+/// `Array`/`Map`/`Variant` are NOT visited because the Delta protocol does not record
+/// min/max stats for those types (see `MinMaxStatsTransform` in
+/// `scan::data_skipping::stats_schema`), so a failure-prone leaf can only ever appear
+/// inside a `Struct` for our callers. If a future caller passes a schema with
+/// failure-prone leaves nested inside `Array`/`Map`/`Variant`, drop these no-op overrides
+/// (the default recursion will then walk into them) and add the matching arms to
+/// [`safe_cast_array`].
+struct StringifyFailureProneLeaves;
+
+impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Cow<'a, PrimitiveType> {
+        match ptype {
+            PrimitiveType::Timestamp
+            | PrimitiveType::TimestampNtz
+            | PrimitiveType::Date
+            | PrimitiveType::Decimal(_) => Cow::Owned(PrimitiveType::String),
+            _ => Cow::Borrowed(ptype),
+        }
+    }
+
+    fn transform_array(&mut self, atype: &'a ArrayType) -> Cow<'a, ArrayType> {
+        Cow::Borrowed(atype)
+    }
+
+    fn transform_map(&mut self, mtype: &'a MapType) -> Cow<'a, MapType> {
+        Cow::Borrowed(mtype)
+    }
+
+    fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+        Cow::Borrowed(stype)
+    }
+}
+
+/// Walks the decoded `RecordBatch` against the original target schema in lockstep and
+/// safe-casts every leaf back to its target type. `safe: true` produces per-cell NULL on
+/// parse failure instead of erroring out the whole batch.
+fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+    let opts = CastOptions {
+        safe: true,
+        ..Default::default()
+    };
+    let columns = decoded
+        .columns()
+        .iter()
+        .zip(target.fields().iter())
+        .map(|(arr, field)| safe_cast_array(arr.clone(), field.data_type(), &opts))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(target.clone(), columns)?)
+}
+
+/// Recursive worker for [`safe_cast_back`]. Recurses through `Struct` containers
+/// preserving the parent null buffer, and applies `cast_with_options` at the leaves.
+///
+/// Delta protocol does not record min/max stats for `Array`/`Map`/`Variant` columns (see
+/// `MinMaxStatsTransform` in `scan::data_skipping::stats_schema`), so a failure-prone leaf
+/// can only ever reach this function nested inside a `Struct`. If that invariant ever
+/// changes, drop the no-op overrides on [`StringifyFailureProneLeaves`] and add the
+/// matching arms here.
+fn safe_cast_array(
+    array: ArrowArrayRef,
+    target: &ArrowDataType,
+    opts: &CastOptions<'_>,
+) -> DeltaResult<ArrowArrayRef> {
+    if array.data_type() == target {
+        return Ok(array);
+    }
+    match target {
+        ArrowDataType::Struct(target_fields) => {
+            let s = array.as_struct();
+            let nulls = s.nulls().cloned();
+            let new_children = s
+                .columns()
+                .iter()
+                .zip(target_fields.iter())
+                .map(|(c, f)| safe_cast_array(c.clone(), f.data_type(), opts))
+                .collect::<DeltaResult<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                target_fields.clone(),
+                new_children,
+                nulls,
+            )?))
+        }
+        _ => Ok(cast_with_options(&array, target, opts)?),
+    }
 }
 
 pub(crate) fn filter_to_record_batch(
@@ -1498,11 +1617,7 @@ mod tests {
     #[test]
     fn test_json_parsing() {
         static EXPECTED_JSON_ERR_STR: &str = "Generic delta kernel error: Malformed JSON: Multiple, partial, or 0 JSON objects on row";
-        fn check_parse_fails(
-            input: Vec<Option<&str>>,
-            schema: ArrowSchemaRef,
-            expected_start: &str,
-        ) {
+        fn check_parse_fails(input: Vec<Option<&str>>, schema: SchemaRef, expected_start: &str) {
             let result = parse_json_impl(&StringArray::from(input), schema);
             let err = result.expect_err("Expected an error");
             let msg = err.to_string();
@@ -1512,11 +1627,14 @@ mod tests {
             );
         }
 
-        let requested_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("a", ArrowDataType::Int32, true),
-            ArrowField::new("b", ArrowDataType::Utf8, true),
-            ArrowField::new("c", ArrowDataType::Int32, true),
-        ]));
+        let requested_schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::STRING),
+                StructField::nullable("c", DataType::INTEGER),
+            ])
+            .unwrap(),
+        );
         let input: Vec<&str> = vec![];
         let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
@@ -1541,7 +1659,7 @@ mod tests {
         );
 
         let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
-        let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
+        let result = parse_json_impl(&StringArray::from(input), requested_schema).unwrap();
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.column(0).null_count(), 2);
         assert_eq!(result.column(1).null_count(), 2);
@@ -1551,16 +1669,14 @@ mod tests {
     #[test]
     fn test_parse_json_with_long_strings() {
         // See issue#1139: https://github.com/delta-io/delta-kernel-rs/issues/1139
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "long_val",
-            ArrowDataType::Utf8,
-            true,
-        )]));
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("long_val", DataType::STRING)]).unwrap(),
+        );
         let long_string = "a".repeat(1_000_000); // 1MB string
         let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
         let input: Vec<Option<&str>> = vec![Some(&json_string)];
 
-        let batch = parse_json_impl(&StringArray::from(input), schema.clone()).unwrap();
+        let batch = parse_json_impl(&StringArray::from(input), schema).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
@@ -1650,27 +1766,223 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_json_impl_propagates_type_errors() {
-        // Verify that parse_json_impl surfaces errors for values that don't match the schema,
-        // so the expression-level caller can catch them and return nulls.
-
-        // Value overflow: 99999 doesn't fit in decimal(4,2) (max 99.99)
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            ArrowDataType::Decimal128(4, 2),
-            true,
-        )]));
-        let input: Vec<Option<&str>> = vec![Some(r#"{"a": 99999}"#)];
-        assert!(parse_json_impl(&StringArray::from(input), schema).is_err());
-
-        // Type mismatch: string where integer expected
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            ArrowDataType::Int64,
-            true,
-        )]));
+    fn test_parse_json_impl_strict_leaf_errors_propagate() {
+        // Type mismatches on strict (non-failure-prone) leaves still surface as batch-level
+        // errors, so the expression-level caller can fall back to its all-null backstop.
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("a", DataType::LONG)]).unwrap(),
+        );
         let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
         assert!(parse_json_impl(&StringArray::from(input), schema).is_err());
+    }
+
+    // === Per-cell NULL on failure-prone leaf parse failures ===
+
+    /// Parses `inputs` against a single-column schema `{column_name: leaf_type}` and asserts
+    /// that rows in `expected_null_rows` are NULL while every other row is non-null.
+    fn assert_per_cell_null_isolation(
+        column_name: &str,
+        leaf_type: DataType,
+        inputs: &[&str],
+        expected_null_rows: &[usize],
+    ) {
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable(column_name, leaf_type)]).unwrap(),
+        );
+        let inputs: Vec<Option<&str>> = inputs.iter().copied().map(Some).collect();
+        let batch = parse_json_impl(&StringArray::from(inputs.clone()), schema)
+            .expect("parse_json_impl should not error on failure-prone leaf parse failures");
+        assert_eq!(batch.num_rows(), inputs.len());
+        let col = batch.column(0);
+        assert_eq!(
+            col.null_count(),
+            expected_null_rows.len(),
+            "unexpected null count for column {column_name}",
+        );
+        for row in 0..inputs.len() {
+            let want_null = expected_null_rows.contains(&row);
+            assert_eq!(
+                col.is_null(row),
+                want_null,
+                "row {row} of column {column_name}: expected is_null={want_null}",
+            );
+        }
+    }
+
+    /// Per-cell NULL isolation across the four failure-prone leaf types. Each case feeds
+    /// a 3-row single-column batch where row 1 is malformed in a way that defeats
+    /// arrow-json's typed decoder; rows 0 and 2 must round-trip to valid typed cells.
+    #[rstest]
+    #[case::timestamp_extended_year(
+        DataType::TIMESTAMP,
+        &[
+            r#"{"v": "2024-01-01T00:00:00Z"}"#,
+            r#"{"v": "+48690-07-02T22:50:38.211Z"}"#,
+            r#"{"v": "2025-06-01T00:00:00Z"}"#,
+        ],
+    )]
+    #[case::timestamp_ntz_garbage(
+        DataType::TIMESTAMP_NTZ,
+        &[
+            r#"{"v": "2024-01-01T00:00:00"}"#,
+            r#"{"v": "not-a-timestamp"}"#,
+            r#"{"v": "2025-06-01T00:00:00"}"#,
+        ],
+    )]
+    #[case::date_out_of_range_month(
+        DataType::DATE,
+        &[
+            r#"{"v": "2024-01-01"}"#,
+            r#"{"v": "2024-13-01"}"#,
+            r#"{"v": "2025-06-30"}"#,
+        ],
+    )]
+    #[case::decimal_overflow(
+        DataType::decimal(10, 2).unwrap(),
+        &[
+            r#"{"v": "10.50"}"#,
+            r#"{"v": "99999999999.99"}"#,
+            r#"{"v": "5.25"}"#,
+        ],
+    )]
+    fn test_parse_json_safe_cast_per_cell_null(
+        #[case] leaf_type: DataType,
+        #[case] inputs: &[&str],
+    ) {
+        assert_per_cell_null_isolation("v", leaf_type, inputs, &[1]);
+    }
+
+    #[test]
+    fn test_parse_json_safe_cast_intermixed_struct_per_cell_isolation() {
+        // Single struct with mixed failure-prone and strict leaves. The bad EventTime on row 1
+        // must not contaminate IngestTime / Price / UserId on the same row, nor any field on
+        // rows 0 / 2. This is the per-cell isolation property end-to-end.
+        let schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("EventTime", DataType::TIMESTAMP),
+                StructField::nullable("IngestTime", DataType::TIMESTAMP),
+                StructField::nullable("Price", DataType::decimal(10, 2).unwrap()),
+                StructField::nullable("UserId", DataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let inputs: Vec<Option<&str>> = vec![
+            Some(
+                r#"{"EventTime": "2024-01-01T00:00:00Z", "IngestTime": "2024-01-01T00:00:01Z", "Price": "10.50", "UserId": 1}"#,
+            ),
+            Some(
+                r#"{"EventTime": "+48690-07-02T22:50:38.211Z", "IngestTime": "2024-06-01T00:00:01Z", "Price": "20.00", "UserId": 2}"#,
+            ),
+            Some(
+                r#"{"EventTime": "2025-06-01T00:00:00Z", "IngestTime": "2025-06-01T00:00:01Z", "Price": "30.75", "UserId": 3}"#,
+            ),
+        ];
+        let batch = parse_json_impl(&StringArray::from(inputs.clone()), schema).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let event_time = batch.column_by_name("EventTime").unwrap();
+        let ingest_time = batch.column_by_name("IngestTime").unwrap();
+        let price = batch.column_by_name("Price").unwrap();
+        let user_id = batch.column_by_name("UserId").unwrap();
+
+        assert!(!event_time.is_null(0) && event_time.is_null(1) && !event_time.is_null(2));
+        assert_eq!(event_time.null_count(), 1);
+
+        for col in [&ingest_time, &price, &user_id] {
+            assert_eq!(
+                col.null_count(),
+                0,
+                "row 1's bad EventTime should not contaminate other fields in the same row"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_json_safe_cast_nested_stats_shape() {
+        // Mirrors the Delta stats StructType:
+        //   { numRecords: Long, nullCount: { EventTime: Long, UserId: Long },
+        //     minValues: { EventTime: Timestamp, UserId: Long },
+        //     maxValues: { EventTime: Timestamp, UserId: Long },
+        //     tightBounds: Bool }
+        let null_count_struct = StructType::try_new(vec![
+            StructField::nullable("EventTime", DataType::LONG),
+            StructField::nullable("UserId", DataType::LONG),
+        ])
+        .unwrap();
+        let min_max_struct = StructType::try_new(vec![
+            StructField::nullable("EventTime", DataType::TIMESTAMP),
+            StructField::nullable("UserId", DataType::LONG),
+        ])
+        .unwrap();
+        let schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("numRecords", DataType::LONG),
+                StructField::nullable("nullCount", null_count_struct),
+                StructField::nullable("minValues", min_max_struct.clone()),
+                StructField::nullable("maxValues", min_max_struct),
+                StructField::nullable("tightBounds", DataType::BOOLEAN),
+            ])
+            .unwrap(),
+        );
+
+        let inputs: Vec<Option<&str>> = vec![
+            Some(
+                r#"{"numRecords": 10, "nullCount": {"EventTime": 0, "UserId": 0},
+                    "minValues": {"EventTime": "2024-01-01T00:00:00Z", "UserId": 1},
+                    "maxValues": {"EventTime": "2024-01-31T00:00:00Z", "UserId": 100},
+                    "tightBounds": true}"#,
+            ),
+            Some(
+                r#"{"numRecords": 20, "nullCount": {"EventTime": 0, "UserId": 0},
+                    "minValues": {"EventTime": "+48690-07-02T22:50:38.211Z", "UserId": 5},
+                    "maxValues": {"EventTime": "+48690-07-02T22:50:38.211Z", "UserId": 200},
+                    "tightBounds": true}"#,
+            ),
+            Some(
+                r#"{"numRecords": 30, "nullCount": {"EventTime": 0, "UserId": 0},
+                    "minValues": {"EventTime": "2025-01-01T00:00:00Z", "UserId": 10},
+                    "maxValues": {"EventTime": "2025-12-31T00:00:00Z", "UserId": 300},
+                    "tightBounds": true}"#,
+            ),
+        ];
+        let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let num_records = batch.column_by_name("numRecords").unwrap();
+        assert_eq!(num_records.null_count(), 0);
+
+        let min_values = batch.column_by_name("minValues").unwrap().as_struct();
+        let max_values = batch.column_by_name("maxValues").unwrap().as_struct();
+        let min_event = min_values.column_by_name("EventTime").unwrap();
+        let max_event = max_values.column_by_name("EventTime").unwrap();
+        let min_user = min_values.column_by_name("UserId").unwrap();
+        let max_user = max_values.column_by_name("UserId").unwrap();
+
+        // EventTime min/max for row 1 must be NULL; rows 0 and 2 must be populated.
+        assert!(!min_event.is_null(0) && min_event.is_null(1) && !min_event.is_null(2));
+        assert!(!max_event.is_null(0) && max_event.is_null(1) && !max_event.is_null(2));
+        // UserId min/max stay populated on every row even when the sibling EventTime fails.
+        assert_eq!(min_user.null_count(), 0);
+        assert_eq!(max_user.null_count(), 0);
+    }
+
+    #[test]
+    fn test_parse_json_safe_cast_all_null_input() {
+        // Every row decodes to `{}` (the unwrap_or default for `None`), so every output cell
+        // is NULL and no error surfaces from the safe-cast pass.
+        let schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("ts", DataType::TIMESTAMP),
+                StructField::nullable("n", DataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let inputs: Vec<Option<&str>> = vec![None, None, None];
+        let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        for col in batch.columns() {
+            assert_eq!(col.null_count(), 3);
+        }
     }
 
     #[test]

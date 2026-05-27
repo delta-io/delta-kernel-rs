@@ -343,18 +343,19 @@ pub fn evaluate_expression(
             }
         }
         (ParseJson(p), _) => {
-            // Evaluate the JSON string expression
             let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
-
-            // Convert kernel schema to Arrow schema and parse
-            let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(p.output_schema.as_ref())?);
-            match parse_json_impl(json_arr.as_ref(), arrow_schema.clone()) {
+            // Coarser backstop for genuinely malformed JSON (incomplete records, unmatched
+            // braces, etc.). Cell-level type-parse failures in failure-prone leaves
+            // (Timestamp/Date/Decimal) are handled inside `parse_json_impl` itself, which
+            // converts them to per-cell NULL rather than failing the batch.
+            match parse_json_impl(json_arr.as_ref(), p.output_schema.clone()) {
                 Ok(batch) => Ok(Arc::new(StructArray::from(batch)) as ArrayRef),
                 Err(e) => {
                     warn!(
                         "Failed to parse JSON stats as {}: {e}. Using null stats.",
                         p.output_schema,
                     );
+                    let arrow_schema = ArrowSchema::try_from_kernel(p.output_schema.as_ref())?;
                     Ok(new_null_array(
                         &ArrowDataType::Struct(arrow_schema.fields().clone()),
                         json_arr.len(),
@@ -1966,47 +1967,29 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_json_errors_return_nulls() {
-        // ParseJson is used for stats parsing. Corrupt or unparseable values should produce
-        // null output rather than failing the query -- files with null stats simply skip data
-        // skipping and are always included in scan results.
+    fn test_parse_json_strict_leaf_errors_fall_back_to_all_null_struct() {
+        // ParseJson is used for stats parsing. Type-parse failures on strict leaves still hit
+        // the coarse swallow inside the ParseJson arm, which returns an all-null struct so
+        // data skipping degrades to "include the file" rather than failing the query.
+        // Per-cell NULLs on failure-prone leaves (Timestamp/Date/Decimal) are tested in
+        // `engine::arrow_utils::tests::test_parse_json_safe_cast_*` and do NOT go through
+        // this fallback.
+        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
+        let json_strings: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
+        let len = json_strings.len();
+        let json_arr = StringArray::from(json_strings);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_arr)]).unwrap();
 
-        fn assert_parse_json_result_all_nulls(
-            json_strings: Vec<Option<&str>>,
-            output_schema: Arc<StructType>,
-        ) {
-            let schema =
-                ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-            let len = json_strings.len();
-            let json_arr = StringArray::from(json_strings);
-            let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_arr)]).unwrap();
+        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "a",
+            DataType::LONG,
+            true,
+        )]));
+        let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
 
-            let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
-            let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-            assert_eq!(result.len(), len);
-            assert_eq!(result.null_count(), len);
-        }
-
-        // Type mismatch: string value where integer is expected
-        assert_parse_json_result_all_nulls(
-            vec![Some(r#"{"a": "not_a_number"}"#)],
-            Arc::new(StructType::new_unchecked(vec![StructField::new(
-                "a",
-                DataType::LONG,
-                true,
-            )])),
-        );
-
-        // Value overflow: 99999 doesn't fit in decimal(4,2) (max 99.99)
-        assert_parse_json_result_all_nulls(
-            vec![Some(r#"{"a": 99999}"#)],
-            Arc::new(StructType::new_unchecked(vec![StructField::new(
-                "a",
-                DataType::decimal(4, 2).unwrap(),
-                true,
-            )])),
-        );
+        assert_eq!(result.len(), len);
+        assert_eq!(result.null_count(), len);
     }
 
     // ==================== MapToStruct Tests ====================
