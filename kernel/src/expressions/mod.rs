@@ -334,46 +334,49 @@ where
     Err(de::Error::custom("Cannot deserialize an Opaque Expression"))
 }
 
-/// A transformation affecting a single field (one pieces of a [`Transform`]). The transformation
-/// could insert 0+ new fields after the target, or could replace the target with 0+ a new fields).
+/// A patch affecting a single input field.
+///
+/// A field patch can insert zero or more expressions after its input field, or it can replace the
+/// input field with zero or more expressions.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct FieldTransform {
-    /// The list of expressions this field transform emits at the target location.
+pub struct ExpressionFieldPatch {
+    /// The expressions this field patch emits at the input field's output position.
     pub exprs: Vec<ExpressionRef>,
     /// If true, the output expressions replace the input field instead of following after it.
     pub is_replace: bool,
-    /// If true, this transform is silently ignored when the target field does not exist in the
-    /// input. Otherwise, a missing target field produces an error.
+    /// If true, this patch is silently ignored when the input field does not exist. Otherwise, a
+    /// missing input field produces an error.
     pub optional: bool,
 }
 
-/// A transformation that efficiently represents sparse modifications to struct schemas.
+/// A sparse expression patch over the fields of one input struct.
 ///
-/// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
-/// specifying those fields that actually change (inserted, replaced, or deleted). Any input field
-/// not specifically mentioned by the transform is passed through, unmodified and with the same
-/// relative field ordering. This is particularly useful for wide schemas where only a few columns
-/// need to be modified and/or dropped, or where a small number of columns need to be injected.
+/// `ExpressionStructPatch` achieves `O(changes)` space complexity instead of `O(schema_width)` by
+/// only specifying fields that actually change (inserted, replaced, or deleted). Any input field
+/// not specifically mentioned by the patch is passed through, unmodified and with the same relative
+/// field ordering. This is particularly useful for wide schemas where only a few columns need to be
+/// modified and/or dropped, or where a small number of columns need to be injected.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Transform {
-    /// The path to the nested input struct this transform operates on (if any). If no path is
-    /// given, the transform operates directly on top-level columns.
+pub struct ExpressionStructPatch {
+    /// The path to the nested input struct this patch operates on (if any). If no path is given,
+    /// the patch operates directly on top-level columns.
     pub input_path: Option<ColumnName>,
-    /// A mapping from named input fields to the transform to be performed on each field.
-    pub field_transforms: HashMap<String, FieldTransform>,
+    /// A mapping from named input fields to the patch to be performed on each field.
+    #[serde(alias = "field_transforms")]
+    pub field_patches: HashMap<String, ExpressionFieldPatch>,
     /// A list of new fields to emit before processing the first input field.
     pub prepended_fields: Vec<ExpressionRef>,
 }
 
-impl Transform {
-    /// Creates a new top-level identity transform. The various `with_xxx` helper methods can be
-    /// used to add specific field transforms.
+impl ExpressionStructPatch {
+    /// Creates a new empty top-level patch. The various `with_xxx` helper methods can be
+    /// used to add specific field patches.
     pub fn new_top_level() -> Self {
         Self::default()
     }
 
-    /// Creates a new identity transform that operates on fields of a nested struct identified by
-    /// `path`. The various `with_xxx` helper methods can be used to add specific field transforms.
+    /// Creates a new empty patch that operates on fields of a nested struct identified by
+    /// `path`. The various `with_xxx` helper methods can be used to add specific field patches.
     pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
     where
         ColumnName: FromIterator<A>,
@@ -422,9 +425,8 @@ impl Transform {
         self
     }
 
-    /// True if this is the identity transform (all input fields pass through unchanged, with no new
-    /// fields inserted).
-    pub fn is_identity(&self) -> bool {
+    /// True if this patch makes no changes.
+    pub fn is_empty(&self) -> bool {
         self.prepended_fields.is_empty() && self.field_patches.is_empty()
     }
 
@@ -433,9 +435,9 @@ impl Transform {
         self.input_path.as_ref()
     }
 
-    // Gets or creates the field transform for a named input field
-    fn field_transform(&mut self, field_name: impl Into<String>) -> &mut FieldTransform {
-        self.field_transforms.entry(field_name.into()).or_default()
+    // Gets or creates the field patch for a named input field.
+    fn field_patch(&mut self, field_name: impl Into<String>) -> &mut ExpressionFieldPatch {
+        self.field_patches.entry(field_name.into()).or_default()
     }
 }
 
@@ -456,9 +458,10 @@ pub enum Expression {
     /// The optional nullability predicate, if provided and evaluates to false/null, makes the
     /// entire struct null.
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
-    /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
+    /// A sparse patch of a struct. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
-    Transform(Transform),
+    #[serde(alias = "Transform")]
+    StructPatch(ExpressionStructPatch),
     /// An expression that takes one expression as input.
     Unary(UnaryExpression),
     /// An expression that takes two expressions as input.
@@ -695,9 +698,9 @@ impl Expression {
         )
     }
 
-    /// Create a new transform expression
-    pub fn transform(transform: Transform) -> Self {
-        Self::Transform(transform)
+    /// Create a new struct patch expression.
+    pub fn struct_patch(patch: ExpressionStructPatch) -> Self {
+        Self::StructPatch(patch)
     }
 
     /// Create a new predicate `self IS NULL`

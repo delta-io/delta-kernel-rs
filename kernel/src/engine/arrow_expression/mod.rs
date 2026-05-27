@@ -348,7 +348,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //     )));
         // };
         let batch = match (self.expression.as_ref(), &self.output_type) {
-            (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_identity() => {
+            (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
                 // Empty patch optimization: Skip expression evaluation and directly apply the
                 // output schema to the input RecordBatch. This is used to cheaply apply a new
                 // output schema to existing data without changing it, e.g. for column mapping.

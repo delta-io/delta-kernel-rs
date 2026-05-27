@@ -1385,7 +1385,7 @@ impl<S> Transaction<S> {
     }
 }
 
-/// Builds the transform expression for converting scan row metadata into a Remove action.
+/// Builds the struct patch for converting scan row metadata into a Remove action.
 ///
 /// Handles two "parsed" columns that predicate-based scans add to scan metadata:
 ///
@@ -1396,7 +1396,7 @@ impl<S> Transaction<S> {
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.
-fn build_remove_transform(
+fn build_remove_struct_patch(
     commit_timestamp: i64,
     data_change: bool,
     columns_to_drop: &[&str],
@@ -1964,7 +1964,7 @@ mod tests {
             "Partition column 'letter' should be dropped. Expression: {expr_str}"
         );
 
-        // With materializePartitionColumns, no columns should be dropped (identity transform)
+        // With materializePartitionColumns, no columns should be dropped (empty patch)
         let (snap_with, wc_with) = snapshot_and_partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
         )?;

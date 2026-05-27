@@ -152,9 +152,9 @@ fn evaluate_struct_expression(
     Ok(Arc::new(data))
 }
 
-/// Evaluates a transform expression by building expressions in input schema order
-fn evaluate_transform_expression(
-    transform: &Transform,
+/// Evaluates a struct patch expression by building expressions in input schema order.
+fn evaluate_struct_patch_expression(
+    patch: &ExpressionStructPatch,
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {

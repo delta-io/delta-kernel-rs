@@ -111,11 +111,14 @@ pub trait ExpressionTransform<'a> {
         Carrier::from_inner(Cow::Borrowed(name))
     }
 
-    /// Called for each transform expression encountered during the traversal (leaf).
+    /// Called for each struct patch expression encountered during the traversal (leaf).
     ///
     /// The provided implementation does _NOT_ recurse into its children.
-    fn transform_expr_transform(&mut self, transform: &'a Transform) -> Self::Output<Transform> {
-        Carrier::from_inner(Cow::Borrowed(transform))
+    fn transform_expr_struct_patch(
+        &mut self,
+        patch: &'a ExpressionStructPatch,
+    ) -> Self::Output<ExpressionStructPatch> {
+        Carrier::from_inner(Cow::Borrowed(patch))
     }
 
     /// Called for each parse-json expression encountered during the traversal. The provided
