@@ -88,7 +88,8 @@ fn nested_struct_fixture() -> (SchemaRef, Vec<RecordBatch>) {
 /// Validate that JSON stats object values match the corresponding parsed struct array.
 ///
 /// Recurses into nested struct sub-fields so paths like `minValues.info.age` are checked.
-/// `field_path` is the dotted path used in assertion messages (e.g. `"minValues"`).
+/// `field_path` is the path prefix for assertion messages at this recursion level
+/// (e.g. `"minValues"` at the top level; extended to `"minValues.info.age"` when recursing).
 fn assert_stats_struct_matches_json(
     struct_array: &StructArray,
     json_object: &serde_json::Map<String, serde_json::Value>,
