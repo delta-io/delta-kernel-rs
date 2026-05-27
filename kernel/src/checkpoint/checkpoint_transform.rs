@@ -16,7 +16,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::ADD_NAME;
-use crate::expressions::{Expression, ExpressionRef, Transform, UnaryExpressionOp};
+use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatch, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
@@ -83,16 +83,16 @@ pub(crate) fn build_checkpoint_transform(
     stats_schema: &SchemaRef,
     partition_schema: Option<&SchemaRef>,
 ) -> ExpressionRef {
-    let mut add_transform = Transform::new_nested([ADD_NAME]);
+    let mut add_patch = ExpressionStructPatch::new_nested([ADD_NAME]);
 
     // Handle stats field
     if config.write_stats_as_json {
         // Populate stats from stats_parsed if needed (for old checkpoints that only had
         // stats_parsed)
-        add_transform = add_transform.with_replaced_field(STATS_FIELD, STATS_JSON_EXPR.clone());
+        add_patch = add_patch.with_replaced_field(STATS_FIELD, STATS_JSON_EXPR.clone());
     } else {
         // Drop stats field when not writing as JSON
-        add_transform = add_transform.with_dropped_field(STATS_FIELD);
+        add_patch = add_patch.with_dropped_field(STATS_FIELD);
     }
 
     // Handle stats_parsed field
@@ -101,30 +101,30 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_struct {
         // Populate stats_parsed from JSON stats (for commits that only have JSON stats)
         let stats_parsed_expr = build_stats_parsed_expr(stats_schema);
-        add_transform = add_transform.with_replaced_field(STATS_PARSED_FIELD, stats_parsed_expr);
+        add_patch = add_patch.with_replaced_field(STATS_PARSED_FIELD, stats_parsed_expr);
     } else {
         // Drop stats_parsed field when not writing as struct
-        add_transform = add_transform.with_dropped_field(STATS_PARSED_FIELD);
+        add_patch = add_patch.with_dropped_field(STATS_PARSED_FIELD);
     }
 
     // Handle partitionValues_parsed field (only for partitioned tables)
     if partition_schema.is_some() {
         if config.write_stats_as_struct {
             let pv_parsed_expr = build_partition_values_parsed_expr();
-            add_transform =
-                add_transform.with_replaced_field(PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
+            add_patch =
+                add_patch.with_replaced_field(PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
         } else {
             // Drop partitionValues_parsed since it was added to read schema
-            add_transform = add_transform.with_dropped_field(PARTITION_VALUES_PARSED_FIELD);
+            add_patch = add_patch.with_dropped_field(PARTITION_VALUES_PARSED_FIELD);
         }
     }
 
-    // Wrap the nested Add transform in a top-level transform that replaces the Add field
-    let add_transform_expr: ExpressionRef = Arc::new(Expression::transform(add_transform));
-    let outer_transform =
-        Transform::new_top_level().with_replaced_field(ADD_NAME, add_transform_expr);
+    // Wrap the nested Add patch in a top-level patch that replaces the Add field.
+    let add_patch_expr: ExpressionRef = Arc::new(Expression::struct_patch(add_patch));
+    let outer_patch =
+        ExpressionStructPatch::new_top_level().with_replaced_field(ADD_NAME, add_patch_expr);
 
-    Arc::new(Expression::transform(outer_transform))
+    Arc::new(Expression::struct_patch(outer_patch))
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
@@ -353,59 +353,59 @@ mod tests {
         assert!(config.write_stats_as_struct);
     }
 
-    /// Helper to extract the outer and inner transforms from a stats transform expression.
-    /// Returns (outer_transform, inner_transform).
-    fn extract_transforms(expr: &Expression) -> (&Transform, &Transform) {
-        let Expression::Transform(outer) = expr else {
-            panic!("Expected outer Transform expression");
+    /// Helper to extract the outer and inner patches from a stats transform expression.
+    /// Returns (outer_patch, inner_patch).
+    fn extract_patches(expr: &Expression) -> (&ExpressionStructPatch, &ExpressionStructPatch) {
+        let Expression::StructPatch(outer) = expr else {
+            panic!("Expected outer StructPatch expression");
         };
 
         // Outer should be top-level (no input path)
         assert!(
             outer.input_path.is_none(),
-            "Outer transform should be top-level"
+            "Outer patch should be top-level"
         );
 
         // Outer should replace "add" field
-        let add_field_transform = outer
-            .field_transforms
+        let add_field_patch = outer
+            .field_patches
             .get(ADD_NAME)
-            .expect("Outer transform should have 'add' field transform");
-        assert!(add_field_transform.is_replace, "Should replace 'add' field");
+            .expect("Outer patch should have 'add' field patch");
+        assert!(add_field_patch.is_replace, "Should replace 'add' field");
         assert_eq!(
-            add_field_transform.exprs.len(),
+            add_field_patch.exprs.len(),
             1,
             "Should have exactly one replacement expression"
         );
 
-        // Extract inner transform
-        let Expression::Transform(inner) = add_field_transform.exprs[0].as_ref() else {
-            panic!("Expected inner Transform expression for 'add' field");
+        // Extract inner patch
+        let Expression::StructPatch(inner) = add_field_patch.exprs[0].as_ref() else {
+            panic!("Expected inner StructPatch expression for 'add' field");
         };
 
         // Inner should target "add" path
         assert_eq!(
             inner.input_path.as_ref().map(|p| p.to_string()),
             Some("add".to_string()),
-            "Inner transform should target 'add' path"
+            "Inner patch should target 'add' path"
         );
 
         (outer, inner)
     }
 
-    /// Helper to check if a field transform is a drop (replace with nothing).
-    fn is_drop(transform: &Transform, field: &str) -> bool {
-        transform
-            .field_transforms
+    /// Helper to check if a field patch is a drop (replace with nothing).
+    fn is_drop(patch: &ExpressionStructPatch, field: &str) -> bool {
+        patch
+            .field_patches
             .get(field)
             .map(|ft| ft.is_replace && ft.exprs.is_empty())
             .unwrap_or(false)
     }
 
-    /// Helper to check if a field transform is a replacement with an expression.
-    fn is_replacement(transform: &Transform, field: &str) -> bool {
-        transform
-            .field_transforms
+    /// Helper to check if a field patch is a replacement with an expression.
+    fn is_replacement(patch: &ExpressionStructPatch, field: &str) -> bool {
+        patch
+            .field_patches
             .get(field)
             .map(|ft| ft.is_replace && ft.exprs.len() == 1)
             .unwrap_or(false)
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn test_build_transform_with_json_only() {
         // writeStatsAsJson=true, writeStatsAsStruct=false (default)
-        // Inner transform: stats=COALESCE, stats_parsed=drop
+        // Inner patch: stats=COALESCE, stats_parsed=drop
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: false,
@@ -422,7 +422,7 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
 
-        let (_, inner) = extract_transforms(&transform_expr);
+        let (_, inner) = extract_patches(&transform_expr);
 
         // stats should be replaced with COALESCE expression
         assert!(
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn test_build_transform_drops_both_when_false() {
         // writeStatsAsJson=false, writeStatsAsStruct=false
-        // Inner transform: stats=drop, stats_parsed=drop
+        // Inner patch: stats=drop, stats_parsed=drop
         let config = StatsTransformConfig {
             write_stats_as_json: false,
             write_stats_as_struct: false,
@@ -448,7 +448,7 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
 
-        let (_, inner) = extract_transforms(&transform_expr);
+        let (_, inner) = extract_patches(&transform_expr);
 
         // Both fields should be dropped
         assert!(is_drop(inner, STATS_FIELD), "stats should be dropped");
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn test_build_transform_with_both_enabled() {
         // writeStatsAsJson=true, writeStatsAsStruct=true
-        // Inner transform: stats=COALESCE, stats_parsed=COALESCE
+        // Inner patch: stats=COALESCE, stats_parsed=COALESCE
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: true,
@@ -469,7 +469,7 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
 
-        let (_, inner) = extract_transforms(&transform_expr);
+        let (_, inner) = extract_patches(&transform_expr);
 
         // Both fields should be replaced with COALESCE expressions
         assert!(
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn test_build_transform_struct_only() {
         // writeStatsAsJson=false, writeStatsAsStruct=true
-        // Inner transform: stats=drop, stats_parsed=COALESCE
+        // Inner patch: stats=drop, stats_parsed=COALESCE
         let config = StatsTransformConfig {
             write_stats_as_json: false,
             write_stats_as_struct: true,
@@ -493,7 +493,7 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
 
-        let (_, inner) = extract_transforms(&transform_expr);
+        let (_, inner) = extract_patches(&transform_expr);
 
         // stats should be dropped
         assert!(is_drop(inner, STATS_FIELD), "stats should be dropped");
@@ -519,7 +519,7 @@ mod tests {
         ]));
         let transform_expr = build_checkpoint_transform(&config, &stats_schema, Some(&pv_schema));
 
-        let (_, inner) = extract_transforms(&transform_expr);
+        let (_, inner) = extract_patches(&transform_expr);
 
         // partitionValues_parsed should be replaced with COALESCE expression
         assert!(
@@ -542,7 +542,7 @@ mod tests {
         )]));
         let transform_expr = build_checkpoint_transform(&config, &stats_schema, Some(&pv_schema));
 
-        let (_, inner) = extract_transforms(&transform_expr);
+        let (_, inner) = extract_patches(&transform_expr);
 
         // partitionValues_parsed should be dropped
         assert!(
@@ -561,12 +561,12 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
 
-        let (_, inner) = extract_transforms(&transform_expr);
+        let (_, inner) = extract_patches(&transform_expr);
 
         // No partitionValues_parsed transform should exist
         assert!(
             !inner
-                .field_transforms
+                .field_patches
                 .contains_key(PARTITION_VALUES_PARSED_FIELD),
             "non-partitioned table should not have partitionValues_parsed transform"
         );

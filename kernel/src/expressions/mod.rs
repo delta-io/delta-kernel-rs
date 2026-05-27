@@ -386,24 +386,24 @@ impl Transform {
 
     /// Specifies a field to drop.
     pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.is_replace = true;
+        let field_patch = self.field_patch(name);
+        field_patch.is_replace = true;
         self
     }
 
     /// Like [`Self::with_dropped_field`], but silently ignored if the field does not exist.
     pub fn with_dropped_field_if_exists(mut self, name: impl Into<String>) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.is_replace = true;
-        field_transform.optional = true;
+        let field_patch = self.field_patch(name);
+        field_patch.is_replace = true;
+        field_patch.optional = true;
         self
     }
 
     /// Specifies an expression to replace a field with.
     pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.exprs.push(expr);
-        field_transform.is_replace = true;
+        let field_patch = self.field_patch(name);
+        field_patch.exprs.push(expr);
+        field_patch.is_replace = true;
         self
     }
 
@@ -416,7 +416,7 @@ impl Transform {
         expr: ExpressionRef,
     ) -> Self {
         match after {
-            Some(field_name) => self.field_transform(field_name).exprs.push(expr),
+            Some(field_name) => self.field_patch(field_name).exprs.push(expr),
             None => self.prepended_fields.push(expr),
         }
         self
@@ -425,10 +425,10 @@ impl Transform {
     /// True if this is the identity transform (all input fields pass through unchanged, with no new
     /// fields inserted).
     pub fn is_identity(&self) -> bool {
-        self.prepended_fields.is_empty() && self.field_transforms.is_empty()
+        self.prepended_fields.is_empty() && self.field_patches.is_empty()
     }
 
-    /// None, if this is a top-level transform. Otherwise, the path of this nested transform.
+    /// None, if this is a top-level patch. Otherwise, the path of this nested patch.
     pub fn input_path(&self) -> Option<&ColumnName> {
         self.input_path.as_ref()
     }
@@ -1033,25 +1033,25 @@ impl Display for Expression {
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
             Struct(exprs, _) => write!(f, "Struct({})", format_child_list(exprs)),
-            Transform(transform) => {
-                write!(f, "Transform(")?;
+            StructPatch(patch) => {
+                write!(f, "StructPatch(")?;
                 let mut sep = "";
-                if !transform.prepended_fields.is_empty() {
-                    let prepended_fields = format_child_list(&transform.prepended_fields);
+                if !patch.prepended_fields.is_empty() {
+                    let prepended_fields = format_child_list(&patch.prepended_fields);
                     write!(f, "prepend [{prepended_fields}]")?;
                     sep = ", ";
                 }
-                for (field_name, field_transform) in &transform.field_transforms {
-                    let insertions = &field_transform.exprs;
+                for (field_name, field_patch) in &patch.field_patches {
+                    let insertions = &field_patch.exprs;
                     if insertions.is_empty() {
-                        if field_transform.is_replace {
+                        if field_patch.is_replace {
                             write!(f, "{sep}drop {field_name}")?;
                         } else {
                             continue; // no-op; ignore it and don't change `sep` below
                         }
                     } else {
                         let insertions = format_child_list(insertions);
-                        if field_transform.is_replace {
+                        if field_patch.is_replace {
                             write!(f, "{sep}replace {field_name} with [{insertions}]")?;
                         } else {
                             write!(f, "{sep}after {field_name} insert [{insertions}]")?;
@@ -1269,7 +1269,7 @@ mod tests {
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, Predicate, Scalar, Transform, UnaryExpressionOp,
+            Expression, ExpressionStructPatch, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::utils::test_utils::assert_result_error_with_message;
@@ -1432,7 +1432,7 @@ mod tests {
             assert_roundtrip(&expr);
         }
 
-        // ==================== Expression::Struct/Transform/Other Tests ====================
+        // ==================== Expression::Struct/StructPatch/Other Tests ====================
 
         #[test]
         fn test_struct_expression_roundtrip() {
@@ -1448,17 +1448,19 @@ mod tests {
         fn test_transform_expressions_roundtrip() {
             let cases: Vec<Expression> = vec![
                 // Identity transform
-                Expression::transform(Transform::new_top_level()),
+                Expression::struct_patch(ExpressionStructPatch::new_top_level()),
                 // Drop field
-                Expression::transform(Transform::new_top_level().with_dropped_field("old_column")),
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_top_level().with_dropped_field("old_column"),
+                ),
                 // Replace field
-                Expression::transform(
-                    Transform::new_top_level()
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_top_level()
                         .with_replaced_field("original", Arc::new(Expression::literal(0))),
                 ),
                 // Insert fields
-                Expression::transform(
-                    Transform::new_top_level()
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_top_level()
                         .with_inserted_field(Some("after_col"), Arc::new(column_expr!("new_col")))
                         .with_inserted_field(
                             None::<String>,
@@ -1466,8 +1468,9 @@ mod tests {
                         ),
                 ),
                 // Nested transform
-                Expression::transform(
-                    Transform::new_nested(["parent", "child"]).with_dropped_field("to_drop"),
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_nested(["parent", "child"])
+                        .with_dropped_field("to_drop"),
                 ),
             ];
 

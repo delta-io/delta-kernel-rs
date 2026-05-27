@@ -19,7 +19,7 @@ use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta, LazyCr
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, Scalar, Transform};
+use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
 use crate::log_segment::LogSegment;
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
@@ -302,8 +302,8 @@ where
 {
     let evaluation_handler = engine.evaluation_handler();
     add_files_metadata.map(move |add_files_batch| {
-        let transform = Expression::transform(
-            Transform::new_top_level()
+        let patch_expr = Expression::struct_patch(
+            ExpressionStructPatch::new_top_level()
                 .with_inserted_field(
                     Some("modificationTime"),
                     Expression::literal(data_change).into(),
@@ -313,7 +313,7 @@ where
                     Expression::unary(ToJson, Expression::column(["stats"])).into(),
                 ),
         );
-        let adds_expr = Expression::struct_from([transform]);
+        let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
             Arc::new(adds_expr),
@@ -881,15 +881,15 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a Transform expression that drops partition columns from the input
+        // Build a StructPatch expression that drops partition columns from the input
         // (unless they should be materialized).
-        let mut transform = Transform::new_top_level();
+        let mut patch = ExpressionStructPatch::new_top_level();
         if !should_materialize_partition_columns {
             for col in &partition_cols {
-                transform = transform.with_dropped_field_if_exists(col);
+                patch = patch.with_dropped_field_if_exists(col);
             }
         }
-        Expression::transform(transform)
+        Expression::struct_patch(patch)
     }
 
     /// Returns the logical partition column names for this table.
@@ -1346,13 +1346,13 @@ impl<S> Transaction<S> {
         let evaluation_handler = engine.evaluation_handler();
 
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
-            let transform = build_remove_transform(
+            let patch = build_remove_struct_patch(
                 self.commit_timestamp,
                 self.data_change,
                 columns_to_drop,
                 coalesce_stats_with_parsed,
             );
-            let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
+            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)]));
             evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
@@ -1401,8 +1401,8 @@ fn build_remove_transform(
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
-) -> Transform {
-    let mut transform = Transform::new_top_level()
+) -> ExpressionStructPatch {
+    let mut patch = ExpressionStructPatch::new_top_level()
         // deletionTimestamp
         .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
         // dataChange
@@ -1416,13 +1416,13 @@ fn build_remove_transform(
 
     if coalesce_stats_with_parsed {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
-        // Both expressions are registered on the "stats" field_transform (is_replace=true),
+        // Both expressions are registered on the "stats" field_patch (is_replace=true),
         // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
         let coalesce_stats = Expression::coalesce([
             Expression::column(["stats"]),
             Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
         ]);
-        transform = transform
+        patch = patch
             .with_replaced_field("stats", coalesce_stats.into())
             .with_inserted_field(
                 Some("stats"),
@@ -1431,13 +1431,13 @@ fn build_remove_transform(
             .with_dropped_field_if_exists(STATS_PARSED_NAME);
     } else {
         // tags inserted after stats; stats passes through unchanged
-        transform = transform.with_inserted_field(
+        patch = patch.with_inserted_field(
             Some("stats"),
             Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
         );
     }
 
-    transform = transform
+    patch = patch
         .with_inserted_field(
             Some("deletionVector"),
             Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
@@ -1452,10 +1452,10 @@ fn build_remove_transform(
         .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
 
     for column_to_drop in columns_to_drop {
-        transform = transform.with_dropped_field(*column_to_drop);
+        patch = patch.with_dropped_field(*column_to_drop);
     }
 
-    transform
+    patch
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to
