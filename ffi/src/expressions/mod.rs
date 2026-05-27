@@ -25,7 +25,7 @@ pub mod opaque_eval;
 mod arrow_eval;
 
 #[cfg(feature = "default-engine-base")]
-use opaque_eval::OpaqueEvalCallbacks;
+use opaque_eval::{EvalMode, OpaqueEvalCallbacks};
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
 pub struct SharedExpression;
@@ -113,34 +113,27 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 ///
 /// # Data skipping
 ///
-/// When wrapped via `Predicate::arrow_opaque`, `as_data_skipping_predicate` rewrites each
-/// `Column` argument into a positional `Expression::struct_from([min_ref, max_ref])` so the
-/// engine's callback receives a `StructArray` it can crack to get min/max per file. Literal args
-/// pass through unchanged. The op's identity and arity are preserved, so the same engine
-/// callback handles both row-time and stats-time evaluation -- it inspects each arg's runtime
-/// data type (struct = stats mode, primitive = row mode).
+/// `as_data_skipping_predicate` rewrites each `Column` arg into a `Struct[min_ref, max_ref]` and
+/// tags the op with `EvalMode::StatsMode`. Literals pass through; `Predicate` children recurse.
+/// See [`EngineEvalPredFn`] for the per-mode arg shapes the engine callback must handle.
 ///
-/// File pruning is only possible when callbacks are attached -- without them, the rewritten
-/// predicate would error at runtime. Bare ops
-/// (`Predicate::opaque(NamedOpaquePredicateOp::new(...))`) abstain from file pruning.
+/// Bare ops (`Predicate::opaque(NamedOpaquePredicateOp::new(...))`) have no callback attached
+/// and so abstain from file pruning. Scalar / partition-pruning paths always abstain.
 ///
-/// The scalar/partition-pruning paths always abstain (`Ok(None)`).
-///
-/// # Known limitations
-///
-/// - Min/max lookup uses a sentinel `DataType::LONG`; columns whose stats schema doesn't carry
-///   LONG-typed min/max (strings, decimals not matching, etc.) silently abstain. A follow-up commit
-///   will plumb the real column type through.
-/// - Inversion (`inverted == true`) abstains -- per-op negation semantics aren't expressed.
-/// - Expression kinds other than `Column`, `Literal`, and `Predicate` abstain.
+/// Inverted ops (`inverted == true`) abstain -- per-op negation isn't expressible. Expression
+/// kinds other than `Column`, `Literal`, and `Predicate` also abstain.
 ///
 /// [`OpaqueEvalCallbacks`]: opaque_eval::OpaqueEvalCallbacks
+/// [`EngineEvalPredFn`]: opaque_eval::EngineEvalPredFn
 #[derive(Debug, Clone)]
 pub struct NamedOpaquePredicateOp {
     name: String,
     #[cfg(feature = "default-engine-base")]
     #[allow(dead_code)] // read via callbacks_clone() under default-engine-base
     callbacks: Option<Arc<OpaqueEvalCallbacks>>,
+    /// Mode forwarded to the engine callback during eval. Defaults to `RowMode`.
+    #[cfg(feature = "default-engine-base")]
+    mode: EvalMode,
 }
 
 impl NamedOpaquePredicateOp {
@@ -151,11 +144,12 @@ impl NamedOpaquePredicateOp {
             name: name.into(),
             #[cfg(feature = "default-engine-base")]
             callbacks: None,
+            #[cfg(feature = "default-engine-base")]
+            mode: EvalMode::RowMode,
         }
     }
 
-    /// Build an op that consults `callbacks` during row-time predicate
-    /// evaluation through the Arrow batch evaluator.
+    /// Build an op that consults `callbacks` during eval. Defaults to `RowMode`.
     #[cfg(feature = "default-engine-base")]
     pub(crate) fn with_callbacks(
         name: impl Into<String>,
@@ -164,7 +158,15 @@ impl NamedOpaquePredicateOp {
         Self {
             name: name.into(),
             callbacks: Some(callbacks),
+            mode: EvalMode::RowMode,
         }
+    }
+
+    /// Consume `self` and return it with `mode` overridden.
+    #[cfg(feature = "default-engine-base")]
+    pub(crate) fn with_mode(mut self, mode: EvalMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     #[cfg(feature = "default-engine-base")]
@@ -176,8 +178,15 @@ impl NamedOpaquePredicateOp {
     pub(crate) fn callbacks_clone(&self) -> Option<Arc<OpaqueEvalCallbacks>> {
         self.callbacks.clone()
     }
+
+    #[cfg(feature = "default-engine-base")]
+    pub(crate) fn mode(&self) -> EvalMode {
+        self.mode
+    }
 }
 
+// Equality by name only. Safe today because kernel has no predicate CSE path; if it gains one,
+// extend this to include `mode` and `callbacks` pointer identity.
 impl PartialEq for NamedOpaquePredicateOp {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name

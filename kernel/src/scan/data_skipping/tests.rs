@@ -394,6 +394,32 @@ fn test_timestamp_stats_enabled() {
     );
 }
 
+/// Tripwire: the FFI opaque-predicate rewrite
+/// (`ffi/src/expressions/arrow_eval.rs::as_data_skipping_predicate`) passes `DataType::LONG`
+/// as a sentinel to `get_min_stat`/`get_max_stat` because it doesn't know each column's real
+/// type. That works because LONG is in `is_skipping_eligible_datatype`, so the type-gate
+/// (`has_min_max_stats(data_type)`) lets the lookup through. If kernel ever drops LONG from
+/// the eligible set, every FFI opaque-predicate column silently loses pruning; the FFI then
+/// needs a new sentinel (or per-column type plumbing).
+#[test]
+fn data_skipping_creators_accept_long_sentinel_for_ffi_rewrite() {
+    let empty_parts: HashSet<String> = HashSet::new();
+    let stats_columns: HashSet<ColumnName> = [column_name!("any_col")].into_iter().collect();
+    let creator = DataSkippingPredicateCreator {
+        partition_columns: &empty_parts,
+        stats_columns: &stats_columns,
+    };
+    let null_guarded = NullGuardedDataSkippingPredicateCreator {
+        partition_columns: HashSet::new(),
+        stats_columns: &stats_columns,
+    };
+    let col = &column_name!("any_col");
+    assert!(creator.get_min_stat(col, &DataType::LONG).is_some());
+    assert!(creator.get_max_stat(col, &DataType::LONG).is_some());
+    assert!(null_guarded.get_min_stat(col, &DataType::LONG).is_some());
+    assert!(null_guarded.get_max_stat(col, &DataType::LONG).is_some());
+}
+
 #[test]
 fn test_adjust_scalar_for_max_stat_truncation() {
     // Timestamp: subtracts 999us

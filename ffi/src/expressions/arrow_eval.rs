@@ -28,19 +28,15 @@ use delta_kernel::kernel_predicates::{
 use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
-use super::opaque_eval::OpaqueEvalCallbacks;
+use super::opaque_eval::{EvalMode, OpaqueEvalCallbacks};
 use super::NamedOpaquePredicateOp;
 use crate::engine_data::ArrowFFIData;
 use crate::kernel_string_slice;
 
-/// Evaluate each arg using kernel's standard evaluator, then bundle the
-/// resulting `ArrayRef`s as a single-batch `RecordBatch` keyed by
-/// `arg0..argN`.
+/// Pre-evaluate each arg into an `ArrayRef`, bundle them as a `RecordBatch` keyed `arg0..argN`.
 ///
-/// `Expression::Struct` args produced by `as_data_skipping_predicate` are pre-evaluated
-/// field-by-field and assembled into a `StructArray` here, since kernel's evaluator requires a
-/// `DataType::Struct` result type for struct expressions and we don't know the field types
-/// upfront (they depend on the underlying stats schema).
+/// `Expression::Struct` args (produced by the stats-mode rewrite) get a dedicated path because
+/// kernel's evaluator needs a `DataType::Struct` result type to name fields, which we don't have.
 fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<RecordBatch> {
     let arrays: Vec<ArrayRef> = args
         .iter()
@@ -57,8 +53,8 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
         .collect();
     let schema = Arc::new(Schema::new(fields));
 
-    // Zero-arg ops (e.g. NOW(), RAND()): empty-schema batch with the correct
-    // row count so the engine knows how many rows to emit.
+    // Zero-arg ops (e.g. NOW(), RAND()): empty-schema batch with explicit row count so the
+    // engine knows how many rows to emit.
     if arrays.is_empty() {
         let n_rows = batch.num_rows();
         return RecordBatch::try_new_with_options(
@@ -73,9 +69,8 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
         .map_err(|e| Error::Generic(format!("opaque eval batch construction: {e}")))
 }
 
-/// Build a `StructArray` from a `Expression::Struct`'s child expressions, naming fields
-/// positionally (`f0`, `f1`, ...). Engine callbacks crack the resulting struct by index, not
-/// by name, so the names are just placeholders that satisfy Arrow's schema requirements.
+/// Build a `StructArray` from a struct expression's children, naming fields positionally
+/// (`f0`, `f1`, ...). Engines crack by index; names are placeholders.
 fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaResult<ArrayRef> {
     let arrays: Vec<ArrayRef> = fields
         .iter()
@@ -84,11 +79,11 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
     let arrow_fields: Fields = arrays
         .iter()
         .enumerate()
-        .map(|(i, a)| Field::new(format!("f{i}"), a.data_type().clone(), a.is_nullable()))
+        .map(|(i, a)| Field::new(format!("f{i}"), a.data_type().clone(), true))
         .collect();
-    let sa = StructArray::try_new(arrow_fields, arrays, None)
-        .map_err(|e| Error::Generic(format!("struct arg construction: {e}")))?;
-    Ok(Arc::new(sa))
+    StructArray::try_new(arrow_fields, arrays, None)
+        .map(|sa| Arc::new(sa) as ArrayRef)
+        .map_err(|e| Error::Generic(format!("struct arg construction: {e}")))
 }
 
 /// Import an `ArrowFFIData` written by the engine back into an `ArrayRef`.
@@ -134,6 +129,7 @@ fn call_eval_pred(
     op_name: &str,
     args: &[Expression],
     batch: &RecordBatch,
+    mode: EvalMode,
     inverted: bool,
 ) -> DeltaResult<BooleanArray> {
     let args_batch = evaluate_args(args, batch)?;
@@ -148,6 +144,7 @@ fn call_eval_pred(
             cb.engine_state,
             kernel_string_slice!(op_name),
             &mut args_ffi,
+            mode,
             inverted,
             &mut result_ffi,
         )
@@ -181,7 +178,7 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
                 self.op_name()
             ))
         })?;
-        call_eval_pred(&cb, self.op_name(), args, batch, inverted)
+        call_eval_pred(&cb, self.op_name(), args, batch, self.mode(), inverted)
     }
 
     fn eval_pred_scalar(
@@ -221,10 +218,12 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         // logic correctly drops this branch from the stats predicate.
         self.callbacks_clone()?;
 
-        // SENTINEL: kernel's `get_min_stat`/`get_max_stat` use the requested type only as a
-        // gate against the stats schema -- columns whose min/max stats don't carry LONG
-        // silently abstain. A follow-up commit will plumb the real per-column type through
-        // the FFI so non-numeric columns (string, decimal, etc.) become prunable too.
+        // Kernel's `DataSkippingPredicateCreator` gates this via `has_min_max_stats(data_type)`;
+        // LONG is in the eligible set, so the rewrite passes the gate regardless of the column's
+        // real type. The resulting `stats_parsed.{min,max}Values.<col>` ref reads whatever type
+        // the stats column actually has at evaluation time. Tripwire if LONG ever leaves the
+        // eligible set: `data_skipping_creators_accept_long_sentinel_for_ffi_rewrite` in
+        // `kernel/src/scan/data_skipping/tests.rs`.
         const SENTINEL_TYPE: DataType = DataType::LONG;
 
         let mut rewritten = Vec::with_capacity(exprs.len());
@@ -233,8 +232,6 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
                 Expression::Column(col) => {
                     let min = evaluator.get_min_stat(col, &SENTINEL_TYPE)?;
                     let max = evaluator.get_max_stat(col, &SENTINEL_TYPE)?;
-                    // Positional struct: field 0 = min, field 1 = max. Field names come from
-                    // the result schema at evaluation time, so engines crack by index.
                     Expression::struct_from([min, max])
                 }
                 Expression::Literal(_) => arg.clone(),
@@ -248,7 +245,8 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         }
         // arrow_opaque (not bare opaque) so runtime dispatch reaches our callback via the
         // ArrowOpaquePredicateOpAdaptor.
-        Some(Predicate::arrow_opaque(self.clone(), rewritten))
+        let stats_op = self.clone().with_mode(EvalMode::StatsMode);
+        Some(Predicate::arrow_opaque(stats_op, rewritten))
     }
 }
 
@@ -309,9 +307,11 @@ mod tests {
         _state: *mut c_void,
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
+        mode: EvalMode,
         inverted: bool,
         result_out: *mut ArrowFFIData,
     ) -> bool {
+        assert_eq!(mode, EvalMode::RowMode);
         let batch = unsafe { take_ffi_record_batch(args_in) };
         assert_eq!(batch.num_columns(), 2);
         let col = batch
@@ -344,6 +344,7 @@ mod tests {
         _state: *mut c_void,
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
+        _mode: EvalMode,
         inverted: bool,
         result_out: *mut ArrowFFIData,
     ) -> bool {
@@ -378,6 +379,7 @@ mod tests {
             *mut c_void,
             KernelStringSlice,
             *mut ArrowFFIData,
+            EvalMode,
             bool,
             *mut ArrowFFIData,
         ) -> bool,
@@ -466,6 +468,7 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             _args_in: *mut ArrowFFIData,
+            _mode: EvalMode,
             _inverted: bool,
             _result_out: *mut ArrowFFIData,
         ) -> bool {
@@ -486,6 +489,7 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
+            _mode: EvalMode,
             _inverted: bool,
             result_out: *mut ArrowFFIData,
         ) -> bool {
@@ -509,6 +513,7 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
+            _mode: EvalMode,
             _inverted: bool,
             _result_out: *mut ArrowFFIData,
         ) -> bool {
@@ -536,6 +541,7 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
+            _mode: EvalMode,
             _inverted: bool,
             result_out: *mut ArrowFFIData,
         ) -> bool {
@@ -802,9 +808,8 @@ mod tests {
             assert!(matches!(opaque.exprs[2], Expression::Predicate(_)));
         }
 
-        /// End-to-end: rewrite produces a predicate that evaluates against a synthesized
-        /// stats batch -- proves the rewrite wraps via `arrow_opaque` (a bare opaque would
-        /// fail the downcast inside the arrow evaluator and never invoke the callback).
+        /// End-to-end: rewrite -> evaluate against a synthesized stats batch -> callback fires.
+        /// Bare `Predicate::opaque` would fail the adapter downcast and silently skip the callback.
         #[test]
         fn rewritten_predicate_dispatches_to_engine_callback() {
             use std::ffi::c_void;
@@ -820,9 +825,11 @@ mod tests {
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
+                mode: EvalMode,
                 _inverted: bool,
                 result_out: *mut ArrowFFIData,
             ) -> bool {
+                assert_eq!(mode, EvalMode::StatsMode);
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 CALL_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
                 let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; batch.num_rows()]));

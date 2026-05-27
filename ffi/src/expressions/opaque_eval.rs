@@ -37,6 +37,19 @@ use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
 use crate::KernelStringSlice;
 
+/// Tells the engine callback how to interpret each arg slot (see [`EngineEvalPredFn`]).
+///
+/// ABI: `#[repr(u8)]`. New variants must append, never reorder.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalMode {
+    /// Per-row evaluation against a data batch. Each arg slot carries one value per row.
+    RowMode = 0,
+    /// Per-file evaluation against a stats batch. `Column` args arrive as `Struct[min, max]`;
+    /// literals pass through.
+    StatsMode = 1,
+}
+
 /// Engine callback for evaluating an opaque predicate.
 ///
 /// Args are pre-evaluated by kernel: `args_in` is a RecordBatch (Struct array with one field per
@@ -53,6 +66,24 @@ use crate::KernelStringSlice;
 /// Returns `true` on success. On `false`, kernel treats the call as a non-fatal evaluation error
 /// and surfaces an `Err` upstream.
 ///
+/// # Arg shapes per [`EvalMode`]
+///
+/// In `RowMode`, each arg slot carries one Arrow value per data row matching the original
+/// expression: `Column` -> column array, `Literal` -> broadcast array, `Predicate` ->
+/// `BooleanArray`. Engine returns one bool per row.
+///
+/// In `StatsMode`, each arg slot carries one value per file, shaped by the original expression:
+///
+/// - `Column` (primitive): `StructArray[min, max]`. Crack by index; inner field names are not part
+///   of the contract.
+/// - `Column` (struct): `StructArray[min, max]` where each side mirrors the column's nested schema.
+///   Delta tracks min/max per leaf only.
+/// - `Column` (map/array): Delta has no min/max for these; slot is NULL and the file is kept.
+/// - `Literal`: broadcast array, same as row mode.
+/// - `Predicate`: `BooleanArray` of per-file verdicts (nulls = keep).
+///
+/// Engine returns one bool per file: `false` = prune, `true` or `null` = keep.
+///
 /// # Engine-side ownership pattern
 /// ```ignore
 /// // Take ownership of the args FFI handles (leaves kernel's slot empty).
@@ -64,6 +95,7 @@ pub type EngineEvalPredFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
+    mode: EvalMode,
     inverted: bool,
     result_out: *mut ArrowFFIData,
 ) -> bool;
@@ -147,6 +179,7 @@ pub(crate) mod tests {
         _state: *mut c_void,
         _op_name: KernelStringSlice,
         _args_in: *mut ArrowFFIData,
+        _mode: EvalMode,
         _inverted: bool,
         _result_out: *mut ArrowFFIData,
     ) -> bool {
