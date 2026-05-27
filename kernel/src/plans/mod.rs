@@ -8,7 +8,7 @@ use bytes::Bytes;
 pub use ir::{IoOperation, Plan, QueryPlan, QueryPlanNode};
 pub use query_builder::QueryPlanBuilder;
 
-use crate::{AsAny, DeltaResult, DeltaResultIterator, EngineData, Error, FileMeta};
+use crate::{AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta};
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
 ///
@@ -24,31 +24,31 @@ pub trait PlanExecutor: AsAny {
 /// Each variant describes a different shape of output that a plan can possibly produce.
 pub enum PlanResult {
     /// A stream of columnar data batches (as [`EngineData`]) produced by the plan.
-    Data(DeltaResultIterator<Box<dyn EngineData>>),
+    Data(DeltaResultIteratorStatic<Box<dyn EngineData>>),
     /// A stream of file metadata entries.
-    FileMeta(DeltaResultIterator<FileMeta>),
+    FileMeta(DeltaResultIteratorStatic<FileMeta>),
     /// A stream of raw byte buffers.
-    Bytes(DeltaResultIterator<Bytes>),
+    Bytes(DeltaResultIteratorStatic<Bytes>),
     /// Represents the successful completion of a plan, but with no return value.
     Unit,
 }
 
 impl PlanResult {
-    pub fn into_data(self) -> DeltaResult<DeltaResultIterator<Box<dyn EngineData>>> {
+    pub fn into_data(self) -> DeltaResult<DeltaResultIteratorStatic<Box<dyn EngineData>>> {
         match self {
             Self::Data(iter) => Ok(iter),
             other => Err(other.type_mismatch("Data")),
         }
     }
 
-    pub fn into_file_meta(self) -> DeltaResult<DeltaResultIterator<FileMeta>> {
+    pub fn into_file_meta(self) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         match self {
             Self::FileMeta(iter) => Ok(iter),
             other => Err(other.type_mismatch("FileMeta")),
         }
     }
 
-    pub fn into_bytes(self) -> DeltaResult<DeltaResultIterator<Bytes>> {
+    pub fn into_bytes(self) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         match self {
             Self::Bytes(iter) => Ok(iter),
             other => Err(other.type_mismatch("Bytes")),
