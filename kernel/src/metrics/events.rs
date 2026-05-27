@@ -107,6 +107,48 @@ impl MetricEvent {
             | Self::ParquetReadCompleted(_) => {}
         }
     }
+
+    /// Dispatch a u64 field update to the inner struct. `Err(span_name)` if `name` is unknown
+    /// for the matched variant, so the caller can warn with context. Exhaustive.
+    pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        match self {
+            // Variants with u64 fields set during span lifetime.
+            Self::LogSegmentLoaded(e) => e.record_u64(name, value),
+            Self::SnapshotCompleted(e) => e.record_u64(name, value),
+            Self::CrcReadCompleted(e) => e.record_u64(name, value),
+
+            // No u64 fields set during span lifetime.
+            Self::ProtocolMetadataLoaded(_)
+            | Self::SnapshotFailed(_)
+            | Self::ScanMetadataCompleted(_)
+            | Self::StorageListCompleted(_)
+            | Self::StorageReadCompleted(_)
+            | Self::StorageCopyCompleted(_)
+            | Self::JsonReadCompleted(_)
+            | Self::ParquetReadCompleted(_) => Ok(()),
+        }
+    }
+
+    /// Dispatch a bool field update to the inner struct. `Err(span_name)` if `name` is unknown
+    /// for the matched variant, so the caller can warn with context. Exhaustive.
+    pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        match self {
+            // Variants with bool fields set during span lifetime.
+            Self::LogSegmentLoaded(e) => e.record_bool(name, value),
+
+            // No bool fields set during span lifetime.
+            Self::ProtocolMetadataLoaded(_)
+            | Self::SnapshotCompleted(_)
+            | Self::SnapshotFailed(_)
+            | Self::CrcReadCompleted(_)
+            | Self::ScanMetadataCompleted(_)
+            | Self::StorageListCompleted(_)
+            | Self::StorageReadCompleted(_)
+            | Self::StorageCopyCompleted(_)
+            | Self::JsonReadCompleted(_)
+            | Self::ParquetReadCompleted(_) => Ok(()),
+        }
+    }
 }
 
 impl fmt::Display for MetricEvent {

@@ -180,11 +180,15 @@ where
 }
 
 // ====================================================================
-// EventVisitor: dispatches field updates to the inner event struct
+// EventVisitor: dispatches field updates to the inner MetricEvent struct
 // ====================================================================
 
-/// Per-span visitor stashed in the span's extensions. Holds the partially-constructed event
-/// while the span runs, plus any deferred warnings to emit after locks are released.
+/// Per-span visitor stashed in the span's extensions. Responsible for:
+///
+/// 1. Holding the partially-constructed `MetricEvent` while the span runs.
+/// 2. Implementing [`Visit`] so the layer can route `record_*` callbacks to the underlying
+///    `MetricEvent` state.
+/// 3. Accumulating any deferred warnings to emit after locks are released.
 struct EventVisitor {
     event: Option<MetricEvent>,
     pending_warnings: Vec<String>,
@@ -211,13 +215,7 @@ impl Visit for EventVisitor {
         let Some(event) = self.event.as_mut() else {
             return;
         };
-        let result = match event {
-            MetricEvent::LogSegmentLoaded(e) => e.record_u64(field.name(), value),
-            MetricEvent::SnapshotCompleted(e) => e.record_u64(field.name(), value),
-            MetricEvent::CrcReadCompleted(e) => e.record_u64(field.name(), value),
-            _ => Ok(()),
-        };
-        if let Err(span_name) = result {
+        if let Err(span_name) = event.record_u64(field.name(), value) {
             self.warn_invalid(field, span_name);
         }
     }
@@ -226,11 +224,7 @@ impl Visit for EventVisitor {
         let Some(event) = self.event.as_mut() else {
             return;
         };
-        let result = match event {
-            MetricEvent::LogSegmentLoaded(e) => e.record_bool(field.name(), value),
-            _ => Ok(()),
-        };
-        if let Err(span_name) = result {
+        if let Err(span_name) = event.record_bool(field.name(), value) {
             self.warn_invalid(field, span_name);
         }
     }
