@@ -43,7 +43,7 @@ pub(crate) mod arrow_utils;
 #[cfg(all(feature = "internal-api", feature = "arrow-expression"))]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
 
-#[cfg(feature = "declarative-plans")]
+#[cfg(all(feature = "default-engine-base", feature = "declarative-plans"))]
 pub mod plans;
 
 #[cfg(test)]

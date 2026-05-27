@@ -1,0 +1,236 @@
+// Proto mirror of `kernel/src/expressions/mod.rs` + `scalars.rs` (the Rust IR is the source
+// of truth for these shapes).
+//
+// Opaque{Expression,Predicate} and Unknown are escape hatches: kernel-rs can't serialise the
+// opaque trait objects, and Unknown is the "do not silently interpret" marker. They appear
+// here so the grammar is total, but engines MUST error on them, not produce NULL.
+
+syntax = "proto3";
+
+package delta.kernel.expressions;
+
+import "schema.proto";
+
+// ============================================================================
+// Operator enums
+// ============================================================================
+
+enum UnaryPredicateOp {
+  UNARY_PREDICATE_OP_UNSPECIFIED = 0;
+  UNARY_PREDICATE_OP_IS_NULL = 1;
+}
+
+enum BinaryPredicateOp {
+  BINARY_PREDICATE_OP_UNSPECIFIED = 0;
+  BINARY_PREDICATE_OP_LESS_THAN = 1;
+  BINARY_PREDICATE_OP_GREATER_THAN = 2;
+  BINARY_PREDICATE_OP_EQUAL = 3;
+  BINARY_PREDICATE_OP_DISTINCT = 4;
+  BINARY_PREDICATE_OP_IN = 5;
+}
+
+enum UnaryExpressionOp {
+  UNARY_EXPRESSION_OP_UNSPECIFIED = 0;
+  UNARY_EXPRESSION_OP_TO_JSON = 1;
+}
+
+enum BinaryExpressionOp {
+  BINARY_EXPRESSION_OP_UNSPECIFIED = 0;
+  BINARY_EXPRESSION_OP_PLUS = 1;
+  BINARY_EXPRESSION_OP_MINUS = 2;
+  BINARY_EXPRESSION_OP_MULTIPLY = 3;
+  BINARY_EXPRESSION_OP_DIVIDE = 4;
+}
+
+enum VariadicExpressionOp {
+  VARIADIC_EXPRESSION_OP_UNSPECIFIED = 0;
+  VARIADIC_EXPRESSION_OP_COALESCE = 1;
+  VARIADIC_EXPRESSION_OP_ARRAY = 2;
+}
+
+enum JunctionPredicateOp {
+  JUNCTION_PREDICATE_OP_UNSPECIFIED = 0;
+  JUNCTION_PREDICATE_OP_AND = 1;
+  JUNCTION_PREDICATE_OP_OR = 2;
+}
+
+// ============================================================================
+// Scalar payloads
+// ============================================================================
+
+// `bits` is the unscaled integer, big-endian two's-complement; pair with `decimal_type` to
+// materialise a language-native decimal.
+message DecimalData {
+  bytes bits = 1;
+  delta.kernel.schema.DecimalType decimal_type = 2;
+}
+
+message ArrayData {
+  delta.kernel.schema.ArrayType array_type = 1;
+  repeated Scalar elements = 2;
+}
+
+// Modeled as repeated key/value pairs because proto map keys must be scalar, but Delta map
+// keys can be any `Scalar` (including structs).
+message MapEntry {
+  Scalar key = 1;
+  Scalar value = 2;
+}
+message MapData {
+  delta.kernel.schema.MapType map_type = 1;
+  repeated MapEntry pairs = 2;
+}
+
+// `fields` and `values` are pairwise indexed: `values[i]` is the value for `fields[i]`.
+message StructData {
+  repeated delta.kernel.schema.StructField fields = 1;
+  repeated Scalar values = 2;
+}
+
+// `Null` carries a `DataType` so the evaluator can produce a NULL of the right type.
+message Scalar {
+  oneof value {
+    int32 integer = 1;
+    int64 long = 2;
+    int32 short = 3;            // i16 narrowed at decode (proto has no i16)
+    int32 byte = 4;             // i8 narrowed at decode (proto has no i8)
+    float float = 5;
+    double double = 6;
+    string string = 7;
+    bool boolean = 8;
+    int64 timestamp = 9;        // micros since epoch, UTC
+    int64 timestamp_ntz = 10;   // micros since epoch, no tz
+    int32 date = 11;            // days since epoch
+    bytes binary = 12;
+    DecimalData decimal = 13;
+    delta.kernel.schema.DataType null = 14;
+    StructData struct = 15;
+    ArrayData array = 16;
+    MapData map = 17;
+  }
+}
+
+message ColumnName {
+  repeated string path = 1;
+}
+
+// ============================================================================
+// Composite expression bodies
+// ============================================================================
+
+message UnaryExpression {
+  UnaryExpressionOp op = 1;
+  Expression expr = 2;
+}
+
+message BinaryExpression {
+  BinaryExpressionOp op = 1;
+  Expression left = 2;
+  Expression right = 3;
+}
+
+message VariadicExpression {
+  VariadicExpressionOp op = 1;
+  repeated Expression exprs = 2;
+}
+
+message IfExpression {
+  Predicate condition = 1;
+  Expression then_expr = 2;
+  Expression else_expr = 3;
+}
+
+message ParseJsonExpression {
+  Expression json_expr = 1;
+  delta.kernel.schema.StructType output_schema = 2;
+}
+
+message MapToStructExpression {
+  Expression map_expr = 1;
+}
+
+// `nullability_predicate` is optional: when set and it evaluates to false/null, the whole
+// struct is null.
+message StructExpression {
+  repeated Expression exprs = 1;
+  Expression nullability_predicate = 2;
+}
+
+message FieldTransform {
+  repeated Expression exprs = 1;
+  bool is_replace = 2;
+  bool optional = 3;
+}
+
+message Transform {
+  // `input_path` is optional: absent means a top-level transform (no input path).
+  ColumnName input_path = 1;
+  map<string, FieldTransform> field_transforms = 2;
+  repeated Expression prepended_fields = 3;
+}
+
+// The opaque op carries only its `name()` because the Rust trait object can't be serialised;
+// engines resolve `name` against a local op registry or hard-error (never NULL).
+message OpaqueExpression {
+  string name = 1;
+  repeated Expression exprs = 2;
+}
+
+message OpaquePredicate {
+  string name = 1;
+  repeated Expression exprs = 2;
+}
+
+// ============================================================================
+// Predicate
+// ============================================================================
+
+message UnaryPredicate {
+  UnaryPredicateOp op = 1;
+  Expression expr = 2;
+}
+
+message BinaryPredicate {
+  BinaryPredicateOp op = 1;
+  Expression left = 2;
+  Expression right = 3;
+}
+
+message JunctionPredicate {
+  JunctionPredicateOp op = 1;
+  repeated Predicate preds = 2;
+}
+
+message Predicate {
+  oneof kind {
+    Expression boolean_expression = 1;
+    Predicate not = 2;
+    UnaryPredicate unary = 3;
+    BinaryPredicate binary = 4;
+    JunctionPredicate junction = 5;
+    OpaquePredicate opaque = 6;
+    string unknown = 7;
+  }
+}
+
+// ============================================================================
+// Expression
+// ============================================================================
+
+message Expression {
+  oneof kind {
+    Scalar literal = 1;
+    ColumnName column = 2;
+    Predicate predicate = 3;
+    StructExpression struct_expr = 4;
+    Transform transform = 5;
+    UnaryExpression unary = 6;
+    BinaryExpression binary = 7;
+    VariadicExpression variadic = 8;
+    IfExpression if_expr = 9;
+    OpaqueExpression opaque = 10;
+    ParseJsonExpression parse_json = 11;
+    MapToStructExpression map_to_struct = 12;
+    string unknown = 13;
+  }
+}
