@@ -254,10 +254,9 @@ impl LogState {
         self
     }
 
-    /// Latest version on the table. The total number of commits on disk is
-    /// `latest_version + 1`. (Does not yet account for log cleanup -- a
-    /// post-cleanup state where commits `0..K` have been removed is a
-    /// separate axis tracked in #2526.)
+    /// Latest version on the table. After cleanup, commits below
+    /// [`min_reachable_version`](Self::min_reachable_version) are gone, but
+    /// `latest_version` still reflects the highest committed version.
     pub fn latest_version(&self) -> u64 {
         self.latest_version
     }
@@ -1021,7 +1020,7 @@ impl TestTableBuilder {
 
     /// Apply a [`DataLayoutConfig`], setting the schema and layout columns. Pair with
     /// [`with_table_config`](Self::with_table_config) to also set write-time properties
-    /// like stats format -- these axes are independent.
+    /// (e.g. stats format); the two axes are independent.
     ///
     /// For `Unpartitioned`, leaves the schema and columns unchanged.
     pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
