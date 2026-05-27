@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use delta_kernel::arrow::array::{make_array, Array, ArrayRef, BooleanArray, RecordBatch};
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use delta_kernel::arrow::datatypes::{Field, Schema};
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOp, ArrowOpaquePredicateOp,
@@ -49,8 +49,8 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
         .collect();
     let schema = Arc::new(Schema::new(fields));
 
-    // If there are zero args, fall back to a single-column dummy of n_rows
-    // so the engine still receives a batch with the correct row count.
+    // Zero-arg ops (e.g. NOW(), RAND()): empty-schema batch with the correct
+    // row count so the engine knows how many rows to emit.
     if arrays.is_empty() {
         let n_rows = batch.num_rows();
         return RecordBatch::try_new_with_options(
@@ -67,6 +67,16 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
 
 /// Import an `ArrowFFIData` written by the engine back into an `ArrayRef`.
 fn import_ffi_array(ffi: &mut ArrowFFIData) -> DeltaResult<ArrayRef> {
+    // Engine returned success but never populated result_out: an empty
+    // FFI_ArrowArray has no `release` callback (per Arrow C Data Interface,
+    // every populated array carries a release fn). Detect this before
+    // handing the empties to `from_ffi`, which would otherwise be UB-adjacent.
+    if ffi.array.is_released() {
+        return Err(Error::Generic(
+            "engine callback returned success but wrote no result array".into(),
+        ));
+    }
+
     // Take ownership of the FFI structs out of the result buffer so the
     // engine's release callbacks fire exactly once.
     let array = std::mem::replace(&mut ffi.array, FFI_ArrowArray::empty());
@@ -82,16 +92,15 @@ fn import_ffi_array(ffi: &mut ArrowFFIData) -> DeltaResult<ArrayRef> {
 /// Engine returned an `ArrayRef` of the wrong top-level shape -- raise an
 /// error rather than silently coercing.
 fn require_boolean_array(arr: ArrayRef) -> DeltaResult<BooleanArray> {
-    match arr.data_type() {
-        ArrowDataType::Boolean => Ok(arr
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| Error::Generic("downcast to BooleanArray failed".into()))?
-            .clone()),
-        other => Err(Error::Generic(format!(
-            "opaque predicate eval_pred returned non-boolean array of type {other:?}"
-        ))),
-    }
+    arr.as_any()
+        .downcast_ref::<BooleanArray>()
+        .cloned()
+        .ok_or_else(|| {
+            Error::Generic(format!(
+                "opaque predicate eval_pred returned non-boolean array of type {:?}",
+                arr.data_type()
+            ))
+        })
 }
 
 fn call_eval_pred(
@@ -200,20 +209,28 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
 
     fn eval_as_data_skipping_predicate(
         &self,
-        _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
-        _exprs: &[Expression],
-        _inverted: bool,
+        evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
     ) -> Option<bool> {
-        None
+        // Defer to the kernel-side OpaquePredicateOp impl on Self so that
+        // ops constructed via `Predicate::arrow_opaque` (i.e. wrapped in the
+        // ArrowOpaquePredicateOpAdaptor) still consult the skipping_decomp
+        // facet through the Adaptor's delegating impl.
+        <Self as delta_kernel::expressions::OpaquePredicateOp>::eval_as_data_skipping_predicate(
+            self, evaluator, exprs, inverted,
+        )
     }
 
     fn as_data_skipping_predicate(
         &self,
-        _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
-        _exprs: &[Expression],
-        _inverted: bool,
+        evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
     ) -> Option<Predicate> {
-        None
+        <Self as delta_kernel::expressions::OpaquePredicateOp>::as_data_skipping_predicate(
+            self, evaluator, exprs, inverted,
+        )
     }
 }
 
@@ -297,14 +314,6 @@ mod tests {
     /// Write a result `ArrayRef` back into the engine's `result_out` slot,
     /// exporting it through Arrow C Data Interface.
     fn write_result(result_out: *mut ArrowFFIData, arr: ArrayRef) {
-        // Wrap as a top-level array via try_from_record_batch (single-column batch).
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "result",
-            arr.data_type().clone(),
-            true,
-        )]));
-        let _batch = RecordBatch::try_new(schema, vec![arr.clone()]).unwrap();
-
         // Convert ArrayRef directly to FFI struct, NOT struct-wrapped, since our
         // import path in arrow_eval expects a top-level array shape.
         let array_data = arr.to_data();
@@ -520,5 +529,127 @@ mod tests {
         let batch = batch_with_col(vec![Some("x")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
         assert!(format!("{err}").contains("engine eval_pred reported failure"));
+    }
+
+    // ============================================================================
+    // Symmetric error paths for the expression flavor + result-shape checks.
+    // ============================================================================
+
+    #[test]
+    fn missing_eval_expr_callback_errors() {
+        use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
+
+        let cb = Arc::new(OpaqueEvalCallbacks {
+            engine_state: ptr::null_mut(),
+            eval_pred: Some(engine_starts_with),
+            eval_expr: None,
+            free_state: noop_free,
+        });
+        let expr = Expression::arrow_opaque(
+            NamedOpaqueExpressionOp::with_callbacks("MISSING_EXPR", cb),
+            [column_expr!("col")],
+        );
+        let batch = batch_with_col(vec![Some("x")]);
+        let err = evaluate_expression(&expr, &batch, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("has no engine eval_expr callback"),
+            "expected eval_expr missing error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn engine_eval_expr_returning_false_surfaces_error() {
+        use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
+
+        unsafe extern "C" fn engine_fail(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            _args_in: *mut ArrowFFIData,
+            _result_out: *mut ArrowFFIData,
+        ) -> bool {
+            false
+        }
+        let cb = Arc::new(OpaqueEvalCallbacks {
+            engine_state: ptr::null_mut(),
+            eval_pred: None,
+            eval_expr: Some(engine_fail),
+            free_state: noop_free,
+        });
+        let expr = Expression::arrow_opaque(
+            NamedOpaqueExpressionOp::with_callbacks("ALWAYS_FAIL_EXPR", cb),
+            [column_expr!("col")],
+        );
+        let batch = batch_with_col(vec![Some("x")]);
+        let err = evaluate_expression(&expr, &batch, None).unwrap_err();
+        assert!(format!("{err}").contains("engine eval_expr reported failure"));
+    }
+
+    #[test]
+    fn engine_returning_non_boolean_array_errors() {
+        use delta_kernel::arrow::array::Int32Array;
+
+        unsafe extern "C" fn engine_int(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            _args_in: *mut ArrowFFIData,
+            _inverted: bool,
+            result_out: *mut ArrowFFIData,
+        ) -> bool {
+            // Pretend to evaluate but return an Int32Array, violating the
+            // BooleanArray contract for predicate results.
+            let out: Int32Array = (0..1).map(Some).collect();
+            write_result(result_out, Arc::new(out));
+            true
+        }
+        let cb = Arc::new(OpaqueEvalCallbacks {
+            engine_state: ptr::null_mut(),
+            eval_pred: Some(engine_int),
+            eval_expr: None,
+            free_state: noop_free,
+        });
+        let pred = Predicate::arrow_opaque(
+            NamedOpaquePredicateOp::with_callbacks("WRONG_SHAPE", cb),
+            [column_expr!("col")],
+        );
+        let batch = batch_with_col(vec![Some("x")]);
+        let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
+        assert!(
+            format!("{err}").contains("non-boolean array"),
+            "expected non-boolean array error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_arg_opaque_predicate_propagates_row_count() {
+        // Zero-arg ops (e.g. NOW(), RAND()): engine sees an empty-schema
+        // batch but must still emit `num_rows` results.
+        unsafe extern "C" fn engine_zero_arg(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _inverted: bool,
+            result_out: *mut ArrowFFIData,
+        ) -> bool {
+            let batch = unsafe { take_ffi_record_batch(args_in) };
+            assert_eq!(batch.num_columns(), 0, "expected zero-column batch");
+            let n = batch.num_rows();
+            let out: BooleanArray = (0..n).map(|_| Some(true)).collect();
+            write_result(result_out, Arc::new(out));
+            true
+        }
+        let cb = Arc::new(OpaqueEvalCallbacks {
+            engine_state: ptr::null_mut(),
+            eval_pred: Some(engine_zero_arg),
+            eval_expr: None,
+            free_state: noop_free,
+        });
+        let pred = Predicate::arrow_opaque(
+            NamedOpaquePredicateOp::with_callbacks("CONST_TRUE", cb),
+            [] as [Expression; 0],
+        );
+        let batch = batch_with_col(vec![Some("a"), Some("b"), Some("c")]);
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result.value(0) && result.value(1) && result.value(2));
     }
 }

@@ -34,9 +34,19 @@ use crate::KernelStringSlice;
 /// The engine writes its result (a top-level `BooleanArray`) into
 /// `result_out` by populating the `array` and `schema` fields. Kernel
 /// takes ownership of those handles via `from_ffi` after the call.
+/// Returning `true` without populating `result_out` is a contract
+/// violation; kernel detects the empty result and surfaces an error.
 ///
 /// Returns `true` on success. On `false`, kernel treats the call as a
 /// non-fatal evaluation error and surfaces an `Err` upstream.
+///
+/// # Engine-side ownership pattern
+/// ```ignore
+/// // Take ownership of the args FFI handles (leaves kernel's slot empty).
+/// let array = std::mem::replace(&mut (*args_in).array, FFI_ArrowArray::empty());
+/// let schema = std::mem::replace(&mut (*args_in).schema, FFI_ArrowSchema::empty());
+/// let data = from_ffi(array, &schema)?;
+/// ```
 pub type EngineEvalPredFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,

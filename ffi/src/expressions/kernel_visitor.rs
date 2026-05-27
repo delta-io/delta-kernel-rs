@@ -709,14 +709,13 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
     state: &mut KernelExpressionVisitorState,
     child_ids: I,
 ) -> Option<Vec<Expression>> {
+    // Drain ALL ids first so the ReferenceSet is consistently emptied,
+    // even when an earlier id is invalid.
     let resolved: Vec<Option<Expression>> = child_ids
         .into_iter()
         .map(|id| unwrap_kernel_expression(state, id))
         .collect();
-    if resolved.iter().any(Option::is_none) {
-        return None;
-    }
-    Some(resolved.into_iter().flatten().collect())
+    resolved.into_iter().collect()
 }
 
 /// Build `Predicate::Opaque(NamedOpaquePredicateOp(name), children)` without
@@ -869,10 +868,12 @@ fn visit_predicate_opaque_with_skipping_impl(
     skipping_decomp_id: usize,
 ) -> DeltaResult<usize> {
     let name = name?;
-    let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
-        return Ok(0);
-    };
-    let Some(decomp) = unwrap_kernel_predicate(state, skipping_decomp_id) else {
+    // Drain BOTH the child IDs AND the decomp ID unconditionally so the
+    // ReferenceSet is consistently emptied regardless of which validation
+    // fails. Asymmetric drain would leak the decomp's slot.
+    let exprs = resolve_opaque_children(state, children.map(|c| c as usize));
+    let decomp = unwrap_kernel_predicate(state, skipping_decomp_id);
+    let (Some(exprs), Some(decomp)) = (exprs, decomp) else {
         return Ok(0);
     };
     let op = NamedOpaquePredicateOp::with_skipping_decomp(name, decomp);
@@ -922,10 +923,12 @@ fn visit_predicate_opaque_with_eval_and_skipping_impl(
     skipping_decomp_id: usize,
 ) -> DeltaResult<usize> {
     let name = name?;
-    let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
-        return Ok(0);
-    };
-    let Some(decomp) = unwrap_kernel_predicate(state, skipping_decomp_id) else {
+    // Drain BOTH the child IDs AND the decomp ID unconditionally so the
+    // ReferenceSet is consistently emptied regardless of which validation
+    // fails. Asymmetric drain would leak the decomp's slot.
+    let exprs = resolve_opaque_children(state, children.map(|c| c as usize));
+    let decomp = unwrap_kernel_predicate(state, skipping_decomp_id);
+    let (Some(exprs), Some(decomp)) = (exprs, decomp) else {
         return Ok(0);
     };
     let op = NamedOpaquePredicateOp::with_callbacks_and_skipping(name, callbacks, decomp);
@@ -1190,5 +1193,287 @@ mod tests {
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, Expression::literal(Scalar::Null(dt)));
+    }
+
+    // ============================================================================
+    // Opaque-op builders (visit_predicate_opaque_impl and friends)
+    //
+    // These tests drive the `_impl` functions directly so we can construct
+    // `EngineIterator` from a plain Vec without going through the C FFI.
+    // ============================================================================
+
+    use std::os::raw::c_void;
+    use std::ptr::NonNull;
+
+    /// Backing buffer for a test `EngineIterator`: yields each id by casting
+    /// it directly to a pointer; the consumer casts back via `c as usize`.
+    ///
+    /// Caveat: an id of 0 is indistinguishable from "end of iteration" (the
+    /// `EngineIterator::next` contract treats null as exhausted). That's fine
+    /// here because 0 is already the kernel's sentinel for "invalid id".
+    struct IterState {
+        ids: Vec<usize>,
+        idx: usize,
+    }
+
+    extern "C" fn iter_next_direct(data: NonNull<c_void>) -> *const c_void {
+        // SAFETY: `data` was set up by `make_iter` to point at a live
+        // `IterState`; the iterator is single-threaded and never re-entered.
+        let state = unsafe { &mut *(data.as_ptr() as *mut IterState) };
+        if state.idx >= state.ids.len() {
+            return std::ptr::null();
+        }
+        let id = state.ids[state.idx];
+        state.idx += 1;
+        id as *const c_void
+    }
+
+    fn make_iter(ids: Vec<usize>) -> (Box<IterState>, EngineIterator) {
+        let mut boxed = Box::new(IterState { ids, idx: 0 });
+        let data_ptr: *mut IterState = &mut *boxed;
+        let it = EngineIterator {
+            data: NonNull::new(data_ptr as *mut c_void).unwrap(),
+            get_next: iter_next_direct,
+        };
+        (boxed, it)
+    }
+
+    fn make_two_literal_ids(state: &mut KernelExpressionVisitorState) -> (usize, usize) {
+        let a = wrap_expression(state, Expression::literal(1i32));
+        let b = wrap_expression(state, Expression::literal(2i32));
+        (a, b)
+    }
+
+    #[test]
+    fn visit_predicate_opaque_impl_builds_named_op_with_children() {
+        let mut state = KernelExpressionVisitorState::default();
+        let (a, b) = make_two_literal_ids(&mut state);
+        let (_keep, mut it) = make_iter(vec![a, b]);
+        let id = visit_predicate_opaque_impl(&mut state, Ok("MY_OP".to_string()), &mut it).unwrap();
+        assert_ne!(id, 0);
+        let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
+        let Predicate::Opaque(opaque) = pred else {
+            panic!("expected Predicate::Opaque, got {pred:?}");
+        };
+        assert_eq!(opaque.op.name(), "MY_OP");
+        assert_eq!(opaque.exprs.len(), 2);
+        assert_eq!(opaque.exprs[0], Expression::literal(1i32));
+        assert_eq!(opaque.exprs[1], Expression::literal(2i32));
+    }
+
+    #[test]
+    fn visit_expression_opaque_impl_wraps_as_expression_not_predicate() {
+        let mut state = KernelExpressionVisitorState::default();
+        let (a, b) = make_two_literal_ids(&mut state);
+        let (_keep, mut it) = make_iter(vec![a, b]);
+        let id =
+            visit_expression_opaque_impl(&mut state, Ok("MY_EXPR".to_string()), &mut it).unwrap();
+        assert_ne!(id, 0);
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        let Expression::Opaque(opaque) = expr else {
+            panic!("expected Expression::Opaque, got {expr:?}");
+        };
+        assert_eq!(opaque.op.name(), "MY_EXPR");
+        assert_eq!(opaque.exprs.len(), 2);
+    }
+
+    #[rstest]
+    #[case::predicate(true)]
+    #[case::expression(false)]
+    fn visit_opaque_returns_zero_on_invalid_child(#[case] is_predicate: bool) {
+        // 9999 is a never-issued ReferenceSet ID, so `unwrap_kernel_*`
+        // returns None and the builder must bail out without wrapping.
+        // (Id=0 is conflated with null/end-of-iteration by the FFI
+        // EngineIterator contract, so it manifests as "no children" rather
+        // than "invalid child" -- not a useful test for this code path.)
+        let mut state = KernelExpressionVisitorState::default();
+        let (_keep, mut it) = make_iter(vec![9999usize]);
+        let id = if is_predicate {
+            visit_predicate_opaque_impl(&mut state, Ok("OP".to_string()), &mut it).unwrap()
+        } else {
+            visit_expression_opaque_impl(&mut state, Ok("OP".to_string()), &mut it).unwrap()
+        };
+        assert_eq!(id, 0, "invalid child should produce id=0 (no node created)");
+    }
+
+    /// Regression test for the ReferenceSet leak: when child resolution
+    /// fails, the decomp ID must still be drained from state so it doesn't
+    /// outlive the failed builder.
+    #[test]
+    fn visit_predicate_opaque_with_skipping_drains_all_ids_even_on_failure() {
+        let mut state = KernelExpressionVisitorState::default();
+        // Set up a valid decomp predicate ID, but pass an invalid child id.
+        let decomp_id = wrap_predicate(&mut state, Predicate::literal(true));
+        let (_keep, mut it) = make_iter(vec![9999usize]);
+
+        let id = visit_predicate_opaque_with_skipping_impl(
+            &mut state,
+            Ok("OP".to_string()),
+            &mut it,
+            decomp_id,
+        )
+        .unwrap();
+        assert_eq!(id, 0, "invalid child should bail out");
+
+        // After the failed call, the decomp ID must have been drained too.
+        // unwrap_kernel_predicate consumes from the same ReferenceSet, so
+        // it should now return None (the slot is empty).
+        assert!(
+            unwrap_kernel_predicate(&mut state, decomp_id).is_none(),
+            "decomp ID should have been drained; ReferenceSet leak detected"
+        );
+    }
+
+    /// Verifies both facets are attached to the resulting opaque op:
+    ///   - decomp facet: `as_data_skipping_predicate` returns `Some(...)` after going through the
+    ///     kernel evaluator (a `None` result would mean the decomp was never stored).
+    ///   - callbacks facet: end-to-end coverage lives in
+    ///     `arrow_eval.rs::end_to_end_starts_with_lower_col_foo`, which routes through the same
+    ///     `Predicate::arrow_opaque` shape this builder produces.
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn visit_predicate_opaque_with_eval_and_skipping_attaches_both_facets() {
+        use std::cmp::Ordering;
+
+        use delta_kernel::expressions::{
+            column_expr, BinaryPredicateOp, ColumnName, JunctionPredicateOp, OpaquePredicateOpRef,
+            Scalar,
+        };
+        use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
+
+        use crate::expressions::opaque_eval::tests::{noop_eval_expr, noop_eval_pred};
+        use crate::expressions::opaque_eval::OpaqueEvalCallbacks;
+
+        // Local free-state stub: avoid the shared TEST_FREES counter so we
+        // don't perturb the `drop_via_arc_clone_fires_free_only_once` test.
+        unsafe extern "C" fn local_free_state(_state: *mut std::ffi::c_void) {}
+
+        let cb = Arc::new(OpaqueEvalCallbacks {
+            engine_state: std::ptr::null_mut(),
+            eval_pred: Some(noop_eval_pred),
+            eval_expr: Some(noop_eval_expr),
+            free_state: local_free_state,
+        });
+
+        // Use the same decomp pattern as the existing
+        // `decomposition_is_rewritten_to_stats_column_refs` test, so the
+        // rewriter below (a trimmed clone of that test's StatsRewriter)
+        // has the dispatch hooks it needs.
+        let mut state = KernelExpressionVisitorState::default();
+        let arg_id = wrap_expression(&mut state, column_expr!("col"));
+        let lo = Predicate::not(Predicate::lt(
+            column_expr!("col"),
+            Expression::literal("foo"),
+        ));
+        let hi = Predicate::lt(column_expr!("col"), Expression::literal("fop"));
+        let decomp = Predicate::and_from([lo, hi]);
+        let decomp_id = wrap_predicate(&mut state, decomp);
+
+        let (_keep, mut it) = make_iter(vec![arg_id]);
+        let id = visit_predicate_opaque_with_eval_and_skipping_impl(
+            &mut state,
+            Ok("STARTS_WITH".to_string()),
+            &mut it,
+            cb,
+            decomp_id,
+        )
+        .unwrap();
+        assert_ne!(id, 0);
+
+        let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
+        let Predicate::Opaque(opaque) = pred else {
+            panic!("expected Predicate::Opaque, got {pred:?}");
+        };
+
+        struct StatsRewriter;
+        fn stats_col(prefix: &str, col: &ColumnName) -> Expression {
+            let mut name = ColumnName::new([prefix]);
+            name = name.join(col);
+            Expression::from(name)
+        }
+        impl DataSkippingPredicateEvaluator for StatsRewriter {
+            type Output = Predicate;
+            type ColumnStat = Expression;
+
+            fn get_min_stat(&self, col: &ColumnName, _: &DataType) -> Option<Expression> {
+                Some(stats_col("minValues", col))
+            }
+            fn get_max_stat(&self, col: &ColumnName, _: &DataType) -> Option<Expression> {
+                Some(stats_col("maxValues", col))
+            }
+            fn get_nullcount_stat(&self, _: &ColumnName) -> Option<Expression> {
+                None
+            }
+            fn get_rowcount_stat(&self) -> Option<Expression> {
+                None
+            }
+            fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Predicate> {
+                if let Scalar::Boolean(b) = val {
+                    Some(Predicate::literal(*b != inverted))
+                } else {
+                    None
+                }
+            }
+            fn eval_pred_scalar_is_null(&self, _: &Scalar, _: bool) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_is_null(&self, _: &ColumnName, _: bool) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_binary_scalars(
+                &self,
+                _: BinaryPredicateOp,
+                _: &Scalar,
+                _: &Scalar,
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
+            fn eval_pred_opaque(
+                &self,
+                _: &OpaquePredicateOpRef,
+                _: &[Expression],
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
+            fn finish_eval_pred_junction(
+                &self,
+                op: JunctionPredicateOp,
+                preds: &mut dyn Iterator<Item = Option<Predicate>>,
+                inverted: bool,
+            ) -> Option<Predicate> {
+                let collected: Vec<Predicate> = preds.collect::<Option<Vec<_>>>()?;
+                let pred = Predicate::junction(op, collected);
+                Some(if inverted { Predicate::not(pred) } else { pred })
+            }
+            fn eval_partial_cmp(
+                &self,
+                ord: Ordering,
+                col: Expression,
+                val: &Scalar,
+                inverted: bool,
+            ) -> Option<Predicate> {
+                let base_op = match ord {
+                    Ordering::Less => BinaryPredicateOp::LessThan,
+                    Ordering::Greater => BinaryPredicateOp::GreaterThan,
+                    Ordering::Equal => BinaryPredicateOp::Equal,
+                };
+                let pred = Predicate::binary(base_op, col, Expression::literal(val.clone()));
+                Some(if inverted { Predicate::not(pred) } else { pred })
+            }
+        }
+
+        let rewriter = StatsRewriter;
+        let skipping = opaque.op.as_data_skipping_predicate(
+            &rewriter
+                as &dyn DataSkippingPredicateEvaluator<Output = Predicate, ColumnStat = Expression>,
+            &opaque.exprs,
+            false,
+        );
+        assert!(
+            skipping.is_some(),
+            "skipping_decomp facet should have been attached; got None"
+        );
     }
 }
