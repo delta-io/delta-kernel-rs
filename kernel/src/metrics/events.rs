@@ -934,6 +934,7 @@ pub struct StorageListCompleted {
 }
 
 impl StorageListCompleted {
+    #[internal_api]
     pub(crate) const NAME: &'static str = "list_completed";
 }
 
@@ -963,6 +964,7 @@ pub struct StorageReadCompleted {
 }
 
 impl StorageReadCompleted {
+    #[internal_api]
     pub(crate) const NAME: &'static str = "read_completed";
 }
 
@@ -991,6 +993,7 @@ pub struct StorageCopyCompleted {
 }
 
 impl StorageCopyCompleted {
+    #[internal_api]
     pub(crate) const NAME: &'static str = "copy_completed";
 }
 

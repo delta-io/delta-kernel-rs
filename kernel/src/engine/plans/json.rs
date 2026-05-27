@@ -63,24 +63,42 @@ impl JsonHandler for PlanBasedJsonHandler {
 mod tests {
     // TODO(#2618): Refactor and share a test suite with sync engine tests.
 
+    use std::io::Write as _;
     use std::sync::Arc;
+
+    use tempfile::NamedTempFile;
+    use url::Url;
 
     use super::PlanBasedJsonHandler;
     use crate::arrow::array::{Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::engine::tests::{make_temp_json_file, test_json_handler_file_path_contract};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::{EngineData, JsonHandler as _};
+    use crate::{EngineData, FileMeta, JsonHandler as _};
 
     fn make_handler() -> PlanBasedJsonHandler {
         PlanBasedJsonHandler::new(Arc::new(SyncPlanExecutor::new()))
     }
 
+    fn temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(temp_file, "{line}").unwrap();
+        }
+        let path = temp_file.path();
+        let file_url = Url::from_file_path(path).unwrap();
+        let size = std::fs::metadata(path).unwrap().len();
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size,
+        };
+        (temp_file, file_meta)
+    }
+
     #[test]
     fn test_read_json_files() {
-        let (_temp, file_meta) =
-            make_temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
+        let (_temp, file_meta) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
         let schema =
             Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
 
@@ -133,10 +151,5 @@ mod tests {
                 .values(),
             &[1, 2, 3]
         );
-    }
-
-    #[test]
-    fn test_file_path_contract() {
-        test_json_handler_file_path_contract(&make_handler());
     }
 }

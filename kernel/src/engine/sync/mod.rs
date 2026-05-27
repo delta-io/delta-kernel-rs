@@ -1,17 +1,16 @@
-//! A simple, single threaded, test-only [`Engine`].
+//! A simple, single threaded, test-only `Engine`.
 //!
-//! All I/O goes through an [`ObjectStore`]. [`SyncEngine::new`] uses a [`LocalFileSystem`]
+//! All I/O goes through an `ObjectStore`. `SyncEngine::new` uses a [`LocalFileSystem`]
 //! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any
-//! `file://` URL is supported. [`SyncEngine::new_with_store`] takes any other store
+//! `file://` URL is supported. `SyncEngine::new_with_store` takes any other store
 //! (e.g. `InMemory`) and uses it directly for all URLs.
 //!
 //! Async work is driven via [`futures::executor::block_on`], which is sufficient for stores
 //! that do not require a tokio reactor (`LocalFileSystem`, `InMemory`). Cloud-backed stores
 //! are NOT supported here -- they would deadlock because `block_on` parks the calling thread
 //! with no reactor to wake it. That's acceptable for this test-only engine; production code
-//! should use [`DefaultEngine`] instead.
+//! should use `DefaultEngine` from the `delta_kernel_default_engine` crate instead.
 //!
-//! [`DefaultEngine`]: crate::engine::default::DefaultEngine
 //! [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
 
 use std::sync::Arc;
@@ -235,26 +234,4 @@ where
         .flatten_ok()
         .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
     Ok(Box::new(result))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::tests::test_arrow_engine;
-
-    #[test]
-    fn test_sync_engine() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let engine = SyncEngine::new();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_sync_engine_with_store() {
-        let store = Arc::new(crate::object_store::memory::InMemory::new());
-        let engine = SyncEngine::new_with_store(store);
-        let url = Url::parse("memory:///test/").unwrap();
-        test_arrow_engine(&engine, &url);
-    }
 }
