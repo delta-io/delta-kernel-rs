@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::plans::{Plan, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
@@ -34,7 +34,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
         let query =
             QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema, predicate).build()?;
         self.executor
-            .execute_plan(Plan::QueryPlan(query))?
+            .execute_op(Operation::QueryPlan(query))?
             .into_data()
     }
 
