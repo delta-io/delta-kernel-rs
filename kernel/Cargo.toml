@@ -121,12 +121,9 @@ schema-diff = []
 # Declarative plan execution via PlanExecutor trait (experimental)
 declarative-plans = []
 
-# Column defaults write/read support (experimental). Gates the `allowColumnDefaults`
-# TableFeature variant so that connectors cannot accidentally use the feature while it
-# is partially implemented. When off, tables that list `allowColumnDefaults` in their
-# writer features are treated as unknown -- writes are blocked, reads are unaffected.
-# TODO(#2630): remove the gate once full column-defaults support ships.
-column-defaults = []
+# Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
+# work. TODO(#2630): remove once full column-defaults support ships.
+column-defaults-in-dev = []
 
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls
