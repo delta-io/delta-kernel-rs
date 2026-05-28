@@ -229,14 +229,21 @@ fn linear_search_file_mod_timestamps(
     }
 
     result.ok_or_else(|| {
-        // Exiting with `result == None` means either (GreatestLower) every commit
-        // is after `timestamp`, so the earliest commit is the nearest, or
-        // (LeastUpper) every commit is before `timestamp`, so the latest is.
-        let nearest = bound
-            .boundary_of(commits)
-            .map(|c| NearestTimestamp::from_boundary(bound, c.location.last_modified))
-            .unwrap_or(NearestTimestamp::Unknown);
-        LogHistoryError::out_of_range(timestamp, bound, nearest)
+        // OOR with non-empty commits: under GreatestLower, `timestamp` is below
+        // the first commit's monotonic ts (which equals its raw `last_modified`
+        // since no prior commit affects it). Under LeastUpper, `timestamp` is
+        // above the last commit's monotonic ts (held in `prev_monotonic_ts`).
+        // Using the monotonized values means a re-query at the suggested
+        // `nearest` round-trips to the same boundary version.
+        let nearest_ts = match bound {
+            Bound::GreatestLower => commits[0].location.last_modified,
+            Bound::LeastUpper => prev_monotonic_ts,
+        };
+        LogHistoryError::out_of_range(
+            timestamp,
+            bound,
+            NearestTimestamp::from_boundary(bound, nearest_ts),
+        )
     })
 }
 
