@@ -51,6 +51,36 @@ static GArrowRecordBatch* get_record_batch(FFI_ArrowArray* array, GArrowSchema* 
   return record_batch;
 }
 
+// We might need to extend the filter array to match the size of the actual data, since kernel
+// doesn't promise that the number of rows in the filter are equal to the number of rows in the
+// data. Anything beyond the filter is implicitly "true", meaning keep the row. Returns the passed
+// array if it is already the correct length, otherwise builds a new array.
+static GArrowBooleanArray* get_full_dv(gint64 batch_len, GArrowBooleanArray* dv_array) {
+  gint64 filter_len = garrow_array_get_length((GArrowArray*) dv_array);
+  if (filter_len < batch_len) {
+    GArrowBooleanArrayBuilder* builder = garrow_boolean_array_builder_new();
+    GError* error = NULL;
+    for (gint64 i = 0; i < filter_len; i++) {
+      gboolean val = garrow_boolean_array_get_value(dv_array, i);
+      garrow_boolean_array_builder_append_value(builder, val, &error);
+      if (report_g_error("Can't append existing value to filter builder", error)) {
+        break;
+      }
+    }
+    for (gint64 i = filter_len; i < batch_len; i++) {
+      garrow_boolean_array_builder_append_value(builder, TRUE, &error);
+      if (report_g_error("Can't append to extended filter builder", error)) {
+        break;
+      }
+    }
+    GArrowBooleanArray* extended_filter = (GArrowBooleanArray*)garrow_array_builder_finish(
+      (GArrowArrayBuilder*)builder, &error);
+    g_object_unref(builder);
+    return extended_filter;
+  }
+  return dv_array;
+}
+
 // append a batch to our context
 static void add_batch_to_context(
   ArrowContext* context,
@@ -61,9 +91,16 @@ static void add_batch_to_context(
   g_object_unref(schema);
   if (context->cur_filter != NULL) {
     GArrowRecordBatch* unfiltered = record_batch;
-    record_batch = garrow_record_batch_filter(unfiltered, context->cur_filter, NULL, NULL);
-    // unref the old batch and filter since we don't need them anymore
+    gint64 batch_len = garrow_record_batch_get_n_rows(unfiltered);
+    GArrowBooleanArray* filter = get_full_dv(batch_len, context->cur_filter);
+    GError* filter_error = NULL;
+    record_batch = garrow_record_batch_filter(unfiltered, filter, NULL, &filter_error);
+    report_g_error("Can't filter record batch", filter_error);
     g_object_unref(unfiltered);
+    if (filter != context->cur_filter) {
+      // if the pointers aren't the same, we allocated
+      g_object_unref(filter);
+    }
     g_object_unref(context->cur_filter);
     context->cur_filter = NULL;
   }
