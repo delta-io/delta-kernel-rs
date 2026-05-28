@@ -43,6 +43,10 @@ pub struct SnapshotBuilder {
 }
 
 impl SnapshotBuilder {
+    // ============================================================================
+    // Constructors
+    // ============================================================================
+
     pub(crate) fn new_for(table_root: impl AsRef<str>) -> Self {
         Self {
             table_root: Some(table_root.as_ref().to_string()),
@@ -62,6 +66,10 @@ impl SnapshotBuilder {
             max_catalog_version: None,
         }
     }
+
+    // ============================================================================
+    // Chainable configuration
+    // ============================================================================
 
     /// Set the target version of the [`Snapshot`]. When omitted, the Snapshot is created at the
     /// latest version of the table.
@@ -105,6 +113,10 @@ impl SnapshotBuilder {
         self.max_catalog_version = Some(max_catalog_version);
         self
     }
+
+    // ============================================================================
+    // Terminal: build the Snapshot
+    // ============================================================================
 
     /// Create a new [`Snapshot`]. This returns a [`SnapshotRef`] (`Arc<Snapshot>`), perhaps
     /// returning a reference to an existing snapshot if the request to build a new snapshot
@@ -203,6 +215,10 @@ impl SnapshotBuilder {
         }
         result
     }
+
+    // ============================================================================
+    // Helpers
+    // ============================================================================
 
     // ===== Catalog-managed Validations =====
 
