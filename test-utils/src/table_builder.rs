@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
@@ -1353,6 +1353,13 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
                     .expect("valid decimal"),
             )
         }
+        ArrowDataType::Struct(fields) => {
+            let child_arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|f| generate_column(f.data_type(), rows, base))
+                .collect();
+            Arc::new(StructArray::new(fields.clone(), child_arrays, None))
+        }
         other => panic!("unsupported Arrow type in test data generation: {other:?}"),
     }
 }
@@ -1547,7 +1554,7 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
 // ===========================================================================
 
 /// Default schema with all Delta primitive types including TimestampNtz
-/// (nested types are a separate concern).
+/// and a nested column type.
 pub(crate) fn default_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
         StructField::new("bool_col", DataType::BOOLEAN, true),
@@ -1563,6 +1570,15 @@ pub(crate) fn default_schema() -> SchemaRef {
         StructField::new("ts_col", DataType::TIMESTAMP, true),
         StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
         StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),
+        StructField::new(
+            "nested_col",
+            DataType::try_struct_type([
+                StructField::nullable("a", DataType::LONG),
+                StructField::nullable("b", DataType::STRING),
+            ])
+            .unwrap(),
+            true,
+        ),
     ]))
 }
 
@@ -1890,6 +1906,22 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 1);
         assert_eq!(snap.schema(), clustered_schema());
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_struct_schema_round_trip() -> DeltaResult<()> {
+        let inner = DataType::try_struct_type([StructField::nullable("a", DataType::LONG)])?;
+        let schema: SchemaRef = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("inner", inner),
+        ])?);
+        let table = TestTableBuilder::new()
+            .with_schema(schema.clone())
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.schema(), schema);
         Ok(())
     }
 
