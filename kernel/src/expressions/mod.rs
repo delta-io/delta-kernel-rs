@@ -236,6 +236,22 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// A conditional expression: `IF(condition, then_expr, else_expr)`.
+///
+/// Equivalent to SQL's `CASE WHEN condition THEN then_expr ELSE else_expr END` for a single
+/// branch. The condition is a [`Predicate`] (boolean-typed); NULL conditions are treated as
+/// false (SQL standard), so a NULL condition selects `else_expr`. Multi-branch CASE
+/// expressions desugar into nested `If` expressions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IfExpression {
+    /// The boolean condition.
+    pub condition: Box<Predicate>,
+    /// The expression evaluated when `condition` is true.
+    pub then_expr: Box<Expression>,
+    /// The expression evaluated when `condition` is false or NULL.
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression that parses a JSON string into a struct with the given schema.
 /// This is the inverse of `ToJson` - it converts a JSON-encoded string column into a
 /// struct column.
@@ -465,6 +481,8 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
     Variadic(VariadicExpression),
+    /// A conditional expression: `IF(condition, then_expr, else_expr)`.
+    If(IfExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_expression")]
@@ -594,6 +612,20 @@ impl VariadicExpression {
     ) -> Self {
         let exprs = exprs.into_iter().map(Into::into).collect();
         Self { op, exprs }
+    }
+}
+
+impl IfExpression {
+    pub(crate) fn new(
+        condition: impl Into<Predicate>,
+        then_expr: impl Into<Expression>,
+        else_expr: impl Into<Expression>,
+    ) -> Self {
+        Self {
+            condition: Box::new(condition.into()),
+            then_expr: Box::new(then_expr.into()),
+            else_expr: Box::new(else_expr.into()),
+        }
     }
 }
 
@@ -773,6 +805,17 @@ impl Expression {
     /// If all expressions evaluate to null, the result is null.
     pub fn coalesce(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
         Self::variadic(VariadicExpressionOp::Coalesce, exprs)
+    }
+
+    /// Creates a new conditional expression `IF(condition, then_expr, else_expr)`.
+    ///
+    /// See [`IfExpression`] for the semantic contract (notably, how NULL conditions are handled).
+    pub fn if_then_else(
+        condition: impl Into<Predicate>,
+        then_expr: impl Into<Expression>,
+        else_expr: impl Into<Expression>,
+    ) -> Self {
+        Self::If(IfExpression::new(condition, then_expr, else_expr))
     }
 
     /// Creates a new opaque expression
@@ -1066,6 +1109,11 @@ impl Display for Expression {
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
             }
+            If(IfExpression {
+                condition,
+                then_expr,
+                else_expr,
+            }) => write!(f, "IF({condition}, {then_expr}, {else_expr})"),
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
@@ -1208,6 +1256,14 @@ mod tests {
             (
                 Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
                 "Struct(Column(x), 2, 10)",
+            ),
+            (
+                Expr::if_then_else(
+                    column_expr!("x").is_null(),
+                    Expr::literal(0),
+                    column_expr!("x"),
+                ),
+                "IF(Column(x) IS NULL, 0, Column(x))",
             ),
         ];
 
@@ -1411,6 +1467,26 @@ mod tests {
                 column_expr!("b"),
                 Expression::literal("default"),
             ]);
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        #[case::if_simple(Expression::if_then_else(
+            column_expr!("flag").is_null(),
+            Expression::literal(0i64),
+            column_expr!("value"),
+        ))]
+        // IF(a IS NULL, 0, IF(a > 100, 100, a)) -- a typical clamp pattern.
+        #[case::if_nested(Expression::if_then_else(
+            column_expr!("a").is_null(),
+            Expression::literal(0i64),
+            Expression::if_then_else(
+                column_expr!("a").gt(Expression::literal(100i64)),
+                Expression::literal(100i64),
+                column_expr!("a"),
+            ),
+        ))]
+        fn test_if_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
         }
 

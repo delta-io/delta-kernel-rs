@@ -131,6 +131,48 @@ where
     })
 }
 
+/// Rebuilds a three-child parent from transformed children only when needed.
+///
+/// Children may have three different types (e.g. `Predicate` + two `Expression`s for an
+/// `IfExpression`); each child has its own carrier. If any child is filtered out (`None`),
+/// filter out the parent by returning `None`. If all three children survive as borrowed
+/// values, this returns a borrowed parent. Otherwise, it uses the provided `map_owned`
+/// function to rebuild and return an owned parent.
+pub(crate) fn map_owned_trio_or_else<'a, Parent, C1, C2, C3, CC1, CC2, CC3, ParentCarrier, R>(
+    parent: &'a Parent,
+    first: CC1,
+    second: CC2,
+    third: CC3,
+    map_owned: impl FnOnce(C1::Owned, C2::Owned, C3::Owned) -> Parent,
+) -> ParentCarrier
+where
+    Parent: Clone,
+    C1: ToOwned + ?Sized + 'a,
+    C2: ToOwned + ?Sized + 'a,
+    C3: ToOwned + ?Sized + 'a,
+    CC1: Carrier<'a, C1, Residual = R>,
+    CC2: Carrier<'a, C2, Residual = R>,
+    CC3: Carrier<'a, C3, Residual = R>,
+    ParentCarrier: Carrier<'a, Parent, Residual = R>,
+{
+    let first = carrier_into_inner_opt!(first);
+    let second = carrier_into_inner_opt!(second);
+    let third = carrier_into_inner_opt!(third);
+    let (Some(first), Some(second), Some(third)) = (first, second, third) else {
+        // SAFETY: Only a filtering carrier could produce None => try_none must succeed.
+        carrier_try_none!();
+        unreachable!();
+    };
+    Carrier::from_inner(match (first, second, third) {
+        (Cow::Borrowed(_), Cow::Borrowed(_), Cow::Borrowed(_)) => Cow::Borrowed(parent),
+        (first, second, third) => Cow::Owned(map_owned(
+            first.into_owned(),
+            second.into_owned(),
+            third.into_owned(),
+        )),
+    })
+}
+
 /// Rebuilds a single-child parent from a transformed child only when needed.
 ///
 /// If the child is filtered out (`None`), filter out the parent by returning `None`. If the child

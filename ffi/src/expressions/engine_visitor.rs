@@ -4,8 +4,8 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData,
-    MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate,
+    ColumnName, Expression, ExpressionRef, IfExpression, JunctionPredicate, JunctionPredicateOp,
+    MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate,
     OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData, Transform,
     UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
     VariadicExpressionOp,
@@ -272,6 +272,14 @@ pub struct EngineExpressionVisitor {
     /// list identified by `sibling_list_id`.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    /// Visits the conditional `If(condition, then_expr, else_expr)` expression belonging to
+    /// the list identified by `sibling_list_id`. The three operands will be in a three-element
+    /// child list identified by `child_list_id`, in order: condition (a predicate),
+    /// then-expression, else-expression.
+    ///
+    /// Engines MUST provide a non-null callback for this slot; kernel dispatches to it
+    /// whenever an `If` expression is encountered.
+    pub visit_if: VisitVariadicFn,
 }
 
 /// Visit the expression of the passed [`SharedExpression`] Handle using the provided `visitor`.
@@ -667,6 +675,17 @@ fn visit_expression_impl(
                 VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
+        }
+        Expression::If(IfExpression {
+            condition,
+            then_expr,
+            else_expr,
+        }) => {
+            let child_list_id = call!(visitor, make_field_list, 3);
+            visit_predicate_impl(visitor, condition, child_list_id);
+            visit_expression_impl(visitor, then_expr, child_list_id);
+            visit_expression_impl(visitor, else_expr, child_list_id);
+            call!(visitor, visit_if, sibling_list_id, child_list_id);
         }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)

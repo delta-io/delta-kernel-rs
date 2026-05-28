@@ -16,6 +16,7 @@ use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
+use crate::arrow::compute::kernels::zip::zip;
 use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -33,9 +34,9 @@ use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
-    Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    ExpressionRef, IfExpression, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
+    OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp,
+    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
@@ -371,6 +372,47 @@ pub fn evaluate_expression(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
         ))),
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
+        (
+            If(IfExpression {
+                condition,
+                then_expr,
+                else_expr,
+            }),
+            result_type,
+        ) => {
+            let cond = evaluate_predicate(condition, batch, false)?;
+            // Skip evaluating the unselected branch when one side covers every row. NULL
+            // entries select `else_expr` per the IR contract, so "every row picks then"
+            // means `true_count == len` AND `null_count == 0`; "no row picks then" just
+            // means `true_count == 0` (nulls already get else).
+            if cond.true_count() == cond.len() && cond.null_count() == 0 {
+                return validate_array_type(
+                    evaluate_expression(then_expr, batch, result_type)?,
+                    result_type,
+                );
+            }
+            if cond.true_count() == 0 {
+                return validate_array_type(
+                    evaluate_expression(else_expr, batch, result_type)?,
+                    result_type,
+                );
+            }
+            let then_arr = evaluate_expression(then_expr, batch, result_type)?;
+            let else_arr = evaluate_expression(else_expr, batch, result_type)?;
+            // Shadow Arrow's "data types differ" error from `zip` with a clearer message that
+            // identifies the kernel-side construct. `zip` itself would also reject this.
+            if then_arr.data_type() != else_arr.data_type() {
+                return Err(Error::generic(format!(
+                    "If branches must have the same type: then={:?}, else={:?}",
+                    then_arr.data_type(),
+                    else_arr.data_type()
+                )));
+            }
+            // `zip` selects truthy where mask is true, falsy where mask is false or NULL --
+            // matches the IR contract that NULL conditions fall through to `else_expr`
+            // (see `IfExpression`).
+            validate_array_type(zip(&cond, &then_arr, &else_arr)?, result_type)
+        }
     }
 }
 
@@ -2560,5 +2602,206 @@ mod tests {
 
         let result = evaluate_expression(&expr, &batch, Some(&output_type));
         assert_result_error_with_message(result, "Missing Struct fields");
+    }
+
+    /// Single-column Int32 batch (column `a`) of arbitrary length / nullability. Used to
+    /// drive the `num_rows == 0` boundary and the multi-row clamp pattern.
+    fn int_a_batch(values: Vec<Option<i32>>, nullable: bool) -> RecordBatch {
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, nullable)]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(values))]).unwrap()
+    }
+
+    /// Single-column nullable Boolean batch (column `flag`) with mixed true/null/false rows
+    /// -- exercises the IR contract that NULL conditions select `else_expr`.
+    fn flag_batch() -> RecordBatch {
+        let schema = ArrowSchema::new(vec![ArrowField::new("flag", ArrowDataType::Boolean, true)]);
+        let flag = BooleanArray::from(vec![Some(true), None, Some(false)]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flag)]).unwrap()
+    }
+
+    // Happy-path If evaluation over Int32: each case checks one contract.
+    // - `mixed_cond_per_row_select` drives the `zip` path.
+    // - The two short-circuit cases use a sentinel string literal in the unselected branch to prove
+    //   it is never evaluated (eager evaluation would fail the type-mismatch check).
+    // - `null_condition_selects_else` exercises the NULL-as-false contract.
+    // - `nested_clamp` is the canonical `IF(a < 0, 0, IF(a > 100, 100, a))` shape.
+    // - `arithmetic_branches` is the realistic FSR shape: condition and branches are arbitrary
+    //   expression trees (binary ops + nested If).
+    // - `empty_batch` is the `num_rows = 0` boundary.
+    #[rstest]
+    #[case::mixed_cond_per_row_select(
+        create_test_batch(),
+        Expr::if_then_else(
+            column_expr!("a").gt(Expr::literal(2_i32)),
+            Expr::literal(10_i32),
+            Expr::literal(20_i32),
+        ),
+        vec![20, 20, 10],
+    )]
+    #[case::short_circuit_all_true_skips_else(
+        create_test_batch(),
+        Expr::if_then_else(
+            column_expr!("a").gt(Expr::literal(0_i32)),
+            Expr::literal(7_i32),
+            Expr::literal("would-error-if-eager"),
+        ),
+        vec![7, 7, 7],
+    )]
+    #[case::short_circuit_all_false_skips_then(
+        create_test_batch(),
+        Expr::if_then_else(
+            column_expr!("a").lt(Expr::literal(0_i32)),
+            Expr::literal("would-error-if-eager"),
+            Expr::literal(9_i32),
+        ),
+        vec![9, 9, 9],
+    )]
+    #[case::null_condition_selects_else(
+        flag_batch(),
+        Expr::if_then_else(
+            Predicate::BooleanExpression(column_expr!("flag")),
+            Expr::literal(1_i32),
+            Expr::literal(2_i32),
+        ),
+        vec![1, 2, 2],
+    )]
+    #[case::nested_clamp(
+        int_a_batch(vec![Some(-5), Some(0), Some(50), Some(150)], false),
+        Expr::if_then_else(
+            column_expr!("a").lt(Expr::literal(0_i32)),
+            Expr::literal(0_i32),
+            Expr::if_then_else(
+                column_expr!("a").gt(Expr::literal(100_i32)),
+                Expr::literal(100_i32),
+                column_expr!("a"),
+            ),
+        ),
+        vec![0, 0, 50, 100],
+    )]
+    // batch.a = [1, 2, 3], batch.b = [10, 20, 30], batch.c = [100, 200, 300].
+    // IF(a + b > 20, a * c, b - a) -- arithmetic in condition and both branches; this is
+    // the realistic FSR dedup-key shape where If is part of a larger expression tree.
+    #[case::arithmetic_branches(
+        create_test_batch(),
+        Expr::if_then_else(
+            (column_expr!("a") + column_expr!("b")).gt(Expr::literal(20_i32)),
+            column_expr!("a") * column_expr!("c"),
+            column_expr!("b") - column_expr!("a"),
+        ),
+        vec![9, 400, 900], // 1+10=11<=20 -> b-a=9; 2+20=22>20 -> a*c=400; 3+30=33>20 -> 900
+    )]
+    #[case::empty_batch(
+        int_a_batch(vec![], false),
+        Expr::if_then_else(
+            column_expr!("a").gt(Expr::literal(0_i32)),
+            Expr::literal(1_i32),
+            Expr::literal(2_i32),
+        ),
+        vec![],
+    )]
+    fn test_evaluate_if_int_per_row(
+        #[case] batch: RecordBatch,
+        #[case] expr: Expr,
+        #[case] expected: Vec<i32>,
+    ) {
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let arr = result.as_primitive::<Int32Type>();
+        assert_eq!(arr.values(), expected.as_slice());
+        assert_eq!(arr.data_type(), &ArrowDataType::Int32);
+    }
+
+    #[test]
+    fn test_evaluate_if_branch_type_mismatch_errors() {
+        // Condition `a > 2` is mixed (false, false, true), so both branches must evaluate
+        // -- the type-mismatch check fires only when neither short-circuit applies.
+        let batch = create_test_batch();
+        let expr = Expr::if_then_else(
+            column_expr!("a").gt(Expr::literal(2_i32)),
+            Expr::literal(1_i32),
+            Expr::literal("text"),
+        );
+        let result = evaluate_expression(&expr, &batch, None);
+        assert_result_error_with_message(result, "If branches must have the same type");
+    }
+
+    #[test]
+    fn test_evaluate_if_preserves_element_nulls() {
+        // a = [1, 2, 3] (non-null); b = [Some(10), None, Some(30)] (nullable). Condition
+        // a >= 2 is mixed, so both branches evaluate; the row where the chosen branch is
+        // itself NULL must produce NULL in the output. Kept separate from the rstest above
+        // because the assertion shape uses `Vec<Option<i32>>` rather than `Vec<i32>`.
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, false),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            ],
+        )
+        .unwrap();
+        let expr = Expr::if_then_else(
+            column_expr!("a").ge(Expr::literal(2_i32)),
+            column_expr!("b"),
+            Expr::literal(0_i32),
+        );
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        // a=1 -> else (0); a=2 -> then (b=NULL); a=3 -> then (b=30)
+        assert_eq!(
+            result
+                .as_primitive::<Int32Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(0), None, Some(30)]
+        );
+    }
+
+    #[test]
+    fn test_evaluate_if_struct_branch_preserves_inner_null_field() {
+        // The chosen branch is a Struct whose struct-level value is always non-null, but
+        // whose single nullable field can carry a null. `zip` must preserve the inner null
+        // through to the output -- it operates per-row on the struct-level validity, while
+        // inner field validity flows through the struct's own child buffers.
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, false),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            ],
+        )
+        .unwrap();
+        let struct_ty = DataType::Struct(Box::new(
+            StructType::try_new([StructField::nullable("value", DataType::INTEGER)]).unwrap(),
+        ));
+        // Cond a >= 2 -> row 0 picks else, rows 1+2 pick then. Row 1's chosen branch carries
+        // a null in the `value` field.
+        let expr = Expr::if_then_else(
+            column_expr!("a").ge(Expr::literal(2_i32)),
+            Expr::struct_from([column_expr!("b")]),
+            Expr::struct_from([Expr::literal(0_i32)]),
+        );
+        let result = evaluate_expression(&expr, &batch, Some(&struct_ty)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        // Every struct row is struct-level non-null.
+        assert_eq!(structs.len(), 3);
+        for row in 0..3 {
+            assert!(structs.is_valid(row));
+        }
+        // Inner field: row 0 = 0 (else), row 1 = NULL (then=b[1]), row 2 = 30 (then=b[2]).
+        assert_eq!(
+            structs
+                .column(0)
+                .as_primitive::<Int32Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(0), None, Some(30)]
+        );
     }
 }
