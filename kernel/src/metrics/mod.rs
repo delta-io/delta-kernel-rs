@@ -11,7 +11,6 @@
 //! # Example: Implementing a Custom MetricsReporter
 //!
 //! ```
-//! use std::sync::Arc;
 //! use delta_kernel::metrics::{MetricsReporter, MetricEvent};
 //!
 //! #[derive(Debug)]
@@ -20,14 +19,14 @@
 //! impl MetricsReporter for LoggingReporter {
 //!     fn report(&self, event: MetricEvent) {
 //!         match event {
-//!             MetricEvent::LogSegmentLoaded { operation_id, duration, num_commit_files, .. } => {
-//!                 println!("Log segment loaded in {:?}: {} commits", duration, num_commit_files);
+//!             MetricEvent::LogSegmentLoaded(e) => {
+//!                 println!("Log segment loaded in {:?}: {} commits", e.duration, e.num_commit_files);
 //!             }
-//!             MetricEvent::SnapshotCompleted { operation_id, version, total_duration } => {
-//!                 println!("Snapshot completed: v{} in {:?}", version, total_duration);
+//!             MetricEvent::SnapshotCompleted(e) => {
+//!                 println!("Snapshot completed: v{} in {:?}", e.version, e.duration);
 //!             }
-//!             MetricEvent::SnapshotFailed { operation_id, duration } => {
-//!                 println!("Snapshot failed: {} after {:?}", operation_id, duration);
+//!             MetricEvent::SnapshotFailed(e) => {
+//!                 println!("Snapshot failed: {} after {:?}", e.operation_id, e.duration);
 //!             }
 //!             _ => {}
 //!         }
@@ -67,16 +66,18 @@
 //! These metrics are standalone and track aggregate storage performance without
 //! correlating to specific Snapshot/Transaction operations.
 
-mod events;
+pub(crate) mod events;
 pub(crate) mod reporter;
 
 use std::sync::Arc;
 
-pub use events::{MetricEvent, MetricId, ScanType};
-pub use reporter::{
-    emit_json_read_completed, emit_parquet_read_completed, LoggingMetricsReporter, MetricsReporter,
-    ReportGeneratorLayer,
+pub use events::{
+    emit_json_read_completed, emit_parquet_read_completed, CrcReadCompleted, JsonReadCompleted,
+    LogSegmentLoaded, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoaded,
+    ScanMetadataCompleted, ScanType, SnapshotCompleted, SnapshotFailed, StorageCopyCompleted,
+    StorageListCompleted, StorageReadCompleted,
 };
+pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;

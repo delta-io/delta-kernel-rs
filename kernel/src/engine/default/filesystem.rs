@@ -11,21 +11,20 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::reporter::{
-    COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME, STORAGE_SPAN,
+use crate::metrics::events::{
+    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, STORAGE_SPAN,
 };
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-/// Stream wrapper that emits a storage metric span when dropped.
+/// Stream wrapper that emits a storage metric span when dropped. Drop fires regardless of
+/// whether the iterator was fully consumed or dropped early.
 ///
 /// The span is always emitted on the thread that drops this iterator, which is the caller's
 /// thread.
 ///
 /// Generic over the inner stream type and item type.
-/// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate
-/// MetricEvent. Metrics are emitted either when the iterator is exhausted or when dropped.
 struct MetricsIterator<I, T> {
     inner: I,
     name: &'static str,
@@ -58,11 +57,12 @@ impl<I, T> Drop for MetricsIterator<I, T> {
             name = self.name,
             num_files = self.num_files,
             bytes_read = self.bytes_read,
-            duration = duration.as_nanos() as u64,
+            duration_ns = duration.as_nanos() as u64,
         );
     }
 }
 
+// Iterator over file metadata (e.g. for `list_from`). Counts num_files only.
 impl<I> Stream for MetricsIterator<I, FileMeta>
 where
     I: Stream<Item = DeltaResult<FileMeta>> + Unpin,
@@ -82,6 +82,7 @@ where
     }
 }
 
+// Iterator over byte buffers (e.g. for `read_files`). Counts num_files and total bytes_read.
 impl<I> Stream for MetricsIterator<I, Bytes>
 where
     I: Stream<Item = DeltaResult<Bytes>> + Unpin,
@@ -173,12 +174,12 @@ async fn list_from_impl(
         // (not here on the background thread where no tracing subscriber is installed).
         let stream = MetricsIterator::new(
             stream::iter(items.into_iter().map(Ok::<FileMeta, crate::Error>)),
-            LIST_COMPLETED_NAME,
+            StorageListCompleted::NAME,
             start,
         );
         Ok(Box::pin(stream))
     } else {
-        let stream = MetricsIterator::new(stream, LIST_COMPLETED_NAME, start);
+        let stream = MetricsIterator::new(stream, StorageListCompleted::NAME, start);
         Ok(Box::pin(stream))
     }
 }
@@ -222,7 +223,7 @@ async fn read_files_impl(
     // buffer the results. This allows us to achieve async concurrency.
     Ok(Box::pin(MetricsIterator::new(
         files.buffered(readahead),
-        READ_COMPLETED_NAME,
+        StorageReadCompleted::NAME,
         start,
     )))
 }
@@ -245,10 +246,10 @@ async fn copy_atomic_impl(
     let duration = start.elapsed();
     let _span = tracing::span!(
         tracing::Level::INFO,
-        "storage",
+        STORAGE_SPAN,
         report = tracing::field::Empty,
-        name = COPY_COMPLETED_NAME,
-        duration = duration.as_nanos() as u64,
+        name = StorageCopyCompleted::NAME,
+        duration_ns = duration.as_nanos() as u64,
     );
 
     result.map_err(|e| match e {

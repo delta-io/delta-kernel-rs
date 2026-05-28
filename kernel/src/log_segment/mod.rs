@@ -20,6 +20,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::events::LOG_SEGMENT_LOADED_SPAN;
 use crate::metrics::MetricId;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -300,9 +301,8 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
-    // Span name must match `SEGMENT_FOR_SNAPSHOT_SPAN` in `metrics::reporter`.
     #[instrument(
-        name = "segment.for_snapshot",
+        name = LOG_SEGMENT_LOADED_SPAN,
         err,
         skip(storage, time_travel_version),
         fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)

@@ -4,6 +4,7 @@ use tracing::{info, instrument};
 
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
+use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::MetricId;
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
@@ -117,9 +118,8 @@ impl SnapshotBuilder {
     ///
     /// [`MetricEvent::SnapshotCompleted`]: crate::metrics::MetricEvent::SnapshotCompleted
     /// [`MetricEvent::SnapshotFailed`]: crate::metrics::MetricEvent::SnapshotFailed
-    // Span name must match `SNAP_BUILD_SPAN` in `metrics::reporter`.
     #[instrument(
-        name = "snap.build",
+        name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
         fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = tracing::field::Empty),
         err
@@ -144,6 +144,9 @@ impl SnapshotBuilder {
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
+        // TODO(#2605): this late `record` is silently dropped by the metrics layer, so every
+        //              `SnapshotCompleted` event carries a nil operation_id. Bind eagerly via a
+        //              `build_inner(self, engine, operation_id)` helper instead.
         tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
         // Pre-build validations for catalog-managed tables
@@ -478,13 +481,13 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
             "expected SnapshotFailed event on build failure"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
             "should not emit SnapshotCompleted on failure"
         );
         Ok(())
@@ -508,26 +511,15 @@ mod tests {
         assert_eq!(snap_v1.version(), 1);
 
         let events = reporter.events();
-        let (version, total_duration) = events
+        let (version, duration) = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::SnapshotCompleted {
-                    version,
-                    total_duration,
-                    ..
-                } = e
-                {
-                    Some((*version, *total_duration))
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::SnapshotCompleted(s) => Some((s.version, s.duration)),
+                _ => None,
             })
             .expect("expected SnapshotCompleted event");
         assert_eq!(version, 1, "version should match the updated snapshot");
-        assert!(
-            total_duration > Duration::ZERO,
-            "total_duration should be non-zero"
-        );
+        assert!(duration > Duration::ZERO, "duration should be non-zero");
         Ok(())
     }
 
@@ -555,20 +547,20 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
             "expected SnapshotFailed when version update goes backwards"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
             "should not emit SnapshotCompleted when version update fails"
         );
         Ok(())
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_completed_total_duration_exceeds_log_segment_load_duration(
+    async fn snapshot_completed_duration_exceeds_log_segment_load_duration(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
@@ -577,34 +569,28 @@ mod tests {
         let _snap = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
 
         let events = reporter.events();
-        let total_duration = events
+        let snap_duration = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::SnapshotCompleted { total_duration, .. } = e {
-                    Some(*total_duration)
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::SnapshotCompleted(s) => Some(s.duration),
+                _ => None,
             })
             .expect("expected SnapshotCompleted event");
         let segment_duration = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::LogSegmentLoaded { duration, .. } = e {
-                    Some(*duration)
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoaded(s) => Some(s.duration),
+                _ => None,
             })
             .expect("expected LogSegmentLoaded event");
 
         assert!(
-            total_duration > Duration::ZERO,
-            "total_duration should be non-zero"
+            snap_duration > Duration::ZERO,
+            "duration should be non-zero"
         );
         assert!(
-            total_duration >= segment_duration,
-            "SnapshotCompleted.total_duration ({total_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
+            snap_duration >= segment_duration,
+            "SnapshotCompleted.duration ({snap_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
         );
         Ok(())
     }
