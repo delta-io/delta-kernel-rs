@@ -5,6 +5,7 @@ use super::{
     IcebergCompatVersion,
 };
 use crate::schema::DataType;
+use crate::schema::PrimitiveType::*;
 use crate::table_configuration::TableConfiguration;
 use crate::DeltaResult;
 
@@ -17,7 +18,6 @@ pub(crate) const V3_VALIDATOR: IcebergCompatValidator = IcebergCompatValidator {
 
 /// Returns `true` if `dt` is allowed at any level of the schema under V3.
 fn is_v3_supported_type(dt: &DataType) -> bool {
-    use crate::schema::PrimitiveType::*;
     matches!(
         dt,
         DataType::Primitive(
@@ -68,6 +68,7 @@ mod tests {
             DataType::DATE,
             DataType::TIMESTAMP,
             DataType::TIMESTAMP_NTZ,
+            DataType::decimal(10, 2).unwrap(),
         ];
         for dt in primitives {
             assert!(

@@ -19,7 +19,6 @@ pub(crate) enum IcebergCompatVersion {
 }
 
 impl IcebergCompatVersion {
-    /// Maps the version to the `TableFeature`.
     pub(super) fn as_table_feature(&self) -> TableFeature {
         match self {
             Self::V3 => TableFeature::IcebergCompatV3,
@@ -77,6 +76,15 @@ struct TypeAllowlistVisitor {
     path: Vec<String>,
 }
 
+impl TypeAllowlistVisitor {
+    /// If `dt` isn't allowed, record it as the offender. No-op if an offender is already set.
+    fn check(&mut self, dt: &DataType) {
+        if self.offender.is_none() && !(self.is_supported)(dt) {
+            self.offender = Some(format!("{} ({})", self.path.join("."), dt));
+        }
+    }
+}
+
 impl<'a> SchemaTransform<'a> for TypeAllowlistVisitor {
     transform_output_type!(|'a, T| ());
 
@@ -85,11 +93,38 @@ impl<'a> SchemaTransform<'a> for TypeAllowlistVisitor {
             return;
         }
         self.path.push(f.name().to_string());
-        if !(self.is_supported)(f.data_type()) {
-            self.offender = Some(format!("{} ({})", self.path.join("."), f.data_type()));
+        self.check(f.data_type());
+        self.recurse_into_struct_field(f);
+        self.path.pop();
+    }
+
+    fn transform_array_element(&mut self, etype: &'a DataType) {
+        if self.offender.is_some() {
             return;
         }
-        self.recurse_into_struct_field(f);
+        self.path.push("element".to_string());
+        self.check(etype);
+        self.transform(etype);
+        self.path.pop();
+    }
+
+    fn transform_map_key(&mut self, etype: &'a DataType) {
+        if self.offender.is_some() {
+            return;
+        }
+        self.path.push("key".to_string());
+        self.check(etype);
+        self.transform(etype);
+        self.path.pop();
+    }
+
+    fn transform_map_value(&mut self, etype: &'a DataType) {
+        if self.offender.is_some() {
+            return;
+        }
+        self.path.push("value".to_string());
+        self.check(etype);
+        self.transform(etype);
         self.path.pop();
     }
 }
@@ -143,7 +178,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ArrayType, MapType, MetadataValue, StructType};
+    use crate::schema::{ArrayType, MapType, MetadataValue, PrimitiveType, StructType};
 
     // === LegacyNestedIdsVisitor: parquet.field.nested.ids detection ===
 
@@ -257,42 +292,111 @@ mod tests {
         assert_eq!(v.offender, expected);
     }
 
-    // === TypeAllowlistVisitor tests  ===
-    //
+    // === TypeAllowlistVisitor tests ===
+
     /// Narrow allowlist: Integer, String, and Struct.
     fn narrow_allowlist(dt: &DataType) -> bool {
-        use crate::schema::PrimitiveType::*;
         matches!(
             dt,
-            DataType::Primitive(Integer | String) | DataType::Struct(_)
+            DataType::Primitive(PrimitiveType::Integer | PrimitiveType::String)
+                | DataType::Struct(_)
+        )
+    }
+
+    /// Wide allowlist: Integer, String, Struct, Array, Map.
+    fn wide_allowlist(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Primitive(PrimitiveType::Integer | PrimitiveType::String)
+                | DataType::Struct(_)
+                | DataType::Array(_)
+                | DataType::Map(_)
         )
     }
 
     fn schema_struct_with_float_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![StructField::new("f", DataType::FLOAT, true)]);
-        StructType::new_unchecked(vec![StructField::new(
+        let inner = StructType::new_unchecked(vec![StructField::nullable("f", DataType::FLOAT)]);
+        StructType::new_unchecked(vec![StructField::nullable(
             "s",
             DataType::Struct(Box::new(inner)),
-            true,
         )])
     }
 
+    fn schema_array_of_float() -> StructType {
+        StructType::new_unchecked(vec![StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+        )])
+    }
+
+    fn schema_map_key_float() -> StructType {
+        StructType::new_unchecked(vec![StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::FLOAT,
+                DataType::STRING,
+                true,
+            ))),
+        )])
+    }
+
+    fn schema_map_value_float() -> StructType {
+        StructType::new_unchecked(vec![StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::FLOAT,
+                true,
+            ))),
+        )])
+    }
+
+    fn schema_float_long() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::FLOAT),
+        ])
+    }
+
     #[rstest]
-    #[case::accept_int_string(simple_schema(), None)]
+    #[case::accept_int_string(narrow_allowlist, simple_schema(), None)]
     #[case::reject_top_level_array(
+        narrow_allowlist,
         schema_with_legacy_at("top"),
         Some("top (array<integer>)".to_string()),
     )]
-    #[case::reject_nested_primitive(
+    #[case::reject_nested_primitive_in_struct(
+        narrow_allowlist,
         schema_struct_with_float_inner(),
         Some("s.f (float)".to_string()),
     )]
-    fn type_allowlist_visitor_under_narrow_allowlist(
+    #[case::reject_primitive_inside_array(
+        wide_allowlist,
+        schema_array_of_float(),
+        Some("arr.element (float)".to_string()),
+    )]
+    #[case::reject_primitive_inside_map_key(
+        wide_allowlist,
+        schema_map_key_float(),
+        Some("m.key (float)".to_string()),
+    )]
+    #[case::reject_primitive_inside_map_value(
+        wide_allowlist,
+        schema_map_value_float(),
+        Some("m.value (float)".to_string()),
+    )]
+    #[case::first_offender_wins(
+        wide_allowlist,
+        schema_float_long(),
+        Some("a (long)".to_string()),
+    )]
+    fn type_allowlist_visitor(
+        #[case] is_supported: fn(&DataType) -> bool,
         #[case] schema: StructType,
         #[case] expected: Option<String>,
     ) {
         let mut v = TypeAllowlistVisitor {
-            is_supported: narrow_allowlist,
+            is_supported,
             offender: None,
             path: vec![],
         };

@@ -432,8 +432,8 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///   always use INT64; INT96 is forbidden.
 /// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
 ///   disable IcebergCompatV3 on an existing table.
-/// - Void type: when delta-spark supports VOID type on icebergCompatV3 tables, add it to the V3
-///   type allowlist (`iceberg_compat/v3.rs::is_v3_supported_type`).
+/// - Void type: when delta-spark supports VOID type on icebergCompatV3 tables, add it to V3's type
+///   allowlist (see the predicate fed to `has_only_supported_types` in `iceberg_compat::v3`).
 ///
 /// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
