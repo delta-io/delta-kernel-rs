@@ -133,7 +133,7 @@ pub(crate) fn get_transform_expr(
         use FieldTransformSpec::*;
         patch = match field_transform {
             StaticInsert { insert_after, expr } => {
-                patch.with_inserted_field(insert_after.clone(), expr.clone())
+                apply_insert_after(patch, insert_after, expr.clone())
             }
             StaticDrop { field_name } => patch.with_dropped_field(field_name.clone()),
             GenerateRowId {
@@ -164,7 +164,7 @@ pub(crate) fn get_transform_expr(
                 };
 
                 let partition_value = Arc::new(partition_value.into());
-                patch.with_inserted_field(insert_after.clone(), partition_value)
+                apply_insert_after(patch, insert_after, partition_value)
             }
             DynamicColumn {
                 field_index,
@@ -177,13 +177,11 @@ pub(crate) fn get_transform_expr(
                 if exists_physically {
                     // Column exists physically - reorder it via drop+insert
                     // This ensures consistent column ordering across file types
-                    patch = patch
-                        .with_dropped_field(physical_name.clone())
-                        .with_inserted_field(
-                            insert_after.clone(),
-                            Arc::new(Expression::column([physical_name.clone()])),
-                        );
-                    patch
+                    apply_insert_after(
+                        patch.with_dropped_field(physical_name),
+                        insert_after,
+                        Arc::new(Expression::column([physical_name])),
+                    )
                 } else {
                     // Column doesn't exist physically - treat as partition column
                     let Some((_, partition_value)) = metadata_values.remove(field_index) else {
@@ -193,13 +191,25 @@ pub(crate) fn get_transform_expr(
                     };
 
                     let partition_value = Arc::new(partition_value.into());
-                    patch.with_inserted_field(insert_after.clone(), partition_value)
+                    apply_insert_after(patch, insert_after, partition_value)
                 }
             }
         }
     }
 
     Ok(Arc::new(Expression::StructPatch(patch)))
+}
+
+// Adapter that converts the insert_after option into a method call on the patch.
+fn apply_insert_after(
+    patch: ExpressionStructPatch,
+    insert_after: &Option<String>,
+    expr: ExpressionRef,
+) -> ExpressionStructPatch {
+    match insert_after {
+        Some(predecessor) => patch.with_inserted_field_after(predecessor, expr),
+        None => patch.with_prepended_field(expr),
+    }
 }
 
 /// Parse a partition value from the raw string representation
@@ -399,17 +409,19 @@ mod tests {
 
         // Verify StaticInsert: should insert after col1
         assert!(patch.field_patches.contains_key("col1"));
-        assert!(!patch.field_patches["col1"].is_replace);
-        assert_eq!(patch.field_patches["col1"].exprs.len(), 1);
-        let Expression::Literal(scalar) = patch.field_patches["col1"].exprs[0].as_ref() else {
+        assert!(patch.field_patches["col1"].replacement_expr.is_none());
+        assert!(!patch.field_patches["col1"].is_drop);
+        assert_eq!(patch.field_patches["col1"].insertions.len(), 1);
+        let Expression::Literal(scalar) = patch.field_patches["col1"].insertions[0].as_ref() else {
             panic!("Expected literal expression for insert");
         };
         assert_eq!(scalar, &Scalar::Integer(42));
 
-        // Verify StaticDrop: should drop col2 (empty expressions and is_replace = true)
+        // Verify StaticDrop: should drop col2
         assert!(patch.field_patches.contains_key("col2"));
-        assert!(patch.field_patches["col2"].is_replace);
-        assert!(patch.field_patches["col2"].exprs.is_empty());
+        assert!(patch.field_patches["col2"].is_drop);
+        assert!(patch.field_patches["col2"].replacement_expr.is_none());
+        assert!(patch.field_patches["col2"].insertions.is_empty());
     }
 
     #[test]
@@ -441,14 +453,19 @@ mod tests {
 
         // Should drop _change_type and insert it after id
         assert!(patch.field_patches.contains_key("_change_type"));
-        assert!(patch.field_patches["_change_type"].is_replace);
-        assert!(patch.field_patches["_change_type"].exprs.is_empty());
+        assert!(patch.field_patches["_change_type"].is_drop);
+        assert!(patch.field_patches["_change_type"]
+            .replacement_expr
+            .is_none());
+        assert!(patch.field_patches["_change_type"].insertions.is_empty());
 
         assert!(patch.field_patches.contains_key("id"));
-        assert!(!patch.field_patches["id"].is_replace);
-        assert_eq!(patch.field_patches["id"].exprs.len(), 1);
+        assert!(patch.field_patches["id"].replacement_expr.is_none());
+        assert!(!patch.field_patches["id"].is_drop);
+        assert_eq!(patch.field_patches["id"].insertions.len(), 1);
 
-        let Expression::Column(column_name) = patch.field_patches["id"].exprs[0].as_ref() else {
+        let Expression::Column(column_name) = patch.field_patches["id"].insertions[0].as_ref()
+        else {
             panic!("Expected column reference");
         };
         assert_eq!(column_name.as_ref(), &["_change_type"]);
@@ -491,10 +508,11 @@ mod tests {
         assert!(!patch.field_patches.contains_key("_change_type"));
 
         assert!(patch.field_patches.contains_key("id"));
-        assert!(!patch.field_patches["id"].is_replace);
-        assert_eq!(patch.field_patches["id"].exprs.len(), 1);
+        assert!(patch.field_patches["id"].replacement_expr.is_none());
+        assert!(!patch.field_patches["id"].is_drop);
+        assert_eq!(patch.field_patches["id"].insertions.len(), 1);
 
-        let Expression::Literal(scalar) = patch.field_patches["id"].exprs[0].as_ref() else {
+        let Expression::Literal(scalar) = patch.field_patches["id"].insertions[0].as_ref() else {
             panic!("Expected literal");
         };
         assert_eq!(scalar, &Scalar::String("insert".to_string()));
@@ -526,10 +544,11 @@ mod tests {
 
         // Should insert metadata value after id
         assert!(patch.field_patches.contains_key("id"));
-        assert!(!patch.field_patches["id"].is_replace);
-        assert_eq!(patch.field_patches["id"].exprs.len(), 1);
+        assert!(patch.field_patches["id"].replacement_expr.is_none());
+        assert!(!patch.field_patches["id"].is_drop);
+        assert_eq!(patch.field_patches["id"].insertions.len(), 1);
 
-        let Expression::Literal(scalar) = patch.field_patches["id"].exprs[0].as_ref() else {
+        let Expression::Literal(scalar) = patch.field_patches["id"].insertions[0].as_ref() else {
             panic!("Expected literal");
         };
         assert_eq!(scalar, &Scalar::Integer(2024));
@@ -592,9 +611,10 @@ mod tests {
             .field_patches
             .get("row_id_col")
             .expect("Should have row_id_col patch");
-        assert!(row_id_patch.is_replace);
+        assert!(row_id_patch.replacement_expr.is_some());
+        assert!(!row_id_patch.is_drop);
 
-        let expeceted_expr = Arc::new(Expression::coalesce([
+        let expected_expr = Arc::new(Expression::coalesce([
             Expression::column(["row_id_col"]),
             Expression::binary(
                 BinaryExpressionOp::Plus,
@@ -602,9 +622,8 @@ mod tests {
                 Expression::column(["row_index_col"]),
             ),
         ]));
-        assert_eq!(row_id_patch.exprs.len(), 1);
-        let expr = &row_id_patch.exprs[0];
-        assert_eq!(expr, &expeceted_expr);
+        let expr = row_id_patch.replacement_expr.as_ref().unwrap();
+        assert_eq!(expr, &expected_expr);
     }
 
     #[test]

@@ -371,15 +371,14 @@ mod tests {
             .field_patches
             .get(ADD_NAME)
             .expect("Outer patch should have 'add' field patch");
-        assert!(add_field_patch.is_replace, "Should replace 'add' field");
-        assert_eq!(
-            add_field_patch.exprs.len(),
-            1,
-            "Should have exactly one replacement expression"
+        assert!(
+            add_field_patch.replacement_expr.is_some(),
+            "Should replace 'add' field"
         );
 
         // Extract inner patch
-        let Expression::StructPatch(inner) = add_field_patch.exprs[0].as_ref() else {
+        let Some(Expression::StructPatch(inner)) = add_field_patch.replacement_expr.as_deref()
+        else {
             panic!("Expected inner StructPatch expression for 'add' field");
         };
 
@@ -398,8 +397,7 @@ mod tests {
         patch
             .field_patches
             .get(field)
-            .map(|ft| ft.is_replace && ft.exprs.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|ft| ft.is_drop && ft.replacement_expr.is_none())
     }
 
     /// Helper to check if a field patch is a replacement with an expression.
@@ -407,8 +405,7 @@ mod tests {
         patch
             .field_patches
             .get(field)
-            .map(|ft| ft.is_replace && ft.exprs.len() == 1)
-            .unwrap_or(false)
+            .is_some_and(|ft| ft.replacement_expr.is_some() && !ft.is_drop)
     }
 
     #[test]

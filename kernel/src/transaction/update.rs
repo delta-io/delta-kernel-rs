@@ -495,8 +495,8 @@ impl<S> Transaction<S> {
             nullable_restored_add_schema().clone().into(),
         )?;
         let with_data_change_expr = Arc::new(Expression::struct_from([Expression::struct_patch(
-            ExpressionStructPatch::new_nested(["add"]).with_inserted_field(
-                Some("modificationTime"),
+            ExpressionStructPatch::new_nested(["add"]).with_inserted_field_after(
+                "modificationTime",
                 Expression::literal(self.data_change).into(),
             ),
         )]));

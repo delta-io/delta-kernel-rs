@@ -94,12 +94,16 @@ struct Unary {
 };
 struct StructPatchExpression {
   ExpressionItemList input_path;
+  ExpressionItemList prepended_fields;
   ExpressionItemList field_patches;
+  ExpressionItemList appended_fields;
 };
 struct FieldPatch {
   char* field_name;
-  ExpressionItemList exprs;
-  bool is_replace;
+  ExpressionItemList replacement_expr;
+  ExpressionItemList insertions;
+  bool is_drop;
+  bool optional;
 };
 struct OpaqueExpression {
   HandleSharedOpaqueExpressionOp op;
@@ -176,6 +180,7 @@ void put_expr_item(void* data, size_t sibling_list_id, void* ref, enum Expressio
 }
 ExpressionItemList get_expr_list(void* data, size_t list_id) {
   ExpressionBuilder* data_ptr = (ExpressionBuilder*)data;
+  assert(list_id != 0);
   assert(list_id < data_ptr->list_count);
   return data_ptr->lists[list_id];
 }
@@ -315,17 +320,9 @@ DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 int patch_op_cmp(const void* a, const void* b) {
   const struct FieldPatch* op_a = ((ExpressionItem*)a)->ref;
   const struct FieldPatch* op_b = ((ExpressionItem*)b)->ref;
-  if (op_a->field_name == NULL && op_b->field_name == NULL) {
-    // break tie below
-  } else if (op_a->field_name == NULL) {
-    return -1;
-  } else if (op_b->field_name == NULL) {
-    return 1;
-  } else {
-    int cmp = strcmp(op_a->field_name, op_b->field_name);
-    if (cmp != 0) {
-      return cmp;
-    } // else break tie below
+  int cmp = strcmp(op_a->field_name, op_b->field_name);
+  if (cmp != 0) {
+    return cmp;
   }
   if (op_a < op_b) {
     return -1;
@@ -340,11 +337,15 @@ void visit_struct_patch_expr(
     void* data,
     uintptr_t sibling_list_id,
     uintptr_t input_path_list_id,
-    uintptr_t child_list_id)
+    uintptr_t prepended_field_list_id,
+    uintptr_t field_patch_list_id,
+    uintptr_t appended_field_list_id)
 {
   struct StructPatchExpression* patch = malloc(sizeof(struct StructPatchExpression));
   patch->input_path = get_expr_list(data, input_path_list_id);
-  patch->field_patches = get_expr_list(data, child_list_id);
+  patch->prepended_fields = get_expr_list(data, prepended_field_list_id);
+  patch->field_patches = get_expr_list(data, field_patch_list_id);
+  patch->appended_fields = get_expr_list(data, appended_field_list_id);
 
   // stable sort the ops by field name to ensure deterministic output
   qsort(
@@ -358,14 +359,18 @@ void visit_struct_patch_expr(
 void visit_field_patch(
     void* data,
     uintptr_t sibling_list_id,
-    const KernelStringSlice* field_name,
-    uintptr_t child_list_id,
-    bool is_replace)
+    KernelStringSlice field_name,
+    uintptr_t replacement_expr_list_id,
+    uintptr_t insertion_expr_list_id,
+    bool is_drop,
+    bool optional)
 {
   struct FieldPatch* field_patch = malloc(sizeof(struct FieldPatch));
-  field_patch->field_name = field_name? allocate_string(*field_name) : NULL;
-  field_patch->exprs = get_expr_list(data, child_list_id);
-  field_patch->is_replace = is_replace;
+  field_patch->field_name = allocate_string(field_name);
+  field_patch->replacement_expr = get_expr_list(data, replacement_expr_list_id);
+  field_patch->insertions = get_expr_list(data, insertion_expr_list_id);
+  field_patch->is_drop = is_drop;
+  field_patch->optional = optional;
   put_expr_item(data, sibling_list_id, field_patch, FieldPatch);
 }
 void visit_opaque_expr(
@@ -470,8 +475,7 @@ uintptr_t make_field_list(void* data, uintptr_t reserve) {
 }
 
 ExpressionItemList construct_expression(SharedExpression* expression) {
-  ExpressionBuilder data = { 0 };
-  make_field_list(&data, 0); // list id 0 is the invalid/missing/empty list
+  ExpressionBuilder data = { .list_count = 1 };
 
   EngineExpressionVisitor visitor = {
     .data = &data,
@@ -522,7 +526,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
 }
 
 ExpressionItemList construct_predicate(SharedPredicate* predicate) {
-  ExpressionBuilder data = { 0 };
+  ExpressionBuilder data = { .list_count = 1 };
   EngineExpressionVisitor visitor = {
     .data = &data,
     .make_field_list = make_field_list,
@@ -586,14 +590,17 @@ void free_expression_item(ExpressionItem ref) {
     case StructPatch: {
       struct StructPatchExpression* patch = ref.ref;
       free_expression_list(patch->input_path);
+      free_expression_list(patch->prepended_fields);
       free_expression_list(patch->field_patches);
+      free_expression_list(patch->appended_fields);
       free(patch);
       break;
     }
     case FieldPatch: {
       struct FieldPatch* field_patch = ref.ref;
       free(field_patch->field_name);
-      free_expression_list(field_patch->exprs);
+      free_expression_list(field_patch->replacement_expr);
+      free_expression_list(field_patch->insertions);
       free(field_patch);
       break;
     }

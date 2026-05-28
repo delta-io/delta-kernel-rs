@@ -304,8 +304,8 @@ where
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
             ExpressionStructPatch::new_top_level()
-                .with_inserted_field(
-                    Some("modificationTime"),
+                .with_inserted_field_after(
+                    "modificationTime",
                     Expression::literal(data_change).into(),
                 )
                 .with_replaced_field(
@@ -1404,46 +1404,38 @@ fn build_remove_struct_patch(
 ) -> ExpressionStructPatch {
     let mut patch = ExpressionStructPatch::new_top_level()
         // deletionTimestamp
-        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        .with_inserted_field_after("path", Expression::literal(commit_timestamp).into())
         // dataChange
-        .with_inserted_field(Some("path"), Expression::literal(data_change).into())
+        .with_inserted_field_after("path", Expression::literal(data_change).into())
         // extended_file_metadata
-        .with_inserted_field(Some("path"), Expression::literal(true).into())
-        .with_inserted_field(
-            Some("path"),
+        .with_inserted_field_after("path", Expression::literal(true).into())
+        .with_inserted_field_after(
+            "path",
             Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
         );
 
     if coalesce_stats_with_parsed {
-        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
-        // Both expressions are registered on the "stats" field_patch (is_replace=true),
-        // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
+        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             Expression::column(["stats"]),
             Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
         ]);
         patch = patch
             .with_replaced_field("stats", coalesce_stats.into())
-            .with_inserted_field(
-                Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-            )
-            .with_dropped_field_if_exists(STATS_PARSED_NAME);
-    } else {
-        // tags inserted after stats; stats passes through unchanged
-        patch = patch.with_inserted_field(
-            Some("stats"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-        );
+            .with_dropped_field(STATS_PARSED_NAME);
     }
 
     patch = patch
-        .with_inserted_field(
-            Some("deletionVector"),
+        .with_inserted_field_after(
+            "stats",
+            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+        )
+        .with_inserted_field_after(
+            "deletionVector",
             Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
         )
-        .with_inserted_field(
-            Some("deletionVector"),
+        .with_inserted_field_after(
+            "deletionVector",
             Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)

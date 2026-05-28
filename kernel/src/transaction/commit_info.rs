@@ -91,12 +91,7 @@ impl<S> Transaction<S> {
                 // Step 2: Build literal expressions for each CommitInfo field.
                 let literal_exprs = commit_info_literal_exprs(kernel_commit_info)?;
 
-                // Step 3: Build ExpressionStructPatch. Replacements must be registered before
-                // insertions so that for the last engine field (which may itself be
-                // replaced), exprs is ordered as [replace_expr, insert_exprs...].
-                // The evaluator emits exprs in declaration order, so the replace
-                // value must come first.
-                let last_engine_field = engine_commit_info_schema.field_names().last().cloned();
+                // Step 3: Build ExpressionStructPatch.
                 let mut patch = ExpressionStructPatch::new_top_level();
 
                 // First pass: replace fields that already exist in the engine schema.
@@ -108,8 +103,7 @@ impl<S> Transaction<S> {
                 // Second pass: append kernel-only fields after the last engine field.
                 for (field_name, expr_ref) in &literal_exprs {
                     if !engine_commit_info_schema.contains(*field_name) {
-                        patch = patch
-                            .with_inserted_field(last_engine_field.as_deref(), expr_ref.clone());
+                        patch = patch.with_appended_field(expr_ref.clone());
                     }
                 }
 
