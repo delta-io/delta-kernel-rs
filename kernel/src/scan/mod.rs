@@ -113,7 +113,7 @@ impl Default for StatsOutputMode {
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
-    schema: Option<SchemaRef>,
+    logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
     stats_output_mode: StatsOutputMode,
 }
@@ -121,7 +121,7 @@ pub struct ScanBuilder {
 impl std::fmt::Debug for ScanBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("ScanBuilder")
-            .field("schema", &self.schema)
+            .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
             .field("stats_output_mode", &self.stats_output_mode)
             .finish()
@@ -133,7 +133,7 @@ impl ScanBuilder {
     pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
         Self {
             snapshot: snapshot.into(),
-            schema: None,
+            logical_read_schema: None,
             predicate: None,
             stats_output_mode: StatsOutputMode::default(),
         }
@@ -146,8 +146,8 @@ impl ScanBuilder {
     ///
     /// [`Schema`]: crate::schema::Schema
     /// [`Snapshot`]: crate::snapshot::Snapshot
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
+    pub fn with_schema(mut self, logical_read_schema: SchemaRef) -> Self {
+        self.logical_read_schema = Some(logical_read_schema);
         self
     }
 
@@ -166,14 +166,20 @@ impl ScanBuilder {
     /// 4` to return a subset of the rows in the scan which satisfy the filter. If `predicate_opt`
     /// is `None`, this is a no-op.
     ///
-    /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
+    /// NOTE: The filtering is best-effort and can produce false positives (rows that should
     /// have been filtered out but were kept).
+    ///
+    /// NOTE: Predicates referencing metadata columns the caller added to the projection via
+    /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
+    /// and will error at build time.
     ///
     /// This method can be combined with [`include_all_stats_columns`]. When both are used, the
     /// kernel performs data skipping internally using the predicate AND outputs parsed
     /// statistics to the engine via the `stats_parsed` column in scan metadata.
     ///
     /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
+    /// [`with_schema`]: ScanBuilder::with_schema
+    /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
@@ -240,11 +246,14 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
+        // Predicates may reference columns outside self.logical_read_schema, so resolve against the
+        // full table schema
+        let table_schema = self.snapshot.schema();
         // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
         // a transient state, but a scan over zero columns has no way to derive row
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
-        if self.snapshot.schema().num_fields() == 0 {
+        if table_schema.num_fields() == 0 {
             return Err(Error::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
@@ -252,14 +261,17 @@ impl ScanBuilder {
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+        let logical_read_schema = self
+            .logical_read_schema
+            .unwrap_or_else(|| table_schema.clone());
 
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
         let state_info = StateInfo::try_new(
-            logical_schema,
+            logical_read_schema,
+            table_schema,
             self.snapshot.table_configuration(),
             self.predicate,
             self.stats_output_mode.clone(),
