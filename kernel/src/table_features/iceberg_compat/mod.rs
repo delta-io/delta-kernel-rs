@@ -3,7 +3,7 @@
 //! Each `delta.enableIcebergCompatV{N}` version owns a submodule (currently only
 //! [`v3`]), and exposes a single
 //! `pub(crate) const V{N}_VALIDATOR: IcebergCompatValidator`. Callers feed that
-//! constant to [`validate_iceberg_compat_if_needed`], the shared dispatcher.
+//! constant to [`validate_iceberg_compat_if_needed`].
 
 pub(crate) mod v3;
 
@@ -352,7 +352,7 @@ mod tests {
     }
 
     /// `a: array<map<string, array<float>>>` followed by a sibling `b: array<float>`.
-    fn schema_deep_nesting_with_sibling() -> StructType {
+    fn schema_deep_nested_float() -> StructType {
         StructType::new_unchecked(vec![
             StructField::nullable(
                 "a",
@@ -406,7 +406,7 @@ mod tests {
     )]
     #[case::reject_deep_then_short_circuits_sibling(
         wide_allowlist,
-        schema_deep_nesting_with_sibling(),
+        schema_deep_nested_float(),
         Some("a.element.value.element (float)".to_string()),
     )]
     fn type_allowlist_visitor(

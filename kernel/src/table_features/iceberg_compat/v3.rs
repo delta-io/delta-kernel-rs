@@ -16,7 +16,6 @@ pub(crate) const V3_VALIDATOR: IcebergCompatValidator = IcebergCompatValidator {
     checks: &[check_v3_supported_types, check_no_legacy_nested_ids],
 };
 
-/// Returns `true` if `dt` is allowed at any level of the schema under V3.
 fn is_v3_supported_type(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -54,7 +53,7 @@ mod tests {
     use crate::schema::{ArrayType, MapType, StructField, StructType};
 
     #[test]
-    fn is_v3_supported_type_accepts_every_current_datatype() {
+    fn is_v3_supported_type_accepted_datatypes() {
         let primitives = [
             DataType::STRING,
             DataType::LONG,
