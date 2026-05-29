@@ -158,7 +158,6 @@ fn evaluate_struct_patch_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    patch.validate()?;
     let mut used_field_patches = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
@@ -1318,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conflicting_replacement_operations_error() {
+    fn test_replacement_takes_precedence_over_drop_and_older_replacements() {
         let batch = create_test_batch();
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
@@ -1334,25 +1333,28 @@ mod tests {
             &expr,
             &batch,
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("multiple replacement/drop operations"));
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[1, 1, 1]);
+        validate_i32_column(result, 1, &[10, 20, 30]);
+        validate_i32_column(result, 2, &[100, 200, 300]);
 
         let patch = ExpressionStructPatch::new_top_level()
             .with_dropped_field("a")
-            .with_replaced_field("a", Expr::literal(1).into());
+            .with_replaced_field("a", Expr::literal(1).into())
+            .with_replaced_field("a", Expr::literal(2).into());
         let expr = Expr::StructPatch(patch);
         let result = evaluate_expression(
             &expr,
             &batch,
             Some(&DataType::Struct(Box::new(output_schema))),
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("multiple replacement/drop operations"));
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[2, 2, 2]);
+        validate_i32_column(result, 1, &[10, 20, 30]);
+        validate_i32_column(result, 2, &[100, 200, 300]);
     }
 
     #[test]

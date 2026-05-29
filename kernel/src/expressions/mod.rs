@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 };
 use crate::schema::SchemaRef;
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::{DataType, DeltaResult, DynPartialEq, Error};
+use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
@@ -340,18 +340,16 @@ where
 /// with one expression, or drop the input field.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ExpressionFieldPatch {
-    /// Set by a call to [`Self::with_replaced_field`]. Mutually incopatible with `is_drop`.
+    /// The expression this field patch emits at the input field's output position instead of the
+    /// original input field.
     pub replacement_expr: Option<ExpressionRef>,
-    /// Set by a call to [`Self::with_dropped_field`]. Mutually incopatible with
-    /// `replacement_expr`.
+    /// If true, and there is no replacement expression, the input field is omitted from the output.
     pub is_drop: bool,
     /// Insertions provided by calls to [`Self::with_inserted_field_after`].
     pub insertions: Vec<ExpressionRef>,
     /// If true, this patch is silently ignored when the input field does not exist. Otherwise, a
     /// missing input field produces an error.
     pub optional: bool,
-    /// True if [`Self::with_replaced_field`] or [`Self::with_dropped_field`] was called twice.
-    pub replacement_conflict: bool,
 }
 
 /// A sparse expression patch over the fields of one input struct.
@@ -393,25 +391,25 @@ impl ExpressionStructPatch {
         }
     }
 
-    /// Specifies a field to drop.
+    /// Specifies a field to drop. Any past or future field replacement overrides a drop request.
     pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
         let field_patch = self.field_patch(name);
-        field_patch.set_drop();
+        field_patch.is_drop = true;
         self
     }
 
     /// Like [`Self::with_dropped_field`], but silently ignored if the field does not exist.
     pub fn with_dropped_field_if_exists(mut self, name: impl Into<String>) -> Self {
         let field_patch = self.field_patch(name);
-        field_patch.set_drop();
+        field_patch.is_drop = true;
         field_patch.optional = true;
         self
     }
 
-    /// Specifies an expression to replace a field with.
+    /// Specifies an expression to replace a field with. This overrides any prior drop or replace calls.
     pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
         let field_patch = self.field_patch(name);
-        field_patch.set_replacement(expr);
+        field_patch.replacement_expr = Some(expr);
         self
     }
 
@@ -453,39 +451,6 @@ impl ExpressionStructPatch {
     // Gets or creates the field patch for a named input field.
     fn field_patch(&mut self, field_name: impl Into<String>) -> &mut ExpressionFieldPatch {
         self.field_patches.entry(field_name.into()).or_default()
-    }
-
-    /// Returns an error if this patch contains contradictory replacement/drop operations.
-    pub(crate) fn validate(&self) -> DeltaResult<()> {
-        for (field_name, field_patch) in &self.field_patches {
-            if field_patch.replacement_conflict {
-                return Err(Error::generic(format!(
-                    "Field patch for '{field_name}' has multiple replacement/drop operations"
-                )));
-            }
-            if field_patch.replacement_expr.is_some() && field_patch.is_drop {
-                return Err(Error::generic(format!(
-                    "Field patch for '{field_name}' cannot both replace and drop the field"
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ExpressionFieldPatch {
-    fn check_for_conflict(&mut self) {
-        self.replacement_conflict = self.replacement_expr.is_some() || self.is_drop
-    }
-
-    fn set_drop(&mut self) {
-        self.check_for_conflict();
-        self.is_drop = true;
-    }
-
-    fn set_replacement(&mut self, expr: ExpressionRef) {
-        self.check_for_conflict();
-        self.replacement_expr = Some(expr);
     }
 }
 
