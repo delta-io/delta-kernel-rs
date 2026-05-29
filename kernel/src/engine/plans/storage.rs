@@ -6,7 +6,7 @@ use bytes::Bytes;
 use itertools::Itertools as _;
 use url::Url;
 
-use crate::plans::{IoOperation, Plan, PlanExecutor, PlanResult};
+use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
@@ -20,7 +20,7 @@ impl PlanBasedStorageHandler {
     }
 
     fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
-        self.executor.execute_plan(Plan::IoOperation(op))
+        self.executor.execute_op(Operation::IoOperation(op))
     }
 }
 

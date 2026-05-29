@@ -3,8 +3,8 @@
 //! (e.g. storage, JSON, parquet) to declarative plan execution rather than implementing
 //! each handler independently.
 //!
-//! This allows a PlanExecutor to become the single surface for connector optimizations, while
-//! still allowing kernel to use existing Engine trait APIs.
+//! This allows a PlanExecutor to become the single surface for connector optimizations,
+//! while still allowing kernel to use existing Engine trait APIs.
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// An [`Engine`] that routes operations through a [`PlanExecutor`].
 ///
 /// Storage, JSON file reads, and Parquet file reads are converted into
-/// [`Plan`](crate::plans::Plan)s and delegated to the plan executor.
+/// [`Operation`](crate::plans::Operation)s and delegated to the plan executor.
 ///
 /// EvaluationHandler capabilities are not supported under plan execution,
 /// so the engine must provide an EvaluationHandler as well.

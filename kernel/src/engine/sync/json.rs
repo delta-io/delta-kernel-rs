@@ -15,8 +15,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler,
-    PredicateRef, ScopedDeltaResultIterator,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    JsonHandler, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler {
@@ -71,7 +71,7 @@ impl JsonHandler for SyncJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: ScopedDeltaResultIterator<'_, FilteredEngineData>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buf = to_json_bytes(data)?;

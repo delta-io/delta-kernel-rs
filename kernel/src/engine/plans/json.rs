@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::plans::{Plan, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilteredEngineData,
-    JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -44,14 +44,14 @@ impl JsonHandler for PlanBasedJsonHandler {
         let query =
             QueryPlanBuilder::scan_json(files.to_vec(), physical_schema, predicate).build()?;
         self.executor
-            .execute_plan(Plan::QueryPlan(query))?
+            .execute_op(Operation::QueryPlan(query))?
             .into_data()
     }
 
     fn write_json_file(
         &self,
         _path: &Url,
-        _data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        _data: DeltaResultIterator<'_, FilteredEngineData>,
         _overwrite: bool,
     ) -> DeltaResult<()> {
         Err(Error::unsupported(

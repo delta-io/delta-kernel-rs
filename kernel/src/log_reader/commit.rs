@@ -5,11 +5,11 @@ use itertools::Itertools;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, DeltaResultIterator, Engine};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine};
 
 /// Phase that processes JSON commit files into [`ActionsBatch`]s
 pub(crate) struct CommitReader {
-    actions: DeltaResultIterator<ActionsBatch>,
+    actions: DeltaResultIteratorStatic<ActionsBatch>,
 }
 
 impl CommitReader {

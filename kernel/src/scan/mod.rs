@@ -24,7 +24,7 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::reporter::emit_scan_metadata_completed;
+use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::{

@@ -5,7 +5,7 @@ use tracing::{info, instrument};
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
 use super::Committer;
-use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData, ScopedDeltaResultIterator};
+use crate::{DeltaResult, DeltaResultIterator, Engine, Error, FileMeta, FilteredEngineData};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
@@ -31,7 +31,7 @@ impl Committer for FileSystemCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         let version = commit_metadata.version();

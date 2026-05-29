@@ -18,7 +18,7 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
 
@@ -118,7 +118,7 @@ Write the actions to a staged commit file in `_staged_commits/`:
 fn commit(
     &self,
     engine: &dyn Engine,
-    actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
+    actions: DeltaResultIterator<'_, FilteredEngineData>,
     commit_metadata: CommitMetadata,
 ) -> DeltaResult<CommitResponse> {
     // Write actions to _staged_commits/<version>.<uuid>.json. `actions` is
@@ -232,7 +232,7 @@ impl Committer for MyCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: ScopedDeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         // 1. Stage: write actions to _staged_commits/

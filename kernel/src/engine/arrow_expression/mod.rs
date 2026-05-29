@@ -348,11 +348,11 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //     )));
         // };
         let batch = match (self.expression.as_ref(), &self.output_type) {
-            (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
-                // Empty transform optimization: Skip expression evaluation and directly apply the
+            (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
+                // Empty patch optimization: Skip expression evaluation and directly apply the
                 // output schema to the input RecordBatch. This is used to cheaply apply a new
                 // output schema to existing data without changing it, e.g. for column mapping.
-                let array = match transform.input_path() {
+                let array = match patch.input_path() {
                     None => Arc::new(StructArray::from(batch.clone())),
                     Some(path) => extract_column(batch, path)?,
                 };

@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::plans::{Plan, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
+    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -34,14 +34,14 @@ impl ParquetHandler for PlanBasedParquetHandler {
         let query =
             QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema, predicate).build()?;
         self.executor
-            .execute_plan(Plan::QueryPlan(query))?
+            .execute_op(Operation::QueryPlan(query))?
             .into_data()
     }
 
     fn write_parquet_file(
         &self,
         _location: Url,
-        _data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         Err(Error::unsupported(
             "PlanBasedParquetHandler does not support write_parquet_file yet",

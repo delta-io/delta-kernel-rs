@@ -8,11 +8,11 @@
 //! with [`TestTableBuilder::with_data`] when a test needs specific file/row counts.
 //!
 //! Provides five orthogonal axes for parameterized testing:
-//! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
-//! - [`FeatureSet`] -- which Delta table features are enabled
-//! - [`TableConfig`] -- runtime knobs (e.g. stats format) orthogonal to features
-//! - [`VersionTarget`] -- how the snapshot is loaded (latest, time travel, incremental)
-//! - [`DataLayoutConfig`] -- data layout (unpartitioned, partitioned, clustered)
+//! - [`LogState`]: what log files exist on disk (commits, checkpoints, CRC)
+//! - [`FeatureSet`]: which Delta table features are enabled
+//! - [`DataLayoutConfig`]: data layout (unpartitioned, partitioned, clustered)
+//! - [`TableConfig`]: runtime knobs (e.g. checkpoint stats format)
+//! - [`VersionTarget`]: how the snapshot is loaded (latest, time travel, incremental)
 //!
 //! # Quick start
 //!
@@ -30,11 +30,16 @@
 //!     log_state: LogState,
 //!     #[values(FeatureSet::empty())]
 //!     feature_set: FeatureSet,
+//!     #[values(unpartitioned())]
+//!     data_layout: DataLayoutConfig,
+//!     #[values(checkpoint_json_stats())]
+//!     table_config: TableConfig,
 //!     #[values(VersionTarget::Latest, VersionTarget::IncrementalToLatest { from: 0 })]
 //!     version_target: VersionTarget,
 //! ) {
-//!     let (engine, snap, _table) =
-//!         test_context!(log_state, feature_set, version_target);
+//!     let (engine, snap, _table) = test_context!(
+//!         log_state, feature_set, data_layout, table_config, version_target,
+//!     );
 //!     let scan = snap.scan_builder().build().unwrap();
 //!     // ...
 //! }
@@ -50,7 +55,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
@@ -72,6 +77,19 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
+
+// ===========================================================================
+// Sweep constants
+// ===========================================================================
+
+/// Latest commit version used by every log state in the
+/// [`default_sweep!`](crate::default_sweep) template.
+pub const DEFAULT_SWEEP_LATEST_VERSION: u64 = 10;
+
+/// Mid version used by the [`default_sweep!`](crate::default_sweep) template for
+/// `AtVersion` and `IncrementalToLatest` targets. Must satisfy
+/// `mid <= DEFAULT_SWEEP_LATEST_VERSION`.
+pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 
 // ===========================================================================
 // Sync/async bridge
@@ -252,53 +270,11 @@ impl LogState {
         self
     }
 
-    /// Canonical log shapes for snapshot reader-path tests. Built against a
-    /// 10-version table; each shape exercises a distinct read path.
-    pub fn common() -> Vec<Self> {
-        const N: u64 = 10;
-        vec![
-            // commits-only: pure JSON replay
-            Self::with_latest_version(N),
-            // checkpoint at latest: no JSON tail (relevant for ICT, where the
-            // latest commit's timestamp lives in the checkpoint)
-            Self::with_latest_version(N).with_checkpoint_at([N]),
-            // checkpoint mid-stream: tail-replay over JSON commits after a checkpoint
-            Self::with_latest_version(N).with_checkpoint_at([N - 5]),
-            // multi-checkpoint: newer supersedes older
-            Self::with_latest_version(N).with_checkpoint_at([N - 5, N]),
-            // post-cleanup: log truncated at the mid-stream checkpoint
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5])
-                .with_cleanup_commits_before(N - 5),
-            // mid-stream checkpoint with hint missing: listing fallback discovers it
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5])
-                .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
-            // two checkpoints + stale hint: hint at mid-stream, real latest at end;
-            // reader follows hint, lists forward, recovers actual latest
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5, N])
-                .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
-            // post-cleanup + missing hint: pruned log with no hint, reader lists
-            // forward to find the surviving checkpoint
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5])
-                .with_cleanup_commits_before(N - 5)
-                .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
-            // post-cleanup + stale hint: pruned log where the hint points at the
-            // lowest surviving checkpoint; reader lists forward to discover latest
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5, N])
-                .with_cleanup_commits_before(N - 5)
-                .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
-        ]
-    }
-
     /// Latest version on the table. The total number of commits on disk is
-    /// `latest_version + 1`. (Does not yet account for log cleanup -- a
-    /// post-cleanup state where commits `0..K` have been removed is a
-    /// separate axis tracked in #2526.)
-    pub(crate) fn latest_version(&self) -> u64 {
+    /// `latest_version + 1` (or fewer if
+    /// [`with_cleanup_commits_before`](Self::with_cleanup_commits_before) removed earlier
+    /// versions).
+    pub fn latest_version(&self) -> u64 {
         self.latest_version
     }
 
@@ -321,6 +297,63 @@ impl LogState {
     pub(crate) fn last_checkpoint_hint(&self) -> LastCheckpointHintState {
         self.last_checkpoint_hint
     }
+}
+
+// Canonical sweep rows for the LogState axis. Test case names derive from these
+// function names (e.g. `log_state_1_commits_only__`).
+
+pub fn commits_only() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+}
+
+pub fn checkpoint_at_end() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_LATEST_VERSION])
+}
+
+pub fn checkpoint_at_end_no_hint() -> LogState {
+    checkpoint_at_end().with_last_checkpoint_hint(LastCheckpointHintState::Missing)
+}
+
+pub fn checkpoint_mid() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_MID_VERSION])
+}
+
+pub fn checkpoint_mid_no_hint() -> LogState {
+    checkpoint_mid().with_last_checkpoint_hint(LastCheckpointHintState::Missing)
+}
+
+pub fn two_checkpoints_stale_hint() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_MID_VERSION, DEFAULT_SWEEP_LATEST_VERSION])
+        .with_last_checkpoint_hint(LastCheckpointHintState::Stale)
+}
+
+// Post-cleanup variants: same shapes as above but with log cleanup applied at MID.
+// Cleanup at MID (not at LATEST) keeps commits MID..=LATEST reachable, so the canonical
+// `at_version(MID)` and `incremental_to_latest { from: MID }` targets still resolve.
+
+pub fn checkpoint_at_end_post_cleanup() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_MID_VERSION, DEFAULT_SWEEP_LATEST_VERSION])
+        .with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_at_end_no_hint_post_cleanup() -> LogState {
+    checkpoint_at_end_post_cleanup().with_last_checkpoint_hint(LastCheckpointHintState::Missing)
+}
+
+pub fn checkpoint_mid_post_cleanup() -> LogState {
+    checkpoint_mid().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_mid_no_hint_post_cleanup() -> LogState {
+    checkpoint_mid_no_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn two_checkpoints_stale_hint_post_cleanup() -> LogState {
+    two_checkpoints_stale_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
 }
 
 /// Extract the version from a versioned log file. Returns `None` for unversioned
@@ -496,37 +529,6 @@ impl FeatureSet {
         self
     }
 
-    /// Common feature sets for cross-product testing: empty, one per write-compatible
-    /// feature, and one with all write-compatible features combined. Not the full power
-    /// set -- add specific combos as needed.
-    ///
-    /// `type_widening` is intentionally excluded because kernel errors when writing
-    /// tables with that feature enabled (see `TableFeature::TypeWidening`).
-    pub fn common() -> Vec<Self> {
-        vec![
-            Self::empty(),
-            Self::new().column_mapping("name"),
-            Self::new().ict(),
-            Self::new().v2_checkpoint(),
-            Self::new().deletion_vectors(),
-            Self::new().append_only(),
-            Self::new().change_data_feed(),
-            Self::new().domain_metadata(),
-            Self::new().vacuum_protocol_check(),
-            Self::new().row_tracking(),
-            Self::new()
-                .column_mapping("name")
-                .ict()
-                .v2_checkpoint()
-                .deletion_vectors()
-                .append_only()
-                .change_data_feed()
-                .domain_metadata()
-                .vacuum_protocol_check()
-                .row_tracking(),
-        ]
-    }
-
     /// Returns the table features implied by the properties in this set. Used by tests
     /// to check that each builder method actually enables the right feature.
     pub fn expected_features(&self) -> Vec<TableFeature> {
@@ -574,16 +576,43 @@ impl fmt::Display for FeatureSet {
     }
 }
 
+// Canonical sweep rows for the FeatureSet axis.
+
+pub fn no_features() -> FeatureSet {
+    FeatureSet::empty()
+}
+
+pub fn all_features_cm_id() -> FeatureSet {
+    all_features_base().column_mapping("id")
+}
+
+pub fn all_features_cm_name() -> FeatureSet {
+    all_features_base().column_mapping("name")
+}
+
+fn all_features_base() -> FeatureSet {
+    FeatureSet::new()
+        .deletion_vectors()
+        .row_tracking()
+        .domain_metadata()
+        .ict()
+        .v2_checkpoint()
+        .vacuum_protocol_check()
+        .change_data_feed()
+        .append_only()
+}
+
 // ===========================================================================
 // TableConfig
 // ===========================================================================
 
 /// Table configuration properties that are orthogonal to table features.
 ///
-/// These are pure runtime knobs (e.g. stats format, checkpoint interval) that don't
-/// affect the protocol or enable features. Use as a separate cross-product axis from
-/// [`FeatureSet`] since the two are independent.
-#[derive(Clone, Debug, Default)]
+/// These are pure runtime knobs (stats format, checkpoint interval, file sizing,
+/// etc.) that don't affect the protocol or enable features. Crossed with
+/// [`DataLayoutConfig`] in the sweep so layout shape and write-time properties
+/// vary independently.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TableConfig {
     pub(crate) table_properties: Vec<(String, String)>,
 }
@@ -611,26 +640,6 @@ impl TableConfig {
         ));
         self
     }
-
-    /// Common table configs for cross-product testing: default plus all four stats
-    /// property combos.
-    pub fn common() -> Vec<Self> {
-        vec![
-            Self::new(),
-            Self::new()
-                .write_stats_as_json(true)
-                .write_stats_as_struct(false),
-            Self::new()
-                .write_stats_as_json(false)
-                .write_stats_as_struct(true),
-            Self::new()
-                .write_stats_as_json(true)
-                .write_stats_as_struct(true),
-            Self::new()
-                .write_stats_as_json(false)
-                .write_stats_as_struct(false),
-        ]
-    }
 }
 
 impl fmt::Display for TableConfig {
@@ -653,6 +662,27 @@ impl fmt::Display for TableConfig {
     }
 }
 
+// Canonical sweep rows for the TableConfig axis. These toggle only the *checkpoint*
+// stats encoding -- per-commit add-file stats are always written and unaffected.
+
+pub fn checkpoint_json_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(true)
+        .write_stats_as_struct(false)
+}
+
+pub fn checkpoint_struct_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(false)
+        .write_stats_as_struct(true)
+}
+
+pub fn no_checkpoint_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(false)
+        .write_stats_as_struct(false)
+}
+
 // ===========================================================================
 // rstest_reuse templates
 // ===========================================================================
@@ -672,10 +702,8 @@ impl fmt::Display for TableConfig {
 // fn test_scan(feature_set: FeatureSet, table_config: TableConfig) { ... }
 // ```
 
-/// All common feature sets: empty, one per write-compatible feature, and all combined.
-///
-/// `type_widening` is intentionally excluded because kernel errors when writing tables
-/// with that feature enabled (see [`FeatureSet::common`]).
+/// Empty + one per write-compatible feature + all combined. `type_widening` is
+/// excluded because kernel errors when writing tables with that feature enabled.
 #[rstest_reuse::template]
 #[rstest::rstest]
 pub fn feature_sets(
@@ -726,8 +754,12 @@ pub fn table_configs(
 
 /// Data layout configuration for cross-product testing.
 ///
-/// Designed for rstest `#[values]` parameterization alongside [`LogState`] and
-/// [`FeatureSet`].
+/// Describes only the partitioning/clustering shape of the table. Write-time table
+/// properties (stats format, etc.) live in [`TableConfig`], which is crossed with
+/// this axis independently.
+///
+/// Designed for rstest `#[values]` parameterization alongside [`LogState`],
+/// [`FeatureSet`], and [`TableConfig`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataLayoutConfig {
     /// No special data layout (default schema).
@@ -767,12 +799,12 @@ impl DataLayoutConfig {
 
     /// Whether this config uses partitioning.
     pub fn is_partitioned(&self) -> bool {
-        *self == DataLayoutConfig::PartitionedAllTypes
+        self == &DataLayoutConfig::PartitionedAllTypes
     }
 
     /// Whether this config uses clustering.
     pub fn is_clustered(&self) -> bool {
-        *self == DataLayoutConfig::ClusteredAllTypes
+        self == &DataLayoutConfig::ClusteredAllTypes
     }
 }
 
@@ -836,6 +868,20 @@ pub fn clustered_schema() -> SchemaRef {
     ]))
 }
 
+// Canonical sweep rows for the DataLayoutConfig axis.
+
+pub fn unpartitioned() -> DataLayoutConfig {
+    DataLayoutConfig::Unpartitioned
+}
+
+pub fn partitioned() -> DataLayoutConfig {
+    DataLayoutConfig::PartitionedAllTypes
+}
+
+pub fn clustered() -> DataLayoutConfig {
+    DataLayoutConfig::ClusteredAllTypes
+}
+
 // ===========================================================================
 // VersionTarget
 // ===========================================================================
@@ -863,6 +909,20 @@ impl fmt::Display for VersionTarget {
                 write!(f, "incremental({from}->latest)")
             }
         }
+    }
+}
+
+// Canonical sweep rows for the VersionTarget axis.
+
+pub fn version_latest() -> VersionTarget {
+    VersionTarget::Latest
+}
+pub fn version_at_mid() -> VersionTarget {
+    VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION)
+}
+pub fn version_incremental_to_latest() -> VersionTarget {
+    VersionTarget::IncrementalToLatest {
+        from: DEFAULT_SWEEP_MID_VERSION,
     }
 }
 
@@ -971,14 +1031,11 @@ impl TestTableBuilder {
         self
     }
 
-    /// Apply a [`DataLayoutConfig`], setting the schema and layout columns accordingly.
-    /// This is the recommended way to configure partitioning or clustering -- it sets both
-    /// the schema and columns in one call. Use
-    /// [`with_partition_columns`](Self::with_partition_columns) or
-    /// [`with_clustering_columns`](Self::with_clustering_columns) directly only when you
-    /// need a custom schema with specific columns.
+    /// Apply a [`DataLayoutConfig`], setting the schema and layout columns. Pair with
+    /// [`with_table_config`](Self::with_table_config) to also set write-time properties
+    /// (e.g. stats format); the two axes are independent.
     ///
-    /// For [`DataLayoutConfig::Unpartitioned`], leaves the schema and columns unchanged.
+    /// For `Unpartitioned`, leaves the schema and columns unchanged.
     pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
         let cols = config.columns();
         if cols.is_empty() {
@@ -1353,6 +1410,13 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
                     .expect("valid decimal"),
             )
         }
+        ArrowDataType::Struct(fields) => {
+            let child_arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|f| generate_column(f.data_type(), rows, base))
+                .collect();
+            Arc::new(StructArray::new(fields.clone(), child_arrays, None))
+        }
         other => panic!("unsupported Arrow type in test data generation: {other:?}"),
     }
 }
@@ -1410,12 +1474,20 @@ impl fmt::Display for TestTable {
 // rstest fixtures
 // ===========================================================================
 
-/// Convenience wrapper: build a [`TestTable`] from a `log_state` and `feature_set`.
-/// Used by the `test_context!` macro and available for direct use in tests.
-pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
+/// Convenience wrapper: build a [`TestTable`] from a `log_state`, `feature_set`,
+/// `data_layout`, and `table_config`. Used by the `test_context!` macro and available
+/// for direct use in tests.
+pub fn test_table(
+    log_state: LogState,
+    feature_set: FeatureSet,
+    data_layout: DataLayoutConfig,
+    table_config: TableConfig,
+) -> TestTable {
     TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(feature_set)
+        .with_data_layout(data_layout)
+        .with_table_config(table_config)
         .build()
         .expect("failed to build test table")
 }
@@ -1458,25 +1530,39 @@ macro_rules! build_snapshot {
 /// Expands at the call site so `Snapshot` and the engine type resolve to the caller's crate
 /// types. Returns `(engine, snapshot, table)`.
 ///
-/// The 3-argument form defaults to `DefaultEngine` and requires `DefaultEngineBuilder` to be in
-/// scope at the call site. The 4-argument form takes an explicit engine factory closure
+/// The 5-argument form defaults to `DefaultEngine` and requires `DefaultEngineBuilder` to be in
+/// scope at the call site. The 6-argument form takes an explicit engine factory closure
 /// `Fn(Arc<DynObjectStore>) -> Engine`, useful when the caller cannot construct a
 /// `DefaultEngine` (e.g. kernel-internal unit tests that depend only on `SyncEngine`).
 ///
 /// ```ignore
-/// let (engine, snap, table) = test_context!(log_state, feature_set, version_target);
-/// let (engine, snap, table) = test_context!(log_state, feature_set, version_target,
-///     |store| SyncEngine::new_with_store(store));
+/// let (engine, snap, table) = test_context!(
+///     log_state, feature_set, data_layout, table_config, version_target,
+/// );
+/// let (engine, snap, table) = test_context!(
+///     log_state, feature_set, data_layout, table_config, version_target,
+///     |store| SyncEngine::new_with_store(store),
+/// );
 /// ```
 #[macro_export]
 macro_rules! test_context {
-    ($log_state:expr, $feature_set:expr, $version_target:expr) => {
-        $crate::test_context!($log_state, $feature_set, $version_target, |store| {
-            DefaultEngineBuilder::new(store).build()
-        })
+    ($log_state:expr, $feature_set:expr, $data_layout:expr, $table_config:expr, $version_target:expr $(,)?) => {
+        $crate::test_context!(
+            $log_state,
+            $feature_set,
+            $data_layout,
+            $table_config,
+            $version_target,
+            |store| { DefaultEngineBuilder::new(store).build() }
+        )
     };
-    ($log_state:expr, $feature_set:expr, $version_target:expr, $engine_factory:expr) => {{
-        let table = $crate::table_builder::test_table($log_state, $feature_set);
+    ($log_state:expr, $feature_set:expr, $data_layout:expr, $table_config:expr, $version_target:expr, $engine_factory:expr $(,)?) => {{
+        let table = $crate::table_builder::test_table(
+            $log_state,
+            $feature_set,
+            $data_layout,
+            $table_config,
+        );
         let engine = ($engine_factory)(table.store().clone());
         let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
         (engine, snap, table)
@@ -1547,7 +1633,7 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
 // ===========================================================================
 
 /// Default schema with all Delta primitive types including TimestampNtz
-/// (nested types are a separate concern).
+/// and a nested column type.
 pub(crate) fn default_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
         StructField::new("bool_col", DataType::BOOLEAN, true),
@@ -1563,6 +1649,15 @@ pub(crate) fn default_schema() -> SchemaRef {
         StructField::new("ts_col", DataType::TIMESTAMP, true),
         StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
         StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),
+        StructField::new(
+            "nested_col",
+            DataType::try_struct_type([
+                StructField::nullable("a", DataType::LONG),
+                StructField::nullable("b", DataType::STRING),
+            ])
+            .unwrap(),
+            true,
+        ),
     ]))
 }
 
@@ -1599,6 +1694,8 @@ mod tests {
     fn test_version_targets(
         #[values(LogState::with_latest_version(4))] log_state: LogState,
         #[values(FeatureSet::empty())] feature_set: FeatureSet,
+        #[values(unpartitioned())] data_layout: DataLayoutConfig,
+        #[values(checkpoint_json_stats())] table_config: TableConfig,
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
@@ -1606,7 +1703,13 @@ mod tests {
         )]
         version_target: VersionTarget,
     ) {
-        let (_engine, snap, _table) = test_context!(log_state, feature_set, version_target);
+        let (_engine, snap, _table) = test_context!(
+            log_state,
+            feature_set,
+            data_layout,
+            table_config,
+            version_target
+        );
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
             VersionTarget::AtVersion(v) => *v,
@@ -1755,9 +1858,16 @@ mod tests {
             .with_cleanup_commits_before(1)
             .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
     )]
+    #[case::stale_hint_points_at_deleted_checkpoint(
+        LogState::with_latest_version(10)
+            .with_checkpoint_at([5, 8])
+            .with_cleanup_commits_before(8)
+            .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
+    )]
     fn test_log_state_checkpoint_shapes_land_on_disk(
         #[case] log_state: LogState,
     ) -> DeltaResult<()> {
+        let expected_version = log_state.latest_version();
         let table = TestTableBuilder::new()
             .with_log_state(log_state.clone())
             .build()?;
@@ -1766,7 +1876,7 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(
             snap.version(),
-            2,
+            expected_version,
             "rebuild lost commits for {}",
             table.description(),
         );
@@ -1836,8 +1946,8 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::partitioned(DataLayoutConfig::PartitionedAllTypes, partitioned_schema())]
-    #[case::clustered(DataLayoutConfig::ClusteredAllTypes, clustered_schema())]
+    #[case::partitioned(partitioned(), partitioned_schema())]
+    #[case::clustered(clustered(), clustered_schema())]
     fn test_data_layout_table(
         #[case] config: DataLayoutConfig,
         #[case] expected_schema: SchemaRef,
@@ -1865,7 +1975,8 @@ mod tests {
         // v0=create, v1-v3=data commits, 10 rows each
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(3))
-            .with_data_layout(DataLayoutConfig::ClusteredAllTypes)
+            .with_data_layout(clustered())
+            .with_table_config(checkpoint_struct_stats())
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -1890,6 +2001,22 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 1);
         assert_eq!(snap.schema(), clustered_schema());
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_struct_schema_round_trip() -> DeltaResult<()> {
+        let inner = DataType::try_struct_type([StructField::nullable("a", DataType::LONG)])?;
+        let schema: SchemaRef = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("inner", inner),
+        ])?);
+        let table = TestTableBuilder::new()
+            .with_schema(schema.clone())
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.schema(), schema);
         Ok(())
     }
 

@@ -180,13 +180,13 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, DeltaResultIterator, Error, ScopedDeltaResultIterator};
+pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{
-    IoOperation, Plan, PlanExecutor, PlanResult, QueryPlan, QueryPlanBuilder, QueryPlanNode,
+    IoOperation, Operation, PlanExecutor, PlanResult, QueryPlan, QueryPlanBuilder, QueryPlanNode,
 };
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
@@ -212,7 +212,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator = DeltaResultIterator<Box<dyn EngineData>>;
+pub type FileDataReadResultIterator = DeltaResultIteratorStatic<Box<dyn EngineData>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,7 +699,7 @@ pub trait JsonHandler: AsAny {
     fn write_json_file(
         &self,
         path: &Url,
-        data: ScopedDeltaResultIterator<'_, FilteredEngineData>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }
@@ -905,7 +905,7 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: DeltaResultIterator<Box<dyn EngineData>>,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
