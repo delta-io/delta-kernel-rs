@@ -20,7 +20,9 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
-use crate::schema::{self, ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{
+    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
+};
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
     FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
