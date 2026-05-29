@@ -43,55 +43,43 @@ StructExpression
     field_patches
       FieldPatch
         field_name: a
-        replacement_expr
         insertions
           String(first)
           StructPatch
-            input_path
-            prepended_fields
             field_patches
               FieldPatch
                 field_name: gone
-                replacement_expr
-                insertions
                 is_drop: true
                 optional: false
               FieldPatch
                 field_name: stub
                 replacement_expr
                   String(replaced)
-                insertions
                 is_drop: false
                 optional: false
               FieldPatch
                 field_name: x
-                replacement_expr
                 insertions
                   Boolean(1)
                 is_drop: false
                 optional: false
               FieldPatch
                 field_name: y
-                replacement_expr
                 insertions
                   Boolean(0)
                 is_drop: false
                 optional: false
-            appended_fields
           String(third)
         is_drop: false
         optional: false
       FieldPatch
         field_name: dropme
-        replacement_expr
-        insertions
         is_drop: true
         optional: false
       FieldPatch
         field_name: replaceme
         replacement_expr
           Integer(42)
-        insertions
         is_drop: false
         optional: false
     appended_fields

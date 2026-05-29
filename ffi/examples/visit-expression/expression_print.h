@@ -23,6 +23,13 @@ void print_expression_item_list_field(const char* field_name, ExpressionItemList
   printf("%s\n", field_name);
   print_expression_item_list(list, depth + 1);
 }
+void print_non_empty_expression_item_list_field(
+    const char* field_name, ExpressionItemList list, int depth) {
+  if (list.len == 0) {
+    return;
+  }
+  print_expression_item_list_field(field_name, list, depth);
+}
 void print_bool_field(const char* field_name, bool value, int depth) {
   print_n_spaces(depth);
   printf("%s: %s\n", field_name, value ? "true" : "false");
@@ -96,10 +103,14 @@ void print_tree_helper(ExpressionItem ref, int depth) {
     case StructPatch: {
       struct StructPatchExpression* patch = ref.ref;
       printf("StructPatch\n");
-      print_expression_item_list_field("input_path", patch->input_path, depth + 1);
-      print_expression_item_list_field("prepended_fields", patch->prepended_fields, depth + 1);
-      print_expression_item_list_field("field_patches", patch->field_patches, depth + 1);
-      print_expression_item_list_field("appended_fields", patch->appended_fields, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "input_path", patch->input_path, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "prepended_fields", patch->prepended_fields, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "field_patches", patch->field_patches, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "appended_fields", patch->appended_fields, depth + 1);
       break;
     }
     case FieldPatch: {
@@ -107,8 +118,10 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       printf("FieldPatch\n");
       print_n_spaces(depth + 1);
       printf("field_name: %s\n", field_patch->field_name);
-      print_expression_item_list_field("replacement_expr", field_patch->replacement_expr, depth + 1);
-      print_expression_item_list_field("insertions", field_patch->insertions, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "replacement_expr", field_patch->replacement_expr, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "insertions", field_patch->insertions, depth + 1);
       print_bool_field("is_drop", field_patch->is_drop, depth + 1);
       print_bool_field("optional", field_patch->optional, depth + 1);
       break;

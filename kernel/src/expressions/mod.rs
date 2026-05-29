@@ -343,7 +343,8 @@ pub struct ExpressionFieldPatch {
     /// The expression this field patch emits at the input field's output position instead of the
     /// original input field.
     pub replacement_expr: Option<ExpressionRef>,
-    /// If true, and there is no replacement expression, the input field is omitted from the output.
+    /// If true, and there is no replacement expression, the input field is omitted from the
+    /// output.
     pub is_drop: bool,
     /// Insertions provided by calls to [`Self::with_inserted_field_after`].
     pub insertions: Vec<ExpressionRef>,
@@ -406,7 +407,8 @@ impl ExpressionStructPatch {
         self
     }
 
-    /// Specifies an expression to replace a field with. This overrides any prior drop or replace calls.
+    /// Specifies an expression to replace a field with. This overrides any prior drop or replace
+    /// calls.
     pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
         let field_patch = self.field_patch(name);
         field_patch.replacement_expr = Some(expr);
