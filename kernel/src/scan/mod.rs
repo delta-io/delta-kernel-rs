@@ -37,7 +37,7 @@ use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
-use crate::table_features::{ColumnMappingMode, Operation};
+use crate::table_features::{ColumnMappingMode, Operation, ReadOp};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::IteratorExt;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -256,7 +256,7 @@ impl ScanBuilder {
 
         self.snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Scan)?;
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))?;
 
         let state_info = StateInfo::try_new(
             logical_schema,

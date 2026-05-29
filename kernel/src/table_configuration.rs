@@ -23,13 +23,14 @@ use crate::scan::data_skipping::stats_schema::{
 };
 use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
+use crate::schema::{SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
-    LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
-    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, CreatePath, CreateSupport,
+    DataWriteOp, DdlOp, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, OpSupport,
+    Operation, ReadOp, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
+    MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -587,33 +588,37 @@ impl TableConfiguration {
         Ok(())
     }
 
-    /// Checks that kernel supports a feature for the given operation.
-    /// Returns an error if the feature is unknown, not supported, or fails validation.
-    fn check_feature_support(
-        &self,
-        feature: &TableFeature,
-        operation: Operation,
-    ) -> DeltaResult<()> {
-        let info = feature.info();
-        match &info.kernel_support {
-            KernelSupport::Supported => {}
-            KernelSupport::NotSupported => {
-                return Err(Error::unsupported(format!(
-                    "Feature '{feature}' is not supported"
-                )))
+    /// Applies a per-cell [`OpSupport`] policy to the given feature.
+    ///
+    /// Returns `Ok` if the operation is allowed for this feature; otherwise an `unsupported`
+    /// error of the form `"Feature 'X': <cell's static suffix>"`.
+    fn apply_cell(&self, feature: &TableFeature, cell: &OpSupport) -> DeltaResult<()> {
+        let blocked_msg = match cell {
+            OpSupport::Allowed => None,
+            OpSupport::NotApplicable => {
+                debug_assert!(
+                    false,
+                    "Feature '{feature}': NotApplicable cell reached at runtime; dispatcher \
+                     invariant has broken (writer-only feature's read cell should be unreachable)"
+                );
+                None
             }
-            KernelSupport::Custom(check) => {
-                check(&self.protocol, &self.table_properties, operation)?;
-            }
+            OpSupport::ForbiddenIfSupported(msg) => Some(*msg),
+            OpSupport::ForbiddenIfEnabled(msg) if self.is_feature_enabled(feature) => Some(*msg),
+            OpSupport::ForbiddenIfEnabled(_) => None,
+            OpSupport::ForbiddenIf { msg, predicate } if predicate(self) => Some(*msg),
+            OpSupport::ForbiddenIf { .. } => None,
         };
-
-        self.validate_feature_requirements(feature)
+        match blocked_msg {
+            Some(msg) => Err(Error::unsupported(format!("Feature '{feature}': {msg}"))),
+            None => Ok(()),
+        }
     }
 
-    /// Returns all reader features enabled for this table based on protocol version.
+    /// Returns all reader features supported by this table based on protocol version.
     /// For table features protocol (v3), returns the explicit reader_features list.
     /// For legacy protocol (v1-2), infers features from the version number.
-    fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
+    fn get_supported_reader_features(&self) -> Vec<TableFeature> {
         match self.protocol.min_reader_version() {
             TABLE_FEATURES_MIN_READER_VERSION => {
                 // Table features reader: use explicit reader_features list
@@ -634,10 +639,10 @@ impl TableConfiguration {
         }
     }
 
-    /// Returns all writer features enabled for this table based on protocol version.
+    /// Returns all writer features supported by this table based on protocol version.
     /// For table features protocol (v7), returns the explicit writer_features list.
     /// For legacy protocol (v1-6), infers features from the version number.
-    fn get_enabled_writer_features(&self) -> Vec<TableFeature> {
+    fn get_supported_writer_features(&self) -> Vec<TableFeature> {
         match self.protocol.min_writer_version() {
             TABLE_FEATURES_MIN_WRITER_VERSION => {
                 // Table features writer: use explicit writer_features list
@@ -661,18 +666,59 @@ impl TableConfiguration {
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
     /// the protocol's features are all supported for the requested operation type.
     ///
-    /// - For `Scan` and `Cdf` operations: checks reader version and reader features
-    /// - For `Write` operations: checks writer version and writer features
+    /// - [`Operation::Read`] operations iterate over reader features.
+    /// - [`Operation::DataWrite`] and [`Operation::Ddl`] operations iterate over writer features.
+    /// - [`Operation::Read`] also validates the reader version is within the kernel's supported
+    ///   range.
+    /// - [`Operation::DataWrite`] and [`Operation::Ddl`] also validate the writer version is within
+    ///   the kernel's supported range.
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
         match operation {
-            Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
-            Operation::Write => self.ensure_write_supported(),
+            Operation::Read(read_op) => {
+                self.check_reader_version()?;
+                self.gate(self.get_supported_reader_features(), |info| match read_op {
+                    ReadOp::Scan => &info.operation_support.read.scan,
+                    ReadOp::Cdf => &info.operation_support.read.cdf,
+                })
+            }
+            Operation::DataWrite(data_write_op) => {
+                self.check_writer_version()?;
+                self.gate(
+                    self.get_supported_writer_features(),
+                    |info| match data_write_op {
+                        DataWriteOp::Append => &info.operation_support.data_write.append,
+                        DataWriteOp::Dml => &info.operation_support.data_write.dml,
+                        DataWriteOp::Maintenance => &info.operation_support.data_write.maintenance,
+                    },
+                )
+            }
+            Operation::Ddl(ddl_op) => {
+                self.check_writer_version()?;
+                self.gate(self.get_supported_writer_features(), |info| match ddl_op {
+                    DdlOp::AddColumn => &info.operation_support.ddl.add_column,
+                    DdlOp::SetNullable => &info.operation_support.ddl.set_nullable,
+                    DdlOp::DropColumn => &info.operation_support.ddl.drop_column,
+                    DdlOp::RenameColumn => &info.operation_support.ddl.rename_column,
+                })
+            }
         }
     }
 
-    /// Internal helper for read operations (Scan, Cdf)
-    fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
+    /// Walks the given supported-feature list and gates each via the per-feature cell that
+    /// `select` returns. Each feature's `feature_requirements` are validated after its cell.
+    fn gate<F>(&self, features: Vec<TableFeature>, select: F) -> DeltaResult<()>
+    where
+        F: Fn(&FeatureInfo) -> &OpSupport,
+    {
+        for feature in features {
+            self.apply_cell(&feature, select(feature.info()))?;
+            self.validate_feature_requirements(&feature)?;
+        }
+        Ok(())
+    }
+
+    fn check_reader_version(&self) -> DeltaResult<()> {
         require!(
             self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
             Error::InvalidProtocol(format!(
@@ -680,26 +726,16 @@ impl TableConfiguration {
                 self.protocol.min_reader_version()
             ))
         );
-        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
         if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum reader version {}",
                 self.protocol.min_reader_version()
             )));
         }
-
-        // Check all enabled reader features have kernel support
-        for feature in self.get_enabled_reader_features() {
-            self.check_feature_support(&feature, operation)?;
-        }
-
         Ok(())
     }
 
-    /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: kernel supports writer versions
-        // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
+    fn check_writer_version(&self) -> DeltaResult<()> {
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
             Error::InvalidProtocol(format!(
@@ -707,30 +743,57 @@ impl TableConfiguration {
                 self.protocol.min_writer_version()
             ))
         );
-        // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
             )));
         }
-
-        // Check all enabled writer features have kernel support
-        for feature in self.get_enabled_writer_features() {
-            self.check_feature_support(&feature, Operation::Write)?;
-        }
-
-        // Schema-dependent validation for Invariants (can't be in FeatureInfo)
-        // TODO: Better story for schema validation for Invariants and other features
-        if self.is_feature_supported(&TableFeature::Invariants)
-            && schema_has_invariants(self.logical_schema.as_ref())
-        {
-            return Err(Error::unsupported(
-                "Column invariants are not yet supported",
-            ));
-        }
-
         Ok(())
+    }
+
+    /// Returns `Ok` if the given `feature` is allowed to land in the protocol via the given
+    /// `path` at table creation time.
+    ///
+    /// Path-based create validation is separate from [`Self::ensure_operation_supported`] because
+    /// CREATE needs origin information (user opt-in vs kernel inference) that the unified
+    /// dispatcher does not have.
+    #[internal_api]
+    pub(crate) fn ensure_create_supported(
+        &self,
+        feature: &TableFeature,
+        path: CreatePath,
+    ) -> DeltaResult<()> {
+        match (&feature.info().operation_support.create, path) {
+            (CreateSupport::Allowed, _) => Ok(()),
+            (CreateSupport::AllowedOnlyViaKernelInference(_), CreatePath::KernelInference) => {
+                Ok(())
+            }
+            (CreateSupport::AllowedOnlyViaKernelInference(msg), CreatePath::UserOptIn) => {
+                Err(Error::unsupported(format!("Feature '{feature}': {msg}")))
+            }
+            (CreateSupport::Forbidden(msg), _) => {
+                Err(Error::unsupported(format!("Feature '{feature}': {msg}")))
+            }
+        }
+    }
+
+    /// Returns an iterator over all features supported by this table's protocol (union of
+    /// reader and writer feature lists, deduplicated).
+    pub(crate) fn all_supported_features(&self) -> impl Iterator<Item = TableFeature> {
+        let mut seen: HashSet<TableFeature> = HashSet::new();
+        let mut out: Vec<TableFeature> = Vec::new();
+        for f in self.get_supported_reader_features() {
+            if seen.insert(f.clone()) {
+                out.push(f);
+            }
+        }
+        for f in self.get_supported_writer_features() {
+            if seen.insert(f.clone()) {
+                out.push(f);
+            }
+        }
+        out.into_iter()
     }
 
     /// Returns information about in-commit timestamp enablement state.
@@ -877,25 +940,6 @@ impl TableConfiguration {
         // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
         self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
-
-    /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
-    /// See `crate::table_features::ROW_TRACKING_INFO` for more details.
-    pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
-        // RowTracking is a prerequisite for IcebergCompatV3, so the IcebergCompatV3 arm is
-        // technically redundant. Just be conservative here to check both.
-        if self.should_write_row_tracking() {
-            return Err(Error::unsupported(
-                "Remove actions are not yet supported on tables with rowTracking supported \
-                 and not suspended",
-            ));
-        }
-        if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
-                "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -911,8 +955,8 @@ mod test {
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
     use crate::table_features::{
-        ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-        TABLE_FEATURES_MIN_WRITER_VERSION,
+        ColumnMappingMode, DataWriteOp, FeatureType, Operation, ReadOp, TableFeature,
+        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
         TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
@@ -1057,8 +1101,8 @@ mod test {
     }
 
     #[rstest]
-    #[case(-1, 2, Operation::Scan)]
-    #[case(1, -1, Operation::Write)]
+    #[case(-1, 2, Operation::Read(ReadOp::Scan))]
+    #[case(1, -1, Operation::DataWrite(DataWriteOp::Append))]
     fn reject_protocol_version_below_minimum(
         #[case] rv: i32,
         #[case] wv: i32,
@@ -1144,7 +1188,8 @@ mod test {
 
         for (table_configuration, result) in cases {
             match (
-                table_configuration.ensure_operation_supported(Operation::Write),
+                table_configuration
+                    .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append)),
                 result,
             ) {
                 (Ok(()), Ok(())) => { /* Correct result */ }
@@ -1300,7 +1345,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         table_config
-            .ensure_operation_supported(Operation::Scan)
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))
             .expect_err("Unknown feature is not supported in kernel");
     }
     #[test]
@@ -1561,12 +1606,19 @@ mod test {
             UnknownFeatureShape::ReaderWriter
         )]
         shape: UnknownFeatureShape,
-        #[values(Operation::Scan, Operation::Cdf, Operation::Write)] operation: Operation,
+        #[values(
+            Operation::Read(ReadOp::Scan),
+            Operation::Read(ReadOp::Cdf),
+            Operation::DataWrite(DataWriteOp::Append)
+        )]
+        operation: Operation,
     ) {
         let (_, config) = create_unknown_feature_config(shape);
         let expected_ok = match shape {
             UnknownFeatureShape::NotListed => true,
-            UnknownFeatureShape::WriterOnly => operation != Operation::Write,
+            UnknownFeatureShape::WriterOnly => {
+                operation != Operation::DataWrite(DataWriteOp::Append)
+            }
             UnknownFeatureShape::ReaderWriter => false,
         };
         assert_eq!(
@@ -1686,13 +1738,19 @@ mod test {
     #[test]
     fn test_ensure_operation_supported_reads() {
         let config = create_mock_table_config(&[], &[]);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))
+            .is_ok());
 
         let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))
+            .is_ok());
 
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))
+            .is_ok());
 
         let config = create_mock_table_config_with_version(
             &[],
@@ -1700,7 +1758,9 @@ mod test {
             2,
             7,
         );
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))
+            .is_ok());
     }
 
     #[test]
@@ -1715,13 +1775,15 @@ mod test {
                 TableFeature::RowTracking,
             ],
         );
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        assert!(config
+            .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
+            .is_ok());
 
         // Type Widening is not supported for writes
         let config = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
         assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            r#"Feature 'typeWidening' is not supported for writes"#,
+            config.ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append)),
+            r#"Feature 'typeWidening': is not supported for writes"#,
         );
     }
 
@@ -1738,7 +1800,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
+            config.ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append)),
             "Feature 'rowTracking' requires 'domainMetadata' to be supported",
         );
     }
@@ -1758,7 +1820,9 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(
-            config.ensure_operation_supported(Operation::Write).is_ok(),
+            config
+                .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
+                .is_ok(),
             "RowTracking with DomainMetadata should be supported for writes"
         );
     }
@@ -1773,7 +1837,9 @@ mod test {
                 TableFeature::InCommitTimestamp,
             ],
         );
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        assert!(config
+            .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
+            .is_ok());
 
         let config = create_mock_table_config(
             &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
@@ -1782,7 +1848,9 @@ mod test {
                 TableFeature::InCommitTimestamp,
             ],
         );
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        assert!(config
+            .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
+            .is_ok());
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization
@@ -2348,7 +2416,9 @@ mod test {
             &[TableFeature::ClusteredTable, TableFeature::DomainMetadata],
         );
         assert!(
-            config.ensure_operation_supported(Operation::Write).is_ok(),
+            config
+                .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
+                .is_ok(),
             "ClusteredTable with DomainMetadata should be supported for writes"
         );
     }
@@ -2419,7 +2489,7 @@ mod test {
             ],
         );
         config
-            .ensure_operation_supported(Operation::Write)
+            .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
             .expect("V3 write should be supported once kernel_support flips to Supported");
     }
 
@@ -2643,22 +2713,90 @@ mod test {
         );
     }
 
-    /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_
-    /// and not _suspended_, which is broader than _enabled_.
+    /// The RowTracking `data_write` matrix cells must reject `Dml` and `Maintenance` whenever
+    /// row tracking is _supported_ and not _suspended_, which is broader than just _enabled_.
+    /// Append is always allowed. See
+    /// [`crate::table_features::row_tracking_supported_and_not_suspended_predicate`]
+    /// for the rationale.
     #[rstest]
     #[case::supported_only(&[], Some("rowTracking"))]
     #[case::supported_and_enabled(&[(ENABLE_ROW_TRACKING, "true")], Some("rowTracking"))]
-    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None /*expected_error_substring */)]
-    fn test_validate_feature_support_for_remove_row_tracking(
+    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None)]
+    fn test_row_tracking_blocks_data_changing_writes(
         #[case] props: &[(&str, &str)],
         #[case] expected_error_substring: Option<&str>,
     ) {
-        let config = create_mock_table_config(props, &[TableFeature::RowTracking]);
-        let result = config.validate_feature_support_for_remove();
-        match expected_error_substring {
-            Some(msg) => assert_result_error_with_message(result, msg),
-            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        let config = create_mock_table_config(
+            props,
+            &[TableFeature::RowTracking, TableFeature::DomainMetadata],
+        );
+        for op in [DataWriteOp::Dml, DataWriteOp::Maintenance] {
+            let result = config.ensure_operation_supported(Operation::DataWrite(op));
+            match expected_error_substring {
+                Some(msg) => assert_result_error_with_message(result, msg),
+                None => assert!(result.is_ok(), "{op:?}: expected Ok, got {result:?}"),
+            }
         }
+        // Append is always allowed regardless of row tracking state.
+        assert!(config
+            .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
+            .is_ok());
+    }
+
+    /// The IcebergCompatV3 `data_write` matrix cells must reject `Dml` and `Maintenance`
+    /// whenever V3 is enabled. On a typical V3 table the RowTracking cell would also fire
+    /// and could mask the V3-specific message. This test orders V3 first in the writer
+    /// feature list so the V3 cell is the one observed; V3's dependency cascade
+    /// (ColumnMapping, RowTracking, DomainMetadata) is still satisfied by including those
+    /// features in the protocol so `validate_feature_requirements` passes for the Append
+    /// case.
+    #[test]
+    fn test_iceberg_compat_v3_blocks_removes_with_specific_message() {
+        let config = create_mock_table_config_with_cm(
+            &[
+                (ENABLE_ICEBERG_COMPAT_V3, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ],
+            Some(ColumnMappingMode::Name),
+            &[TableFeature::ColumnMapping],
+            // V3 listed first so its cell fires before RowTracking's.
+            &[
+                TableFeature::IcebergCompatV3,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+                TableFeature::ColumnMapping,
+            ],
+        );
+        for op in [DataWriteOp::Dml, DataWriteOp::Maintenance] {
+            assert_result_error_with_message(
+                config.ensure_operation_supported(Operation::DataWrite(op)),
+                "Remove actions are not yet supported on icebergCompatV3-enabled tables",
+            );
+        }
+        // Append must still succeed (V3 doesn't restrict append-shaped writes).
+        assert!(config
+            .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
+            .is_ok());
+    }
+
+    /// CatalogManaged and CatalogOwnedPreview's `read.cdf` cell must block CDF reads
+    /// whenever the feature is in the protocol's reader features. Reads of regular table
+    /// data (`Scan`) must still succeed.
+    #[rstest]
+    #[case(TableFeature::CatalogManaged, "Feature 'catalogManaged'")]
+    #[case(TableFeature::CatalogOwnedPreview, "Feature 'catalogOwned-preview'")]
+    fn test_catalog_features_block_cdf_reads(
+        #[case] feature: TableFeature,
+        #[case] expected_substring: &str,
+    ) {
+        let config = create_mock_table_config(&[], &[feature]);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Read(ReadOp::Cdf)),
+            expected_substring,
+        );
+        assert!(config
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))
+            .is_ok());
     }
 
     /// Test helper: variant of `create_mock_table_config` that also takes an optional

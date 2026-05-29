@@ -23,7 +23,7 @@ use crate::schema::{
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{format_features, Operation, TableFeature};
+use crate::table_features::{format_features, Operation, ReadOp, TableFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
@@ -294,7 +294,7 @@ impl LogReplayScanner {
             // If protocol is updated, check if Change Data Feed is supported
             if has_protocol_update {
                 table_configuration
-                    .ensure_operation_supported(Operation::Cdf)
+                    .ensure_operation_supported(Operation::Read(ReadOp::Cdf))
                     .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
             }
         }

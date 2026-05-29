@@ -11,7 +11,7 @@ use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
 use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::Operation;
+use crate::table_features::{Operation, ReadOp};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, Version,
@@ -52,7 +52,7 @@ impl IncrementalScanBuilder {
     /// that's important — the snapshot's `log_tail` carries staged commits that a fresh
     /// storage listing would miss.
     ///
-    /// Validates only the target's reader features via [`Operation::Scan`]. By the protocol's
+    /// Validates only the target's reader features via [`ReadOp::Scan`]. By the protocol's
     /// feature-immutability rule, the target's `readerFeatures` is a superset of every
     /// reader feature used in any commit in `(base_version, target_version]`. Of the fields
     /// kernel itself decodes from each row (path + deletionVector.*), only
@@ -87,7 +87,7 @@ impl IncrementalScanBuilder {
         // TODO(#2552): surface in-range protocol/metadata changes to the consumer.
         self.target_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Scan)?;
+            .ensure_operation_supported(Operation::Read(ReadOp::Scan))?;
 
         // TODO(#2493): replace this block with `CommitRange` once it exists.
         // Today we use the snapshot's already-validated commit list rather than re-listing
