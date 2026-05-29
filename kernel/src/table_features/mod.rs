@@ -7,7 +7,7 @@ pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
     get_column_mapping_mode_from_properties, physical_to_logical_column_name,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
-    validate_column_mapping_id, SeenColumnMappingAnnotations,
+    validate_column_mapping_id,
 };
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -155,6 +155,7 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantType-preview")]
     #[serde(rename = "variantType-preview")]
     VariantTypePreview,
+    VariantShredding,
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
@@ -347,9 +348,16 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-/// TODO: When kernel writes the materialized `row_id` / `row_commit_version`
-/// columns, they must use the reserved parquet field IDs defined by the
-/// protocol on IcebergCompatV3 tables, not auto-assigned IDs.
+// TODO(#2538): Currently we reject `Transaction::commit` when it contains staged remove-file
+// actions on RowTracking-supported (and not-suspended) tables because
+//   1. kernel does not yet materialize stable row IDs / commit versions on write, which blocks COW
+//      rewrites,
+//   2. kernel does not yet validate if remove actions correctly reserved row IDs / commit versions.
+// Unblock after both 1 and 2 are supported.
+//
+// TODO: When kernel writes the materialized `row_id` / `row_commit_version` columns, they must
+// use the reserved parquet field IDs defined by the protocol on IcebergCompatV3 tables, not
+// auto-assigned IDs.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -509,8 +517,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    // We support writing to tables with DeletionVectors enabled, but we never write DV files
-    // ourselves (no DML). The kernel only performs append operations.
+    // The kernel can read DV-bearing tables and install connector-authored DV descriptors via
+    // `Transaction::update_deletion_vectors`, including through the FFI
+    // `transaction_update_deletion_vectors` path.
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
@@ -589,6 +598,14 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -627,6 +644,7 @@ impl TableFeature {
             | TableFeature::VacuumProtocolCheck
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
+            | TableFeature::VariantShredding
             | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
@@ -690,6 +708,7 @@ impl TableFeature {
             TableFeature::VacuumProtocolCheck => &VACUUM_PROTOCOL_CHECK_INFO,
             TableFeature::VariantType => &VARIANT_TYPE_INFO,
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
+            TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
@@ -827,6 +846,7 @@ mod tests {
                 TableFeature::VacuumProtocolCheck => "vacuumProtocolCheck",
                 TableFeature::VariantType => "variantType",
                 TableFeature::VariantTypePreview => "variantType-preview",
+                TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };

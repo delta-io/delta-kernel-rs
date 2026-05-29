@@ -20,10 +20,11 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use serde_json::Value;
-use test_utils::{assert_result_error_with_message, test_table_setup};
+use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
 
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.
@@ -180,17 +181,84 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_create_table_empty_schema_not_supported() -> DeltaResult<()> {
+async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    // Create empty schema
+    // CREATE TABLE with no columns is a valid Delta operation; users may add columns
+    // later via ALTER TABLE ADD COLUMN.
     let schema = Arc::new(StructType::try_new(vec![])?);
 
-    // Try to create table with empty schema - should fail at build time
-    let result = create_table(&table_path, schema, "InvalidApp/0.1.0")
+    create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+    assert_eq!(snapshot.schema().num_fields(), 0);
+
+    Ok(())
+}
+
+/// Checkpoints serialize the table schema into their parquet payload, so a zero-column
+/// schema is a corner the writer can plausibly mishandle. This test creates an empty
+/// table, checkpoints immediately, then reloads from scratch to confirm the schema
+/// survives the round-trip across all column-mapping modes.
+#[rstest]
+#[case::no_cm(None)]
+#[case::cm_name(Some("name"))]
+#[case::cm_id(Some("id"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_create_table_empty_schema_checkpoint_round_trip(
+    #[case] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let schema = Arc::new(StructType::try_new(vec![])?);
+    let mut builder = create_table(&table_path, schema, "EmptySchemaApp/0.1.0");
+    if let Some(mode) = cm_mode {
+        builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+    }
+    builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let v0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let (_, _ckpt_snapshot) = v0.checkpoint(engine.as_ref(), None)?;
+
+    let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(reloaded.version(), 0);
+    assert_eq!(reloaded.schema().num_fields(), 0);
+    let max_id = reloaded
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .get("delta.columnMapping.maxColumnId")
+        .and_then(|v| v.parse::<i64>().ok());
+    assert_eq!(max_id, cm_mode.map(|_| 0));
+
+    Ok(())
+}
+
+#[rstest]
+#[case::partitioned_empty(DataLayout::partitioned::<_, &str>([]), "at least one column")]
+#[case::clustered_missing_column(DataLayout::clustered(["foo"]), "not found in schema")]
+#[tokio::test]
+async fn test_create_table_empty_schema_layout_errors(
+    #[case] layout: DataLayout,
+    #[case] expected_err: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![])?);
+    let result = create_table(&table_path, schema, "EmptySchemaApp/0.1.0")
+        .with_data_layout(layout)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert_result_error_with_message(result, "cannot be empty");
+    assert_result_error_with_message(result, expected_err);
 
     Ok(())
 }

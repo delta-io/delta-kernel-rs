@@ -202,13 +202,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Type widening metadata mismatch in nested struct fields",
-        &[
-            "tw_nested_field/specs/tw_nested_field_read_all",
-            "tw_nested_field/specs/tw_nested_field_read_large_count",
-        ],
-    ),
-    (
         "Schema deserialization fails for TimestampNTZ type",
         &["ds_multi_file_time/"],
     ),
