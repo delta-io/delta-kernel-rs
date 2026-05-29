@@ -334,12 +334,15 @@ fn read_scan_file(
 mod tests {
     use std::sync::Arc;
 
+    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Scalar};
+    use crate::object_store::memory::InMemory;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
+    use crate::transaction::create_table::create_table;
     use crate::Predicate;
 
     #[test]
@@ -465,10 +468,27 @@ mod tests {
     // Regression for issue #2468 on the CDF path
     #[test]
     fn cdf_predicate_on_unprojected_data_column_in_table_schema_succeeds() {
-        let path = "./tests/data/table-with-cdf";
-        let engine = Box::new(SyncEngine::new());
-        let url = delta_kernel::try_parse_uri(path).unwrap();
-        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+        let url_str = "memory:///test_table/";
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store);
+
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("part", DataType::STRING),
+        ]));
+        create_table(url_str, schema, "DefaultEngine")
+            .with_table_properties([("delta.enableChangeDataFeed", "true")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap()
+            .commit(&engine)
+            .unwrap()
+            .unwrap_committed();
+
+        let url = url::Url::parse(url_str).unwrap();
+        // This regression validates predicate resolution at build time, which is independent
+        // of the CDF version span. A wider range would require a second commit with real
+        // change data (see LocalMockTable).
+        let table_changes = TableChanges::try_new(url, &engine, 0, Some(0)).unwrap();
 
         // Project only "part"; predicate references unprojected "id".
         let schema = table_changes.schema().project(&["part"]).unwrap();
@@ -485,7 +505,7 @@ mod tests {
             PhysicalPredicate::Some(pred, _) if pred == &predicate));
     }
 
-    // github issue #525
+    // See delta-io/delta-kernel-rs#525
     #[test]
     fn cdf_predicate_on_unprojected_cdf_metadata_column_builds_but_is_no_op() {
         let path = "./tests/data/table-with-cdf";

@@ -339,7 +339,7 @@ impl StateInfo {
             .map(|p| p.references().into_iter().cloned().collect())
             .unwrap_or_default();
 
-        // we use table_schema here as predicate can reference columns outside projection
+        // We use table_schema here as predicate can reference columns outside projection.
         let physical_predicate = match predicate {
             Some(pred) => PhysicalPredicate::try_new(&pred, &table_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,

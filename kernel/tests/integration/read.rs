@@ -1121,15 +1121,30 @@ async fn test_partition_pruning_with_column_mapping(
 
     let stream = scan.execute(engine)?;
     let mut files_scanned = 0;
+    // "category" is in the output iff there's no projection (SELECT *) or the projection
+    // explicitly includes it.
+    let expect_category = select_cols
+        .as_ref()
+        .is_none_or(|cols| cols.contains(&"category"));
     for engine_data in stream {
         let result_batch = into_record_batch(engine_data?);
-        // The "category" partition column (when included in the projection) should be 'A'
-        // for every surviving row.
-        if let Ok(category_idx) = result_batch.schema().index_of("category") {
-            let category_col = result_batch.column(category_idx).as_string::<i32>();
-            for i in 0..result_batch.num_rows() {
-                assert_eq!(category_col.value(i), "A");
+        // The "category" partition column should be present exactly when projected, and
+        // should be 'A' for every surviving row.
+        match result_batch.schema().index_of("category") {
+            Ok(category_idx) => {
+                assert!(
+                    expect_category,
+                    "category present but not expected in projection"
+                );
+                let category_col = result_batch.column(category_idx).as_string::<i32>();
+                for i in 0..result_batch.num_rows() {
+                    assert_eq!(category_col.value(i), "A");
+                }
             }
+            Err(_) => assert!(
+                !expect_category,
+                "category missing but expected in projection"
+            ),
         }
         files_scanned += 1;
     }
