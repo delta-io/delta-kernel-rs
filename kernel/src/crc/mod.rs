@@ -19,7 +19,6 @@
 mod delta;
 mod file_size_histogram;
 mod file_stats;
-mod lazy;
 mod reader;
 mod state;
 mod writer;
@@ -32,8 +31,7 @@ pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
 pub(crate) use file_stats::{is_incremental_safe_operation, FileStatsDelta};
-pub(crate) use lazy::{CrcLoadResult, LazyCrc};
-pub(crate) use reader::try_read_crc_file;
+pub(crate) use reader::read_crc_file_or_none;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};

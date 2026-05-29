@@ -1092,31 +1092,6 @@ impl LogSegment {
         }
     }
 
-    /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
-    ///
-    /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
-    /// checkpoint-based replay, so checkpoint files and metadata are preserved. Only commits
-    /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
-    /// needed for this replay path (CRC file, latest commit file) are dropped.
-    pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
-        let (commits, compactions) =
-            self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
-        LogSegment {
-            end_version: self.end_version,
-            checkpoint_version: self.checkpoint_version,
-            log_root: self.log_root.clone(),
-            last_checkpoint_metadata: self.last_checkpoint_metadata.clone(),
-            listed: LogSegmentFiles {
-                ascending_commit_files: commits,
-                ascending_compaction_files: compactions,
-                checkpoint_parts: self.listed.checkpoint_parts.clone(),
-                latest_crc_file: None,
-                latest_commit_file: None,
-                max_published_version: None,
-            },
-        }
-    }
-
     /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
     /// If `lo_exclusive` is `None`, there is no lower bound.
     fn filtered_commits_and_compactions(
