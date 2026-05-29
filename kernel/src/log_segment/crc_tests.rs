@@ -52,13 +52,7 @@ fn protocol_v2_dv_ntz() -> Protocol {
 }
 
 fn protocol_v2_ict() -> Protocol {
-    Protocol::try_new(
-        3,
-        7,
-        Some(["v2Checkpoint"]),
-        Some(["v2Checkpoint", "inCommitTimestamp"]),
-    )
-    .unwrap()
+    Protocol::try_new_modern(["v2Checkpoint"], ["v2Checkpoint", "inCommitTimestamp"]).unwrap()
 }
 
 fn metadata_a() -> Metadata {
@@ -107,7 +101,7 @@ fn metadata_ict() -> Metadata {
 // Action JSON helpers
 // ============================================================================
 
-fn bootstrap() -> Vec<serde_json::Value> {
+fn create_table_actions() -> Vec<serde_json::Value> {
     vec![
         commit_info("CREATE", None),
         protocol(protocol_v2()),
@@ -115,7 +109,7 @@ fn bootstrap() -> Vec<serde_json::Value> {
     ]
 }
 
-fn bootstrap_ict() -> Vec<serde_json::Value> {
+fn create_table_actions_with_ict() -> Vec<serde_json::Value> {
     vec![
         commit_info("CREATE", None),
         protocol(protocol_v2_ict()),
@@ -162,11 +156,19 @@ fn remove(path: &str, size: Option<i64>) -> serde_json::Value {
     obj
 }
 
-fn domain_metadata(domain: &str, configuration: &str, removed: bool) -> serde_json::Value {
+fn domain_metadata(domain: &str, configuration: &str) -> serde_json::Value {
     json!({"domainMetadata": {
         "domain": domain,
         "configuration": configuration,
-        "removed": removed,
+        "removed": false,
+    }})
+}
+
+fn domain_metadata_tombstone(domain: &str) -> serde_json::Value {
+    json!({"domainMetadata": {
+        "domain": domain,
+        "configuration": "",
+        "removed": true,
     }})
 }
 
@@ -810,7 +812,7 @@ async fn test_p_m_propagation(
         ..crc_complete_empty_dm_set_txn()
     };
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         .commit(1, v1_actions)
         .build()
         .await
@@ -836,7 +838,7 @@ async fn test_ict_from_newest_commit_only_replaces_base(
         ..crc_complete_empty_dm_set_txn()
     };
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap_ict())
+        .commit(0, create_table_actions_with_ict())
         .commit(1, [commit_info("WRITE", Some(1000))])
         .commit(2, v2_actions)
         .build()
@@ -859,13 +861,10 @@ async fn test_ict_from_newest_commit_only_replaces_base(
 async fn test_dm_overrides_base_and_preserves_completeness(#[case] base_dm: DomainMetadataState) {
     let base = crc_with_dm_and_txn_states(base_dm, SetTransactionState::Complete(HashMap::new()));
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         .commit(
             1, // <-- updates "a"; "b" stays at base value
-            [
-                domain_metadata("a", "new_a", /* removed */ false),
-                commit_info("WRITE", None),
-            ],
+            [commit_info("WRITE", None), domain_metadata("a", "new_a")],
         )
         .build()
         .await
@@ -891,13 +890,10 @@ async fn test_dm_overrides_base_and_preserves_completeness(#[case] base_dm: Doma
 async fn test_dm_tombstone_removes_entry_from_base(#[case] base_dm: DomainMetadataState) {
     let base = crc_with_dm_and_txn_states(base_dm, SetTransactionState::Complete(HashMap::new()));
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         .commit(
             1, // <-- tombstone removes "a" from the base map
-            [
-                domain_metadata("a", "", /* removed */ true),
-                commit_info("WRITE", None),
-            ],
+            [commit_info("WRITE", None), domain_metadata_tombstone("a")],
         )
         .build()
         .await
@@ -914,20 +910,11 @@ async fn test_dm_tombstone_removes_entry_from_base(#[case] base_dm: DomainMetada
 #[tokio::test]
 async fn test_dm_newer_commit_wins_over_older_commit_for_same_domain() {
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
-        .commit(
-            1,
-            [
-                domain_metadata("d", "old", /* removed */ false),
-                commit_info("WRITE", None),
-            ],
-        )
+        .commit(0, create_table_actions())
+        .commit(1, [commit_info("WRITE", None), domain_metadata("d", "old")])
         .commit(
             2, // <-- same domain in two commits; newest wins
-            [
-                domain_metadata("d", "new", /* removed */ false),
-                commit_info("WRITE", None),
-            ],
+            [commit_info("WRITE", None), domain_metadata("d", "new")],
         )
         .build()
         .await
@@ -952,7 +939,7 @@ async fn test_dm_newer_commit_wins_over_older_commit_for_same_domain() {
 async fn test_txn_overrides_base_and_preserves_completeness(#[case] base_txn: SetTransactionState) {
     let base = crc_with_dm_and_txn_states(DomainMetadataState::Complete(HashMap::new()), base_txn);
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         .commit(
             1,
             [set_txn("app_a", 42, Some(999)), commit_info("WRITE", None)],
@@ -974,7 +961,7 @@ async fn test_txn_overrides_base_and_preserves_completeness(#[case] base_txn: Se
 #[tokio::test]
 async fn test_txn_newer_commit_wins_over_older_commit_for_same_app() {
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         .commit(
             1,
             [set_txn("app", 1, Some(100)), commit_info("WRITE", None)],
@@ -997,12 +984,12 @@ async fn test_txn_newer_commit_wins_over_older_commit_for_same_app() {
 #[tokio::test]
 async fn test_adds_and_removes_accumulate() {
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
-        .commit(1, [add("a", 100), commit_info("WRITE", None)])
-        .commit(2, [add("b", 200), commit_info("WRITE", None)])
-        .commit(3, [add("c", 300), commit_info("WRITE", None)])
+        .commit(0, create_table_actions())
+        .commit(1, [commit_info("WRITE", None), add("a", 100)])
+        .commit(2, [commit_info("WRITE", None), add("b", 200)])
+        .commit(3, [commit_info("WRITE", None), add("c", 300)])
         .commit(4, [remove("a", Some(100)), commit_info("WRITE", None)])
-        .commit(5, [add("d", 400), commit_info("WRITE", None)])
+        .commit(5, [commit_info("WRITE", None), add("d", 400)])
         .commit(6, [remove("b", Some(200)), commit_info("WRITE", None)])
         .build()
         .await
@@ -1018,8 +1005,8 @@ async fn test_adds_and_removes_accumulate() {
 
 // Three distinct ways a single commit can lose incremental safety.
 #[rstest]
-#[case::remove_no_size(vec![remove("orphan", None), commit_info("WRITE", None)])]
-#[case::add_with_unsafe_op(vec![add("a", 100), commit_info("ANALYZE STATS", None)])]
+#[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
+#[case::add_with_unsafe_op(vec![commit_info("ANALYZE STATS", None), add("a", 100)])]
 #[case::add_with_no_commit_info(vec![add("a", 100)])]
 #[tokio::test]
 async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
@@ -1030,7 +1017,7 @@ async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
         SetTransactionState::Complete(HashMap::from([txn_entry("app", 5, Some(100))])),
     );
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         .commit(1, v1_actions)
         .build()
         .await
@@ -1052,10 +1039,10 @@ async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
 #[tokio::test]
 async fn test_from_disk_advances_file_stats() {
     let built = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         // Base CRC: a (100 B, bin 0) + b (10_000 B, bin 1).
         .crc_with_files(0, protocol_v2(), metadata_a(), None, &[100, 10_000])
-        .commit(1, [add("c", 20_000), commit_info("WRITE", None)]) // c lands in bin 2
+        .commit(1, [commit_info("WRITE", None), add("c", 20_000)]) // c lands in bin 2
         .commit(2, [remove("a", Some(100)), commit_info("WRITE", None)]) // a removed from bin 0
         .build()
         .await;
@@ -1078,9 +1065,9 @@ async fn test_from_disk_advances_file_stats() {
 async fn test_from_disk_no_histogram_means_no_result_histogram() {
     // Empty file_sizes => no histogram persisted on disk.
     let built = CrcReadTest::new()
-        .commit(0, bootstrap())
+        .commit(0, create_table_actions())
         .crc(0, protocol_v2(), metadata_a(), None)
-        .commit(1, [add("a", 100), commit_info("WRITE", None)])
+        .commit(1, [commit_info("WRITE", None), add("a", 100)])
         .build()
         .await;
     let base = built.read_crc_at(0).unwrap();
@@ -1092,11 +1079,11 @@ async fn test_from_disk_no_histogram_means_no_result_histogram() {
 async fn test_from_disk_with_non_zero_crc_version() {
     // Stale CRC is at v2, not v0. Replay covers (2, 3].
     let built = CrcReadTest::new()
-        .commit(0, bootstrap())
-        .commit(1, [add("a", 100), commit_info("WRITE", None)])
-        .commit(2, [add("b", 200), commit_info("WRITE", None)])
+        .commit(0, create_table_actions())
+        .commit(1, [commit_info("WRITE", None), add("a", 100)])
+        .commit(2, [commit_info("WRITE", None), add("b", 200)])
         .crc_with_files(2, protocol_v2(), metadata_a(), None, &[100, 200])
-        .commit(3, [add("c", 300), commit_info("WRITE", None)])
+        .commit(3, [commit_info("WRITE", None), add("c", 300)])
         .build()
         .await;
     let base = built.read_crc_at(2).unwrap();
@@ -1111,7 +1098,7 @@ async fn test_from_disk_with_non_zero_crc_version() {
 #[tokio::test]
 async fn test_full_replay_across_two_commits_propagates_all_state() {
     // Realistic shape: a table evolves over two commits. v=1 initial activity; v=2 adds
-    // more, removes an older file, updates metadata, and stamps an ICT. The bootstrap
+    // more, removes an older file, updates metadata, and stamps an ICT. The create_table_actions
     // (and the base) use an ICT-enabled protocol so the v=2 ICT is well-formed.
     let base = Crc {
         protocol: protocol_v2_ict(),
@@ -1119,14 +1106,14 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
         ..crc_complete_empty_dm_set_txn()
     };
     let crc = CrcReadTest::new()
-        .commit(0, bootstrap_ict())
+        .commit(0, create_table_actions_with_ict())
         .commit(
             1,
             [
-                add("a", 100),
-                domain_metadata("kept", "v1_value", /* removed */ false),
-                set_txn("app_a", 1, Some(100)),
                 commit_info("WRITE", None),
+                add("a", 100),
+                domain_metadata("kept", "v1_value"),
+                set_txn("app_a", 1, Some(100)),
             ],
         )
         .commit(
@@ -1136,7 +1123,7 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
                 metadata(metadata_b()),
                 add("b", 200),
                 remove("a", Some(100)),
-                domain_metadata("d", "x", /* removed */ false),
+                domain_metadata("d", "x"),
                 set_txn("app_b", 5, Some(200)),
             ],
         )
@@ -1145,7 +1132,7 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
         .incrementally_build_crc(&base)
         .unwrap();
 
-    // Newest commit's M and ICT win; protocol stays at bootstrap's ICT-enabled choice.
+    // Newest commit's M and ICT win; protocol stays at create_table_actions's ICT-enabled choice.
     assert_eq!(crc.protocol, protocol_v2_ict());
     assert_eq!(crc.metadata, metadata_b());
     assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
