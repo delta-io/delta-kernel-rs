@@ -203,7 +203,7 @@ pub struct StructField {
     /// The data type of this field
     #[serde(rename = "type")]
     pub data_type: DataType,
-    /// Whether this field is logically nullable.
+    /// Denotes whether this field is logically nullable.
     ///
     /// Logical nullability differs from physical nullability: whether the field can
     /// actually be null in valid data. A field is physically nullable if and only
@@ -227,7 +227,7 @@ pub struct StructField {
     /// { "s": null, "s.a": null }  // acceptable
     /// ```
     ///
-    /// Negative example -- schema: `s: struct<a: int (nullable=false)> (nullable=false)`
+    /// Negative example: schema: `s: struct<a: int (nullable=false)> (nullable=false)`
     /// ```json
     /// // schema
     /// { "name": "s", "nullable": false, "type": {
