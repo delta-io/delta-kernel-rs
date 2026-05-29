@@ -366,8 +366,8 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    //`my_row_index` is computed during the scan, not stored in the table,
-    //so a predicate can't filter on it
+    // `my_row_index` is computed during the scan, not stored in the table,
+    // so a predicate can't filter on it
     let projection = Arc::new(
         snapshot
             .schema()
