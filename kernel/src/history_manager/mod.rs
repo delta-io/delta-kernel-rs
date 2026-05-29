@@ -562,32 +562,35 @@ pub fn timestamp_range_to_versions(
 /// - `engine`: kernel engine used to list `log_root`.
 /// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
 /// - `earliest_ratified_commit_version`: For catalog-managed tables, the earliest version the
-///   catalog has ratified. Pass `None` for filesystem-only tables. When `Some(0)` is passed this
-///   function returns `0` immediately without listing storage, since for a catalog-managed table
-///   the only way no published commits exist on the filesystem is when v0 has not yet been
-///   published (commits ratify in order).
+///   catalog has ratified commit. Pass `None` for filesystem-only tables.
 ///
 /// # Errors
 /// - Propagates any error from listing the log directory.
-/// - Returns [`LogHistoryError::NoPublishedCommits`] when the log directory contains no published
-///   commit files and the caller did not pass `earliest_ratified_commit_version == Some(0)`.
+/// - [`LogHistoryError::NoPublishedCommits`] when the log directory contains no published commit
+///   files
+/// - [`DeltaError::GenericError`] when there is no file-system commit when the earliest CCv2 commit
+///   is v0.
+#[allow(unused)]
 #[tracing::instrument(skip(engine), ret)]
-pub fn get_earliest_published_commit_version(
+fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    // v0 not yet published on a catalog-managed table: short-circuit before listing.
-    if earliest_ratified_commit_version == Some(0) {
-        return Ok(0);
-    }
-
     list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
         .filter_ok(|f| f.file_type == LogPathFileType::Commit)
         .next()
         .transpose()?
         .map(|f| f.version)
         .ok_or_else(|| {
+            if earliest_ratified_commit_version == Some(0) {
+                return DeltaError::generic(format!(
+                    "The catalog-managed table commit v0 should be a file-system commit, \
+                    but listing the log for table {} return an empty. \
+                    Please check the CCv2 catalog commit server",
+                    log_root,
+                ));
+            }
             DeltaError::from(LogHistoryError::NoPublishedCommits {
                 log_root: log_root.clone(),
             })
@@ -1500,20 +1503,36 @@ mod tests {
         }
     }
 
+    enum Expected {
+        Version(Version),
+        NoPublishedCommits,
+        CCv2MissingV0FilesystemCommit,
+    }
+
     #[tokio::test]
     #[rstest::rstest]
-    #[case::no_ratified_commit(3, None, None, Ok(0))]
-    #[case::ratified_commit_version_0(3, Some(0), None, Ok(0))]
-    #[case::ratified_commit_version_greater_than_0(3, Some(2), None, Ok(0))]
-    #[case::log_listing_empty_no_ratified_commit(0, None, None, Err(()))]
-    #[case::log_listing_empty_ratified_commit(0, Some(2), None, Err(()))]
-    #[case::log_listing_empty_ratified_commit_v0(0, Some(0), None, Ok(0))]
-    #[case::cleanup_v0_with_catalog_hint_returns_next_published(4, Some(2), Some(0), Ok(1))]
+    #[case::no_ratified_commit(3, None, None, Expected::Version(0))]
+    #[case::ratified_commit_version_0(3, Some(0), None, Expected::Version(0))]
+    #[case::ratified_commit_version_greater_than_0(3, Some(2), None, Expected::Version(0))]
+    #[case::log_listing_empty_no_ratified_commit(0, None, None, Expected::NoPublishedCommits)]
+    #[case::log_listing_empty_ratified_commit(0, Some(2), None, Expected::NoPublishedCommits)]
+    #[case::log_listing_empty_ratified_commit_v0(
+        0,
+        Some(0),
+        None,
+        Expected::CCv2MissingV0FilesystemCommit
+    )]
+    #[case::cleanup_v0_with_catalog_hint_returns_next_published(
+        4,
+        Some(2),
+        Some(0),
+        Expected::Version(1)
+    )]
     async fn test_get_earliest_published_commit_version(
         #[case] num_commits: usize,
         #[case] earliest_ratified_commit_version: Option<Version>,
         #[case] last_cleanup_version: Option<Version>,
-        #[case] expected: Result<Version, ()>,
+        #[case] expected: Expected,
     ) {
         let timestamps = (0..num_commits)
             .map(|i| (i as i64, None))
@@ -1535,10 +1554,14 @@ mod tests {
             earliest_ratified_commit_version,
         );
         match expected {
-            Ok(v) => assert_eq!(res.unwrap(), v),
-            Err(()) => assert!(
-                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoPublishedCommits { .. }))
+            Expected::Version(v) => assert_eq!(res.unwrap(), v),
+            Expected::NoPublishedCommits => assert!(
+                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoPublishedCommits { .. })),
+                "{res:?}"
             ),
+            Expected::CCv2MissingV0FilesystemCommit => {
+                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+            }
         }
     }
 
