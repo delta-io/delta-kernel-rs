@@ -133,12 +133,14 @@ define_sweeps! {
         checkpoint_struct_stats(),
         no_checkpoint_stats()
     ),
-    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
-    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
+    // TODO: ICT read assertions (needs pub get_in_commit_timestamp). Add a sweep row
+    //       that pins AtTimestamp to a commit-derived value once that lands.
     version_target_values = (
         version_latest(),
         version_at_mid(),
-        version_incremental_to_latest()
+        version_incremental_to_latest(),
+        version_incremental_from_mid_to_pre_latest(),
+        version_at_timestamp_max()
     ),
 }
 use std::collections::HashMap;

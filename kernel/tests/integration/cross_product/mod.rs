@@ -13,8 +13,9 @@ use test_utils::table_builder::{
     checkpoint_mid_no_hint_post_cleanup, checkpoint_mid_post_cleanup, checkpoint_struct_stats,
     clustered, commits_only, crc_at_end, crc_at_mid, no_checkpoint_stats, no_features, partitioned,
     test_table, two_checkpoints_stale_hint, two_checkpoints_stale_hint_post_cleanup, unpartitioned,
-    version_at_mid, version_incremental_to_latest, version_latest, DataLayoutConfig, FeatureSet,
-    LogState, TableConfig, VersionTarget,
+    version_at_mid, version_at_timestamp_max, version_incremental_from_mid_to_pre_latest,
+    version_incremental_to_latest, version_latest, DataLayoutConfig, FeatureSet, LogState,
+    TableConfig, VersionTarget,
 };
 use test_utils::{build_snapshot, default_sweep, read_scan};
 
@@ -41,10 +42,11 @@ fn test_cross_product_read_write(
     let snap = build_snapshot!(version_target, table.table_root(), engine.as_ref());
 
     let expected_version = match &version_target {
-        VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => {
-            log_state.latest_version()
-        }
+        VersionTarget::Latest
+        | VersionTarget::IncrementalToLatest { .. }
+        | VersionTarget::AtTimestamp(_) => log_state.latest_version(),
         VersionTarget::AtVersion(v) => *v,
+        VersionTarget::IncrementalFrom { to, .. } => *to,
     };
     assert_eq!(snap.version(), expected_version);
 
