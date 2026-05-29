@@ -97,12 +97,39 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
     Ok(())
 }
 
+// An unreadable CRC at the snapshot version must not break loading: the snapshot falls back
+// to log replay for P&M and exposes no CRC.
+#[tokio::test]
+async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Plant a garbage CRC file at the table version.
+    let crc_path = _temp_dir.path().join("_delta_log/00000000000000000000.crc");
+    std::fs::write(&crc_path, b"not valid crc json").unwrap();
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+    assert!(snapshot.crc().is_none());
+    assert!(snapshot.get_file_stats_if_present().is_none());
+
+    Ok(())
+}
+
 // ============================================================================
 // CRC test visibility: Snapshot::crc
 // ============================================================================
 
 #[tokio::test]
-async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> {
+async fn test_crc_returns_resolved_crc_at_snapshot_version() -> DeltaResult<()> {
     // ===== GIVEN =====
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     let table_root = url::Url::from_directory_path(path).unwrap();
@@ -136,7 +163,7 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
 }
 
 #[tokio::test]
-async fn test_get_current_crc_if_loaded_returns_none_when_no_crc() -> DeltaResult<()> {
+async fn test_crc_returns_none_when_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -520,8 +547,8 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
         "CRC should be loaded at v1 after incremental snapshot update"
     );
 
-    // Committing from this snapshot should produce a post-commit CRC (proves
-    // compute_post_commit_crc found the loaded CRC and applied the delta)
+    // Committing from this snapshot produces a post-commit CRC by applying the delta to the
+    // chained CRC.
     let col: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
     let committed_v2 = insert_data(incremental_v1, &engine, vec![col])
         .await?

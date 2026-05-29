@@ -238,7 +238,6 @@ impl Snapshot {
             &new_log_segment,
             existing_log_segment,
             existing_snapshot.crc(),
-            existing_snapshot_version,
             engine,
         );
 
@@ -344,9 +343,9 @@ impl Snapshot {
         new_log_segment: &LogSegment,
         existing_log_segment: &LogSegment,
         existing_crc: Option<&Arc<Crc>>,
-        existing_snapshot_version: Version,
         engine: &dyn Engine,
     ) -> (Option<ParsedLogPath>, Option<Arc<Crc>>) {
+        let existing_snapshot_version = existing_log_segment.end_version;
         let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
         let crc_satisfies_new_ckpt = |crc: &ParsedLogPath| {
             new_log_segment
@@ -365,12 +364,13 @@ impl Snapshot {
             .filter(|f| {
                 f.version > existing_snapshot_version || f.version == new_log_segment.end_version
             })
-            .and_then(
-                |crc_file| match existing_crc.filter(|c| c.version == crc_file.version) {
-                    Some(crc) => Some(crc.clone()),
-                    None => read_crc_file_or_none(engine, crc_file),
-                },
-            );
+            .and_then(|resolved| {
+                // Reuse the existing snapshot's CRC on a same-version refresh (Case D.2).
+                existing_crc
+                    .filter(|c| c.version == resolved.version)
+                    .map(Arc::clone)
+                    .or_else(|| read_crc_file_or_none(engine, resolved))
+            });
         (crc_file, crc)
     }
 

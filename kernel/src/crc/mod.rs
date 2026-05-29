@@ -12,7 +12,7 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
-// Allow unreachable_pub because this module is pub when test-utils is enabled
+// Allow unreachable_pub because this module is pub when internal-api is enabled
 // but pub(crate) otherwise. The items need to be pub for integration tests.
 #![allow(unreachable_pub)]
 
@@ -57,7 +57,7 @@ use crate::{DeltaResult, Error, Version};
 /// 3. Contain exactly one JSON object with the schema mirrored by `CrcRaw`.
 ///
 /// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
-/// when the `test-utils` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
+/// when the `internal-api` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
 // TODO: rename `Crc` to `CrcState` to align with `FileStatsState`, `SetTransactionState`, etc.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Crc {

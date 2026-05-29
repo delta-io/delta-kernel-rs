@@ -264,7 +264,6 @@ impl Snapshot {
     /// When `Some(crc)`, `crc.version == self.version()` and queries backed by the CRC hit
     /// cache at zero I/O.
     #[internal_api]
-    #[allow(unused)]
     pub(crate) fn crc(&self) -> Option<&Arc<Crc>> {
         self.crc.as_ref()
     }
