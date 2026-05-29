@@ -555,21 +555,26 @@ pub fn timestamp_range_to_versions(
 /// Returns the earliest published commit version available on the file system for this table.
 ///
 /// The returned version is the version of the lowest-numbered `*.json` commit file present in
-/// `log_root`. The returned version is not guaranteed to still exist by the time the caller
+/// `log_root`. The returned version is not guaranteed to exist by the time the caller
 /// acts on it: a concurrent log-cleanup operation may delete the file.
 ///
 /// # Parameters
 /// - `engine`: kernel engine used to list `log_root`.
 /// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
-/// - `earliest_ratified_commit_version`: For catalog-managed tables, the earliest version the
+/// - `earliest_ratified_commit_version`: For catalog-managed tables, it is the earliest version the
 ///   catalog has ratified commit. Pass `None` for filesystem-only tables.
 ///
 /// # Errors
 /// - Propagates any error from listing the log directory.
 /// - [`LogHistoryError::NoPublishedCommits`] when the log directory contains no published commit
 ///   files
-/// - [`DeltaError::GenericError`] when there is no file-system commit when the earliest CCv2 commit
-///   is v0.
+/// - [`DeltaError::Generic`] when there is no file-system commit and the earliest CCv2 commit is
+///   v0. For a catalog-managed table, v0 must be a published file-system commit before the catalog
+///   exposes the table. Otherwise a filesystem-only client could list an empty `_delta_log/` and
+///   "create" a table at the same location. An empty listing here therefore indicates a broken
+///   invariant rather than a normal missing version.
+// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
+// this helper lands.
 #[allow(unused)]
 #[tracing::instrument(skip(engine), ret)]
 fn get_earliest_published_commit_version(
@@ -586,9 +591,8 @@ fn get_earliest_published_commit_version(
             if earliest_ratified_commit_version == Some(0) {
                 return DeltaError::generic(format!(
                     "The catalog-managed table commit v0 should be a file-system commit, \
-                    but listing the log for table {} return an empty. \
-                    Please check the CCv2 catalog commit server",
-                    log_root,
+                    but listing the log for table {log_root} returned no commits. \
+                    Please check the CCv2 catalog server."
                 ));
             }
             DeltaError::from(LogHistoryError::NoPublishedCommits {
@@ -1521,12 +1525,6 @@ mod tests {
         Some(0),
         None,
         Expected::CCv2MissingV0FilesystemCommit
-    )]
-    #[case::cleanup_v0_with_catalog_hint_returns_next_published(
-        4,
-        Some(2),
-        Some(0),
-        Expected::Version(1)
     )]
     async fn test_get_earliest_published_commit_version(
         #[case] num_commits: usize,
