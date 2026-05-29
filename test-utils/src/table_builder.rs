@@ -1028,9 +1028,17 @@ pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
         to: DEFAULT_SWEEP_LATEST_VERSION - 1,
     }
 }
-/// Timestamp travel using `i64::MAX`, which always resolves to the latest version (every
-/// commit's timestamp is less than `i64::MAX`). Exercises the `latest_version_as_of` code
-/// path uniformly across ICT-enabled and file-modification-timestamp tables.
+/// Timestamp travel using `i64::MAX`. Always resolves to the latest version (every
+/// commit's timestamp is less than `i64::MAX`), so this is a smoke test that the
+/// timestamp-conversion path (log-segment build, ICT detection, comparison loop) runs
+/// without error across the sweep -- not a resolution-correctness check.
+///
+/// Non-trivial resolution to an intermediate version is covered by
+/// `test_at_timestamp_resolves_to_intermediate_version` in
+/// `kernel/tests/integration/cross_product`, which controls file modification times
+/// explicitly via local-filesystem [`std::fs::File::set_modified`]. The default sweep
+/// can't reach that case because `InMemory` collapses successive `put` timestamps to a
+/// single millisecond.
 pub fn version_at_timestamp_max() -> VersionTarget {
     VersionTarget::AtTimestamp(i64::MAX)
 }
