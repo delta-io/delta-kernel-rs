@@ -1,5 +1,90 @@
 # Changelog
 
+## [v0.24.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.24.0/) (2026-05-29)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.23.0...v0.24.0)
+
+
+### 🚀 Features / new APIs
+
+1. *(ffi)* Expose transaction deletion vector updates ([#2495])
+2. Crc merics using tracing instrumentation ([#2540])
+3. Allow fields with same physical name and different physical path ([#2576])
+4. Enforce CRC ICT consistency on write ([#2584])
+5. Support creating Delta tables with empty schema ([#2545])
+6. Two tiny CRC refactors ([#2597])
+7. Block read and blind-append on empty-schema Delta tables ([#2546])
+8. Support variantShredding as a feature ([#2594])
+9. Introduce PlanExecutor trait + basic plan IR ([#2590])
+10. Add file size metrics for scans ([#2585])
+11. Reverse incremental CRC replay accumulator + visitor ([#2602])
+12. Introduce PlanBasedEngine and a SyncPlanExecutor ([#2621])
+13. Re-add nearest_timestamp to LogHistoryError ([#2600])
+
+### 🐛 Bug Fixes
+
+1. Block removeFile for some row tracking table ([#2539])
+2. Coerce field names during parquet field-id matching ([#2558])
+3. Surface numRecords from struct-stats-only checkpoints via ScanFile.stats ([#2542])
+4. Drop predicate refs to non-stats columns during rewrite ([#2575])
+
+### 📚 Documentation
+
+1. Update list_from doc ([#2581])
+2. Minor user guide README update ([#2601])
+
+### 🚜 Refactor
+
+1. Introduce DomainMetadataState typed enum ([#2567])
+2. Introduce SetTransactionState typed enum ([#2570])
+3. Move apply_schema out of arrow_expression ([#2580])
+4. Create stat field name constants ([#2586])
+5. Reshape CrcDelta, get it ready for incremental visitor and accumulator ([#2583])
+6. Crc test infra / setup ([#2616])
+7. Use DeltaResultIterator where possible ([#2622])
+8. Rename ScopedDeltaResultIterator ([#2632])
+9. Rename Plan enum to Operation ([#2635])
+10. Reorganize metrics module for better cohesion ([#2604])
+11. Add snapshot/incremental.rs; snapshot section headers ([#2647])
+
+### 🧪 Testing
+
+1. Support nested structs in table-builder data generation ([#2648])
+
+
+[#2567]: https://github.com/delta-io/delta-kernel-rs/pull/2567
+[#2495]: https://github.com/delta-io/delta-kernel-rs/pull/2495
+[#2539]: https://github.com/delta-io/delta-kernel-rs/pull/2539
+[#2570]: https://github.com/delta-io/delta-kernel-rs/pull/2570
+[#2558]: https://github.com/delta-io/delta-kernel-rs/pull/2558
+[#2580]: https://github.com/delta-io/delta-kernel-rs/pull/2580
+[#2581]: https://github.com/delta-io/delta-kernel-rs/pull/2581
+[#2540]: https://github.com/delta-io/delta-kernel-rs/pull/2540
+[#2542]: https://github.com/delta-io/delta-kernel-rs/pull/2542
+[#2576]: https://github.com/delta-io/delta-kernel-rs/pull/2576
+[#2584]: https://github.com/delta-io/delta-kernel-rs/pull/2584
+[#2586]: https://github.com/delta-io/delta-kernel-rs/pull/2586
+[#2583]: https://github.com/delta-io/delta-kernel-rs/pull/2583
+[#2575]: https://github.com/delta-io/delta-kernel-rs/pull/2575
+[#2545]: https://github.com/delta-io/delta-kernel-rs/pull/2545
+[#2597]: https://github.com/delta-io/delta-kernel-rs/pull/2597
+[#2546]: https://github.com/delta-io/delta-kernel-rs/pull/2546
+[#2594]: https://github.com/delta-io/delta-kernel-rs/pull/2594
+[#2601]: https://github.com/delta-io/delta-kernel-rs/pull/2601
+[#2590]: https://github.com/delta-io/delta-kernel-rs/pull/2590
+[#2585]: https://github.com/delta-io/delta-kernel-rs/pull/2585
+[#2616]: https://github.com/delta-io/delta-kernel-rs/pull/2616
+[#2622]: https://github.com/delta-io/delta-kernel-rs/pull/2622
+[#2602]: https://github.com/delta-io/delta-kernel-rs/pull/2602
+[#2621]: https://github.com/delta-io/delta-kernel-rs/pull/2621
+[#2632]: https://github.com/delta-io/delta-kernel-rs/pull/2632
+[#2635]: https://github.com/delta-io/delta-kernel-rs/pull/2635
+[#2604]: https://github.com/delta-io/delta-kernel-rs/pull/2604
+[#2600]: https://github.com/delta-io/delta-kernel-rs/pull/2600
+[#2647]: https://github.com/delta-io/delta-kernel-rs/pull/2647
+[#2648]: https://github.com/delta-io/delta-kernel-rs/pull/2648
+
+
 ## [v0.23.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.23.0/) (2026-05-15)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.22.1...v0.23.0)
