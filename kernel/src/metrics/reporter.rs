@@ -246,11 +246,16 @@ impl Visit for EventVisitor {
             "return" => {} // default to the success case
             "error" => {
                 // `#[instrument(err)]` records `error` when the wrapped function returns Err.
-                // Flip SnapshotCompleted into SnapshotFailed.
                 self.event = match self.event.take() {
+                    // Flip SnapshotCompleted into SnapshotFailed.
                     Some(MetricEvent::SnapshotCompleted(snap)) => {
                         Some(MetricEvent::SnapshotFailed(snap.into_failed()))
                     }
+                    // A "Loaded" event represents a successful load. Drop it on error so a
+                    // failed load is not reported as an empty successful one.
+                    Some(
+                        MetricEvent::DomainMetadataLoaded(_) | MetricEvent::SetTransactionLoaded(_),
+                    ) => None,
                     other => other,
                 };
             }

@@ -405,7 +405,7 @@ impl fmt::Display for SnapshotFailed {
 // DomainMetadataLoaded
 // ====================================================================
 
-pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "domain_metadata_loaded";
+pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "snap.get_domain_metadata";
 
 /// Emitted once per domain metadata load, whether served from the CRC cache (`from_cache`) or
 /// from a log replay. Covers connector-issued loads of user domains and kernel-internal loads of
@@ -462,7 +462,7 @@ impl fmt::Display for DomainMetadataLoaded {
         write!(
             f,
             "DomainMetadataLoaded(duration={duration:?}, from_cache={from_cache}, \
-             domains_returned={num_domains_returned})"
+             num_domains_returned={num_domains_returned})"
         )
     }
 }
@@ -471,11 +471,11 @@ impl fmt::Display for DomainMetadataLoaded {
 // SetTransactionLoaded
 // ====================================================================
 
-pub(crate) const SET_TRANSACTION_LOADED_SPAN: &str = "set_transaction_loaded";
+pub(crate) const SET_TRANSACTION_LOADED_SPAN: &str = "snap.get_app_id_version";
 
 /// Emitted once per `SetTransaction` (app id) load, whether served from the CRC cache
 /// (`from_cache`) or from a log replay. `found` is true when the app id has a committed
-/// transaction version, false when no `SetTransaction` exists for it.
+/// transaction version, false when none exists or the existing one is expired.
 #[derive(Debug, Clone)]
 pub struct SetTransactionLoaded {
     // === Set during span lifetime ===

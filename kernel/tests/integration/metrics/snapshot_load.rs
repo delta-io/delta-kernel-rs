@@ -1,8 +1,7 @@
-//! Snapshot-loading and on-demand API metrics tests.
+//! Metrics tests for snapshot loading and on-demand snapshot APIs.
 //!
-//! Covers all major log-segment shapes (delta-only, V1 checkpoint, log compaction, CRC
-//! fast-path, CRC at prior version, checkpoint with tail commits) plus on-demand API calls
-//! (`get_domain_metadata`) that incur additional I/O after a snapshot is already built.
+//! Each test builds a table in a known state, attaches a `CountingReporter`, and asserts the
+//! exact metric counters a real connector would observe.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -394,8 +393,8 @@ fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> Delt
 // Scenario 9: domain metadata and set-transaction loads
 // ============================================================================
 
-// Creates a table with clustering and rowTracking enabled (two system domain metadatas), as well
-// as a SetTransaction.
+// Creates a table with clustering and rowTracking enabled (two system domain metadatas), plus a
+// user domain metadata and a SetTransaction.
 async fn setup_table_with_dms_and_set_txns(
     write_crc: bool,
 ) -> DeltaResult<(Url, tempfile::TempDir)> {
@@ -414,6 +413,7 @@ async fn setup_table_with_dms_and_set_txns(
     let snap_v1 = snap_v0
         .transaction(committer(), engine.as_ref())?
         .with_operation("WRITE".to_string())
+        .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -478,6 +478,56 @@ async fn get_app_id_version_load_emits_loaded_metric(#[case] with_crc: bool) -> 
     assert_eq!(reporter.set_transaction_loads.get(), 1);
     assert_eq!(reporter.set_transaction_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.set_transaction_found.get(), 0);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::log_replay(false)]
+#[case::crc_cache(true)]
+#[tokio::test]
+async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) -> DeltaResult<()> {
+    let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(with_crc).await?;
+
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let snap = Snapshot::builder_for(table_url).build(&engine)?;
+
+    // Hit on the user domain.
+    reporter.reset();
+    assert!(snap.get_domain_metadata("myapp.config", &engine)?.is_some());
+    assert_eq!(reporter.domain_metadata_loads.get(), 1);
+    assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
+    assert_eq!(reporter.domain_metadata_domains_returned.get(), 1);
+
+    // Miss on a nonexistent domain. A Complete CRC answers the miss from cache; without a CRC it
+    // falls back to log replay.
+    reporter.reset();
+    assert!(snap
+        .get_domain_metadata("does.not.exist", &engine)?
+        .is_none());
+    assert_eq!(reporter.domain_metadata_loads.get(), 1);
+    assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
+    assert_eq!(reporter.domain_metadata_domains_returned.get(), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_loads_emit_no_metric() -> DeltaResult<()> {
+    let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(false).await?;
+
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let snap = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+    // Remove a commit so the log has a gap and the replay-based load fails.
+    let log_dir = table_url.to_file_path().unwrap().join("_delta_log");
+    std::fs::remove_file(log_dir.join("00000000000000000001.json")).unwrap();
+
+    reporter.reset();
+    assert!(snap.get_domain_metadata("myapp.config", &engine).is_err());
+    assert!(snap.get_app_id_version("my-app", &engine).is_err());
+    assert_eq!(reporter.domain_metadata_loads.get(), 0);
+    assert_eq!(reporter.set_transaction_loads.get(), 0);
 
     Ok(())
 }
