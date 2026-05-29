@@ -195,12 +195,10 @@ impl fmt::Display for LastCheckpointHintState {
 ///   The corresponding `{version}.json` files are absent and the log tail points at the staged
 ///   commits. Models a fully-unratified tail.
 /// - [`StagedAndPublished`](Self::StagedAndPublished): the last `num_versions` commits exist as
-///   both staged AND published files on disk. The log tail interleaves both forms (staged for even
-///   offsets, published for odd) so kernel must use the catalog's choice rather than filesystem
-///   discovery. This is a synthetic stress test of log_tail resolution; real catalogs ratify in
-///   commit order and produce a contiguous prefix of published versions followed by a suffix of
-///   staged ones, not an interleaving. Requires `num_versions >= 2` so both forms actually appear
-///   in the tail.
+///   both staged and published files on disk. The log tail interleaves the two forms per version,
+///   stress-testing log_tail resolution against filesystem discovery. Real catalogs ratify in
+///   commit order (contiguous published prefix, staged suffix); this variant deliberately
+///   interleaves. Requires `num_versions >= 2` so both forms appear in the tail.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CatalogTailState {
     #[default]
@@ -344,8 +342,8 @@ impl LogState {
     /// Set the catalog-managed tail materialization state.
     ///
     /// Non-`None` states require the paired [`FeatureSet`] to enable `catalog_managed()`
-    /// and require `k <= latest_version` (v=0 is the create-table commit and cannot be
-    /// staged). The builder asserts on these preconditions at `build()` time.
+    /// and require `num_versions <= latest_version` (v=0 is the create-table commit and
+    /// cannot be staged). The builder asserts on these preconditions at `build()` time.
     pub fn with_catalog_tail(mut self, state: CatalogTailState) -> Self {
         self.catalog_tail = state;
         self
@@ -1448,16 +1446,13 @@ fn make_committer(is_catalog_managed: bool) -> Box<dyn Committer> {
 // Test catalog committer
 // ===========================================================================
 
-/// A minimal [`Committer`] that mirrors [`FileSystemCommitter`]'s on-disk behavior --
-/// every commit lands at the published path -- but reports `is_catalog_committer() ==
-/// true` so kernel accepts it for catalog-managed tables. The post-build catalog tail
-/// materialization step then creates any staged files the requested layout needs.
+/// A minimal [`Committer`] that writes commits to the published path (matching
+/// [`FileSystemCommitter`]) while reporting `is_catalog_committer() == true` so
+/// kernel accepts it for catalog-managed tables. The post-build catalog tail
+/// materialization step creates any staged files the layout needs.
 ///
-/// Diverges from production catalog committers (e.g. `UCCommitter`), which write a
-/// staged file, call a catalog API, and leave publishing to a separate `publish()`
-/// step. This committer skips all of that for simplicity. Tests that need fidelity to
-/// real catalog-write semantics (staged log_segment, separate publish step) should use
-/// a more faithful committer.
+/// For tests that need separate stage-then-publish semantics matching
+/// `UCCommitter`, use a more faithful committer.
 #[derive(Debug, Default)]
 struct TestCatalogCommitter;
 
@@ -1828,10 +1823,9 @@ pub fn test_table(
 ///
 /// Expands at the call site so `Snapshot` resolves to the caller's crate. This avoids
 /// the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests' kernel.
-/// Requires `Snapshot` to be in scope at the call site. For catalog-managed tables, the
-/// macro threads `with_log_tail` and `with_max_catalog_version` through every builder
-/// and additionally requires `LogPath` and `FileMeta` to be in scope at the call site
-/// (kernel's `with_log_tail` accepts the caller's `LogPath`, not `test_utils`'s).
+/// Requires `Snapshot` to be in scope. For catalog-managed tables, also requires
+/// `LogPath` and `FileMeta` in scope; the macro threads `with_log_tail` and
+/// `with_max_catalog_version` through every builder arm.
 #[macro_export]
 macro_rules! build_snapshot {
     ($version_target:expr, $table:expr, $engine:expr $(,)?) => {{
@@ -2616,9 +2610,6 @@ mod tests {
     // Catalog-managed tests
     // ===========================================================================
 
-    /// Baseline: a catalog-managed table with no staged tail still requires
-    /// `with_max_catalog_version`. The builder exposes it via `max_catalog_version()`
-    /// and the macro threads it through.
     #[test]
     fn test_catalog_managed_no_tail_round_trip() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
@@ -2775,9 +2766,6 @@ mod tests {
         Ok(())
     }
 
-    /// Catalog-managed loads must thread `with_log_tail`/`with_max_catalog_version`
-    /// through every macro arm. Cover `AtVersion` both below and inside the staged
-    /// range, and `IncrementalToLatest` from inside the staged range.
     #[rstest::rstest]
     #[case::latest(VersionTarget::Latest, 4)]
     #[case::at_version_zero(VersionTarget::AtVersion(0), 0)]
@@ -2787,15 +2775,18 @@ mod tests {
     #[case::incremental_from_zero(VersionTarget::IncrementalToLatest { from: 0 }, 4)]
     #[case::incremental_from_below_tail(VersionTarget::IncrementalToLatest { from: 2 }, 4)]
     #[case::incremental_from_inside_tail(VersionTarget::IncrementalToLatest { from: 3 }, 4)]
-    fn test_catalog_managed_staged_only_version_targets(
+    #[case::incremental_from_latest(VersionTarget::IncrementalToLatest { from: 4 }, 4)]
+    fn test_catalog_managed_version_targets_across_tails(
         #[case] target: VersionTarget,
         #[case] expected: u64,
+        #[values(
+            CatalogTailState::StagedOnly { num_versions: 2 },
+            CatalogTailState::StagedAndPublished { num_versions: 2 },
+        )]
+        tail: CatalogTailState,
     ) -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .with_log_state(
-                LogState::with_latest_version(4)
-                    .with_catalog_tail(CatalogTailState::StagedOnly { num_versions: 2 }),
-            )
+            .with_log_state(LogState::with_latest_version(4).with_catalog_tail(tail))
             .with_features(FeatureSet::new().catalog_managed())
             .build()?;
         let engine = table.engine();
@@ -2804,8 +2795,6 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end read assertion: if `with_log_tail` is mis-threaded for a
-    /// StagedOnly tail, the staged commits disappear and the row count drops.
     #[rstest::rstest]
     #[case::staged_only(CatalogTailState::StagedOnly { num_versions: 2 })]
     #[case::staged_and_published(CatalogTailState::StagedAndPublished { num_versions: 2 })]
@@ -2837,11 +2826,17 @@ mod tests {
         FeatureSet::new(),
         "catalog_tail requires `FeatureSet::catalog_managed()`",
     )]
+    #[case::num_versions_zero(
+        LogState::with_latest_version(2)
+            .with_catalog_tail(CatalogTailState::StagedOnly { num_versions: 0 }),
+        FeatureSet::new().catalog_managed(),
+        "catalog_tail num_versions must be >= 1",
+    )]
     #[case::num_versions_exceeds_latest(
         LogState::with_latest_version(2)
             .with_catalog_tail(CatalogTailState::StagedOnly { num_versions: 3 }),
         FeatureSet::new().catalog_managed(),
-        "must be <= latest_version",
+        "catalog_tail num_versions (3) must be <= latest_version",
     )]
     #[case::checkpoint_in_staged_range(
         LogState::with_latest_version(4)
