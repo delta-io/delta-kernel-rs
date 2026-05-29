@@ -346,7 +346,7 @@ pub struct ExpressionFieldPatch {
     /// If true, and there is no replacement expression, the input field is omitted from the
     /// output.
     pub is_drop: bool,
-    /// Insertions provided by calls to [`Self::with_inserted_field_after`].
+    /// Insertions provided by calls to [`ExpressionStructPatch::with_inserted_field_after`].
     pub insertions: Vec<ExpressionRef>,
     /// If true, this patch is silently ignored when the input field does not exist. Otherwise, a
     /// missing input field produces an error.
