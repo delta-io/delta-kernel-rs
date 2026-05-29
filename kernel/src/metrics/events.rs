@@ -76,6 +76,8 @@ pub enum MetricEvent {
     ProtocolMetadataLoaded(ProtocolMetadataLoaded),
     SnapshotCompleted(SnapshotCompleted),
     SnapshotFailed(SnapshotFailed),
+    DomainMetadataLoaded(DomainMetadataLoaded),
+    SetTransactionLoaded(SetTransactionLoaded),
     CrcReadCompleted(CrcReadCompleted),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
@@ -94,6 +96,8 @@ impl MetricEvent {
             Self::ProtocolMetadataLoaded(e) => e.set_duration(d),
             Self::SnapshotCompleted(e) => e.set_duration(d),
             Self::SnapshotFailed(e) => e.set_duration(d),
+            Self::DomainMetadataLoaded(e) => e.set_duration(d),
+            Self::SetTransactionLoaded(e) => e.set_duration(d),
             Self::CrcReadCompleted(e) => e.set_duration(d),
 
             // Duration already set at construction.
@@ -112,11 +116,13 @@ impl MetricEvent {
             // Variants with u64 fields set during span lifetime.
             Self::LogSegmentLoaded(e) => e.record_u64(name, value),
             Self::SnapshotCompleted(e) => e.record_u64(name, value),
+            Self::DomainMetadataLoaded(e) => e.record_u64(name, value),
             Self::CrcReadCompleted(e) => e.record_u64(name, value),
 
             // No u64 fields set during span lifetime — a runtime record() on these is a bug.
             Self::ProtocolMetadataLoaded(_) => Err(ProtocolMetadataLoaded::SPAN_NAME),
             Self::SnapshotFailed(_) => Err(SnapshotCompleted::SPAN_NAME),
+            Self::SetTransactionLoaded(_) => Err(SetTransactionLoaded::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -130,6 +136,8 @@ impl MetricEvent {
         match self {
             // Variants with bool fields set during span lifetime.
             Self::LogSegmentLoaded(e) => e.record_bool(name, value),
+            Self::DomainMetadataLoaded(e) => e.record_bool(name, value),
+            Self::SetTransactionLoaded(e) => e.record_bool(name, value),
 
             // No bool fields set during span lifetime — a runtime record() on these is a bug.
             Self::ProtocolMetadataLoaded(_) => Err(ProtocolMetadataLoaded::SPAN_NAME),
@@ -153,6 +161,8 @@ impl fmt::Display for MetricEvent {
             Self::ProtocolMetadataLoaded(e) => e.fmt(f),
             Self::SnapshotCompleted(e) => e.fmt(f),
             Self::SnapshotFailed(e) => e.fmt(f),
+            Self::DomainMetadataLoaded(e) => e.fmt(f),
+            Self::SetTransactionLoaded(e) => e.fmt(f),
             Self::CrcReadCompleted(e) => e.fmt(f),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
@@ -387,6 +397,130 @@ impl fmt::Display for SnapshotFailed {
         write!(
             f,
             "SnapshotFailed(id={operation_id}, duration={duration:?})"
+        )
+    }
+}
+
+// ====================================================================
+// DomainMetadataLoaded
+// ====================================================================
+
+pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "domain_metadata_loaded";
+
+/// Emitted once per domain metadata load, whether served from the CRC cache (`from_cache`) or
+/// from a log replay. Covers connector-issued loads of user domains and kernel-internal loads of
+/// system (`delta.*`) domains such as clustering or row tracking.
+#[derive(Debug, Clone)]
+pub struct DomainMetadataLoaded {
+    // === Set during span lifetime ===
+    pub from_cache: bool,
+    pub num_domains_returned: u64,
+
+    // === Set on span close ===
+    pub duration: Duration,
+}
+
+impl DomainMetadataLoaded {
+    pub(crate) const SPAN_NAME: &'static str = DOMAIN_METADATA_LOADED_SPAN;
+
+    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+        Self {
+            from_cache: false,
+            num_domains_returned: 0,
+            duration: Duration::default(),
+        }
+    }
+
+    pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        match name {
+            "num_domains_returned" => self.num_domains_returned = value,
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        match name {
+            "from_cache" => self.from_cache = value,
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_duration(&mut self, d: Duration) {
+        self.duration = d;
+    }
+}
+
+impl fmt::Display for DomainMetadataLoaded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            from_cache,
+            num_domains_returned,
+            duration,
+        } = self;
+        write!(
+            f,
+            "DomainMetadataLoaded(duration={duration:?}, from_cache={from_cache}, \
+             domains_returned={num_domains_returned})"
+        )
+    }
+}
+
+// ====================================================================
+// SetTransactionLoaded
+// ====================================================================
+
+pub(crate) const SET_TRANSACTION_LOADED_SPAN: &str = "set_transaction_loaded";
+
+/// Emitted once per `SetTransaction` (app id) load, whether served from the CRC cache
+/// (`from_cache`) or from a log replay. `found` is true when the app id has a committed
+/// transaction version, false when no `SetTransaction` exists for it.
+#[derive(Debug, Clone)]
+pub struct SetTransactionLoaded {
+    // === Set during span lifetime ===
+    pub from_cache: bool,
+    pub found: bool,
+
+    // === Set on span close ===
+    pub duration: Duration,
+}
+
+impl SetTransactionLoaded {
+    pub(crate) const SPAN_NAME: &'static str = SET_TRANSACTION_LOADED_SPAN;
+
+    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+        Self {
+            from_cache: false,
+            found: false,
+            duration: Duration::default(),
+        }
+    }
+
+    pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        match name {
+            "from_cache" => self.from_cache = value,
+            "found" => self.found = value,
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_duration(&mut self, d: Duration) {
+        self.duration = d;
+    }
+}
+
+impl fmt::Display for SetTransactionLoaded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            from_cache,
+            found,
+            duration,
+        } = self;
+        write!(
+            f,
+            "SetTransactionLoaded(duration={duration:?}, from_cache={from_cache}, found={found})"
         )
     }
 }

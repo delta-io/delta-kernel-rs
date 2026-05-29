@@ -10,9 +10,9 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
 use super::events::{
-    storage_metric_from_attrs, CrcReadCompleted, JsonReadCompleted, LogSegmentLoaded, MetricEvent,
-    ParquetReadCompleted, ProtocolMetadataLoaded, ScanMetadataCompleted, SnapshotCompleted,
-    STORAGE_SPAN,
+    storage_metric_from_attrs, CrcReadCompleted, DomainMetadataLoaded, JsonReadCompleted,
+    LogSegmentLoaded, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoaded,
+    ScanMetadataCompleted, SetTransactionLoaded, SnapshotCompleted, STORAGE_SPAN,
 };
 
 // ====================================================================
@@ -113,6 +113,12 @@ where
             )),
             SnapshotCompleted::SPAN_NAME => Some(MetricEvent::SnapshotCompleted(
                 SnapshotCompleted::from_attrs(attrs),
+            )),
+            DomainMetadataLoaded::SPAN_NAME => Some(MetricEvent::DomainMetadataLoaded(
+                DomainMetadataLoaded::from_attrs(attrs),
+            )),
+            SetTransactionLoaded::SPAN_NAME => Some(MetricEvent::SetTransactionLoaded(
+                SetTransactionLoaded::from_attrs(attrs),
             )),
             CrcReadCompleted::SPAN_NAME => Some(MetricEvent::CrcReadCompleted(
                 CrcReadCompleted::from_attrs(attrs),
