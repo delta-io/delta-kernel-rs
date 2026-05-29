@@ -62,16 +62,16 @@ cargo +nightly fmt \
 
 ### Feature Flags
 
+Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list):
+
 - `default-engine-rustls` / `default-engine-native-tls` -- async Arrow/Tokio engine (pick a TLS backend)
 - `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
   but the default engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
-- `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
-- `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
+- `test-utils`, `integration-test` -- development only
 
 ## Architecture at a Glance
 
@@ -90,8 +90,8 @@ actions, enforces protocol compliance, delegates atomic commit to a `Committer`.
 `EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
 `kernel/src/engine/default/`.
 
-**EngineData:** opaque columnar data interface. IMPORTANT: never access `EngineData` columns
-directly -- always use the visitor pattern (`visit_rows` with typed `GetData` accessors).
+**EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
+directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
 
 ## Testing
 
@@ -138,9 +138,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
   `LocalFileSystem::new_with_prefix()` with `add_commit` -- the prefix causes double-nesting
   because `add_commit` already resolves the full path from the URL. For in-memory tests, use
-  `InMemory::new()` with `"memory:///"`. Always use the same `table_root` URL string for
+  `InMemory::new()` with `"memory:///"`. ALWAYS use the same `table_root` URL string for
   both `add_commit` (writing log files) and `snapshot`/`Snapshot::try_new` (reading the
-  table). Always include a trailing slash in directory URLs to ensure correct path joining.
+  table). ALWAYS include a trailing slash in directory URLs to ensure correct path joining.
 
 ### Common test helpers
 
@@ -235,9 +235,9 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Common Gotchas
 
-- **EngineData is opaque:** Never downcast to `ArrowEngineData` or any concrete type
-  in production code (ok in tests). Never assume one batch per file -- always iterate.
-- **Column mapping:** Physical column names can differ from logical names. Always use
+- **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
+  in production code (ok in tests). NEVER assume one batch per file -- ALWAYS iterate.
+- **Column mapping:** Physical column names can differ from logical names. ALWAYS use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
 - **Transforms:** Generic recursive schema and expression transform traits and helpers
@@ -251,23 +251,9 @@ Keep this list updated when new protocol features are added to kernel.
   the extensions block closes, and emit via `warn!()` only then. See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
 
-## Code Style / Documentation
+## Code Style
 
 - Line width is 100 characters. Wrap comments and string literals at 100, not 80.
-- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
-  `// ============`).
-- MUST include doc comments for all public functions, structs, enums, and methods.
-- MUST document function parameters, return values, and errors.
-- Keep comments up-to-date with code changes.
-- Include examples in doc comments for complex functions only.
-- NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
-  checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
-- Comments should be concise and non-repetitive -- find the right place to say it once.
-- Comments should never include temporal references -- only refer to current code and
-  design, not past iterations.
-- Doc comments focus on "what" (contract with caller) more than "how" (implementation),
-  unless the "how" meaningfully impacts the "what".
-- Code comments state intent and explain "why" -- don't restate what the code self-documents.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code) -- never inside function bodies.
 - Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
@@ -280,6 +266,33 @@ Keep this list updated when new protocol features are added to kernel.
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
+
+## Comment & Doc Style
+
+- MUST include doc comments for all public functions, structs, enums, and methods.
+- MUST document function parameters, return values, and errors.
+- Doc comments focus on "what" (contract with caller) more than "how" (implementation),
+  unless the "how" meaningfully impacts the "what".
+- Code comments state intent and explain "why" -- don't restate what the code self-documents.
+- Be succinct. No verbose AI-slop comments. With well-written and well-named code,
+  verbose comments are worse than none.
+- Say each thing once, in the right place -- don't repeat the same idea across
+  doc comment and inline comment.
+- Comments earn their place only for hidden invariants, real-bug workarounds, or
+  constraints the reader can't see from the code itself.
+- Don't enumerate what grep can answer. Lists like `// Used by a, b, c` rot the
+  moment `d` lands. Describe the shape; let the reader grep.
+- No stale-prone anchors in durable docs or source comments: counts ("the 10
+  variants", "5-arm match"), line numbers, or enumeration lists. Describe the
+  shape; let the reader grep.
+- Comments MUST NOT include temporal references -- only refer to current code and
+  design, not past iterations.
+- Keep comments up-to-date with code changes.
+- Include examples in doc comments for complex functions only.
+- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`).
+- NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
+  checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
 
 ## Pull Requests
 
