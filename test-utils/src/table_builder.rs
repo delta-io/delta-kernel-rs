@@ -54,10 +54,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
+use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
@@ -834,7 +835,8 @@ pub fn table_configs(
 /// [`FeatureSet`], and [`TableConfig`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataLayoutConfig {
-    /// No special data layout (default schema).
+    /// No partitioning or clustering. Uses an all-primitives schema including a
+    /// nested-struct column.
     Unpartitioned,
     /// Partition by every valid primitive type. Uses [`partitioned_schema`] with all columns
     /// as partition columns.
@@ -843,6 +845,12 @@ pub enum DataLayoutConfig {
     /// clustering-eligible columns. Boolean and Binary are excluded (not stats-eligible).
     ClusteredAllTypes,
 }
+
+/// Period for sparse null injection. Data generation emits a null every
+/// `NULL_RATE_EVERY_NTH` rows for each nullable, non-partition column, regardless of
+/// [`DataLayoutConfig`]. Partition and clustering values are never nulled so partition
+/// values stay well-defined.
+pub const NULL_RATE_EVERY_NTH: usize = 3;
 
 impl DataLayoutConfig {
     /// The layout column names (partition or clustering) for this config. Returns all
@@ -1338,7 +1346,13 @@ async fn write_data_commit<E: TaskExecutor>(
                 continue;
             }
             let data_type = arrow_field.data_type();
-            columns.push(generate_column(data_type, rows_per_file, base));
+            let values = generate_column(data_type, rows_per_file, base);
+            let values = if arrow_field.is_nullable() {
+                with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
+            } else {
+                values
+            };
+            columns.push(values);
             data_fields.push(arrow_field.clone());
         }
         let data_arrow_schema = ArrowSchema::new(data_fields);
@@ -1442,12 +1456,36 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
         ArrowDataType::Struct(fields) => {
             let child_arrays: Vec<ArrayRef> = fields
                 .iter()
-                .map(|f| generate_column(f.data_type(), rows, base))
+                .map(|f| {
+                    let child = generate_column(f.data_type(), rows, base);
+                    if f.is_nullable() {
+                        with_sparse_nulls(child, NULL_RATE_EVERY_NTH)
+                    } else {
+                        child
+                    }
+                })
                 .collect();
             Arc::new(StructArray::new(fields.clone(), child_arrays, None))
         }
         other => panic!("unsupported Arrow type in test data generation: {other:?}"),
     }
+}
+
+/// Wrap `array` so that every `every_nth`-th row reads as null. Used by
+/// [`write_data_commit`] to make the default sweep exercise null-aware code paths
+/// (stats null counts, predicate evaluation under null, etc.) uniformly.
+fn with_sparse_nulls(array: ArrayRef, every_nth: usize) -> ArrayRef {
+    assert!(every_nth >= 1, "every_nth must be >= 1");
+    let n = array.len();
+    let valid: Vec<bool> = (0..n).map(|i| !i.is_multiple_of(every_nth)).collect();
+    let null_buffer = NullBuffer::from(valid);
+    let data = array
+        .to_data()
+        .into_builder()
+        .nulls(Some(null_buffer))
+        .build()
+        .expect("rebuilding array with null buffer");
+    delta_kernel::arrow::array::make_array(data)
 }
 
 // ===========================================================================
@@ -1990,6 +2028,39 @@ mod tests {
         let batches = crate::read_scan(&scan, engine)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
+        Ok(())
+    }
+
+    /// Verifies the data generator injects sparse nulls into every nullable data column.
+    /// Uses `rows_per_file = NULL_RATE_EVERY_NTH * 3` so each file has exactly three null
+    /// rows per column.
+    #[test]
+    fn test_sparse_null_injection_in_generated_data() -> DeltaResult<()> {
+        let rows_per_file = NULL_RATE_EVERY_NTH * 3;
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(1))
+            .with_data(1, rows_per_file)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, rows_per_file);
+        let expected_nulls_per_col = rows_per_file / NULL_RATE_EVERY_NTH;
+        for batch in &batches {
+            for col_idx in 0..batch.num_columns() {
+                let null_count = batch.column(col_idx).null_count();
+                assert_eq!(
+                    null_count,
+                    expected_nulls_per_col,
+                    "column '{}' should have {expected_nulls_per_col} nulls, got {null_count}",
+                    batch.schema().field(col_idx).name(),
+                );
+            }
+        }
         Ok(())
     }
 
