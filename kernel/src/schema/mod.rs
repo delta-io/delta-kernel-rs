@@ -214,8 +214,8 @@ pub struct StructField {
     /// are violations of [`StructField::nullable`], because parent nulls can be propagated to children. Two cases are
     /// distinguished:
     ///
-    /// - **Inherited nullability mismatch**: a non-nullable nested field has nulls when its parent
-    ///   is null.
+    /// - **Inherited nullability mismatch**: a non-nullable nested field has nulls when any of its
+    ///   ancestors is null.
     ///
     ///   Example -- schema: `s: struct<a: int NOT NULL> (nullable)`
     ///   ```json
@@ -229,7 +229,7 @@ pub struct StructField {
     ///   ```
     ///
     /// - **Genuine nullability mismatch**: a non-nullable field has nulls when:
-    ///   1. Its parent is non-null, or
+    ///   1. All of its ancestors are non-null, or
     ///   2. The field is top-level.
     ///
     ///   Example 1 -- top-level non-nullable field:
