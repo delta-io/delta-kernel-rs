@@ -113,7 +113,7 @@ impl Default for StatsOutputMode {
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
-    schema: Option<SchemaRef>,
+    logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
     stats_output_mode: StatsOutputMode,
 }
@@ -121,7 +121,7 @@ pub struct ScanBuilder {
 impl std::fmt::Debug for ScanBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("ScanBuilder")
-            .field("schema", &self.schema)
+            .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
             .field("stats_output_mode", &self.stats_output_mode)
             .finish()
@@ -133,7 +133,7 @@ impl ScanBuilder {
     pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
         Self {
             snapshot: snapshot.into(),
-            schema: None,
+            logical_read_schema: None,
             predicate: None,
             stats_output_mode: StatsOutputMode::default(),
         }
@@ -147,7 +147,7 @@ impl ScanBuilder {
     /// [`Schema`]: crate::schema::Schema
     /// [`Snapshot`]: crate::snapshot::Snapshot
     pub fn with_schema(mut self, logical_read_schema: SchemaRef) -> Self {
-        self.schema = Some(logical_read_schema);
+        self.logical_read_schema = Some(logical_read_schema);
         self
     }
 
@@ -246,8 +246,8 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
-        // Predicates may reference columns outside with_schema, so resolve against the full table
-        // schema
+        // Predicates may reference columns outside self.logical_read_schema, so resolve against the
+        // full table schema
         let table_schema = self.snapshot.schema();
         // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
         // a transient state, but a scan over zero columns has no way to derive row
@@ -261,7 +261,9 @@ impl ScanBuilder {
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_read_schema = self.schema.unwrap_or_else(|| table_schema.clone());
+        let logical_read_schema = self
+            .logical_read_schema
+            .unwrap_or_else(|| table_schema.clone());
 
         self.snapshot
             .table_configuration()

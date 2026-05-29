@@ -762,11 +762,9 @@ fn predicate_on_letter_and_number(
     Ok(())
 }
 
-// Regression test for issue #2468: a predicate may reference table-schema columns that are
-// outside the `with_schema` projection. The scan must build successfully, return only the
-// projected columns, and still apply data/partition skipping driven by the unprojected predicate.
+// Regression test for issue #2468
 #[rstest::rstest]
-#[case::data_column_not_in_projection(
+#[case::predicate_on_unprojected_data_column_in_table_schema_succeeds(
     // `number` is a data column not present in the projected schema (`a_float`).
     column_expr!("number").gt(Expr::literal(4i64)),
     vec![
@@ -781,9 +779,7 @@ fn predicate_on_letter_and_number(
     .map(String::from)
     .collect()
 )]
-#[case::partition_column_not_in_projection(
-    // `letter` is the partition column. Projection drops it from output, but partition
-    // pruning still resolves against it.
+#[case::predicate_on_partition_column_in_table_schema_succeeds(
     column_expr!("letter").eq(Expr::literal("a")),
     vec![
         "+---------+",
@@ -797,11 +793,8 @@ fn predicate_on_letter_and_number(
     .map(String::from)
     .collect()
 )]
-#[case::mixed_projected_and_unprojected(
-    // Combines the projected data column `a_float` with the unprojected data column
-    // `number`. Both refs must resolve: `a_float` via the projected output schema and
-    // `number` via the full table schema. Matching rows are (4.4, 4, letter=a) and
-    // (5.5, 5, letter=b); files for letter=c are pruned by the `number < 6` bound.
+#[case::predicate_on_mixed_projected_and_unprojected_columns_succeeds(
+    // a_float is projected, number is unprojected
     Pred::and(
         column_expr!("a_float").gt(Expr::literal(4.0)),
         column_expr!("number").lt(Expr::literal(6i64)),
@@ -1066,7 +1059,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     1
 )]
 #[tokio::test]
-async fn partition_pruning_with_column_mapping(
+async fn test_partition_pruning_with_column_mapping(
     #[case] predicate: Arc<Pred>,
     #[case] select_cols: Option<Vec<&'static str>>,
     #[case] expected_files: usize,

@@ -338,12 +338,26 @@ fn test_physical_predicate_case_insensitive_unknown_column() {
     assert!(result.is_err());
 }
 
-/// `ScanBuilder` decouples the projection (`with_schema`) from the schema predicate
-/// references resolve against (the snapshot's table schema). A caller-added metadata
-/// column lives only in the projection: it is not mirrored into the table schema. A
-/// predicate referencing such a column therefore has no resolution target and must be
-/// rejected at build time. This pins that contract on the public API surface so future
-/// refactors to the wiring inside `ScanBuilder::build` cannot silently regress it.
+#[test]
+fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    let projection = snapshot.schema().project(&["a_float"]).unwrap();
+    let predicate = Arc::new(column_expr!("number").gt(Expr::literal(5_i64)));
+
+    let scan = snapshot
+        .scan_builder()
+        .with_schema(projection)
+        .with_predicate(predicate)
+        .build()
+        .expect("build should accept a predicate referencing a non-projection table column");
+
+    assert_eq!(scan.logical_schema().fields().len(), 1);
+}
+
 #[test]
 fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let path =
@@ -352,9 +366,8 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    // Augment the projection with a `RowIndex` metadata column. The snapshot's
-    // `schema()` -- which `ScanBuilder::build` passes as the predicate-resolution
-    // schema -- is untouched, so `my_row_index` exists only in the projection.
+    //`my_row_index` is computed during the scan, not stored in the table,
+    //so a predicate can't filter on it
     let projection = Arc::new(
         snapshot
             .schema()

@@ -111,17 +111,15 @@ impl TableChangesScanBuilder {
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
         // so valid references to unprojected columns aren't rejected.
-        let predicate_schema = self.table_changes.schema().clone().into();
+        let table_schema: SchemaRef = self.table_changes.schema().clone().into();
         // If no projection is supplied, default to the full CDF-extended schema (SELECT *).
-        let logical_schema = self
-            .schema
-            .unwrap_or_else(|| self.table_changes.schema.clone().into());
+        let logical_read_schema = self.schema.unwrap_or_else(|| table_schema.clone());
 
         // Create StateInfo using CDF field classifier
         // CDF doesn't support stats output
         let state_info = StateInfo::try_new(
-            logical_schema,
-            predicate_schema,
+            logical_read_schema,
+            table_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
             StatsOutputMode::default(),
@@ -464,11 +462,9 @@ mod tests {
         ));
     }
 
-    // Regression for issue #2468 on the CDF path: a predicate may reference columns in the
-    // full CDF-extended schema even when `with_schema` narrows the output. Build must succeed
-    // and the predicate must be carried through to the scan state.
+    // Regression for issue #2468 on the CDF path
     #[test]
-    fn cdf_predicate_on_unprojected_data_column() {
+    fn cdf_predicate_on_unprojected_data_column_in_table_schema_succeeds() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
@@ -489,12 +485,9 @@ mod tests {
             PhysicalPredicate::Some(pred, _) if pred == &predicate));
     }
 
-    // The CDF builder docstring documents that predicates over `_change_type`,
-    // `_commit_version`, `_commit_timestamp` are accepted but have no filtering effect (the
-    // kernel does not apply them; see issue #525). This pins the "accepted at build time"
-    // half of that contract on the unprojected path.
+    // github issue #525
     #[test]
-    fn cdf_predicate_on_unprojected_cdf_metadata_column() {
+    fn cdf_predicate_on_unprojected_cdf_metadata_column_builds_but_is_no_op() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();

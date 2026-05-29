@@ -222,12 +222,13 @@ impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
-    /// `logical_read_schema` - The logical schema of the scan output, which includes partition
-    /// columns `table_schema` - The schema predicate column references are resolved against.
-    /// Should contain every column the predicate may legitimately reference (typically the full
+    /// `logical_read_schema` - The logical schema of the scan output
+    /// `table_schema` - The schema against which predicate column references are resolved.
+    /// Must contain every column the predicate may legitimately reference (typically the full
     /// table schema, or full CDF-extended schema for CDF scans). Currently, we do not carry
     /// over any metadata columns from the `logical_read_schema` to the `table_schema` (issue
-    /// 2633). `table_configuration` - The TableConfiguration for this table
+    /// 2633).
+    /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
     /// `stats_output_mode` - Controls how file statistics are handled during the scan
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
@@ -338,6 +339,7 @@ impl StateInfo {
             .map(|p| p.references().into_iter().cloned().collect())
             .unwrap_or_default();
 
+        //we use table_schema here as predicate can reference columns outside projection
         let physical_predicate = match predicate {
             Some(pred) => PhysicalPredicate::try_new(&pred, &table_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
