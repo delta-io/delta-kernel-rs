@@ -73,14 +73,17 @@ pub enum IoOperation {
 }
 
 impl IoOperation {
+    /// Constructs an [`IoOperation::FileListing`] for the given URL.
     pub fn file_listing(url: Url) -> Self {
         Self::FileListing { url }
     }
 
+    /// Constructs an [`IoOperation::ReadBytes`] for the given file slices.
     pub fn read_bytes(files: Vec<FileSlice>) -> Self {
         Self::ReadBytes { files }
     }
 
+    /// Constructs an [`IoOperation::WriteBytes`] for the given URL, data, and overwrite flag.
     pub fn write_bytes(url: Url, data: Bytes, overwrite: bool) -> Self {
         Self::WriteBytes {
             url,
@@ -89,10 +92,12 @@ impl IoOperation {
         }
     }
 
+    /// Constructs an [`IoOperation::HeadFile`] for the given URL.
     pub fn head_file(url: Url) -> Self {
         Self::HeadFile { url }
     }
 
+    /// Constructs an [`IoOperation::AtomicCopy`] for the given source and destination URLs.
     pub fn atomic_copy(source: Url, destination: Url) -> Self {
         Self::AtomicCopy {
             source,
@@ -100,6 +105,7 @@ impl IoOperation {
         }
     }
 
+    /// Constructs an [`IoOperation::ParquetFooter`] for the given file metadata.
     pub fn parquet_footer(file: FileMeta) -> Self {
         Self::ParquetFooter { file }
     }
