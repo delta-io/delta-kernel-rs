@@ -49,12 +49,10 @@ impl ParquetHandler for PlanBasedParquetHandler {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
-        let op = IoOperation::parquet_schema(file.clone());
-        let schema = self
-            .executor
+        let op = IoOperation::parquet_footer(file.clone());
+        self.executor
             .execute_op(Operation::IoOperation(op))?
-            .into_schema()?;
-        Ok(ParquetFooter { schema })
+            .into_parquet_footer()
     }
 }
 
