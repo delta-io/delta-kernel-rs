@@ -21,9 +21,9 @@
 
 use std::cmp::Ordering;
 
-use error::LogHistoryError;
+use error::{LogHistoryError, NearestTimestamp};
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -189,10 +189,11 @@ fn linear_search_file_mod_timestamps(
     bound: Bound,
 ) -> Result<Version, LogHistoryError> {
     if commits.is_empty() {
-        return Err(LogHistoryError::TimestampOutOfRange {
+        return Err(LogHistoryError::out_of_range(
             timestamp,
-            reason: bound.out_of_range_reason(),
-        });
+            bound,
+            NearestTimestamp::Unknown,
+        ));
     }
 
     let lo_version = commits[0].version;
@@ -227,9 +228,22 @@ fn linear_search_file_mod_timestamps(
         prev_monotonic_ts = monotonic_ts;
     }
 
-    result.ok_or(LogHistoryError::TimestampOutOfRange {
-        timestamp,
-        reason: bound.out_of_range_reason(),
+    result.ok_or_else(|| {
+        // OOR with non-empty commits: under GreatestLower, `timestamp` is below
+        // the first commit's monotonic ts (which equals its raw `last_modified`
+        // since no prior commit affects it). Under LeastUpper, `timestamp` is
+        // above the last commit's monotonic ts (held in `prev_monotonic_ts`).
+        // Using the monotonized values means a re-query at the suggested
+        // `nearest` round-trips to the same boundary version.
+        let nearest_ts = match bound {
+            Bound::GreatestLower => commits[0].location.last_modified,
+            Bound::LeastUpper => prev_monotonic_ts,
+        };
+        LogHistoryError::out_of_range(
+            timestamp,
+            bound,
+            NearestTimestamp::from_boundary(bound, nearest_ts),
+        )
     })
 }
 
@@ -243,10 +257,11 @@ fn binary_search_ict_timestamps(
     engine: &dyn Engine,
 ) -> Result<Version, LogHistoryError> {
     if commits.is_empty() {
-        return Err(LogHistoryError::TimestampOutOfRange {
+        return Err(LogHistoryError::out_of_range(
             timestamp,
-            reason: bound.out_of_range_reason(),
-        });
+            bound,
+            NearestTimestamp::Unknown,
+        ));
     }
 
     let lo_version = commits[0].version;
@@ -265,10 +280,29 @@ fn binary_search_ict_timestamps(
     match binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound) {
         Ok(idx) => Ok(commits[idx].version),
         Err(SearchError::KeyFunctionError(error)) => Err(error),
-        Err(SearchError::OutOfRange) => Err(LogHistoryError::TimestampOutOfRange {
-            timestamp,
-            reason: bound.out_of_range_reason(),
-        }),
+        Err(SearchError::OutOfRange) => {
+            // OutOfRange under `GreatestLower` means timestamp < commits[0]'s
+            // ICT; under `LeastUpper` it means timestamp > commits.last()'s
+            // ICT. The boundary timestamp is read via `commit_to_ict`; on
+            // engine failure we degrade to `Unknown` so the original
+            // out-of-range error is preserved.
+            let nearest = bound
+                .boundary_of(commits)
+                .and_then(|boundary| {
+                    commit_to_ict(boundary)
+                        .inspect_err(|e| {
+                            warn!(
+                                error = ?e,
+                                version = boundary.version,
+                                "failed to read boundary ICT for nearest_timestamp hint",
+                            );
+                        })
+                        .ok()
+                        .map(|ts| NearestTimestamp::from_boundary(bound, ts))
+                })
+                .unwrap_or(NearestTimestamp::Unknown);
+            Err(LogHistoryError::out_of_range(timestamp, bound, nearest))
+        }
     }
 }
 
@@ -320,10 +354,11 @@ pub(crate) fn timestamp_to_version(
         (Ordering::Greater, Bound::GreatestLower) => return Ok(snapshot.version()),
         // Timestamp after snapshot: for LeastUpper, no version exists
         (Ordering::Greater, Bound::LeastUpper) => {
-            return Err(LogHistoryError::TimestampOutOfRange {
+            return Err(LogHistoryError::out_of_range(
                 timestamp,
-                reason: bound.out_of_range_reason(),
-            });
+                bound,
+                NearestTimestamp::Latest(snap_ts),
+            ));
         }
         // Timestamp before snapshot: need to search the log
         _ => {}
@@ -1019,6 +1054,57 @@ mod tests {
                 "{res:?}"
             ),
         }
+    }
+
+    /// Verifies `nearest_timestamp` is populated on `TimestampOutOfRange`. Covers
+    /// the three reachable populate sites: linear file-mod search out-of-range,
+    /// ICT binary-search out-of-range, and the snapshot short-circuit.
+    #[rstest::rstest]
+    // Linear file-mod GLB: timestamp below earliest commit on the standard table.
+    // nearest = Earliest(commits[0].last_modified) = Earliest(50).
+    #[case::linear_glb_below_earliest(
+        &[(50, None), (150, None), (250, None), (350, Some(300)), (450, Some(400))],
+        Some(3),
+        0,
+        Bound::GreatestLower,
+        NearestTimestamp::Earliest(50),
+    )]
+    // Snapshot short-circuit LUB: timestamp above the snapshot's ICT (snap_ts = 400).
+    #[case::short_circuit_lub_after_snapshot(
+        &[(50, None), (150, None), (250, None), (350, Some(300)), (450, Some(400))],
+        Some(3),
+        1000,
+        Bound::LeastUpper,
+        NearestTimestamp::Latest(400),
+    )]
+    // ICT binary-search GLB: timestamp below earliest ICT on an ICT-from-creation
+    // table. nearest = Earliest(ICT(v0)) = Earliest(100).
+    #[case::ict_glb_below_earliest(
+        &[(0, Some(100)), (0, Some(200)), (0, Some(300))],
+        Some(0),
+        50,
+        Bound::GreatestLower,
+        NearestTimestamp::Earliest(100),
+    )]
+    #[tokio::test]
+    async fn test_timestamp_out_of_range_nearest_timestamp(
+        #[case] timestamps: &[(Timestamp, Option<Timestamp>)],
+        #[case] ict_enablement: Option<Version>,
+        #[case] timestamp: Timestamp,
+        #[case] bound: Bound,
+        #[case] expected_nearest: NearestTimestamp,
+    ) {
+        let (_table, engine, snapshot, _log_segment) =
+            build_test_snapshot(timestamps, ict_enablement, None).await;
+
+        let err = timestamp_to_version(&snapshot, &engine, timestamp, bound).unwrap_err();
+        let LogHistoryError::TimestampOutOfRange {
+            nearest_timestamp, ..
+        } = err
+        else {
+            panic!("expected TimestampOutOfRange, got {err:?}");
+        };
+        assert_eq!(nearest_timestamp, expected_nearest);
     }
 
     /// ICT enabled at v3 but v4 is missing its ICT timestamp (error case).

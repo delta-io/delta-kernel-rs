@@ -84,25 +84,25 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_expression_item_list(var->exprs, depth + 1);
       break;
     }
-    case Transform: {
-      struct TransformExpression* transform = ref.ref;
-      printf("Transform\n");
-      print_expression_item_list(transform->input_path, depth + 1);
-      print_expression_item_list(transform->field_transforms, depth + 1);
+    case StructPatch: {
+      struct StructPatchExpression* patch = ref.ref;
+      printf("StructPatch\n");
+      print_expression_item_list(patch->input_path, depth + 1);
+      print_expression_item_list(patch->field_patches, depth + 1);
       break;
     }
-    case FieldTransform: {
-      struct FieldTransform* field_transform = ref.ref;
-      if (!field_transform->field_name) {
+    case FieldPatch: {
+      struct FieldPatch* field_patch = ref.ref;
+      if (!field_patch->field_name) {
         printf("Prepend\n");
-      } else if (!field_transform->is_replace) {
-        printf("Insert(%s)\n", field_transform->field_name);
-      } else if (!field_transform->exprs.len) {
-        printf("Drop(%s)\n", field_transform->field_name);
+      } else if (!field_patch->is_replace) {
+        printf("Insert(%s)\n", field_patch->field_name);
+      } else if (!field_patch->exprs.len) {
+        printf("Drop(%s)\n", field_patch->field_name);
       } else {
-        printf("Replace(%s)\n", field_transform->field_name);
+        printf("Replace(%s)\n", field_patch->field_name);
       }
-      print_expression_item_list(field_transform->exprs, depth + 1);
+      print_expression_item_list(field_patch->exprs, depth + 1);
       break;
     }
     case OpaqueExpression: {

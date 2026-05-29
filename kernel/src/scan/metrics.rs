@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::metrics::{MetricEvent, MetricId, ScanType};
+use crate::metrics::{MetricId, ScanMetadataCompleted, ScanType};
 
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
@@ -103,20 +103,20 @@ impl ScanMetrics {
         self.predicate_eval_time_ns.store(0, Ordering::Relaxed);
     }
 
-    /// Snapshot all counters into a `MetricEvent::ScanMetadataCompleted`.
+    /// Snapshot all counters into a [`ScanMetadataCompleted`] event payload.
     ///
-    /// `scan_type` identifies whether this event was emitted by full scan metadata replay or
-    /// by a phase of parallel scan metadata replay.
+    /// `scan_type` identifies whether this event was emitted by full scan metadata replay or by
+    /// a phase of parallel scan metadata replay.
     pub(crate) fn to_event(
         &self,
         operation_id: MetricId,
         scan_type: ScanType,
-        total_duration: Duration,
-    ) -> MetricEvent {
-        MetricEvent::ScanMetadataCompleted {
+        duration: Duration,
+    ) -> ScanMetadataCompleted {
+        ScanMetadataCompleted {
             operation_id,
             scan_type,
-            total_duration,
+            duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),
             num_active_add_files: self.num_active_add_files.load(Ordering::Relaxed),
             active_add_files_bytes: self.active_add_files_bytes.load(Ordering::Relaxed),

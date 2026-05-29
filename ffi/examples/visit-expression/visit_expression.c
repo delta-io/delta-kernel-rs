@@ -91,7 +91,7 @@ int main() {
         "This test demonstrates the full range of expression types.\n"
         "Some types are not yet supported in round-trip reconstruction:\n"
         "  - Struct/Array/Map literals (nested data structures)\n"
-        "  - Transform expressions (schema evolution operations)\n"
+        "  - StructPatch expressions (schema evolution operations)\n"
         "  - Opaque expressions (custom user-defined expressions)"
     },
     {

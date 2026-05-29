@@ -334,46 +334,49 @@ where
     Err(de::Error::custom("Cannot deserialize an Opaque Expression"))
 }
 
-/// A transformation affecting a single field (one pieces of a [`Transform`]). The transformation
-/// could insert 0+ new fields after the target, or could replace the target with 0+ a new fields).
+/// A patch affecting a single input field.
+///
+/// A field patch can insert zero or more expressions after its input field, or it can replace the
+/// input field with zero or more expressions.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct FieldTransform {
-    /// The list of expressions this field transform emits at the target location.
+pub struct ExpressionFieldPatch {
+    /// The expressions this field patch emits at the input field's output position.
     pub exprs: Vec<ExpressionRef>,
     /// If true, the output expressions replace the input field instead of following after it.
     pub is_replace: bool,
-    /// If true, this transform is silently ignored when the target field does not exist in the
-    /// input. Otherwise, a missing target field produces an error.
+    /// If true, this patch is silently ignored when the input field does not exist. Otherwise, a
+    /// missing input field produces an error.
     pub optional: bool,
 }
 
-/// A transformation that efficiently represents sparse modifications to struct schemas.
+/// A sparse expression patch over the fields of one input struct.
 ///
-/// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
-/// specifying those fields that actually change (inserted, replaced, or deleted). Any input field
-/// not specifically mentioned by the transform is passed through, unmodified and with the same
-/// relative field ordering. This is particularly useful for wide schemas where only a few columns
-/// need to be modified and/or dropped, or where a small number of columns need to be injected.
+/// `ExpressionStructPatch` achieves `O(changes)` space complexity instead of `O(schema_width)` by
+/// only specifying fields that actually change (inserted, replaced, or deleted). Any input field
+/// not specifically mentioned by the patch is passed through, unmodified and with the same relative
+/// field ordering. This is particularly useful for wide schemas where only a few columns need to be
+/// modified and/or dropped, or where a small number of columns need to be injected.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Transform {
-    /// The path to the nested input struct this transform operates on (if any). If no path is
-    /// given, the transform operates directly on top-level columns.
+pub struct ExpressionStructPatch {
+    /// The path to the nested input struct this patch operates on (if any). If no path is given,
+    /// the patch operates directly on top-level columns.
     pub input_path: Option<ColumnName>,
-    /// A mapping from named input fields to the transform to be performed on each field.
-    pub field_transforms: HashMap<String, FieldTransform>,
+    /// A mapping from named input fields to the patch to be performed on each field.
+    #[serde(alias = "field_transforms")]
+    pub field_patches: HashMap<String, ExpressionFieldPatch>,
     /// A list of new fields to emit before processing the first input field.
     pub prepended_fields: Vec<ExpressionRef>,
 }
 
-impl Transform {
-    /// Creates a new top-level identity transform. The various `with_xxx` helper methods can be
-    /// used to add specific field transforms.
+impl ExpressionStructPatch {
+    /// Creates a new empty top-level patch. The various `with_xxx` helper methods can be
+    /// used to add specific field patches.
     pub fn new_top_level() -> Self {
         Self::default()
     }
 
-    /// Creates a new identity transform that operates on fields of a nested struct identified by
-    /// `path`. The various `with_xxx` helper methods can be used to add specific field transforms.
+    /// Creates a new empty patch that operates on fields of a nested struct identified by
+    /// `path`. The various `with_xxx` helper methods can be used to add specific field patches.
     pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
     where
         ColumnName: FromIterator<A>,
@@ -386,24 +389,24 @@ impl Transform {
 
     /// Specifies a field to drop.
     pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.is_replace = true;
+        let field_patch = self.field_patch(name);
+        field_patch.is_replace = true;
         self
     }
 
     /// Like [`Self::with_dropped_field`], but silently ignored if the field does not exist.
     pub fn with_dropped_field_if_exists(mut self, name: impl Into<String>) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.is_replace = true;
-        field_transform.optional = true;
+        let field_patch = self.field_patch(name);
+        field_patch.is_replace = true;
+        field_patch.optional = true;
         self
     }
 
     /// Specifies an expression to replace a field with.
     pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
-        let field_transform = self.field_transform(name);
-        field_transform.exprs.push(expr);
-        field_transform.is_replace = true;
+        let field_patch = self.field_patch(name);
+        field_patch.exprs.push(expr);
+        field_patch.is_replace = true;
         self
     }
 
@@ -416,26 +419,25 @@ impl Transform {
         expr: ExpressionRef,
     ) -> Self {
         match after {
-            Some(field_name) => self.field_transform(field_name).exprs.push(expr),
+            Some(field_name) => self.field_patch(field_name).exprs.push(expr),
             None => self.prepended_fields.push(expr),
         }
         self
     }
 
-    /// True if this is the identity transform (all input fields pass through unchanged, with no new
-    /// fields inserted).
-    pub fn is_identity(&self) -> bool {
-        self.prepended_fields.is_empty() && self.field_transforms.is_empty()
+    /// True if this patch makes no changes.
+    pub fn is_empty(&self) -> bool {
+        self.prepended_fields.is_empty() && self.field_patches.is_empty()
     }
 
-    /// None, if this is a top-level transform. Otherwise, the path of this nested transform.
+    /// None, if this is a top-level patch. Otherwise, the path of this nested patch.
     pub fn input_path(&self) -> Option<&ColumnName> {
         self.input_path.as_ref()
     }
 
-    // Gets or creates the field transform for a named input field
-    fn field_transform(&mut self, field_name: impl Into<String>) -> &mut FieldTransform {
-        self.field_transforms.entry(field_name.into()).or_default()
+    // Gets or creates the field patch for a named input field.
+    fn field_patch(&mut self, field_name: impl Into<String>) -> &mut ExpressionFieldPatch {
+        self.field_patches.entry(field_name.into()).or_default()
     }
 }
 
@@ -456,9 +458,10 @@ pub enum Expression {
     /// The optional nullability predicate, if provided and evaluates to false/null, makes the
     /// entire struct null.
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
-    /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
+    /// A sparse patch of a struct. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
-    Transform(Transform),
+    #[serde(alias = "Transform")]
+    StructPatch(ExpressionStructPatch),
     /// An expression that takes one expression as input.
     Unary(UnaryExpression),
     /// An expression that takes two expressions as input.
@@ -695,9 +698,9 @@ impl Expression {
         )
     }
 
-    /// Create a new transform expression
-    pub fn transform(transform: Transform) -> Self {
-        Self::Transform(transform)
+    /// Create a new struct patch expression.
+    pub fn struct_patch(patch: ExpressionStructPatch) -> Self {
+        Self::StructPatch(patch)
     }
 
     /// Create a new predicate `self IS NULL`
@@ -1033,25 +1036,25 @@ impl Display for Expression {
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
             Struct(exprs, _) => write!(f, "Struct({})", format_child_list(exprs)),
-            Transform(transform) => {
-                write!(f, "Transform(")?;
+            StructPatch(patch) => {
+                write!(f, "StructPatch(")?;
                 let mut sep = "";
-                if !transform.prepended_fields.is_empty() {
-                    let prepended_fields = format_child_list(&transform.prepended_fields);
+                if !patch.prepended_fields.is_empty() {
+                    let prepended_fields = format_child_list(&patch.prepended_fields);
                     write!(f, "prepend [{prepended_fields}]")?;
                     sep = ", ";
                 }
-                for (field_name, field_transform) in &transform.field_transforms {
-                    let insertions = &field_transform.exprs;
+                for (field_name, field_patch) in &patch.field_patches {
+                    let insertions = &field_patch.exprs;
                     if insertions.is_empty() {
-                        if field_transform.is_replace {
+                        if field_patch.is_replace {
                             write!(f, "{sep}drop {field_name}")?;
                         } else {
                             continue; // no-op; ignore it and don't change `sep` below
                         }
                     } else {
                         let insertions = format_child_list(insertions);
-                        if field_transform.is_replace {
+                        if field_patch.is_replace {
                             write!(f, "{sep}replace {field_name} with [{insertions}]")?;
                         } else {
                             write!(f, "{sep}after {field_name} insert [{insertions}]")?;
@@ -1269,7 +1272,7 @@ mod tests {
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, Predicate, Scalar, Transform, UnaryExpressionOp,
+            Expression, ExpressionStructPatch, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::utils::test_utils::assert_result_error_with_message;
@@ -1432,7 +1435,7 @@ mod tests {
             assert_roundtrip(&expr);
         }
 
-        // ==================== Expression::Struct/Transform/Other Tests ====================
+        // ==================== Expression::Struct/StructPatch/Other Tests ====================
 
         #[test]
         fn test_struct_expression_roundtrip() {
@@ -1448,17 +1451,19 @@ mod tests {
         fn test_transform_expressions_roundtrip() {
             let cases: Vec<Expression> = vec![
                 // Identity transform
-                Expression::transform(Transform::new_top_level()),
+                Expression::struct_patch(ExpressionStructPatch::new_top_level()),
                 // Drop field
-                Expression::transform(Transform::new_top_level().with_dropped_field("old_column")),
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_top_level().with_dropped_field("old_column"),
+                ),
                 // Replace field
-                Expression::transform(
-                    Transform::new_top_level()
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_top_level()
                         .with_replaced_field("original", Arc::new(Expression::literal(0))),
                 ),
                 // Insert fields
-                Expression::transform(
-                    Transform::new_top_level()
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_top_level()
                         .with_inserted_field(Some("after_col"), Arc::new(column_expr!("new_col")))
                         .with_inserted_field(
                             None::<String>,
@@ -1466,8 +1471,9 @@ mod tests {
                         ),
                 ),
                 // Nested transform
-                Expression::transform(
-                    Transform::new_nested(["parent", "child"]).with_dropped_field("to_drop"),
+                Expression::struct_patch(
+                    ExpressionStructPatch::new_nested(["parent", "child"])
+                        .with_dropped_field("to_drop"),
                 ),
             ];
 

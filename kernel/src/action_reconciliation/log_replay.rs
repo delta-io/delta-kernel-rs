@@ -41,7 +41,7 @@ use crate::log_replay::{
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -129,15 +129,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(
-        inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
-    ) -> Self {
+    pub(crate) fn new(inner: DeltaResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),

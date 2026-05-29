@@ -1,6 +1,6 @@
 //! Intermediate representation (IR) for declarative plans.
 //!
-//! The top-level type is a [`Plan`], which communicates to the
+//! The top-level type is an [`Operation`], which communicates to the
 //! [`PlanExecutor`](super::PlanExecutor) what to do.
 
 use bytes::Bytes;
@@ -9,11 +9,12 @@ use url::Url;
 use crate::schema::SchemaRef;
 use crate::{FileMeta, FileSlice, PredicateRef};
 
-/// Represents a set of instructions that the [`PlanExecutor`](super::PlanExecutor) should perform.
+/// Represents a set of instructions that the [`PlanExecutor`](super::PlanExecutor)
+/// should perform.
 ///
 /// It can either be an IO operation or a declarative query.
 #[derive(Debug)]
-pub enum Plan {
+pub enum Operation {
     /// A singular I/O operation that returns concretely typed data such as bytes or file metadata.
     IoOperation(IoOperation),
     /// A query on relational-like data, expressed through a plan algebra.
@@ -28,8 +29,9 @@ pub enum Plan {
 pub enum IoOperation {
     /// Recursively list files at the given URL.
     ///
-    /// Should return a [`PlanResult::FileMeta`](super::PlanResult::FileMeta) with one entry per
-    /// file. See [`StorageHandler::list_from`] for more details on the ordering contract.
+    /// Should return a [`PlanResult::FileMeta`](super::PlanResult::FileMeta) with one
+    /// entry per file. See [`StorageHandler::list_from`] for more details on the ordering
+    /// contract.
     ///
     /// [`StorageHandler::list_from`]: crate::StorageHandler::list_from
     FileListing { url: Url },
@@ -41,8 +43,8 @@ pub enum IoOperation {
     ReadBytes { files: Vec<FileSlice> },
     /// Write raw bytes to a file at the given URL.
     ///
-    /// Returns [`PlanResult::Unit`](super::PlanResult::Unit) on success. If `overwrite` is false
-    /// and the file already exists, the executor should return
+    /// Returns [`PlanResult::Unit`](super::PlanResult::Unit) on success. If `overwrite`
+    /// is false and the file already exists, the executor should return
     /// [`Error::FileAlreadyExists`](crate::Error::FileAlreadyExists).
     WriteBytes {
         url: Url,
@@ -51,8 +53,8 @@ pub enum IoOperation {
     },
     /// Retrieve metadata for a single file (HEAD request).
     ///
-    /// Returns [`PlanResult::FileMeta`](super::PlanResult::FileMeta) with a single entry.
-    /// If the file does not exist, the executor should return an error.
+    /// Returns [`PlanResult::FileMeta`](super::PlanResult::FileMeta) with a single
+    /// entry. If the file does not exist, the executor should return an error.
     HeadFile { url: Url },
     /// Atomically copy a file from `source` to `destination`.
     ///
@@ -102,8 +104,8 @@ pub type QueryPlan = QueryPlanNode;
 pub enum QueryPlanNode {
     /// Read and parse newline-delimited JSON files, returning columnar data.
     ///
-    /// Returns [`PlanResult::Data`](super::PlanResult::Data) with columns matching the provided
-    /// `physical_schema`. See [`JsonHandler::read_json_files`] for more details on column
+    /// Returns [`PlanResult::Data`](super::PlanResult::Data) with columns matching the
+    /// provided `physical_schema`. See [`JsonHandler::read_json_files`] for more details on column
     /// resolution rules and ordering contracts.
     ///
     /// [`JsonHandler::read_json_files`]: crate::JsonHandler::read_json_files
@@ -114,9 +116,9 @@ pub enum QueryPlanNode {
     },
     /// Read and parse Apache Parquet files, returning columnar data.
     ///
-    /// Returns [`PlanResult::Data`](super::PlanResult::Data) with columns matching the provided
-    /// `physical_schema`. See [`ParquetHandler::read_parquet_files`] for more details on column
-    /// resolution rules and ordering contracts.
+    /// Returns [`PlanResult::Data`](super::PlanResult::Data) with columns matching the
+    /// provided `physical_schema`. See [`ParquetHandler::read_parquet_files`] for more details on
+    /// column resolution rules and ordering contracts.
     ///
     /// [`ParquetHandler::read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     ScanParquet {
