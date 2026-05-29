@@ -331,9 +331,8 @@ pub fn two_checkpoints_stale_hint() -> LogState {
 }
 
 // Post-cleanup variants: same shapes as above but with log cleanup applied at MID.
-// 99% of production tables have had maintenance run on them. Cleanup at MID (not at
-// LATEST) keeps commits MID..=LATEST reachable, so the canonical `at_version(MID)`
-// and `incremental_to_latest { from: MID }` targets still resolve.
+// Cleanup at MID (not at LATEST) keeps commits MID..=LATEST reachable, so the canonical
+// `at_version(MID)` and `incremental_to_latest { from: MID }` targets still resolve.
 
 pub fn checkpoint_at_end_post_cleanup() -> LogState {
     LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)

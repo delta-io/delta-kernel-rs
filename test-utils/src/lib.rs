@@ -114,6 +114,8 @@ define_sweeps! {
         checkpoint_struct_stats(),
         no_checkpoint_stats()
     ),
+    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
+    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
     version_target_values = (
         version_latest(),
         version_at_mid(),
