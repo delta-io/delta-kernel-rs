@@ -1,7 +1,7 @@
 //! IcebergCompatV3 checks.
 
 use super::{
-    check_no_legacy_nested_ids, has_only_supported_types, IcebergCompatValidator,
+    check_no_legacy_nested_ids, check_only_supported_types, IcebergCompatValidator,
     IcebergCompatVersion,
 };
 use crate::schema::DataType;
@@ -41,7 +41,7 @@ fn is_v3_supported_type(dt: &DataType) -> bool {
 }
 
 fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
-    has_only_supported_types(
+    check_only_supported_types(
         tc,
         is_v3_supported_type,
         IcebergCompatVersion::V3.as_table_feature().as_ref(),

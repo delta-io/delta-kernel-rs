@@ -51,7 +51,7 @@ pub(crate) fn validate_iceberg_compat_if_needed(
 
 /// Walks `tc.logical_schema()` and errors on the first field whose data type
 /// fails `is_supported`. Reports the offending column path + type in the error.
-pub(super) fn has_only_supported_types(
+pub(super) fn check_only_supported_types(
     tc: &TableConfiguration,
     is_supported: fn(&DataType) -> bool,
     feature_label: &str,
@@ -83,6 +83,17 @@ impl TypeAllowlistVisitor {
             self.offender = Some(format!("{} ({})", self.path.join("."), dt));
         }
     }
+
+    /// Descend into a nested element type (array element, map key, or map value).
+    fn visit_nested(&mut self, seg: &str, ele_type: &DataType) {
+        if self.offender.is_some() {
+            return;
+        }
+        self.path.push(seg.to_string());
+        self.check(ele_type);
+        self.transform(ele_type);
+        self.path.pop();
+    }
 }
 
 impl<'a> SchemaTransform<'a> for TypeAllowlistVisitor {
@@ -99,33 +110,15 @@ impl<'a> SchemaTransform<'a> for TypeAllowlistVisitor {
     }
 
     fn transform_array_element(&mut self, etype: &'a DataType) {
-        if self.offender.is_some() {
-            return;
-        }
-        self.path.push("element".to_string());
-        self.check(etype);
-        self.transform(etype);
-        self.path.pop();
+        self.visit_nested("element", etype);
     }
 
     fn transform_map_key(&mut self, etype: &'a DataType) {
-        if self.offender.is_some() {
-            return;
-        }
-        self.path.push("key".to_string());
-        self.check(etype);
-        self.transform(etype);
-        self.path.pop();
+        self.visit_nested("key", etype);
     }
 
     fn transform_map_value(&mut self, etype: &'a DataType) {
-        if self.offender.is_some() {
-            return;
-        }
-        self.path.push("value".to_string());
-        self.check(etype);
-        self.transform(etype);
-        self.path.pop();
+        self.visit_nested("value", etype);
     }
 }
 
@@ -358,6 +351,27 @@ mod tests {
         ])
     }
 
+    /// `a: array<map<string, array<float>>>` followed by a sibling `b: array<float>`.
+    fn schema_deep_nesting_with_sibling() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::nullable(
+                "a",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+                        true,
+                    ))),
+                    true,
+                ))),
+            ),
+            StructField::nullable(
+                "b",
+                DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+            ),
+        ])
+    }
+
     #[rstest]
     #[case::accept_int_string(narrow_allowlist, simple_schema(), None)]
     #[case::reject_top_level_array(
@@ -389,6 +403,11 @@ mod tests {
         wide_allowlist,
         schema_float_long(),
         Some("a (long)".to_string()),
+    )]
+    #[case::reject_deep_then_short_circuits_sibling(
+        wide_allowlist,
+        schema_deep_nesting_with_sibling(),
+        Some("a.element.value.element (float)".to_string()),
     )]
     fn type_allowlist_visitor(
         #[case] is_supported: fn(&DataType) -> bool,
