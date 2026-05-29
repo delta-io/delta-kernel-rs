@@ -1281,7 +1281,7 @@ fn mixed_string_kernel_fields() -> [StructField; 3] {
 }
 
 /// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
-/// identity transform branch. The output schema is derived from actual column types, so
+/// empty patch branch. The output schema is derived from actual column types, so
 /// `LargeUtf8` and `Utf8View` columns remain valid even though the kernel type is `STRING`.
 #[test]
 fn test_evaluator_mixed_string_types_identity_transform() {
@@ -1291,7 +1291,9 @@ fn test_evaluator_mixed_string_types_identity_transform() {
     let output_type = KernelDataType::Struct(Box::new(StructType::new_unchecked(fields)));
 
     let handler = ArrowEvaluationHandler;
-    let expression: ExpressionRef = Arc::new(Expression::Transform(Transform::new_top_level()));
+    let expression: ExpressionRef = Arc::new(Expression::StructPatch(
+        ExpressionStructPatch::new_top_level(),
+    ));
     handler
         .new_expression_evaluator(input_schema, expression, output_type)
         .unwrap()

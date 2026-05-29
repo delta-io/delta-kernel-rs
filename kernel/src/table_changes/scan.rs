@@ -277,7 +277,7 @@ fn read_scan_file(
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
-        // Transform the physical data into the correct logical form, or pass through unchanged
+        // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
             eval.evaluate(batch.as_ref())
         } else {
