@@ -5,21 +5,49 @@
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.23.0...v0.24.0)
 
 
+### 🏗️ Breaking changes
+
+1. Reorganize `metrics` module for better cohesion ([#2604])
+   - `MetricEvent` variants are tuple variants wrapping a per-event struct (e.g.
+     `MetricEvent::ScanMetadataCompleted(ScanMetadataCompleted { .. })`). Callers matching on
+     `MetricEvent` must match the wrapped struct instead of inline named fields.
+2. Add CRC read metrics via tracing instrumentation ([#2540])
+   - Adds the `MetricEvent::CrcReadCompleted` event and a `has_latest_crc_file` field on
+     `LogSegmentLoaded`. Exhaustive matches on `MetricEvent` must handle the new variant.
+3. Add file size metrics for scans ([#2585])
+   - `ScanMetadataCompleted` gains an `active_add_files_bytes: u64` field (total size of add
+     files surviving log replay). Callers constructing or exhaustively matching it must account
+     for the new field.
+4. Re-add `nearest_timestamp` to `LogHistoryError` ([#2600])
+   - The `LogHistoryError::TimestampOutOfRange` variant gains a `nearest_timestamp` field.
+     Callers matching this variant with named fields must add `nearest_timestamp` (or `..`).
+5. Rename `Plan` enum to `Operation` ([#2635])
+   - Rename `Plan` to `Operation` at all call sites (exported from `delta_kernel::plans` under
+     the `declarative-plans` feature). Variant names are unchanged.
+6. Introduce `DomainMetadataState` typed enum ([#2567])
+   - The `Crc` field `domain_metadata: Option<HashMap<..>>` becomes
+     `domain_metadata_state: DomainMetadataState` (`Complete` / `Partial`). Affects consumers of
+     the `crc` module, which is public only under the `test-utils` feature.
+7. Introduce `SetTransactionState` typed enum ([#2570])
+   - The `Crc` field `set_transactions: Option<HashMap<..>>` becomes
+     `set_transaction_state: SetTransactionState` (`Complete` / `Partial`). Affects consumers of
+     the `crc` module, which is public only under the `test-utils` feature.
+8. Support `variantShredding` as a feature ([#2594])
+   - Kernel now supports the `variantShredding` table feature (previously only
+     `variantShredding-preview`). Tables enabling it are read and written instead of rejected as
+     an unsupported feature.
+
 ### 🚀 Features / new APIs
 
 1. *(ffi)* Expose transaction deletion vector updates ([#2495])
-2. Crc merics using tracing instrumentation ([#2540])
-3. Allow fields with same physical name and different physical path ([#2576])
-4. Enforce CRC ICT consistency on write ([#2584])
-5. Support creating Delta tables with empty schema ([#2545])
-6. Two tiny CRC refactors ([#2597])
-7. Block read and blind-append on empty-schema Delta tables ([#2546])
-8. Support variantShredding as a feature ([#2594])
-9. Introduce PlanExecutor trait + basic plan IR ([#2590])
-10. Add file size metrics for scans ([#2585])
-11. Reverse incremental CRC replay accumulator + visitor ([#2602])
-12. Introduce PlanBasedEngine and a SyncPlanExecutor ([#2621])
-13. Re-add nearest_timestamp to LogHistoryError ([#2600])
+2. Allow fields with same physical name and different physical path ([#2576])
+3. Enforce CRC ICT consistency on write ([#2584])
+4. Support creating Delta tables with empty schema ([#2545])
+5. Two tiny CRC refactors ([#2597])
+6. Block read and blind-append on empty-schema Delta tables ([#2546])
+7. Introduce PlanExecutor trait + basic plan IR ([#2590])
+8. Reverse incremental CRC replay accumulator + visitor ([#2602])
+9. Introduce PlanBasedEngine and a SyncPlanExecutor ([#2621])
 
 ### 🐛 Bug Fixes
 
@@ -35,17 +63,13 @@
 
 ### 🚜 Refactor
 
-1. Introduce DomainMetadataState typed enum ([#2567])
-2. Introduce SetTransactionState typed enum ([#2570])
-3. Move apply_schema out of arrow_expression ([#2580])
-4. Create stat field name constants ([#2586])
-5. Reshape CrcDelta, get it ready for incremental visitor and accumulator ([#2583])
-6. Crc test infra / setup ([#2616])
-7. Use DeltaResultIterator where possible ([#2622])
-8. Rename ScopedDeltaResultIterator ([#2632])
-9. Rename Plan enum to Operation ([#2635])
-10. Reorganize metrics module for better cohesion ([#2604])
-11. Add snapshot/incremental.rs; snapshot section headers ([#2647])
+1. Move apply_schema out of arrow_expression ([#2580])
+2. Create stat field name constants ([#2586])
+3. Reshape CrcDelta, get it ready for incremental visitor and accumulator ([#2583])
+4. CRC test infra / setup ([#2616])
+5. Use DeltaResultIterator where possible ([#2622])
+6. Rename ScopedDeltaResultIterator ([#2632])
+7. Add snapshot/incremental.rs; snapshot section headers ([#2647])
 
 ### 🧪 Testing
 
