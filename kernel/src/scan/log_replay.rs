@@ -1113,8 +1113,7 @@ mod tests {
             let mut field_patches = patch.field_patches.iter();
             let (field_name, field_patch) = field_patches.next().unwrap();
             assert_eq!(field_name, "value");
-            assert!(field_patch.replacement_expr.is_none());
-            assert!(!field_patch.is_drop);
+            assert!(field_patch.keep_input);
             let [expr] = &field_patch.insertions[..] else {
                 panic!("Expected a single insertion");
             };
@@ -1198,9 +1197,8 @@ mod tests {
                     .field_patches
                     .get("row_id_col")
                     .expect("Should have row_id_col patch");
-                assert!(row_id_patch.replacement_expr.is_some());
-                assert!(!row_id_patch.is_drop);
-                let expr = row_id_patch.replacement_expr.as_ref().unwrap();
+                assert!(!row_id_patch.keep_input);
+                let expr = &row_id_patch.insertions[0];
                 let expected_expr = Arc::new(Expr::coalesce([
                     Expr::column(["row_id_col"]),
                     Expr::binary(

@@ -1,6 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 };
 use crate::schema::SchemaRef;
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::{DataType, DeltaResult, DynPartialEq};
+use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
@@ -336,21 +336,30 @@ where
 
 /// A patch affecting a single input field.
 ///
-/// A field patch can insert zero or more expressions after its input field, replace the input field
-/// with one expression, or drop the input field.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// A field patch can keep or omit its input field, then insert zero or more expressions after the
+/// input field's output position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExpressionFieldPatch {
-    /// The expression this field patch emits at the input field's output position instead of the
-    /// original input field.
-    pub replacement_expr: Option<ExpressionRef>,
-    /// If true, and there is no replacement expression, the input field is omitted from the
-    /// output.
-    pub is_drop: bool,
-    /// Insertions provided by calls to [`ExpressionStructPatch::with_inserted_field_after`].
+    /// If true, the original input field is emitted before this patch's insertions. If false, the
+    /// input field is omitted and the first insertion, if present, occupies the input field's
+    /// output position.
+    pub keep_input: bool,
+    /// Insertions provided by calls to [`ExpressionStructPatch::with_inserted_field_after`], or by
+    /// builder lowering for replacement and nested patch operations.
     pub insertions: Vec<ExpressionRef>,
     /// If true, this patch is silently ignored when the input field does not exist. Otherwise, a
     /// missing input field produces an error.
     pub optional: bool,
+}
+
+impl Default for ExpressionFieldPatch {
+    fn default() -> Self {
+        Self {
+            keep_input: true,
+            insertions: Vec::new(),
+            optional: false,
+        }
+    }
 }
 
 /// A sparse expression patch over the fields of one input struct.
@@ -392,26 +401,26 @@ impl ExpressionStructPatch {
         }
     }
 
-    /// Specifies a field to drop. Any past or future field replacement overrides a drop request.
+    /// Specifies a field to drop.
     pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
         let field_patch = self.field_patch(name);
-        field_patch.is_drop = true;
+        field_patch.keep_input = false;
         self
     }
 
     /// Like [`Self::with_dropped_field`], but silently ignored if the field does not exist.
     pub fn with_dropped_field_if_exists(mut self, name: impl Into<String>) -> Self {
         let field_patch = self.field_patch(name);
-        field_patch.is_drop = true;
+        field_patch.keep_input = false;
         field_patch.optional = true;
         self
     }
 
-    /// Specifies an expression to replace a field with. This overrides any prior drop or replace
-    /// calls.
+    /// Specifies an expression to replace a field with.
     pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
         let field_patch = self.field_patch(name);
-        field_patch.replacement_expr = Some(expr);
+        field_patch.keep_input = false;
+        field_patch.insertions.insert(0, expr);
         self
     }
 
@@ -453,6 +462,402 @@ impl ExpressionStructPatch {
     // Gets or creates the field patch for a named input field.
     fn field_patch(&mut self, field_name: impl Into<String>) -> &mut ExpressionFieldPatch {
         self.field_patches.entry(field_name.into()).or_default()
+    }
+}
+
+/// Builds a raw [`ExpressionStructPatch`] from an ordered list of requested patch operations.
+///
+/// The builder records user intent, checks for conflicting destructive operations, and lowers
+/// nested field paths into recursive raw struct patches. The resulting raw patch only needs to
+/// describe whether each input field is kept and which expressions are emitted at that field's
+/// output position.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExpressionStructPatchBuilder {
+    input_path: Option<ColumnName>,
+    /// Recorded operations, each paired with the path of the (possibly nested) struct it targets.
+    /// An empty path targets this builder's input struct directly.
+    operations: Vec<(ColumnName, ExpressionStructPatchOperation)>,
+}
+
+/// A single operation local to the struct identified by its paired path. The target struct path is
+/// tracked separately (see [`ExpressionStructPatchBuilder::operations`]) so each operation only
+/// describes what to do, not where to find the struct to act on.
+#[derive(Debug, Clone, PartialEq)]
+enum ExpressionStructPatchOperation {
+    Prepend(ExpressionRef),
+    Append(ExpressionRef),
+    InsertAfter {
+        field_name: String,
+        expr: ExpressionRef,
+    },
+    InputFieldAction {
+        field_name: String,
+        action: InputFieldAction,
+    },
+}
+
+impl ExpressionStructPatchOperation {
+    // Convenience constructor for an input field action operation.
+    fn input_field_action(field_name: impl Into<String>, action: InputFieldAction) -> Self {
+        Self::InputFieldAction {
+            field_name: field_name.into(),
+            action,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct PatchNode {
+    prepended_fields: Vec<ExpressionRef>,
+    appended_fields: Vec<ExpressionRef>,
+    fields: HashMap<String, FieldPatchBuildState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct FieldPatchBuildState {
+    input_field_action: InputFieldAction,
+    insert_after: Vec<ExpressionRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+enum InputFieldAction {
+    #[default]
+    Keep,
+    Drop {
+        optional: bool,
+    },
+    Replace(ExpressionRef),
+    Patch(Box<PatchNode>),
+}
+
+impl InputFieldAction {
+    fn is_optional_drop(&self) -> bool {
+        matches!(self, InputFieldAction::Drop { optional: true })
+    }
+}
+
+impl ExpressionStructPatchBuilder {
+    /// Creates a new top-level patch builder.
+    pub fn new_top_level() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new builder that operates on fields of a nested struct identified by `path`.
+    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        Self {
+            input_path: Some(ColumnName::new(path)),
+            operations: Vec::new(),
+        }
+    }
+
+    /// Records a field drop.
+    pub fn with_dropped_field(self, field_name: impl Into<String>) -> Self {
+        self.with_dropped_field_at(ColumnName::default(), field_name)
+    }
+
+    /// Records a field drop in a nested struct.
+    pub fn with_dropped_field_at<A>(
+        self,
+        struct_path: impl IntoIterator<Item = A>,
+        field_name: impl Into<String>,
+    ) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.record(
+            struct_path,
+            ExpressionStructPatchOperation::input_field_action(
+                field_name,
+                InputFieldAction::Drop { optional: false },
+            ),
+        )
+    }
+
+    /// Records an optional field drop.
+    pub fn with_dropped_field_if_exists(self, field_name: impl Into<String>) -> Self {
+        self.with_dropped_field_if_exists_at(ColumnName::default(), field_name)
+    }
+
+    /// Records an optional field drop in a nested struct.
+    pub fn with_dropped_field_if_exists_at<A>(
+        self,
+        struct_path: impl IntoIterator<Item = A>,
+        field_name: impl Into<String>,
+    ) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.record(
+            struct_path,
+            ExpressionStructPatchOperation::input_field_action(
+                field_name,
+                InputFieldAction::Drop { optional: true },
+            ),
+        )
+    }
+
+    /// Records a field replacement.
+    pub fn with_replaced_field(self, field_name: impl Into<String>, expr: ExpressionRef) -> Self {
+        self.with_replaced_field_at(ColumnName::default(), field_name, expr)
+    }
+
+    /// Records a field replacement in a nested struct.
+    pub fn with_replaced_field_at<A>(
+        self,
+        struct_path: impl IntoIterator<Item = A>,
+        field_name: impl Into<String>,
+        expr: ExpressionRef,
+    ) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.record(
+            struct_path,
+            ExpressionStructPatchOperation::input_field_action(
+                field_name,
+                InputFieldAction::Replace(expr),
+            ),
+        )
+    }
+
+    /// Records an expression to emit before processing the first input field.
+    pub fn with_prepended_field(self, expr: ExpressionRef) -> Self {
+        self.with_prepended_field_at(ColumnName::default(), expr)
+    }
+
+    /// Records an expression to emit before processing the first input field of a nested struct.
+    pub fn with_prepended_field_at<A>(
+        self,
+        struct_path: impl IntoIterator<Item = A>,
+        expr: ExpressionRef,
+    ) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.record(struct_path, ExpressionStructPatchOperation::Prepend(expr))
+    }
+
+    /// Records an expression to insert after the field identified by `path`.
+    pub fn with_inserted_field_after(
+        self,
+        field_name: impl Into<String>,
+        expr: ExpressionRef,
+    ) -> Self {
+        self.with_inserted_field_after_at(ColumnName::default(), field_name, expr)
+    }
+
+    /// Records an expression to insert after the named field in a nested struct.
+    pub fn with_inserted_field_after_at<A>(
+        self,
+        struct_path: impl IntoIterator<Item = A>,
+        field_name: impl Into<String>,
+        expr: ExpressionRef,
+    ) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.record(
+            struct_path,
+            ExpressionStructPatchOperation::InsertAfter {
+                field_name: field_name.into(),
+                expr,
+            },
+        )
+    }
+
+    /// Records an expression to append after all input fields and field-specific insertions.
+    pub fn with_appended_field(self, expr: ExpressionRef) -> Self {
+        self.with_appended_field_at(ColumnName::default(), expr)
+    }
+
+    /// Records an expression to append after all fields of a nested struct.
+    pub fn with_appended_field_at<A>(
+        self,
+        struct_path: impl IntoIterator<Item = A>,
+        expr: ExpressionRef,
+    ) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.record(struct_path, ExpressionStructPatchOperation::Append(expr))
+    }
+
+    // Records an operation against the struct identified by `struct_path` (empty targets the input
+    // struct directly).
+    fn record<A>(
+        mut self,
+        struct_path: impl IntoIterator<Item = A>,
+        operation: ExpressionStructPatchOperation,
+    ) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.operations
+            .push((ColumnName::new(struct_path), operation));
+        self
+    }
+
+    /// Builds the raw patch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the builder contains multiple drop/replace requests for the same
+    /// field, or when a destructive operation on one field overlaps with an operation on a nested
+    /// child field.
+    pub fn build(self) -> DeltaResult<ExpressionStructPatch> {
+        let mut root = PatchNode::default();
+        for (struct_path, operation) in self.operations {
+            root.apply_operation(&struct_path, operation)?;
+        }
+        root.into_raw_patch(self.input_path)
+    }
+}
+
+impl PatchNode {
+    fn apply_operation(
+        &mut self,
+        struct_path: &ColumnName,
+        operation: ExpressionStructPatchOperation,
+    ) -> DeltaResult<()> {
+        let node = self.node_at_mut(struct_path)?;
+        match operation {
+            ExpressionStructPatchOperation::Prepend(expr) => {
+                node.prepended_fields.push(expr);
+            }
+            ExpressionStructPatchOperation::Append(expr) => {
+                node.appended_fields.push(expr);
+            }
+            ExpressionStructPatchOperation::InsertAfter { field_name, expr } => {
+                let entry = node.field_state_mut(field_name, |field_name, entry| {
+                    if entry.input_field_action.is_optional_drop() {
+                        return Err(Error::generic(format!(
+                            "Field '{field_name}' cannot combine optional drop with insert-after"
+                        )));
+                    }
+                    Ok(())
+                })?;
+                entry.insert_after.push(expr);
+            }
+            ExpressionStructPatchOperation::InputFieldAction { field_name, action } => {
+                let entry = node.field_state_mut(field_name, |field_name, entry| {
+                    if entry.input_field_action != InputFieldAction::Keep {
+                        return Err(Error::generic(format!(
+                            "Field '{field_name}' has multiple input field actions"
+                        )));
+                    }
+                    if action.is_optional_drop() && !entry.insert_after.is_empty() {
+                        return Err(Error::generic(format!(
+                            "Field '{field_name}' cannot combine optional drop with insert-after"
+                        )));
+                    }
+                    Ok(())
+                })?;
+                entry.input_field_action = action;
+            }
+        }
+        Ok(())
+    }
+
+    fn node_at_mut(&mut self, path: &[String]) -> DeltaResult<&mut Self> {
+        let Some((field_name, remaining)) = path.split_first() else {
+            return Ok(self);
+        };
+        // NOTE: No need to validate existing entries, `patch_node_mut` handles it.
+        self.fields
+            .entry(field_name.to_string())
+            .or_default()
+            .patch_node_mut(field_name)?
+            .node_at_mut(remaining)
+    }
+
+    /// Fetches mutable state for the requested field.
+    /// * If not yet present, create and return a new defaulted entry
+    /// * If already existing, invoke the validator on it and return the entry on success
+    fn field_state_mut(
+        &mut self,
+        field_name: String,
+        validate_existing: impl FnOnce(&str, &FieldPatchBuildState) -> DeltaResult<()>,
+    ) -> DeltaResult<&mut FieldPatchBuildState> {
+        match self.fields.entry(field_name) {
+            hash_map::Entry::Vacant(entry) => Ok(entry.insert(FieldPatchBuildState::default())),
+            hash_map::Entry::Occupied(entry) => {
+                validate_existing(entry.key(), entry.get())?;
+                Ok(entry.into_mut())
+            }
+        }
+    }
+
+    fn into_raw_patch(self, input_path: Option<ColumnName>) -> DeltaResult<ExpressionStructPatch> {
+        let fields = self.fields.into_iter();
+        let field_patches = fields.map(|(field_name, state)| -> DeltaResult<_> {
+            let patch = state.into_raw_field_patch(input_path.as_ref(), &field_name)?;
+            Ok((field_name, patch))
+        });
+
+        Ok(ExpressionStructPatch {
+            field_patches: field_patches.try_collect()?,
+            prepended_fields: self.prepended_fields,
+            appended_fields: self.appended_fields,
+            input_path,
+        })
+    }
+}
+
+impl FieldPatchBuildState {
+    /// Every ancestor field of a field we want to patch must have a Patch field action. We can
+    /// convert from Keep (no-op or insert-after) to Patch, but not Drop or Replace.
+    fn patch_node_mut(&mut self, field_name: &str) -> DeltaResult<&mut PatchNode> {
+        if self.input_field_action == InputFieldAction::Keep {
+            self.input_field_action = InputFieldAction::Patch(Box::default());
+        }
+        let InputFieldAction::Patch(node) = &mut self.input_field_action else {
+            return Err(Error::generic(format!(
+                "Cannot patch nested fields under dropped/replaced field '{field_name}'"
+            )));
+        };
+        Ok(node)
+    }
+
+    fn into_raw_field_patch(
+        self,
+        parent_input_path: Option<&ColumnName>,
+        field_name: &str,
+    ) -> DeltaResult<ExpressionFieldPatch> {
+        let mut insertions = self.insert_after;
+        let (keep_input, optional) = match self.input_field_action {
+            InputFieldAction::Keep => {
+                if insertions.is_empty() {
+                    return Err(Error::generic(format!(
+                        "Internal error: builder produced a no-op patch for field '{field_name}'"
+                    )));
+                }
+                (true, false)
+            }
+            InputFieldAction::Drop { optional } => (false, optional),
+            InputFieldAction::Replace(expr) => {
+                insertions.insert(0, expr);
+                (false, false)
+            }
+            InputFieldAction::Patch(node) => {
+                let field_name = ColumnName::new([field_name]);
+                let child_input_path = match parent_input_path {
+                    Some(parent) => parent.join(&field_name),
+                    None => field_name,
+                };
+                let child_patch = node.into_raw_patch(Some(child_input_path))?;
+                insertions.insert(0, Arc::new(Expression::StructPatch(child_patch)));
+                (false, false)
+            }
+        };
+
+        Ok(ExpressionFieldPatch {
+            keep_input,
+            insertions,
+            optional,
+        })
     }
 }
 
@@ -1060,16 +1465,18 @@ impl Display for Expression {
                     sep = ", ";
                 }
                 for (field_name, field_patch) in &patch.field_patches {
-                    if let Some(replacement_expr) = &field_patch.replacement_expr {
-                        write!(f, "{sep}replace {field_name} with [{replacement_expr}]")?;
-                        sep = ", ";
-                    } else if field_patch.is_drop {
+                    if !field_patch.keep_input && field_patch.insertions.is_empty() {
                         write!(f, "{sep}drop {field_name}")?;
                         sep = ", ";
                     }
                     if !field_patch.insertions.is_empty() {
                         let insertions = format_child_list(&field_patch.insertions);
-                        write!(f, "{sep}after {field_name} insert [{insertions}]")?;
+                        let action = if field_patch.keep_input {
+                            "after"
+                        } else {
+                            "replace/after"
+                        };
+                        write!(f, "{sep}{action} {field_name} insert [{insertions}]")?;
                         sep = ", ";
                     }
                 }
@@ -1202,11 +1609,15 @@ impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
+    use std::sync::Arc;
 
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+    use super::{
+        column_expr, column_pred, Expression as Expr, ExpressionStructPatchBuilder,
+        Predicate as Pred,
+    };
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1276,6 +1687,64 @@ mod tests {
             let result = format!("{pred}");
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn struct_patch_builder_lowers_nested_paths_to_raw_patches() {
+        let patch = ExpressionStructPatchBuilder::new_top_level()
+            .with_dropped_field_at(["add"], "gone")
+            .with_replaced_field_at(["add"], "stub", Arc::new(Expr::literal("replaced")))
+            .with_inserted_field_after_at(["add"], "x", Arc::new(Expr::literal(true)))
+            .with_inserted_field_after("add", Arc::new(Expr::literal("after_add")))
+            .build()
+            .unwrap();
+
+        let add_patch = patch.field_patches.get("add").unwrap();
+        assert!(!add_patch.keep_input);
+        assert_eq!(add_patch.insertions.len(), 2);
+
+        let Expr::StructPatch(inner) = add_patch.insertions[0].as_ref() else {
+            panic!("Expected nested struct patch");
+        };
+        assert_eq!(
+            inner.input_path.as_ref().map(|p| p.to_string()).as_deref(),
+            Some("add")
+        );
+
+        let gone = inner.field_patches.get("gone").unwrap();
+        assert!(!gone.keep_input);
+        assert!(gone.insertions.is_empty());
+
+        let stub = inner.field_patches.get("stub").unwrap();
+        assert!(!stub.keep_input);
+        assert_eq!(stub.insertions, vec![Arc::new(Expr::literal("replaced"))]);
+
+        let x = inner.field_patches.get("x").unwrap();
+        assert!(x.keep_input);
+        assert_eq!(x.insertions, vec![Arc::new(Expr::literal(true))]);
+
+        assert_eq!(
+            add_patch.insertions[1],
+            Arc::new(Expr::literal("after_add"))
+        );
+    }
+
+    #[test]
+    fn struct_patch_builder_rejects_destructive_overlaps() {
+        let result = ExpressionStructPatchBuilder::new_top_level()
+            .with_dropped_field("add")
+            .with_inserted_field_after_at(["add"], "x", Arc::new(Expr::literal(true)))
+            .build();
+        assert!(result.unwrap_err().to_string().contains("nested fields"));
+
+        let result = ExpressionStructPatchBuilder::new_top_level()
+            .with_replaced_field_at(["add"], "x", Arc::new(Expr::literal("one")))
+            .with_dropped_field_at(["add"], "x")
+            .build();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("multiple input field actions"));
     }
 
     // ==================== Serde Roundtrip Tests ====================

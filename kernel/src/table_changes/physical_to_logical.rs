@@ -228,8 +228,7 @@ mod tests {
         // Should have a patch for the "id" field with CDF metadata
         assert!(patch.field_patches.contains_key("id"));
         let id_patch = &patch.field_patches["id"];
-        assert!(id_patch.replacement_expr.is_none());
-        assert!(!id_patch.is_drop);
+        assert!(id_patch.keep_input);
         assert_eq!(id_patch.insertions.len(), 2);
 
         // Verify _change_type is "insert" for Add files

@@ -515,7 +515,7 @@ impl CheckpointWriter {
             &schema_context.stats_config,
             &schema_context.stats_schema,
             schema_context.partition_schema.as_ref(),
-        );
+        )?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             read_schema,
             transform_expr,

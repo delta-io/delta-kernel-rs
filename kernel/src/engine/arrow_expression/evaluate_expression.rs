@@ -195,16 +195,13 @@ fn evaluate_struct_patch_expression(
     for input_field in source_data.schema_fields() {
         let field_name: &str = input_field.name();
 
-        // Any field that isn't replaced or dropped passes through unchanged
         let field_patch = patch.field_patches.get(field_name);
-        if let Some(expr) = field_patch.and_then(|patch| patch.replacement_expr.as_ref()) {
-            output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
-        } else if !field_patch.is_some_and(|patch| patch.is_drop) {
+        if field_patch.is_none_or(|patch| patch.keep_input) {
             output_cols.push(extract_column(source_data, &[field_name])?);
             let _ = next_output_type()?; // consume and discard the output schema field
         }
 
-        // Process any insertions that come after this field
+        // Process any insertions that come at or after this field's output position.
         if let Some(field_patch) = field_patch {
             for expr in &field_patch.insertions {
                 output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
@@ -1317,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replacement_takes_precedence_over_drop_and_older_replacements() {
+    fn test_raw_replacement_occupies_field_position() {
         let batch = create_test_batch();
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
@@ -1342,8 +1339,7 @@ mod tests {
 
         let patch = ExpressionStructPatch::new_top_level()
             .with_dropped_field("a")
-            .with_replaced_field("a", Expr::literal(1).into())
-            .with_replaced_field("a", Expr::literal(2).into());
+            .with_replaced_field("a", Expr::literal(1).into());
         let expr = Expr::StructPatch(patch);
         let result = evaluate_expression(
             &expr,
@@ -1352,7 +1348,7 @@ mod tests {
         )
         .unwrap();
         let result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        validate_i32_column(result, 0, &[2, 2, 2]);
+        validate_i32_column(result, 0, &[1, 1, 1]);
         validate_i32_column(result, 1, &[10, 20, 30]);
         validate_i32_column(result, 2, &[100, 200, 300]);
     }
