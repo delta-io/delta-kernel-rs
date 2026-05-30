@@ -42,6 +42,18 @@ pub mod error;
 /// All timestamp values should be specified in milliseconds, not seconds or nanoseconds.
 pub type Timestamp = i64;
 
+/// A commit located by a timestamp query: its [`Version`] paired with the commit's timestamp
+#[derive(Debug, PartialEq, Eq)]
+pub struct Commit {
+    /// The commit version.
+    pub version: Version,
+    /// Timestamp (milliseconds since the Unix epoch) associated with this commit.
+    ///
+    /// This is the commit's in-commit timestamp (ICT) when ICT is enabled, otherwise the
+    /// *monotonized* file modification time (which may exceed the raw time under clock skew).
+    pub timestamp: Timestamp,
+}
+
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 #[derive(Debug, PartialEq, Eq)]
 enum TimestampSearchBounds {
@@ -57,6 +69,7 @@ enum TimestampSearchBounds {
         index: usize,
         /// The version at which ICT was enabled.
         ict_enablement_version: Version,
+        ict_enablement_timestamp: Timestamp,
     },
 }
 
@@ -149,6 +162,7 @@ fn get_timestamp_search_bounds(
         Ordering::Less => TimestampSearchBounds::FileModificationSearchUntil {
             index: ict_enablement_idx,
             ict_enablement_version,
+            ict_enablement_timestamp: ict_timestamp,
         },
         // Greater: Restrict search to ICT commits only via ICTSearchStartingFrom.
         Ordering::Greater => TimestampSearchBounds::ICTSearchStartingFrom(ict_enablement_idx),
@@ -169,7 +183,8 @@ fn get_timestamp_search_bounds(
 /// * `bound` - The type of bound to find (GreatestLower or LeastUpper)
 ///
 /// # Returns
-/// The version matching the bound criteria, or an error if no match exists.
+/// The [`Commit`] matching the bound criteria, whose `timestamp` is the monotonized file
+/// modification time, or an error if no match exists.
 //
 // NOTE: Monotonization trade-offs
 //
@@ -187,7 +202,7 @@ fn linear_search_file_mod_timestamps(
     commits: &[ParsedLogPath],
     timestamp: Timestamp,
     bound: Bound,
-) -> Result<Version, LogHistoryError> {
+) -> Result<Commit, LogHistoryError> {
     if commits.is_empty() {
         return Err(LogHistoryError::out_of_range(
             timestamp,
@@ -200,7 +215,7 @@ fn linear_search_file_mod_timestamps(
     let hi_version = commits[commits.len() - 1].version;
     info!(lo_version, hi_version, "File modification linear search");
 
-    let mut result: Option<Version> = None;
+    let mut result: Option<Commit> = None;
     let mut prev_monotonic_ts = i64::MIN;
 
     for commit in commits {
@@ -218,10 +233,20 @@ fn linear_search_file_mod_timestamps(
 
         match bound {
             // GreatestLower: update result until we surpass `timestamp`
-            Bound::GreatestLower if monotonic_ts <= timestamp => result = Some(commit.version),
+            Bound::GreatestLower if monotonic_ts <= timestamp => {
+                result = Some(Commit {
+                    version: commit.version,
+                    timestamp: monotonic_ts,
+                })
+            }
             Bound::GreatestLower => break,
             // LeastUpper: return version upon first match
-            Bound::LeastUpper if monotonic_ts >= timestamp => return Ok(commit.version),
+            Bound::LeastUpper if monotonic_ts >= timestamp => {
+                return Ok(Commit {
+                    version: commit.version,
+                    timestamp: monotonic_ts,
+                })
+            }
             Bound::LeastUpper => {}
         }
 
@@ -255,7 +280,7 @@ fn binary_search_ict_timestamps(
     timestamp: Timestamp,
     bound: Bound,
     engine: &dyn Engine,
-) -> Result<Version, LogHistoryError> {
+) -> Result<Commit, LogHistoryError> {
     if commits.is_empty() {
         return Err(LogHistoryError::out_of_range(
             timestamp,
@@ -278,7 +303,11 @@ fn binary_search_ict_timestamps(
     };
 
     match binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound) {
-        Ok(idx) => Ok(commits[idx].version),
+        Ok(idx) => {
+            let version = commits[idx].version;
+            let timestamp = commit_to_ict(&commits[idx])?;
+            Ok(Commit { version, timestamp })
+        }
         Err(SearchError::KeyFunctionError(error)) => Err(error),
         Err(SearchError::OutOfRange) => {
             // OutOfRange under `GreatestLower` means timestamp < commits[0]'s
@@ -306,14 +335,14 @@ fn binary_search_ict_timestamps(
     }
 }
 
-/// Converts a timestamp to a version based on the specified bound type.
+/// Converts a timestamp to a [`Commit`] based on the specified bound type.
 ///
-/// This function finds the appropriate commit version that corresponds to the given timestamp
+/// This function finds the appropriate commit that corresponds to the given timestamp
 /// according to the bound parameter:
 ///
-/// - `Bound::GreatestLower`: Returns the version with the greatest timestamp that is less than or
+/// - `Bound::GreatestLower`: Returns the commit with the greatest timestamp that is less than or
 ///   equal to the given timestamp (the version immediately before or at the timestamp).
-/// - `Bound::LeastUpper`: Returns the version with the smallest timestamp that is greater than or
+/// - `Bound::LeastUpper`: Returns the commit with the smallest timestamp that is greater than or
 ///   equal to the given timestamp (the version immediately at or after the timestamp).
 ///
 /// # Visual Example:
@@ -341,7 +370,7 @@ pub(crate) fn timestamp_to_version(
     engine: &dyn Engine,
     timestamp: Timestamp,
     bound: Bound,
-) -> Result<Version, LogHistoryError> {
+) -> Result<Commit, LogHistoryError> {
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
     let snap_ts = snapshot
@@ -349,9 +378,19 @@ pub(crate) fn timestamp_to_version(
         .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
     match (timestamp.cmp(&snap_ts), bound) {
         // Exact match: snapshot version satisfies both bounds
-        (Ordering::Equal, _) => return Ok(snapshot.version()),
+        (Ordering::Equal, _) => {
+            return Ok(Commit {
+                version: snapshot.version(),
+                timestamp: snap_ts,
+            })
+        }
         // Timestamp after snapshot: for GreatestLower, snapshot is the answer
-        (Ordering::Greater, Bound::GreatestLower) => return Ok(snapshot.version()),
+        (Ordering::Greater, Bound::GreatestLower) => {
+            return Ok(Commit {
+                version: snapshot.version(),
+                timestamp: snap_ts,
+            })
+        }
         // Timestamp after snapshot: for LeastUpper, no version exists
         (Ordering::Greater, Bound::LeastUpper) => {
             return Err(LogHistoryError::out_of_range(
@@ -405,7 +444,7 @@ pub(crate) fn timestamp_to_version(
     let search_bounds = get_timestamp_search_bounds(snapshot, &log_segment, timestamp)?;
 
     match search_bounds {
-        TimestampSearchBounds::ExactMatch(version) => Ok(version),
+        TimestampSearchBounds::ExactMatch(version) => Ok(Commit { version, timestamp }),
         TimestampSearchBounds::ICTSearchStartingFrom(lo) => {
             binary_search_ict_timestamps(&commits[lo..], timestamp, bound, engine)
         }
@@ -415,13 +454,17 @@ pub(crate) fn timestamp_to_version(
         TimestampSearchBounds::FileModificationSearchUntil {
             index,
             ict_enablement_version,
+            ict_enablement_timestamp,
         } => {
             linear_search_file_mod_timestamps(&commits[..index], timestamp, bound).or_else(|e| {
                 // For LeastUpper, if no version found in pre-ICT region, the ICT enablement
                 // version is the answer (protocol guarantees enablementTs > prev_mod_time)
                 match (&e, bound) {
                     (LogHistoryError::TimestampOutOfRange { .. }, Bound::LeastUpper) => {
-                        Ok(ict_enablement_version)
+                        Ok(Commit {
+                            version: ict_enablement_version,
+                            timestamp: ict_enablement_timestamp,
+                        })
                     }
                     _ => Err(e),
                 }
@@ -430,7 +473,7 @@ pub(crate) fn timestamp_to_version(
     }
 }
 
-/// Gets the latest version with a timestamp at or before `timestamp`.
+/// Gets the latest [`Commit`] (version and timestamp) with a timestamp at or before `timestamp`.
 ///
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or before
 /// the given timestamp.
@@ -444,20 +487,20 @@ pub(crate) fn timestamp_to_version(
 /// let engine = DefaultEngine::try_new(...)?;
 /// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
 ///
-/// // Get the latest version as of January 1, 2023
+/// // Get the latest commit as of January 1, 2023
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
-/// let version = latest_version_as_of(&snapshot, &engine, timestamp)?;
+/// let commit = latest_version_as_of(&snapshot, &engine, timestamp)?;
 /// ```
 #[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
-) -> DeltaResult<Version> {
+) -> DeltaResult<Commit> {
     timestamp_to_version(snapshot, engine, timestamp, Bound::GreatestLower).map_err(Into::into)
 }
 
-/// Gets the first version with a timestamp at or after `timestamp`.
+/// Gets the first [`Commit`] (version and timestamp) with a timestamp at or after `timestamp`.
 ///
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or after
 /// the given timestamp.
@@ -471,16 +514,16 @@ pub fn latest_version_as_of(
 /// let engine = DefaultEngine::try_new(...)?;
 /// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
 ///
-/// // Find the first version that occurred at or after January 1, 2023
+/// // Find the first commit that occurred at or after January 1, 2023
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
-/// let version = first_version_after(&snapshot, &engine, timestamp)?;
+/// let commit = first_version_after(&snapshot, &engine, timestamp)?;
 /// ```
 #[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
-) -> DeltaResult<Version> {
+) -> DeltaResult<Commit> {
     timestamp_to_version(snapshot, engine, timestamp, Bound::LeastUpper).map_err(Into::into)
 }
 
@@ -552,12 +595,12 @@ pub fn timestamp_range_to_versions(
     // helper (e.g., timestamp_to_version_in_segment) to cut listing time in half.
 
     // Convert the start timestamp to version
-    let start_version = first_version_after(snapshot, engine, start_timestamp)?;
+    let start_version = first_version_after(snapshot, engine, start_timestamp)?.version;
 
     // If the end timestamp is present, convert it to an end version
     let end_version = end_timestamp
         .map(|end| {
-            let end_version = latest_version_as_of(snapshot, engine, end)?;
+            let end_version = latest_version_as_of(snapshot, engine, end)?.version;
 
             // Verify that the start version is no greater than the end version. This can
             // happen in the case that the entire timestamp range falls between two commits.
@@ -763,9 +806,9 @@ mod tests {
 
     // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT enabled at v3)
     #[rstest::rstest]
-    #[case::file_mod_region(50, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3 })]
-    #[case::file_mod_between(60, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3 })]
-    #[case::file_mod_last(299, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3 })]
+    #[case::file_mod_region(50, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3, ict_enablement_timestamp: 300 })]
+    #[case::file_mod_between(60, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3, ict_enablement_timestamp: 300 })]
+    #[case::file_mod_last(299, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3, ict_enablement_timestamp: 300 })]
     #[case::exact_enablement(300, TimestampSearchBounds::ExactMatch(3))]
     #[case::ict_after_enablement(301, TimestampSearchBounds::ICTSearchStartingFrom(3))]
     #[case::ict_far_future(1000, TimestampSearchBounds::ICTSearchStartingFrom(3))]
@@ -903,32 +946,32 @@ mod tests {
 
     // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
     #[rstest::rstest]
-    #[case::before_all_lub(0, Bound::LeastUpper, Some(0))]
+    #[case::before_all_lub(0, Bound::LeastUpper, Some(Commit { version: 0, timestamp: 50 }))]
     #[case::before_all_glb(0, Bound::GreatestLower, None)]
-    #[case::negative_lub(-1, Bound::LeastUpper, Some(0))]
+    #[case::negative_lub(-1, Bound::LeastUpper, Some(Commit { version: 0, timestamp: 50 }))]
     #[case::after_all_lub(1000, Bound::LeastUpper, None)]
-    #[case::after_all_glb(1000, Bound::GreatestLower, Some(4))]
-    #[case::exact_v0_lub(50, Bound::LeastUpper, Some(0))]
-    #[case::exact_v0_glb(50, Bound::GreatestLower, Some(0))]
-    #[case::exact_v1_lub(150, Bound::LeastUpper, Some(1))]
-    #[case::exact_v1_glb(150, Bound::GreatestLower, Some(1))]
-    #[case::exact_v3_ict_lub(300, Bound::LeastUpper, Some(3))]
-    #[case::exact_v3_ict_glb(300, Bound::GreatestLower, Some(3))]
-    #[case::between_v0_v1_lub(100, Bound::LeastUpper, Some(1))]
-    #[case::between_v0_v1_glb(100, Bound::GreatestLower, Some(0))]
-    #[case::just_after_last_file_mod_lub(251, Bound::LeastUpper, Some(3))]
-    #[case::just_after_last_file_mod_glb(251, Bound::GreatestLower, Some(2))]
-    #[case::just_before_ict_lub(299, Bound::LeastUpper, Some(3))]
-    #[case::just_before_ict_glb(299, Bound::GreatestLower, Some(2))]
-    #[case::just_after_ict_glb(301, Bound::GreatestLower, Some(3))]
-    #[case::just_after_ict_lub(301, Bound::LeastUpper, Some(4))]
-    #[case::between_ict_commits(350, Bound::GreatestLower, Some(3))]
-    #[case::between_ict_commits_lub(350, Bound::LeastUpper, Some(4))]
+    #[case::after_all_glb(1000, Bound::GreatestLower, Some(Commit { version: 4, timestamp: 400 }))]
+    #[case::exact_v0_lub(50, Bound::LeastUpper, Some(Commit { version: 0, timestamp: 50 }))]
+    #[case::exact_v0_glb(50, Bound::GreatestLower, Some(Commit { version: 0, timestamp: 50 }))]
+    #[case::exact_v1_lub(150, Bound::LeastUpper, Some(Commit { version: 1, timestamp: 150 }))]
+    #[case::exact_v1_glb(150, Bound::GreatestLower, Some(Commit { version: 1, timestamp: 150 }))]
+    #[case::exact_v3_ict_lub(300, Bound::LeastUpper, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::exact_v3_ict_glb(300, Bound::GreatestLower, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::between_v0_v1_lub(100, Bound::LeastUpper, Some(Commit { version: 1, timestamp: 150 }))]
+    #[case::between_v0_v1_glb(100, Bound::GreatestLower, Some(Commit { version: 0, timestamp: 50 }))]
+    #[case::just_after_last_file_mod_lub(251, Bound::LeastUpper, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::just_after_last_file_mod_glb(251, Bound::GreatestLower, Some(Commit { version: 2, timestamp: 250 }))]
+    #[case::just_before_ict_lub(299, Bound::LeastUpper, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::just_before_ict_glb(299, Bound::GreatestLower, Some(Commit { version: 2, timestamp: 250 }))]
+    #[case::just_after_ict_glb(301, Bound::GreatestLower, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::just_after_ict_lub(301, Bound::LeastUpper, Some(Commit { version: 4, timestamp: 400 }))]
+    #[case::between_ict_commits(350, Bound::GreatestLower, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::between_ict_commits_lub(350, Bound::LeastUpper, Some(Commit { version: 4, timestamp: 400 }))]
     #[tokio::test]
     async fn test_timestamp_to_version_standard_table(
         #[case] timestamp: Timestamp,
         #[case] bound: Bound,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let timestamps = [
             (50, None),
@@ -942,7 +985,7 @@ mod tests {
 
         let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
                 matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
                 "{res:?}"
@@ -952,19 +995,19 @@ mod tests {
 
     // Table: v0=100, v1=200, v2=300 (ICT from creation)
     #[rstest::rstest]
-    #[case::exact_v0_glb(100, Bound::GreatestLower, Some(0))]
-    #[case::exact_v0_lub(100, Bound::LeastUpper, Some(0))]
-    #[case::between_v0_v1_glb(150, Bound::GreatestLower, Some(0))]
-    #[case::between_v0_v1_lub(150, Bound::LeastUpper, Some(1))]
-    #[case::between_v1_v2_glb(250, Bound::GreatestLower, Some(1))]
-    #[case::between_v1_v2_lub(250, Bound::LeastUpper, Some(2))]
+    #[case::exact_v0_glb(100, Bound::GreatestLower, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::exact_v0_lub(100, Bound::LeastUpper, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::between_v0_v1_glb(150, Bound::GreatestLower, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::between_v0_v1_lub(150, Bound::LeastUpper, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::between_v1_v2_glb(250, Bound::GreatestLower, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::between_v1_v2_lub(250, Bound::LeastUpper, Some(Commit { version: 2, timestamp: 300 }))]
     #[case::before_all_glb(50, Bound::GreatestLower, None)]
-    #[case::before_all_lub(50, Bound::LeastUpper, Some(0))]
+    #[case::before_all_lub(50, Bound::LeastUpper, Some(Commit { version: 0, timestamp: 100 }))]
     #[tokio::test]
     async fn test_ict_from_creation(
         #[case] timestamp: Timestamp,
         #[case] bound: Bound,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let mock_table =
             mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))
@@ -975,7 +1018,7 @@ mod tests {
 
         let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
                 matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
                 "{res:?}"
@@ -985,17 +1028,17 @@ mod tests {
 
     /// Single commit table: v0=100 (file mod only)
     #[rstest::rstest]
-    #[case::exact_glb(100, Bound::GreatestLower, Some(0))]
-    #[case::exact_lub(100, Bound::LeastUpper, Some(0))]
+    #[case::exact_glb(100, Bound::GreatestLower, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::exact_lub(100, Bound::LeastUpper, Some(Commit { version: 0, timestamp: 100 }))]
     #[case::before_glb(50, Bound::GreatestLower, None)]
-    #[case::before_lub(50, Bound::LeastUpper, Some(0))]
-    #[case::after_glb(150, Bound::GreatestLower, Some(0))]
+    #[case::before_lub(50, Bound::LeastUpper, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::after_glb(150, Bound::GreatestLower, Some(Commit { version: 0, timestamp: 100 }))]
     #[case::after_lub(150, Bound::LeastUpper, None)]
     #[tokio::test]
     async fn test_single_commit(
         #[case] timestamp: Timestamp,
         #[case] bound: Bound,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let mock_table = mock_table_with_timestamps(&[(100, None)], None).await;
         let engine = SyncEngine::new();
@@ -1004,7 +1047,7 @@ mod tests {
 
         let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
                 matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
                 "{res:?}"
@@ -1016,20 +1059,20 @@ mod tests {
     /// Raw: v0=100, v1=200, v2=150, v3=180, v4=300
     /// Monotonized: v0=100, v1=200, v2=201, v3=202, v4=300
     #[rstest::rstest]
-    #[case::exact_v0_glb(100, Bound::GreatestLower, Some(0))]
-    #[case::exact_v1_glb(200, Bound::GreatestLower, Some(1))]
-    #[case::monotonized_v2_glb(201, Bound::GreatestLower, Some(2))]
-    #[case::monotonized_v3_glb(202, Bound::GreatestLower, Some(3))]
-    #[case::between_v3_v4_glb(250, Bound::GreatestLower, Some(3))]
-    #[case::exact_v4_glb(300, Bound::GreatestLower, Some(4))]
-    #[case::raw_v2_maps_to_v1_lub(150, Bound::LeastUpper, Some(1))]
-    #[case::monotonized_v2_lub(201, Bound::LeastUpper, Some(2))]
-    #[case::after_v3_monotonized_lub(203, Bound::LeastUpper, Some(4))]
+    #[case::exact_v0_glb(100, Bound::GreatestLower, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::exact_v1_glb(200, Bound::GreatestLower, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::monotonized_v2_glb(201, Bound::GreatestLower, Some(Commit { version: 2, timestamp: 201 }))]
+    #[case::monotonized_v3_glb(202, Bound::GreatestLower, Some(Commit { version: 3, timestamp: 202 }))]
+    #[case::between_v3_v4_glb(250, Bound::GreatestLower, Some(Commit { version: 3, timestamp: 202 }))]
+    #[case::exact_v4_glb(300, Bound::GreatestLower, Some(Commit { version: 4, timestamp: 300 }))]
+    #[case::raw_v2_maps_to_v1_lub(150, Bound::LeastUpper, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::monotonized_v2_lub(201, Bound::LeastUpper, Some(Commit { version: 2, timestamp: 201 }))]
+    #[case::after_v3_monotonized_lub(203, Bound::LeastUpper, Some(Commit { version: 4, timestamp: 300 }))]
     #[tokio::test]
     async fn test_non_monotonic_timestamps(
         #[case] timestamp: Timestamp,
         #[case] bound: Bound,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let mock_table = mock_table_with_timestamps(
             &[
@@ -1048,7 +1091,7 @@ mod tests {
 
         let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
                 matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
                 "{res:?}"
@@ -1142,19 +1185,19 @@ mod tests {
     // Matches test_timestamp_to_version_standard_table cases for GreatestLower bound
     #[rstest::rstest]
     #[case::before_all(0, None)]
-    #[case::exact_v0(50, Some(0))]
-    #[case::between_v0_v1(100, Some(0))]
-    #[case::exact_v1(150, Some(1))]
-    #[case::just_after_last_file_mod(251, Some(2))]
-    #[case::just_before_ict(299, Some(2))]
-    #[case::exact_ict_enablement(300, Some(3))]
-    #[case::just_after_ict(301, Some(3))]
-    #[case::between_ict_commits(350, Some(3))]
-    #[case::after_all(1000, Some(4))]
+    #[case::exact_v0(50, Some(Commit { version: 0, timestamp: 50 }))]
+    #[case::between_v0_v1(100, Some(Commit { version: 0, timestamp: 50 }))]
+    #[case::exact_v1(150, Some(Commit { version: 1, timestamp: 150 }))]
+    #[case::just_after_last_file_mod(251, Some(Commit { version: 2, timestamp: 250 }))]
+    #[case::just_before_ict(299, Some(Commit { version: 2, timestamp: 250 }))]
+    #[case::exact_ict_enablement(300, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::just_after_ict(301, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::between_ict_commits(350, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::after_all(1000, Some(Commit { version: 4, timestamp: 400 }))]
     #[tokio::test]
     async fn test_latest_version_as_of(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let timestamps = [
             (50, None),
@@ -1170,7 +1213,7 @@ mod tests {
 
         let res = latest_version_as_of(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
@@ -1178,20 +1221,20 @@ mod tests {
     // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
     // Matches test_timestamp_to_version_standard_table cases for LeastUpper bound
     #[rstest::rstest]
-    #[case::before_all(0, Some(0))]
-    #[case::exact_v0(50, Some(0))]
-    #[case::between_v0_v1(100, Some(1))]
-    #[case::exact_v1(150, Some(1))]
-    #[case::just_after_last_file_mod(251, Some(3))]
-    #[case::just_before_ict(299, Some(3))]
-    #[case::exact_ict_enablement(300, Some(3))]
-    #[case::just_after_ict(301, Some(4))]
-    #[case::between_ict_commits(350, Some(4))]
+    #[case::before_all(0, Some(Commit { version: 0, timestamp: 50 }))]
+    #[case::exact_v0(50, Some(Commit { version: 0, timestamp: 50 }))]
+    #[case::between_v0_v1(100, Some(Commit { version: 1, timestamp: 150 }))]
+    #[case::exact_v1(150, Some(Commit { version: 1, timestamp: 150 }))]
+    #[case::just_after_last_file_mod(251, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::just_before_ict(299, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::exact_ict_enablement(300, Some(Commit { version: 3, timestamp: 300 }))]
+    #[case::just_after_ict(301, Some(Commit { version: 4, timestamp: 400 }))]
+    #[case::between_ict_commits(350, Some(Commit { version: 4, timestamp: 400 }))]
     #[case::after_all(1000, None)]
     #[tokio::test]
     async fn test_first_version_after(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let timestamps = [
             (50, None),
@@ -1207,7 +1250,7 @@ mod tests {
 
         let res = first_version_after(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
@@ -1314,14 +1357,14 @@ mod tests {
 
     /// File-mod-only table (no ICT): v0=100, v1=200, v2=300
     #[rstest::rstest]
-    #[case::exact_match(200, Some(1))]
-    #[case::between_commits(150, Some(0))]
-    #[case::after_all(500, Some(2))]
+    #[case::exact_match(200, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::between_commits(150, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::after_all(500, Some(Commit { version: 2, timestamp: 300 }))]
     #[case::before_all(50, None)]
     #[tokio::test]
     async fn test_latest_version_as_of_file_mod_only(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let table =
             mock_table_with_timestamps(&[(100, None), (200, None), (300, None)], None).await;
@@ -1331,21 +1374,21 @@ mod tests {
 
         let res = latest_version_as_of(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
 
     /// File-mod-only table (no ICT): v0=100, v1=200, v2=300
     #[rstest::rstest]
-    #[case::exact_match(200, Some(1))]
-    #[case::between_commits(150, Some(1))]
-    #[case::before_all(50, Some(0))]
+    #[case::exact_match(200, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::between_commits(150, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::before_all(50, Some(Commit { version: 0, timestamp: 100 }))]
     #[case::after_all(500, None)]
     #[tokio::test]
     async fn test_first_version_after_file_mod_only(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let table =
             mock_table_with_timestamps(&[(100, None), (200, None), (300, None)], None).await;
@@ -1355,21 +1398,21 @@ mod tests {
 
         let res = first_version_after(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
 
     /// ICT from creation: v0=100, v1=200, v2=300 (all ICT)
     #[rstest::rstest]
-    #[case::exact_match(200, Some(1))]
-    #[case::between_commits(150, Some(0))]
-    #[case::after_all(500, Some(2))]
+    #[case::exact_match(200, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::between_commits(150, Some(Commit { version: 0, timestamp: 100 }))]
+    #[case::after_all(500, Some(Commit { version: 2, timestamp: 300 }))]
     #[case::before_all(50, None)]
     #[tokio::test]
     async fn test_latest_version_as_of_ict_from_creation(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let table =
             mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))
@@ -1380,21 +1423,21 @@ mod tests {
 
         let res = latest_version_as_of(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
 
     /// ICT from creation: v0=100, v1=200, v2=300 (all ICT)
     #[rstest::rstest]
-    #[case::exact_match(200, Some(1))]
-    #[case::between_commits(150, Some(1))]
-    #[case::before_all(50, Some(0))]
+    #[case::exact_match(200, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::between_commits(150, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::before_all(50, Some(Commit { version: 0, timestamp: 100 }))]
     #[case::after_all(500, None)]
     #[tokio::test]
     async fn test_first_version_after_ict_from_creation(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let table =
             mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))
@@ -1405,7 +1448,7 @@ mod tests {
 
         let res = first_version_after(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
@@ -1414,15 +1457,15 @@ mod tests {
     /// Raw: v0=100, v1=200, v2=150, v3=180, v4=300
     /// Monotonized: v0=100, v1=200, v2=201, v3=202, v4=300
     #[rstest::rstest]
-    #[case::exact_v1(200, Some(1))]
-    #[case::monotonized_v2(201, Some(2))]
-    #[case::monotonized_v3(202, Some(3))]
-    #[case::between_v3_v4(250, Some(3))]
-    #[case::raw_v2_between_v0_v1(150, Some(0))]
+    #[case::exact_v1(200, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::monotonized_v2(201, Some(Commit { version: 2, timestamp: 201 }))]
+    #[case::monotonized_v3(202, Some(Commit { version: 3, timestamp: 202 }))]
+    #[case::between_v3_v4(250, Some(Commit { version: 3, timestamp: 202 }))]
+    #[case::raw_v2_between_v0_v1(150, Some(Commit { version: 0, timestamp: 100 }))]
     #[tokio::test]
     async fn test_latest_version_as_of_non_monotonic(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let table = mock_table_with_timestamps(
             &[
@@ -1441,7 +1484,7 @@ mod tests {
 
         let res = latest_version_as_of(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
@@ -1450,15 +1493,15 @@ mod tests {
     /// Raw: v0=100, v1=200, v2=150, v3=180, v4=300
     /// Monotonized: v0=100, v1=200, v2=201, v3=202, v4=300
     #[rstest::rstest]
-    #[case::exact_v1(200, Some(1))]
-    #[case::monotonized_v2(201, Some(2))]
-    #[case::monotonized_v3(202, Some(3))]
-    #[case::after_v3_monotonized(203, Some(4))]
-    #[case::raw_v2_maps_to_v1(150, Some(1))]
+    #[case::exact_v1(200, Some(Commit { version: 1, timestamp: 200 }))]
+    #[case::monotonized_v2(201, Some(Commit { version: 2, timestamp: 201 }))]
+    #[case::monotonized_v3(202, Some(Commit { version: 3, timestamp: 202 }))]
+    #[case::after_v3_monotonized(203, Some(Commit { version: 4, timestamp: 300 }))]
+    #[case::raw_v2_maps_to_v1(150, Some(Commit { version: 1, timestamp: 200 }))]
     #[tokio::test]
     async fn test_first_version_after_non_monotonic(
         #[case] timestamp: Timestamp,
-        #[case] expected: Option<Version>,
+        #[case] expected: Option<Commit>,
     ) {
         let table = mock_table_with_timestamps(
             &[
@@ -1477,7 +1520,7 @@ mod tests {
 
         let res = first_version_after(&snapshot, &engine, timestamp);
         match expected {
-            Some(v) => assert_eq!(res.unwrap(), v),
+            Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
     }
