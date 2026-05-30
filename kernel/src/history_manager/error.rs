@@ -1,5 +1,7 @@
 //! Error types for the history manager module.
 
+use url::Url;
+
 use super::Timestamp;
 use crate::Version;
 
@@ -37,6 +39,28 @@ pub enum LogHistoryError {
         timestamp: Timestamp,
         /// Description of why the timestamp is out of range.
         reason: &'static str,
+    },
+    /// The log directory contains no commit files. Either the directory is empty or it
+    /// contains only checkpoint files. Returned by [`get_earliest_recreatable_commit`].
+    ///
+    /// [`get_earliest_recreatable_commit`]: super::get_earliest_recreatable_commit
+    #[error("No commit files found at {log_root}")]
+    NoCommitsFound {
+        /// The log root URL that was scanned.
+        log_root: Url,
+    },
+    /// Commit files exist in the log but the table cannot be reconstructed: commit version 0
+    /// is missing and no complete checkpoint is present to anchor the surviving commits.
+    /// Returned by [`get_earliest_recreatable_commit`].
+    ///
+    /// [`get_earliest_recreatable_commit`]: super::get_earliest_recreatable_commit
+    #[error(
+        "No recreatable commits found at {log_root}: commits exist but version 0 is missing \
+         and no complete checkpoint is present"
+    )]
+    NoRecreatableCommit {
+        /// The log root URL that was scanned.
+        log_root: Url,
     },
     /// An internal error occurred during timestamp conversion.
     #[error("{context}{}", source.as_ref().map(|e| format!(": {e}")).unwrap_or_default())]

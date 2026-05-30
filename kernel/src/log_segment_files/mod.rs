@@ -64,7 +64,7 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
-fn list_from_storage(
+pub(crate) fn list_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,

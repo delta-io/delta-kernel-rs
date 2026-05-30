@@ -20,13 +20,16 @@
 //! not guaranteed to be monotonically increasing across commits.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use error::LogHistoryError;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace};
+use url::Url;
 
 use crate::log_segment::LogSegment;
-use crate::path::ParsedLogPath;
+use crate::log_segment_files::list_from_storage;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
@@ -549,19 +552,137 @@ pub fn timestamp_range_to_versions(
     Ok((start_version, end_version))
 }
 
+/// Returns the earliest table version that can be fully reconstructed from the log at
+/// `log_root`. This is either commit version 0 (if `00...00.json` exists), or the version
+/// of the earliest complete checkpoint whose version is at or beyond the smallest
+/// surviving commit. A checkpoint is complete when a single-part or UUID file exists, or
+/// when all `num_parts` of a multi-part checkpoint are present.
+///
+/// The returned version is a *lower bound*: a concurrent log cleanup may delete the
+/// underlying file after this function returns. Callers should treat it accordingly.
+///
+/// If `earliest_ratified_commit_version` is `Some(0)`, the catalog has ratified commit 0
+/// and the filesystem listing is skipped entirely; any other value is informational and
+/// does not short-circuit the scan.
+///
+/// # Note
+///
+/// This matches Java `DeltaHistoryManager.getEarliestRecreatableCommit`: it requires the
+/// returned checkpoint to be at a version `>=` the smallest surviving commit. That
+/// ensures the log is contiguous from the checkpoint forward (a checkpoint at version V
+/// always has a matching commit at V under the Delta cleanup invariant). If the smallest
+/// commit appears at a version strictly greater than the latest complete checkpoint
+/// (e.g. a corrupt log where the checkpoint's own commit JSON has been deleted), this
+/// function returns [`LogHistoryError::NoRecreatableCommit`].
+///
+/// # Errors
+///
+/// Returns [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at
+/// all (empty directory, or only checkpoint files).
+///
+/// Returns [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
+/// `00...00.json` nor a complete checkpoint at a version `>=` the smallest commit is
+/// present.
+#[tracing::instrument(skip(engine), err, fields(log_root = %log_root))]
+pub fn get_earliest_recreatable_commit(
+    engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+) -> DeltaResult<Version> {
+    // Catalog-managed fast path: if the catalog has ratified v=0, we know commit 0
+    // exists (even if not yet published to `_delta_log/`).
+    if earliest_ratified_commit_version == Some(0) {
+        return Ok(0);
+    }
+
+    let mut last_complete_checkpoint: Option<Version> = None;
+    // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
+    // checkpoint completeness. Using a set (not a count) makes the check robust to
+    // duplicate part numbers within the same checkpoint version.
+    let mut multi_part_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
+    // Lowest commit version seen so far. Stays at `Version::MAX` if no commit is ever
+    // observed, which distinguishes `NoCommitsFound` from `NoRecreatableCommit`.
+    let mut smallest_commit_version = Version::MAX;
+
+    let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)
+        .map_err(|e| {
+        LogHistoryError::internal("listing _delta_log for earliest recreatable commit", e)
+    })?;
+    for parsed in listing {
+        let parsed = parsed.map_err(|e| {
+            LogHistoryError::internal("listing _delta_log for earliest recreatable commit", e)
+        })?;
+        match parsed.file_type {
+            LogPathFileType::Commit => {
+                if parsed.version == 0 {
+                    return Ok(0);
+                }
+                smallest_commit_version = smallest_commit_version.min(parsed.version);
+
+                // Early exit: returning here yields the earliest checkpoint that anchors
+                // the smallest surviving commit. Because the listing is in version order
+                // and checkpoint files at version V sort before the commit at V, this
+                // returns the first checkpoint whose version `>=` the smallest commit.
+                if let Some(cp) = last_complete_checkpoint {
+                    if cp >= smallest_commit_version {
+                        return Ok(cp);
+                    }
+                }
+            }
+            LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint => {
+                last_complete_checkpoint = Some(parsed.version);
+            }
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } => {
+                let parts = multi_part_progress
+                    .entry((parsed.version, num_parts))
+                    .or_default();
+                parts.insert(part_num);
+                if parts.len() == num_parts as usize {
+                    last_complete_checkpoint = Some(parsed.version);
+                }
+            }
+            LogPathFileType::StagedCommit
+            | LogPathFileType::CompactedCommit { .. }
+            | LogPathFileType::Crc
+            | LogPathFileType::Unknown => {}
+        }
+    }
+
+    let saw_any_commit = smallest_commit_version != Version::MAX;
+    match last_complete_checkpoint {
+        Some(cp) if saw_any_commit && cp >= smallest_commit_version => Ok(cp),
+        _ if saw_any_commit => Err(LogHistoryError::NoRecreatableCommit {
+            log_root: log_root.clone(),
+        }
+        .into()),
+        _ => Err(LogHistoryError::NoCommitsFound {
+            log_root: log_root.clone(),
+        }
+        .into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs::OpenOptions;
+    use std::ops::RangeInclusive;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
+    use bytes::Bytes;
     use test_utils::delta_path_for_version;
     use url::Url;
 
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path as ObjectPath;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
@@ -1452,6 +1573,201 @@ mod tests {
         match expected {
             Ok(v) => assert_eq!(res.unwrap(), v),
             Err(()) => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    // ====================================================================================
+    // Tests for get_earliest_recreatable_commit
+    // ====================================================================================
+
+    /// Builds an in-memory store with one entry per given log file path and returns
+    /// an engine wired to it plus the corresponding `_delta_log/` URL.
+    fn engine_with_log_files(paths: &[String]) -> (SyncEngine, Url) {
+        let store = Arc::new(InMemory::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for path in paths {
+                store
+                    .put(
+                        &ObjectPath::from(path.as_str()),
+                        Bytes::from_static(b"x").into(),
+                    )
+                    .await
+                    .expect("put log file");
+            }
+        });
+        (
+            SyncEngine::new_with_store(store),
+            Url::parse("memory:///_delta_log/").unwrap(),
+        )
+    }
+
+    fn commit_path(v: Version) -> String {
+        delta_path_for_version(v, "json").to_string()
+    }
+
+    fn single_part_checkpoint_path(v: Version) -> String {
+        format!("_delta_log/{v:020}.checkpoint.parquet")
+    }
+
+    fn uuid_checkpoint_path(v: Version) -> String {
+        // Fixed UUID for deterministic paths.
+        format!("_delta_log/{v:020}.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet")
+    }
+
+    fn multi_part_checkpoint_paths(v: Version, num_parts: u32) -> Vec<String> {
+        (1..=num_parts)
+            .map(|part| format!("_delta_log/{v:020}.checkpoint.{part:010}.{num_parts:010}.parquet"))
+            .collect()
+    }
+
+    /// Asserts that `$result` is `Err(DeltaError::LogHistory(boxed))` where `*boxed` matches
+    /// the given pattern.
+    macro_rules! assert_log_history_err {
+        ($result:expr, $pat:pat) => {{
+            let err = $result.unwrap_err();
+            match &err {
+                DeltaError::LogHistory(boxed) if matches!(**boxed, $pat) => {}
+                _ => panic!("expected {}, got: {err}", stringify!($pat)),
+            }
+        }};
+    }
+
+    /// Builds a "truncated log" layout: `checkpoint_paths` plus commits over `commit_range`.
+    fn truncated_log(
+        checkpoint_paths: Vec<String>,
+        commit_range: RangeInclusive<Version>,
+    ) -> Vec<String> {
+        let mut paths: Vec<String> = checkpoint_paths;
+        paths.extend(commit_range.map(commit_path));
+        paths
+    }
+
+    /// Builds a 3-part multi-part checkpoint at v=5 with parts `[1, 2, 2]` (no part 3).
+    fn multi_part_with_duplicate_parts() -> Vec<String> {
+        vec![
+            format!(
+                "_delta_log/{:020}.checkpoint.{:010}.{:010}.parquet",
+                5, 1, 3
+            ),
+            format!(
+                "_delta_log/{:020}.checkpoint.{:010}.{:010}.parquet",
+                5, 2, 3
+            ),
+            format!(
+                "_delta_log/{:020}.checkpoint.{:010}.{:010}.parquet",
+                5, 2, 3
+            ),
+        ]
+    }
+
+    /// All cases where `get_earliest_recreatable_commit` returns a specific version.
+    #[rstest::rstest]
+    #[case::v0_exists((0..=5).map(commit_path).collect(), None, 0)]
+    #[case::truncated_single_part(truncated_log(vec![single_part_checkpoint_path(5)], 5..=9), None, 5)]
+    #[case::truncated_uuid(truncated_log(vec![uuid_checkpoint_path(5)], 5..=9), None, 5)]
+    #[case::truncated_multi_part(truncated_log(multi_part_checkpoint_paths(5, 3), 5..=9), None, 5)]
+    // Smallest commit is at v=7, so the earlier checkpoint at v=3 cannot anchor it; the
+    // multi-part checkpoint at v=7 does.
+    #[case::picks_first_anchored_checkpoint(
+        {
+            let mut p = vec![single_part_checkpoint_path(3)];
+            p.extend(multi_part_checkpoint_paths(7, 2));
+            p.extend([commit_path(7), commit_path(8)]);
+            p
+        },
+        None,
+        7,
+    )]
+    // Two complete checkpoints with commits anchoring the earlier one: must return the
+    // earliest anchored checkpoint (v=3), not the latest (v=7). This is the Java/Spark
+    // `DeltaHistoryManager` behavior.
+    #[case::prefers_earliest_anchored_checkpoint_over_later_one(
+        {
+            let mut p = vec![single_part_checkpoint_path(3)];
+            p.extend((3..=8).map(commit_path));
+            p.push(single_part_checkpoint_path(7));
+            p
+        },
+        None,
+        3,
+    )]
+    #[case::prefers_v0_over_later_checkpoint(
+        {
+            let mut p: Vec<_> = (0..=5).map(commit_path).collect();
+            p.push(single_part_checkpoint_path(5));
+            p
+        },
+        None,
+        0,
+    )]
+    #[case::ratified_zero_fast_path(vec![], Some(0), 0)]
+    #[case::non_zero_ratified_falls_through_to_scan((0..=3).map(commit_path).collect(), Some(99), 0)]
+    fn earliest_recreatable_returns_expected_version(
+        #[case] paths: Vec<String>,
+        #[case] ratified: Option<Version>,
+        #[case] expected: Version,
+    ) {
+        let (engine, log_root) = engine_with_log_files(&paths);
+        let v = get_earliest_recreatable_commit(&engine, &log_root, ratified).unwrap();
+        assert_eq!(v, expected);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ErrKind {
+        NoCommits,
+        NoRecreatable,
+    }
+
+    /// All cases where `get_earliest_recreatable_commit` returns an error. Staged-only
+    /// is not exercised because staged commits are filtered upstream by `should_list`.
+    #[rstest::rstest]
+    #[case::empty_log(vec![], None, ErrKind::NoCommits)]
+    #[case::crc_only(vec![format!("_delta_log/{:020}.crc", 5)], None, ErrKind::NoCommits)]
+    #[case::compacted_only(vec![format!("_delta_log/{:020}.{:020}.compacted.json", 0, 5)], None, ErrKind::NoCommits)]
+    #[case::checkpoint_only(vec![single_part_checkpoint_path(5)], None, ErrKind::NoCommits)]
+    #[case::non_zero_ratified_on_empty_log(vec![], Some(5), ErrKind::NoCommits)]
+    #[case::commits_have_no_anchor(vec![commit_path(2), commit_path(3)], None, ErrKind::NoRecreatable)]
+    #[case::incomplete_multi_part(
+        {
+            let mut p = multi_part_checkpoint_paths(5, 3);
+            p.pop(); // drop the last part
+            p.extend((5..=9).map(commit_path));
+            p
+        },
+        None,
+        ErrKind::NoRecreatable,
+    )]
+    #[case::duplicate_multi_part_parts(
+        truncated_log(multi_part_with_duplicate_parts(), 5..=9),
+        None,
+        ErrKind::NoRecreatable,
+    )]
+    // Checkpoint at v=5 but the smallest surviving commit is at v=6 (no commit 5). The
+    // checkpoint cannot anchor the log, matching Java `DeltaHistoryManager`.
+    #[case::checkpoint_strictly_before_smallest_commit(
+        {
+            let mut p = vec![single_part_checkpoint_path(5)];
+            p.extend((6..=8).map(commit_path));
+            p
+        },
+        None,
+        ErrKind::NoRecreatable,
+    )]
+    fn earliest_recreatable_returns_expected_error(
+        #[case] paths: Vec<String>,
+        #[case] ratified: Option<Version>,
+        #[case] expected: ErrKind,
+    ) {
+        let (engine, log_root) = engine_with_log_files(&paths);
+        let res = get_earliest_recreatable_commit(&engine, &log_root, ratified);
+        match expected {
+            ErrKind::NoCommits => {
+                assert_log_history_err!(res, LogHistoryError::NoCommitsFound { .. })
+            }
+            ErrKind::NoRecreatable => {
+                assert_log_history_err!(res, LogHistoryError::NoRecreatableCommit { .. })
+            }
         }
     }
 }
