@@ -122,6 +122,11 @@ pub(crate) enum TableFeature {
     ClusteredTable,
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
+    /// Column Default Values.
+    ///
+    /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
+    /// the `column-defaults-in-dev` cargo feature.
+    AllowColumnDefaults,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -476,6 +481,18 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2630): drop the gate once column-defaults is fully supported.
+static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "column-defaults-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "column-defaults-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -660,6 +677,7 @@ impl TableFeature {
             | TableFeature::IcebergCompatV3
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
+            TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -695,6 +713,7 @@ impl TableFeature {
             TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
+            TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -848,6 +867,7 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 

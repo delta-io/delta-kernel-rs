@@ -123,6 +123,10 @@ schema-diff = []
 #       for JSON parsing
 declarative-plans = ["arrow-conversion", "arrow-expression"]
 
+# Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
+# work. TODO(#2630): remove once full column-defaults support ships.
+column-defaults-in-dev = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls
 default-engine-base = [
