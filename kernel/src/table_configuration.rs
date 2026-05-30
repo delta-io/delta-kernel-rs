@@ -1783,11 +1783,28 @@ mod test {
             ],
         );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
 
+    #[test]
+    fn test_catalog_managed_requires_in_commit_timestamp() {
         // Without ICT enabled, the catalog-managed feature requirement fails.
         let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
+            "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled",
+        );
+
+        // The same requirement applies to catalogOwned-preview.
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled",
+        );
+
+        // The requirement is enforced on the read path too, not just writes.
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Scan),
             "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled",
         );
     }
