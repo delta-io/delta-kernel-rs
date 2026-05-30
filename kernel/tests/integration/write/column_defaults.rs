@@ -20,10 +20,9 @@ use test_utils::{create_table, engine_store_setup, test_table_setup};
 #[cfg(feature = "column-defaults-in-dev")]
 use test_utils::{insert_data, test_read};
 
-/// Kernel's `create_table` builder must reject `delta.feature.allowColumnDefaults=supported`
-/// because `allowColumnDefaults` is not in `ALLOWED_DELTA_FEATURES`.
+// TODO(#2630): Allow create table to support column defaults
 #[test]
-fn test_create_table_rejects_allow_column_defaults() -> DeltaResult<()> {
+fn test_create_table_rejects_col_defaults() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "id",
@@ -42,20 +41,16 @@ fn test_create_table_rejects_allow_column_defaults() -> DeltaResult<()> {
     Ok(())
 }
 
-/// With the `column-defaults-in-dev` cargo feature disabled, starting a write transaction
-/// against a table that lists `allowColumnDefaults` in writer features must fail because
-/// `KernelSupport` resolves to `NotSupported`.
 #[tokio::test]
 #[cfg(not(feature = "column-defaults-in-dev"))]
-async fn test_allow_column_defaults_blocked_when_cargo_feature_off(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_col_defaults_blocked_when_cargo_feature_off() -> Result<(), Box<dyn std::error::Error>>
+{
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
     ])?);
 
-    let (store, engine, table_location) =
-        engine_store_setup("test_allow_column_defaults_off", None);
+    let (store, engine, table_location) = engine_store_setup("test_col_defaults_off", None);
     let table_url = create_table(
         store.clone(),
         table_location,
@@ -80,20 +75,16 @@ async fn test_allow_column_defaults_blocked_when_cargo_feature_off(
     Ok(())
 }
 
-/// With the `column-defaults-in-dev` cargo feature enabled, a table that lists
-/// `allowColumnDefaults` in writer features supports snapshot loading, blind appends, and
-/// round-trip reads.
 #[tokio::test]
 #[cfg(feature = "column-defaults-in-dev")]
-async fn test_blind_append_to_allow_column_defaults_table() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn test_blind_append_to_col_defaults_table_supported_when_cargo_feature_on(
+) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
     ])?);
 
-    let (store, engine, table_location) =
-        engine_store_setup("test_table_allow_column_defaults", None);
+    let (store, engine, table_location) = engine_store_setup("test_table_col_defaults", None);
     // Use the JSON helper instead of the kernel `create_table` builder because the
     // latter does not whitelist this feature in `ALLOWED_DELTA_FEATURES`.
     let table_url = create_table(
