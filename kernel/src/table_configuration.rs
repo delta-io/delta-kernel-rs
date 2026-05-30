@@ -1783,6 +1783,13 @@ mod test {
             ],
         );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+
+        // Without ICT enabled, the catalog-managed feature requirement fails.
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled",
+        );
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization
