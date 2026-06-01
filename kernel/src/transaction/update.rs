@@ -18,13 +18,15 @@ use tracing::instrument;
 
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::get_log_add_schema;
+use crate::actions::{get_log_add_schema, NUM_RECORDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
 use crate::error::Error;
-use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
+use crate::expressions::{
+    column_name, ArrayData, ColumnName, ExpressionStructPatch, Scalar, StructData,
+};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
@@ -469,13 +471,13 @@ impl<S> Transaction<S> {
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
-        // Transform to replace the deletionVector field with the new DV from
+        // Struct patch to replace the deletionVector field with the new DV from
         // NEW_DELETION_VECTOR_NAME, then drop the NEW_DELETION_VECTOR_NAME column. The
         // engine data has this temporary column appended by update_deletion_vectors(), but
         // it is not expected by the transforms used in generate_remove_actions() which
         // expect only the scan row schema fields.
-        let with_new_dv_transform = Expression::transform(
-            Transform::new_top_level()
+        let with_new_dv_expr = Expression::struct_patch(
+            ExpressionStructPatch::new_top_level()
                 .with_replaced_field(
                     "deletionVector",
                     Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
@@ -484,7 +486,7 @@ impl<S> Transaction<S> {
         );
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
-            Arc::new(with_new_dv_transform),
+            Arc::new(with_new_dv_expr),
             nullable_scan_rows_schema().clone().into(),
         )?;
         let restored_add_eval = evaluation_handler.new_expression_evaluator(
@@ -492,16 +494,15 @@ impl<S> Transaction<S> {
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
         )?;
-        let with_data_change_transform =
-            Arc::new(Expression::struct_from([Expression::transform(
-                Transform::new_nested(["add"]).with_inserted_field(
-                    Some("modificationTime"),
-                    Expression::literal(self.data_change).into(),
-                ),
-            )]));
+        let with_data_change_expr = Arc::new(Expression::struct_from([Expression::struct_patch(
+            ExpressionStructPatch::new_nested(["add"]).with_inserted_field(
+                Some("modificationTime"),
+                Expression::literal(self.data_change).into(),
+            ),
+        )]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(
             nullable_restored_add_schema().clone(),
-            with_data_change_transform,
+            with_data_change_expr,
             nullable_add_log_schema().clone().into(),
         )?;
         Ok(file_metadata_batch.map(
@@ -601,7 +602,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 let stats = stats.ok_or_else(|| {
                     Error::generic(format!(
                         "update_deletion_vectors: file {path} has no stats; \
-                         deletion vectors require an accurate numRecords"
+                         deletion vectors require an accurate {NUM_RECORDS}"
                     ))
                 })?;
                 let parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
@@ -610,12 +611,12 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     ))
                 })?;
                 if parsed
-                    .get("numRecords")
+                    .get(NUM_RECORDS)
                     .and_then(serde_json::Value::as_u64)
                     .is_none()
                 {
                     return Err(Error::generic(format!(
-                        "update_deletion_vectors: stats for {path} is missing numRecords \
+                        "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
                          or it is not a non-negative integer"
                     )));
                 }
@@ -711,7 +712,7 @@ mod tests {
         let result = visitor.visit_rows_of(&data);
         if expect_error {
             let msg = result.expect_err("expected error").to_string();
-            assert!(msg.contains("numRecords"), "message was: {msg}");
+            assert!(msg.contains(NUM_RECORDS), "message was: {msg}");
             assert!(msg.contains(TEST_PATH), "message was: {msg}");
         } else {
             result.expect("validation should pass");

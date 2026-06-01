@@ -17,18 +17,14 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// Validates a schema for CREATE TABLE or ALTER TABLE.
 ///
 /// Performs the following checks:
-/// 1. Schema is non-empty
-/// 2. No duplicate column names (case-insensitive, including nested fields)
-/// 3. Column names contain only valid characters
-/// 4. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
-///    by kernel; see `TableConfiguration::ensure_write_supported`)
+/// 1. No duplicate column names (case-insensitive, including nested fields)
+/// 2. Column names contain only valid characters
+/// 3. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
+///    by kernel)
 pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<()> {
-    if schema.num_fields() == 0 {
-        return Err(Error::generic("Schema cannot be empty"));
-    }
     let mut validator = SchemaValidator::new(column_mapping_mode);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
@@ -91,9 +87,7 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         self.current_path.push(field.name().to_ascii_lowercase());
 
         // Reject `delta.invariants` metadata on any field. Kernel cannot evaluate SQL
-        // expression invariants, so writing to any table with invariants metadata is
-        // blocked by `TableConfiguration::ensure_write_supported`. Reject at create
-        // time with a clearer, path-aware error.
+        // expression invariants, so reject at create time with a clear, path-aware error.
         //
         // Note: unlike `NonNullFieldChecker`, this validator intentionally does NOT
         // skip recursion into variant internals. Variants are not expected to carry
@@ -421,6 +415,9 @@ mod tests {
     #[case::special_chars_with_cm(schema_with_special_chars(), ColumnMappingMode::Name)]
     #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
     #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
+    #[case::empty_no_cm(StructType::new_unchecked(vec![]), ColumnMappingMode::None)]
+    #[case::empty_cm_name(StructType::new_unchecked(vec![]), ColumnMappingMode::Name)]
+    #[case::empty_cm_id(StructType::new_unchecked(vec![]), ColumnMappingMode::Id)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
         assert!(validate_schema(&schema, cm).is_ok());
     }
@@ -428,7 +425,6 @@ mod tests {
     // === Invalid schemas ===
 
     #[rstest]
-    #[case::empty_schema(StructType::new_unchecked(vec![]), ColumnMappingMode::None, &["cannot be empty"])]
     #[case::space_without_cm(schema_with_space(), ColumnMappingMode::None, &["invalid character"])]
     #[case::semicolon_without_cm(schema_with_semicolon(), ColumnMappingMode::None, &["invalid character"])]
     #[case::newline_with_cm(schema_with_newline(), ColumnMappingMode::Name, &["newline"])]

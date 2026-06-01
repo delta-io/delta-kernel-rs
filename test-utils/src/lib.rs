@@ -1,7 +1,127 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod column_mapping_fixtures;
 pub mod counting_reporter;
 pub mod table_builder;
+
+// `rstest` and the `table_builder` factories appear inside the `define_sweeps!`
+// invocation below. Macro bodies are token streams that are only resolved when
+// consumer crates apply the emitted templates, so rustc doesn't see these uses.
+#[allow(unused_imports)]
+use rstest::rstest;
+pub use rstest_reuse;
+use rstest_reuse::template;
+#[allow(unused_imports)]
+use table_builder::*;
+
+/// Emits canonical sweep templates from a single source of truth.
+///
+/// Generates one `default_sweep` template (full Cartesian product of all five axes)
+/// plus one per-axis template (`log_state_sweep`, `feature_set_sweep`,
+/// `data_layout_sweep`, `table_config_sweep`, `version_target_sweep`). Each per-axis
+/// template only supplies its own axis; the consumer test fills in the others with
+/// inline `#[values(...)]` to control combination count.
+///
+/// Templates are emitted at crate root so the generated `#[macro_export]` macros
+/// are reachable cross-crate as `test_utils::<name>` via `#[rstest_reuse::apply]`.
+///
+/// ```ignore
+/// // Iterate only the LogState axis; fix everything else.
+/// #[apply(log_state_sweep)]
+/// fn my_test(
+///     log_state: LogState,
+///     #[values(no_features())] feature_set: FeatureSet,
+///     #[values(unpartitioned())] data_layout: DataLayoutConfig,
+///     #[values(checkpoint_json_stats())] table_config: TableConfig,
+///     #[values(version_latest())] version_target: VersionTarget,
+/// ) { /* ... */ }
+/// ```
+macro_rules! define_sweeps {
+    (
+        log_state_values = $ls:tt,
+        feature_set_values = $fs:tt,
+        data_layout_values = $dl:tt,
+        table_config_values = $tc:tt,
+        version_target_values = $vt:tt $(,)?
+    ) => {
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn default_sweep(
+            #[values $ls] log_state: LogState,
+            #[values $fs] feature_set: FeatureSet,
+            #[values $dl] data_layout: DataLayoutConfig,
+            #[values $tc] table_config: TableConfig,
+            #[values $vt] version_target: VersionTarget,
+        ) {
+        }
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn log_state_sweep(#[values $ls] log_state: LogState) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn feature_set_sweep(#[values $fs] feature_set: FeatureSet) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn data_layout_sweep(#[values $dl] data_layout: DataLayoutConfig) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn table_config_sweep(#[values $tc] table_config: TableConfig) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn version_target_sweep(#[values $vt] version_target: VersionTarget) {}
+    };
+}
+
+define_sweeps! {
+    // TODO: CRC at last / stale CRC (needs LogState::with_crc_at).
+    // TODO: Log compaction (needs LogState::with_compaction_at, #2337).
+    // TODO: Schema history (add/drop/rename) (needs schema-evolution support).
+    log_state_values = (
+        commits_only(),
+        checkpoint_at_end(),
+        checkpoint_at_end_no_hint(),
+        checkpoint_mid(),
+        checkpoint_mid_no_hint(),
+        two_checkpoints_stale_hint(),
+        checkpoint_at_end_post_cleanup(),
+        checkpoint_at_end_no_hint_post_cleanup(),
+        checkpoint_mid_post_cleanup(),
+        checkpoint_mid_no_hint_post_cleanup(),
+        two_checkpoints_stale_hint_post_cleanup()
+    ),
+    // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
+    //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
+    //       allowColumnDefaults, identityColumns, NTZ/variant (schema-driven),
+    //       catalogManaged, collations for CM=name, typeWidening write support).
+    // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
+    // TODO: iceV3 (needs icebergCompatV3).
+    feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
+    // TODO: null-distribution and partition-by-timestamp-with-CM rows.
+    data_layout_values = (unpartitioned(), partitioned(), clustered()),
+    table_config_values = (
+        checkpoint_json_stats(),
+        checkpoint_struct_stats(),
+        no_checkpoint_stats()
+    ),
+    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
+    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
+    version_target_values = (
+        version_latest(),
+        version_at_mid(),
+        version_incremental_to_latest()
+    ),
+}
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +129,9 @@ pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CountingReporter, RelaxedCounter,
 };
-use delta_kernel::actions::get_log_add_schema;
+use delta_kernel::actions::{
+    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
     StringArray, StructArray,
@@ -985,12 +1107,12 @@ pub fn create_add_files_metadata(
 
     let stats_struct = StructArray::from(vec![
         (
-            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
             Arc::new(num_records_array) as ArrayRef,
         ),
         (
             Arc::new(Field::new(
-                "nullCount",
+                NULL_COUNT,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -998,7 +1120,7 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "minValues",
+                MIN_VALUES,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -1006,14 +1128,14 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "maxValues",
+                MAX_VALUES,
                 ArrowDataType::Struct(empty_struct_fields),
                 true,
             )),
             Arc::new(empty_struct) as ArrayRef,
         ),
         (
-            Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+            Arc::new(Field::new(TIGHT_BOUNDS, ArrowDataType::Boolean, true)),
             Arc::new(tight_bounds_array) as ArrayRef,
         ),
     ]);

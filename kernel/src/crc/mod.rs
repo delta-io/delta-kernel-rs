@@ -12,14 +12,13 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
-// Allow unreachable_pub because this module is pub when test-utils is enabled
-// but pub(crate) otherwise. The items need to be pub for integration tests.
+// Allow unreachable_pub because this module is pub when internal-api is enabled
+// but pub(crate) otherwise.
 #![allow(unreachable_pub)]
 
 mod delta;
 mod file_size_histogram;
 mod file_stats;
-mod lazy;
 mod reader;
 mod state;
 mod writer;
@@ -31,8 +30,9 @@ pub(crate) use delta::CrcDelta;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
-pub(crate) use file_stats::FileStatsDelta;
-pub(crate) use lazy::{CrcLoadResult, LazyCrc};
+pub(crate) use file_stats::{is_incremental_safe_operation, FileStatsDelta};
+pub(crate) use reader::read_crc_file_or_none;
+#[cfg(test)]
 pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,7 @@ pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 pub(crate) use writer::try_write_crc_file;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::Error;
+use crate::{DeltaResult, Error, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -59,12 +59,13 @@ use crate::Error;
 /// 3. Contain exactly one JSON object with the schema mirrored by `CrcRaw`.
 ///
 /// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
-/// when the `test-utils` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
+/// when the `internal-api` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
 // TODO: rename `Crc` to `CrcState` to align with `FileStatsState`, `SetTransactionState`, etc.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "CrcRaw")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Crc {
     // ===== Required fields =====
+    /// The table version this CRC describes.
+    pub version: Version,
     /// The table [`Metadata`] at this version.
     pub metadata: Metadata,
     /// The table [`Protocol`] at this version.
@@ -166,10 +167,10 @@ struct CrcRaw {
     file_size_histogram: Option<FileSizeHistogram>,
 }
 
-impl TryFrom<CrcRaw> for Crc {
-    type Error = Error;
-
-    fn try_from(raw: CrcRaw) -> Result<Self, Self::Error> {
+impl Crc {
+    /// Parse a `.crc` file body. `version` comes from the filename (the body does not carry it).
+    pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> DeltaResult<Self> {
+        let raw: CrcRaw = serde_json::from_slice(bytes)?;
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
         // Reject malformed files at the deserialization boundary so callers can trust the value.
         for (name, value) in [
@@ -189,6 +190,7 @@ impl TryFrom<CrcRaw> for Crc {
             file_size_histogram: raw.file_size_histogram,
         });
         Ok(Crc {
+            version,
             metadata: raw.metadata,
             protocol: raw.protocol,
             file_stats_state,
@@ -348,7 +350,7 @@ mod tests {
             ]
         }"#;
 
-        let crc: Crc = serde_json::from_str(json).unwrap();
+        let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
 
         // A present `setTransactions` array deserializes as `Complete` (authoritative).
         let txns = crc.set_transaction_state.expect_complete();
@@ -390,7 +392,7 @@ mod tests {
             "setTransactions": null,
             "domainMetadata": null
         }"#;
-        let crc: Crc = serde_json::from_str(json).unwrap();
+        let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert_eq!(
             crc.set_transaction_state,
             SetTransactionState::Partial(HashMap::new())
@@ -418,7 +420,7 @@ mod tests {
             },
             "protocol": {"minReaderVersion": 1, "minWriterVersion": 1}
         }"#;
-        let crc: Crc = serde_json::from_str(json).unwrap();
+        let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert_eq!(
             crc.set_transaction_state,
             SetTransactionState::Partial(HashMap::new())
@@ -498,7 +500,7 @@ mod tests {
         );
 
         let json_str = serde_json::to_string(&original).unwrap();
-        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+        let deserialized = Crc::try_from_json_bytes(json_str.as_bytes(), 0).unwrap();
 
         assert_eq!(original, deserialized);
     }
@@ -511,7 +513,7 @@ mod tests {
         );
 
         let json_str = serde_json::to_string(&original).unwrap();
-        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+        let deserialized = Crc::try_from_json_bytes(json_str.as_bytes(), 0).unwrap();
 
         assert_eq!(original, deserialized);
 
@@ -534,7 +536,7 @@ mod tests {
         );
 
         let json_str = serde_json::to_string(&original).unwrap();
-        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+        let deserialized = Crc::try_from_json_bytes(json_str.as_bytes(), 0).unwrap();
 
         assert_eq!(
             deserialized.domain_metadata_state,
@@ -555,7 +557,7 @@ mod tests {
         );
 
         let json_str = serde_json::to_string(&original).unwrap();
-        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+        let deserialized = Crc::try_from_json_bytes(json_str.as_bytes(), 0).unwrap();
 
         assert_eq!(
             deserialized.set_transaction_state,
@@ -609,7 +611,7 @@ mod tests {
 
         // Round-trip through JSON
         let json_str = serde_json::to_string(&crc).unwrap();
-        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+        let deserialized = Crc::try_from_json_bytes(json_str.as_bytes(), 0).unwrap();
 
         // Verify scalar fields survive the round-trip
         let stats = deserialized.file_stats().unwrap();
@@ -676,7 +678,9 @@ mod tests {
     ) {
         let (m, p) = counts(bad);
         let json = crc_json_with_counts(m, p);
-        let err = serde_json::from_str::<Crc>(&json).unwrap_err().to_string();
+        let err = Crc::try_from_json_bytes(json.as_bytes(), 0)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains(field),
             "expected error to mention {field} for value {bad}, got: {err}"
@@ -744,7 +748,7 @@ mod tests {
             field_name,
             r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#,
         );
-        let crc: Crc = serde_json::from_str(&json).unwrap();
+        let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert!(crc.file_stats().unwrap().file_size_histogram().is_some());
     }
 
@@ -753,7 +757,7 @@ mod tests {
     #[case::legacy_name("histogramOpt")]
     fn de_null_file_size_histogram_deserializes_to_none(#[case] field_name: &str) {
         let json = crc_json_with_histogram(field_name, "null");
-        let crc: Crc = serde_json::from_str(&json).unwrap();
+        let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
         assert!(crc.file_stats().unwrap().file_size_histogram().is_none());
     }
 
@@ -777,7 +781,7 @@ mod tests {
         #[values("fileSizeHistogram", "histogramOpt")] field_name: &str,
     ) {
         let json = crc_json_with_histogram(field_name, histogram_json);
-        assert!(serde_json::from_str::<Crc>(&json).is_err());
+        assert!(Crc::try_from_json_bytes(json.as_bytes(), 0).is_err());
     }
 
     /// CRC files written by kernel always use the spec-correct field name `fileSizeHistogram`,
@@ -789,7 +793,7 @@ mod tests {
             "histogramOpt",
             r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [1, 0], "totalBytes": [50, 0]}"#,
         );
-        let crc: Crc = serde_json::from_str(&legacy_json).unwrap();
+        let crc = Crc::try_from_json_bytes(legacy_json.as_bytes(), 0).unwrap();
 
         let serialized = serde_json::to_value(&crc).unwrap();
         assert!(serialized.get("fileSizeHistogram").is_some());
@@ -851,7 +855,7 @@ mod tests {
                 "{second_name}": {second_payload}
             }}"#
         );
-        let err = serde_json::from_str::<Crc>(&json).unwrap_err();
+        let err = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap_err();
         assert!(
             err.to_string().contains("duplicate field"),
             "expected duplicate-field error, got: {err}"

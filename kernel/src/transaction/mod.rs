@@ -9,16 +9,17 @@ use tracing::{info, instrument};
 
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    DomainMetadata, Metadata, Protocol, SetTransaction, MAX_VALUES, METADATA_NAME, MIN_VALUES,
+    NULL_COUNT, NUM_RECORDS, PROTOCOL_NAME, TIGHT_BOUNDS,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{CrcDelta, FileStatsDelta, LazyCrc};
+use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, Scalar, Transform};
+use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
 use crate::log_segment::LogSegment;
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
@@ -112,14 +113,14 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
     let stats = StructField::nullable(
         "stats",
         DataType::struct_type_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
             // nullCount, minValues, maxValues are dynamic based on data schema.
             // Empty struct placeholders indicate these fields exist but their inner
             // structure depends on the table schema and stats column configuration.
-            StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NULL_COUNT, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(MIN_VALUES, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(MAX_VALUES, DataType::struct_type_unchecked(vec![])),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]),
     );
 
@@ -301,8 +302,8 @@ where
 {
     let evaluation_handler = engine.evaluation_handler();
     add_files_metadata.map(move |add_files_batch| {
-        let transform = Expression::transform(
-            Transform::new_top_level()
+        let patch_expr = Expression::struct_patch(
+            ExpressionStructPatch::new_top_level()
                 .with_inserted_field(
                     Some("modificationTime"),
                     Expression::literal(data_change).into(),
@@ -312,7 +313,7 @@ where
                     Expression::unary(ToJson, Expression::column(["stats"])).into(),
                 ),
         );
-        let adds_expr = Expression::struct_from([transform]);
+        let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
             Arc::new(adds_expr),
@@ -371,6 +372,7 @@ impl<S> Transaction<S> {
         }
 
         self.validate_blind_append_semantics()?;
+        self.ensure_schema_non_empty_for_data_writes()?;
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -485,7 +487,7 @@ impl<S> Transaction<S> {
                 let bin_boundaries = self
                     .read_snapshot_opt
                     .as_ref()
-                    .and_then(|snap| snap.get_file_stats_if_loaded())
+                    .and_then(|snap| snap.get_file_stats_if_present())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
                 let crc_delta = self.build_crc_delta(
@@ -702,6 +704,34 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Reject data file writes (add/remove/DV) against an empty-schema table.
+    /// CREATE TABLE and metadata-only commits are exempt.
+    fn ensure_schema_non_empty_for_data_writes(&self) -> DeltaResult<()> {
+        if self.is_create_table() {
+            return Ok(());
+        }
+        if self.has_data_file_actions() {
+            self.ensure_schema_non_empty_for_write_context()?;
+        }
+        Ok(())
+    }
+
+    /// Reject `WriteContext` handouts on empty-schema tables, so engines fail
+    /// before staging any parquet. CREATE TABLE is exempt.
+    fn ensure_schema_non_empty_for_write_context(&self) -> DeltaResult<()> {
+        if self.is_create_table() {
+            return Ok(());
+        }
+        if self.effective_table_config.logical_schema().num_fields() == 0 {
+            return Err(Error::generic(
+                "Cannot write data files to a Delta table with empty schema; \
+                 use `snapshot.alter_table().add_column(...)` to add at least one \
+                 column before writing data",
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns true if this is a create-table transaction.
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
@@ -710,6 +740,13 @@ impl<S> Transaction<S> {
             "CREATE TABLE operation should not have a read snapshot"
         );
         self.read_snapshot_opt.is_none()
+    }
+
+    /// True iff this transaction stages any data-file action (add, remove, or DV update).
+    fn has_data_file_actions(&self) -> bool {
+        !self.add_files_metadata.is_empty()
+            || !self.remove_files_metadata.is_empty()
+            || !self.dv_matched_files.is_empty()
     }
 
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
@@ -844,15 +881,15 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a Transform expression that drops partition columns from the input
+        // Build a StructPatch expression that drops partition columns from the input
         // (unless they should be materialized).
-        let mut transform = Transform::new_top_level();
+        let mut patch = ExpressionStructPatch::new_top_level();
         if !should_materialize_partition_columns {
             for col in &partition_cols {
-                transform = transform.with_dropped_field_if_exists(col);
+                patch = patch.with_dropped_field_if_exists(col);
             }
         }
-        Expression::transform(transform)
+        Expression::struct_patch(patch)
     }
 
     /// Returns the logical partition column names for this table.
@@ -921,6 +958,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
+        self.ensure_schema_non_empty_for_write_context()?;
         let shared = self.shared_write_state();
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -968,6 +1006,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
+        self.ensure_schema_non_empty_for_write_context()?;
         let shared = self.shared_write_state();
         require!(
             shared.logical_partition_columns.is_empty(),
@@ -1191,8 +1230,8 @@ impl<S> Transaction<S> {
                 let snapshot = Snapshot::new_with_crc(
                     log_segment,
                     self.effective_table_config,
-                    Arc::new(LazyCrc::new_precomputed(crc, 0)),
-                );
+                    Some(Arc::new(crc)),
+                )?;
                 (stats, Arc::new(snapshot))
             }
         };
@@ -1216,6 +1255,28 @@ impl<S> Transaction<S> {
             &self.remove_files_metadata,
             bin_boundaries,
         )?;
+        // TODO: drop these conversions by migrating the upstream chain
+        //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
+        //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
+        //       checks into the type system.
+        let domain_metadata = dm_changes
+            .into_iter()
+            .map(|dm| (dm.domain().to_string(), dm))
+            .collect();
+        let set_transactions = self
+            .set_transactions
+            .iter()
+            .map(|txn| (txn.app_id.clone(), txn.clone()))
+            .collect();
+        // Although `remove.size` is optional per the Delta protocol, the kernel write path
+        // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
+        // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
+        // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
+        // present, and only operation classification can flip `is_incremental_safe`.
+        let is_incremental_safe = self
+            .operation
+            .as_deref()
+            .is_some_and(is_incremental_safe_operation);
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1224,11 +1285,10 @@ impl<S> Transaction<S> {
             metadata: self
                 .should_emit_metadata
                 .then(|| self.effective_table_config.metadata().clone()),
-            domain_metadata_changes: dm_changes,
-            set_transaction_changes: self.set_transactions.clone(),
+            domain_metadata,
+            set_transactions,
             in_commit_timestamp,
-            operation: self.operation.clone(),
-            has_missing_file_size: false, // writes always have sizes
+            is_incremental_safe,
         })
     }
 
@@ -1286,13 +1346,13 @@ impl<S> Transaction<S> {
         let evaluation_handler = engine.evaluation_handler();
 
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
-            let transform = build_remove_transform(
+            let patch = build_remove_struct_patch(
                 self.commit_timestamp,
                 self.data_change,
                 columns_to_drop,
                 coalesce_stats_with_parsed,
             );
-            let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
+            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)]));
             evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
@@ -1325,7 +1385,7 @@ impl<S> Transaction<S> {
     }
 }
 
-/// Builds the transform expression for converting scan row metadata into a Remove action.
+/// Builds the struct patch for converting scan row metadata into a Remove action.
 ///
 /// Handles two "parsed" columns that predicate-based scans add to scan metadata:
 ///
@@ -1336,13 +1396,13 @@ impl<S> Transaction<S> {
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.
-fn build_remove_transform(
+fn build_remove_struct_patch(
     commit_timestamp: i64,
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
-) -> Transform {
-    let mut transform = Transform::new_top_level()
+) -> ExpressionStructPatch {
+    let mut patch = ExpressionStructPatch::new_top_level()
         // deletionTimestamp
         .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
         // dataChange
@@ -1356,13 +1416,13 @@ fn build_remove_transform(
 
     if coalesce_stats_with_parsed {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
-        // Both expressions are registered on the "stats" field_transform (is_replace=true),
+        // Both expressions are registered on the "stats" field_patch (is_replace=true),
         // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
         let coalesce_stats = Expression::coalesce([
             Expression::column(["stats"]),
             Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
         ]);
-        transform = transform
+        patch = patch
             .with_replaced_field("stats", coalesce_stats.into())
             .with_inserted_field(
                 Some("stats"),
@@ -1371,13 +1431,13 @@ fn build_remove_transform(
             .with_dropped_field_if_exists(STATS_PARSED_NAME);
     } else {
         // tags inserted after stats; stats passes through unchanged
-        transform = transform.with_inserted_field(
+        patch = patch.with_inserted_field(
             Some("stats"),
             Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
         );
     }
 
-    transform = transform
+    patch = patch
         .with_inserted_field(
             Some("deletionVector"),
             Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
@@ -1392,10 +1452,10 @@ fn build_remove_transform(
         .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
 
     for column_to_drop in columns_to_drop {
-        transform = transform.with_dropped_field(*column_to_drop);
+        patch = patch.with_dropped_field(*column_to_drop);
     }
 
-    transform
+    patch
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to
@@ -1567,7 +1627,7 @@ mod tests {
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
     };
-    use crate::{EvaluationHandler, Snapshot};
+    use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1585,7 +1645,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             Err(Error::IOError(std::io::Error::other("simulated IO error")))
@@ -1609,7 +1669,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             // This won't be reached in tests — the validation error fires before commit.
@@ -1739,11 +1799,11 @@ mod tests {
             StructField::nullable(
                 "stats",
                 DataType::struct_type_unchecked(vec![
-                    StructField::nullable("numRecords", DataType::LONG),
-                    StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
-                    StructField::nullable("tightBounds", DataType::BOOLEAN),
+                    StructField::nullable(NUM_RECORDS, DataType::LONG),
+                    StructField::nullable(NULL_COUNT, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(MIN_VALUES, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(MAX_VALUES, DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
                 ]),
             ),
         ]);
@@ -1904,7 +1964,7 @@ mod tests {
             "Partition column 'letter' should be dropped. Expression: {expr_str}"
         );
 
-        // With materializePartitionColumns, no columns should be dropped (identity transform)
+        // With materializePartitionColumns, no columns should be dropped (empty patch)
         let (snap_with, wc_with) = snapshot_and_partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
         )?;
@@ -2512,16 +2572,16 @@ mod tests {
         let value_fields = vec![StructField::nullable("value", DataType::LONG)];
         let value_struct_type = DataType::struct_type_unchecked(value_fields.clone());
         let stats_type = DataType::struct_type_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", value_struct_type.clone()),
-            StructField::nullable("minValues", value_struct_type.clone()),
-            StructField::nullable("maxValues", value_struct_type.clone()),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, value_struct_type.clone()),
+            StructField::nullable(MIN_VALUES, value_struct_type.clone()),
+            StructField::nullable(MAX_VALUES, value_struct_type.clone()),
         ]);
         let stats_fields = vec![
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", value_struct_type.clone()),
-            StructField::nullable("minValues", value_struct_type.clone()),
-            StructField::nullable("maxValues", value_struct_type),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, value_struct_type.clone()),
+            StructField::nullable(MIN_VALUES, value_struct_type.clone()),
+            StructField::nullable(MAX_VALUES, value_struct_type),
         ];
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),
@@ -2755,7 +2815,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _actions: DeltaResultIterator<'_, FilteredEngineData>,
             commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());

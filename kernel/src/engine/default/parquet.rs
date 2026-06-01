@@ -34,8 +34,8 @@ use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter}
 use crate::schema::{SchemaRef, StructType};
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
+    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -340,7 +340,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         let store = self.store.clone();
 
@@ -583,6 +583,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -719,8 +720,8 @@ mod tests {
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
         let stats = StructArray::try_new(
             vec![
-                Field::new("numRecords", ArrowDataType::Int64, true),
-                Field::new("tightBounds", ArrowDataType::Boolean, true),
+                Field::new(NUM_RECORDS, ArrowDataType::Int64, true),
+                Field::new(TIGHT_BOUNDS, ArrowDataType::Boolean, true),
             ]
             .into(),
             vec![
@@ -844,7 +845,7 @@ mod tests {
 
         // Check numRecords from stats
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -921,7 +922,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Test writing through the trait method
@@ -1070,7 +1071,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the data
@@ -1457,7 +1458,7 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // WHEN we write a parquet file to that path

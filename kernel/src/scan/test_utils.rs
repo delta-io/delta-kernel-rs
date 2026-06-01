@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -165,6 +166,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
         physical_partition_schema: None,
+        physical_stats_columns: HashSet::new(),
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let (iter, _metrics) = scan_action_iter(
