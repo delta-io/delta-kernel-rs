@@ -178,14 +178,8 @@ impl SnapshotBuilder {
                     effective_version,
                     operation_id,
                 )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    operation_id,
-                    None,
-                )
-                .map(Into::into)
+                Snapshot::try_new_from_log_segment(table_url, log_segment, engine, operation_id)
+                    .map(Into::into)
             })
         } else {
             existing_snapshot

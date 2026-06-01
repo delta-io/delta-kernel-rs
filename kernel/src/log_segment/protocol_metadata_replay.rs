@@ -3,11 +3,13 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
-use tracing::{info, instrument, warn};
+use std::sync::Arc;
+
+use tracing::{info, instrument};
 
 use super::LogSegment;
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::crc::{CrcLoadResult, LazyCrc};
+use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
 use crate::metrics::MetricId;
@@ -23,10 +25,10 @@ impl LogSegment {
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
-        lazy_crc: &LazyCrc,
+        crc: Option<&Arc<Crc>>,
         operation_id: MetricId,
     ) -> DeltaResult<(Metadata, Protocol)> {
-        match self.read_protocol_metadata_opt(engine, lazy_crc)? {
+        match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p)) => Ok((m, p)),
             (None, Some(_)) => Err(Error::MissingMetadata),
             (Some(_), None) => Err(Error::MissingProtocol),
@@ -41,26 +43,18 @@ impl LogSegment {
     /// snapshot updates where the caller can fall back to an existing snapshot's Protocol and
     /// Metadata.
     ///
-    /// The `lazy_crc` parameter allows the CRC to be loaded at most once and shared for
-    /// future use (domain metadata, in-commit timestamp, etc.).
+    /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
+    /// short-circuit or seed the replay.
     #[instrument(name = "log_seg.load_p_m", skip_all, err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
         engine: &dyn Engine,
-        lazy_crc: &LazyCrc,
+        crc: Option<&Arc<Crc>>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let crc_version = lazy_crc.crc_version();
-
         // Case 1: If CRC at target version, use it directly and exit early.
-        if crc_version == Some(self.end_version) {
-            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
-                info!("P&M from CRC at target version {}", self.end_version);
-                return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
-            }
-            warn!(
-                "CRC at target version {} failed to load, falling back to log replay",
-                self.end_version
-            );
+        if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
+            info!("P&M from CRC at target version {}", self.end_version);
+            return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
         }
 
         // We didn't return above, so we need to do log replay to find P&M.
@@ -69,17 +63,16 @@ impl LogSegment {
         //         commits *after* the CRC version.
         //   (a) If we find new P&M in the pruned replay, return it.
         //   (b) If we don't find new P&M, fall back to the CRC.
-        //   (c) If the CRC also fails, fall back to replaying the remaining segment
-        //       (checkpoint + commits up through the CRC version).
         //
-        // Case 3: CRC at target version failed to load => Full P&M log replay.
-        //
-        // Case 4: No CRC exists at all => Full P&M log replay.
+        // Case 3: No CRC exists => Full P&M log replay.
 
-        if let Some(crc_v) = crc_version.filter(|&v| v < self.end_version) {
+        if let Some(crc) = crc.filter(|c| c.version < self.end_version) {
             // Case 2(a): Replay only commits after CRC version
-            info!("Pruning log segment to commits after CRC version {}", crc_v);
-            let pruned = self.segment_after_crc(crc_v);
+            info!(
+                "Pruning log segment to commits after CRC version {}",
+                crc.version
+            );
+            let pruned = self.segment_after_crc(crc.version);
             let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine, None, None)?;
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
@@ -87,29 +80,17 @@ impl LogSegment {
                 return Ok((metadata_opt, protocol_opt));
             }
 
-            // Case 2(b): P&M incomplete from pruned replay, try CRC.
+            // Case 2(b): P&M incomplete from pruned replay, use the CRC.
             // Use `or_else` so any newer P or M found in the pruned replay takes priority
             // over the (older) CRC values.
-            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
-                info!("P&M fallback to CRC (no P&M changes after CRC version)");
-                return Ok((
-                    metadata_opt.or_else(|| Some(crc.metadata.clone())),
-                    protocol_opt.or_else(|| Some(crc.protocol.clone())),
-                ));
-            }
-
-            // Case 2(c): CRC failed to load. Replay the remaining segment (checkpoint +
-            // commits up through CRC version), carrying forward any partial results from the
-            // pruned replay above.
-            warn!(
-                "CRC at version {} failed to load, replaying remaining segment",
-                crc_v
-            );
-            let remaining = self.segment_through_crc(crc_v);
-            return remaining.replay_for_pm(engine, metadata_opt, protocol_opt);
+            info!("P&M fallback to CRC (no P&M changes after CRC version)");
+            return Ok((
+                metadata_opt.or_else(|| Some(crc.metadata.clone())),
+                protocol_opt.or_else(|| Some(crc.protocol.clone())),
+            ));
         }
 
-        // Case 3 / Case 4: Full P&M log replay.
+        // Case 3: Full P&M log replay.
         self.replay_for_pm(engine, None, None)
     }
 
