@@ -69,6 +69,7 @@ enum TimestampSearchBounds {
         index: usize,
         /// The version at which ICT was enabled.
         ict_enablement_version: Version,
+        /// The timestamp at which ICT was enabled.
         ict_enablement_timestamp: Timestamp,
     },
 }
