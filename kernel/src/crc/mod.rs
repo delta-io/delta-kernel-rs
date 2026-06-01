@@ -13,7 +13,7 @@
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
 // Allow unreachable_pub because this module is pub when internal-api is enabled
-// but pub(crate) otherwise. The items need to be pub for integration tests.
+// but pub(crate) otherwise.
 #![allow(unreachable_pub)]
 
 mod delta;
