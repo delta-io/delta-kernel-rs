@@ -9,7 +9,7 @@ their latest docs say.
 
 
 ## building
-The book is built in CI and deployed to github pages. TODO link to the page here. When working on
+The book is built in CI and deployed to [docs.delta.io/kernel/rust](https://docs.delta.io/kernel/rust/). When working on
 the book locally you can preview changes with mdbook local server:
 
 ```bash
