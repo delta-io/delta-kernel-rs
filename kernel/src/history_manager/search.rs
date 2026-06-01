@@ -28,6 +28,17 @@ impl Bound {
             Bound::GreatestLower => "no version exists at or before this timestamp",
         }
     }
+
+    /// Returns the boundary element of `slice` on the side an out-of-range
+    /// search failed against: the first element for `GreatestLower` (search
+    /// key was below it) and the last for `LeastUpper` (search key was above
+    /// it). Returns `None` when `slice` is empty.
+    pub(crate) fn boundary_of<'a, T>(&self, slice: &'a [T]) -> Option<&'a T> {
+        match self {
+            Bound::GreatestLower => slice.first(),
+            Bound::LeastUpper => slice.last(),
+        }
+    }
 }
 
 /// Represents the errors that can occur when performing binary search using

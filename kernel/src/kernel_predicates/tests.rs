@@ -849,20 +849,38 @@ fn test_eval_opaque_predicate() {
     let pred = Pred::opaque(OpaqueAndOp, vec![column_expr!("x"), Expr::literal(true)]);
     let skipping_pred = as_data_skipping_predicate(&pred).unwrap();
 
-    // Test direct evaluation and indirect data skipping
+    // Direct evaluation works for any column type.
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(true));
     assert_eq!(filter.eval(&pred), Some(true), "AND(x, TRUE)");
-    assert_eq!(filter.eval(&skipping_pred), Some(true), "AND(x, TRUE)");
 
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(false));
     assert_eq!(filter.eval(&pred), Some(false), "AND(x, TRUE)");
-    assert_eq!(filter.eval(&skipping_pred), Some(false), "AND(x, TRUE)");
 
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::Null(DataType::BOOLEAN));
     assert_eq!(filter.eval(&pred), None, "AND(x, TRUE)");
-    assert_eq!(filter.eval(&skipping_pred), None, "AND(x, TRUE)");
 
-    // Test direct data skipping
+    // Indirect data skipping: `x` is Boolean and Boolean columns carry no min/max stats
+    // per the Delta protocol (see `is_skipping_eligible_datatype`). The rewrite therefore
+    // drops the `x` arm, leaving `AND(NULL, TRUE)` which evaluates to NULL for every filter.
+    assert_eq!(
+        DefaultKernelPredicateEvaluator::from(Scalar::from(true)).eval(&skipping_pred),
+        None,
+        "AND(x, TRUE) -- Boolean min/max unsupported"
+    );
+    assert_eq!(
+        DefaultKernelPredicateEvaluator::from(Scalar::from(false)).eval(&skipping_pred),
+        None,
+        "AND(x, TRUE) -- Boolean min/max unsupported"
+    );
+    assert_eq!(
+        DefaultKernelPredicateEvaluator::from(Scalar::Null(DataType::BOOLEAN)).eval(&skipping_pred),
+        None,
+        "AND(x, TRUE) -- Boolean min/max unsupported"
+    );
+
+    // Direct evaluation through a `ParquetStatsProvider` still works because that path
+    // doesn't go through min/max rewriting -- `OpaqueAndOp::eval_pred_scalar` evaluates
+    // each arm directly against the provider.
     let filter = OneStatsValue(Scalar::from(true));
     assert_eq!(filter.eval(&pred), Some(true), "AND(x, TRUE)");
 
@@ -909,10 +927,13 @@ fn test_eval_opaque_complex() {
         Some(false),
         "AND(x < TRUE, x < (2 < 5))"
     );
+    // Post-fold, `x < TRUE` no longer produces a stats-based skipping arm because Boolean
+    // columns carry no min/max stats per the Delta protocol. Combined with the already-NULL
+    // opaque-expression arm, `complex_skipping_pred` evaluates to NULL for every filter.
     assert_eq!(
         filter.eval(&complex_skipping_pred),
-        Some(false),
-        "AND(x < TRUE, x < (2 < 5))"
+        None,
+        "AND(x < TRUE, x < (2 < 5)) -- Boolean min/max unsupported"
     );
 }
 

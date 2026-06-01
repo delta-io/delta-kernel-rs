@@ -6,6 +6,7 @@ use std::time::Instant;
 use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, column_name, joined_column_expr, BinaryPredicateOp, ColumnName,
@@ -15,6 +16,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
+use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::require;
@@ -44,7 +46,14 @@ use delta_kernel_derive::internal_api;
 ///   predicate is dropped.
 #[cfg(test)]
 pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
-    DataSkippingPredicateCreator::new(&Default::default()).eval(pred)
+    let stats_columns = all_referenced_columns(pred);
+    DataSkippingPredicateCreator::new(&Default::default(), &stats_columns).eval(pred)
+}
+
+/// Permissive stats-columns set for tests that exercise rewrite mechanics, not the gate.
+#[cfg(test)]
+pub(crate) fn all_referenced_columns(pred: &Pred) -> HashSet<ColumnName> {
+    pred.references().into_iter().cloned().collect()
 }
 
 #[cfg(test)]
@@ -52,16 +61,30 @@ pub(crate) fn as_data_skipping_predicate_with_partitions(
     pred: &Pred,
     partition_columns: &HashSet<String>,
 ) -> Option<Pred> {
-    DataSkippingPredicateCreator::new(partition_columns).eval(pred)
+    let stats_columns = all_referenced_columns(pred);
+    DataSkippingPredicateCreator::new(partition_columns, &stats_columns).eval(pred)
 }
 
-/// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`]
-/// instead of [`KernelPredicateEvaluator::eval`].
+/// Like [`as_data_skipping_predicate_with_partitions`] but invokes
+/// [`KernelPredicateEvaluator::eval_sql_where`] instead of [`KernelPredicateEvaluator::eval`].
+#[cfg(test)]
 fn as_sql_data_skipping_predicate(
     pred: &Pred,
     partition_columns: &HashSet<String>,
 ) -> Option<Pred> {
-    DataSkippingPredicateCreator::new(partition_columns).eval_sql_where(pred)
+    let stats_columns = all_referenced_columns(pred);
+    as_sql_data_skipping_predicate_with_stats_columns(pred, partition_columns, &stats_columns)
+}
+
+/// Like [`as_sql_data_skipping_predicate`] but only rewrites references to columns in
+/// `stats_columns`; other columns return `None` from the `get_*_stat` methods and
+/// junction-fold into NULL literals.
+pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
+    pred: &Pred,
+    partition_columns: &HashSet<String>,
+    stats_columns: &HashSet<ColumnName>,
+) -> Option<Pred> {
+    DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
 }
 
 #[internal_api]
@@ -101,6 +124,10 @@ impl DataSkippingFilter {
     ///   `partitionValues` string map into a typed struct. Only used when `partition_schema` is
     ///   `Some`.
     /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
+    /// - `stats_columns`: Physical leaf paths whose stats are in `stats_schema`. References to
+    ///   other data columns fold to NULL (keeping the file). Must line up with `stats_schema` --
+    ///   otherwise the rewritten predicate references columns the unified schema doesn't have and
+    ///   evaluator construction fails.
     /// - `metrics`: Optional metrics to record data skipping statistics.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -111,6 +138,7 @@ impl DataSkippingFilter {
         partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
         input_schema: SchemaRef,
+        stats_columns: &HashSet<ColumnName>,
         metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
@@ -162,9 +190,10 @@ impl DataSkippingFilter {
             .evaluation_handler()
             .new_predicate_evaluator(
                 unified_schema.clone(),
-                Arc::new(as_sql_data_skipping_predicate(
+                Arc::new(as_sql_data_skipping_predicate_with_stats_columns(
                     &predicate,
                     &partition_columns,
+                    stats_columns,
                 )?),
             )
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
@@ -322,13 +351,27 @@ impl DataSkippingFilter {
 /// ```
 ///
 /// Partition columns are excluded since their values live in `add.partitionValues_parsed`,
-/// not `add.stats_parsed`.
+/// not `add.stats_parsed`. `physical_partition_columns` is the table's full partition list;
+/// pass an empty slice for unpartitioned tables.
+///
+/// `physical_stats_columns` restricts rewrites to columns which are expected to have stats
+/// collected; other references fold to NULL (keeps the file). Must match the column set
+/// used to build `physical_stats_schema`, otherwise the row-group filter sees a missing
+/// field.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
-    partition_columns: &[String],
+    physical_partition_columns: &[String],
+    physical_stats_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
-    let partition_columns: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
-    NullGuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
+    let partition_columns: HashSet<&str> = physical_partition_columns
+        .iter()
+        .map(String::as_str)
+        .collect();
+    NullGuardedDataSkippingPredicateCreator {
+        partition_columns,
+        stats_columns: physical_stats_columns,
+    }
+    .eval(pred)
 }
 
 /// Maps an ordering and inversion flag to the corresponding comparison predicate.
@@ -389,6 +432,15 @@ fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
     }
 }
 
+/// A column carries min/max stats iff it's a primitive whose type supports min/max skipping.
+/// Boolean / Binary, Array, Map, and Variant leaves carry nullCount only. Struct columns
+/// have no per-struct stats; only their primitive leaves do, recursively.
+/// Must match `MinMaxStatsTransform`'s acceptance rule. Otherwise the predicate creator
+/// emits refs to min/max fields the stats schema doesn't contain.
+fn has_min_max_stats(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype))
+}
+
 /// Rewrites user predicates into stats-based predicates for data skipping.
 ///
 /// For data columns, rewrites to `stats_parsed.minValues.*`/`stats_parsed.maxValues.*`/
@@ -399,16 +451,32 @@ struct DataSkippingPredicateCreator<'a> {
     /// Physical names of partition columns. For these columns, stats come from
     /// `partitionValues.<col>` (exact values) instead of min/max ranges.
     partition_columns: &'a HashSet<String>,
+    /// Physical leaf paths whose stats are present in `stats_parsed` (honors
+    /// `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, and required
+    /// columns). References to data columns not in this set return `None` from the
+    /// `get_*_stat` methods, which junction-folds to NULL.
+    ///
+    /// Must match the column set used to build `physical_stats_schema`; otherwise the
+    /// rewritten predicate references columns absent from the unified schema.
+    stats_columns: &'a HashSet<ColumnName>,
 }
 
 impl<'a> DataSkippingPredicateCreator<'a> {
-    fn new(partition_columns: &'a HashSet<String>) -> Self {
-        Self { partition_columns }
+    fn new(partition_columns: &'a HashSet<String>, stats_columns: &'a HashSet<ColumnName>) -> Self {
+        Self {
+            partition_columns,
+            stats_columns,
+        }
     }
 
     fn is_partition_column(&self, col: &ColumnName) -> bool {
         let path = col.path();
         path.len() == 1 && self.partition_columns.contains(path[0].as_str())
+    }
+
+    /// Returns `true` when `col` is in `stats_columns`.
+    fn is_stats_column(&self, col: &ColumnName) -> bool {
+        self.stats_columns.contains(col)
     }
 
     /// Wraps a partition predicate with `OR(NOT is_add, pred)` to protect Remove rows from
@@ -425,22 +493,32 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     type ColumnStat = Expr;
 
     /// Retrieves the minimum value of a column. For partition columns, returns the exact
-    /// partition value (which serves as both min and max).
-    fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
+    /// partition value (which serves as both min and max). Returns `None` for data columns
+    /// outside the stat-columns set or whose type is not min/max-eligible.
+    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
+        } else if !self.is_stats_column(col) || !has_min_max_stats(data_type) {
+            None
         } else {
-            Some(Expr::from(column_name!("stats_parsed.minValues").join(col)))
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", MIN_VALUES]).join(col),
+            ))
         }
     }
 
     /// Retrieves the maximum value of a column. For partition columns, returns the exact
-    /// partition value.
-    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
+    /// partition value. Returns `None` for data columns outside the stat-columns set or whose
+    /// type is not min/max-eligible.
+    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
+        } else if !self.is_stats_column(col) || !has_min_max_stats(data_type) {
+            None
         } else {
-            Some(Expr::from(column_name!("stats_parsed.maxValues").join(col)))
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", MAX_VALUES]).join(col),
+            ))
         }
     }
 
@@ -463,18 +541,21 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 
-    /// Retrieves the null count of a column. Partition columns don't have nullCount stats.
+    /// Retrieves the null count of a column. Partition columns don't have nullCount stats,
+    /// nor do data columns outside the stat-columns set.
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
-        if self.is_partition_column(col) {
+        if self.is_partition_column(col) || !self.is_stats_column(col) {
             None
         } else {
-            Some(Expr::from(column_name!("stats_parsed.nullCount").join(col)))
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", NULL_COUNT]).join(col),
+            ))
         }
     }
 
     /// Retrieves the row count statistic.
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(column_expr!("stats_parsed.numRecords"))
+        Some(Expr::from(ColumnName::new(["stats_parsed", NUM_RECORDS])))
     }
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
@@ -561,6 +642,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 /// live in `add.partitionValues_parsed`, not `add.stats_parsed`.
 struct NullGuardedDataSkippingPredicateCreator<'a> {
     partition_columns: HashSet<&'a str>,
+    /// Physical leaf paths whose stats are present in `stats_parsed`. Same contract as
+    /// `DataSkippingPredicateCreator::stats_columns`. Must match the column set used to
+    /// build `physical_stats_schema`, or the row-group filter sees a missing field.
+    stats_columns: &'a HashSet<ColumnName>,
 }
 
 impl NullGuardedDataSkippingPredicateCreator<'_> {
@@ -568,6 +653,11 @@ impl NullGuardedDataSkippingPredicateCreator<'_> {
     fn is_partition_column(&self, col: &ColumnName) -> bool {
         let path = col.path();
         path.len() == 1 && self.partition_columns.contains(path[0].as_str())
+    }
+
+    /// Returns `true` when `col` is in `stats_columns`.
+    fn is_stats_column(&self, col: &ColumnName) -> bool {
+        self.stats_columns.contains(col)
     }
 }
 
@@ -579,29 +669,35 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     // the checkpoint skipping path applies its own `add.stats_parsed` prefix afterward.
     // Partition columns return None since their values live in `add.partitionValues_parsed`.
 
-    fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
-        if self.is_partition_column(col) {
+    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        if self.is_partition_column(col)
+            || !self.is_stats_column(col)
+            || !has_min_max_stats(data_type)
+        {
             return None;
         }
-        Some(joined_column_expr!("minValues", col))
+        Some(Expr::from(ColumnName::new([MIN_VALUES]).join(col)))
     }
 
-    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
-        if self.is_partition_column(col) {
+    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        if self.is_partition_column(col)
+            || !self.is_stats_column(col)
+            || !has_min_max_stats(data_type)
+        {
             return None;
         }
-        Some(joined_column_expr!("maxValues", col))
+        Some(Expr::from(ColumnName::new([MAX_VALUES]).join(col)))
     }
 
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
-        if self.is_partition_column(col) {
+        if self.is_partition_column(col) || !self.is_stats_column(col) {
             return None;
         }
-        Some(joined_column_expr!("nullCount", col))
+        Some(Expr::from(ColumnName::new([NULL_COUNT]).join(col)))
     }
 
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(column_expr!("numRecords"))
+        Some(Expr::from(ColumnName::new([NUM_RECORDS])))
     }
 
     /// Compares a column's max stat against a literal value, adjusting for timestamp

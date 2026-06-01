@@ -11,7 +11,8 @@ use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -2869,13 +2870,13 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
 
     // Build a V1 checkpoint schema with stats_parsed containing an integer column.
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "minValues",
+            MIN_VALUES,
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
         ),
         StructField::nullable(
-            "maxValues",
+            MAX_VALUES,
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
         ),
     ]);
@@ -3053,12 +3054,12 @@ async fn test_max_published_version_checkpoint_only() {
 // Helper to create a checkpoint schema with stats_parsed for testing
 fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "minValues",
+            MIN_VALUES,
             StructType::new_unchecked(min_values_fields.clone()),
         ),
-        StructField::nullable("maxValues", StructType::new_unchecked(min_values_fields)),
+        StructField::nullable(MAX_VALUES, StructType::new_unchecked(min_values_fields)),
     ]);
 
     let add_schema = StructType::new_unchecked([
@@ -3072,12 +3073,9 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 // Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
 fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
     StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
-        StructField::nullable(
-            "minValues",
-            StructType::new_unchecked(column_fields.clone()),
-        ),
-        StructField::nullable("maxValues", StructType::new_unchecked(column_fields)),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
+        StructField::nullable(MIN_VALUES, StructType::new_unchecked(column_fields.clone())),
+        StructField::nullable(MAX_VALUES, StructType::new_unchecked(column_fields)),
     ])
 }
 
@@ -3220,7 +3218,7 @@ fn test_schema_has_compatible_stats_parsed_multiple_columns() {
 fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
     // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         // No minValues or maxValues fields
     ]);
 
@@ -3244,10 +3242,10 @@ fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
 fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         // minValues is a primitive type instead of a Struct
-        StructField::nullable("minValues", DataType::STRING),
-        StructField::nullable("maxValues", DataType::STRING),
+        StructField::nullable(MIN_VALUES, DataType::STRING),
+        StructField::nullable(MAX_VALUES, DataType::STRING),
     ]);
 
     let add_schema = StructType::new_unchecked([
@@ -4181,7 +4179,7 @@ async fn test_get_unpublished_catalog_commits() {
 }
 
 // ============================================================================
-// Tests: segment_after_crc / segment_through_crc
+// Tests: segment_after_crc
 // ============================================================================
 
 fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
@@ -4210,8 +4208,6 @@ struct CrcPruningCase {
     crc_version: u64,
     after_commits: &'static [u64],
     after_compactions: &'static [(u64, u64)],
-    through_commits: &'static [u64],
-    through_compactions: &'static [(u64, u64)],
 }
 
 #[rstest::rstest]
@@ -4219,7 +4215,6 @@ struct CrcPruningCase {
 // commits:             x  x  x  x  x  x  x  x  x  x
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
 #[case::only_deltas_no_checkpoint(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[],
@@ -4227,15 +4222,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // checkpoint:                |
 // commits:                      x  x  x  x  x  x  x
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:              x  x
 #[case::only_deltas_with_checkpoint(CrcPruningCase {
     commits: &[3, 4, 5, 6, 7, 8, 9],
     compactions: &[],
@@ -4243,8 +4235,6 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
@@ -4252,7 +4242,6 @@ struct CrcPruningCase {
 // crc:                             |
 // after commits:                      x  x  x  x  x
 // after compactions:                  [-----]
-// through commits:     x  x  x  x  x
 #[case::compaction_after_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(5, 7)],
@@ -4260,16 +4249,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[], // TODO(#2337): restore to &[(5, 7)] when re-enabled
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
 // compactions:               [-----------]
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
-// through compactions:
 #[case::compaction_overlaps_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(2, 6)],
@@ -4277,16 +4262,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
 // compactions:         [-----]
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
-// through compactions: [-----]
 #[case::compaction_before_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(0, 2)],
@@ -4294,8 +4275,6 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[], // TODO(#2337): restore to &[(0, 2)] when re-enabled
 })]
 #[tokio::test]
 async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
@@ -4312,14 +4291,6 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
     assert!(after.checkpoint_version.is_none());
     assert!(after.listed.checkpoint_parts.is_empty());
-
-    let through = seg.segment_through_crc(case.crc_version);
-    assert_eq!(extract_commit_versions(&through), case.through_commits);
-    assert_eq!(
-        extract_compaction_ranges(&through),
-        case.through_compactions
-    );
-    assert_eq!(through.checkpoint_version, case.checkpoint);
 }
 
 #[rstest::rstest]
