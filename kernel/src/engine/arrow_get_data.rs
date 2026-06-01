@@ -423,6 +423,20 @@ mod tests {
         assert_eq!(array.get_timestamp(2, "f").unwrap(), None);
     }
 
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[test]
+    fn test_get_timestamp_nanos_ntz() {
+        // TimestampNanosecond with no timezone stores nanoseconds since epoch
+        let array = PrimitiveArray::<TimestampNanosecondType>::from(vec![
+            Some(1_000_000),
+            Some(-1_000_000),
+            None,
+        ]);
+        assert_eq!(array.get_timestamp(0, "f").unwrap(), Some(1_000_000));
+        assert_eq!(array.get_timestamp(1, "f").unwrap(), Some(-1_000_000));
+        assert_eq!(array.get_timestamp(2, "f").unwrap(), None);
+    }
+
     #[test]
     fn test_get_decimal() {
         // Decimal128 stores as i128

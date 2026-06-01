@@ -327,6 +327,25 @@ pub unsafe extern "C" fn visit_field_timestamp_nanos(
         .into_extern_result(&allocate_error)
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
+/// Visit a timestamp_nanos_ntz field. Similar to timestamp_ntz but nanosecond resolution.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_timestamp_nanos_ntz(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNanosNtz, nullable)
+        .into_extern_result(&allocate_error)
+}
+
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
 /// precision and scale.
 ///
@@ -775,6 +794,7 @@ mod tests {
         //   col_timestamp: timestamp,
         //   col_timestamp_ntz: timestamp_ntz,
         //   col_timestamp_nanos: timestamp_nanos,
+        //   col_timestamp_nanos_ntz: timestamp_nanos_ntz,
         //   col_decimal: decimal(10,2),
         //   col_array: array<string>,
         //   col_map: map<string, long>,
@@ -800,6 +820,9 @@ mod tests {
         #[cfg(feature = "nanosecond-timestamps")]
         let col_timestamp_nanos =
             visit_field!(timestamp_nanos, state, "col_timestamp_nanos", false);
+        #[cfg(feature = "nanosecond-timestamps")]
+        let col_timestamp_nanos_ntz =
+            visit_field!(timestamp_nanos_ntz, state, "col_timestamp_nanos_ntz", false);
         let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
 
         // Create array<string>
@@ -846,6 +869,8 @@ mod tests {
             col_timestamp_ntz,
             #[cfg(feature = "nanosecond-timestamps")]
             col_timestamp_nanos,
+            #[cfg(feature = "nanosecond-timestamps")]
+            col_timestamp_nanos_ntz,
             col_decimal,
             col_array,
             col_map,
@@ -883,6 +908,8 @@ mod tests {
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
             #[cfg(feature = "nanosecond-timestamps")]
             ("col_timestamp_nanos", PrimitiveType::TimestampNanos),
+            #[cfg(feature = "nanosecond-timestamps")]
+            ("col_timestamp_nanos_ntz", PrimitiveType::TimestampNanosNtz),
         ];
         assert_eq!(fields.len(), primitive_field_expectations.len() + 5);
 

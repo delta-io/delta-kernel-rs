@@ -72,4 +72,4 @@ internal-api = []
 test-ffi = []
 
 # Preview feature, not yet part of Delta protocol.
-nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]
+nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps", "test_utils/nanosecond-timestamps"]

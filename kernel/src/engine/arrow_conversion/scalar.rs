@@ -110,6 +110,12 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
                 .as_primitive::<TimestampMicrosecondType>()
                 .value(row_idx),
         )),
+        #[cfg(feature = "nanosecond-timestamps")]
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(Scalar::TimestampNanosNtz(
+            array
+                .as_primitive::<TimestampNanosecondType>()
+                .value(row_idx),
+        )),
         ArrowDataType::Decimal128(precision, scale) => {
             if *scale < 0 {
                 return Err(Error::generic(format!(
@@ -162,6 +168,8 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
             Ok(DataType::TIMESTAMP_NANOS)
         }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => Ok(DataType::TIMESTAMP_NTZ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(DataType::TIMESTAMP_NANOS_NTZ),
         ArrowDataType::Decimal128(p, s) => {
             if *s < 0 {
                 return Err(Error::generic(format!(
@@ -364,6 +372,28 @@ mod tests {
         );
     }
 
+    // Nanosecond timestamps without a timezone map to TIMESTAMP_NANOS_NTZ. An empty timezone
+    // string is equivalent to None per the Arrow spec.
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[test]
+    fn test_extract_primitive_scalar_timestamp_nanos_ntz() {
+        let array = TimestampNanosecondArray::from(vec![1_000_000i64]);
+        assert_eq!(
+            extract_primitive_scalar(&array, 0).unwrap(),
+            Scalar::TimestampNanosNtz(1_000_000)
+        );
+        let array = TimestampNanosecondArray::from(vec![None::<i64>]);
+        assert_eq!(
+            extract_primitive_scalar(&array, 0).unwrap(),
+            Scalar::Null(DataType::TIMESTAMP_NANOS_NTZ)
+        );
+        let array = TimestampNanosecondArray::from(vec![1_000_000i64]).with_timezone("");
+        assert_eq!(
+            extract_primitive_scalar(&array, 0).unwrap(),
+            Scalar::TimestampNanosNtz(1_000_000)
+        );
+    }
+
     #[rstest]
     #[case::utc("UTC")]
     #[case::us_eastern("America/New_York")]
@@ -431,6 +461,13 @@ mod tests {
         ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         DataType::TIMESTAMP_NANOS
     ))]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_nanos_ntz(
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::TIMESTAMP_NANOS_NTZ
+        )
+    )]
     #[case::timestamp_ntz(
         ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
         DataType::TIMESTAMP_NTZ
@@ -597,6 +634,9 @@ mod tests {
     #[case::timestamp_ntz(Arc::new(TimestampMicrosecondArray::from(vec![1_743_436_200_123_456i64])) as ArrayRef)]
     #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos_tz(
         Arc::new(TimestampNanosecondArray::from(vec![1_743_436_200_000_000_123i64]).with_timezone("UTC")) as ArrayRef
+    ))]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos_ntz(
+        Arc::new(TimestampNanosecondArray::from(vec![1_743_436_200_123_456_789i64])) as ArrayRef
     ))]
     #[case::decimal(
         Arc::new(Decimal128Array::from(vec![12345i128]).with_precision_and_scale(10, 2).unwrap()) as ArrayRef

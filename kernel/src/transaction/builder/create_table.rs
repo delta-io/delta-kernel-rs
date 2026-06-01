@@ -430,12 +430,18 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
 }
 
 #[cfg(feature = "nanosecond-timestamps")]
-/// Conditionally adds the `timestampNanos` feature to the protocol when the schema contains
-/// TimestampNanos columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+/// Conditionally adds the `timestampNanos` and `timestampNtz` features to the protocol when the
+/// schema contains TimestampNanos columns anywhere in the schema tree (top-level, nested structs,
+/// arrays, maps).
 fn maybe_enable_timestamp_nanos(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
     if schema_contains_timestamp_nanos(schema) {
         add_feature_to_lists(
             TableFeature::TimestampNanos,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        add_feature_to_lists(
+            TableFeature::TimestampWithoutTimezone,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );

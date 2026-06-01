@@ -147,6 +147,8 @@ define_column_types!(COL_TYPES_TIMESTAMP, DataType::TIMESTAMP);
 define_column_types!(COL_TYPES_TIMESTAMP_NTZ, DataType::TIMESTAMP_NTZ);
 #[cfg(feature = "nanosecond-timestamps")]
 define_column_types!(COL_TYPES_TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS);
+#[cfg(feature = "nanosecond-timestamps")]
+define_column_types!(COL_TYPES_TIMESTAMP_NANOS_NTZ, DataType::TIMESTAMP_NANOS_NTZ);
 #[allow(clippy::unwrap_used)]
 static COL_TYPES_DECIMAL: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     let names = vec![
@@ -190,6 +192,8 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         #[cfg(feature = "nanosecond-timestamps")]
         &DataType::TIMESTAMP_NANOS => Ok(&COL_TYPES_TIMESTAMP_NANOS),
+        #[cfg(feature = "nanosecond-timestamps")]
+        &DataType::TIMESTAMP_NANOS_NTZ => Ok(&COL_TYPES_TIMESTAMP_NANOS_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
         &DataType::VOID
         | DataType::Struct(_)
@@ -221,7 +225,9 @@ fn is_stat_present<'b>(
             Ok(getter.get_timestamp(row_idx, field_name)?.is_some())
         }
         #[cfg(feature = "nanosecond-timestamps")]
-        &DataType::TIMESTAMP_NANOS => Ok(getter.get_timestamp(row_idx, field_name)?.is_some()),
+        &DataType::TIMESTAMP_NANOS | &DataType::TIMESTAMP_NANOS_NTZ => {
+            Ok(getter.get_timestamp(row_idx, field_name)?.is_some())
+        }
         &DataType::STRING => Ok(getter.get_str(row_idx, field_name)?.is_some()),
         &DataType::BINARY => Ok(getter.get_binary(row_idx, field_name)?.is_some()),
         DataType::Primitive(PrimitiveType::Decimal(_)) => {

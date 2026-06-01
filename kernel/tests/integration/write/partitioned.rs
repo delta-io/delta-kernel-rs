@@ -58,7 +58,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
     #[cfg(not(feature = "nanosecond-timestamps"))]
     assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
     #[cfg(feature = "nanosecond-timestamps")]
-    assert_eq!(snapshot.table_configuration().partition_columns().len(), 14);
+    assert_eq!(snapshot.table_configuration().partition_columns().len(), 15);
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
     let (add, rel_path) = read_single_add(&table_path, 1)?;
@@ -363,6 +363,8 @@ fn all_types_schema() -> Arc<StructType> {
             StructField::nullable("p_timestamp_ntz", DataType::TIMESTAMP_NTZ),
             #[cfg(feature = "nanosecond-timestamps")]
             StructField::nullable("p_timestamp_nanos", DataType::TIMESTAMP_NANOS),
+            #[cfg(feature = "nanosecond-timestamps")]
+            StructField::nullable("p_timestamp_nanos_ntz", DataType::TIMESTAMP_NANOS_NTZ),
         ])
         .unwrap(),
     )
@@ -384,6 +386,8 @@ const PARTITION_COLS: &[&str] = &[
     "p_timestamp_ntz",
     #[cfg(feature = "nanosecond-timestamps")]
     "p_timestamp_nanos",
+    #[cfg(feature = "nanosecond-timestamps")]
+    "p_timestamp_nanos_ntz",
 ];
 
 // ==============================================================================
@@ -410,6 +414,8 @@ fn normal_arrow_columns() -> Vec<ArrayRef> {
         ts_ntz_array(ts),
         #[cfg(feature = "nanosecond-timestamps")]
         Arc::new(TimestampNanosecondArray::from(vec![ts * 1000 + 123]).with_timezone("UTC")),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![ts * 1000 + 456])),
     ]
 }
 
@@ -435,6 +441,11 @@ fn normal_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::err
             "p_timestamp_nanos".into(),
             Scalar::TimestampNanos(ts * 1000 + 123),
         ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_ntz".into(),
+            Scalar::TimestampNanosNtz(ts * 1000 + 456),
+        ),
     ]))
 }
 
@@ -455,6 +466,8 @@ const EXPECTED_NORMAL_PVS: &[(&str, &str)] = &[
     ("p_timestamp_ntz", "2025-03-31 15:30:00.123456"),
     #[cfg(feature = "nanosecond-timestamps")]
     ("p_timestamp_nanos", "2025-03-31T15:30:00.123456123Z"),
+    #[cfg(feature = "nanosecond-timestamps")]
+    ("p_timestamp_nanos_ntz", "2025-03-31 15:30:00.123456456"),
 ];
 
 // ==============================================================================
@@ -484,6 +497,8 @@ fn null_arrow_columns() -> Vec<ArrayRef> {
         Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>])),
         #[cfg(feature = "nanosecond-timestamps")]
         Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>])),
     ]
 }
 
@@ -510,6 +525,11 @@ fn null_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::error
         (
             "p_timestamp_nanos".into(),
             Scalar::Null(DataType::TIMESTAMP_NANOS),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_ntz".into(),
+            Scalar::Null(DataType::TIMESTAMP_NANOS_NTZ),
         ),
     ]))
 }
@@ -565,6 +585,8 @@ fn assert_normal_values(sorted: &RecordBatch) {
     assert_col!(sorted, 13, TimestampMicrosecondArray, ts); // p_timestamp_ntz
     #[cfg(feature = "nanosecond-timestamps")]
     assert_col!(sorted, 14, TimestampNanosecondArray, ts * 1000 + 123); // p_timestamp_nanos
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_col!(sorted, 15, TimestampNanosecondArray, ts * 1000 + 456); // p_timestamp_nanos_ntz
 }
 
 /// Asserts all partition columns (indices 1-13) are null for the single row.
@@ -572,7 +594,7 @@ fn assert_all_partition_columns_null(sorted: &RecordBatch) {
     assert_eq!(sorted.num_rows(), 1);
     let mut num_columns = 13;
     if cfg!(feature = "nanosecond-timestamps") {
-        num_columns += 1;
+        num_columns += 2;
     }
     for col_idx in 1..=num_columns {
         assert!(

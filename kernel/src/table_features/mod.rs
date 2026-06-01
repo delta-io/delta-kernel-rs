@@ -565,7 +565,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
 static TIMESTAMP_NANOSECOND_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(
+        TableFeature::TimestampWithoutTimezone,
+    )],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };

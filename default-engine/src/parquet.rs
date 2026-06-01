@@ -1209,6 +1209,18 @@ mod tests {
                         .with_timezone("UTC"),
                     ) as Arc<dyn Array>,
                 ),
+                #[cfg(feature = "nanosecond-timestamps")]
+                // Timestamps in nanoseconds (without timezone)
+                (
+                    "timestamp_nanos_ntz_col",
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        1609459200000000000i64, // 2021-01-01 00:00:00
+                        1609545600000000000i64,
+                        1609632000000000000i64,
+                        1609718400000000000i64,
+                        1609804800000000123i64,
+                    ])) as Arc<dyn Array>,
+                ),
                 // Timestamp (with UTC timezone)
                 (
                     "timestamp_col",
@@ -1289,7 +1301,7 @@ mod tests {
         assert_eq!(data[0].num_rows(), 5);
         assert_eq!(
             data[0].num_columns(),
-            13 + cfg!(feature = "nanosecond-timestamps") as usize
+            13 + 2 * cfg!(feature = "nanosecond-timestamps") as usize
         );
 
         let mut col_idx = 0;
@@ -1400,6 +1412,17 @@ mod tests {
             assert!(timestamp_col
                 .timezone()
                 .is_some_and(|tz| tz.eq_ignore_ascii_case("utc")));
+            col_idx += 1;
+
+            // Verify timestamp column (without timezone)
+            let timestamp_ntz_col = data[0]
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(timestamp_ntz_col.value(0), 1609459200000000000i64);
+            assert_eq!(timestamp_ntz_col.value(4), 1609804800000000123i64);
+            assert!(timestamp_ntz_col.timezone().is_none());
             col_idx += 1;
         }
 

@@ -1705,8 +1705,13 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
             }
             #[cfg(feature = "nanosecond-timestamps")]
             PrimitiveType::TimestampNanos => {
-                // Nanoseconds since epoch
+                // Nanoseconds since epoch (UTC)
                 Scalar::TimestampNanos((18000 + seed as i64) * 86_400_000_000_000)
+            }
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanosNtz => {
+                // Nanoseconds since epoch (no timezone)
+                Scalar::TimestampNanosNtz((18000 + seed as i64) * 86_400_000_000_000)
             }
             PrimitiveType::Decimal(dt) => {
                 let scale_factor = 10i128.pow(dt.scale() as u32);
@@ -1740,6 +1745,8 @@ pub(crate) fn default_schema() -> SchemaRef {
         StructField::new("date_col", DataType::DATE, true),
         #[cfg(feature = "nanosecond-timestamps")]
         StructField::new("ts_nanos_col", DataType::TIMESTAMP_NANOS, true),
+        #[cfg(feature = "nanosecond-timestamps")]
+        StructField::new("ts_nanos_ntz_col", DataType::TIMESTAMP_NANOS_NTZ, true),
         StructField::new("ts_col", DataType::TIMESTAMP, true),
         StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
         StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),

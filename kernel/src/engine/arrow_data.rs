@@ -501,7 +501,7 @@ impl ArrowEngineData {
                     .ok_or("timestamp")
             }
             #[cfg(feature = "nanosecond-timestamps")]
-            &DataType::TIMESTAMP_NANOS => {
+            &DataType::TIMESTAMP_NANOS | &DataType::TIMESTAMP_NANOS_NTZ => {
                 debug!("Pushing timestamp array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<TimestampNanosecondType>()
                     .map(|a| a as _)

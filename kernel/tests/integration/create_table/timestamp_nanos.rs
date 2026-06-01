@@ -1,9 +1,8 @@
-//! TimestampNanos integration tests for the CreateTable API.
+//! TimestampNanos and TimestampNanosNtz integration tests for the CreateTable API.
 //!
-//! Tests that creating a table with TimestampNanos columns in the schema
+//! Tests that creating a table with TimestampNanos or TimestampNanosNtz columns in the schema
 //! automatically adds the `timestampNanos` feature to the protocol, and that
-//! TimestampNanos columns interact correctly with other features (column
-//! mapping, variant).
+//! such columns interact correctly with other features (column mapping, variant).
 
 use std::sync::Arc;
 
@@ -17,8 +16,8 @@ use delta_kernel::table_features::{
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::DeltaResult;
 use test_utils::{
-    cm_properties, multiple_nanots_schema, nested_nanots_schema, test_table_setup,
-    top_level_nanots_schema,
+    cm_properties, multiple_nanots_ntz_schema, multiple_nanots_schema, nested_nanots_ntz_schema,
+    nested_nanots_schema, test_table_setup, top_level_nanots_ntz_schema, top_level_nanots_schema,
 };
 
 /// Asserts the snapshot's protocol includes timestampNanos with correct reader/writer versions.
@@ -27,6 +26,10 @@ fn assert_timestamp_nanos_protocol(snapshot: &Snapshot) {
     assert!(
         table_config.is_feature_supported(&TableFeature::TimestampNanos),
         "timestampNanos feature should be supported"
+    );
+    assert!(
+        table_config.is_feature_supported(&TableFeature::TimestampWithoutTimezone),
+        "timestampNtz feature should be supported"
     );
     let protocol = table_config.protocol();
     assert!(
@@ -39,13 +42,17 @@ fn assert_timestamp_nanos_protocol(snapshot: &Snapshot) {
     );
 }
 
-/// TimestampNanos schema auto-enables timestampNanos across schema shapes and column mapping modes.
+/// TimestampNanos and TimestampNanosNtz schemas auto-enable timestampNanos across schema shapes
+/// and column mapping modes.
 #[rstest::rstest]
 fn test_create_table_with_timestamp_nanos(
     #[values(
         top_level_nanots_schema(),
         nested_nanots_schema(),
-        multiple_nanots_schema()
+        multiple_nanots_schema(),
+        top_level_nanots_ntz_schema(),
+        nested_nanots_ntz_schema(),
+        multiple_nanots_ntz_schema()
     )]
     schema: Arc<StructType>,
     #[values("none", "name", "id")] cm_mode: &str,
@@ -113,14 +120,16 @@ fn test_create_table_no_timestamp_nanos_no_feature() -> DeltaResult<()> {
     Ok(())
 }
 
-/// A schema with both TimestampNanos and Variant columns enables both features.
-#[test]
-fn test_create_table_timestamp_nanos_and_variant() -> DeltaResult<()> {
+/// A schema with a TimestampNanos (or TimestampNanosNtz) and Variant column enables both features.
+#[rstest::rstest]
+fn test_create_table_timestamp_nanos_and_variant(
+    #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] ts_type: DataType,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::new_unchecked(vec![
         StructField::new("id", DataType::INTEGER, false),
-        StructField::new("ts", DataType::TIMESTAMP_NANOS, true),
+        StructField::new("ts", ts_type, true),
         StructField::new("v", DataType::unshredded_variant(), true),
     ]));
 
@@ -135,6 +144,10 @@ fn test_create_table_timestamp_nanos_and_variant() -> DeltaResult<()> {
     assert!(
         table_config.is_feature_supported(&TableFeature::TimestampNanos),
         "timestampNanos feature should be supported"
+    );
+    assert!(
+        table_config.is_feature_supported(&TableFeature::TimestampWithoutTimezone),
+        "timestampNtz feature should be supported"
     );
     assert!(
         table_config.is_feature_supported(&TableFeature::VariantType),
