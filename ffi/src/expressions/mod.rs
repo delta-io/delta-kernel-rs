@@ -113,15 +113,18 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 ///
 /// # Data skipping
 ///
-/// `as_data_skipping_predicate` rewrites each `Column` arg into a `Struct[min_ref, max_ref]` and
-/// tags the op with `EvalMode::StatsMode`. Literals pass through; `Predicate` children recurse.
-/// See [`EngineEvalPredFn`] for the per-mode arg shapes the engine callback must handle.
+/// `as_data_skipping_predicate` (StatsMode) rewrites each `Column` arg into a
+/// `Struct[min, max, nullcount, rowcount]` and tags the op with `EvalMode::StatsMode`. Literals
+/// pass through; `Predicate` children recurse. This is the only mode that prunes files -- RowMode
+/// evaluates per data row and never drops files. See [`EngineEvalPredFn`] for the per-mode arg
+/// shapes the engine callback must handle.
 ///
 /// Bare ops (`Predicate::opaque(NamedOpaquePredicateOp::new(...))`) have no callback attached
 /// and so abstain from file pruning. Scalar / partition-pruning paths always abstain.
 ///
-/// Inverted ops (`inverted == true`) abstain -- per-op negation isn't expressible. Expression
-/// kinds other than `Column`, `Literal`, and `Predicate` also abstain.
+/// The StatsMode rewrite abstains (keeps all files) when: the op is inverted (`inverted == true`,
+/// since per-op negation isn't expressible), a `Column` arg has no sibling literal to infer its
+/// type from, or an arg is some kind other than `Column`, `Literal`, or `Predicate`.
 ///
 /// [`OpaqueEvalCallbacks`]: opaque_eval::OpaqueEvalCallbacks
 /// [`EngineEvalPredFn`]: opaque_eval::EngineEvalPredFn
@@ -185,11 +188,23 @@ impl NamedOpaquePredicateOp {
     }
 }
 
-// Equality by name only. Safe today because kernel has no predicate CSE path; if it gains one,
-// extend this to include `mode` and `callbacks` pointer identity.
 impl PartialEq for NamedOpaquePredicateOp {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
+        // The name identifies the op. Under `default-engine-base` the op also carries an eval mode
+        // and a callback bundle, both of which change how it evaluates, so equality must include
+        // them: same mode, and the same callbacks by `Arc` pointer identity (callbacks aren't
+        // otherwise comparable).
+        let names_eq = self.name == other.name;
+        #[cfg(feature = "default-engine-base")]
+        let extras_eq = self.mode == other.mode
+            && match (&self.callbacks, &other.callbacks) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+        #[cfg(not(feature = "default-engine-base"))]
+        let extras_eq = true;
+        names_eq && extras_eq
     }
 }
 
@@ -263,12 +278,64 @@ mod tests {
     }
 
     #[test]
-    fn named_opaque_predicate_op_equality_by_name_only() {
-        let a = NamedOpaquePredicateOp::new("LIKE");
-        let b = NamedOpaquePredicateOp::new("LIKE");
-        let c = NamedOpaquePredicateOp::new("OTHER");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
+    fn named_opaque_predicate_op_equality() {
+        // Name is the baseline identity.
+        assert_eq!(
+            NamedOpaquePredicateOp::new("LIKE"),
+            NamedOpaquePredicateOp::new("LIKE")
+        );
+        assert_ne!(
+            NamedOpaquePredicateOp::new("LIKE"),
+            NamedOpaquePredicateOp::new("OTHER")
+        );
+
+        // Under default-engine-base, equality also distinguishes eval mode and callback identity,
+        // since both change how the op evaluates.
+        #[cfg(feature = "default-engine-base")]
+        {
+            use std::ffi::c_void;
+            use std::sync::Arc;
+
+            use super::opaque_eval::{EvalMode, OpaqueEvalCallbacks};
+            use crate::engine_data::ArrowFFIData;
+            use crate::{KernelStringSlice, OptionalValue};
+
+            unsafe extern "C" fn stub_eval(
+                _: *mut c_void,
+                _: KernelStringSlice,
+                _: *mut ArrowFFIData,
+                _: EvalMode,
+                _: bool,
+            ) -> OptionalValue<*mut ArrowFFIData> {
+                OptionalValue::None
+            }
+            unsafe extern "C" fn stub_free(_: *mut c_void) {}
+            let make_cb = || {
+                Arc::new(OpaqueEvalCallbacks {
+                    engine_state: std::ptr::null_mut(),
+                    eval_pred: stub_eval,
+                    free_state: stub_free,
+                })
+            };
+
+            // Same name, different mode -> not equal.
+            assert_ne!(
+                NamedOpaquePredicateOp::new("OP"),
+                NamedOpaquePredicateOp::new("OP").with_mode(EvalMode::StatsMode)
+            );
+
+            // Same callbacks Arc (cloned) -> equal; distinct Arcs -> not equal (pointer identity).
+            let cb = make_cb();
+            let shared = NamedOpaquePredicateOp::with_callbacks("OP", cb.clone());
+            assert_eq!(shared, NamedOpaquePredicateOp::with_callbacks("OP", cb));
+            assert_ne!(
+                shared,
+                NamedOpaquePredicateOp::with_callbacks("OP", make_cb())
+            );
+
+            // Callbacks present vs absent -> not equal.
+            assert_ne!(shared, NamedOpaquePredicateOp::new("OP"));
+        }
     }
 
     /// The kernel-trait impl always abstains -- the real rewrite lives on the

@@ -35,7 +35,7 @@ use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
-use crate::KernelStringSlice;
+use crate::{KernelStringSlice, OptionalValue};
 
 /// Tells the engine callback how to interpret each arg slot (see [`EngineEvalPredFn`]).
 ///
@@ -52,19 +52,31 @@ pub enum EvalMode {
 
 /// Engine callback for evaluating an opaque predicate.
 ///
-/// Args are pre-evaluated by kernel: `args_in` is a RecordBatch (Struct array with one field per
-/// argument) exported via Arrow C Data Interface. The engine takes ownership of the FFI handles by
-/// moving them out of `*args_in` (typically via `std::mem::replace` or its C equivalent), then
-/// imports via `from_ffi`. Kernel does not free the handles after the call returns; it sees the
-/// emptied struct's Drop as a no-op.
+/// # Arguments (`args_in`)
 ///
-/// The engine writes its result (a top-level `BooleanArray`) into `result_out` by populating the
-/// `array` and `schema` fields. Kernel takes ownership of those handles via `from_ffi` after the
-/// call. Returning `true` without populating `result_out` is a contract violation; kernel detects
-/// the empty result and surfaces an error.
+/// Args are pre-evaluated by kernel and handed over as a single `RecordBatch` (a struct array with
+/// one field per argument) exported across the Arrow [C Data Interface]. Ownership of the inner
+/// `FFI_ArrowArray` / `FFI_ArrowSchema` transfers to the engine: it imports them through its own
+/// Arrow layer (e.g. arrow-glib's `garrow_record_batch_import`, or C++ `arrow::ImportRecordBatch`)
+/// and is responsible for invoking the Arrow release callbacks when evaluation completes. Kernel
+/// does not touch the handles after the call returns.
 ///
-/// Returns `true` on success. On `false`, kernel treats the call as a non-fatal evaluation error
-/// and surfaces an `Err` upstream.
+/// # Result
+///
+/// Returns `OptionalValue::Some(ptr)` on success, where `ptr` owns an [`ArrowFFIData`] holding the
+/// result as a top-level `BooleanArray` (also exported across the C Data Interface). Kernel takes
+/// ownership of `*ptr`, imports the inner array/schema, and reclaims the container; `ptr` must be
+/// allocated the way kernel reclaims it -- a `Box<ArrowFFIData>` pointer (mirroring
+/// [`free_arrow_ffi_data`](crate::engine_data::free_arrow_ffi_data)).
+///
+/// Returns `OptionalValue::None` to signal a (non-fatal) evaluation failure; kernel surfaces an
+/// `Err` upstream.
+///
+/// # Panics
+///
+/// The callback must not panic or otherwise unwind across the FFI boundary -- it is invoked
+/// directly from kernel Rust code, and unwinding into kernel is undefined behavior. Engines must
+/// trap their own errors and report them via `OptionalValue::None`.
 ///
 /// # Arg shapes per [`EvalMode`]
 ///
@@ -74,7 +86,7 @@ pub enum EvalMode {
 ///
 /// In `StatsMode`, each arg slot carries one value per file, shaped by the original expression:
 ///
-/// - `Column` (primitive): `StructArray[min, max, nullcount, rowcount]`. Crack by index:
+/// - `Column` (primitive): `StructArray[min, max, nullcount, rowcount]`. Index by position:
 ///   - 0 = min, 1 = max (column's eligible type)
 ///   - 2 = nullcount (`Int64`; all-null if the column has no nullcount stats)
 ///   - 3 = rowcount (`Int64`; all-null only in checkpoint-only batches that lack it)
@@ -90,25 +102,30 @@ pub enum EvalMode {
 /// - `Literal`: broadcast array, same as row mode.
 /// - `Predicate`: `BooleanArray` of per-file verdicts (nulls = keep).
 ///
+/// All four are conservative, never something the engine can treat as exact. `min`/`max` are
+/// *containing* bounds (valid regardless of the file's `tightBounds` flag): any value outside
+/// `[min, max]` is guaranteed absent, but `min`/`max` need not actually occur. `nullcount`/
+/// `rowcount` may overcount the live rows (e.g. a file with a deletion vector whose stats predate
+/// the deletes). The engine must therefore only prune when the predicate cannot be satisfied by
+/// *any* value in `[min, max]`, and must not treat `min`/`max` as present or `nullcount`/`rowcount`
+/// as exact. This matches kernel-native data skipping, which treats the same stats as conservative
+/// bounds.
+///
 /// Engine returns one bool per file: `false` = prune, `true` or `null` = keep.
 ///
-/// # Engine-side ownership pattern
-/// ```ignore
-/// // Take ownership of the args FFI handles (leaves kernel's slot empty).
-/// let array = std::mem::replace(&mut (*args_in).array, FFI_ArrowArray::empty());
-/// let schema = std::mem::replace(&mut (*args_in).schema, FFI_ArrowSchema::empty());
-/// let data = from_ffi(array, &schema)?;
-/// ```
+/// [C Data Interface]: https://arrow.apache.org/docs/format/CDataInterface.html
 pub type EngineEvalPredFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
     mode: EvalMode,
     inverted: bool,
-    result_out: *mut ArrowFFIData,
-) -> bool;
+) -> OptionalValue<*mut ArrowFFIData>;
 
 /// Destructor for the engine's state pointer.
+///
+/// Must not panic or unwind across the FFI boundary -- it is called from kernel Rust code (when the
+/// last reference to the eval context drops) and unwinding into kernel is undefined behavior.
 pub type EngineFreeStateFn = unsafe extern "C" fn(engine_state: *mut c_void);
 
 /// Bundle of engine callbacks for opaque-predicate evaluation.
@@ -189,9 +206,8 @@ pub(crate) mod tests {
         _args_in: *mut ArrowFFIData,
         _mode: EvalMode,
         _inverted: bool,
-        _result_out: *mut ArrowFFIData,
-    ) -> bool {
-        true
+    ) -> OptionalValue<*mut ArrowFFIData> {
+        OptionalValue::None
     }
 
     pub(crate) unsafe extern "C" fn counting_free_state(_state: *mut c_void) {

@@ -1,6 +1,6 @@
 //! `ArrowOpaquePredicateOp` impl for `NamedOpaquePredicateOp`.
 //!
-//! Kernel's `evaluate_predicate` recurses through compound shapes (Binary, Junction, etc.)
+//! Kernel's `evaluate_predicate` recurses through compound expressions (Binary, Junction, etc.)
 //! natively. This module is the leaf: when kernel hits an opaque predicate, we evaluate each arg
 //! via `evaluate_expression`, bundle the resulting `ArrayRef`s as a `RecordBatch`, export through
 //! Arrow C Data Interface, and hand them to the engine's callback. Engine receives pre-computed
@@ -31,7 +31,7 @@ use delta_kernel::{DeltaResult, Error, Predicate};
 use super::opaque_eval::{EvalMode, OpaqueEvalCallbacks};
 use super::NamedOpaquePredicateOp;
 use crate::engine_data::ArrowFFIData;
-use crate::kernel_string_slice;
+use crate::{kernel_string_slice, OptionalValue};
 
 /// Pre-evaluate each arg into an `ArrayRef`, bundle them as a `RecordBatch` keyed `arg0..argN`.
 ///
@@ -87,8 +87,64 @@ fn pick_column_type_hint(exprs: &[Expression]) -> Option<DataType> {
     })
 }
 
+/// Rewrite a single opaque-predicate arg into its stats-mode form. `Column` -> a positional
+/// `Struct[min, max, nullcount, rowcount]`; `Literal` passes through unchanged; `Predicate`
+/// recurses through kernel's standard data-skipping evaluator.
+///
+/// Returns `None` (which makes the whole predicate abstain) when the arg can't be expressed
+/// against stats: an unsupported expression kind, or a non-partition `Column` with no
+/// `type_hint`. Reading min/max stats requires the column's type, which we only learn from a
+/// sibling literal (see [`pick_column_type_hint`]); with no literal to borrow we abstain rather
+/// than guess. A column whose type is known but whose stats weren't collected still produces a
+/// wrapper with null min/max, so the engine can prune on nullcount/rowcount alone.
+fn rewrite_stat_arg(
+    evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+    arg: &Expression,
+    type_hint: Option<&DataType>,
+) -> Option<Expression> {
+    let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
+    match arg {
+        Expression::Column(col) => {
+            // Probe with LONG to detect partition columns: kernel returns Some regardless of type
+            // for partition cols, and the `partitionValues_parsed` prefix reveals the kind.
+            let probe = evaluator.get_min_stat(col, &DataType::LONG);
+            let (min, max, is_partition_col) = match probe.filter(is_partition_column_ref) {
+                // Partition value is exact and type-agnostic: reuse the probe for both bounds.
+                Some(partition_min) => {
+                    let max = evaluator
+                        .get_max_stat(col, &DataType::LONG)
+                        .unwrap_or_else(null_long);
+                    (partition_min, max, true)
+                }
+                // Data column: reading min/max stats requires the column type, which we lift from
+                // a sibling literal. With no literal the type is unknown, so we abstain. With a
+                // type but no stats collected for the column, min/max fall back to null and the
+                // engine prunes on nullcount/rowcount alone.
+                None => {
+                    let ty = type_hint?;
+                    let min = evaluator.get_min_stat(col, ty).unwrap_or_else(null_long);
+                    let max = evaluator.get_max_stat(col, ty).unwrap_or_else(null_long);
+                    (min, max, false)
+                }
+            };
+            let nullcount = evaluator.get_nullcount_stat(col).unwrap_or_else(null_long);
+            let rowcount = if is_partition_col {
+                null_long()
+            } else {
+                evaluator.get_rowcount_stat().unwrap_or_else(null_long)
+            };
+            Some(Expression::struct_from([min, max, nullcount, rowcount]))
+        }
+        Expression::Literal(_) => Some(arg.clone()),
+        Expression::Predicate(p) => Some(Expression::Predicate(Box::new(
+            evaluator.eval_pred(p, false)?,
+        ))),
+        _ => None,
+    }
+}
+
 /// Build a `StructArray` from a struct expression's children, naming fields positionally
-/// (`f0`, `f1`, ...). Engines crack by index; names are placeholders.
+/// (`f0`, `f1`, ...). Engines index into the struct by position; field names are placeholders.
 fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaResult<ArrayRef> {
     let arrays: Vec<ArrayRef> = fields
         .iter()
@@ -104,15 +160,15 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
         .map_err(|e| Error::Generic(format!("struct arg construction: {e}")))
 }
 
-/// Import an `ArrowFFIData` written by the engine back into an `ArrayRef`.
+/// Import an `ArrowFFIData` produced by the engine back into an `ArrayRef`.
 fn import_ffi_array(ffi: &mut ArrowFFIData) -> DeltaResult<ArrayRef> {
-    // Engine returned success but never populated result_out: an empty
+    // Engine signalled success but handed back an unpopulated result: an empty
     // FFI_ArrowArray has no `release` callback (per Arrow C Data Interface,
     // every populated array carries a release fn). Detect this before
     // handing the empties to `from_ffi`, which would otherwise be UB-adjacent.
     if ffi.array.is_released() {
         return Err(Error::Generic(
-            "engine callback returned success but wrote no result array".into(),
+            "engine callback returned success but no result array".into(),
         ));
     }
 
@@ -152,27 +208,33 @@ fn call_eval_pred(
 ) -> DeltaResult<BooleanArray> {
     let args_batch = evaluate_args(args, batch)?;
     let mut args_ffi = ArrowFFIData::try_from_record_batch(&args_batch)?;
-    let mut result_ffi = ArrowFFIData::empty();
 
-    // SAFETY: callback was supplied by the engine. We pass a writable
-    // args slot (engine takes ownership of the Arrow FFI handles) and a
-    // writable result slot (engine writes its output handles here).
-    let ok = unsafe {
+    // SAFETY: callback was supplied by the engine. We pass a writable args slot; the engine takes
+    // ownership of the Arrow FFI handles by moving them out of it.
+    let result = unsafe {
         (cb.eval_pred)(
             cb.engine_state,
             kernel_string_slice!(op_name),
             &mut args_ffi,
             mode,
             inverted,
-            &mut result_ffi,
         )
     };
-    if !ok {
+    let OptionalValue::Some(ptr) = result else {
         return Err(Error::Generic(format!(
             "engine eval_pred reported failure for `{op_name}`"
         )));
+    };
+    if ptr.is_null() {
+        return Err(Error::Generic(format!(
+            "engine eval_pred returned a null result for `{op_name}`"
+        )));
     }
 
+    // SAFETY: on success the engine transfers ownership of a `Box`-allocated `ArrowFFIData`
+    // (see `EngineEvalPredFn`); reclaim it so its memory is freed when `result_ffi` drops. The
+    // inner Arrow structs are moved out by `import_ffi_array`, leaving an empty (no-op Drop) box.
+    let mut result_ffi = unsafe { Box::from_raw(ptr) };
     let arr = import_ffi_array(&mut result_ffi)?;
     require_boolean_array(arr)
 }
@@ -236,59 +298,15 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         // logic correctly drops this branch from the stats predicate.
         self.callbacks_clone()?;
 
+        // Each `Column` arg becomes a `Struct[min, max, nullcount, rowcount]`; literals pass
+        // through; `Predicate` children recurse. If any arg can't be rewritten (e.g. a data
+        // column with no type hint), the whole predicate abstains and kernel keeps every file.
         let type_hint = pick_column_type_hint(exprs);
+        let rewritten = exprs
+            .iter()
+            .map(|arg| rewrite_stat_arg(evaluator, arg, type_hint.as_ref()))
+            .collect::<Option<Vec<_>>>()?;
 
-        let mut rewritten = Vec::with_capacity(exprs.len());
-        for arg in exprs {
-            let new_arg = match arg {
-                Expression::Column(col) => {
-                    let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
-
-                    // Probe with LONG to detect partition columns (kernel returns Some regardless
-                    // of type for partition cols; the prefix reveals which kind). For partition
-                    // cols we reuse the probe for min/max since the type is ignored. For data
-                    // cols we need the type hint and fall back to null when unavailable --
-                    // nullcount/rowcount still flow through so ops like IS_DEFINED can prune on
-                    // null density alone.
-                    let probe = evaluator.get_min_stat(col, &DataType::LONG);
-                    let (min, max, is_partition_col) = match probe.filter(is_partition_column_ref) {
-                        Some(partition_min) => {
-                            let mx = evaluator
-                                .get_max_stat(col, &DataType::LONG)
-                                .unwrap_or_else(null_long);
-                            (partition_min, mx, true)
-                        }
-                        None => {
-                            let (m, mx) = type_hint
-                                .as_ref()
-                                .and_then(|ty| {
-                                    let m = evaluator.get_min_stat(col, ty)?;
-                                    let mx = evaluator.get_max_stat(col, ty)?;
-                                    Some((m, mx))
-                                })
-                                .unwrap_or_else(|| (null_long(), null_long()));
-                            (m, mx, false)
-                        }
-                    };
-
-                    let nullcount = evaluator.get_nullcount_stat(col).unwrap_or_else(null_long);
-                    let rowcount = if is_partition_col {
-                        null_long()
-                    } else {
-                        evaluator.get_rowcount_stat().unwrap_or_else(null_long)
-                    };
-
-                    Expression::struct_from([min, max, nullcount, rowcount])
-                }
-                Expression::Literal(_) => arg.clone(),
-                Expression::Predicate(p) => {
-                    let rw = evaluator.eval_pred(p, false)?;
-                    Expression::Predicate(Box::new(rw))
-                }
-                _ => return None,
-            };
-            rewritten.push(new_arg);
-        }
         // arrow_opaque (not bare opaque) so runtime dispatch reaches our callback via the
         // ArrowOpaquePredicateOpAdaptor.
         let stats_op = self.clone().with_mode(EvalMode::StatsMode);
@@ -333,17 +351,13 @@ mod tests {
         sa.into()
     }
 
-    /// Write a result `ArrayRef` back into `result_out` as a top-level array.
-    fn write_result(result_out: *mut ArrowFFIData, arr: ArrayRef) {
+    /// Export an `ArrayRef` as a boxed `ArrowFFIData` and hand kernel an owning pointer, the way a
+    /// real engine returns its result from `eval_pred`.
+    fn make_result(arr: ArrayRef) -> OptionalValue<*mut ArrowFFIData> {
         let array_data = arr.to_data();
-        let array_ffi = delta_kernel::arrow::array::ffi::FFI_ArrowArray::new(&array_data);
-        let schema_ffi =
-            delta_kernel::arrow::array::ffi::FFI_ArrowSchema::try_from(array_data.data_type())
-                .unwrap();
-        unsafe {
-            (*result_out).array = array_ffi;
-            (*result_out).schema = schema_ffi;
-        }
+        let array = FFI_ArrowArray::new(&array_data);
+        let schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
+        OptionalValue::Some(Box::into_raw(Box::new(ArrowFFIData { array, schema })))
     }
 
     /// Composite opaque predicate: `STARTS_WITH(LOWER(args[0]), args[1])`. Both
@@ -355,8 +369,7 @@ mod tests {
         args_in: *mut ArrowFFIData,
         mode: EvalMode,
         inverted: bool,
-        result_out: *mut ArrowFFIData,
-    ) -> bool {
+    ) -> OptionalValue<*mut ArrowFFIData> {
         assert_eq!(mode, EvalMode::RowMode);
         let batch = unsafe { take_ffi_record_batch(args_in) };
         assert_eq!(batch.num_columns(), 2);
@@ -379,8 +392,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        write_result(result_out, Arc::new(out));
-        true
+        make_result(Arc::new(out))
     }
 
     /// Simpler opaque predicate: `STARTS_WITH(args[0], args[1])` with no LOWER.
@@ -392,8 +404,7 @@ mod tests {
         args_in: *mut ArrowFFIData,
         _mode: EvalMode,
         inverted: bool,
-        result_out: *mut ArrowFFIData,
-    ) -> bool {
+    ) -> OptionalValue<*mut ArrowFFIData> {
         let batch = unsafe { take_ffi_record_batch(args_in) };
         let lhs = batch
             .column(0)
@@ -414,8 +425,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        write_result(result_out, Arc::new(out));
-        true
+        make_result(Arc::new(out))
     }
 
     unsafe extern "C" fn noop_free(_state: *mut c_void) {}
@@ -427,8 +437,7 @@ mod tests {
             *mut ArrowFFIData,
             EvalMode,
             bool,
-            *mut ArrowFFIData,
-        ) -> bool,
+        ) -> OptionalValue<*mut ArrowFFIData>,
     ) -> Arc<OpaqueEvalCallbacks> {
         Arc::new(OpaqueEvalCallbacks {
             engine_state: ptr::null_mut(),
@@ -509,16 +518,15 @@ mod tests {
     // === Negative paths ==========================================================
 
     #[test]
-    fn engine_returning_false_surfaces_error() {
+    fn engine_returning_none_surfaces_error() {
         unsafe extern "C" fn engine_fail(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             _args_in: *mut ArrowFFIData,
             _mode: EvalMode,
             _inverted: bool,
-            _result_out: *mut ArrowFFIData,
-        ) -> bool {
-            false
+        ) -> OptionalValue<*mut ArrowFFIData> {
+            OptionalValue::None
         }
         let pred = Predicate::arrow_opaque(
             NamedOpaquePredicateOp::with_callbacks("ALWAYS_FAIL", callbacks_for(engine_fail)),
@@ -530,6 +538,27 @@ mod tests {
     }
 
     #[test]
+    fn engine_returning_some_null_pointer_surfaces_error() {
+        unsafe extern "C" fn engine_null(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _mode: EvalMode,
+            _inverted: bool,
+        ) -> OptionalValue<*mut ArrowFFIData> {
+            let _ = unsafe { take_ffi_record_batch(args_in) };
+            OptionalValue::Some(ptr::null_mut())
+        }
+        let pred = Predicate::arrow_opaque(
+            NamedOpaquePredicateOp::with_callbacks("RETURNS_NULL", callbacks_for(engine_null)),
+            [column_expr!("col")],
+        );
+        let batch = batch_with_col(vec![Some("x")]);
+        let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
+        assert!(format!("{err}").contains("null result"), "got: {err}");
+    }
+
+    #[test]
     fn engine_returning_non_boolean_array_errors() {
         unsafe extern "C" fn engine_int(
             _state: *mut c_void,
@@ -537,12 +566,10 @@ mod tests {
             args_in: *mut ArrowFFIData,
             _mode: EvalMode,
             _inverted: bool,
-            result_out: *mut ArrowFFIData,
-        ) -> bool {
+        ) -> OptionalValue<*mut ArrowFFIData> {
             let _ = unsafe { take_ffi_record_batch(args_in) };
             let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-            write_result(result_out, arr);
-            true
+            make_result(arr)
         }
         let pred = Predicate::arrow_opaque(
             NamedOpaquePredicateOp::with_callbacks("RETURNS_INT", callbacks_for(engine_int)),
@@ -561,11 +588,10 @@ mod tests {
             args_in: *mut ArrowFFIData,
             _mode: EvalMode,
             _inverted: bool,
-            _result_out: *mut ArrowFFIData,
-        ) -> bool {
-            // Consume args but never populate result_out.
+        ) -> OptionalValue<*mut ArrowFFIData> {
+            // Consume args but hand back an empty (unpopulated) result.
             let _ = unsafe { take_ffi_record_batch(args_in) };
-            true
+            OptionalValue::Some(Box::into_raw(Box::new(ArrowFFIData::empty())))
         }
         let pred = Predicate::arrow_opaque(
             NamedOpaquePredicateOp::with_callbacks("EMPTY", callbacks_for(engine_empty)),
@@ -573,10 +599,7 @@ mod tests {
         );
         let batch = batch_with_col(vec![Some("x")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
-        assert!(
-            format!("{err}").contains("wrote no result array"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("no result array"), "got: {err}");
     }
 
     // === Zero-arg opaque predicate ===============================================
@@ -589,14 +612,12 @@ mod tests {
             args_in: *mut ArrowFFIData,
             _mode: EvalMode,
             _inverted: bool,
-            result_out: *mut ArrowFFIData,
-        ) -> bool {
+        ) -> OptionalValue<*mut ArrowFFIData> {
             let batch = unsafe { take_ffi_record_batch(args_in) };
             assert_eq!(batch.num_columns(), 0, "zero-arg => no columns");
             let n = batch.num_rows();
             let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));
-            write_result(result_out, arr);
-            true
+            make_result(arr)
         }
         let pred = Predicate::arrow_opaque(
             NamedOpaquePredicateOp::with_callbacks("ZERO_ARG", callbacks_for(engine_always_true)),
@@ -813,35 +834,13 @@ mod tests {
             assert_eq!(opaque.exprs[1], Expression::literal("foo"));
         }
 
-        /// Single Column arg with no literal: min/max null out (no type hint), but nullcount
-        /// and rowcount still flow through. Enables IS_DEFINED-style ops to prune.
+        /// A data column with no sibling literal gives no type hint, so min/max stats can't be
+        /// read. We abstain for the whole predicate rather than emit a partial wrapper.
         #[test]
-        fn column_without_type_hint_emits_partial_wrapper() {
+        fn abstains_when_data_column_has_no_type_hint() {
             let op = op_with_callbacks("IS_DEFINED");
             let args = [column_expr!("col")];
-            let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
-            let Predicate::Opaque(opaque) = pred else {
-                panic!("expected Opaque");
-            };
-            let Expression::Struct(fields, _) = &opaque.exprs[0] else {
-                panic!("expected Struct arg");
-            };
-            assert_eq!(fields.len(), 4);
-            assert_eq!(
-                *fields[0],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
-            assert_eq!(
-                *fields[1],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
-            // Nullcount: stub returns None -> typed-null fallback.
-            assert_eq!(
-                *fields[2],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
-            // Rowcount: stub returns Some(stats_parsed.numRecords).
-            assert_eq!(*fields[3], stats_col_numrecords());
+            assert!(rewrite(&op, &args, &rewriter(), false).is_none());
         }
 
         #[test]
@@ -961,14 +960,12 @@ mod tests {
                 args_in: *mut ArrowFFIData,
                 mode: EvalMode,
                 _inverted: bool,
-                result_out: *mut ArrowFFIData,
-            ) -> bool {
+            ) -> OptionalValue<*mut ArrowFFIData> {
                 assert_eq!(mode, EvalMode::StatsMode);
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 CALL_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
                 let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; batch.num_rows()]));
-                write_result(result_out, arr);
-                true
+                make_result(arr)
             }
 
             let op = NamedOpaquePredicateOp::with_callbacks("OP", callbacks_for(engine_count));
@@ -1047,8 +1044,7 @@ mod tests {
                 args_in: *mut ArrowFFIData,
                 mode: EvalMode,
                 _inverted: bool,
-                result_out: *mut ArrowFFIData,
-            ) -> bool {
+            ) -> OptionalValue<*mut ArrowFFIData> {
                 assert_eq!(mode, EvalMode::StatsMode);
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let col = batch
@@ -1068,8 +1064,7 @@ mod tests {
                 }
                 // Without nullcount, we can't prune -- keep every file.
                 let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; batch.num_rows()]));
-                write_result(result_out, arr);
-                true
+                make_result(arr)
             }
 
             let op = NamedOpaquePredicateOp::with_callbacks(

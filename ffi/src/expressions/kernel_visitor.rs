@@ -1110,4 +1110,108 @@ mod tests {
         let id = visit_predicate_opaque_impl(&mut state, Ok("OP".to_string()), &mut it).unwrap();
         assert_eq!(id, 0, "invalid child should produce id=0 (no node created)");
     }
+
+    // ============================================================================
+    // Top-level `extern "C"` entry points. These drive the real FFI symbols (with
+    // an engine-supplied `allocate_error` and the handle alloc/dealloc dance) so
+    // miri can validate the unsafe boundary, not just the `_impl` helpers above.
+    // ============================================================================
+
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::kernel_string_slice;
+
+    #[test]
+    fn visit_predicate_opaque_ffi_builds_predicate() {
+        let mut state = KernelExpressionVisitorState::default();
+        let (a, b) = make_two_literal_ids(&mut state);
+        let (_keep, mut it) = make_iter(vec![a, b]);
+        let name = "MY_OP";
+        let result = unsafe {
+            visit_predicate_opaque(
+                &mut state,
+                kernel_string_slice!(name),
+                &mut it,
+                allocate_err,
+            )
+        };
+        let id = ok_or_panic(result);
+        assert_ne!(id, 0);
+        let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
+        let Predicate::Opaque(opaque) = pred else {
+            panic!("expected Predicate::Opaque, got {pred:?}");
+        };
+        assert_eq!(opaque.op.name(), "MY_OP");
+        assert_eq!(opaque.exprs.len(), 2);
+    }
+
+    /// Drives `visit_predicate_opaque_with_eval` end to end: create an eval context, build the
+    /// predicate through the FFI symbol, then verify the engine's `free_state` fires exactly once
+    /// when the last reference (held by the predicate) drops.
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn visit_predicate_opaque_with_eval_ffi_builds_and_frees() {
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::engine_data::ArrowFFIData;
+        use crate::expressions::opaque_eval::{
+            create_opaque_eval_context, free_opaque_eval_context, EvalMode, OpaqueEvalCallbacks,
+        };
+        use crate::OptionalValue;
+
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn stub_eval(
+            _: *mut c_void,
+            _: KernelStringSlice,
+            _: *mut ArrowFFIData,
+            _: EvalMode,
+            _: bool,
+        ) -> OptionalValue<*mut ArrowFFIData> {
+            OptionalValue::None
+        }
+        unsafe extern "C" fn counting_free(_: *mut c_void) {
+            FREED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        FREED.store(0, Ordering::SeqCst);
+        let ctx = unsafe {
+            create_opaque_eval_context(OpaqueEvalCallbacks {
+                engine_state: std::ptr::null_mut(),
+                eval_pred: stub_eval,
+                free_state: counting_free,
+            })
+        };
+
+        let mut state = KernelExpressionVisitorState::default();
+        let (a, b) = make_two_literal_ids(&mut state);
+        let (_keep, mut it) = make_iter(vec![a, b]);
+        let name = "MY_EVAL_OP";
+        // shallow_copy lends the handle to the FFI call (which clones the inner Arc) while we keep
+        // ownership of the original to free below.
+        let result = unsafe {
+            visit_predicate_opaque_with_eval(
+                &mut state,
+                kernel_string_slice!(name),
+                &mut it,
+                ctx.shallow_copy(),
+                allocate_err,
+            )
+        };
+        let id = ok_or_panic(result);
+        assert_ne!(id, 0);
+
+        // Releasing our handle drops one Arc ref; the predicate still holds the other.
+        unsafe { free_opaque_eval_context(ctx) };
+        assert_eq!(
+            FREED.load(Ordering::SeqCst),
+            0,
+            "predicate still holds a ref"
+        );
+
+        // Dropping the predicate drops the last ref, firing the engine's free_state exactly once.
+        let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
+        drop(pred);
+        assert_eq!(FREED.load(Ordering::SeqCst), 1, "free_state must fire once");
+    }
 }
