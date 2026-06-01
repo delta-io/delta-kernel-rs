@@ -558,17 +558,16 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(None); // Not a domainMetadata action, continue checking other types
         };
 
-        // Exclude tombstones (removed=true) from checkpoint per protocol spec
         let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED.index]
             .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
             .unwrap_or(false);
-        if removed {
-            return Ok(Some(false));
-        }
 
-        // If the domain already exists in the set, the insertion will return false,
-        // indicating that this is a duplicate.
-        Ok(Some(self.seen_domains.insert(domain.to_string())))
+        // If the domain already exists in the set, the insertion returns false,
+        // indicating a duplicate.
+        let is_latest = self.seen_domains.insert(domain.to_string());
+
+        // Exclude tombstones (removed=true) from the checkpoint per protocol spec.
+        Ok(Some(is_latest && !removed))
     }
 
     /// Determines if a row in the batch should be included.
@@ -944,6 +943,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_action_reconciliation_visitor_excludes_domain_tombstone_suppresses_prior_add(
+    ) -> DeltaResult<()> {
+        let json_strings: StringArray = vec![
+            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":true}}"#,
+            r#"{"domainMetadata":{"domain":"survivor","configuration":"survivor_cfg","removed":false}}"#,
+            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":false}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut seen_file_keys = HashSet::new();
+        let mut seen_txns = HashSet::new();
+        let mut seen_domains = HashSet::new();
+        let mut visitor = ActionReconciliationVisitor::new(
+            &mut seen_file_keys,
+            true,
+            vec![true; 3],
+            0,
+            false,
+            false,
+            &mut seen_txns,
+            &mut seen_domains,
+            None,
+        );
+
+        visitor.visit_rows_of(batch.as_ref())?;
+
+        // Only the surviving domain is kept.
+        let expected = vec![false, true, false];
+        assert_eq!(visitor.selection_vector, expected);
+        assert_eq!(visitor.actions_count, 1);
+        assert_eq!(visitor.seen_domains.len(), 2);
+
+        Ok(())
+    }
+
     /// This test ensures that the processor correctly deduplicates and filters
     /// non-file actions (metadata, protocol, txn) across multiple batches.
     #[test]
@@ -983,6 +1019,30 @@ mod tests {
             &vec![false, false, false, true]
         );
         assert_eq!(actions_count, 4);
+        assert_eq!(add_actions, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_action_reconciliation_actions_iter_domain_tombstone_suppresses_add_across_batches(
+    ) -> DeltaResult<()> {
+        let batch1 = vec![
+            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":true}}"#,
+            r#"{"domainMetadata":{"domain":"survivor","configuration":"survivor_cfg","removed":false}}"#,
+        ];
+        let batch2 = vec![
+            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":false}}"#,
+        ];
+
+        let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
+        let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
+
+        // In batch 2 the stale "foo" add is suppressed, so the batch is dropped from the results
+        // entirely.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].selection_vector(), &vec![false, true]);
+        assert_eq!(actions_count, 1); // only the surviving domain
         assert_eq!(add_actions, 0);
 
         Ok(())

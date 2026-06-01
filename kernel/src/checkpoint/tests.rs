@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{from_slice, json, Value};
-use tempfile::tempdir;
 use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
 
@@ -764,75 +763,92 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     Ok(())
 }
 
+// Domain metadata reconciliation through a checkpoint.
+// Live domain must survive, while tombstoned domain
+// must be excluded from the checkpoint.
+#[rstest::rstest]
+// "foo" stays live: checkpoint keeps protocol + metadata + foo + survivor = 4 actions.
+#[case::preserves_metadata(false, Some("foo_value".to_string()), 3, 4)]
+// "foo" is tombstoned: checkpoint keeps protocol + metadata + survivor = 3 actions.
+#[case::excludes_tombstone(true, None, 4, 3)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
-    // ===== Setup =====
-    let tmp_dir = tempdir().unwrap();
-    let table_path = tmp_dir.path();
-    let table_url = Url::from_directory_path(table_path).unwrap();
-    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+async fn test_checkpoint_domain_metadata_reconciliation(
+    #[case] remove_foo: bool,
+    #[case] expected_foo: Option<String>,
+    #[case] expected_version: u64,
+    #[case] expected_checkpoint_size: u64,
+) -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let table_root = Url::parse("memory:///")?;
 
-    // ===== Create Table =====
-    let commit0 = [
-        json!({
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": [],
-                "writerFeatures": ["domainMetadata"]
-            }
-        }),
-        json!({
-            "metaData": {
-                "id": "test-table-id",
-                "format": { "provider": "parquet", "options": {} },
-                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns": [],
-                "configuration": {},
-                "createdTime": 1587968585495i64
-            }
-        }),
-    ]
-    .map(|j| j.to_string())
-    .join("\n");
-    std::fs::write(
-        table_path.join("_delta_log/00000000000000000000.json"),
-        commit0,
+    // Version 0: protocol (with the domainMetadata writer feature) + metadata.
+    write_commit_to_store(
+        &store,
+        vec![
+            Action::Protocol(
+                Protocol::try_new_modern(TableFeature::EMPTY_LIST, ["domainMetadata"]).unwrap(),
+            ),
+            create_metadata_action(),
+        ],
+        0,
     )
-    .unwrap();
+    .await?;
 
-    // ===== Create Engine =====
-    let engine = SyncEngine::new();
-
-    let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let add_domain = |domain: &str, value: &str| -> DeltaResult<()> {
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let result = txn
-            .with_domain_metadata(domain.to_string(), value.to_string())
-            .commit(&engine)?;
-        assert!(result.is_committed());
+        txn.with_domain_metadata(domain.to_string(), value.to_string())
+            .commit(&engine)?
+            .unwrap_committed();
         Ok(())
     };
 
-    // ===== Commit Domain Metadata =====
-    commit_domain_metadata("foo", "bar1")?;
-    commit_domain_metadata("foo", "bar2")?;
+    // Versions 1 & 2: write "foo" twice so the checkpoint must keep only the latest value.
+    add_domain("foo", "foo_value_old")?;
+    add_domain("foo", "foo_value")?;
+    add_domain("survivor", "survivor_value")?;
 
-    // ===== Case 1: Verify domain metadata is preserved *before* checkpoint =====
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    assert_eq!(snapshot.version(), 2);
-    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
-    assert_eq!(domain_value, Some("bar2".to_string()));
+    // Version 4: tombstone "foo".
+    if remove_foo {
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        txn.with_domain_metadata_removed("foo".to_string())
+            .commit(&engine)?
+            .unwrap_committed();
+    }
 
-    // Trigger checkpoint
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot.version(), expected_version);
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, expected_foo);
+    assert_eq!(
+        snapshot.get_domain_metadata("survivor", &engine)?,
+        Some("survivor_value".to_string())
+    );
+
     snapshot.checkpoint(&engine, None)?;
 
-    // ===== Case 2: Verify domain metadata is preserved *after* checkpoint =====
-    let snapshot = Snapshot::builder_for(table_url)
-        .at_version(2)
+    let checkpoint_path = Path::from(format!(
+        "_delta_log/{expected_version:020}.checkpoint.parquet"
+    ));
+    let checkpoint_size = store.head(&checkpoint_path).await?.size;
+    assert_last_checkpoint_contents(
+        &store,
+        expected_version,
+        expected_checkpoint_size,
+        0,
+        checkpoint_size,
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_root)
+        .at_version(expected_version)
         .build(&engine)?;
-    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
-    assert_eq!(domain_value, Some("bar2".to_string()));
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, expected_foo);
+    assert_eq!(
+        snapshot.get_domain_metadata("survivor", &engine)?,
+        Some("survivor_value".to_string())
+    );
 
     Ok(())
 }
@@ -895,8 +911,6 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     snapshot_v1.checkpoint(&engine, None)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
-
-// TODO: Add test that checkpoint does not contain tombstoned domain metadata.
 
 /// Helper to create metadata action with specific stats settings
 fn create_metadata_with_stats_config(
