@@ -24,6 +24,7 @@ use crate::crc::{
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
+use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::MetricId;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
@@ -348,13 +349,27 @@ impl Snapshot {
     /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
     /// Uses the CRC fast path when available, otherwise falls back to log replay.
+    ///
+    /// Reports metrics: `SetTransactionLoaded`.
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
-    #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
+    #[instrument(
+        parent = &self.span,
+        name = SET_TRANSACTION_LOADED_SPAN,
+        skip_all,
+        err,
+        fields(report, from_cache, found)
+    )]
     pub fn get_app_id_version(
         &self,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
+        fn record_metric(from_cache: bool, found: bool) {
+            let span = tracing::Span::current();
+            span.record("from_cache", from_cache);
+            span.record("found", found);
+        }
+
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
@@ -366,16 +381,19 @@ impl Snapshot {
             match &crc.set_transaction_state {
                 SetTransactionState::Complete(map) => {
                     // Complete is authoritative: a miss means the app_id has no transaction.
-                    return Ok(map
+                    let version = map
                         .get(application_id)
                         .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                        .map(|txn| txn.version));
+                        .map(|txn| txn.version);
+                    record_metric(true, version.is_some());
+                    return Ok(version);
                 }
                 SetTransactionState::Partial(map) => {
                     // Hit is authoritative; miss falls through to log replay below.
                     if let Some(txn) = map.get(application_id) {
                         let version = (!is_set_txn_expired(expiration_timestamp, txn.last_updated))
                             .then_some(txn.version);
+                        record_metric(true, version.is_some());
                         return Ok(version);
                     }
                 }
@@ -389,6 +407,7 @@ impl Snapshot {
             engine,
             expiration_timestamp,
         )?;
+        record_metric(false, txn.is_some());
         Ok(txn.map(|t| t.version))
     }
 
@@ -483,12 +502,27 @@ impl Snapshot {
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
     /// requested domain is in a Partial cache, also answer from the cache; else full log
     /// replay. `domains == None` means load all.
+    ///
+    /// Reports metrics: `DomainMetadataLoaded`.
+    #[instrument(
+        parent = &self.span,
+        name = DOMAIN_METADATA_LOADED_SPAN,
+        skip_all,
+        err,
+        fields(report, from_cache, num_domains_returned)
+    )]
     #[internal_api]
     pub(crate) fn get_domain_metadatas_internal(
         &self,
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
+        fn record_metric(from_cache: bool, num_domains_returned: usize) {
+            let span = tracing::Span::current();
+            span.record("from_cache", from_cache);
+            span.record("num_domains_returned", num_domains_returned as u64);
+        }
+
         // Fast path: serve from CRC if it tracks domain metadata at this version.
         if let Some(crc) = self
             .lazy_crc
@@ -496,7 +530,7 @@ impl Snapshot {
         {
             match &crc.domain_metadata_state {
                 DomainMetadataState::Complete(map) => {
-                    return Ok(match domains {
+                    let hits: DomainMetadataMap = match domains {
                         None => map.clone(),
                         // Look up each filter key. A miss means the domain does not exist
                         // at this version (Complete is authoritative for misses), so skip
@@ -505,7 +539,9 @@ impl Snapshot {
                             .iter()
                             .filter_map(|&k| map.get(k).map(|v| (k.to_string(), v.clone())))
                             .collect(),
-                    });
+                    };
+                    record_metric(true, hits.len());
+                    return Ok(hits);
                 }
                 DomainMetadataState::Partial(map) => {
                     if let Some(filter) = domains {
@@ -520,6 +556,7 @@ impl Snapshot {
                             .map(|&k| map.get(k).map(|v| (k.to_string(), v.clone())))
                             .collect();
                         if let Some(hits) = hits {
+                            record_metric(true, hits.len());
                             return Ok(hits);
                         }
                     }
@@ -531,7 +568,9 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        self.log_segment().scan_domain_metadatas(domains, engine)
+        let replayed = self.log_segment().scan_domain_metadatas(domains, engine)?;
+        record_metric(false, replayed.len());
+        Ok(replayed)
     }
 
     /// Fetch both user-controlled and system-controlled domain metadata for a specific domain
