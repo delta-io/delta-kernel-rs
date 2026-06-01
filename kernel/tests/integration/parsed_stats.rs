@@ -23,7 +23,7 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::table_builder::{unpartitioned, version_latest, FeatureSet, LogState, TableConfig};
-use test_utils::test_context;
+use test_utils::{get_column, test_context};
 
 /// Validate that JSON stats object values match the corresponding parsed struct array.
 ///
@@ -108,12 +108,7 @@ fn validate_nested_columns(
             continue;
         };
         let path = format!("{field_prefix}.{key}");
-        let sub_struct = parsed
-            .column_by_name(key)
-            .unwrap_or_else(|| panic!("{path}: present in JSON but missing from parsed struct"))
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap_or_else(|| panic!("{path}: expected StructArray for nested column"));
+        let sub_struct = get_column!(parsed, key, StructArray);
         assert_stats_struct_matches_json(sub_struct, sub_obj, row_idx, &path);
     }
 }
