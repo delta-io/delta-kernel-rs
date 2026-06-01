@@ -248,62 +248,47 @@ impl CountingReporter {
 impl MetricsReporter for CountingReporter {
     fn report(&self, event: MetricEvent) {
         match event {
-            MetricEvent::StorageListCompleted { num_files, .. } => {
+            MetricEvent::StorageListCompleted(e) => {
                 self.list_calls.inc();
-                self.list_files_seen.add(num_files);
+                self.list_files_seen.add(e.num_files);
             }
-            MetricEvent::StorageReadCompleted {
-                num_files,
-                bytes_read,
-                ..
-            } => {
+            MetricEvent::StorageReadCompleted(e) => {
                 self.storage_read_calls.inc();
-                self.storage_read_files.add(num_files);
-                self.storage_bytes_read.add(bytes_read);
+                self.storage_read_files.add(e.num_files);
+                self.storage_bytes_read.add(e.bytes_read);
             }
-            MetricEvent::StorageCopyCompleted { .. } => {
+            MetricEvent::StorageCopyCompleted(_) => {
                 self.copy_calls.inc();
             }
-            MetricEvent::JsonReadCompleted {
-                num_files,
-                bytes_read,
-            } => {
+            MetricEvent::JsonReadCompleted(e) => {
                 self.json_read_calls.inc();
-                self.json_files_read.add(num_files);
-                self.json_bytes_read.add(bytes_read);
+                self.json_files_read.add(e.num_files);
+                self.json_bytes_read.add(e.bytes_read);
             }
-            MetricEvent::ParquetReadCompleted {
-                num_files,
-                bytes_read,
-            } => {
+            MetricEvent::ParquetReadCompleted(e) => {
                 self.parquet_read_calls.inc();
-                self.parquet_files_read.add(num_files);
-                self.parquet_bytes_read.add(bytes_read);
+                self.parquet_files_read.add(e.num_files);
+                self.parquet_bytes_read.add(e.bytes_read);
             }
-            MetricEvent::SnapshotCompleted { .. } => {
+            MetricEvent::SnapshotCompleted(_) => {
                 self.snapshot_completions.inc();
             }
-            MetricEvent::LogSegmentLoaded {
-                num_commit_files,
-                num_checkpoint_files,
-                num_compaction_files,
-                has_latest_crc_file,
-                ..
-            } => {
+            MetricEvent::LogSegmentLoaded(e) => {
                 self.log_segment_loads.inc();
-                self.commit_files.add(num_commit_files);
-                self.checkpoint_files.add(num_checkpoint_files);
-                self.compaction_files.add(num_compaction_files);
-                self.latest_crc_files_found.add(has_latest_crc_file as u64);
+                self.commit_files.add(e.num_commit_files);
+                self.checkpoint_files.add(e.num_checkpoint_files);
+                self.compaction_files.add(e.num_compaction_files);
+                self.latest_crc_files_found
+                    .add(e.has_latest_crc_file as u64);
             }
-            MetricEvent::CrcReadCompleted { bytes_read, .. } => {
+            MetricEvent::CrcReadCompleted(e) => {
                 self.crc_read_calls.inc();
-                self.crc_bytes_read.add(bytes_read);
+                self.crc_bytes_read.add(e.bytes_read);
             }
-            // Intentionally not tracked -- add counters if needed.
-            MetricEvent::ProtocolMetadataLoaded { .. }
-            | MetricEvent::SnapshotFailed { .. }
-            | MetricEvent::ScanMetadataCompleted { .. } => {}
+            // Intentionally not tracked. Add counters if needed.
+            MetricEvent::ProtocolMetadataLoaded(_)
+            | MetricEvent::SnapshotFailed(_)
+            | MetricEvent::ScanMetadataCompleted(_) => {}
         }
     }
 }
@@ -313,7 +298,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use delta_kernel::metrics::MetricId;
+    use delta_kernel::metrics::{
+        CrcReadCompleted, LogSegmentLoaded, MetricId, ProtocolMetadataLoaded, SnapshotCompleted,
+        SnapshotFailed, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
+    };
 
     use super::*;
 
@@ -324,14 +312,14 @@ mod tests {
     #[test]
     fn report_storage_list_completed_increments_list_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::StorageListCompleted {
+        reporter.report(MetricEvent::StorageListCompleted(StorageListCompleted {
             duration: dur(),
             num_files: 10,
-        });
-        reporter.report(MetricEvent::StorageListCompleted {
+        }));
+        reporter.report(MetricEvent::StorageListCompleted(StorageListCompleted {
             duration: dur(),
             num_files: 5,
-        });
+        }));
         assert_eq!(reporter.list_calls.get(), 2);
         assert_eq!(reporter.list_files_seen.get(), 15);
     }
@@ -339,11 +327,11 @@ mod tests {
     #[test]
     fn report_storage_read_completed_increments_read_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::StorageReadCompleted {
+        reporter.report(MetricEvent::StorageReadCompleted(StorageReadCompleted {
             duration: dur(),
             num_files: 3,
             bytes_read: 1024,
-        });
+        }));
         assert_eq!(reporter.storage_read_calls.get(), 1);
         assert_eq!(reporter.storage_read_files.get(), 3);
         assert_eq!(reporter.storage_bytes_read.get(), 1024);
@@ -352,32 +340,34 @@ mod tests {
     #[test]
     fn report_storage_copy_completed_increments_copy_counter() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::StorageCopyCompleted { duration: dur() });
+        reporter.report(MetricEvent::StorageCopyCompleted(StorageCopyCompleted {
+            duration: dur(),
+        }));
         assert_eq!(reporter.copy_calls.get(), 1);
     }
 
     #[test]
     fn report_snapshot_completed_increments_snapshot_counter() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::SnapshotCompleted {
+        reporter.report(MetricEvent::SnapshotCompleted(SnapshotCompleted {
             operation_id: MetricId::new(),
             version: 0,
-            total_duration: dur(),
-        });
+            duration: dur(),
+        }));
         assert_eq!(reporter.snapshot_completions.get(), 1);
     }
 
     #[test]
     fn report_log_segment_loaded_increments_log_replay_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::LogSegmentLoaded {
+        reporter.report(MetricEvent::LogSegmentLoaded(LogSegmentLoaded {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
             num_compaction_files: 1,
             has_latest_crc_file: true,
-        });
+        }));
         assert_eq!(reporter.log_segment_loads.get(), 1);
         assert_eq!(reporter.commit_files.get(), 7);
         assert_eq!(reporter.checkpoint_files.get(), 2);
@@ -388,14 +378,14 @@ mod tests {
     #[test]
     fn report_log_segment_loaded_without_crc_does_not_increment_crc_counter() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::LogSegmentLoaded {
+        reporter.report(MetricEvent::LogSegmentLoaded(LogSegmentLoaded {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 3,
             num_checkpoint_files: 1,
             num_compaction_files: 0,
             has_latest_crc_file: false,
-        });
+        }));
         assert_eq!(reporter.log_segment_loads.get(), 1);
         assert_eq!(reporter.latest_crc_files_found.get(), 0);
     }
@@ -403,14 +393,14 @@ mod tests {
     #[test]
     fn report_crc_read_completed_increments_crc_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::CrcReadCompleted {
+        reporter.report(MetricEvent::CrcReadCompleted(CrcReadCompleted {
             duration: dur(),
             bytes_read: 512,
-        });
-        reporter.report(MetricEvent::CrcReadCompleted {
+        }));
+        reporter.report(MetricEvent::CrcReadCompleted(CrcReadCompleted {
             duration: dur(),
             bytes_read: 256,
-        });
+        }));
         assert_eq!(reporter.crc_read_calls.get(), 2);
         assert_eq!(reporter.crc_bytes_read.get(), 768);
     }
@@ -418,42 +408,46 @@ mod tests {
     #[test]
     fn report_untracked_events_does_not_panic() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::ProtocolMetadataLoaded {
+        reporter.report(MetricEvent::ProtocolMetadataLoaded(
+            ProtocolMetadataLoaded {
+                operation_id: MetricId::new(),
+                duration: dur(),
+            },
+        ));
+        reporter.report(MetricEvent::SnapshotFailed(SnapshotFailed {
             operation_id: MetricId::new(),
             duration: dur(),
-        });
-        reporter.report(MetricEvent::SnapshotFailed {
-            operation_id: MetricId::new(),
-            duration: dur(),
-        });
+        }));
         assert_eq!(reporter.snapshot_completions.get(), 0);
     }
 
     #[test]
     fn reset_zeros_all_counters() {
         let reporter = Arc::new(CountingReporter::new());
-        reporter.report(MetricEvent::StorageListCompleted {
+        reporter.report(MetricEvent::StorageListCompleted(StorageListCompleted {
             duration: dur(),
             num_files: 10,
-        });
-        reporter.report(MetricEvent::StorageReadCompleted {
+        }));
+        reporter.report(MetricEvent::StorageReadCompleted(StorageReadCompleted {
             duration: dur(),
             num_files: 3,
             bytes_read: 1024,
-        });
-        reporter.report(MetricEvent::StorageCopyCompleted { duration: dur() });
-        reporter.report(MetricEvent::LogSegmentLoaded {
+        }));
+        reporter.report(MetricEvent::StorageCopyCompleted(StorageCopyCompleted {
+            duration: dur(),
+        }));
+        reporter.report(MetricEvent::LogSegmentLoaded(LogSegmentLoaded {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
             num_compaction_files: 1,
             has_latest_crc_file: true,
-        });
-        reporter.report(MetricEvent::CrcReadCompleted {
+        }));
+        reporter.report(MetricEvent::CrcReadCompleted(CrcReadCompleted {
             duration: dur(),
             bytes_read: 512,
-        });
+        }));
 
         reporter.reset();
 

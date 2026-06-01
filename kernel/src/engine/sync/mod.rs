@@ -40,6 +40,9 @@ pub(crate) mod json;
 mod parquet;
 mod storage;
 
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod plan;
+
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
 pub(crate) struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,

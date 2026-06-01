@@ -20,10 +20,10 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
-use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{self, ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{
-    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
-    ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
+    DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
+    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
 };
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
@@ -1428,21 +1428,21 @@ impl ParquetHandler for EmptyParquetHandler {
     fn read_parquet_files(
         &self,
         _files: &[FileMeta],
-        _schema: crate::schema::SchemaRef,
+        _schema: schema::SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> crate::DeltaResult<FileDataReadResultIterator> {
+    ) -> DeltaResult<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> crate::DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
         unimplemented!()
     }
 
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: Box<dyn Iterator<Item = crate::DeltaResult<Box<dyn EngineData>>> + Send>,
-    ) -> crate::DeltaResult<()> {
+        _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
         unimplemented!()
     }
 }
@@ -1555,52 +1555,55 @@ mod scan_metadata_completed_tests {
         reporter
             .events()
             .into_iter()
-            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted(_)))
             .expect("expected ScanMetadataCompleted event")
     }
 
     #[rstest]
-    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 0, 0)]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
         Some(Arc::new(Pred::literal(false))),
         0,
         0,
         0,
+        0,
         0
     )]
-    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
-    #[case::with_checkpoint("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 0, 2, 0)]
+    #[case::with_checkpoint(
+        "./tests/data/with_checkpoint_no_last_checkpoint/",
+        None,
+        2,
+        1,
+        1010,
+        1,
+        0
+    )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
-        2, 2, 0, 4
+        2, 2, 1502, 0, 4
     )]
     fn test_scan_metrics(
         #[case] table: &str,
         #[case] predicate: Option<Arc<Pred>>,
         #[case] expected_add_seen: u64,
         #[case] expected_active: u64,
+        #[case] expected_active_bytes: u64,
         #[case] expected_removes: u64,
         #[case] expected_filtered: u64,
     ) {
         let (reporter, _guard, _) = run_scan(table, predicate);
-        let MetricEvent::ScanMetadataCompleted {
-            total_duration,
-            num_add_files_seen,
-            num_active_add_files,
-            num_remove_files_seen,
-            num_predicate_filtered,
-            ..
-        } = get_scan_event(&reporter)
-        else {
+        let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
-        assert!(total_duration > Duration::ZERO);
-        assert_eq!(num_add_files_seen, expected_add_seen);
-        assert_eq!(num_active_add_files, expected_active);
-        assert_eq!(num_remove_files_seen, expected_removes);
-        assert_eq!(num_predicate_filtered, expected_filtered);
+        assert!(e.duration > Duration::ZERO);
+        assert_eq!(e.num_add_files_seen, expected_add_seen);
+        assert_eq!(e.num_active_add_files, expected_active);
+        assert_eq!(e.active_add_files_bytes, expected_active_bytes);
+        assert_eq!(e.num_remove_files_seen, expected_removes);
+        assert_eq!(e.num_predicate_filtered, expected_filtered);
     }
 
     #[test]
@@ -1620,6 +1623,6 @@ mod scan_metadata_completed_tests {
         assert!(reporter
             .events()
             .iter()
-            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
+            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_))));
     }
 }

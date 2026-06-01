@@ -4,9 +4,9 @@ This book serves as a user guide + developer guide + overall docs for the kernel
 docs.rs and top-level README, the three provide comprehensive documentation for the project.
 
 ## prerequisites
-This book is built with [`mdbook`]. Install the latest version with `cargo install mdbook` or whatever
-their latest docs say.
 
+This book is built with [`mdbook`]. Install the latest version with `cargo install mdbook` or whatever
+their latest docs say. If running into issues with the `mermaid` preprocessor (e.g. "Unable to run the preprocessor `mermaid`"), run `cargo install mdbook-mermaid`.
 
 ## building
 The book is built in CI and deployed to github pages. TODO link to the page here. When working on
