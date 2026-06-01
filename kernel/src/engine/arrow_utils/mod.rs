@@ -15,7 +15,8 @@ use self::apply_schema::apply_schema_to_struct;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
+    StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::{cast_with_options, CastOptions};
@@ -1136,10 +1137,13 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     unsafe { StructArray::new_unchecked(fields, columns, nulls) }
 }
 
-/// Arrow lacks the functionality to json-parse a string column into a struct column, so we
-/// implement it here. This method is for json-parsing each string in a column of strings (add.stats
-/// to be specific) to produce a nested column of strongly typed values. We require that N rows in
-/// means N rows out.
+/// Parse a column of JSON strings into a typed `RecordBatch` matching `schema`. N input
+/// rows produce N output rows.
+///
+/// Failure-prone primitive leaves (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) produce
+/// per-cell NULL when the typed decoder rejects a value (extended-year timestamps,
+/// decimals that overflow the declared precision, etc.). Other leaf type mismatches still
+/// surface as batch-level errors.
 #[internal_api]
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
@@ -1150,11 +1154,10 @@ pub(crate) fn parse_json(
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
-/// Raw implementation of the JSON parsing. Separate from the public function for testing.
-/// Also used by ParseJson expression evaluation.
+/// Raw implementation of [`parse_json`]; see there for the per-cell NULL contract.
 ///
-/// Accepts any string array type (`StringArray`, `LargeStringArray`, `StringViewArray`) to avoid
-/// narrowing casts that could overflow (e.g. `LargeStringArray` -> `StringArray`).
+/// Accepts any string array type (`StringArray`, `LargeStringArray`, `StringViewArray`) to
+/// avoid narrowing casts that could overflow.
 pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
     schema: SchemaRef,
@@ -1181,12 +1184,9 @@ fn parse_json_inner<'a>(
     num_rows: usize,
     schema: SchemaRef,
 ) -> DeltaResult<RecordBatch> {
-    // arrow-json's typed Timestamp/Date/Decimal decoders fail the entire batch on a single
-    // bad cell. `StringifyFailureProneLeaves` rewrites those leaves to `String` so the
-    // typed decode accepts any well-formed JSON string; `safe_cast_back` then casts each
-    // string cell back to the target type with `safe: true`, producing per-cell NULL on
-    // parse failure. `Cow::Borrowed` from the transform means no failure-prone leaves
-    // were present, so we can skip the safe-cast pass entirely.
+    // arrow-json's typed Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch
+    // on a single bad cell, so rewrite those leaves to `String` first and safe-cast back to
+    // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
     match StringifyFailureProneLeaves.transform_struct(schema.as_ref()) {
         Cow::Borrowed(_) => {
             let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
@@ -1250,30 +1250,20 @@ fn decode_with_arrow_json<'a>(
     ))
 }
 
-/// Rewrites the four arrow-json-failure-prone primitive types (`Timestamp`, `TimestampNtz`,
-/// `Date`, `Decimal`) to `String` so the typed decoder will accept any well-formed JSON
-/// string instead of failing the whole batch on cells the typed parsers reject. The
-/// post-decode safe-cast pass converts each string cell back to the original type,
-/// producing per-cell NULL on parse failure.
+/// Rewrites failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) to
+/// `String` so the typed decoder accepts any well-formed JSON string for those cells.
 ///
-/// `Array`/`Map`/`Variant` are NOT visited because the Delta protocol does not record
-/// min/max stats for those types (see `MinMaxStatsTransform` in
-/// `scan::data_skipping::stats_schema`), so a failure-prone leaf can only ever appear
-/// inside a `Struct` for our callers. If a future caller passes a schema with
-/// failure-prone leaves nested inside `Array`/`Map`/`Variant`, drop these no-op overrides
-/// (the default recursion will then walk into them) and add the matching arms to
-/// [`safe_cast_array`].
+/// `Array`/`Map`/`Variant` are not visited: Delta doesn't track min/max stats for them,
+/// so a failure-prone leaf only ever shows up inside a `Struct` for our callers.
 struct StringifyFailureProneLeaves;
 
 impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Cow<'a, PrimitiveType> {
+        use PrimitiveType::*;
         match ptype {
-            PrimitiveType::Timestamp
-            | PrimitiveType::TimestampNtz
-            | PrimitiveType::Date
-            | PrimitiveType::Decimal(_) => Cow::Owned(PrimitiveType::String),
+            Timestamp | TimestampNtz | Date | Decimal(_) => Cow::Owned(String),
             _ => Cow::Borrowed(ptype),
         }
     }
@@ -1291,31 +1281,31 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
     }
 }
 
-/// Walks the decoded `RecordBatch` against the original target schema in lockstep and
-/// safe-casts every leaf back to its target type. `safe: true` produces per-cell NULL on
-/// parse failure instead of erroring out the whole batch.
+/// Safe-casts each column of `decoded` back to its target type. `safe: true` produces
+/// per-cell NULL on parse failure rather than failing the whole batch.
 fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<RecordBatch> {
     let opts = CastOptions {
         safe: true,
         ..Default::default()
     };
-    let columns = decoded
-        .columns()
-        .iter()
+    let (_, columns, row_count) = decoded.into_parts();
+    let columns = columns
+        .into_iter()
         .zip(target.fields().iter())
-        .map(|(arr, field)| safe_cast_array(arr.clone(), field.data_type(), &opts))
+        .map(|(arr, field)| safe_cast_array(arr, field.data_type(), &opts))
         .collect::<DeltaResult<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(target.clone(), columns)?)
+    Ok(RecordBatch::try_new_with_options(
+        target.clone(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )?)
 }
 
-/// Recursive worker for [`safe_cast_back`]. Recurses through `Struct` containers
-/// preserving the parent null buffer, and applies `cast_with_options` at the leaves.
+/// Recursive worker for [`safe_cast_back`]. Recurses through `Struct` containers preserving
+/// the parent null buffer; applies `cast_with_options` at the leaves.
 ///
-/// Delta protocol does not record min/max stats for `Array`/`Map`/`Variant` columns (see
-/// `MinMaxStatsTransform` in `scan::data_skipping::stats_schema`), so a failure-prone leaf
-/// can only ever reach this function nested inside a `Struct`. If that invariant ever
-/// changes, drop the no-op overrides on [`StringifyFailureProneLeaves`] and add the
-/// matching arms here.
+/// Delta doesn't track min/max stats for `Array`/`Map`/`Variant`, so a failure-prone leaf
+/// only ever reaches here inside a `Struct`.
 fn safe_cast_array(
     array: ArrowArrayRef,
     target: &ArrowDataType,

@@ -321,7 +321,9 @@ async fn extended_year_timestamp_stats_dont_collapse_skipping(
     // at the same on-disk root the kernel-managed engine uses. The kernel only reads commit
     // files during scan_metadata, so a fake Add (no backing parquet) is fine for this test.
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
-    let table_url_string = format!("file://{}/", std::path::Path::new(&table_path).display());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    let table_url_string = table_url.to_string();
 
     // Co-locate the malformed `file_B` with a valid `file_D` (Sep 2024, out of predicate
     // range) in the same commit. If the parse error all-nulled the batch, file_D would
