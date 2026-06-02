@@ -1344,6 +1344,7 @@ dependencies = [
 name = "delta_kernel_ffi"
 version = "0.24.0"
 dependencies = [
+ "bytes",
  "cbindgen",
  "delta-kernel-unity-catalog",
  "delta_kernel",
