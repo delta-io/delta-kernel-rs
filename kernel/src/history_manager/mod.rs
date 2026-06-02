@@ -591,64 +591,41 @@ pub fn timestamp_range_to_versions(
 /// `log_root`. This is either commit version 0 (if `00...00.json` exists), or the version
 /// of the earliest complete checkpoint that anchors the smallest surviving commit. A
 /// checkpoint is complete when a single-part or UUID file exists, or when all `num_parts`
-/// of a multi-part checkpoint are present.
+/// of a multi-part checkpoint are present. The returned version is not guaranteed to exist by the
+/// time the caller acts on it: a concurrent log-cleanup operation may delete the file.
 ///
-/// The returned version is a *lower bound*: a concurrent log cleanup may delete the
-/// underlying file after this function returns. Callers should treat it accordingly.
-///
-/// `earliest_ratified_commit_version` is a catalog-managed (CCv2) validation signal, not a
-/// version hint: only `Some(0)` is consulted, and only on the error path. For a
-/// catalog-managed table, commit 0 must be a published filesystem commit before the catalog
-/// exposes the table, so an empty log combined with `Some(0)` is a broken invariant (see
-/// `# Errors`). Every other value is ignored -- the scan finds commit 0 on its own when it
-/// is present.
-///
-/// # Note
-///
-/// This matches Java `DeltaHistoryManager.getEarliestRecreatableCommit`. A complete
-/// checkpoint at version V is a full snapshot of the table through V, so it anchors a
-/// smallest surviving commit of V+1: the checkpoint's own `commit@V` may have been cleaned
-/// up (the Delta protocol permits this, since the checkpoint subsumes it). The in-loop
-/// anchoring check therefore accepts a checkpoint at a version `>= smallest_commit - 1`. If
-/// the smallest surviving commit is more than one version beyond the latest complete
-/// checkpoint (a gap the cleanup invariant cannot produce), this returns
-/// [`LogHistoryError::NoRecreatableCommit`].
+/// # Parameters
+/// - `engine`: kernel engine used to list `log_root`.
+/// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
+/// - `earliest_ratified_commit_version`: For catalog-managed tables, it is the earliest version the
+///   catalog has ratified commit. Pass `None` for filesystem-only tables.
 ///
 /// # Errors
-///
-/// Returns [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at all
+/// - Propagate any error from listing the log directory.
+/// - [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at all
 /// (empty directory, or only checkpoint files) -- unless `earliest_ratified_commit_version`
 /// is `Some(0)`, in which case it returns a generic [`Error`](crate::Error) flagging the
 /// broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
-///
-/// Returns [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
+/// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
 /// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
-///
-/// Returns [`LogHistoryError::Internal`] if listing `_delta_log` or parsing a log path
-/// fails.
-#[tracing::instrument(skip(engine), err, fields(log_root = %log_root))]
-pub fn get_earliest_recreatable_commit(
+// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
+// this helper lands.
+#[allow(unused)]
+#[tracing::instrument(skip(engine), err, ret)]
+fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
     let mut last_complete_checkpoint: Option<Version> = None;
     // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
-    // checkpoint completeness. Using a set (not a count) makes the check robust to
-    // duplicate part numbers within the same checkpoint version.
-    let mut multi_part_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
-    // Lowest commit version seen so far. Stays at `Version::MAX` if no commit is ever
-    // observed, which distinguishes `NoCommitsFound` from `NoRecreatableCommit`.
+    // checkpoint completeness.
+    let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
     let mut smallest_commit_version = Version::MAX;
 
-    let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)
-        .map_err(|e| {
-        LogHistoryError::internal("listing _delta_log for earliest recreatable commit", e)
-    })?;
-    for parsed in listing {
-        let parsed = parsed.map_err(|e| {
-            LogHistoryError::internal("listing _delta_log for earliest recreatable commit", e)
-        })?;
+    let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
+    for parsed_result in listing {
+        let parsed = parsed_result?;
         match parsed.file_type {
             LogPathFileType::Commit => {
                 if parsed.version == 0 {
@@ -656,15 +633,9 @@ pub fn get_earliest_recreatable_commit(
                 }
                 smallest_commit_version = smallest_commit_version.min(parsed.version);
 
-                // Early exit: a complete checkpoint at V anchors a smallest surviving commit
-                // of V+1 (the checkpoint subsumes its own `commit@V`, which cleanup may
-                // delete). Because the listing is in version order and checkpoint files at
-                // version V sort before the commit at V, this returns the earliest checkpoint
-                // that anchors the smallest surviving commit. Matches Java
-                // `lastCompleteCheckpoint >= smallestDeltaVersion - 1`.
-                if let Some(cp) = last_complete_checkpoint {
-                    if cp + 1 >= smallest_commit_version {
-                        return Ok(cp);
+                if let Some(checkpoint_version) = last_complete_checkpoint {
+                    if checkpoint_version + 1 >= smallest_commit_version {
+                        return Ok(checkpoint_version);
                     }
                 }
             }
@@ -675,7 +646,7 @@ pub fn get_earliest_recreatable_commit(
                 part_num,
                 num_parts,
             } => {
-                let parts = multi_part_progress
+                let parts = multi_part_checkpoint_progress
                     .entry((parsed.version, num_parts))
                     .or_default();
                 parts.insert(part_num);
@@ -693,22 +664,16 @@ pub fn get_earliest_recreatable_commit(
     let saw_any_commit = smallest_commit_version != Version::MAX;
     match last_complete_checkpoint {
         Some(cp) if saw_any_commit && cp >= smallest_commit_version => Ok(cp),
-        _ if saw_any_commit => Err(LogHistoryError::NoRecreatableCommit {
+        _ if saw_any_commit => Err(DeltaError::from(LogHistoryError::NoRecreatableCommit {
             log_root: log_root.clone(),
-        }
-        .into()),
-        // No commits at all. For a catalog-managed table that has ratified commit 0 this is
-        // a broken invariant: commit 0 must be a published filesystem commit before the
-        // catalog exposes the table. Mirrors `get_earliest_published_commit_version`.
+        })),
         _ if earliest_ratified_commit_version == Some(0) => Err(DeltaError::generic(format!(
-            "The catalog-managed table commit v0 should be a file-system commit, but listing \
-             the log for table {log_root} returned no commits. Please check the CCv2 catalog \
-             server."
+            "expected a published v0 commit for catalog-managed table {log_root}, \
+                                    but the log listing returned no commits"
         ))),
-        _ => Err(LogHistoryError::NoCommitsFound {
+        _ => Err(DeltaError::from(LogHistoryError::NoCommitsFound {
             log_root: log_root.clone(),
-        }
-        .into()),
+        })),
     }
 }
 
@@ -733,7 +698,7 @@ mod tests {
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+    use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Version;
 
     fn get_test_schema() -> SchemaRef {
@@ -1719,18 +1684,6 @@ mod tests {
             .collect()
     }
 
-    /// Asserts that `$result` is `Err(DeltaError::LogHistory(boxed))` where `*boxed` matches
-    /// the given pattern.
-    macro_rules! assert_log_history_err {
-        ($result:expr, $pat:pat) => {{
-            let err = $result.unwrap_err();
-            match &err {
-                DeltaError::LogHistory(boxed) if matches!(**boxed, $pat) => {}
-                _ => panic!("expected {}, got: {err}", stringify!($pat)),
-            }
-        }};
-    }
-
     /// Builds a "truncated log" layout: `checkpoint_paths` plus commits over `commit_range`.
     fn truncated_log(
         checkpoint_paths: Vec<String>,
@@ -1765,8 +1718,6 @@ mod tests {
     #[case::truncated_single_part(truncated_log(vec![single_part_checkpoint_path(5)], 5..=9), None, 5)]
     #[case::truncated_uuid(truncated_log(vec![uuid_checkpoint_path(5)], 5..=9), None, 5)]
     #[case::truncated_multi_part(truncated_log(multi_part_checkpoint_paths(5, 3), 5..=9), None, 5)]
-    // Smallest commit is at v=7, so the earlier checkpoint at v=3 cannot anchor it; the
-    // multi-part checkpoint at v=7 does.
     #[case::picks_first_anchored_checkpoint(
         {
             let mut p = vec![single_part_checkpoint_path(3)];
@@ -1777,9 +1728,6 @@ mod tests {
         None,
         7,
     )]
-    // Two complete checkpoints with commits anchoring the earlier one: must return the
-    // earliest anchored checkpoint (v=3), not the latest (v=7). This is the Java/Spark
-    // `DeltaHistoryManager` behavior.
     #[case::prefers_earliest_anchored_checkpoint_over_later_one(
         {
             let mut p = vec![single_part_checkpoint_path(3)];
@@ -1799,11 +1747,8 @@ mod tests {
         None,
         0,
     )]
-    // `Some(0)` does not short-circuit: the scan finds the published commit 0 on its own.
     #[case::ratified_zero_with_v0_present((0..=3).map(commit_path).collect(), Some(0), 0)]
     #[case::non_zero_ratified_falls_through_to_scan((0..=3).map(commit_path).collect(), Some(99), 0)]
-    // Checkpoint at v=5 anchors a smallest surviving commit of v=6: the checkpoint subsumes
-    // its own (cleaned-up) commit 5. Matches Java `>= smallestDeltaVersion - 1`.
     #[case::checkpoint_one_before_smallest_commit_anchors(
         {
             let mut p = vec![single_part_checkpoint_path(5)];
@@ -1831,19 +1776,15 @@ mod tests {
         Ccv2MissingV0,
     }
 
-    /// All cases where `get_earliest_recreatable_commit` returns an error. Staged-only
-    /// is not exercised because staged commits are filtered upstream by `should_list`.
+    /// All cases where `get_earliest_recreatable_commit` returns an error.
     #[rstest::rstest]
     #[case::empty_log(vec![], None, ErrKind::NoCommits)]
     #[case::crc_only(vec![format!("_delta_log/{:020}.crc", 5)], None, ErrKind::NoCommits)]
     #[case::compacted_only(vec![format!("_delta_log/{:020}.{:020}.compacted.json", 0, 5)], None, ErrKind::NoCommits)]
     #[case::checkpoint_only(vec![single_part_checkpoint_path(5)], None, ErrKind::NoCommits)]
     #[case::non_zero_ratified_on_empty_log(vec![], Some(5), ErrKind::NoCommits)]
-    // Ratified commit 0 with an empty log is a broken CCv2 invariant, not a benign miss.
     #[case::ratified_zero_on_empty_log(vec![], Some(0), ErrKind::Ccv2MissingV0)]
     #[case::commits_have_no_anchor(vec![commit_path(2), commit_path(3)], None, ErrKind::NoRecreatable)]
-    // `Some(0)` only escalates the empty-log case; with commits present but no anchor it
-    // stays `NoRecreatableCommit`.
     #[case::ratified_zero_commits_no_anchor(vec![commit_path(2), commit_path(3)], Some(0), ErrKind::NoRecreatable)]
     #[case::incomplete_multi_part(
         {
@@ -1860,8 +1801,6 @@ mod tests {
         None,
         ErrKind::NoRecreatable,
     )]
-    // Checkpoint at v=5 is more than one version below the smallest surviving commit (v=7):
-    // a gap the cleanup invariant cannot produce, so the checkpoint cannot anchor the log.
     #[case::checkpoint_two_before_smallest_commit(
         {
             let mut p = vec![single_part_checkpoint_path(5)];
@@ -1877,15 +1816,19 @@ mod tests {
         #[case] expected: ErrKind,
     ) {
         let (engine, log_root) = engine_with_log_files(&paths);
-        let res = get_earliest_recreatable_commit(&engine, &log_root, ratified);
-        match expected {
-            ErrKind::NoCommits => {
-                assert_log_history_err!(res, LogHistoryError::NoCommitsFound { .. })
+        let err = get_earliest_recreatable_commit(&engine, &log_root, ratified).unwrap_err();
+        let matched = match (&err, expected) {
+            (DeltaError::LogHistory(e), ErrKind::NoCommits) => {
+                matches!(**e, LogHistoryError::NoCommitsFound { .. })
             }
-            ErrKind::NoRecreatable => {
-                assert_log_history_err!(res, LogHistoryError::NoRecreatableCommit { .. })
+            (DeltaError::LogHistory(e), ErrKind::NoRecreatable) => {
+                matches!(**e, LogHistoryError::NoRecreatableCommit { .. })
             }
-            ErrKind::Ccv2MissingV0 => assert_result_error_with_message(res, "CCv2 catalog server"),
-        }
+            (_, ErrKind::Ccv2MissingV0) => {
+                err.to_string().contains("expected a published v0 commit")
+            }
+            _ => false,
+        };
+        assert!(matched, "unexpected error for {expected:?}: {err}");
     }
 }
