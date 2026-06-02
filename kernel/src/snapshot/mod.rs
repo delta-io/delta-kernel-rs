@@ -287,7 +287,8 @@ impl Snapshot {
     /// Estimated owned heap size in bytes for this snapshot. Best-effort estimate
     /// for capacity tracking, not authoritative.
     ///
-    /// Counts only the dominant per-snapshot heap contributors:
+    /// Counts only the dominant per-snapshot heap contributors, normally > 70% of the snapshot's
+    /// owned heap size:
     /// - For every listed log path (commit, compaction, checkpoint, latest CRC, latest commit): the
     ///   filename / extension / Url string heap.
     /// - Vec buffer capacity (`capacity * size_of::<ParsedLogPath>()`) for the three Vec fields on
