@@ -118,6 +118,15 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
+# Declarative plan execution via PlanExecutor trait (experimental).
+# note: there is a dependency on arrow because PlanBasedEngine assumes the use of Arrow EngineData
+#       for JSON parsing
+declarative-plans = ["arrow-conversion", "arrow-expression"]
+
+# Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
+# work. TODO(#2630): remove once full column-defaults support ships.
+column-defaults-in-dev = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls
 default-engine-base = [
@@ -154,6 +163,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "fmt",
 ] }
 rstest = "0.23"
+rstest_reuse = "0.7"
 [[bench]]
 name = "metadata_bench"
 harness = false

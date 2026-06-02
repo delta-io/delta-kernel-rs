@@ -7,7 +7,7 @@ use url::Url;
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
-use crate::actions::{Add, ADD_NAME};
+use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
@@ -626,17 +626,14 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
                 .column_by_name("stats_parsed")
                 .unwrap()
                 .as_struct();
-            assert_eq!(
-                struct_field_value::<Int64Type>(stats, "numRecords", row),
-                42
-            );
-            let min_vals = stats.column_by_name("minValues").unwrap().as_struct();
+            assert_eq!(struct_field_value::<Int64Type>(stats, NUM_RECORDS, row), 42);
+            let min_vals = stats.column_by_name(MIN_VALUES).unwrap().as_struct();
             assert_eq!(struct_field_value::<Int64Type>(min_vals, "id", row), 1);
             assert_eq!(struct_field_string(min_vals, "name", row), "alice");
-            let max_vals = stats.column_by_name("maxValues").unwrap().as_struct();
+            let max_vals = stats.column_by_name(MAX_VALUES).unwrap().as_struct();
             assert_eq!(struct_field_value::<Int64Type>(max_vals, "id", row), 100);
             assert_eq!(struct_field_string(max_vals, "name", row), "zoe");
-            let null_count = stats.column_by_name("nullCount").unwrap().as_struct();
+            let null_count = stats.column_by_name(NULL_COUNT).unwrap().as_struct();
             assert_eq!(struct_field_value::<Int64Type>(null_count, "id", row), 0);
             assert_eq!(struct_field_value::<Int64Type>(null_count, "name", row), 5);
         }

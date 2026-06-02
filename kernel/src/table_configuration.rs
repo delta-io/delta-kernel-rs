@@ -335,6 +335,19 @@ impl TableConfiguration {
         )
     }
 
+    /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
+    /// every column reference in the rewritten predicate against this set, so the two
+    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
+    /// point to keep their gate input in lockstep.
+    pub(crate) fn physical_stats_columns_set(
+        &self,
+        required_columns: Option<&[ColumnName]>,
+    ) -> HashSet<ColumnName> {
+        self.physical_stats_column_names(required_columns)
+            .into_iter()
+            .collect()
+    }
+
     /// Returns the physical partition schema for `partitionValues_parsed`.
     ///
     /// Field names are physical column names (respecting column mapping mode),
@@ -864,6 +877,25 @@ impl TableConfiguration {
         // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
         self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
+
+    /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
+    /// See `crate::table_features::ROW_TRACKING_INFO` for more details.
+    pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
+        // RowTracking is a prerequisite for IcebergCompatV3, so the IcebergCompatV3 arm is
+        // technically redundant. Just be conservative here to check both.
+        if self.should_write_row_tracking() {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with rowTracking supported \
+                 and not suspended",
+            ));
+        }
+        if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -876,7 +908,7 @@ mod test {
     use url::Url;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -885,6 +917,7 @@ mod test {
     use crate::table_properties::{
         TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
         ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+        ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -1844,7 +1877,7 @@ mod test {
         // Verify field names are logical names
         let min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = min_values {
@@ -1868,7 +1901,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = physical_min_values {
@@ -1904,7 +1937,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         let DataType::Struct(inner) = physical_min_values else {
@@ -2000,7 +2033,7 @@ mod test {
 
         let DataType::Struct(inner) = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type()
         else {
@@ -2608,6 +2641,24 @@ mod test {
             config.validate_feature_requirements(&feature_to_enable),
             expected_error_substring,
         );
+    }
+
+    /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_
+    /// and not _suspended_, which is broader than _enabled_.
+    #[rstest]
+    #[case::supported_only(&[], Some("rowTracking"))]
+    #[case::supported_and_enabled(&[(ENABLE_ROW_TRACKING, "true")], Some("rowTracking"))]
+    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None /*expected_error_substring */)]
+    fn test_validate_feature_support_for_remove_row_tracking(
+        #[case] props: &[(&str, &str)],
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = create_mock_table_config(props, &[TableFeature::RowTracking]);
+        let result = config.validate_feature_support_for_remove();
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
     }
 
     /// Test helper: variant of `create_mock_table_config` that also takes an optional

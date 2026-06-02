@@ -89,11 +89,9 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
-// Public under test-utils so integration tests can inspect CRC state via
-// Snapshot::get_current_crc_if_loaded_for_testing.
-#[cfg(feature = "test-utils")]
+#[cfg(feature = "internal-api")]
 pub mod crc;
-#[cfg(not(feature = "test-utils"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -104,6 +102,8 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -178,17 +178,22 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, Error};
+pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+#[cfg(feature = "declarative-plans")]
+pub use plans::{
+    IoOperation, Operation, PlanExecutor, PlanResult, QueryPlan, QueryPlanBuilder, QueryPlanNode,
+};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
     feature = "default-engine-native-tls",
     feature = "default-engine-rustls",
-    feature = "arrow-conversion"
+    feature = "arrow-conversion",
+    feature = "declarative-plans"
 ))]
 pub mod engine;
 
@@ -205,8 +210,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+pub type FileDataReadResultIterator = DeltaResultIteratorStatic<Box<dyn EngineData>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,11 +589,20 @@ pub(crate) trait IntoEngineData {
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
 pub trait StorageHandler: AsAny {
-    /// List the paths in the same directory that are lexicographically greater than
-    /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
+    /// Recursively list files whose full path is lexicographically greater than (UTF-8 sorting)
+    /// the given `path`, restricted to descendants of `path`'s parent directory. The result must
+    /// be sorted by the full path (UTF-8 byte order).
     ///
-    /// If the path is directory-like (ends with '/'), the result should contain
-    /// all the files in the directory.
+    /// The listing is **recursive**: files in nested subdirectories are included, not just files
+    /// directly under the parent. For example, listing from `dir/0001.json` may return
+    /// `dir/0002.json`, `dir/sub/0003.json`, and `dir/sub/nested/0004.json`, all interleaved
+    /// in lexicographic order.
+    ///
+    /// The parent directory is derived from `path`:
+    /// - If `path` is directory-like (ends with `/`), the parent is `path` itself and the result
+    ///   contains all files at or below that directory.
+    /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
+    ///   under that parent) whose full path sorts strictly greater than `path` are returned.
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
@@ -684,7 +697,7 @@ pub trait JsonHandler: AsAny {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }
@@ -890,7 +903,7 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
@@ -947,6 +960,15 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`PlanExecutor`].
+    ///
+    /// The default implementation panics for now because the feature is still under development.
+    #[cfg(feature = "declarative-plans")]
+    #[allow(clippy::panic)]
+    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
+        unimplemented!("this engine does not provide a PlanExecutor")
+    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

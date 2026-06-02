@@ -61,6 +61,24 @@ get_default_engine() -> transaction() -> with_engine_info() -> with_operation() 
 
 `commit()` and `create_table_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
 
+Deletion vector update flow:
+
+```
+transaction()
+  -> dv_descriptor_map_new()
+  -> dv_descriptor_new()
+  -> dv_descriptor_map_insert()
+  -> scan() -> scan_metadata_iter_init()
+  -> transaction_update_deletion_vectors()
+  -> commit()
+```
+
+The engine authors the DV file and passes descriptor fields to `dv_descriptor_new`. The
+descriptor map and scan iterator are both consumed by `transaction_update_deletion_vectors`;
+descriptor handles are consumed by `dv_descriptor_map_insert` only on success and must be
+freed by the caller on error. DV updates require both the `deletionVectors` reader/writer
+feature and `delta.enableDeletionVectors=true`.
+
 ## Building
 
 ```bash
