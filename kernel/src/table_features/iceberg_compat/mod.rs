@@ -56,7 +56,7 @@ pub(super) fn check_only_supported_types(
     is_supported: fn(&DataType) -> bool,
     feature_label: &str,
 ) -> DeltaResult<()> {
-    let mut v = TypeAllowlistVisitor {
+    let mut v = TypeAllowListVisitor {
         is_supported,
         offender: None,
         path: vec![],
@@ -70,13 +70,18 @@ pub(super) fn check_only_supported_types(
     )))
 }
 
-struct TypeAllowlistVisitor {
+struct TypeAllowListVisitor {
     is_supported: fn(&DataType) -> bool,
+    /// The first unsupported field encountered, rendered as `<dotted.path> (<type>)`, or `None`
+    /// if every field is supported.
+    ///
+    /// For example, given schema `struct<events: array<struct<ts: timestamp>>>` (and assuming
+    /// `timestamp` is unsupported), the offender is `events.element.ts (timestamp)`.
     offender: Option<String>,
     path: Vec<String>,
 }
 
-impl TypeAllowlistVisitor {
+impl TypeAllowListVisitor {
     /// If `dt` isn't allowed, record it as the offender. No-op if an offender is already set.
     fn check(&mut self, dt: &DataType) {
         if self.offender.is_none() && !(self.is_supported)(dt) {
@@ -96,7 +101,7 @@ impl TypeAllowlistVisitor {
     }
 }
 
-impl<'a> SchemaTransform<'a> for TypeAllowlistVisitor {
+impl<'a> SchemaTransform<'a> for TypeAllowListVisitor {
     transform_output_type!(|'a, T| ());
 
     fn transform_struct_field(&mut self, f: &'a StructField) {
@@ -414,7 +419,7 @@ mod tests {
         #[case] schema: StructType,
         #[case] expected: Option<String>,
     ) {
-        let mut v = TypeAllowlistVisitor {
+        let mut v = TypeAllowListVisitor {
             is_supported,
             offender: None,
             path: vec![],
