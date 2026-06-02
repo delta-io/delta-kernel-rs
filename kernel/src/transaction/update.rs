@@ -211,6 +211,8 @@ impl Transaction {
     /// of scan file data. It joins the two together internally and will generate appropriate
     /// remove/add actions on commit to update the deletion vectors.
     ///
+    /// On commit, each matched file's add action carries `stats.tightBounds: false`.
+    ///
     /// # Arguments
     ///
     /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
@@ -228,6 +230,7 @@ impl Transaction {
     ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
     /// - A matched file's scan metadata is missing or has invalid `stats.numRecords`
+    /// - A matched file's `stats` is not valid JSON or is not a JSON object
     ///
     /// # Examples
     ///
@@ -280,8 +283,7 @@ impl Transaction {
         // 4. Cache the result in dv_matched_files for generating remove/add actions during commit
         for scan_file_result in existing_data_files {
             let scan_file = scan_file_result?;
-            visitor.new_dv_entries.clear();
-            visitor.new_stats_entries.clear();
+            visitor.new_entries.clear();
             visitor.matched_file_indexes.clear();
             visitor.visit_rows_of(&scan_file)?;
             let (data, mut selection_vector) = scan_file.into_parts();
@@ -307,15 +309,14 @@ impl Transaction {
 
             // Append two temporary columns to the scan data: the new DV descriptor and the
             // rewritten stats (with `tightBounds: false`).
+            let (dv_entries, stats_entries): (Vec<Scalar>, Vec<Scalar>) = visitor
+                .new_entries
+                .drain(..)
+                .map(|entry| (entry.deletion_vector, entry.stats))
+                .unzip();
             let new_columns = vec![
-                ArrayData::try_new(
-                    struct_deletion_vector_schema().clone(),
-                    visitor.new_dv_entries.clone(),
-                )?,
-                ArrayData::try_new(
-                    ArrayType::new(DataType::STRING, true),
-                    visitor.new_stats_entries.clone(),
-                )?,
+                ArrayData::try_new(struct_deletion_vector_schema().clone(), dv_entries)?,
+                ArrayData::try_new(ArrayType::new(DataType::STRING, true), stats_entries)?,
             ];
             matched_files.push(FilteredEngineData::try_new(
                 data.append_columns(new_dv_column_schema().clone(), new_columns)?,
@@ -546,18 +547,35 @@ impl<S> Transaction<S> {
 // DvMatchVisitor: matches file paths from scan data against new DV descriptors
 // =============================================================================
 
+/// One visited row's new deletion vector descriptor paired with its rewritten stats.
+struct DvUpdateEntry {
+    deletion_vector: Scalar,
+    stats: Scalar,
+}
+
+impl DvUpdateEntry {
+    /// The (null DV, null stats) entry for rows that are not getting a DV update.
+    fn null() -> Self {
+        static NULL_DV: LazyLock<Scalar> =
+            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+        static NULL_STATS: LazyLock<Scalar> = LazyLock::new(|| Scalar::Null(DataType::STRING));
+        Self {
+            deletion_vector: NULL_DV.clone(),
+            stats: NULL_STATS.clone(),
+        }
+    }
+}
+
 /// Visitor that matches file paths from scan data against new deletion vector descriptors.
 /// Used by update_deletion_vectors() to attach new DV descriptors to scan file metadata.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 struct DvMatchVisitor<'a> {
     /// Map from file path to the new deletion vector descriptor for that file
     dv_updates: &'a HashMap<String, DeletionVectorDescriptor>,
-    /// Accumulated DV descriptors (or nulls) for each visited row, in visit order
-    new_dv_entries: Vec<Scalar>,
-    /// Accumulated rewritten `stats` strings (or nulls) for each visited row, in visit order.
-    /// Matched rows carry their original stats with `tightBounds` forced to `false`; this stays
-    /// index-aligned with `new_dv_entries`.
-    new_stats_entries: Vec<Scalar>,
+    /// Accumulated (DV descriptor, rewritten stats) pairs for each visited row, in visit order.
+    /// Matched rows carry the new DV and their original stats with `tightBounds` forced to
+    /// `false`.
+    new_entries: Vec<DvUpdateEntry>,
     /// Indexes of rows that matched a file path in dv_update. These must be in
     /// ascending order
     matched_file_indexes: Vec<usize>,
@@ -574,8 +592,7 @@ impl<'a> DvMatchVisitor<'a> {
     fn new(dv_updates: &'a HashMap<String, DeletionVectorDescriptor>) -> Self {
         Self {
             dv_updates,
-            new_dv_entries: Vec::new(),
-            new_stats_entries: Vec::new(),
+            new_entries: Vec::new(),
             matched_file_indexes: Vec::new(),
         }
     }
@@ -600,34 +617,24 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
     ) -> DeltaResult<()> {
-        static NULL_DV: LazyLock<Scalar> =
-            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
-        static NULL_STATS: LazyLock<Scalar> = LazyLock::new(|| Scalar::Null(DataType::STRING));
         static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
             DeletionVectorDescriptor::to_schema()
                 .into_fields()
                 .collect()
         });
         let num_rows = rows.num_rows();
-        self.new_dv_entries.reserve(num_rows);
-        self.new_stats_entries.reserve(num_rows);
+        self.new_entries.reserve(num_rows);
         for row_index in rows {
-            // Fill in nulls for any deselected rows before this one. Both vecs stay index-aligned.
-            self.new_dv_entries
-                .resize_with(row_index, || NULL_DV.clone());
-            self.new_stats_entries
-                .resize_with(row_index, || NULL_STATS.clone());
+            // Fill in null entries for any deselected rows before this one.
+            self.new_entries.resize_with(row_index, DvUpdateEntry::null);
             let path_opt: Option<String> = getters[Self::PATH_INDEX].get_opt(row_index, "path")?;
             let Some(path) = path_opt else {
                 // Null path means a non-add action row (remove, metadata, etc.)
-                self.new_dv_entries.push(NULL_DV.clone());
-                self.new_stats_entries.push(NULL_STATS.clone());
+                self.new_entries.push(DvUpdateEntry::null());
                 continue;
             };
             if let Some(dv_result) = self.dv_updates.get(&path) {
                 // DVs require an accurate numRecords stat per the Delta protocol.
-                // We set the tightBound as false here to avoid heavy re-computation of the stats,
-                // and align with delta-spark.
                 let stats: Option<String> =
                     getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
                 let stats = stats.ok_or_else(|| {
@@ -657,8 +664,8 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     )));
                 }
 
-                // Set tightBounds to false(if not already false) to avoid heavy re-computation of
-                // the stats, and align with delta-spark.
+                // Widen tightBounds to false (unless already false) instead of recomputing the
+                // stats. Matches delta-spark.
                 let already_wide = stats_obj
                     .get(TIGHT_BOUNDS)
                     .and_then(serde_json::Value::as_bool)
@@ -673,7 +680,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                         ))
                     })?
                 };
-                self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
+                let deletion_vector = Scalar::Struct(StructData::try_new(
                     DV_SCHEMA_FIELDS.clone(),
                     vec![
                         Scalar::from(dv_result.storage_type.to_string()),
@@ -682,19 +689,18 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                         Scalar::from(dv_result.size_in_bytes),
                         Scalar::from(dv_result.cardinality),
                     ],
-                )?));
-                self.new_stats_entries.push(Scalar::from(new_stats));
+                )?);
+                self.new_entries.push(DvUpdateEntry {
+                    deletion_vector,
+                    stats: Scalar::from(new_stats),
+                });
                 self.matched_file_indexes.push(row_index);
             } else {
-                self.new_dv_entries.push(NULL_DV.clone());
-                self.new_stats_entries.push(NULL_STATS.clone());
+                self.new_entries.push(DvUpdateEntry::null());
             }
         }
-        // Pad with trailing nulls for any deselected rows at the end.
-        self.new_dv_entries
-            .resize_with(num_rows, || NULL_DV.clone());
-        self.new_stats_entries
-            .resize_with(num_rows, || NULL_STATS.clone());
+        // Pad with trailing null entries for any deselected rows at the end.
+        self.new_entries.resize_with(num_rows, DvUpdateEntry::null);
         Ok(())
     }
 }
@@ -749,31 +755,36 @@ mod tests {
     }
 
     #[rstest]
-    #[case::null_stats(None, &[], true)]
-    #[case::stats_missing_num_records(Some("{}"), &[], true)]
-    #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], false)]
+    #[case::null_stats(None, &[], Some(NUM_RECORDS))]
+    #[case::stats_missing_num_records(Some("{}"), &[], Some(NUM_RECORDS))]
+    #[case::stats_not_json_object(Some("5"), &[], Some("not a JSON object"))]
+    #[case::stats_invalid_json(Some("{not json"), &[], Some("not valid JSON"))]
+    #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], None)]
     #[case::extra_columns_dont_shift_indexes(
         Some(r#"{"numRecords":10}"#),
         &["size", "modificationTime"],
-        false,
+        None,
     )]
     fn dv_match_visitor_validates_matched_row_stats(
         #[case] stats: Option<&str>,
         #[case] extra_columns: &[&str],
-        #[case] expect_error: bool,
+        #[case] expected_err: Option<&str>,
     ) {
         let dv_updates = dv_updates_for(TEST_PATH);
         let mut visitor = DvMatchVisitor::new(&dv_updates);
         let data = make_scan_metadata_row(TEST_PATH, stats, extra_columns);
 
         let result = visitor.visit_rows_of(&data);
-        if expect_error {
-            let msg = result.expect_err("expected error").to_string();
-            assert!(msg.contains(NUM_RECORDS), "message was: {msg}");
-            assert!(msg.contains(TEST_PATH), "message was: {msg}");
-        } else {
-            result.expect("validation should pass");
-            assert_eq!(visitor.matched_file_indexes, vec![0]);
+        match expected_err {
+            Some(sub_str) => {
+                let msg = result.expect_err("expected error").to_string();
+                assert!(msg.contains(sub_str), "message was: {msg}");
+                assert!(msg.contains(TEST_PATH), "message was: {msg}");
+            }
+            None => {
+                result.expect("validation should pass");
+                assert_eq!(visitor.matched_file_indexes, vec![0]);
+            }
         }
     }
 
