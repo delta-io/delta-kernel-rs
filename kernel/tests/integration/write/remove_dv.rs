@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::actions::NUM_RECORDS;
+use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -644,6 +644,106 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
             }
         }
         _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+/// A DV update over a batch where only some files are targeted: only the matched files get
+/// remove/add pairs.
+#[tokio::test]
+async fn test_update_deletion_vectors_updates_only_matched_files(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    let file_names = &[
+        "file0.parquet",
+        "file1.parquet",
+        "file2.parquet",
+        "file3.parquet",
+    ];
+    let (store, engine, table_url, file_paths) =
+        create_dv_table_with_files("test_table", schema, file_names).await?;
+
+    // Target only files 1 and 3 for a DV update; files 0 and 2 must be left untouched.
+    let targeted = [file_paths[1].clone(), file_paths[3].clone()];
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
+        .with_engine_info("test engine")
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    let dv_map: HashMap<String, DeletionVectorDescriptor> = targeted
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: format!("dv_{path}.bin"),
+                    offset: Some(1),
+                    size_in_bytes: 40,
+                    cardinality: 1,
+                },
+            )
+        })
+        .collect();
+
+    let scan_files = get_scan_files(snapshot, engine.as_ref())?;
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let version = committed.commit_version();
+
+    // Read the commit directly from the (in-memory) store.
+    let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
+    let commit_content = store
+        .get(&Path::from_url_path(commit_path.path())?)
+        .await?
+        .bytes()
+        .await?;
+    let actions: Vec<serde_json::Value> = Deserializer::from_slice(&commit_content)
+        .into_iter()
+        .try_collect()?;
+    let adds: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("add")).collect();
+    let removes: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("remove")).collect();
+
+    // Only the two targeted files produce remove/add pairs.
+    assert_eq!(adds.len(), 2, "only the targeted files should be re-added");
+    assert_eq!(
+        removes.len(),
+        2,
+        "only the targeted files should be removed"
+    );
+
+    let mut added_paths: Vec<&str> = adds.iter().map(|a| a["path"].as_str().unwrap()).collect();
+    added_paths.sort();
+    let mut expected: Vec<&str> = targeted.iter().map(String::as_str).collect();
+    expected.sort();
+    assert_eq!(
+        added_paths, expected,
+        "re-added paths must be exactly the targeted files"
+    );
+
+    // Each new add carries its DV and widened tightBounds, with numRecords preserved.
+    for add in &adds {
+        assert!(
+            add["deletionVector"].is_object(),
+            "new add must carry a deletion vector"
+        );
+        let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
+        assert_eq!(
+            stats[TIGHT_BOUNDS].as_bool(),
+            Some(false),
+            "DV-updated add must widen tightBounds"
+        );
+        assert_eq!(
+            stats[NUM_RECORDS].as_i64(),
+            Some(3),
+            "numRecords must be preserved"
+        );
     }
 
     Ok(())
