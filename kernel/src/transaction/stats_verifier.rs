@@ -7,6 +7,7 @@
 
 use std::sync::LazyLock;
 
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
@@ -19,11 +20,11 @@ use crate::DeltaResult;
 /// For each required column, validates that `nullCount` is present (non-null) and that
 /// `minValues` and `maxValues` are present unless the column is all-null
 /// (`nullCount == numRecords`).
-pub(crate) struct StatsVerifier {
+pub(crate) struct StatsColumnVerifier {
     required_columns: Vec<(ColumnName, DataType)>,
 }
 
-impl StatsVerifier {
+impl StatsColumnVerifier {
     /// Create a new verifier that checks statistics for the given required columns and types.
     pub(crate) fn new(required_columns: Vec<(ColumnName, DataType)>) -> Self {
         Self { required_columns }
@@ -55,10 +56,10 @@ impl StatsVerifier {
     ) -> DeltaResult<()> {
         let column_names = vec![
             ColumnName::new(["path"]),
-            ColumnName::new(["stats", "numRecords"]),
-            build_stat_path(column, "nullCount"),
-            build_stat_path(column, "minValues"),
-            build_stat_path(column, "maxValues"),
+            ColumnName::new(["stats", NUM_RECORDS]),
+            build_stat_path(column, NULL_COUNT),
+            build_stat_path(column, MIN_VALUES),
+            build_stat_path(column, MAX_VALUES),
         ];
         let types = column_types_for(data_type)?;
 
@@ -67,7 +68,7 @@ impl StatsVerifier {
         let mut missing_max: Vec<String> = Vec::new();
 
         for batch in add_files {
-            let mut visitor = ColumnStatsVisitor {
+            let mut visitor = ColumnStatsValidator {
                 data_type,
                 types,
                 missing_null_count: &mut missing_null_count,
@@ -163,6 +164,13 @@ static COL_TYPES_DECIMAL: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     (names, types).into()
 });
 
+/// [`ColumnNamesAndTypes`] for [`NumRecordsValidator`].
+static NUM_RECORDS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    let names = vec![column_name!("path"), column_name!("stats.numRecords")];
+    let types = vec![DataType::STRING, DataType::LONG];
+    (names, types).into()
+});
+
 /// Select the predefined static type array for a given column data type.
 fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> {
     match dt {
@@ -219,7 +227,7 @@ fn is_stat_present<'b>(
 
 /// Visitor that checks nullCount, minValues, and maxValues for a single column in one pass.
 /// Expects 5 getters: [path, numRecords, nullCount, minValues, maxValues].
-struct ColumnStatsVisitor<'a> {
+struct ColumnStatsValidator<'a> {
     data_type: &'a DataType,
     types: &'static ColumnNamesAndTypes,
     missing_null_count: &'a mut Vec<String>,
@@ -227,7 +235,7 @@ struct ColumnStatsVisitor<'a> {
     missing_max: &'a mut Vec<String>,
 }
 
-impl RowVisitor for ColumnStatsVisitor<'_> {
+impl RowVisitor for ColumnStatsValidator<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         self.types.as_ref()
     }
@@ -243,8 +251,8 @@ impl RowVisitor for ColumnStatsVisitor<'_> {
 
         for row_idx in 0..row_count {
             let path: String = getters[0].get(row_idx, "path")?;
-            let num_records = getters[1].get_long(row_idx, "numRecords")?;
-            let null_count = getters[2].get_long(row_idx, "nullCount")?;
+            let num_records = getters[1].get_long(row_idx, NUM_RECORDS)?;
+            let null_count = getters[2].get_long(row_idx, NULL_COUNT)?;
 
             // When all rows are null (or the file is empty), minValues/maxValues are
             // expected to be null since there are no non-null values to aggregate.
@@ -261,6 +269,63 @@ impl RowVisitor for ColumnStatsVisitor<'_> {
             }
         }
 
+        Ok(())
+    }
+}
+
+/// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
+/// violation and returns an error containing the `add.path`.
+pub(crate) fn verify_num_records_present(
+    add_files: &[Box<dyn crate::EngineData>],
+) -> DeltaResult<()> {
+    let column_names = vec![
+        ColumnName::new(["path"]),
+        ColumnName::new(["stats", NUM_RECORDS]),
+    ];
+    let mut first_missing: Option<String> = None;
+    for batch in add_files {
+        let mut visitor = NumRecordsValidator {
+            first_missing: &mut first_missing,
+        };
+        batch.visit_rows(&column_names, &mut visitor)?;
+        if first_missing.is_some() {
+            break;
+        }
+    }
+    if let Some(path) = first_missing {
+        return Err(Error::stats_validation(format!(
+            "'stats.numRecords' is required for this table (see \
+             `TableConfiguration::requires_stats_num_records`), but is missing for file '{path}'",
+        )));
+    }
+    Ok(())
+}
+
+/// Visitor validates that every `add` action has `stats.numRecords` populated.
+/// Stops at the first row whose `numRecords` is null and records that row's `add.path`.
+struct NumRecordsValidator<'a> {
+    first_missing: &'a mut Option<String>,
+}
+
+impl RowVisitor for NumRecordsValidator<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        NUM_RECORDS_TYPES.as_ref()
+    }
+
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 2,
+            Error::internal_error(format!(
+                "Expected 2 getters for numRecords validation, got {}",
+                getters.len()
+            ))
+        );
+        for row_idx in 0..row_count {
+            if getters[1].get_long(row_idx, NUM_RECORDS)?.is_none() {
+                *self.first_missing = Some(getters[0].get(row_idx, "path")?);
+                return Ok(());
+            }
+        }
         Ok(())
     }
 }
@@ -334,10 +399,10 @@ mod tests {
         };
 
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            inner_struct_type("nullCount"),
-            inner_struct_type("minValues"),
-            inner_struct_type("maxValues"),
+            ArrowField::new(NUM_RECORDS, ArrowDataType::Int64, true),
+            inner_struct_type(NULL_COUNT),
+            inner_struct_type(MIN_VALUES),
+            inner_struct_type(MAX_VALUES),
         ]);
         let stats_struct = StructArray::new(
             stats_fields.clone(),
@@ -365,7 +430,7 @@ mod tests {
     #[test]
     fn test_verifier_with_empty_add_files() {
         let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
-        let verifier = StatsVerifier::new(columns);
+        let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[]);
         assert!(result.is_ok());
     }
@@ -381,7 +446,7 @@ mod tests {
         );
 
         let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
-        let verifier = StatsVerifier::new(columns);
+        let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[batch]);
         assert!(result.is_ok());
     }
@@ -389,9 +454,9 @@ mod tests {
     #[test]
     fn test_verify_missing_stat_category() {
         let cases = [
-            ("nullCount", vec![None], vec![Some(1)], vec![Some(100)]),
-            ("minValues", vec![Some(0)], vec![None], vec![Some(100)]),
-            ("maxValues", vec![Some(0)], vec![Some(1)], vec![None]),
+            (NULL_COUNT, vec![None], vec![Some(1)], vec![Some(100)]),
+            (MIN_VALUES, vec![Some(0)], vec![None], vec![Some(100)]),
+            (MAX_VALUES, vec![Some(0)], vec![Some(1)], vec![None]),
         ];
         for (category, null_counts, min_values, max_values) in cases {
             let batch = create_add_file_batch(
@@ -401,7 +466,8 @@ mod tests {
                 min_values,
                 max_values,
             );
-            let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
+            let verifier =
+                StatsColumnVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
             let err_msg = verifier.verify(&[batch]).unwrap_err().to_string();
             assert!(err_msg.contains("file1.parquet"), "case: {category}");
             assert!(err_msg.contains(category), "case: {category}");
@@ -426,7 +492,7 @@ mod tests {
         );
 
         let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
-        let verifier = StatsVerifier::new(columns);
+        let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[batch1, batch2]);
 
         assert!(result.is_err());
@@ -445,7 +511,7 @@ mod tests {
             vec![None],
         );
 
-        let verifier = StatsVerifier::new(vec![]);
+        let verifier = StatsColumnVerifier::new(vec![]);
         let result = verifier.verify(&[batch]);
         assert!(result.is_ok());
     }
@@ -462,7 +528,7 @@ mod tests {
         );
 
         let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
-        let verifier = StatsVerifier::new(columns);
+        let verifier = StatsColumnVerifier::new(columns);
         assert!(verifier.verify(&[batch]).is_ok());
     }
 
@@ -478,11 +544,11 @@ mod tests {
         );
 
         let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
-        let verifier = StatsVerifier::new(columns);
+        let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[batch]);
         assert!(matches!(result, Err(Error::StatsValidation(_))));
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("minValues"));
+        assert!(err.contains(MIN_VALUES));
     }
 
     /// Creates test data with two columns (col_a, col_b) in stats, both LONG.
@@ -523,10 +589,10 @@ mod tests {
             ArrowField::new("col_b", ArrowDataType::Int64, true),
         ]));
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            ArrowField::new("nullCount", inner_type.clone(), true),
-            ArrowField::new("minValues", inner_type.clone(), true),
-            ArrowField::new("maxValues", inner_type, true),
+            ArrowField::new(NUM_RECORDS, ArrowDataType::Int64, true),
+            ArrowField::new(NULL_COUNT, inner_type.clone(), true),
+            ArrowField::new(MIN_VALUES, inner_type.clone(), true),
+            ArrowField::new(MAX_VALUES, inner_type, true),
         ]);
         let stats_struct = StructArray::new(
             stats_fields.clone(),
@@ -566,7 +632,7 @@ mod tests {
             (ColumnName::new(["col_a"]), DataType::LONG),
             (ColumnName::new(["col_b"]), DataType::LONG),
         ];
-        assert!(StatsVerifier::new(columns).verify(&[batch]).is_ok());
+        assert!(StatsColumnVerifier::new(columns).verify(&[batch]).is_ok());
 
         // col_a valid, col_b missing minValues
         let batch = create_two_column_batch(
@@ -583,18 +649,18 @@ mod tests {
             (ColumnName::new(["col_a"]), DataType::LONG),
             (ColumnName::new(["col_b"]), DataType::LONG),
         ];
-        let err_msg = StatsVerifier::new(columns)
+        let err_msg = StatsColumnVerifier::new(columns)
             .verify(&[batch])
             .unwrap_err()
             .to_string();
         assert!(err_msg.contains("col_b"));
-        assert!(err_msg.contains("minValues"));
+        assert!(err_msg.contains(MIN_VALUES));
         assert!(!err_msg.contains("col_a"));
     }
 
     /// Verifies that stats collected from non-standard Arrow string representations
     /// (LargeUtf8/LargeStringArray, Utf8View/StringViewArray) can be validated by
-    /// StatsVerifier, which expects Delta's logical STRING type. Engines may use any of
+    /// StatsColumnVerifier, which expects Delta's logical STRING type. Engines may use any of
     /// these representations, and the stats pipeline must handle them without type errors.
     #[rstest]
     #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["Austin", "Boston", "Chicago"])) as ArrayRef)]
@@ -625,13 +691,14 @@ mod tests {
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
 
-        let verifier = StatsVerifier::new(vec![(ColumnName::new(["city"]), DataType::STRING)]);
+        let verifier =
+            StatsColumnVerifier::new(vec![(ColumnName::new(["city"]), DataType::STRING)]);
         verifier.verify(&[engine_data]).unwrap();
     }
 
     /// Verify collect_stats produces correct stats shape for all-null and empty batches.
     /// These cases keep the column in minValues/maxValues with null values (so that
-    /// StatsVerifier can find the field via visit_rows and check nullCount == numRecords).
+    /// StatsColumnVerifier can find the field via visit_rows and check nullCount == numRecords).
     #[rstest]
     #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
     #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
@@ -648,7 +715,7 @@ mod tests {
 
         // numRecords should match row count
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -657,7 +724,7 @@ mod tests {
 
         // All-null/empty columns are present in minValues/maxValues with null values
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -665,7 +732,7 @@ mod tests {
         assert!(min_values.column_by_name("col").unwrap().is_null(0));
 
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -808,7 +875,152 @@ mod tests {
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
 
-        let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), dt)]);
+        let verifier = StatsColumnVerifier::new(vec![(ColumnName::new(["col"]), dt)]);
         verifier.verify(&[engine_data]).unwrap();
+    }
+
+    // ============================================================================
+    // verify_num_records_present tests
+    // ============================================================================
+
+    #[rstest]
+    #[case::empty_input(vec![], None, vec![])]
+    #[case::all_present(
+        vec![vec![("a.parquet", Some(10)), ("b.parquet", Some(20))]],
+        None/* expected_first_offender */,
+        vec![]/* later_offenders */,
+    )]
+    #[case::first_offender_named_later_offenders_hidden(
+        vec![vec![("a.parquet", Some(10)), ("b.parquet", None), ("c.parquet", None)]],
+        Some("b.parquet"),
+        vec!["c.parquet"],
+    )]
+    #[case::short_circuits_across_batches(
+        vec![
+            vec![("a.parquet", None), ("b.parquet", Some(20))],
+            vec![("c.parquet", Some(30)), ("d.parquet", None)],
+        ],
+        Some("a.parquet"),
+        vec!["d.parquet"],
+    )]
+    fn test_verify_num_records_present(
+        #[case] batches: Vec<Vec<(&str, Option<i64>)>>,
+        #[case] expected_first_offender: Option<&str>,
+        #[case] later_offenders: Vec<&str>,
+    ) {
+        let batches: Vec<Box<dyn EngineData>> = batches
+            .into_iter()
+            .map(|rows| {
+                let (paths, num_records): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+                create_add_file_batch_with_num_records(paths, num_records)
+            })
+            .collect();
+        let result = verify_num_records_present(&batches);
+        match expected_first_offender {
+            None => result.unwrap(),
+            Some(path) => {
+                let err = result.unwrap_err().to_string();
+                assert!(
+                    err.contains("'stats.numRecords' is required") && err.contains(path),
+                    "expected error containing '{path}', but got: {err}",
+                );
+                for later_offender in &later_offenders {
+                    assert!(
+                        !err.contains(later_offender),
+                        "error should not mention '{later_offender}': {err}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_num_records_present_flags_add_without_stats() {
+        let batch = create_add_file_batch_with_stats_mask(
+            vec!["a.parquet", "b.parquet"],
+            vec![true, false],
+        );
+        let err = verify_num_records_present(&[batch])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'stats.numRecords' is required") && err.contains("b.parquet"),
+            "expected error naming b.parquet, got: {err}",
+        );
+        assert!(
+            !err.contains("a.parquet"),
+            "row with stats present should not be flagged: {err}",
+        );
+    }
+
+    fn create_add_file_batch_with_num_records(
+        paths: Vec<&str>,
+        num_records: Vec<Option<i64>>,
+    ) -> Box<dyn EngineData> {
+        let n = paths.len();
+        create_add_file_batch(
+            paths,
+            num_records,
+            vec![None; n],
+            vec![None; n],
+            vec![None; n],
+        )
+    }
+
+    /// Build an add-file batch where rows with `stats_present[i] == false` carry no `stats`
+    /// at all; other rows get `numRecords = 10`.
+    fn create_add_file_batch_with_stats_mask(
+        paths: Vec<&str>,
+        stats_present: Vec<bool>,
+    ) -> Box<dyn EngineData> {
+        assert_eq!(paths.len(), stats_present.len());
+        let n = paths.len();
+        let num_records: Vec<Option<i64>> = stats_present.iter().map(|p| p.then_some(10)).collect();
+        let path_array = StringArray::from(paths);
+
+        let col_field = Arc::new(ArrowField::new("col", ArrowDataType::Int64, true));
+        let inner_struct_type = |name: &str| {
+            ArrowField::new(
+                name,
+                ArrowDataType::Struct(Fields::from(vec![ArrowField::new(
+                    "col",
+                    ArrowDataType::Int64,
+                    true,
+                )])),
+                true,
+            )
+        };
+        let stats_fields = Fields::from(vec![
+            ArrowField::new(NUM_RECORDS, ArrowDataType::Int64, true),
+            inner_struct_type(NULL_COUNT),
+            inner_struct_type(MIN_VALUES),
+            inner_struct_type(MAX_VALUES),
+        ]);
+        let zero_inner_struct_array = StructArray::new(
+            Fields::from(vec![col_field]),
+            vec![Arc::new(Int64Array::from(vec![None as Option<i64>; n])) as ArrayRef],
+            None, /* null buffer */
+        );
+        let stats_struct_array = StructArray::new(
+            stats_fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(num_records)) as ArrayRef,
+                Arc::new(zero_inner_struct_array.clone()) as ArrayRef,
+                Arc::new(zero_inner_struct_array.clone()) as ArrayRef,
+                Arc::new(zero_inner_struct_array) as ArrayRef,
+            ],
+            // null buffer: rows with stats_present[i] == false are null
+            Some(stats_present.into_iter().collect()),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("path", ArrowDataType::Utf8, false),
+            ArrowField::new("stats", ArrowDataType::Struct(stats_fields), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(path_array), Arc::new(stats_struct_array)],
+        )
+        .unwrap();
+        Box::new(ArrowEngineData::new(batch))
     }
 }

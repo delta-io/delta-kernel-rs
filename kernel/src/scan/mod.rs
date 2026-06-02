@@ -24,7 +24,7 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::reporter::emit_scan_metadata_completed;
+use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::{
@@ -38,7 +38,7 @@ use crate::schema::{
     ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{ExpressionTransform, SchemaTransform};
+use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::IteratorExt;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
@@ -240,6 +240,17 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
+        // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
+        // a transient state, but a scan over zero columns has no way to derive row
+        // counts downstream and panics in the arrow layer. Users must populate the
+        // schema with ALTER TABLE ADD COLUMN before scanning.
+        if self.snapshot.schema().num_fields() == 0 {
+            return Err(Error::generic(
+                "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
+                 to add at least one column before scanning",
+            ));
+        }
+
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
@@ -362,6 +373,8 @@ struct GetReferencedFields<'a> {
     column_mapping_mode: ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // Capture the path mapping for this leaf field
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         // Record the physical name mappings for all referenced leaf columns. Delta column names
@@ -409,8 +422,10 @@ struct PrefixColumns {
 }
 
 impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
+        Cow::Owned(self.prefix.join(name))
     }
 }
 
@@ -418,6 +433,8 @@ struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
 impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // NOTE: We already verified all column references. But if the map probe ever did fail, the
     // transform would just delete any expression(s) that reference the invalid column.
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
@@ -852,12 +869,16 @@ impl Scan {
             .table_configuration()
             .metadata()
             .partition_columns();
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+        let skipping_pred = as_checkpoint_skipping_predicate(
+            predicate,
+            partition_columns,
+            &self.state_info.physical_stats_columns,
+        )?;
 
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),
         };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
+        let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
     }
 

@@ -40,6 +40,9 @@ impl CrcLoadResult {
 ///
 /// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
 /// Can also hold a precomputed CRC (e.g. from post-commit CRC merge) without a backing file.
+// TODO: remove `LazyCrc`. We will soon be doing incremental CRC replay, in which we always
+//       read the CRC if available. Note: in the meantime, `LazyCrc` and `Crc` both duplicate
+//       the version.
 #[derive(Debug)]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
@@ -145,16 +148,16 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::crc::{FileStats, FileStatsState};
+    use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
 
     fn table_root() -> url::Url {
         url::Url::parse("memory:///").unwrap()
     }
 
-    fn test_engine() -> DefaultEngine<TokioBackgroundExecutor> {
-        DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()
+    fn test_engine() -> SyncEngine {
+        SyncEngine::new_with_store(Arc::new(InMemory::new()))
     }
 
     // ===== CrcLoadResult Tests =====
@@ -162,15 +165,16 @@ mod tests {
     #[test]
     fn test_crc_load_result_loaded() {
         let crc = Crc {
-            table_size_bytes: 100,
-            num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: 10,
+                table_size_bytes: 100,
+                file_size_histogram: None,
+            }),
             ..Default::default()
         };
         let loaded = CrcLoadResult::Loaded(Arc::new(crc));
-        assert!(loaded.get().is_some());
-        assert_eq!(loaded.get().unwrap().table_size_bytes, 100);
+        let stats = loaded.get().unwrap().file_stats().unwrap();
+        assert_eq!(stats.table_size_bytes(), 100);
     }
 
     #[rstest]
@@ -228,7 +232,7 @@ mod tests {
         assert!(lazy.is_loaded());
 
         let crc = result.get().unwrap();
-        assert_eq!(crc.table_size_bytes, 5259);
+        assert_eq!(crc.file_stats().unwrap().table_size_bytes(), 5259);
     }
 
     #[test]
@@ -250,10 +254,11 @@ mod tests {
 
     fn test_crc(table_size_bytes: i64) -> Crc {
         Crc {
-            table_size_bytes,
-            num_files: 1,
-            num_metadata: 1,
-            num_protocol: 1,
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: 1,
+                table_size_bytes,
+                file_size_histogram: None,
+            }),
             ..Default::default()
         }
     }
@@ -268,8 +273,7 @@ mod tests {
 
         // get_if_loaded_at_version should return the CRC at the correct version
         let loaded = lazy.get_if_loaded_at_version(5);
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().table_size_bytes, 42);
+        assert_eq!(loaded.unwrap().file_stats().unwrap().table_size_bytes(), 42);
 
         // Wrong version should return None
         assert!(lazy.get_if_loaded_at_version(4).is_none());

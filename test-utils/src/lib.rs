@@ -1,12 +1,137 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod column_mapping_fixtures;
 pub mod counting_reporter;
 pub mod table_builder;
+
+// `rstest` and the `table_builder` factories appear inside the `define_sweeps!`
+// invocation below. Macro bodies are token streams that are only resolved when
+// consumer crates apply the emitted templates, so rustc doesn't see these uses.
+#[allow(unused_imports)]
+use rstest::rstest;
+pub use rstest_reuse;
+use rstest_reuse::template;
+#[allow(unused_imports)]
+use table_builder::*;
+
+/// Emits canonical sweep templates from a single source of truth.
+///
+/// Generates one `default_sweep` template (full Cartesian product of all five axes)
+/// plus one per-axis template (`log_state_sweep`, `feature_set_sweep`,
+/// `data_layout_sweep`, `table_config_sweep`, `version_target_sweep`). Each per-axis
+/// template only supplies its own axis; the consumer test fills in the others with
+/// inline `#[values(...)]` to control combination count.
+///
+/// Templates are emitted at crate root so the generated `#[macro_export]` macros
+/// are reachable cross-crate as `test_utils::<name>` via `#[rstest_reuse::apply]`.
+///
+/// ```ignore
+/// // Iterate only the LogState axis; fix everything else.
+/// #[apply(log_state_sweep)]
+/// fn my_test(
+///     log_state: LogState,
+///     #[values(no_features())] feature_set: FeatureSet,
+///     #[values(unpartitioned())] data_layout: DataLayoutConfig,
+///     #[values(checkpoint_json_stats())] table_config: TableConfig,
+///     #[values(version_latest())] version_target: VersionTarget,
+/// ) { /* ... */ }
+/// ```
+macro_rules! define_sweeps {
+    (
+        log_state_values = $ls:tt,
+        feature_set_values = $fs:tt,
+        data_layout_values = $dl:tt,
+        table_config_values = $tc:tt,
+        version_target_values = $vt:tt $(,)?
+    ) => {
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn default_sweep(
+            #[values $ls] log_state: LogState,
+            #[values $fs] feature_set: FeatureSet,
+            #[values $dl] data_layout: DataLayoutConfig,
+            #[values $tc] table_config: TableConfig,
+            #[values $vt] version_target: VersionTarget,
+        ) {
+        }
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn log_state_sweep(#[values $ls] log_state: LogState) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn feature_set_sweep(#[values $fs] feature_set: FeatureSet) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn data_layout_sweep(#[values $dl] data_layout: DataLayoutConfig) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn table_config_sweep(#[values $tc] table_config: TableConfig) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn version_target_sweep(#[values $vt] version_target: VersionTarget) {}
+    };
+}
+
+define_sweeps! {
+    // TODO: CRC at last / stale CRC (needs LogState::with_crc_at).
+    // TODO: Log compaction (needs LogState::with_compaction_at, #2337).
+    // TODO: Schema history (add/drop/rename) (needs schema-evolution support).
+    log_state_values = (
+        commits_only(),
+        checkpoint_at_end(),
+        checkpoint_at_end_no_hint(),
+        checkpoint_mid(),
+        checkpoint_mid_no_hint(),
+        two_checkpoints_stale_hint(),
+        checkpoint_at_end_post_cleanup(),
+        checkpoint_at_end_no_hint_post_cleanup(),
+        checkpoint_mid_post_cleanup(),
+        checkpoint_mid_no_hint_post_cleanup(),
+        two_checkpoints_stale_hint_post_cleanup()
+    ),
+    // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
+    //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
+    //       allowColumnDefaults, identityColumns, NTZ/variant (schema-driven),
+    //       catalogManaged, collations for CM=name, typeWidening write support).
+    // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
+    // TODO: iceV3 (needs icebergCompatV3).
+    feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
+    // TODO: null-distribution and partition-by-timestamp-with-CM rows.
+    data_layout_values = (unpartitioned(), partitioned(), clustered()),
+    table_config_values = (
+        checkpoint_json_stats(),
+        checkpoint_struct_stats(),
+        no_checkpoint_stats()
+    ),
+    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
+    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
+    version_target_values = (
+        version_latest(),
+        version_at_mid(),
+        version_incremental_to_latest()
+    ),
+}
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub use counting_reporter::{CountingReporter, RelaxedCounter};
-use delta_kernel::actions::get_log_add_schema;
+pub use counting_reporter::{
+    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
+    CountingReporter, RelaxedCounter,
+};
+use delta_kernel::actions::{
+    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
     StringArray, StructArray,
@@ -33,7 +158,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -270,7 +395,10 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 }
 
 // Resolve a table from a root and relative path
-fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+pub(crate) fn resolve_table_path(
+    table_root: impl AsRef<str>,
+    relative: &Path,
+) -> DeltaResult<Path> {
     let url = try_parse_uri(table_root)?;
     Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
 }
@@ -436,6 +564,8 @@ pub fn engine_store_setup(
 
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
+// For property-gated writer features, this helper also writes the corresponding enablement
+// property when the writer feature is requested.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
     store: Arc<DynObjectStore>,
@@ -497,6 +627,9 @@ pub async fn create_table(
         }
         if writer_features.contains(&"changeDataFeed") {
             config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+        if writer_features.contains(&"deletionVectors") {
+            config.insert("delta.enableDeletionVectors".to_string(), json!("true"));
         }
         if reader_features.contains(&"catalogManaged") {
             config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
@@ -668,8 +801,7 @@ pub async fn insert_data<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
@@ -680,6 +812,23 @@ pub async fn insert_data<E: TaskExecutor>(
     txn.add_files(add_files_metadata);
 
     txn.commit(engine.as_ref())
+}
+
+/// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
+pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
+    snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+}
+
+/// Load latest snapshot from `table_url` and start a transaction using a [`FileSystemCommitter`].
+///
+/// Convenience for the common test pattern of building a fresh snapshot just to start a
+/// transaction, when the snapshot itself is not needed afterward.
+pub fn load_and_begin_transaction(
+    table_url: impl AsRef<str>,
+    engine: &dyn Engine,
+) -> DeltaResult<Transaction> {
+    let snapshot = Snapshot::builder_for(table_url).build(engine)?;
+    begin_transaction(snapshot, engine)
 }
 
 // Helper function to set json values in a serde_json Values
@@ -900,10 +1049,12 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
 }
 
 /// Creates add file metadata for one or more files without partition values.
-/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+///
+/// Each tuple contains `(file_path, file_size, mod_time, num_records)`. `num_records` is
+/// `Option<i64>` so callers can produce a NULL `stats.numRecords` cell.
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
-    files: Vec<(&str, i64, i64, i64)>,
+    files: Vec<(&str, i64, i64, Option<i64>)>,
 ) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
     let num_files = files.len();
 
@@ -956,12 +1107,12 @@ pub fn create_add_files_metadata(
 
     let stats_struct = StructArray::from(vec![
         (
-            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
             Arc::new(num_records_array) as ArrayRef,
         ),
         (
             Arc::new(Field::new(
-                "nullCount",
+                NULL_COUNT,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -969,7 +1120,7 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "minValues",
+                MIN_VALUES,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -977,14 +1128,14 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "maxValues",
+                MAX_VALUES,
                 ArrowDataType::Struct(empty_struct_fields),
                 true,
             )),
             Arc::new(empty_struct) as ArrayRef,
         ),
         (
-            Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+            Arc::new(Field::new(TIGHT_BOUNDS, ArrowDataType::Boolean, true)),
             Arc::new(tight_bounds_array) as ArrayRef,
         ),
     ]);
@@ -1260,6 +1411,21 @@ pub fn remove_all_and_get_remove_actions(
         _ => panic!("Transaction should be committed"),
     };
     read_actions_from_commit(table_url, committed.commit_version(), "remove")
+}
+
+/// Build a `serde_json::Value` mapping nested dot-paths to ids.
+///
+/// For example, `nested_ids_json(&[("array_in_map.key", 100)])` builds:
+///
+/// ```json
+/// { "array_in_map.key": 100 }
+/// ```
+pub fn nested_ids_json(entries: &[(&str, i64)]) -> serde_json::Value {
+    let obj: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::from(*v)))
+        .collect();
+    serde_json::Value::Object(obj)
 }
 
 /// Asserts that `action["partitionValues"]` contains the given key with the expected value.

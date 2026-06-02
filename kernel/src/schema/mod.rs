@@ -16,8 +16,10 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
-use crate::table_features::{get_field_column_mapping_info, ColumnMappingMode};
-use crate::transforms::SchemaTransform;
+use crate::table_features::{
+    validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
+};
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -100,7 +102,27 @@ impl From<bool> for MetadataValue {
 pub enum ColumnMetadataKey {
     ColumnMappingId,
     ColumnMappingPhysicalName,
+    /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
+    /// Map. Stored on the *nearest ancestor* StructField as a JSON object whose keys are
+    /// dot-paths rooted at that field's name.
+    ///
+    /// # Example: list-in-map
+    ///
+    /// For `m: map<int, array<int>>` and the key/value/element fields having field ids
+    /// 100/101/102, the metadata on `m` should be:
+    ///
+    /// ```json
+    /// {
+    ///   "delta.columnMapping.nested.ids": {
+    ///     "m.key":           100,
+    ///     "m.value":         101,
+    ///     "m.value.element": 102
+    ///   }
+    /// }
+    /// ```
+    ColumnMappingNestedIds,
     ParquetFieldId,
+    ParquetFieldNestedIds,
     GenerationExpression,
     IdentityStart,
     IdentityStep,
@@ -116,10 +138,16 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
+            Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
             // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
             // established by delta-spark and other Delta ecosystem implementations for storing
             // Parquet field IDs in StructField metadata.
             Self::ParquetFieldId => "parquet.field.id",
+            // The Delta protocol defines this key for IcebergCompatV2/V3 nested field ids. It is
+            // legacy and will be replaced by `delta.columnMapping.nested.ids` (which kernel
+            // uses everywhere). Kept here for protocol compatibility only.
+            // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
+            Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
             Self::GenerationExpression => "delta.generationExpression",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
@@ -208,6 +236,18 @@ pub struct StructField {
     pub nullable: bool,
     /// A JSON map containing information about this column
     pub metadata: HashMap<String, MetadataValue>,
+}
+
+/// Parsed (and validated) pre-existing column-mapping annotations on a single field, as
+/// returned by [`StructField::validate_and_extract_existing_column_mapping_annotations`].
+/// Either, both, or neither of the two fields may be present; a field with neither set has no
+/// pre-populated column-mapping metadata.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExistingColumnMappingAnnotations<'a> {
+    /// Parsed `delta.columnMapping.id`, if present. Guaranteed non-negative.
+    pub id: Option<i64>,
+    /// Borrowed `delta.columnMapping.physicalName`, if present. Guaranteed non-empty.
+    pub physical_name: Option<&'a str>,
 }
 
 impl StructField {
@@ -334,6 +374,96 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
+    /// Returns this field's `delta.columnMapping.id` annotation if present and well-formed.
+    /// Returns `None` if the annotation is missing or carries a non-numeric value.
+    pub fn column_mapping_id(&self) -> Option<i64> {
+        match self.get_config_value(&ColumnMetadataKey::ColumnMappingId)? {
+            MetadataValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Validates and extracts pre-existing column-mapping annotations on this field, returning
+    /// the parsed `id` and `physical_name` borrowed from the field's metadata. Returning the
+    /// parsed values lets the column-mapping assignment dispatch match on
+    /// `(Option<i64>, Option<&str>)` directly, which makes the dispatch total and obviates a
+    /// catch-all panic for malformed annotations the validator already rejects.
+    ///
+    /// Rejects:
+    /// - `delta.columnMapping.id` is present but not a `MetadataValue::Number`,
+    /// - `delta.columnMapping.id` is a `Number` but lies outside the protocol's 32-bit non-negative
+    ///   range (negative or `> i32::MAX`); see
+    ///   [`crate::table_features::validate_column_mapping_id`],
+    /// - `delta.columnMapping.physicalName` is present but not a `MetadataValue::String`,
+    /// - `delta.columnMapping.physicalName` is an empty `String`.
+    ///
+    /// Empty-name, negative-id, and over-`i32::MAX` id are stricter than delta-spark (which
+    /// accepts the first two and historically truncates the third); kernel fails fast at
+    /// write time so a connector that supplies bad metadata learns about it on the call that
+    /// produced it. Wrong-typed `id` errors take precedence over wrong-typed `physicalName`
+    /// errors (a connector that fixes the `id` and retries will then see the `physicalName`
+    /// error).
+    pub(crate) fn validate_and_extract_existing_column_mapping_annotations(
+        &self,
+    ) -> DeltaResult<ExistingColumnMappingAnnotations<'_>> {
+        let id = match self.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+            Some(MetadataValue::Number(n)) => {
+                validate_column_mapping_id(*n)
+                    .map_err(|e| Error::schema(format!("Field '{}': {e}", self.name)))?;
+                Some(*n)
+            }
+            None => None,
+            Some(_) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-numeric `{}` annotation",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                )));
+            }
+        };
+        let physical_name =
+            match self.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                Some(MetadataValue::String(s)) if s.is_empty() => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has an empty `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+                Some(MetadataValue::String(s)) => Some(s.as_str()),
+                None => None,
+                Some(_) => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has a non-string `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+            };
+        Ok(ExistingColumnMappingAnnotations { id, physical_name })
+    }
+
+    /// Recursively collects every `delta.columnMapping.id` reachable from this field --
+    /// the field's own ID plus any nested struct fields under Struct/Array/Map/Variant.
+    /// Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn collect_column_mapping_ids(&self) -> Vec<i64> {
+        struct CollectIds(Vec<i64>);
+        impl<'a> SchemaTransform<'a> for CollectIds {
+            transform_output_type!(|'a, T| ());
+
+            fn transform_struct_field(&mut self, field: &'a StructField) {
+                if let Some(id) = field.column_mapping_id() {
+                    self.0.push(id);
+                }
+                self.recurse_into_struct_field(field)
+            }
+        }
+        let mut visitor = CollectIds(Vec::new());
+        visitor.transform_struct_field(self);
+        visitor.0
+    }
+
     /// Get the physical name for this field as it should be read from parquet.
     ///
     /// When `column_mapping_mode` is `None`, always returns the logical name (even if physical
@@ -443,7 +573,9 @@ impl StructField {
         &self,
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
-        MakePhysical::new(column_mapping_mode).run_field(self)
+        MakePhysical::new(column_mapping_mode)
+            .transform_struct_field(self)
+            .map(|f| f.into_owned())
     }
 
     pub(crate) fn has_invariants(&self) -> bool {
@@ -457,8 +589,8 @@ impl StructField {
     /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
     ///
     /// NOTE: Caller affirms that `self` was already validated by
-    /// [`crate::table_features::get_field_column_mapping_info`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`], to ensure that
+    /// annotations are always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
@@ -471,7 +603,8 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `get_field_column_mapping_info` should have verified that this has a field Id
+                    // `validate_and_extract_column_mapping_annotations` should have verified that
+                    // this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -942,11 +1075,7 @@ impl StructType {
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
         let mut transformer = MakePhysical::new(column_mapping_mode);
-        let fields: Vec<StructField> = self
-            .fields()
-            .map(|field| transformer.run_field(field))
-            .try_collect()?;
-        Self::try_new(fields)
+        transformer.transform_struct(self).map(|s| s.into_owned())
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -1318,16 +1447,17 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
     }
 }
 
-struct InvariantChecker(bool);
+struct InvariantChecker;
 
 impl<'a> SchemaTransform<'a> for InvariantChecker {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
         if field.has_invariants() {
-            self.0 = true;
-        } else if !self.0 {
-            let _ = self.recurse_into_struct_field(field);
+            Err(())
+        } else {
+            self.recurse_into_struct_field(field)
         }
-        Some(Cow::Borrowed(field))
     }
 }
 
@@ -1336,32 +1466,29 @@ impl<'a> SchemaTransform<'a> for InvariantChecker {
 /// This traverses the entire schema to check for the presence of the `delta.invariants`
 /// metadata key.
 pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
-    let mut checker = InvariantChecker(false);
-    let _ = checker.transform_struct(schema);
-    checker.0
+    InvariantChecker.transform_struct(schema).is_err()
 }
 
 /// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
 /// Walks the full schema tree including nested struct, array element, and map value structs.
-struct NonNullFieldChecker {
-    found: bool,
-}
+struct NonNullFieldChecker;
 
 impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
     /// Skip recursion into variant internals. The `metadata` and `value` fields inside a
     /// `Variant` are protocol-defined, always non-null, and not user-controlled, so they
     /// must not be treated as user-declared non-null columns.
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        Some(Cow::Borrowed(stype))
+    fn transform_variant(&mut self, _stype: &'a StructType) -> Result<(), ()> {
+        Ok(())
     }
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
         if !field.is_nullable() {
-            self.found = true;
-        } else if !self.found {
-            let _ = self.recurse_into_struct_field(field);
+            return Err(());
         }
-        Some(Cow::Borrowed(field))
+
+        self.recurse_into_struct_field(field)
     }
 }
 
@@ -1370,9 +1497,7 @@ impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
 ///
 /// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
 pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
-    let mut checker = NonNullFieldChecker { found: false };
-    let _ = checker.transform_struct(schema);
-    checker.found
+    NonNullFieldChecker.transform_struct(schema).is_err()
 }
 
 /// Normalizes column name field names to match the casing in the schema.
@@ -2035,7 +2160,9 @@ impl GetSchemaLeaves {
 }
 
 impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
-    fn transform_struct_field(&mut self, field: &StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| ());
+
+    fn transform_struct_field(&mut self, field: &'a StructField) {
         self.path.push(field.name.clone());
         if let DataType::Struct(_) = field.data_type {
             self.recurse_into_struct_field(field);
@@ -2044,92 +2171,92 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
             self.types.push(field.data_type.clone());
         }
         self.path.pop();
-        None
     }
 }
 
 struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
-    path: Vec<&'a str>,
-    seen: HashMap<i64, &'a str>,
-    err: Option<Error>,
+    /// Logical path of current field's parent, used for error messages.
+    logical_path: Vec<&'a str>,
+    /// `delta.columnMapping.id` -> first claimer logical name.
+    seen_ids: HashMap<i64, &'a str>,
+    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
+    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
+    /// pushed in `transform_struct` (root struct included) and popped after iterating its
+    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
+    /// elements / keys / values are anonymous.
+    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
         Self {
             column_mapping_mode,
-            path: vec![],
-            seen: HashMap::new(),
-            err: None,
-        }
-    }
-
-    /// Transforms a single [`StructField`] from logical to physical. Returns the physical
-    /// field on success, or the first error encountered during the recursive transformation.
-    fn run_field(&mut self, field: &'a StructField) -> DeltaResult<StructField> {
-        let result = self.transform_struct_field(field);
-        match (self.err.take(), result) {
-            (Some(err), _) => Err(err),
-            // Theoretically impossible: MakePhysical only returns None when it sets an error
-            (None, None) => Err(Error::internal_error(
-                "make_physical: transform returned None without setting an error",
-            )),
-            (None, Some(field)) => Ok(field.into_owned()),
+            logical_path: vec![],
+            seen_ids: HashMap::new(),
+            sibling_names_stack: vec![],
         }
     }
 
     fn transform_inner<T>(
         &mut self,
-        field_name: &'a str,
-        transform: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<T> {
-        if self.err.is_some() {
-            return None;
-        }
-        self.path.push(field_name);
+        logical_name: &'a str,
+        transform: impl FnOnce(&mut Self) -> DeltaResult<T>,
+    ) -> DeltaResult<T> {
+        self.logical_path.push(logical_name);
         let result = transform(self);
-        self.path.pop();
+        self.logical_path.pop();
         result
     }
 }
 impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
-    fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
+
+    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
+        self.sibling_names_stack.push(HashMap::new());
+        let result = self.recurse_into_struct(stype);
+        self.sibling_names_stack.pop();
+        result
+    }
+
+    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<array element>", |this| this.transform(etype))
     }
-    fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<map key>", |this| this.transform(ktype))
     }
-    fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<map value>", |this| this.transform(vtype))
     }
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(
+        &mut self,
+        field: &'a StructField,
+    ) -> DeltaResult<Cow<'a, StructField>> {
+        let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
+            field,
+            self.column_mapping_mode,
+            &self.logical_path,
+            Some(&mut self.seen_ids),
+            self.sibling_names_stack.last_mut(),
+        )?;
+
+        if field.is_metadata_column() {
+            return Ok(Cow::Borrowed(field));
+        }
+
         self.transform_inner(field.name(), |this| {
-            let (physical_name, _id) = get_field_column_mapping_info(
-                field,
-                this.column_mapping_mode,
-                &this.path,
-                Some(&mut this.seen),
-            )
-            .map_err(|e| this.err = Some(e))
-            .ok()?;
-
-            if field.is_metadata_column() {
-                return Some(Cow::Borrowed(field));
-            }
-
             let field = this.recurse_into_struct_field(field)?;
 
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
             let name = physical_name.to_owned();
 
-            Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+            Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
         })
     }
 
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+    fn transform_variant(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
         // There is no column mapping metadata inside the struct fields of a variant, so
         // we do not recurse into the variant fields
-        Some(Cow::Borrowed(stype))
+        Ok(Cow::Borrowed(stype))
     }
 }
 
@@ -2141,7 +2268,8 @@ mod tests {
     use super::*;
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::{
-        assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
+        assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
+        test_deep_nested_schema_missing_leaf_cm,
     };
 
     fn example_schema_metadata() -> &'static str {
@@ -2523,6 +2651,44 @@ mod tests {
             schema.make_physical(ColumnMappingMode::Id),
             "Duplicate column mapping ID",
         );
+    }
+
+    #[rstest]
+    #[case::accepted_same_phy_name_different_paths(fixtures::same_phy_name_different_paths(), /*expected_error_substring*/None)]
+    #[case::rejected_deeply_nested_repeat_physical_paths(
+        fixtures::deeply_nested_repeat_physical_paths(),
+        Some({
+            let (a, b) =
+                fixtures::deeply_nested_collider_paths();
+            format!("assigned to both '{a}' and '{b}'")
+        }),
+    )]
+    #[case::multiple_physical_name_collisions_reports_first(
+        fixtures::multiple_physical_name_collisions(),
+        Some("'p' assigned to both 'a' and 'b'".to_string()),
+    )]
+    fn test_make_physical_dup_physical_name(
+        #[case] schema: StructType,
+        #[case] expected_error_substring: Option<String>,
+    ) {
+        // The same dedup rules should apply under both CM modes.
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result = schema.make_physical(mode);
+            match &expected_error_substring {
+                None => {
+                    result.expect("The input schema should be valid");
+                }
+                Some(substr) => {
+                    assert_result_error_with_message(result.as_ref().map(|_| ()), substr);
+                    if let Err(e) = &result {
+                        assert!(
+                            !e.to_string().contains("'q'"),
+                            "walker must short-circuit on first collision under {mode:?}; got: {e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

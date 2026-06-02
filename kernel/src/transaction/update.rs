@@ -18,13 +18,15 @@ use tracing::instrument;
 
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::get_log_add_schema;
+use crate::actions::{get_log_add_schema, NUM_RECORDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
 use crate::error::Error;
-use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
+use crate::expressions::{
+    column_name, ArrayData, ColumnName, ExpressionStructPatch, Scalar, StructData,
+};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
@@ -215,12 +217,17 @@ impl Transaction {
     ///   new deletion vector descriptor for that file.
     /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
     ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`.
+    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
+    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The transaction targets table creation instead of an existing table
+    /// - The table does not have deletion vectors enabled via protocol support and the
+    ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
+    /// - A matched file's scan metadata is missing or has invalid `stats.numRecords`
     ///
     /// # Examples
     ///
@@ -260,17 +267,10 @@ impl Transaction {
                 "Deletion vector operations require an existing table",
             ));
         }
-        if !self
-            .effective_table_config
-            .is_feature_supported(&TableFeature::DeletionVectors)
-        {
-            return Err(Error::unsupported(
-                "Deletion vector operations require reader version 3, writer version 7, \
-                 and the 'deletionVectors' feature in both reader and writer features",
-            ));
-        }
+        self.ensure_deletion_vectors_enabled()?;
 
         let mut matched_dv_files = 0;
+        let mut matched_files = Vec::new();
         let mut visitor = DvMatchVisitor::new(&new_dv_descriptors);
 
         // Process each batch of scan file metadata to prepare for DV updates:
@@ -293,8 +293,10 @@ impl Transaction {
                     if visitor.matched_file_indexes[current_matched_index] != i {
                         *selected = false;
                     } else {
+                        // `matched_file_indexes` is populated from a FilteredRowVisitor, so every
+                        // matched row was selected in the original scan metadata.
                         current_matched_index += 1;
-                        matched_dv_files += if *selected { 1 } else { 0 };
+                        matched_dv_files += 1;
                     }
                 } else {
                     // Deselect any files after the last matched file
@@ -306,7 +308,7 @@ impl Transaction {
                 struct_deletion_vector_schema().clone(),
                 visitor.new_dv_entries.clone(),
             )?];
-            self.dv_matched_files.push(FilteredEngineData::try_new(
+            matched_files.push(FilteredEngineData::try_new(
                 data.append_columns(new_dv_column_schema().clone(), new_columns)?,
                 selection_vector,
             )?);
@@ -320,6 +322,23 @@ impl Transaction {
             )));
         }
 
+        self.dv_matched_files.extend(matched_files);
+        Ok(())
+    }
+
+    /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
+    /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
+    fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::DeletionVectors)
+        {
+            return Err(Error::unsupported(
+                "Deletion vector writes require reader version 3, writer version 7, the \
+                 'deletionVectors' feature in both reader and writer features, and the \
+                 `delta.enableDeletionVectors` table property set to `true`",
+            ));
+        }
         Ok(())
     }
 }
@@ -355,15 +374,8 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 
 /// Schema for scan row data with nullable statistics fields.
 /// Used when generating remove actions to ensure statistics can be null if missing.
-// Safety: The panic here is acceptable because scan_row_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
-static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_with_all_fields_nullable(scan_row_schema().as_ref())
-        .unwrap_or_else(|_| panic!("Failed to transform scan_row_schema"))
-        .into()
-});
+static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_with_all_fields_nullable(scan_row_schema().as_ref()).into());
 
 /// Returns the nullable scan row schema.
 fn nullable_scan_rows_schema() -> &'static SchemaRef {
@@ -372,15 +384,8 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 
 /// Schema for restored add actions with nullable statistics fields.
 /// Used when transforming scan data back to add actions with potentially missing statistics.
-// Safety: The panic here is acceptable because restored_add_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
-static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_with_all_fields_nullable(restored_add_schema())
-        .unwrap_or_else(|_| panic!("Failed to transform restored_add_schema"))
-        .into()
-});
+static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_with_all_fields_nullable(restored_add_schema()).into());
 
 /// Returns the nullable restored add action schema.
 fn nullable_restored_add_schema() -> &'static SchemaRef {
@@ -389,15 +394,8 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 
 /// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues
 /// with null values in required fields that aren't selected.
-// Safety: The panic here is acceptable because add_log_schema is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be
-// caught during development.
-#[allow(clippy::panic)]
-static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_with_all_fields_nullable(get_log_add_schema())
-        .unwrap_or_else(|_| panic!("Failed to transform nullable_restored_add_schema"))
-        .into()
-});
+static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_with_all_fields_nullable(get_log_add_schema()).into());
 
 /// Returns the schema for nullable restored add actions with dataChange field.
 /// This schema extends the nullable restored add schema with a dataChange boolean field
@@ -437,7 +435,7 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 // These methods are generic over the transaction state `S` because they are called from the
 // shared `commit()` path in `mod.rs` (`impl<S> Transaction<S>`). DV updates can only be
 // populated on `ExistingTableTransaction`, so the `is_create_table()` guard below is
-// defence-in-depth against future misuse.
+// defense-in-depth against future misuse.
 impl<S> Transaction<S> {
     /// Generate remove/add action pairs for files with DV updates.
     ///
@@ -473,13 +471,13 @@ impl<S> Transaction<S> {
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
-        // Transform to replace the deletionVector field with the new DV from
+        // Struct patch to replace the deletionVector field with the new DV from
         // NEW_DELETION_VECTOR_NAME, then drop the NEW_DELETION_VECTOR_NAME column. The
         // engine data has this temporary column appended by update_deletion_vectors(), but
         // it is not expected by the transforms used in generate_remove_actions() which
         // expect only the scan row schema fields.
-        let with_new_dv_transform = Expression::transform(
-            Transform::new_top_level()
+        let with_new_dv_expr = Expression::struct_patch(
+            ExpressionStructPatch::new_top_level()
                 .with_replaced_field(
                     "deletionVector",
                     Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
@@ -488,7 +486,7 @@ impl<S> Transaction<S> {
         );
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
-            Arc::new(with_new_dv_transform),
+            Arc::new(with_new_dv_expr),
             nullable_scan_rows_schema().clone().into(),
         )?;
         let restored_add_eval = evaluation_handler.new_expression_evaluator(
@@ -496,16 +494,15 @@ impl<S> Transaction<S> {
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
         )?;
-        let with_data_change_transform =
-            Arc::new(Expression::struct_from([Expression::transform(
-                Transform::new_nested(["add"]).with_inserted_field(
-                    Some("modificationTime"),
-                    Expression::literal(self.data_change).into(),
-                ),
-            )]));
+        let with_data_change_expr = Arc::new(Expression::struct_from([Expression::struct_patch(
+            ExpressionStructPatch::new_nested(["add"]).with_inserted_field(
+                Some("modificationTime"),
+                Expression::literal(self.data_change).into(),
+            ),
+        )]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(
             nullable_restored_add_schema().clone(),
-            with_data_change_transform,
+            with_data_change_expr,
             nullable_add_log_schema().clone().into(),
         )?;
         Ok(file_metadata_batch.map(
@@ -546,6 +543,8 @@ struct DvMatchVisitor<'a> {
 impl<'a> DvMatchVisitor<'a> {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     const PATH_INDEX: usize = 0;
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    const STATS_INDEX: usize = 1;
 
     /// Creates a new DvMatchVisitor that will match file paths against the provided DV updates map.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -562,8 +561,8 @@ impl<'a> DvMatchVisitor<'a> {
 impl FilteredRowVisitor for DvMatchVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
-            let names = vec![column_name!("path")];
-            let types = vec![DataType::STRING];
+            let names = vec![column_name!("path"), column_name!("stats")];
+            let types = vec![DataType::STRING, DataType::STRING];
             (names, types)
         });
         (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
@@ -597,6 +596,30 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 continue;
             };
             if let Some(dv_result) = self.dv_updates.get(&path) {
+                // DVs require an accurate numRecords stat per the Delta protocol.
+                let stats: Option<String> =
+                    getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
+                let stats = stats.ok_or_else(|| {
+                    Error::generic(format!(
+                        "update_deletion_vectors: file {path} has no stats; \
+                         deletion vectors require an accurate {NUM_RECORDS}"
+                    ))
+                })?;
+                let parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
+                    Error::generic(format!(
+                        "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
+                    ))
+                })?;
+                if parsed
+                    .get(NUM_RECORDS)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+                {
+                    return Err(Error::generic(format!(
+                        "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
+                         or it is not a non-negative integer"
+                    )));
+                }
                 self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
                     DV_SCHEMA_FIELDS.clone(),
                     vec![
@@ -616,5 +639,96 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         self.new_dv_entries
             .resize_with(num_rows, || NULL_DV.clone());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
+    use crate::arrow::array::{ArrayRef, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
+
+    const TEST_PATH: &str = "data/file.parquet";
+
+    /// Build a single-row scan-metadata-like batch. `path` and `stats` are addressed by name
+    /// (matching `DvMatchVisitor::selected_column_names_and_types`), so the surrounding
+    /// `extra_columns` and their positions deliberately exercise name-based getter binding.
+    fn make_scan_metadata_row(
+        path: &str,
+        stats: Option<&str>,
+        extra_columns: &[&str],
+    ) -> FilteredEngineData {
+        let mut fields = vec![
+            ArrowField::new("path", ArrowDataType::Utf8, true),
+            ArrowField::new("stats", ArrowDataType::Utf8, true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some(path)])),
+            Arc::new(StringArray::from(vec![stats])),
+        ];
+        for name in extra_columns {
+            fields.push(ArrowField::new(*name, ArrowDataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![Some("ignored")])));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    fn dv_updates_for(path: &str) -> HashMap<String, DeletionVectorDescriptor> {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            "AAAAAAAA".to_string(),
+            None,
+            8,
+            0,
+        )
+        .unwrap();
+        HashMap::from([(path.to_string(), descriptor)])
+    }
+
+    #[rstest]
+    #[case::null_stats(None, &[], true)]
+    #[case::stats_missing_num_records(Some("{}"), &[], true)]
+    #[case::stats_with_num_records(Some(r#"{"numRecords":10}"#), &[], false)]
+    #[case::extra_columns_dont_shift_indexes(
+        Some(r#"{"numRecords":10}"#),
+        &["size", "modificationTime"],
+        false,
+    )]
+    fn dv_match_visitor_validates_matched_row_stats(
+        #[case] stats: Option<&str>,
+        #[case] extra_columns: &[&str],
+        #[case] expect_error: bool,
+    ) {
+        let dv_updates = dv_updates_for(TEST_PATH);
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, stats, extra_columns);
+
+        let result = visitor.visit_rows_of(&data);
+        if expect_error {
+            let msg = result.expect_err("expected error").to_string();
+            assert!(msg.contains(NUM_RECORDS), "message was: {msg}");
+            assert!(msg.contains(TEST_PATH), "message was: {msg}");
+        } else {
+            result.expect("validation should pass");
+            assert_eq!(visitor.matched_file_indexes, vec![0]);
+        }
+    }
+
+    #[test]
+    fn dv_match_visitor_skips_validation_for_unmatched_rows() {
+        let dv_updates = dv_updates_for("other/file.parquet");
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, None, &[]);
+
+        visitor
+            .visit_rows_of(&data)
+            .expect("unmatched rows must not trigger stats validation");
+        assert!(visitor.matched_file_indexes.is_empty());
     }
 }

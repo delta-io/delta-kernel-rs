@@ -20,10 +20,8 @@ use crate::checkpoint::{
 };
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use crate::engine::default::DefaultEngineBuilder;
+use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
-use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
@@ -56,7 +54,7 @@ fn test_deleted_file_retention_timestamp(
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action includes the v2Checkpoint reader/writer feature.
@@ -116,7 +114,7 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     let add_actions_counter = 75;
     let size_in_bytes: i64 = 1024 * 1024; // 1MB
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Create last checkpoint metadata
     let last_checkpoint_batch = create_last_checkpoint_data(
@@ -301,7 +299,7 @@ async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> 
 #[tokio::test]
 async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit: adds `fake_path_1`
     write_commit_to_store(
@@ -379,7 +377,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -444,7 +442,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     write_commit_to_store(
@@ -534,7 +532,7 @@ fn test_last_checkpoint_hint_stats_rejects_invalid_input(
 #[tokio::test]
 async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // 1st commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
@@ -609,7 +607,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // normal commit with catalog-managed protocol
     write_commit_to_store(
@@ -672,12 +670,7 @@ fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Version 0: metadata & protocol
     write_commit_to_store(
@@ -737,7 +730,7 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
@@ -761,7 +754,7 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
@@ -809,13 +802,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     .unwrap();
 
     // ===== Create Engine =====
-    let store = Arc::new(LocalFileSystem::new());
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new();
 
     let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -838,7 +825,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     assert_eq!(domain_value, Some("bar2".to_string()));
 
     // Trigger checkpoint
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // ===== Case 2: Verify domain metadata is preserved *after* checkpoint =====
     let snapshot = Snapshot::builder_for(table_url)
@@ -854,12 +841,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
 {
     let (store, _) = new_in_memory_store();
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     let table_root = Url::parse("memory:///")?;
     let _ = create_table(
@@ -896,7 +878,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     // Checkpoint at version 2
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
     assert_eq!(snapshot_v2.version(), 2);
-    snapshot_v2.checkpoint(&engine)?;
+    snapshot_v2.checkpoint(&engine, None)?;
     let last_checkpoint = read_last_checkpoint_file(&store).await?;
     let size_in_bytes = last_checkpoint
         .get("sizeInBytes")
@@ -910,7 +892,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let snapshot_v1 = Snapshot::builder_for(table_root)
         .at_version(1)
         .build(&engine)?;
-    snapshot_v1.checkpoint(&engine)?;
+    snapshot_v1.checkpoint(&engine, None)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
 
@@ -1026,12 +1008,7 @@ async fn test_stats_config_round_trip(
     #[values(true, false)] struct2: bool,
 ) -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new_with_store(store.clone());
     let table_root = Url::parse("memory:///")?;
 
     // Commit 0: protocol + metadata with initial settings
@@ -1055,7 +1032,7 @@ async fn test_stats_config_round_trip(
 
     // Write checkpoint 1 to parquet with (json1, struct1) settings
     let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-    snapshot1.checkpoint(&engine)?;
+    snapshot1.checkpoint(&engine, None)?;
 
     // Commit 2: update metadata with new settings
     write_commit_to_store(
@@ -1098,12 +1075,7 @@ async fn test_stats_config_round_trip_partitioned(
     #[values(true, false)] struct2: bool,
 ) -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new_with_store(store.clone());
     let table_root = Url::parse("memory:///")?;
 
     // Commit 0: protocol + partitioned metadata with initial settings
@@ -1136,7 +1108,7 @@ async fn test_stats_config_round_trip_partitioned(
 
     // Write checkpoint 1 with (json1, struct1) settings
     let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-    snapshot1.checkpoint(&engine)?;
+    snapshot1.checkpoint(&engine, None)?;
 
     // Commit 2: update metadata with new settings
     write_commit_to_store(
@@ -1215,12 +1187,7 @@ async fn test_stats_config_round_trip_partitioned(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     let config = HashMap::from([
         ("delta.checkpoint.writeStatsAsJson".into(), "true".into()),
@@ -1264,7 +1231,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     Snapshot::builder_for(table_root.clone())
         .build(&engine)?
-        .checkpoint(&engine)?;
+        .checkpoint(&engine, None)?;
 
     // Version 1: new metadata WITH __CHAR_VARCHAR_TYPE_STRING on the "name" field
     let schema_v1 = Arc::new(StructType::new_unchecked([
@@ -1288,7 +1255,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
     // doesn't see a mismatch
     Snapshot::builder_for(table_root)
         .build(&engine)?
-        .checkpoint(&engine)?;
+        .checkpoint(&engine, None)?;
 
     Ok(())
 }

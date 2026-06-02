@@ -2,7 +2,8 @@ write-table
 ===========
 
 C FFI example for the write transaction surface. Demonstrates `transaction`,
-`with_engine_info`, `get_unpartitioned_write_context`, `get_write_schema`, `get_write_path`,
+`with_engine_info`, `get_unpartitioned_write_context`, the four write-context accessors
+(`get_write_schema`, `get_physical_write_schema`, `get_logical_to_physical`, `get_write_path`),
 `set_data_change`, and `commit` against an existing table.
 
 # Building
@@ -26,3 +27,4 @@ follow-up; once it lands, this example should grow an `add_files` flow alongside
 `with_domain_metadata` / `with_domain_metadata_removed` demo (the `domainMetadata` writer
 feature can be enabled today via the existing `create_table_builder_with_table_property`
 API by setting `delta.feature.domainMetadata=supported`).
+

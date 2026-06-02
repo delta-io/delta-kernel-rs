@@ -19,11 +19,12 @@
 //! - [`validate_keys`]: checks key completeness (case-insensitive matching, normalizes to schema
 //!   case, detects post-normalization duplicates).
 //! - [`validate_types`]: checks that each `Scalar`'s type matches the partition column's schema
-//!   type. Null scalars skip the type check.
-
+//!   type, and that non-null partition columns are never assigned a value that would serialize to a
+//!   null partition value.
 use std::collections::HashMap;
 
 use crate::expressions::Scalar;
+use crate::partition::serialization::would_serialize_to_null;
 use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
 
@@ -105,8 +106,15 @@ fn validate_keys(
 }
 
 /// Validates that each [`Scalar`] value's type is compatible with the corresponding
-/// partition column's type in the table schema. Null scalars skip the type check
-/// (null is valid for any partition column type).
+/// partition column's type in the table schema. Values that would serialize to a null
+/// partition value skip the value type check, but a
+/// null partition value is only legal when the schema field is nullable.
+///
+/// Nullability is enforced before any non-null type check, so the rejection treats null
+/// scalars and their serialization-equivalent forms (empty strings, empty binary)
+/// uniformly -- otherwise an empty `Scalar::String` for a `nullable: false` column would
+/// pass validation, then collapse to JSON null at serialization, landing a null value in
+/// a NOT NULL column.
 ///
 /// # Parameters
 /// - `logical_schema`: the table's logical schema.
@@ -117,6 +125,8 @@ fn validate_keys(
 /// # Errors
 /// - A partition column is not found in the table schema
 /// - A partition column's schema type is not a primitive (struct, array, map are rejected)
+/// - A null-equivalent value (null scalar, empty string, or empty binary) is provided for a
+///   non-nullable partition column
 /// - A non-null value's type does not match the partition column's schema type
 fn validate_types(
     logical_schema: &StructType,
@@ -138,7 +148,13 @@ fn validate_types(
                  Partition columns must be primitive types."
             )));
         }
-        if value.is_null() {
+        if would_serialize_to_null(value) {
+            if !field.nullable {
+                return Err(Error::invalid_partition_values(format!(
+                    "partition column '{col_name}' is not nullable but received a value that \
+                     serializes to null (null scalar, empty string, or empty binary)"
+                )));
+            }
             continue;
         }
         let actual_type = value.data_type();
@@ -170,6 +186,14 @@ mod tests {
         let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
         let values = HashMap::from([("p".to_string(), value)]);
         validate_types(&schema, &values).unwrap_err().to_string()
+    }
+
+    /// Like [`assert_type_ok`] but uses a `nullable` schema field. Used by null-value cases,
+    /// since null scalars are only valid for nullable partition columns.
+    fn assert_type_ok_nullable(data_type: DataType, value: Scalar) {
+        let schema = StructType::new_unchecked(vec![StructField::nullable("p", data_type)]);
+        let values = HashMap::from([("p".to_string(), value)]);
+        validate_types(&schema, &values).unwrap();
     }
 
     // ============================================================================
@@ -310,7 +334,9 @@ mod tests {
     /// Every non-null row from the "String and binary encoding" table in
     /// `partition/mod.rs`. Row numbers reference that table.
     #[rstest]
-    // STRING rows
+    // STRING rows. Rows 49 (empty binary) and 65 (empty string) are null-equivalent under
+    // the protocol and are covered by the null-into-nullable / null-into-non-nullable tests
+    // further down -- they are intentionally absent from this "type-match passes" group.
     #[case(DataType::STRING, Scalar::String("\x00".into()))] // row 47
     #[case(DataType::STRING, Scalar::String("before\x00after".into()))] // row 48
     #[case(DataType::STRING, Scalar::String("a{b".into()))] // row 54
@@ -324,11 +350,9 @@ mod tests {
     #[case(DataType::STRING, Scalar::String("a&b+c$d;e,f".into()))] // row 62
     #[case(DataType::STRING, Scalar::String("Serbia/srb%".into()))] // row 63
     #[case(DataType::STRING, Scalar::String("100%25".into()))] // row 64
-    #[case(DataType::STRING, Scalar::String("".into()))] // row 65
     #[case(DataType::STRING, Scalar::String(" ".into()))] // row 67
     #[case(DataType::STRING, Scalar::String("  ".into()))] // row 68
     // BINARY rows
-    #[case(DataType::BINARY, Scalar::Binary(vec![]))] // row 49
     #[case(DataType::BINARY, Scalar::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]))] // row 50
     #[case(DataType::BINARY, Scalar::Binary(vec![0x48, 0x45, 0x4C, 0x4C, 0x4F]))] // row 51
     #[case(DataType::BINARY, Scalar::Binary(vec![0x00, 0xFF]))] // row 52
@@ -340,8 +364,10 @@ mod tests {
         assert_type_ok(data_type, value);
     }
 
-    /// NULL rows from the encoding table. Null is valid for every partition column type,
-    /// regardless of the Scalar::Null inner type.
+    /// Null-equivalent rows from the encoding table. Under the Delta protocol, three Scalar
+    /// shapes serialize to JSON null in `partitionValues`: `Scalar::Null`, empty `Scalar::String`,
+    /// and empty `Scalar::Binary`. All three are valid for every partition column type when the
+    /// schema field is nullable, regardless of the `Scalar::Null` inner type.
     #[rstest]
     #[case(DataType::INTEGER, Scalar::Null(DataType::INTEGER))] // row 5
     #[case(DataType::LONG, Scalar::Null(DataType::LONG))] // row 8
@@ -356,16 +382,50 @@ mod tests {
     #[case(DataType::TIMESTAMP_NTZ, Scalar::Null(DataType::TIMESTAMP_NTZ))] // row 46
     #[case(DataType::STRING, Scalar::Null(DataType::STRING))] // row 66
     #[case(DataType::BINARY, Scalar::Null(DataType::BINARY))] // (binary NULL)
-    fn test_validate_types_null_returns_ok(#[case] data_type: DataType, #[case] value: Scalar) {
-        assert_type_ok(data_type, value);
+    #[case(DataType::STRING, Scalar::String(String::new()))] // row 65: empty string
+    #[case(DataType::BINARY, Scalar::Binary(Vec::new()))] // row 49: empty binary
+    fn test_validate_types_null_into_nullable_returns_ok(
+        #[case] data_type: DataType,
+        #[case] value: Scalar,
+    ) {
+        assert_type_ok_nullable(data_type, value);
     }
 
-    /// Null skips the type check even when the Scalar::Null inner type does not match
-    /// the schema column type. This is intentional: null is valid for any partition
-    /// column regardless of what type the Null carries.
+    /// Null skips the value type check even when the `Scalar::Null` inner type does not match
+    /// the schema column type. This is intentional: null carries no concrete type to compare
+    /// against.
     #[test]
     fn test_validate_types_null_with_mismatched_inner_type_returns_ok() {
-        assert_type_ok(DataType::INTEGER, Scalar::Null(DataType::STRING));
+        assert_type_ok_nullable(DataType::INTEGER, Scalar::Null(DataType::STRING));
+    }
+
+    /// A null-equivalent partition value (null scalar, empty string, or empty binary) for
+    /// a non-nullable partition column is rejected
+    #[rstest]
+    #[case(DataType::INTEGER, Scalar::Null(DataType::INTEGER))]
+    #[case(DataType::LONG, Scalar::Null(DataType::LONG))]
+    #[case(DataType::STRING, Scalar::Null(DataType::STRING))]
+    #[case(DataType::BINARY, Scalar::Null(DataType::BINARY))]
+    #[case(DataType::BOOLEAN, Scalar::Null(DataType::BOOLEAN))]
+    #[case(DataType::DATE, Scalar::Null(DataType::DATE))]
+    #[case(DataType::TIMESTAMP, Scalar::Null(DataType::TIMESTAMP))]
+    #[case(DataType::TIMESTAMP_NTZ, Scalar::Null(DataType::TIMESTAMP_NTZ))]
+    #[case(DataType::decimal(10, 2).unwrap(), Scalar::Null(DataType::decimal(10, 2).unwrap()))]
+    // Null with mismatched inner type is also rejected the schema's nullability is the
+    // only thing checked for null scalars.
+    #[case(DataType::INTEGER, Scalar::Null(DataType::STRING))]
+    // Empty string and empty binary serialize to JSON null per the Delta protocol; they
+    // must be rejected for NOT NULL partition columns alongside `Scalar::Null` so a
+    // serialization-equivalent value cannot bypass the nullability check.
+    #[case(DataType::STRING, Scalar::String(String::new()))]
+    #[case(DataType::BINARY, Scalar::Binary(Vec::new()))]
+    fn test_validate_types_null_into_non_nullable_returns_error(
+        #[case] data_type: DataType,
+        #[case] value: Scalar,
+    ) {
+        let err = assert_type_err(data_type, value);
+        assert!(err.contains("not nullable"), "{err}");
+        assert!(err.contains("'p'"), "{err}");
     }
 
     /// Type mismatch: every non-null Scalar variant against the wrong schema type.

@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
@@ -147,7 +147,9 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{load_test_table, parse_json_batch, CapturingReporter};
+    use crate::utils::test_utils::{
+        install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
+    };
     use crate::{PredicateRef, SnapshotRef};
 
     // ============================================================
@@ -227,7 +229,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
         let json_adds = add_paths
@@ -314,7 +316,7 @@ mod tests {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
         let sidecar1_data = parse_json_batch(vec![
@@ -952,9 +954,7 @@ mod tests {
     #[test]
     fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> DeltaResult<()> {
         let reporter = Arc::new(CapturingReporter::default());
-        let _guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let scan = snapshot.scan_builder().build()?;
@@ -971,7 +971,7 @@ mod tests {
         let scan_events: Vec<&ScanType> = events
             .iter()
             .filter_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted { scan_type, .. } => Some(scan_type),
+                MetricEvent::ScanMetadataCompleted(s) => Some(&s.scan_type),
                 _ => None,
             })
             .collect();
@@ -991,9 +991,7 @@ mod tests {
     #[test]
     fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> DeltaResult<()> {
         let reporter = Arc::new(CapturingReporter::default());
-        let _guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
         let scan = snapshot.scan_builder().build()?;
@@ -1010,11 +1008,11 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::SequentialPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s)
+                    if s.scan_type == ScanType::SequentialPhase =>
+                {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected SequentialPhase ScanMetadataCompleted event after finish()");
@@ -1030,11 +1028,9 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::ParallelPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s) if s.scan_type == ScanType::ParallelPhase => {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected ParallelPhase ScanMetadataCompleted event after log_metrics()");

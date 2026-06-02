@@ -60,6 +60,11 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
 - `scan.parallel_scan_metadata(engine)` -- two-phase distributed log replay (`pub(crate)`,
   requires `internal-api` feature)
 
+**Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
+diff over `(base_version, target_version]` -- live Adds as a `FilteredEngineData` iterator
+plus a terminal summary of live Add and Remove file keys. Use this to advance a cached
+file listing without re-scanning the table.
+
 ## Write Path
 
 `Snapshot` -> `Transaction` -> commit
@@ -118,6 +123,8 @@ all returned batches -- the engine may split a single file across multiple batch
 
 - `kernel/src/snapshot/` -- `Snapshot`, `SnapshotBuilder`, entry point for reads/writes
 - `kernel/src/scan/` -- `Scan`, `ScanBuilder`, log replay, data skipping
+- `kernel/src/incremental_scan/` -- `IncrementalScanBuilder`, streaming file-action diff
+  between two versions
 - `kernel/src/transaction/` -- `Transaction`, `WriteContext`, `create_table` builder
 - `kernel/src/partition/` -- partition value validation, serialization, Hive-style path
    encoding, URI encoding for `add.path`
@@ -132,7 +139,7 @@ all returned batches -- the engine may split a single file across multiple batch
   `column_expr!` macro
 - `kernel/src/transforms/` -- generic recursive transforms (`ExpressionTransform`,
   `SchemaTransform`)
-- `kernel/src/checkpoint/` -- checkpoint writing (V1 and V2 single-file classic-named)
+- `kernel/src/checkpoint/` -- classic-named checkpoint writing (V1; V2 with or without sidecars)
 - `kernel/src/table_configuration.rs` -- table metadata, properties, feature management
 - `kernel/src/table_features/` -- protocol feature definitions, `TableFeature` enum
 - `kernel/src/table_properties.rs` -- table property parsing (delta.appendOnly, etc.)

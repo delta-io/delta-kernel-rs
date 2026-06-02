@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.21.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.23.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -68,7 +68,7 @@ reqwest = { version = "0.13", default-features = false, optional = true, feature
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
-object_store_13 = { package = "object_store", version = "0.13.1", optional = true, features = ["aws", "azure", "gcp", "http"] }
+object_store_13 = { package = "object_store", version = "0.13.2", optional = true, features = ["aws", "azure", "gcp", "http"] }
 
 # arrow 57
 [dependencies.arrow_57]
@@ -118,6 +118,9 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
+# Declarative plan execution via PlanExecutor trait (experimental)
+declarative-plans = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls
 default-engine-base = [
@@ -154,6 +157,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "fmt",
 ] }
 rstest = "0.23"
+rstest_reuse = "0.7"
 [[bench]]
 name = "metadata_bench"
 harness = false
@@ -162,11 +166,15 @@ harness = false
 name = "expression_bench"
 harness = false
 
-# Consolidated write-path integration tests. Linking each integration test as a
-# separate binary is expensive (every binary re-links Arrow, Parquet, and the
-# default engine), so all write tests share a single binary whose entry point
-# is `tests/write/main.rs` and whose topics live as modules under that
-# directory.
+# Single integration test binary. Linking each integration test as a separate
+# binary is expensive (every binary re-links Arrow, Parquet, and the default
+# engine), so all integration tests share one binary whose entry point is
+# `tests/integration/main.rs` and whose topics live as submodules.
 [[test]]
-name = "write"
-path = "tests/write/main.rs"
+name = "integration"
+path = "tests/integration/main.rs"
+
+# Declare as an example for access to test_utils
+[[example]]
+name = "metrics-tester"
+path = "tests/integration/metrics_main.rs"

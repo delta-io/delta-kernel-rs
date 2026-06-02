@@ -16,6 +16,16 @@ use crate::Version;
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
+/// A boxed, `Send` iterator of [`DeltaResult<T>`] items.
+///
+/// Convenience alias for the common pattern of returning a streaming, fallible iterator from
+/// kernel APIs.
+pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send + 'a>;
+
+/// `'static` counterpart to [`DeltaResultIterator`] for cases where the iterator does not
+/// reference borrowed data.
+pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
+
 /// All the types of errors that the kernel can run into
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
@@ -229,6 +239,13 @@ pub enum Error {
     /// Error during log history operations (timestamp queries, version lookups)
     #[error(transparent)]
     LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
+
+    #[cfg(feature = "declarative-plans")]
+    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    PlanResultTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -323,6 +340,11 @@ impl Error {
 
     pub fn stats_validation(msg: impl ToString) -> Self {
         Self::StatsValidation(msg.to_string())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub fn plan_result_type_mismatch(expected: &'static str, actual: &'static str) -> Self {
+        Self::PlanResultTypeMismatch { expected, actual }
     }
 
     // Capture a backtrace when the error is constructed.

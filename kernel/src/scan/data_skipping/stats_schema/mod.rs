@@ -3,17 +3,16 @@
 mod column_filter;
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::schema::{
-    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
-    StructType,
+    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
-use crate::transforms::SchemaTransform;
-use crate::{DeltaResult, Error};
+use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::DeltaResult;
 
 /// Generates the expected schema for file statistics.
 ///
@@ -137,7 +136,7 @@ pub(crate) fn expected_stats_schema(
     requested_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
     let mut fields = Vec::with_capacity(5);
-    fields.push(StructField::nullable("numRecords", DataType::LONG));
+    fields.push(StructField::nullable(NUM_RECORDS, DataType::LONG));
 
     // generate the base stats schema:
     // - make all fields nullable
@@ -150,25 +149,24 @@ pub(crate) fn expected_stats_schema(
 
         // convert all leaf fields to data type LONG for null count
         let mut null_count_transform = NullCountStatsTransform;
-        if let Some(null_count_schema) = null_count_transform.transform_struct(&base_schema) {
-            fields.push(StructField::nullable(
-                "nullCount",
-                null_count_schema.into_owned(),
-            ));
-        };
+        let null_count_schema = null_count_transform.transform_struct(&base_schema);
+        fields.push(StructField::nullable(
+            NULL_COUNT,
+            null_count_schema.into_owned(),
+        ));
 
         // include only min/max skipping eligible fields (data types)
         let mut min_max_transform = MinMaxStatsTransform;
         if let Some(min_max_schema) = min_max_transform.transform_struct(&base_schema) {
             let min_max_schema = min_max_schema.into_owned();
-            fields.push(StructField::nullable("minValues", min_max_schema.clone()));
-            fields.push(StructField::nullable("maxValues", min_max_schema));
+            fields.push(StructField::nullable(MIN_VALUES, min_max_schema.clone()));
+            fields.push(StructField::nullable(MAX_VALUES, min_max_schema));
         }
     }
 
     // tightBounds indicates whether min/max statistics are accurate (true) or potentially
     // outdated due to deletion vectors (false)
-    fields.push(StructField::nullable("tightBounds", DataType::BOOLEAN));
+    fields.push(StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN));
 
     StructType::try_new(fields)
 }
@@ -193,35 +191,6 @@ pub(crate) fn stats_column_names(
     columns
 }
 
-/// Creates a stats schema from a referenced schema (e.g. columns from a predicate).
-/// Returns schema: `{ numRecords, nullCount, minValues, maxValues }`
-///
-/// This is used to build the schema for parsing JSON stats and for reading stats_parsed
-/// from checkpoints when only a subset of columns is needed (e.g. predicate-referenced columns).
-pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
-    let stats_schema = schema_with_all_fields_nullable(referenced_schema).ok()?;
-
-    let nullcount_schema = NullCountStatsTransform
-        .transform_struct(&stats_schema)?
-        .into_owned();
-
-    let schema = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
-        StructField::nullable("nullCount", nullcount_schema),
-        StructField::nullable("minValues", stats_schema.clone()),
-        StructField::nullable("maxValues", stats_schema),
-    ]);
-
-    // Strip field metadata. The stats types are derived from the table schema, but the metadata on
-    // the fields should not be included in the stats fields
-    let schema = StripFieldMetadataTransform
-        .transform_struct(&schema)
-        .map(|s| s.into_owned())
-        .unwrap_or(schema);
-
-    Some(Arc::new(schema))
-}
-
 /// Strips all field metadata from a schema.
 ///
 /// Field metadata describes the logical table column, not the stats values themselves. This
@@ -230,8 +199,10 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
 /// changed.
 pub(crate) struct StripFieldMetadataTransform;
 impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        Some(match self.transform(&field.data_type)? {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        match self.transform(&field.data_type) {
             Cow::Borrowed(_) if field.metadata.is_empty() => Cow::Borrowed(field),
             data_type => Cow::Owned(StructField {
                 name: field.name.clone(),
@@ -239,26 +210,25 @@ impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
                 nullable: field.is_nullable(),
                 metadata: Default::default(),
             }),
-        })
+        }
     }
 }
 
 /// Make all fields of a schema nullable.
 /// Used for stats schemas where stats may not be available for all columns.
-pub(crate) fn schema_with_all_fields_nullable(schema: &Schema) -> DeltaResult<Schema> {
-    match NullableStatsTransform.transform_struct(schema) {
-        Some(schema) => Ok(schema.into_owned()),
-        None => Err(Error::internal_error("NullableStatsTransform failed")),
-    }
+pub(crate) fn schema_with_all_fields_nullable(schema: &Schema) -> Schema {
+    NullableStatsTransform.transform_struct(schema).into_owned()
 }
 
 /// Transforms a schema to make all fields nullable.
 /// Used for stats schemas where stats may not be available for all columns.
 pub(crate) struct NullableStatsTransform;
 impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let data_type = self.transform(&field.data_type)?;
-        Some(make_nullable_field(field, data_type))
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        let data_type = self.transform(&field.data_type);
+        make_nullable_field(field, data_type)
     }
 }
 
@@ -287,16 +257,18 @@ fn make_nullable_field<'a>(
 /// is preserved for all fields.
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
         // Only recurse into struct fields; convert all other types (leaf fields) to LONG
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
-            _ => Some(Cow::Owned(StructField {
+            _ => Cow::Owned(StructField {
                 name: field.name.clone(),
                 data_type: DataType::LONG,
                 nullable: true,
                 metadata: field.metadata.clone(),
-            })),
+            }),
         }
     }
 }
@@ -340,6 +312,8 @@ impl<'col> BaseStatsTransform<'col> {
 }
 
 impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // Always traverse struct fields. All non-struct leaf types count against the column limit.
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.filter.enter_field(field.name());
@@ -372,6 +346,8 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
 struct MinMaxStatsTransform;
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // Array, Map, and Variant fields pass through BaseStatsTransform (for nullCount) but must
     // be excluded from min/max stats.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
@@ -431,11 +407,11 @@ mod tests {
     /// Builds an expected stats schema from the given null count and min/max nested schemas.
     fn expected_stats(null_count: StructType, min_max: StructType) -> StructType {
         StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", null_count),
-            StructField::nullable("minValues", min_max.clone()),
-            StructField::nullable("maxValues", min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, null_count),
+            StructField::nullable(MIN_VALUES, min_max.clone()),
+            StructField::nullable(MAX_VALUES, min_max),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ])
     }
 
@@ -480,11 +456,9 @@ mod tests {
         // but make all fields nullable
         let expected_min_max = NullableStatsTransform
             .transform_struct(&file_schema)
-            .unwrap()
             .into_owned();
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_min_max)
-            .unwrap()
             .into_owned();
 
         let expected = expected_stats(null_count, expected_min_max);
@@ -584,7 +558,6 @@ mod tests {
         )]);
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_fields)
-            .unwrap()
             .into_owned();
 
         let expected = expected_stats(null_count, expected_fields);
@@ -638,11 +611,11 @@ mod tests {
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
         let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("minValues", expected_min_max.clone()),
-            StructField::nullable("maxValues", expected_min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, expected_null_count),
+            StructField::nullable(MIN_VALUES, expected_min_max.clone()),
+            StructField::nullable(MAX_VALUES, expected_min_max),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -673,7 +646,6 @@ mod tests {
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_fields)
-            .unwrap()
             .into_owned();
 
         let expected = expected_stats(null_count, expected_fields);
@@ -805,9 +777,9 @@ mod tests {
 
         // minValues/maxValues: no fields are eligible (boolean/binary/array excluded)
         let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, expected_null_count),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -863,9 +835,9 @@ mod tests {
         // minValues/maxValues: all 3 complex types are excluded by MinMaxStatsTransform,
         // and col1/col2 are past the limit, so no min/max fields at all.
         let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, expected_null_count),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -910,11 +882,11 @@ mod tests {
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
         let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("minValues", expected_min_max.clone()),
-            StructField::nullable("maxValues", expected_min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, expected_null_count),
+            StructField::nullable(MIN_VALUES, expected_min_max.clone()),
+            StructField::nullable(MAX_VALUES, expected_min_max),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -1140,7 +1112,7 @@ mod tests {
         .unwrap();
 
         // Should include both columns
-        let min_values = with_none.field("minValues").expect("should have minValues");
+        let min_values = with_none.field(MIN_VALUES).expect("should have minValues");
         if let DataType::Struct(inner) = min_values.data_type() {
             assert!(inner.field("id").is_some());
             assert!(inner.field("name").is_some());
@@ -1170,8 +1142,8 @@ mod tests {
 
         // No data columns pass both filters, so only numRecords + tightBounds
         let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);

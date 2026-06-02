@@ -10,8 +10,8 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME,
-    PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, MAX_VALUES,
+    METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -20,6 +20,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::events::LOG_SEGMENT_LOADED_SPAN;
 use crate::metrics::MetricId;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -31,6 +32,7 @@ use crate::{
     StorageHandler, Version,
 };
 
+mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
@@ -223,6 +225,7 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
+        validate_latest_commit_file(&listed_files, effective_version)?;
 
         let log_segment = LogSegment {
             end_version: effective_version,
@@ -298,12 +301,11 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
-    // Span name must match `SEGMENT_FOR_SNAPSHOT_SPAN` in `metrics::reporter`.
     #[instrument(
-        name = "segment.for_snapshot",
+        name = LOG_SEGMENT_LOADED_SPAN,
         err,
         skip(storage, time_travel_version),
-        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
+        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(
@@ -336,6 +338,10 @@ impl LogSegment {
                 tracing::Span::current().record(
                     "num_compaction_files",
                     log_segment.listed.ascending_compaction_files.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "has_latest_crc_file",
+                    log_segment.listed.latest_crc_file.is_some(),
                 );
                 Ok(log_segment)
             }
@@ -1240,7 +1246,7 @@ impl LogSegment {
         // Check type compatibility for both minValues and maxValues structs.
         // While these typically have the same schema, the protocol doesn't guarantee it,
         // so we check both to be safe.
-        for field_name in ["minValues", "maxValues"] {
+        for field_name in [MIN_VALUES, MAX_VALUES] {
             let Some(checkpoint_values_field) = stats_struct.field(field_name) else {
                 // stats_parsed exists but no minValues/maxValues - unusual but valid
                 continue;
@@ -1516,4 +1522,30 @@ fn validate_end_version(
         );
     }
     Ok(effective_version)
+}
+
+/// Validates the `latest_commit_file` field of a [`LogSegmentFiles`]. Enforces:
+///
+/// 1. If `ascending_commit_files` is non-empty, `latest_commit_file` must be `Some`.
+/// 2. If `latest_commit_file` is `Some`, its version must equal `effective_version`.
+fn validate_latest_commit_file(
+    listed: &LogSegmentFiles,
+    effective_version: Version,
+) -> DeltaResult<()> {
+    require!(
+        listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
+        Error::internal_error(
+            "latest_commit_file must be Some when ascending_commit_files is non-empty"
+        )
+    );
+    if let Some(commit) = &listed.latest_commit_file {
+        require!(
+            commit.version == effective_version,
+            Error::internal_error(format!(
+                "latest_commit_file version {} does not match end_version {effective_version}",
+                commit.version,
+            ))
+        );
+    }
+    Ok(())
 }

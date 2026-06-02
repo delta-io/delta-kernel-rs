@@ -2,7 +2,11 @@
 .DS_Store
 
 # IDE
-.claude/
+# .claude — keep private by default, allowlist published slash commands
+.claude/*
+!.claude/commands/
+.claude/commands/*
+!.claude/commands/update-user-guide.md
 .cursor/
 .dir-locals.el
 .idea/
