@@ -94,4 +94,11 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn is_v3_supported_type_rejects_void() {
+        // Void is excluded from the V3 allowlist (by omission) to match delta-spark, which
+        // cannot consume an icebergCompatV3 table containing a void column.
+        assert!(!is_v3_supported_type(&DataType::VOID));
+    }
 }
