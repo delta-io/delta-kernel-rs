@@ -196,10 +196,10 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
     // Strip the SQL syntax envelope per target type, then delegate to the existing
     // `PrimitiveType::parse_scalar` for the actual value parsing.
     let raw: Cow<'_, str> = match primitive {
-        PrimitiveType::Date => Cow::Owned(strip_typed_prefix_and_unquote(trimmed, "DATE")?),
-        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => {
-            Cow::Owned(strip_typed_prefix_and_unquote(trimmed, "TIMESTAMP")?)
-        }
+        PrimitiveType::Date => Cow::Owned(strip_typed_prefix_and_unquote(trimmed, &["DATE"])?),
+        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => Cow::Owned(
+            strip_typed_prefix_and_unquote(trimmed, &["TIMESTAMP_NTZ", "TIMESTAMP"])?,
+        ),
         // Numeric and Boolean: parse_scalar handles signed numbers and case-insensitive
         // TRUE/FALSE directly. Reject any input that looks like a quoted SQL string to avoid
         // accidentally treating `'42'` as the integer 42.
@@ -251,11 +251,14 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
     Ok(out)
 }
 
-/// Strip an optional typed-literal keyword prefix (e.g. `DATE` or `TIMESTAMP`) and then unwrap
-/// the required `'...'` quoted body.
-fn strip_typed_prefix_and_unquote(input: &str, keyword: &str) -> DeltaResult<String> {
+/// Strip an optional typed-literal keyword prefix (e.g. `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`)
+/// and then unwrap the required `'...'` quoted body. Any of the given `keywords` may appear
+/// as the prefix; case-insensitive.
+fn strip_typed_prefix_and_unquote(input: &str, keywords: &[&str]) -> DeltaResult<String> {
     let body = match input.split_once(char::is_whitespace) {
-        Some((prefix, rest)) if prefix.eq_ignore_ascii_case(keyword) => rest.trim_start(),
+        Some((prefix, rest)) if keywords.iter().any(|kw| prefix.eq_ignore_ascii_case(kw)) => {
+            rest.trim_start()
+        }
         _ => input,
     };
     unquote_string(body)
@@ -375,6 +378,8 @@ mod tests {
     #[rstest]
     #[case("'2024-01-01 12:34:56'", "2024-01-01 12:34:56")]
     #[case("TIMESTAMP '2024-01-01 12:34:56.789'", "2024-01-01 12:34:56.789")]
+    #[case("TIMESTAMP_NTZ '2024-01-01 12:34:56'", "2024-01-01 12:34:56")]
+    #[case("timestamp_ntz '2024-01-01 12:34:56.789'", "2024-01-01 12:34:56.789")]
     fn parses_timestamp_literals(#[case] sql: &str, #[case] equivalent: &str) {
         let got = parse_sql(sql, &DataType::TIMESTAMP).unwrap();
         assert_eq!(
