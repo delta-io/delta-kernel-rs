@@ -292,7 +292,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
-    // ScanBuilder::include_all_stats_columns() doesn't support stats_parsed when
+    // `ScanBuilder::with_stats(StatsOptions::all())` doesn't support stats_parsed when
     // dataSkippingNumIndexedCols=0. Read directly from the checkpoint parquet file instead.
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let delta_log = std::path::Path::new(&setup.table_path).join("_delta_log");
