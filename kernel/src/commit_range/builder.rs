@@ -189,10 +189,12 @@ fn validate_number_of_commit_files(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::commit_range::DeltaAction;
     use crate::engine::sync::SyncEngine;
-    use crate::Snapshot;
+    use crate::{Engine, Snapshot};
 
     /// `table-with-dv-small` has versions 0 and 1 (snapshot version = 1).
     fn dv_small_table_root() -> Url {
@@ -306,38 +308,36 @@ mod tests {
 
     #[test]
     fn build_descending_ordering_yields_commits_in_reverse_order() {
-        use crate::commit_range::DeltaAction;
-
         let table_root = dv_small_table_root();
-        let engine = SyncEngine::new();
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let actions = [DeltaAction::Add, DeltaAction::Remove];
 
         let asc_range = CommitRange::builder_for(table_root.as_str(), 0)
             .with_end_version(1)
-            .build(&engine)
+            .build(engine.as_ref())
             .unwrap();
         let desc_range = CommitRange::builder_for(table_root.as_str(), 0)
             .with_end_version(1)
             .with_ordering(CommitOrdering::DescendingOrder)
-            .build(&engine)
+            .build(engine.as_ref())
             .unwrap();
 
         let snapshot_at_start = Snapshot::builder_for(table_root.as_str())
             .at_version(0)
-            .build(&engine)
+            .build(engine.as_ref())
             .unwrap();
         let snapshot_at_end = Snapshot::builder_for(table_root.as_str())
             .at_version(1)
-            .build(&engine)
+            .build(engine.as_ref())
             .unwrap();
 
         let asc_versions = asc_range
-            .commits(&engine, snapshot_at_start, &actions)
+            .commits(engine.clone(), Some(snapshot_at_start), &actions)
             .unwrap()
             .map(|c| c.unwrap().version())
             .collect::<Vec<_>>();
         let desc_versions = desc_range
-            .commits(&engine, snapshot_at_end, &actions)
+            .commits(engine, Some(snapshot_at_end), &actions)
             .unwrap()
             .map(|c| c.unwrap().version())
             .collect::<Vec<_>>();

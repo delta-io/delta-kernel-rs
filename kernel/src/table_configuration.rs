@@ -26,9 +26,9 @@ use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
-    LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
-    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -579,24 +579,7 @@ impl TableConfiguration {
     /// For table features protocol (v3), returns the explicit reader_features list.
     /// For legacy protocol (v1-2), infers features from the version number.
     fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
-        match self.protocol.min_reader_version() {
-            TABLE_FEATURES_MIN_READER_VERSION => {
-                // Table features reader: use explicit reader_features list
-                self.protocol
-                    .reader_features()
-                    .map(|f| f.to_vec())
-                    .unwrap_or_default()
-            }
-            v if (1..=2).contains(&v) => {
-                // Legacy reader: infer features from version
-                LEGACY_READER_FEATURES
-                    .iter()
-                    .filter(|f| f.is_valid_for_legacy_reader(v))
-                    .cloned()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
+        crate::table_features::enabled_reader_features(&self.protocol)
     }
 
     /// Returns all writer features enabled for this table based on protocol version.
@@ -638,20 +621,7 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        require!(
-            self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
-                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
-                self.protocol.min_reader_version()
-            ))
-        );
-        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
-        if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-            return Err(Error::unsupported(format!(
-                "Unsupported minimum reader version {}",
-                self.protocol.min_reader_version()
-            )));
-        }
+        crate::table_features::check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
         for feature in self.get_enabled_reader_features() {

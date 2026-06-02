@@ -20,6 +20,7 @@ use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use crate::table_properties::TableProperties;
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 mod column_mapping;
 mod timestamp_ntz;
@@ -721,6 +722,87 @@ pub(crate) fn format_features(features: &[TableFeature]) -> String {
     format!("[{}]", feature_strings.join(", "))
 }
 
+/// Reader features enabled for `protocol`. For `min_reader_version == 3` returns the
+/// explicit `reader_features` list; for `1..=2` returns the legacy-inferred subset
+/// (currently only `ColumnMapping` at `v=2`). All other versions yield an empty list.
+///
+/// Shared by [`validate_protocol`] and `TableConfiguration::get_enabled_reader_features`.
+pub(crate) fn enabled_reader_features(protocol: &Protocol) -> Vec<TableFeature> {
+    match protocol.min_reader_version() {
+        TABLE_FEATURES_MIN_READER_VERSION => protocol
+            .reader_features()
+            .map(|f| f.to_vec())
+            .unwrap_or_default(),
+        v if (1..=2).contains(&v) => LEGACY_READER_FEATURES
+            .iter()
+            .filter(|f| f.is_valid_for_legacy_reader(v))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Enforce that `protocol.min_reader_version()` lies within
+/// `[MIN_VALID_RW_VERSION, MAX_VALID_READER_VERSION]`. Below the minimum yields
+/// [`Error::InvalidProtocol`]; above the maximum yields [`Error::Unsupported`].
+///
+/// Shared by [`validate_protocol`] and `TableConfiguration::ensure_read_supported`.
+pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
+    require!(
+        protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
+        Error::InvalidProtocol(format!(
+            "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+            protocol.min_reader_version()
+        ))
+    );
+    if protocol.min_reader_version() > MAX_VALID_READER_VERSION {
+        return Err(Error::unsupported(format!(
+            "Unsupported minimum reader version {}",
+            protocol.min_reader_version()
+        )));
+    }
+    Ok(())
+}
+
+/// Stateless protocol-level check that the kernel can read tables governed by `protocol`.
+///
+/// Unlike `TableConfiguration::ensure_operation_supported`, this does not require a
+/// `Metadata` action or any table properties. It mirrors Java kernel's
+/// `TableFeatures.validateKernelCanReadTheTable` and is used when validating individual
+/// commits in a `CommitRange` for the streaming use case, where Metadata may not be
+/// present in every commit.
+///
+/// The validation:
+/// - Rejects reader versions outside `[MIN_VALID_RW_VERSION, MAX_VALID_READER_VERSION]`.
+/// - Enumerates reader features (explicit list for `min_reader_version == 3`, or the
+///   legacy-inferred subset for versions 1-2).
+/// - For each feature, rejects `KernelSupport::NotSupported`. `KernelSupport::Custom(_)` is treated
+///   as readable (see the per-`Custom`-arm note below).
+pub(crate) fn validate_protocol(protocol: &Protocol) -> DeltaResult<()> {
+    check_reader_version_range(protocol)?;
+
+    for feature in enabled_reader_features(protocol) {
+        match feature.info().kernel_support {
+            KernelSupport::Supported => {}
+            KernelSupport::NotSupported => {
+                return Err(Error::unsupported(format!(
+                    "Feature '{feature}' is not supported by kernel",
+                )));
+            }
+            KernelSupport::Custom(_) => {
+                // All current `Custom` reader-feature callbacks (`CatalogManaged`,
+                // `CatalogOwnedPreview`, `TypeWidening`, `TypeWideningPreview`) return
+                // `Ok(())` for `Operation::Scan` regardless of `TableProperties`, so
+                // stateless validation treats `Custom` as readable. If a future Custom
+                // callback truly depends on properties for read support, this assumption
+                // must be revisited.
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +839,85 @@ mod tests {
         assert_eq!(&typed_reader, mixed_reader);
         assert_eq!(typed_writer.len(), 3);
         assert_eq!(&typed_writer, mixed_writer);
+    }
+
+    #[test]
+    fn validate_protocol_rejects_reader_version_below_minimum() {
+        let protocol = Protocol::new_unchecked(0, 1, None, None);
+        match validate_protocol(&protocol) {
+            Err(Error::InvalidProtocol(msg)) => assert!(msg.contains('0'), "got: {msg}"),
+            other => panic!("expected InvalidProtocol, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_protocol_rejects_reader_version_above_maximum() {
+        let protocol = Protocol::new_unchecked(99, 1, None, None);
+        match validate_protocol(&protocol) {
+            Err(Error::Unsupported(msg)) => assert!(msg.contains("99"), "got: {msg}"),
+            other => panic!("expected Unsupported, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_protocol_accepts_legacy_reader_v1() {
+        let protocol = Protocol::try_new_legacy(1, 1).unwrap();
+        validate_protocol(&protocol).expect("legacy v1 reader must be accepted");
+    }
+
+    #[test]
+    fn validate_protocol_accepts_legacy_reader_v2() {
+        // Legacy reader v2 implies ColumnMapping (KernelSupport::Supported); writer 5 is required
+        // to set the column_mapping_mode property, so we pair (2, 5).
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        validate_protocol(&protocol).expect("legacy v2 reader must be accepted");
+    }
+
+    #[test]
+    fn validate_protocol_accepts_v3_empty_reader_features() {
+        // (3, 7) with empty feature lists is the minimal table-features protocol; no features
+        // means nothing to reject.
+        let protocol = Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![]));
+        validate_protocol(&protocol).expect("(3, 7) with empty features must be accepted");
+    }
+
+    #[test]
+    fn validate_protocol_accepts_supported_explicit_feature() {
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors],
+        )
+        .unwrap();
+        validate_protocol(&protocol).expect("supported reader feature must be accepted");
+    }
+
+    #[test]
+    fn validate_protocol_rejects_unknown_reader_feature() {
+        let unknown = TableFeature::unknown("notARealFeature");
+        let protocol = Protocol::try_new_modern([unknown.clone()], [unknown.clone()]).unwrap();
+        match validate_protocol(&protocol) {
+            Err(Error::Unsupported(msg)) => {
+                assert!(msg.contains("notARealFeature"), "got: {msg}")
+            }
+            other => panic!("expected Unsupported, got: {other:?}"),
+        }
+    }
+
+    // TODO: revisit this assumption if a future `KernelSupport::Custom` reader-feature
+    // callback truly depends on `TableProperties` for read support. The current set
+    // (CatalogManaged, CatalogOwnedPreview, TypeWidening, TypeWideningPreview) all
+    // return `Ok(())` for `Operation::Scan` regardless of properties.
+    #[test]
+    fn validate_protocol_accepts_custom_support_feature() {
+        // CatalogManaged has KernelSupport::Custom (requires TableProperties to validate),
+        // but its Scan callback returns Ok regardless of properties. Stateless validation
+        // therefore treats it as readable.
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::CatalogManaged],
+            [TableFeature::CatalogManaged],
+        )
+        .unwrap();
+        validate_protocol(&protocol).expect("Custom reader-feature must be accepted for Scan");
     }
 
     #[test]
