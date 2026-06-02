@@ -1140,6 +1140,9 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 /// Parse a column of JSON strings into a typed `RecordBatch` matching `schema`. N input
 /// rows produce N output rows.
 ///
+/// Arrow lacks the functionality to json-parse a string column into a struct column, so we
+/// implement it here.
+///
 /// Failure-prone primitive leaves (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) produce
 /// per-cell NULL when the typed decoder rejects a value (extended-year timestamps,
 /// decimals that overflow the declared precision, etc.). Other leaf type mismatches still
