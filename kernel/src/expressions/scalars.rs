@@ -756,6 +756,9 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
+            IntervalYearMonth | IntervalDayTime => Err(Error::unsupported(
+                "Interval types are not supported as scalar or partition values",
+            )),
         }
     }
 

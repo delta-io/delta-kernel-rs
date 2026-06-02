@@ -368,6 +368,10 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    // Exposed as the physical integer (i32 months / i64 microseconds); interval
+                    // semantics live in the Delta logical schema.
+                    PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
+                    PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(

@@ -1623,6 +1623,9 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 Scalar::decimal(bits, dt.precision(), dt.scale())
                     .expect("test seed produced invalid decimal")
             }
+            PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                panic!("interval types are not supported as partition values")
+            }
         },
         other => panic!("partition columns must be primitive types, got: {other:?}"),
     }
