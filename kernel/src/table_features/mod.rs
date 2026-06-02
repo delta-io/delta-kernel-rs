@@ -10,6 +10,8 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id,
 };
 use delta_kernel_derive::internal_api;
+pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -25,6 +27,7 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+mod iceberg_compat;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -442,7 +445,8 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///   always use INT64; INT96 is forbidden.
 /// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
 ///   disable IcebergCompatV3 on an existing table.
-/// - Void type: when supported, it must not appear inside map or array types.
+/// - Void type: when delta-spark supports VOID type on icebergCompatV3 tables, add it to V3's type
+///   allowlist (`is_v3_supported_type` in `iceberg_compat::v3`).
 ///
 /// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
