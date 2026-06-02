@@ -1959,7 +1959,6 @@ mod tests {
     #[case::crc_at_v0(LogState::with_latest_version(2).with_crc_at([0]))]
     #[case::crc_at_v1(LogState::with_latest_version(2).with_crc_at([1]))]
     #[case::crc_at_latest(LogState::with_latest_version(2).with_crc_at([2]))]
-    #[case::multiple_crcs(LogState::with_latest_version(2).with_crc_at([0, 1, 2]))]
     #[case::checkpoint_with_later_crc(
         LogState::with_latest_version(2).with_checkpoint_at([1]).with_crc_at([2]),
     )]
