@@ -284,13 +284,13 @@ impl Snapshot {
         self.table_configuration.logical_schema()
     }
 
-    /// Approximate owned heap size in bytes for this snapshot. Best-effort estimate
+    /// Estimated owned heap size in bytes for this snapshot. Best-effort estimate
     /// for capacity tracking, not authoritative.
     ///
     /// Counts only the dominant per-snapshot heap contributors:
     /// - For every listed log path (commit, compaction, checkpoint, latest CRC, latest commit): the
     ///   filename / extension / Url string heap.
-    /// - Vec buffer capacity (capacity * size_of::<ParsedLogPath>()) for the three Vec fields on
+    /// - Vec buffer capacity (`capacity * size_of::<ParsedLogPath>()`) for the three Vec fields on
     ///   `LogSegmentFiles`.
     /// - The log root Url string.
     /// - The raw `schemaString` JSON on table metadata.
@@ -2154,8 +2154,7 @@ mod tests {
         );
 
         // 100 extra checkpoint parts: each contributes to heap.
-        // Kernel doesn't yet support writing multi-part checkpoints, so we mannually
-        // hacks here.
+        // Kernel doesn't yet support writing multi-part checkpoints, so we manually add them here.
         let snap_extra_checkpoints =
             snapshot_with_extra_files(&baseline_snap, |listed, log_root| {
                 for i in 1..=100u32 {
@@ -2180,8 +2179,7 @@ mod tests {
         );
 
         // 100 extra log compaction files: each contributes to heap.
-        // Kernel disables the writing of log compaction files currently, so we are manually adding
-        // hacks here.
+        // Kernel disables writing log compaction files currently, so we manually add them here.
         let snap_extra_compactions =
             snapshot_with_extra_files(&baseline_snap, |listed, log_root| {
                 for i in 0..100u64 {
@@ -2242,12 +2240,12 @@ mod tests {
             .table_configuration()
             .metadata()
             .schema_string()
-            .len()
+            .capacity()
             - snap_small
                 .table_configuration()
                 .metadata()
                 .schema_string()
-                .len();
+                .capacity();
         let heap_delta = snap_wide.estimated_owned_heap_size_bytes()
             - snap_small.estimated_owned_heap_size_bytes();
         // Tables differ only in schemaString, so heap_delta should be approximately the
