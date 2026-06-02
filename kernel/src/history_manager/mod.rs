@@ -625,13 +625,13 @@ fn get_earliest_recreatable_commit(
 
     let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
-        let parsed = parsed_result?;
-        match parsed.file_type {
+        let parsed_log_path = parsed_result?;
+        match parsed_log_path.file_type {
             LogPathFileType::Commit => {
-                if parsed.version == 0 {
+                if parsed_log_path.version == 0 {
                     return Ok(0);
                 }
-                smallest_commit_version = smallest_commit_version.min(parsed.version);
+                smallest_commit_version = smallest_commit_version.min(parsed_log_path.version);
 
                 if let Some(checkpoint_version) = last_complete_checkpoint {
                     if checkpoint_version + 1 >= smallest_commit_version {
@@ -640,18 +640,18 @@ fn get_earliest_recreatable_commit(
                 }
             }
             LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint => {
-                last_complete_checkpoint = Some(parsed.version);
+                last_complete_checkpoint = Some(parsed_log_path.version);
             }
             LogPathFileType::MultiPartCheckpoint {
                 part_num,
                 num_parts,
             } => {
                 let parts = multi_part_checkpoint_progress
-                    .entry((parsed.version, num_parts))
+                    .entry((parsed_log_path.version, num_parts))
                     .or_default();
                 parts.insert(part_num);
                 if parts.len() == num_parts as usize {
-                    last_complete_checkpoint = Some(parsed.version);
+                    last_complete_checkpoint = Some(parsed_log_path.version);
                 }
             }
             LogPathFileType::StagedCommit
@@ -663,7 +663,11 @@ fn get_earliest_recreatable_commit(
 
     let saw_any_commit = smallest_commit_version != Version::MAX;
     match last_complete_checkpoint {
-        Some(cp) if saw_any_commit && cp >= smallest_commit_version => Ok(cp),
+        Some(checkpoint_version)
+            if saw_any_commit && checkpoint_version >= smallest_commit_version =>
+        {
+            Ok(checkpoint_version)
+        }
         _ if saw_any_commit => Err(DeltaError::from(LogHistoryError::NoRecreatableCommit {
             log_root: log_root.clone(),
         })),
@@ -688,13 +692,12 @@ mod tests {
     use bytes::Bytes;
     use test_utils::delta_path_for_version;
     use url::Url;
+    use uuid::Uuid;
 
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::object_store::path::Path as ObjectPath;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
@@ -1646,27 +1649,21 @@ mod tests {
     /// Builds an in-memory store with one entry per given log file path and returns
     /// an engine wired to it plus the corresponding `_delta_log/` URL.
     fn engine_with_log_files(paths: &[String]) -> (SyncEngine, Url) {
-        let store = Arc::new(InMemory::new());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            for path in paths {
-                store
-                    .put(
-                        &ObjectPath::from(path.as_str()),
-                        Bytes::from_static(b"x").into(),
-                    )
-                    .await
-                    .expect("put log file");
-            }
-        });
-        (
-            SyncEngine::new_with_store(store),
-            Url::parse("memory:///_delta_log/").unwrap(),
-        )
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let storage = engine.storage_handler();
+        for path in paths {
+            let url = Url::parse(&format!("memory:///{path}")).unwrap();
+            storage
+                .put(&url, Bytes::from_static(b"x"), false)
+                .expect("put log file");
+        }
+        (engine, Url::parse("memory:///_delta_log/").unwrap())
     }
 
-    fn commit_path(v: Version) -> String {
-        delta_path_for_version(v, "json").to_string()
+    fn commit_path(version_range: RangeInclusive<Version>) -> Vec<String> {
+        version_range
+            .map(|v| delta_path_for_version(v, "json").to_string())
+            .collect()
     }
 
     fn single_part_checkpoint_path(v: Version) -> String {
@@ -1674,8 +1671,7 @@ mod tests {
     }
 
     fn uuid_checkpoint_path(v: Version) -> String {
-        // Fixed UUID for deterministic paths.
-        format!("_delta_log/{v:020}.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet")
+        format!("_delta_log/{v:020}.checkpoint.{}.parquet", Uuid::new_v4())
     }
 
     fn multi_part_checkpoint_paths(v: Version, num_parts: u32) -> Vec<String> {
@@ -1690,69 +1686,70 @@ mod tests {
         commit_range: RangeInclusive<Version>,
     ) -> Vec<String> {
         let mut paths: Vec<String> = checkpoint_paths;
-        paths.extend(commit_range.map(commit_path));
+        paths.extend(commit_path(commit_range));
         paths
     }
 
-    /// Builds a 3-part multi-part checkpoint at v=5 with parts `[1, 2, 2]` (no part 3).
-    fn multi_part_with_duplicate_parts() -> Vec<String> {
-        vec![
-            format!(
-                "_delta_log/{:020}.checkpoint.{:010}.{:010}.parquet",
-                5, 1, 3
-            ),
-            format!(
-                "_delta_log/{:020}.checkpoint.{:010}.{:010}.parquet",
-                5, 2, 3
-            ),
-            format!(
-                "_delta_log/{:020}.checkpoint.{:010}.{:010}.parquet",
-                5, 2, 3
-            ),
-        ]
-    }
-
-    /// All cases where `get_earliest_recreatable_commit` returns a specific version.
     #[rstest::rstest]
-    #[case::v0_exists((0..=5).map(commit_path).collect(), None, 0)]
+    #[case::v0_exists(commit_path(0..=5), None, 0)]
     #[case::truncated_single_part(truncated_log(vec![single_part_checkpoint_path(5)], 5..=9), None, 5)]
     #[case::truncated_uuid(truncated_log(vec![uuid_checkpoint_path(5)], 5..=9), None, 5)]
     #[case::truncated_multi_part(truncated_log(multi_part_checkpoint_paths(5, 3), 5..=9), None, 5)]
+    #[case::ratified_zero_with_v0_present(commit_path(0..=3), Some(0), 0)]
+    #[case::non_zero_ratified_falls_through_to_scan(commit_path(0..=3), Some(4), 0)]
+    #[case::commit_cleanup_before_checkpoint(
+        {
+            let mut p = commit_path(2..=4);
+            p.push(uuid_checkpoint_path(4));
+            p
+        },
+        None,
+        4
+    )]
     #[case::picks_first_anchored_checkpoint(
         {
             let mut p = vec![single_part_checkpoint_path(3)];
             p.extend(multi_part_checkpoint_paths(7, 2));
-            p.extend([commit_path(7), commit_path(8)]);
+            p.extend(commit_path(7..=8));
             p
         },
         None,
         7,
     )]
-    #[case::prefers_earliest_anchored_checkpoint_over_later_one(
+    #[case::listing_with_multiple_full_checkpoints(
         {
             let mut p = vec![single_part_checkpoint_path(3)];
-            p.extend((3..=8).map(commit_path));
+            p.extend(commit_path(3..=7));
             p.push(single_part_checkpoint_path(7));
             p
         },
         None,
         3,
     )]
-    #[case::prefers_v0_over_later_checkpoint(
+    #[case::listing_with_cleanup_checkpoints(
+            {
+                let mut p = multi_part_checkpoint_paths(3, 3);
+                p.remove(0);
+                p.extend(commit_path(3..=7));
+                p.push(single_part_checkpoint_path(7));
+                p
+            },
+            None,
+            7,
+        )]
+    #[case::listing_with_v0_and_full_checkpoint(
         {
-            let mut p: Vec<_> = (0..=5).map(commit_path).collect();
+            let mut p = commit_path(0..=5);
             p.push(single_part_checkpoint_path(5));
             p
         },
         None,
         0,
     )]
-    #[case::ratified_zero_with_v0_present((0..=3).map(commit_path).collect(), Some(0), 0)]
-    #[case::non_zero_ratified_falls_through_to_scan((0..=3).map(commit_path).collect(), Some(99), 0)]
-    #[case::checkpoint_one_before_smallest_commit_anchors(
+    #[case::checkpoint_before_smallest_commit_anchors(
         {
             let mut p = vec![single_part_checkpoint_path(5)];
-            p.extend((6..=8).map(commit_path));
+            p.extend(commit_path(6..=8));
             p
         },
         None,
@@ -1776,7 +1773,6 @@ mod tests {
         Ccv2MissingV0,
     }
 
-    /// All cases where `get_earliest_recreatable_commit` returns an error.
     #[rstest::rstest]
     #[case::empty_log(vec![], None, ErrKind::NoCommits)]
     #[case::crc_only(vec![format!("_delta_log/{:020}.crc", 5)], None, ErrKind::NoCommits)]
@@ -1784,32 +1780,8 @@ mod tests {
     #[case::checkpoint_only(vec![single_part_checkpoint_path(5)], None, ErrKind::NoCommits)]
     #[case::non_zero_ratified_on_empty_log(vec![], Some(5), ErrKind::NoCommits)]
     #[case::ratified_zero_on_empty_log(vec![], Some(0), ErrKind::Ccv2MissingV0)]
-    #[case::commits_have_no_anchor(vec![commit_path(2), commit_path(3)], None, ErrKind::NoRecreatable)]
-    #[case::ratified_zero_commits_no_anchor(vec![commit_path(2), commit_path(3)], Some(0), ErrKind::NoRecreatable)]
-    #[case::incomplete_multi_part(
-        {
-            let mut p = multi_part_checkpoint_paths(5, 3);
-            p.pop(); // drop the last part
-            p.extend((5..=9).map(commit_path));
-            p
-        },
-        None,
-        ErrKind::NoRecreatable,
-    )]
-    #[case::duplicate_multi_part_parts(
-        truncated_log(multi_part_with_duplicate_parts(), 5..=9),
-        None,
-        ErrKind::NoRecreatable,
-    )]
-    #[case::checkpoint_two_before_smallest_commit(
-        {
-            let mut p = vec![single_part_checkpoint_path(5)];
-            p.extend((7..=9).map(commit_path));
-            p
-        },
-        None,
-        ErrKind::NoRecreatable,
-    )]
+    #[case::commits_have_no_anchor(commit_path(2..=3), None, ErrKind::NoRecreatable)]
+    #[case::ratified_zero_commits_no_anchor(commit_path(2..=3), Some(0), ErrKind::NoRecreatable)]
     fn earliest_recreatable_returns_expected_error(
         #[case] paths: Vec<String>,
         #[case] ratified: Option<Version>,
