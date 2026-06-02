@@ -190,9 +190,9 @@ pub struct LogState {
     checkpoints_at: Vec<u64>,
     /// Format applied to every checkpoint in `checkpoints_at`.
     checkpoint_format: CheckpointFormat,
-    /// If `Some(v)`, a `.crc` file is written at version `v`. Requires
-    /// `v <= latest_version`.
-    crc_at: Option<u64>,
+    /// Sorted ascending, distinct, all `<= latest_version`. A `.crc` file is
+    /// written at each listed version.
+    crcs_at: Vec<u64>,
     /// If `Some(n)`, log files at versions `< n` are deleted after the table is built.
     cleanup_before: Option<u64>,
     /// State of the `_last_checkpoint` hint file. Defaults to `Present`.
@@ -207,7 +207,7 @@ impl LogState {
             latest_version: n,
             checkpoints_at: Vec::new(),
             checkpoint_format: CheckpointFormat::Default,
-            crc_at: None,
+            crcs_at: Vec::new(),
             cleanup_before: None,
             last_checkpoint_hint: LastCheckpointHintState::Present,
         }
@@ -248,32 +248,29 @@ impl LogState {
         }
     }
 
-    /// Write a CRC file at version `v`. Requires `v <= latest_version`.
+    /// Add CRC files at the given versions. Pass `[v]` for a single CRC or
+    /// `[v1, v2, ...]` for multiple. Each `v` must be `<= latest_version` and
+    /// not already present.
     ///
     /// # Panics
     ///
-    /// Panics if `v > latest_version` or if a CRC version is already set.
-    pub fn with_crc_at(mut self, v: u64) -> Self {
-        assert!(
-            v <= self.latest_version,
-            "crc_at ({v}) must be <= latest_version ({})",
-            self.latest_version,
-        );
-        assert!(
-            self.crc_at.is_none(),
-            "crc_at already set to {:?}; LogState models a single CRC",
-            self.crc_at,
-        );
-        self.crc_at = Some(v);
-        self
-    }
-
-    /// Optionally write a CRC file at the given version. No-op when `None`.
-    pub fn maybe_with_crc_at(self, v: Option<u64>) -> Self {
-        match v {
-            Some(v) => self.with_crc_at(v),
-            None => self,
+    /// Panics if any `v > latest_version` or is already present.
+    pub fn with_crc_at(mut self, vs: impl IntoIterator<Item = u64>) -> Self {
+        for v in vs {
+            assert!(
+                v <= self.latest_version,
+                "crc_at ({v}) must be <= latest_version ({})",
+                self.latest_version,
+            );
+            assert!(
+                !self.crcs_at.contains(&v),
+                "crc_at ({v}) already present in {:?}",
+                self.crcs_at,
+            );
+            self.crcs_at.push(v);
         }
+        self.crcs_at.sort_unstable();
+        self
     }
 
     /// Switch every checkpoint to V2 with sidecars. Pass `None` for the kernel
@@ -326,9 +323,9 @@ impl LogState {
         &self.checkpoint_format
     }
 
-    /// Version at which a CRC file is written, if any.
-    pub(crate) fn crc_at(&self) -> Option<u64> {
-        self.crc_at
+    /// Versions at which CRC files are written, in ascending order.
+    pub(crate) fn crcs_at(&self) -> &[u64] {
+        &self.crcs_at
     }
 
     /// Version below which commits and checkpoints have been cleaned up, if any.
@@ -375,18 +372,18 @@ pub fn two_checkpoints_stale_hint() -> LogState {
 
 pub fn crc_at_end() -> LogState {
     LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
-        .with_crc_at(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
 }
 
 pub fn crc_at_mid() -> LogState {
     LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
-        .with_crc_at(DEFAULT_SWEEP_MID_VERSION)
+        .with_crc_at([DEFAULT_SWEEP_MID_VERSION])
 }
 
 pub fn checkpoint_at_end_crc_at_end() -> LogState {
     LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
         .with_checkpoint_at([DEFAULT_SWEEP_LATEST_VERSION])
-        .with_crc_at(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
 }
 
 // Post-cleanup variants: same shapes as above but with log cleanup applied at MID.
@@ -416,15 +413,15 @@ pub fn two_checkpoints_stale_hint_post_cleanup() -> LogState {
 }
 
 pub fn checkpoint_at_end_crc_at_end_post_cleanup() -> LogState {
-    checkpoint_at_end_post_cleanup().with_crc_at(DEFAULT_SWEEP_LATEST_VERSION)
+    checkpoint_at_end_post_cleanup().with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
 }
 
 pub fn checkpoint_at_end_crc_at_mid_post_cleanup() -> LogState {
-    checkpoint_at_end_post_cleanup().with_crc_at(DEFAULT_SWEEP_MID_VERSION)
+    checkpoint_at_end_post_cleanup().with_crc_at([DEFAULT_SWEEP_MID_VERSION])
 }
 
 pub fn checkpoint_mid_crc_at_mid_post_cleanup() -> LogState {
-    checkpoint_mid_post_cleanup().with_crc_at(DEFAULT_SWEEP_MID_VERSION)
+    checkpoint_mid_post_cleanup().with_crc_at([DEFAULT_SWEEP_MID_VERSION])
 }
 
 /// Extract the version from a versioned log file. Returns `None` for unversioned
@@ -475,7 +472,7 @@ impl fmt::Display for LogState {
         for v in &self.checkpoints_at {
             write!(f, "+checkpoint_at({v})")?;
         }
-        if let Some(v) = self.crc_at {
+        for v in &self.crcs_at {
             write!(f, "+crc_at({v})")?;
         }
         if let Some(n) = self.cleanup_before {
@@ -1203,8 +1200,8 @@ impl TestTableBuilder {
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
 
-        let crc_at = self.log_state.crc_at();
-        if crc_at == Some(0) {
+        let crcs_at = self.log_state.crcs_at();
+        if crcs_at.contains(&0) {
             write_crc(&snapshot, engine.as_ref())?;
         }
         if checkpoints_at.contains(&0) {
@@ -1227,7 +1224,7 @@ impl TestTableBuilder {
             )
             .await?
             .unwrap_post_commit_snapshot();
-            if crc_at == Some(v) {
+            if crcs_at.contains(&v) {
                 write_crc(&snapshot, engine.as_ref())?;
             }
             if checkpoints_at.contains(&v) {
@@ -1959,22 +1956,23 @@ mod tests {
             .with_cleanup_commits_before(8)
             .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
     )]
-    #[case::crc_at_v0(LogState::with_latest_version(2).with_crc_at(0))]
-    #[case::crc_at_v1(LogState::with_latest_version(2).with_crc_at(1))]
-    #[case::crc_at_latest(LogState::with_latest_version(2).with_crc_at(2))]
+    #[case::crc_at_v0(LogState::with_latest_version(2).with_crc_at([0]))]
+    #[case::crc_at_v1(LogState::with_latest_version(2).with_crc_at([1]))]
+    #[case::crc_at_latest(LogState::with_latest_version(2).with_crc_at([2]))]
+    #[case::multiple_crcs(LogState::with_latest_version(2).with_crc_at([0, 1, 2]))]
     #[case::checkpoint_with_later_crc(
-        LogState::with_latest_version(2).with_checkpoint_at([1]).with_crc_at(2),
+        LogState::with_latest_version(2).with_checkpoint_at([1]).with_crc_at([2]),
     )]
     #[case::crc_below_cleanup_is_deleted(
         LogState::with_latest_version(3)
             .with_checkpoint_at([2])
-            .with_crc_at(1)
+            .with_crc_at([1])
             .with_cleanup_commits_before(2),
     )]
     #[case::crc_at_cleanup_boundary_survives(
         LogState::with_latest_version(3)
             .with_checkpoint_at([2])
-            .with_crc_at(2)
+            .with_crc_at([2])
             .with_cleanup_commits_before(2),
     )]
     fn test_log_state_checkpoint_shapes_land_on_disk(
@@ -2164,7 +2162,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let log_state = LogState::with_latest_version(2)
             .with_checkpoint_at([2])
-            .with_crc_at(2);
+            .with_crc_at([2]);
         let table = TestTableBuilder::new()
             .with_log_state(log_state.clone())
             .with_features(features)
@@ -2192,15 +2190,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be <= latest_version")]
     fn test_with_crc_at_rejects_above_latest_version() {
-        LogState::with_latest_version(2).with_crc_at(3);
+        LogState::with_latest_version(2).with_crc_at([3]);
     }
 
     #[test]
-    #[should_panic(expected = "crc_at already set")]
-    fn test_with_crc_at_rejects_double_call() {
-        LogState::with_latest_version(2)
-            .with_crc_at(1)
-            .with_crc_at(2);
+    #[should_panic(expected = "already present")]
+    fn test_with_crc_at_rejects_duplicate_version() {
+        LogState::with_latest_version(2).with_crc_at([1, 1]);
     }
 
     #[test]
@@ -2307,7 +2303,7 @@ mod tests {
             }
         }
 
-        if let Some(v) = log_state.crc_at() {
+        for &v in log_state.crcs_at() {
             let crc_name = format!("{v:020}.crc");
             let surviving = v >= cleanup;
             let found = entries.iter().any(|name| name == &crc_name);
