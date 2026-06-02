@@ -146,6 +146,29 @@ impl KernelStringSlice {
     }
 }
 
+/// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.
+///
+/// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
+/// must not be retained beyond the foreign function call it was passed into.
+#[repr(C)]
+pub struct KernelBytesSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl KernelBytesSlice {
+    /// Creates a new bytes slice from a source byte slice.
+    ///
+    /// # Safety
+    /// Caller must guarantee that the source will outlive the created KernelBytesSlice.
+    pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
+            len: source.len(),
+        }
+    }
+}
+
 /// FFI-safe implementation for Rust's `Option<T>`
 #[derive(PartialEq, Debug)]
 #[repr(C)]
