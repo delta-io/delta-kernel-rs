@@ -2,7 +2,6 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
-use std::mem::size_of;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -793,51 +792,32 @@ impl Snapshot {
         self.table_configuration.logical_schema()
     }
 
-    /// Approximate owned heap size in bytes for this snapshot.
+    /// Approximate owned heap size in bytes for this snapshot. Best-effort estimate
+    /// for capacity tracking, not authoritative.
     ///
-    /// Includes the two dominant per-snapshot heap contributors:
-    /// 1. Listed file metadata (e.g., file name, location).
-    /// 2. The raw `schemaString` JSON(raw string of the schema).
+    /// Counts only the dominant per-snapshot heap contributors:
+    /// - For every listed log path (commit, compaction, checkpoint, latest CRC, latest commit): the
+    ///   filename / extension / Url string heap.
+    /// - Vec buffer capacity (capacity * size_of::<ParsedLogPath>()) for the three Vec fields on
+    ///   `LogSegmentFiles`.
+    /// - The log root Url string.
+    /// - The raw `schemaString` JSON on table metadata.
     ///
-    /// Excludes shared schemas (the logical and physical schemas on `TableConfiguration`):
-    /// these are `Arc`-shared across snapshots.
+    /// The Arc-shared variables (e.g. logical/physical schemas, `lazy_crc`) are not counted,
+    /// as they can be shared between multiple snapshots and are not owned by a single snapshot.
     ///
-    /// This is an estimate, not an authoritative measurement.
+    /// Other variables' contributions to heap size are relatively small, so they are not counted
+    /// here.
     ///
-    /// Runs in O(n) where n is the number of files in the log segment.
-    pub fn approximate_owned_heap_size(&self) -> usize {
-        let mut bytes = 0;
-
-        // === Part 1: Listed file metadata ===
-        let files = &self.log_segment.listed;
-
-        // Sum each Vec's heap buffer (capacity * element size).
-        let parsed_log_path_count = files.ascending_commit_files.capacity()
-            + files.ascending_compaction_files.capacity()
-            + files.checkpoint_parts.capacity();
-        bytes += parsed_log_path_count * size_of::<ParsedLogPath>();
-
-        // Plus the per-element heap (strings inside each ParsedLogPath).
-        let per_path_heap = |p: &ParsedLogPath| {
-            p.filename.capacity() + p.extension.capacity() + p.location.location.as_str().len()
-        };
-        for p in files
-            .ascending_commit_files
-            .iter()
-            .chain(&files.ascending_compaction_files)
-            .chain(&files.checkpoint_parts)
-            .chain(&files.latest_crc_file)
-            .chain(&files.latest_commit_file)
-        {
-            bytes += per_path_heap(p);
-        }
-
-        bytes += self.log_segment.log_root.as_str().len();
-
-        // === Part 2: Raw schemaString JSON ===
-        bytes += self.table_configuration().metadata().schema_string().len();
-
-        bytes
+    /// Runs in O(n) over listed log files.
+    pub fn estimated_owned_heap_size(&self) -> usize {
+        self.log_segment.listed.estimated_heap_size_bytes()
+            + self.log_segment.log_root.as_str().len()
+            + self
+                .table_configuration()
+                .metadata()
+                .schema_string()
+                .capacity()
     }
 
     /// Get the [`TableProperties`] for this [`Snapshot`].
@@ -3869,15 +3849,15 @@ mod tests {
                     listed.checkpoint_parts.push(part);
                 }
             });
-        let delta_checkpoints =
-            snap_extra_checkpoints.approximate_owned_heap_size() - baseline_heap;
+        let delta_checkpoints = snap_extra_checkpoints.estimated_owned_heap_size() - baseline_heap;
         assert!(
             delta_checkpoints >= 15_000,
             "delta_checkpoints {delta_checkpoints} should be >= 15_000 for 100 checkpoint parts"
         );
 
         // 100 extra log compaction files: each contributes to heap.
-        // Kernel disable writing log compaction files currently, so we mannually hacks here.
+        // Kernel disables the writing of log compaction files currently, so we are manually adding
+        // hacks here.
         let snap_extra_compactions =
             snapshot_with_extra_files(&baseline_snap, |listed, log_root| {
                 for i in 0..100u64 {
@@ -3895,8 +3875,7 @@ mod tests {
                     listed.ascending_compaction_files.push(comp);
                 }
             });
-        let delta_compactions =
-            snap_extra_compactions.approximate_owned_heap_size() - baseline_heap;
+        let delta_compactions = snap_extra_compactions.estimated_owned_heap_size() - baseline_heap;
         assert!(
             delta_compactions >= 15_000,
             "delta_compactions {delta_compactions} should be >= 15_000 for 100 compaction files"
@@ -3945,7 +3924,7 @@ mod tests {
                 .schema_string()
                 .len();
         let heap_delta =
-            snap_wide.approximate_owned_heap_size() - snap_small.approximate_owned_heap_size();
+            snap_wide.estimated_owned_heap_size() - snap_small.estimated_owned_heap_size();
         // Tables differ only in schemaString, so heap_delta should be approximately the
         // schema_str_delta.
         let ratio = heap_delta as f64 / schema_str_delta as f64;
@@ -3963,7 +3942,7 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        let heap = snapshot.approximate_owned_heap_size();
+        let heap = snapshot.estimated_owned_heap_size();
         assert!(heap > 0, "heap size should be nonzero");
         assert!(
             heap < 10000,
