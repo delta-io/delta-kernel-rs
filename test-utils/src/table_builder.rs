@@ -77,7 +77,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Snapshot};
 
 // ===========================================================================
 // Sweep constants
@@ -389,12 +389,6 @@ pub fn checkpoint_at_end_crc_at_end() -> LogState {
         .with_crc_at(DEFAULT_SWEEP_LATEST_VERSION)
 }
 
-pub fn checkpoint_at_end_crc_at_mid() -> LogState {
-    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
-        .with_checkpoint_at([DEFAULT_SWEEP_LATEST_VERSION])
-        .with_crc_at(DEFAULT_SWEEP_MID_VERSION)
-}
-
 // Post-cleanup variants: same shapes as above but with log cleanup applied at MID.
 // Cleanup at MID (not at LATEST) keeps commits MID..=LATEST reachable, so the canonical
 // `at_version(MID)` and `incremental_to_latest { from: MID }` targets still resolve.
@@ -419,6 +413,18 @@ pub fn checkpoint_mid_no_hint_post_cleanup() -> LogState {
 
 pub fn two_checkpoints_stale_hint_post_cleanup() -> LogState {
     two_checkpoints_stale_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_at_end_crc_at_end_post_cleanup() -> LogState {
+    checkpoint_at_end_post_cleanup().with_crc_at(DEFAULT_SWEEP_LATEST_VERSION)
+}
+
+pub fn checkpoint_at_end_crc_at_mid_post_cleanup() -> LogState {
+    checkpoint_at_end_post_cleanup().with_crc_at(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_mid_crc_at_mid_post_cleanup() -> LogState {
+    checkpoint_mid_post_cleanup().with_crc_at(DEFAULT_SWEEP_MID_VERSION)
 }
 
 /// Extract the version from a versioned log file. Returns `None` for unversioned
@@ -1198,8 +1204,9 @@ impl TestTableBuilder {
             .unwrap_post_commit_snapshot();
 
         let crc_at = self.log_state.crc_at();
-        let mut crc_snapshot = (crc_at == Some(0)).then(|| snapshot.clone());
-
+        if crc_at == Some(0) {
+            write_crc(&snapshot, engine.as_ref())?;
+        }
         if checkpoints_at.contains(&0) {
             snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
             if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
@@ -1221,7 +1228,7 @@ impl TestTableBuilder {
             .await?
             .unwrap_post_commit_snapshot();
             if crc_at == Some(v) {
-                crc_snapshot = Some(snapshot.clone());
+                write_crc(&snapshot, engine.as_ref())?;
             }
             if checkpoints_at.contains(&v) {
                 snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
@@ -1229,15 +1236,6 @@ impl TestTableBuilder {
                     stale_hint_bytes = Some(read_hint_bytes(&store, &resolved_hint_path).await?);
                 }
             }
-        }
-
-        if let Some(snap) = crc_snapshot {
-            let (result, _) = snap.write_checksum(engine.as_ref())?;
-            assert_eq!(
-                result,
-                ChecksumWriteResult::Written,
-                "fresh in-memory table should never have a CRC on disk at this version",
-            );
         }
 
         match hint_state {
@@ -1294,6 +1292,19 @@ impl TestTableBuilder {
 // ===========================================================================
 // Data commit via kernel write path
 // ===========================================================================
+
+/// Write a CRC file via kernel's checksum writer. Builder invariant: the snapshot
+/// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
+/// that version cannot already exist on disk.
+fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
+    let (result, _) = snapshot.write_checksum(engine)?;
+    assert_eq!(
+        result,
+        ChecksumWriteResult::Written,
+        "fresh in-memory table should never have a CRC on disk at this version",
+    );
+    Ok(())
+}
 
 /// Write a data commit using kernel's transaction + write_parquet path.
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
@@ -2361,43 +2372,46 @@ mod tests {
         version: u64,
     }
 
+    /// Read and JSON-parse a file from `store`. Returns `Ok(None)` if absent.
+    async fn try_read_json(
+        store: &DynObjectStore,
+        path: &Path,
+    ) -> DeltaResult<Option<serde_json::Value>> {
+        let bytes = match store.get(path).await {
+            Ok(r) => r.bytes().await.map_err(delta_kernel::Error::from)?,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(delta_kernel::Error::from(e)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| delta_kernel::Error::generic(e.to_string()))
+    }
+
     /// Read and parse the `_last_checkpoint` hint, if present.
     fn read_last_checkpoint_hint(store: &Arc<DynObjectStore>) -> DeltaResult<Option<HintFile>> {
         let store = store.clone();
         block_on_sync(move || async move {
             let path = Path::from("_delta_log/_last_checkpoint");
-            match store.get(&path).await {
-                Ok(get_result) => {
-                    let bytes = get_result
-                        .bytes()
-                        .await
-                        .map_err(delta_kernel::Error::from)?;
-                    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-                        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+            match try_read_json(&store, &path).await? {
+                Some(parsed) => {
                     let version = parsed["version"].as_u64().ok_or_else(|| {
                         delta_kernel::Error::generic("hint missing `version` field")
                     })?;
                     Ok(Some(HintFile { version }))
                 }
-                Err(ObjectStoreError::NotFound { .. }) => Ok(None),
-                Err(e) => Err(delta_kernel::Error::from(e)),
+                None => Ok(None),
             }
         })
     }
 
-    /// Read and parse a CRC file at `version`.
+    /// Read and parse a CRC file at `version`. Errors if the file is absent.
     fn read_crc_json(store: &Arc<DynObjectStore>, version: u64) -> DeltaResult<serde_json::Value> {
         let store = store.clone();
         block_on_sync(move || async move {
             let path = Path::from(format!("_delta_log/{version:020}.crc"));
-            let bytes = store
-                .get(&path)
-                .await
-                .map_err(delta_kernel::Error::from)?
-                .bytes()
-                .await
-                .map_err(delta_kernel::Error::from)?;
-            serde_json::from_slice(&bytes).map_err(|e| delta_kernel::Error::generic(e.to_string()))
+            try_read_json(&store, &path)
+                .await?
+                .ok_or_else(|| delta_kernel::Error::generic(format!("CRC at v={version} missing")))
         })
     }
 

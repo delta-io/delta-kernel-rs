@@ -96,12 +96,14 @@ define_sweeps! {
         crc_at_end(),
         crc_at_mid(),
         checkpoint_at_end_crc_at_end(),
-        checkpoint_at_end_crc_at_mid(),
         checkpoint_at_end_post_cleanup(),
         checkpoint_at_end_no_hint_post_cleanup(),
         checkpoint_mid_post_cleanup(),
         checkpoint_mid_no_hint_post_cleanup(),
-        two_checkpoints_stale_hint_post_cleanup()
+        two_checkpoints_stale_hint_post_cleanup(),
+        checkpoint_at_end_crc_at_end_post_cleanup(),
+        checkpoint_at_end_crc_at_mid_post_cleanup(),
+        checkpoint_mid_crc_at_mid_post_cleanup()
     ),
     // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
     //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,

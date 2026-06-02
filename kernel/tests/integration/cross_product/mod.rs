@@ -6,12 +6,13 @@ use rstest::rstest;
 use rstest_reuse::apply;
 use test_utils::table_builder::{
     all_features_cm_id, all_features_cm_name, checkpoint_at_end, checkpoint_at_end_crc_at_end,
-    checkpoint_at_end_crc_at_mid, checkpoint_at_end_no_hint,
-    checkpoint_at_end_no_hint_post_cleanup, checkpoint_at_end_post_cleanup, checkpoint_json_stats,
-    checkpoint_mid, checkpoint_mid_no_hint, checkpoint_mid_no_hint_post_cleanup,
-    checkpoint_mid_post_cleanup, checkpoint_struct_stats, clustered, commits_only, crc_at_end,
-    crc_at_mid, no_checkpoint_stats, no_features, partitioned, test_table,
-    two_checkpoints_stale_hint, two_checkpoints_stale_hint_post_cleanup, unpartitioned,
+    checkpoint_at_end_crc_at_end_post_cleanup, checkpoint_at_end_crc_at_mid_post_cleanup,
+    checkpoint_at_end_no_hint, checkpoint_at_end_no_hint_post_cleanup,
+    checkpoint_at_end_post_cleanup, checkpoint_json_stats, checkpoint_mid,
+    checkpoint_mid_crc_at_mid_post_cleanup, checkpoint_mid_no_hint,
+    checkpoint_mid_no_hint_post_cleanup, checkpoint_mid_post_cleanup, checkpoint_struct_stats,
+    clustered, commits_only, crc_at_end, crc_at_mid, no_checkpoint_stats, no_features, partitioned,
+    test_table, two_checkpoints_stale_hint, two_checkpoints_stale_hint_post_cleanup, unpartitioned,
     version_at_mid, version_incremental_to_latest, version_latest, DataLayoutConfig, FeatureSet,
     LogState, TableConfig, VersionTarget,
 };
