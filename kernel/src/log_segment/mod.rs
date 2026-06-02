@@ -1062,12 +1062,10 @@ impl LogSegment {
             .try_collect()
     }
 
-    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
-    ///
-    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
-    /// checkpoint files, CRC files, and last checkpoint metadata. Only commits and compactions
-    /// in `(start_v_exclusive, end_version]` are retained.
-    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+    /// Creates a pruned LogSegment of only the commits and compactions in
+    /// `(start_v_exclusive, end_version]`, dropping checkpoint files, CRC files, and
+    /// last-checkpoint metadata.
+    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> Self {
         let (commits, compactions) =
             self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
         LogSegment {

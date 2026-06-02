@@ -244,7 +244,7 @@ impl Snapshot {
         // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
         // checkpoint. The existing snapshot supplies the P&M baseline.
         let (new_metadata, new_protocol) = new_log_segment
-            .segment_after_crc(existing_snapshot_version)
+            .segment_after_version(existing_snapshot_version)
             .read_protocol_metadata_opt(engine)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
@@ -330,11 +330,11 @@ impl Snapshot {
     /// if and only if its version is >= the new segment's checkpoint version. This preserves
     /// the [`LogSegmentFiles`] invariant `crc.version >= checkpoint.version`.
     ///
-    /// The returned `Crc` is read only when the resolved CRC file is newer than
-    /// `existing_snapshot_version` (so it can contribute P&M for the new commits) or at the new
-    /// end version (so it can back the new snapshot). An older CRC can do neither, so it is left
-    /// unread and only contributes its path to the combined segment. When the resolved CRC is
-    /// the one `existing_crc` already holds, it is reused instead of re-read.
+    /// The returned `Crc` is read when the resolved CRC file is newer than
+    /// `existing_snapshot_version` (currently unused; see #2674) or at the new end version (which
+    /// backs the new snapshot). An older CRC can do neither, so it is left unread and only
+    /// contributes its path to the combined segment. When the resolved CRC is the one
+    /// `existing_crc` already holds, it is reused instead of re-read.
     fn resolve_crc(
         new_log_segment: &LogSegment,
         existing_log_segment: &LogSegment,

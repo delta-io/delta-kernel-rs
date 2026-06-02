@@ -1747,15 +1747,16 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     );
 
     // === Check: write_checksum ===
-    match crc_staleness {
-        CrcStaleness::Absent => assert!(matches!(
-            fresh.write_checksum(engine.as_ref()),
-            Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
-        )),
-        _ => assert_eq!(
+    if expect_crc_present {
+        assert_eq!(
             fresh.write_checksum(engine.as_ref())?.0,
             ChecksumWriteResult::Written
-        ),
+        );
+    } else {
+        assert!(matches!(
+            fresh.write_checksum(engine.as_ref()),
+            Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+        ));
     }
 
     Ok(())
@@ -1795,6 +1796,35 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
         fresh.write_checksum(engine.as_ref()),
         Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
     ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    snap.write_checksum(engine.as_ref())?;
+    insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_committed();
+
+    let commit_v1 = _temp_dir
+        .path()
+        .join("_delta_log/00000000000000000001.json");
+    std::fs::write(&commit_v1, b"}}} not valid commit json").unwrap();
+
+    assert!(Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())
+        .is_err());
 
     Ok(())
 }

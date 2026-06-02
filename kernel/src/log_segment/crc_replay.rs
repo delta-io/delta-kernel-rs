@@ -71,23 +71,25 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 impl LogSegment {
-    /// Try to build the CRC at this segment's `end_version`: read the on-disk CRC (absent or
-    /// unreadable -> `None`) and advance a stale one to `end_version`.
+    /// Try to build the CRC at this segment's `end_version`. Handles three cases:
+    /// - Case 1: CRC absent (1A) or read fails (1B) -> return None
+    /// - Case 2: CRC at `end_version` -> return it as-is
+    /// - Case 3: Stale CRC older than `end_version` -> advance it to `end_version`
     pub(crate) fn try_build_incremental_crc(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Arc<Crc>>> {
         let Some(crc_file) = self.listed.latest_crc_file.as_ref() else {
-            return Ok(None);
+            return Ok(None); // Case 1A
         };
         let Some(base_crc) = read_crc_file_or_none(engine, crc_file) else {
-            return Ok(None);
+            return Ok(None); // Case 1B
         };
         if base_crc.version == self.end_version {
-            return Ok(Some(base_crc));
+            return Ok(Some(base_crc)); // Case 2
         }
         let advanced = self.build_incremental_crc_from_base(engine, &base_crc)?;
-        Ok(Some(Arc::new(advanced)))
+        Ok(Some(Arc::new(advanced))) // Case 3
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
@@ -281,6 +283,8 @@ impl CrcReplayAccumulator {
         fs.net_files += 1;
         fs.net_bytes += size;
         if let Some(hist) = fs.net_histogram.as_mut() {
+            // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
+            //              Indeterminate instead, like a missing remove size.
             hist.insert(size)?;
         }
         Ok(())

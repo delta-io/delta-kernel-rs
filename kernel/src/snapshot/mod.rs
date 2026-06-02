@@ -181,6 +181,8 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let crc = log_segment.try_build_incremental_crc(engine)?;
 
+        // TODO(#2677): emit an `IncrementalCrcLoad` metric on the CRC branch; the
+        //              `ProtocolMetadataLoaded` span only fires on the replay branch below.
         let (metadata, protocol) = match crc.as_deref() {
             Some(c) => (c.metadata.clone(), c.protocol.clone()),
             None => log_segment.read_protocol_metadata(engine, operation_id)?,
