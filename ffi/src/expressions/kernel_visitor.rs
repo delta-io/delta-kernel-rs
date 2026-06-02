@@ -499,6 +499,10 @@ impl NullTypeTag {
                 PrimitiveType::Date => (Self::Date, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
+                // Interval types have no FFI null-literal tag yet; treat as non-primitive.
+                PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                    (Self::NonPrimitive, 0, 0)
+                }
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this

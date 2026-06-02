@@ -174,17 +174,13 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "void_007_void_with_backticks/specs/void_007_void_with_backticks_read_all",
         ],
     ),
+    // Interval columns read as their physical integer (i32 months / i64 microseconds), which
+    // the rest of the intv_* suite now passes. Partitioned interval columns additionally
+    // require materializing the partition value as a Scalar, which interval does not yet
+    // support (no Scalar::Interval variant).
     (
-        "Interval types not supported in schema deserialization",
-        &[
-            "intv_001_interval_ym_basic/",
-            "intv_002_interval_dt_basic/",
-            "intv_003_interval_partitioned/",
-            "intv_004_interval_negative/",
-            "intv_005_interval_mixed/",
-            "intv_boundary_values/",
-            "intv_sub_second/",
-        ],
+        "Interval partition values not supported (needs Scalar::Interval)",
+        &["intv_003_interval_partitioned/specs/intv_003_interval_partitioned_read_all"],
     ),
     (
         "Cannot fall back to log replay when checkpoint files are missing or incomplete",
