@@ -237,10 +237,10 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
 // ============================================================================
 // TODO: migrate to TestTableBuilder when CRC LogState variants land (#2284)
 
-/// When a CRC file exists at an older version than the snapshot, the kernel takes the
-/// partial-replay path: it replays only the tail commits (those after the CRC version)
-/// looking for Protocol/Metadata changes, then falls back to the CRC when none are
-/// found. This produces JSON reads for the tail commits AND a storage read for the CRC.
+/// When a CRC file exists at an older version than the snapshot, the kernel advances it to the
+/// target version via reverse-replay: it reads the tail commits (those after the CRC version)
+/// once and reads the base CRC from storage. P&M come from the advanced CRC, so there is no
+/// separate P&M scan.
 ///
 /// This is a normal, expected table state -- having a CRC from a previous version is
 /// not an error or degraded condition.
@@ -249,7 +249,7 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
 /// one), so this test uses `create_table` commit -> `post_commit_snapshot` ->
 /// `write_checksum` to write the CRC at v0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> DeltaResult<()> {
+async fn crc_at_prior_version_advances_via_reverse_replay() -> DeltaResult<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -286,16 +286,17 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
 
     // Measurement: build snapshot at latest (v2); CRC is at v0 (two versions behind)
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
+    let snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
+    assert_eq!(snap.crc().expect("stale CRC advanced to v2").version, 2);
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 3); // v0, v1, v2
 
-    // Tail replay: commits v1 and v2 (after the CRC at v0) are replayed via JSON
+    // Reverse-replay reads the tail commits v1 and v2 (after the CRC at v0) in one JSON call.
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 2);
-    // CRC is loaded from storage as a fallback (P+M not found in the tail commits)
+    // The base CRC at v0 is read from storage.
     assert!(reporter.storage_read_calls.get() >= 1);
 
     Ok(())
