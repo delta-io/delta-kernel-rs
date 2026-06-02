@@ -606,12 +606,7 @@ impl TableConfiguration {
                 check(&self.protocol, &self.table_properties, operation)?;
             }
         };
-
-        // Feature requirements are writer-side constraints, so only enforce them on writes.
-        match operation {
-            Operation::Write => self.validate_feature_requirements(feature),
-            Operation::Scan | Operation::Cdf => Ok(()),
-        }
+        self.validate_feature_requirements(feature)
     }
 
     /// Returns all reader features enabled for this table based on protocol version.
@@ -1789,31 +1784,23 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
-    // The catalog-managed ICT requirement is enforced on writes but not reads.
+    // A catalog-managed table requires inCommitTimestamp to be enabled.
     #[rstest]
-    #[case::catalog_managed_write(
+    #[case::catalog_managed(
         TableFeature::CatalogManaged,
-        Operation::Write,
-        Some("Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled")
+        "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"
     )]
-    #[case::catalog_owned_preview_write(
+    #[case::catalog_owned_preview(
         TableFeature::CatalogOwnedPreview,
-        Operation::Write,
-        Some("Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled")
+        "Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled"
     )]
-    #[case::catalog_managed_scan(TableFeature::CatalogManaged, Operation::Scan, None)]
-    #[case::catalog_owned_preview_scan(TableFeature::CatalogOwnedPreview, Operation::Scan, None)]
     fn test_catalog_managed_requires_in_commit_timestamp(
         #[case] feature: TableFeature,
-        #[case] operation: Operation,
-        #[case] expected_error: Option<&str>,
+        #[case] expected_error: &str,
     ) {
         let config = create_mock_table_config(&[], &[feature]);
-        let result = config.ensure_operation_supported(operation);
-        match expected_error {
-            Some(msg) => assert_result_error_with_message(result, msg),
-            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
-        }
+        let result = config.ensure_operation_supported(Operation::Write);
+        assert_result_error_with_message(result, expected_error);
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization
