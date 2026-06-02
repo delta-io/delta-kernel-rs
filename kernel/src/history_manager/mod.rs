@@ -589,9 +589,7 @@ pub fn timestamp_range_to_versions(
 
 /// Returns the earliest table version that can be fully reconstructed from the log at
 /// `log_root`. This is either commit version 0 (if `00...00.json` exists), or the version
-/// of the earliest complete checkpoint that anchors the smallest surviving commit. A
-/// checkpoint is complete when a single-part or UUID file exists, or when all `num_parts`
-/// of a multi-part checkpoint are present. The returned version is not guaranteed to exist by the
+/// of the earliest complete checkpoint. The returned version is not guaranteed to exist by the
 /// time the caller acts on it: a concurrent log-cleanup operation may delete the file.
 ///
 /// # Parameters
