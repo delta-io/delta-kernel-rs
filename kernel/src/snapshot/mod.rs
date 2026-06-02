@@ -1117,8 +1117,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::{
-        checkpoint_json_stats, unpartitioned, FeatureSet, LogState, TestTableBuilder,
-        VersionTarget,
+        checkpoint_json_stats, unpartitioned, FeatureSet, LogState, TestTableBuilder, VersionTarget,
     };
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -2173,7 +2172,8 @@ mod tests {
                     listed.checkpoint_parts.push(part);
                 }
             });
-        let delta_checkpoints = snap_extra_checkpoints.estimated_owned_heap_size_bytes() - baseline_heap;
+        let delta_checkpoints =
+            snap_extra_checkpoints.estimated_owned_heap_size_bytes() - baseline_heap;
         assert!(
             delta_checkpoints >= 15_000,
             "delta_checkpoints {delta_checkpoints} should be >= 15_000 for 100 checkpoint parts"
@@ -2199,7 +2199,8 @@ mod tests {
                     listed.ascending_compaction_files.push(comp);
                 }
             });
-        let delta_compactions = snap_extra_compactions.estimated_owned_heap_size_bytes() - baseline_heap;
+        let delta_compactions =
+            snap_extra_compactions.estimated_owned_heap_size_bytes() - baseline_heap;
         assert!(
             delta_compactions >= 15_000,
             "delta_compactions {delta_compactions} should be >= 15_000 for 100 compaction files"
@@ -2247,8 +2248,8 @@ mod tests {
                 .metadata()
                 .schema_string()
                 .len();
-        let heap_delta =
-            snap_wide.estimated_owned_heap_size_bytes() - snap_small.estimated_owned_heap_size_bytes();
+        let heap_delta = snap_wide.estimated_owned_heap_size_bytes()
+            - snap_small.estimated_owned_heap_size_bytes();
         // Tables differ only in schemaString, so heap_delta should be approximately the
         // schema_str_delta.
         let ratio = heap_delta as f64 / schema_str_delta as f64;

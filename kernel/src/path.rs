@@ -110,7 +110,7 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
     /// Estimated heap size in bytes, best-effort estimate.
-    /// 
+    ///
     /// The Url(self.location) is measured via `len()` because it doesn't expose the capacity of its
     /// internal `serialization` String, so any String capacity slack on it is not counted.
     pub(crate) fn estimated_heap_size_bytes(&self) -> usize {
