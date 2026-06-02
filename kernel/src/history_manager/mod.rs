@@ -1646,7 +1646,7 @@ mod tests {
     // Tests for get_earliest_recreatable_commit
     // ====================================================================================
 
-    /// Builds an in-memory store with one entry per given log file path and returns
+    /// Builds an in-memory store with a mock entry per given log file path and returns
     /// an engine wired to it plus the corresponding `_delta_log/` URL.
     fn engine_with_log_files(paths: &[String]) -> (SyncEngine, Url) {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
