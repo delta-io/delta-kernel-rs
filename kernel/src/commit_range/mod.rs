@@ -48,7 +48,7 @@
 mod actions;
 mod builder;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 pub use actions::{CommitAction, DeltaAction};
 pub use builder::{CommitOrdering, CommitRangeBuilder};
@@ -58,26 +58,11 @@ use crate::actions::{
     Add, Cdc, CommitInfo, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
-use crate::expressions::Expression;
 use crate::path::ParsedLogPath;
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
-use crate::{DeltaResult, Engine, EngineData, Error, Version};
-
-/// Output column name for the per-row commit version emitted by [`CommitRange::actions`].
-const COMMIT_VERSION_COL: &str = "version";
-
-/// Output column name for the per-row commit timestamp emitted by [`CommitRange::actions`].
-const COMMIT_TIMESTAMP_COL: &str = "timestamp";
-
-/// Per-row metadata columns prepended by [`CommitRange::actions`].
-static METADATA_FIELDS: LazyLock<[StructField; 2]> = LazyLock::new(|| {
-    [
-        StructField::not_null(COMMIT_VERSION_COL, DataType::LONG),
-        StructField::not_null(COMMIT_TIMESTAMP_COL, DataType::LONG),
-    ]
-});
+use crate::{DeltaResult, Engine, Error, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
 /// plus the materialized commit-file pointers in `commit_files`.
@@ -204,64 +189,6 @@ impl CommitRange {
             latest_metadata,
         })
     }
-
-    /// Yield action batches across all commits as [`crate::EngineData`], with
-    /// `version` and `timestamp` columns prepended to each batch's struct schema.
-    ///
-    /// Built on top of [`Self::commits`]: every batch is transformed via the engine's
-    /// `EvaluationHandler` to inject the commit's version and timestamp as literal
-    /// columns. The original action columns (`add`, `remove`, ...) are passed through
-    /// unchanged in the order driven by `actions`.
-    ///
-    /// Returns `Err` eagerly under the same conditions as [`Self::commits`]. Per-commit
-    /// validation errors and per-batch errors surface during iteration.
-    pub fn actions(
-        &self,
-        engine: Arc<dyn Engine>,
-        start_snapshot: Option<SnapshotRef>,
-        actions: &[DeltaAction],
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
-        let action_kinds = actions.to_vec();
-        let input_schema = build_read_schema(action_kinds.iter().copied());
-        let output_schema = actions_output_schema(&action_kinds);
-        let evaluation_handler = engine.evaluation_handler();
-        let commits_iter = self.commits(engine, start_snapshot, actions)?;
-
-        Ok(commits_iter.flat_map(
-            move |commit_res| -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
-                let commit = match commit_res {
-                    Ok(c) => c,
-                    Err(e) => return Box::new(std::iter::once(Err(e))),
-                };
-                let version_i64 = match i64::try_from(commit.version()) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Box::new(std::iter::once(Err(Error::generic(format!(
-                            "commit version {} overflows i64",
-                            commit.version()
-                        )))));
-                    }
-                };
-                let expr =
-                    actions_transform_expression(&action_kinds, version_i64, commit.timestamp());
-                let evaluator = match evaluation_handler.new_expression_evaluator(
-                    input_schema.clone(),
-                    Arc::new(expr),
-                    output_schema.clone().into(),
-                ) {
-                    Ok(e) => e,
-                    Err(e) => return Box::new(std::iter::once(Err(e))),
-                };
-                let batches = match commit.get_actions() {
-                    Ok(it) => it,
-                    Err(e) => return Box::new(std::iter::once(Err(e))),
-                };
-                Box::new(batches.map(move |batch_res| {
-                    batch_res.and_then(|batch| evaluator.evaluate(batch.as_ref()))
-                }))
-            },
-        ))
-    }
 }
 
 /// Iterator yielded by [`CommitRange::commits`]. Holds the iterator's accumulated
@@ -271,7 +198,7 @@ impl CommitRange {
 pub(crate) struct CommitActionsIterator {
     engine: Arc<dyn Engine>,
     table_root: Url,
-    log_path_iter: std::vec::IntoIter<ParsedLogPath>, // impl IntoIter<ParsedLogPath>
+    log_path_iter: std::vec::IntoIter<ParsedLogPath>, // impl IntoIter<ParsedLog>
     commit_ordering: CommitOrdering,
     read_schema: SchemaRef,
     latest_protocol: Option<Protocol>,
@@ -330,18 +257,6 @@ impl Iterator for CommitActionsIterator {
     }
 }
 
-/// Map a [`DeltaAction`] to the JSON column name used in the Delta log.
-fn action_column_name(action: DeltaAction) -> &'static str {
-    match action {
-        DeltaAction::Add => ADD_NAME,
-        DeltaAction::Remove => REMOVE_NAME,
-        DeltaAction::Metadata => METADATA_NAME,
-        DeltaAction::Protocol => PROTOCOL_NAME,
-        DeltaAction::CommitInfo => COMMIT_INFO_NAME,
-        DeltaAction::Cdc => CDC_NAME,
-    }
-}
-
 /// Build the nullable [`StructField`] that represents this action kind in the read schema.
 fn action_to_field(action: DeltaAction) -> StructField {
     match action {
@@ -363,33 +278,6 @@ fn build_read_schema(actions: impl IntoIterator<Item = DeltaAction>) -> SchemaRe
     ))
 }
 
-/// Output schema produced by [`CommitRange::actions`]:
-/// `struct<version: long, timestamp: long, ...input_fields>`.
-fn actions_output_schema(actions: &[DeltaAction]) -> SchemaRef {
-    let action_fields = actions.iter().copied().map(action_to_field);
-    Arc::new(StructType::new_unchecked(
-        METADATA_FIELDS.iter().cloned().chain(action_fields),
-    ))
-}
-
-/// Per-commit transformation expression: emits a struct of
-/// `[literal(version), literal(timestamp), col(action_1), col(action_2), ...]`.
-fn actions_transform_expression(
-    actions: &[DeltaAction],
-    commit_version: i64,
-    commit_timestamp: i64,
-) -> Expression {
-    let metadata = [
-        Expression::literal(commit_version),
-        Expression::literal(commit_timestamp),
-    ];
-    let action_columns = actions
-        .iter()
-        .copied()
-        .map(|a| Expression::column([action_column_name(a)]));
-    Expression::struct_from(metadata.into_iter().chain(action_columns))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -403,7 +291,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
     use crate::object_store::memory::InMemory;
-    use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes};
+    use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
     use crate::Snapshot;
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
@@ -517,50 +405,6 @@ mod tests {
         assert_eq!(removes.len(), 1, "v=1 has exactly one remove");
         // DV rewrite: the same physical file path appears on both sides.
         assert_eq!(adds[0], removes[0], "DV rewrite shares the file path");
-    }
-
-    /// Visitor capturing `(version, timestamp, add.path, remove.path)` per row.
-    #[derive(Default)]
-    struct ActionsTaggedVisitor {
-        rows: Vec<(i64, i64, Option<String>, Option<String>)>,
-    }
-
-    impl RowVisitor for ActionsTaggedVisitor {
-        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-            static COLS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                (
-                    vec![
-                        column_name!("version"),
-                        column_name!("timestamp"),
-                        column_name!("add.path"),
-                        column_name!("remove.path"),
-                    ],
-                    vec![
-                        DataType::LONG,
-                        DataType::LONG,
-                        DataType::STRING,
-                        DataType::STRING,
-                    ],
-                )
-                    .into()
-            });
-            COLS.as_ref()
-        }
-
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
-            for i in 0..row_count {
-                let version: i64 = getters[0].get(i, "version")?;
-                let timestamp: i64 = getters[1].get(i, "timestamp")?;
-                let add_path: Option<String> = getters[2].get_opt(i, "add.path")?;
-                let remove_path: Option<String> = getters[3].get_opt(i, "remove.path")?;
-                self.rows.push((version, timestamp, add_path, remove_path));
-            }
-            Ok(())
-        }
     }
 
     /// Build an in-memory engine pre-loaded with `commits` (each `(version, body)` pair becomes
@@ -854,44 +698,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn actions_yields_metadata_columns_prepended() {
-        let (range, engine, anchor_snapshot) = open_test_range_at(0);
-        let files = range.commit_files.clone();
-
-        let actions = [DeltaAction::Add, DeltaAction::Remove];
-        let mut visitor = ActionsTaggedVisitor::default();
-        for batch_res in range
-            .actions(engine, Some(anchor_snapshot), &actions)
-            .unwrap()
-        {
-            visitor.visit_rows_of(batch_res.unwrap().as_ref()).unwrap();
-        }
-
-        let mut add_versions = visitor
-            .rows
-            .iter()
-            .filter_map(|r| r.2.as_ref().map(|_| r.0))
-            .collect::<Vec<_>>();
-        add_versions.sort();
-        let remove_versions = visitor
-            .rows
-            .iter()
-            .filter_map(|r| r.3.as_ref().map(|_| r.0))
-            .collect::<Vec<_>>();
-        assert_eq!(add_versions, vec![0, 1], "adds appear in v=0 and v=1");
-        assert_eq!(remove_versions, vec![1], "remove appears only in v=1");
-
-        // timestamp matches each commit file's last_modified.
-        for (version, timestamp, _, _) in &visitor.rows {
-            let v_ix = *version as usize;
-            assert_eq!(
-                *timestamp, files[v_ix].location.last_modified,
-                "timestamp for commit {version} must match file last_modified",
-            );
-        }
-    }
-
     /// Count the rows in a single batch iterator returned by `get_actions`.
     fn count_rows(it: crate::FileDataReadResultIterator) -> DeltaResult<usize> {
         let mut total = 0;
@@ -945,51 +751,6 @@ mod tests {
             first, second,
             "get_actions must yield identical content across calls",
         );
-    }
-
-    #[tokio::test]
-    async fn actions_without_snapshot_yields_metadata_columns() {
-        // v=0 carries valid P+M plus a single Add. With no snapshot, `actions()` must
-        // still prepend `version` and `timestamp` columns to the emitted batches.
-        let add_line = r#"{"add":{"path":"foo/bar.parquet","partitionValues":{},"size":100,"modificationTime":1000,"dataChange":true}}"#;
-        let v0 = format!(
-            "{}\n{}\n{}",
-            VALID_PROTOCOL_LINE, VALID_METADATA_LINE, add_line,
-        );
-        let (engine, table_root) = engine_with_commits(&[(0, &v0)]).await;
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::Add];
-        let mut saw_metadata_columns = false;
-        for batch_res in range.actions(engine, None, &actions).unwrap() {
-            let batch = batch_res.unwrap();
-            let arrow = batch
-                .any_ref()
-                .downcast_ref::<ArrowEngineData>()
-                .expect("default engine returns ArrowEngineData");
-            let names = arrow
-                .record_batch()
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().to_string())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                names,
-                vec![
-                    COMMIT_VERSION_COL.to_string(),
-                    COMMIT_TIMESTAMP_COL.to_string(),
-                    ADD_NAME.to_string(),
-                ],
-                "actions() must prepend version+timestamp to the requested actions",
-            );
-            saw_metadata_columns = true;
-        }
-        assert!(saw_metadata_columns, "expected at least one emitted batch");
     }
 
     #[tokio::test]
