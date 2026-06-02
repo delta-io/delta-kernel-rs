@@ -109,6 +109,14 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 }
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
+    /// Estimated heap size in bytes, best-effort estimate.
+    ///
+    /// The Url(self.location) is measured via `len()` because it doesn't expose the capacity of its
+    /// internal `serialization` String. Any String capacity slack on it is not counted.
+    pub(crate) fn estimated_heap_size_bytes(&self) -> usize {
+        self.filename.capacity() + self.extension.capacity() + self.location.as_url().as_str().len()
+    }
+
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is
     // local.
     #[internal_api]
