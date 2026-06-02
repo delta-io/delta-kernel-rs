@@ -810,7 +810,7 @@ impl Snapshot {
     /// here.
     ///
     /// Runs in O(n) over listed log files.
-    pub fn estimated_owned_heap_size(&self) -> usize {
+    pub fn estimated_owned_heap_size_bytes(&self) -> usize {
         self.log_segment.listed.estimated_heap_size_bytes()
             + self.log_segment.log_root.as_str().len()
             + self
@@ -3807,11 +3807,11 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    // === approximate_heap_size ===
-    /// Test that the approximate_owned_heap_size is correctly considering normal commit jsons,
+    // === estimated_owned_heap_size ===
+    /// Test that the estimated_owned_heap_size is correctly considering normal commit jsons,
     /// checkpoint parts, and log compaction files.
     #[test]
-    fn approximate_owned_heap_size_on_table_with_many_log_files() {
+    fn estimated_owned_heap_size_on_table_with_many_log_files() {
         // Baseline: 101 commits (v0..=v100), no checkpoint, no compactions.
         let (_engine, baseline_snap, _table) = test_utils::test_context!(
             LogState::with_latest_version(100),
@@ -3820,7 +3820,7 @@ mod tests {
             SyncEngine::new_with_store
         );
 
-        let baseline_heap = baseline_snap.approximate_owned_heap_size();
+        let baseline_heap = baseline_snap.estimated_owned_heap_size();
         let struct_size = size_of::<Snapshot>();
         // Heap size should be at least 5 times the stack size, to account for
         // the 100 commits file metadata.
@@ -3849,7 +3849,7 @@ mod tests {
                     listed.checkpoint_parts.push(part);
                 }
             });
-        let delta_checkpoints = snap_extra_checkpoints.estimated_owned_heap_size() - baseline_heap;
+        let delta_checkpoints = snap_extra_checkpoints.estimated_owned_heap_size_bytes() - baseline_heap;
         assert!(
             delta_checkpoints >= 15_000,
             "delta_checkpoints {delta_checkpoints} should be >= 15_000 for 100 checkpoint parts"
@@ -3875,7 +3875,7 @@ mod tests {
                     listed.ascending_compaction_files.push(comp);
                 }
             });
-        let delta_compactions = snap_extra_compactions.estimated_owned_heap_size() - baseline_heap;
+        let delta_compactions = snap_extra_compactions.estimated_owned_heap_size_bytes() - baseline_heap;
         assert!(
             delta_compactions >= 15_000,
             "delta_compactions {delta_compactions} should be >= 15_000 for 100 compaction files"
@@ -3883,9 +3883,9 @@ mod tests {
     }
 
     /// Two tables that differ only in schema width: the wider schema should bump
-    /// approximate_owned_heap_size by approximately the schemaString delta.
+    /// estimated_owned_heap_size by approximately the schemaString delta.
     #[test]
-    fn approximate_owned_heap_size_reflects_schema_string() {
+    fn estimated_owned_heap_size_reflects_schema_string() {
         fn snap_with_schema(schema: SchemaRef) -> SnapshotRef {
             let store = Arc::new(InMemory::new());
             let engine = SyncEngine::new_with_store(store);
@@ -3924,7 +3924,7 @@ mod tests {
                 .schema_string()
                 .len();
         let heap_delta =
-            snap_wide.estimated_owned_heap_size() - snap_small.estimated_owned_heap_size();
+            snap_wide.estimated_owned_heap_size_bytes() - snap_small.estimated_owned_heap_size_bytes();
         // Tables differ only in schemaString, so heap_delta should be approximately the
         // schema_str_delta.
         let ratio = heap_delta as f64 / schema_str_delta as f64;
@@ -3935,14 +3935,14 @@ mod tests {
     }
 
     #[test]
-    fn approximate_owned_heap_size_for_version_zero() {
+    fn estimated_owned_heap_size_for_version_zero() {
         let table = TestTableBuilder::new().build().unwrap();
         let engine = SyncEngine::new_with_store(table.store().clone());
         let snapshot = Snapshot::builder_for(table.table_root())
             .build(&engine)
             .unwrap();
 
-        let heap = snapshot.estimated_owned_heap_size();
+        let heap = snapshot.estimated_owned_heap_size_bytes();
         assert!(heap > 0, "heap size should be nonzero");
         assert!(
             heap < 10000,
