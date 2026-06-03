@@ -187,6 +187,11 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
+        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+            Err(Error::internal_error(format!(
+                "Interval types are not yet supported for stats validation: {dt}"
+            )))
+        }
         DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => Err(
             Error::internal_error(format!("Unsupported data type for stats validation: {dt}")),
         ),
@@ -216,6 +221,11 @@ fn is_stat_present<'b>(
         &DataType::BINARY => Ok(getter.get_binary(row_idx, field_name)?.is_some()),
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
+        }
+        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+            Err(Error::internal_error(format!(
+                "Interval types are not yet supported for stats presence check: {data_type}"
+            )))
         }
         DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => {
             Err(Error::internal_error(format!(
