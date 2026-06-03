@@ -11,58 +11,16 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::events::{
-    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, STORAGE_SPAN,
-};
+use crate::metrics::events::{StorageCopyCompleted, StorageListCompleted, StorageReadCompleted};
+use crate::metrics::{emit_storage_span, MetricsIterator};
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-/// Stream wrapper that emits a storage metric span when dropped. Drop fires regardless of
-/// whether the iterator was fully consumed or dropped early.
-///
-/// The span is always emitted on the thread that drops this iterator, which is the caller's
-/// thread.
-///
-/// Generic over the inner stream type and item type.
-struct MetricsIterator<I, T> {
-    inner: I,
-    name: &'static str,
-    start: Instant,
-    num_files: u64,
-    bytes_read: u64,
-    _phantom: std::marker::PhantomData<T>,
-}
+// Async `Stream` impls for the shared `MetricsIterator`. They live in this file rather
+// than next to the struct because `futures` is an optional dep gated on the default-engine
+// feature; the sync `Iterator` impls (always available) live in `metrics::storage_iterator`.
 
-impl<I, T> MetricsIterator<I, T> {
-    fn new(inner: I, name: &'static str, start: Instant) -> Self {
-        Self {
-            inner,
-            name,
-            start,
-            num_files: 0,
-            bytes_read: 0,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<I, T> Drop for MetricsIterator<I, T> {
-    fn drop(&mut self) {
-        let duration = self.start.elapsed();
-        let _span = tracing::span!(
-            tracing::Level::INFO,
-            STORAGE_SPAN,
-            report = tracing::field::Empty,
-            name = self.name,
-            num_files = self.num_files,
-            bytes_read = self.bytes_read,
-            duration_ns = duration.as_nanos() as u64,
-        );
-    }
-}
-
-// Iterator over file metadata (e.g. for `list_from`). Counts num_files only.
 impl<I> Stream for MetricsIterator<I, FileMeta>
 where
     I: Stream<Item = DeltaResult<FileMeta>> + Unpin,
@@ -73,7 +31,7 @@ where
         match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
             Some(item) => {
                 if item.is_ok() {
-                    self.num_files += 1;
+                    self.record_file();
                 }
                 Poll::Ready(Some(item))
             }
@@ -82,7 +40,6 @@ where
     }
 }
 
-// Iterator over byte buffers (e.g. for `read_files`). Counts num_files and total bytes_read.
 impl<I> Stream for MetricsIterator<I, Bytes>
 where
     I: Stream<Item = DeltaResult<Bytes>> + Unpin,
@@ -93,8 +50,7 @@ where
         match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
             Some(item) => {
                 if let Ok(ref bytes) = item {
-                    self.num_files += 1;
-                    self.bytes_read += bytes.len() as u64;
+                    self.record_bytes(bytes.len() as u64);
                 }
                 Poll::Ready(Some(item))
             }
@@ -243,14 +199,7 @@ async fn copy_atomic_impl(
     let result = store
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
         .await;
-    let duration = start.elapsed();
-    let _span = tracing::span!(
-        tracing::Level::INFO,
-        STORAGE_SPAN,
-        report = tracing::field::Empty,
-        name = StorageCopyCompleted::NAME,
-        duration_ns = duration.as_nanos() as u64,
-    );
+    emit_storage_span(StorageCopyCompleted::NAME, start.elapsed(), 0, 0);
 
     result.map_err(|e| match e {
         object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
