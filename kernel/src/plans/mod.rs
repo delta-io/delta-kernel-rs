@@ -3,7 +3,6 @@
 //! This module is opt-in behind the `declarative-plans` feature flag.
 pub mod ir;
 mod query_builder;
-mod validate;
 
 use bytes::Bytes;
 pub use ir::nodes::ScanFile;
