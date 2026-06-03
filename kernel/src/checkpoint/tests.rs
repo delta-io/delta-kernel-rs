@@ -28,7 +28,7 @@ use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{DeltaResult, FileMeta, LogPath, Snapshot, SnapshotRef};
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -763,92 +763,82 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     Ok(())
 }
 
-// Domain metadata reconciliation through a checkpoint.
-// Live domain must survive, while tombstoned domain
-// must be excluded from the checkpoint.
-#[rstest::rstest]
-// "foo" stays live: checkpoint keeps protocol + metadata + foo + survivor = 4 actions.
-#[case::preserves_metadata(false, Some("foo_value".to_string()), 3, 4)]
-// "foo" is tombstoned: checkpoint keeps protocol + metadata + survivor = 3 actions.
-#[case::excludes_tombstone(true, None, 4, 3)]
+/// Check that domain metadata is reconciled correctly across a checkpoint for all snapshot-loading
+/// paths. "foo" is updated and kept live, while "zip" is added and then tombstoned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_domain_metadata_reconciliation(
-    #[case] remove_foo: bool,
-    #[case] expected_foo: Option<String>,
-    #[case] expected_version: u64,
-    #[case] expected_checkpoint_size: u64,
-) -> DeltaResult<()> {
+async fn test_checkpoint_domain_metadata_reconciliation() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let table_root = Url::parse("memory:///")?;
 
-    // Version 0: protocol (with the domainMetadata writer feature) + metadata.
-    write_commit_to_store(
-        &store,
-        vec![
-            Action::Protocol(
-                Protocol::try_new_modern(TableFeature::EMPTY_LIST, ["domainMetadata"]).unwrap(),
-            ),
-            create_metadata_action(),
-        ],
-        0,
-    )
-    .await?;
+    let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "value",
+        KernelDataType::INTEGER,
+    )]));
+    let snapshot = create_table(table_root.as_str(), schema, "test")
+        .with_table_properties([("delta.feature.domainMetadata", "supported")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?
+        .unwrap_post_commit_snapshot();
 
-    let add_domain = |domain: &str, value: &str| -> DeltaResult<()> {
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    // Commit a domain metadata action from the prior post-commit snapshot
+    // and return the new post-commit snapshot.
+    let write_domain_metadata = |snapshot: SnapshotRef,
+                                 domain: &str,
+                                 value: &str,
+                                 is_removed: bool|
+     -> DeltaResult<SnapshotRef> {
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        txn.with_domain_metadata(domain.to_string(), value.to_string())
-            .commit(&engine)?
-            .unwrap_committed();
+        let txn = if is_removed {
+            txn.with_domain_metadata_removed(domain.to_string())
+        } else {
+            txn.with_domain_metadata(domain.to_string(), value.to_string())
+        };
+        Ok(txn.commit(&engine)?.unwrap_post_commit_snapshot())
+    };
+
+    let snapshot = write_domain_metadata(snapshot, "foo", "bar1", false)?;
+    // Update "foo": only the latest value should survive into the checkpoint.
+    let snapshot = write_domain_metadata(snapshot, "foo", "bar2", false)?;
+    let snapshot = write_domain_metadata(snapshot, "zip", "zap", false)?;
+    let post_commit = write_domain_metadata(snapshot, "zip", "", true)?; // tombstone
+
+    // Reconciled domain metadata: "foo" kept at its latest value, "zip" removed.
+    let assert_domains = |snapshot: &SnapshotRef| -> DeltaResult<()> {
+        assert_eq!(
+            snapshot.get_domain_metadata("foo", &engine)?,
+            Some("bar2".to_string())
+        );
+        assert_eq!(snapshot.get_domain_metadata("zip", &engine)?, None);
         Ok(())
     };
 
-    // Versions 1 & 2: write "foo" twice so the checkpoint must keep only the latest value.
-    add_domain("foo", "foo_value_old")?;
-    add_domain("foo", "foo_value")?;
-    add_domain("survivor", "survivor_value")?;
+    let crc = post_commit
+        .crc()
+        .expect("post-commit snapshot carries a CRC");
+    let domains = crc.domain_metadata_state.expect_complete();
+    assert!(domains.contains_key("foo"));
+    assert!(!domains.contains_key("zip"));
+    assert_domains(&post_commit)?;
 
-    // Version 4: tombstone "foo".
-    if remove_foo {
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        txn.with_domain_metadata_removed("foo".to_string())
-            .commit(&engine)?
-            .unwrap_committed();
-    }
+    // A freshly built snapshot has no CRC, so it resolves the same state via log replay.
+    let fresh_pre = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert!(fresh_pre.crc().is_none());
+    assert_domains(&fresh_pre)?;
 
-    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-    assert_eq!(snapshot.version(), expected_version);
-    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, expected_foo);
-    assert_eq!(
-        snapshot.get_domain_metadata("survivor", &engine)?,
-        Some("survivor_value".to_string())
-    );
+    let version = fresh_pre.version();
+    fresh_pre.checkpoint(&engine, None)?;
 
-    snapshot.checkpoint(&engine, None)?;
-
-    let checkpoint_path = Path::from(format!(
-        "_delta_log/{expected_version:020}.checkpoint.parquet"
-    ));
+    // The checkpoint excludes the "zip" tombstone and its prior add: it holds protocol + metadata
+    // + "foo" = 3 actions, with no add files.
+    let checkpoint_path = Path::from(format!("_delta_log/{version:020}.checkpoint.parquet"));
     let checkpoint_size = store.head(&checkpoint_path).await?.size;
-    assert_last_checkpoint_contents(
-        &store,
-        expected_version,
-        expected_checkpoint_size,
-        0,
-        checkpoint_size,
-    )
-    .await?;
+    assert_last_checkpoint_contents(&store, version, 3, 0, checkpoint_size).await?;
 
-    let snapshot = Snapshot::builder_for(table_root)
-        .at_version(expected_version)
+    let fresh_post = Snapshot::builder_for(table_root)
+        .at_version(version)
         .build(&engine)?;
-    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, expected_foo);
-    assert_eq!(
-        snapshot.get_domain_metadata("survivor", &engine)?,
-        Some("survivor_value".to_string())
-    );
+    assert_domains(&fresh_post)?;
 
     Ok(())
 }

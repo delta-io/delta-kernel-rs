@@ -566,11 +566,12 @@ impl ActionReconciliationVisitor<'_> {
             .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
             .unwrap_or(false);
 
-        // If the domain already exists in the set, the insertion returns false,
-        // indicating a duplicate.
+        // Record the domain before deciding inclusion, even for a tombstone. Replay is
+        // newest-first, so the first action seen for a domain must suppress every older action for
+        // it (a re-seen domain makes `insert` return false).
         let is_latest = self.seen_domains.insert(domain.to_string());
 
-        // Exclude tombstones (removed=true) from the checkpoint per protocol spec.
+        // Exclude the tombstone itself from the checkpoint per protocol spec.
         Ok(Some(is_latest && !removed))
     }
 
@@ -948,43 +949,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_action_reconciliation_visitor_excludes_domain_tombstone_suppresses_prior_add(
-    ) -> DeltaResult<()> {
-        let json_strings: StringArray = vec![
-            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":true}}"#,
-            r#"{"domainMetadata":{"domain":"survivor","configuration":"survivor_cfg","removed":false}}"#,
-            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":false}}"#,
-        ]
-        .into();
-        let batch = parse_json_batch(json_strings);
-
-        let mut seen_file_keys = HashSet::new();
-        let mut seen_txns = HashSet::new();
-        let mut seen_domains = HashSet::new();
-        let mut visitor = ActionReconciliationVisitor::new(
-            &mut seen_file_keys,
-            true,
-            vec![true; 3],
-            0,
-            false,
-            false,
-            &mut seen_txns,
-            &mut seen_domains,
-            None,
-        );
-
-        visitor.visit_rows_of(batch.as_ref())?;
-
-        // Only the surviving domain is kept.
-        let expected = vec![false, true, false];
-        assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.actions_count, 1);
-        assert_eq!(visitor.seen_domains.len(), 2);
-
-        Ok(())
-    }
-
     /// This test ensures that the processor correctly deduplicates and filters
     /// non-file actions (metadata, protocol, txn) across multiple batches.
     #[test]
@@ -1029,25 +993,30 @@ mod tests {
         Ok(())
     }
 
+    // Checks that a tombstone suppresses a domain's prior add and that a re-add in a newer commit
+    // shows up in a checkpoint.
     #[test]
-    fn test_action_reconciliation_actions_iter_domain_tombstone_suppresses_add_across_batches(
+    fn test_action_reconciliation_actions_iter_domain_metadata_tombstone_and_readd(
     ) -> DeltaResult<()> {
-        let batch1 = vec![
+        let v11_commit = vec![
+            r#"{"domainMetadata":{"domain":"bar","configuration":"bar_v2","removed":false}}"#,
             r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":true}}"#,
-            r#"{"domainMetadata":{"domain":"survivor","configuration":"survivor_cfg","removed":false}}"#,
         ];
-        let batch2 = vec![
-            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_cfg","removed":false}}"#,
+        let v10_commit = vec![
+            r#"{"domainMetadata":{"domain":"baz","configuration":"baz_cfg","removed":false}}"#,
+            r#"{"domainMetadata":{"domain":"bar","configuration":"bar_v1","removed":true}}"#,
+            r#"{"domainMetadata":{"domain":"foo","configuration":"foo_old","removed":false}}"#,
         ];
 
-        let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
+        let input_batches = vec![create_batch(v11_commit)?, create_batch(v10_commit)?];
         let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
 
-        // In batch 2 the stale "foo" add is suppressed, so the batch is dropped from the results
-        // entirely.
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].selection_vector(), &vec![false, true]);
-        assert_eq!(actions_count, 1); // only the surviving domain
+        // v11: re-added "bar" kept, "foo" tombstone excluded.
+        // v10: control "baz" kept; the older "bar" tombstone and "foo" add are both suppressed.
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].selection_vector(), &vec![true, false]);
+        assert_eq!(results[1].selection_vector(), &vec![true, false, false]);
+        assert_eq!(actions_count, 2); // re-added "bar" + control "baz"
         assert_eq!(add_actions, 0);
 
         Ok(())
