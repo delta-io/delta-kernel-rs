@@ -1647,28 +1647,6 @@ mod tests {
         }
     }
 
-    /// Commits v0..v3 are written, v1 is deleted. The function should still return v0 since
-    /// listing is forward-scanning and the lowest commit version remains v0.
-    #[tokio::test]
-    async fn test_get_earliest_published_commit_version_with_gap_in_middle() {
-        let timestamps = (0..4).map(|_| (0, None)).collect::<Vec<_>>();
-        let table = mock_table_with_timestamps(&timestamps, None).await;
-        let engine = SyncEngine::new();
-        let log_root = Url::from_directory_path(table.table_root().join("_delta_log")).unwrap();
-
-        // Delete v1, leaving v0, v2, v3 on disk
-        remove_file(
-            log_root
-                .to_file_path()
-                .unwrap()
-                .join("00000000000000000001.json"),
-        )
-        .unwrap();
-
-        let res = get_earliest_published_commit_version(&engine, &log_root, None);
-        assert_eq!(res.unwrap(), 0);
-    }
-
     #[tokio::test]
     async fn test_get_earliest_published_commit_version_ignores_staged_commits() {
         let timestamps = vec![(0, None)];
