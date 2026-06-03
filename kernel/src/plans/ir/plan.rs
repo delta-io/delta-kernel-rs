@@ -50,24 +50,35 @@ pub struct PlanNode {
 /// Each RefId is bound exactly once -- single-static-assignment (SSA) form. Callers
 /// preserve this invariant; the IR does not validate it.
 ///
-/// An executable plan has at least one node, and the last node is the plan's
-/// terminal: its output is the value the engine streams to the caller, accessible
-/// via [`Plan::result`]. Plans with no nodes, or with multiple "terminal" nodes
-/// (RefIds no other node consumes), are not executable; the plan builder is
-/// responsible for never producing them.
+/// A `Plan` has at least one node. The **terminal node** is always the
+/// last entry in `nodes`: it is the only node whose `output` no other node lists in
+/// `inputs`, and `Plan::result()` returns that node's `output` RefId -- the value the
+/// engine streams to the caller. 
+/// 
+/// # Execution
+/// 
+/// Because `nodes` is topologically sorted, an engine can evaluate the nodes in
+/// the order specified in `nodes`.  Each node's inputs are guaranteed bound by
+/// the time the node is evaluated.
+/// 
+/// For the best performance, connectors are encouraged to run kernel-produced
+/// plans through their query optimizer before execution (e.g. to fold adjacent
+/// filters, merge scans over the same files, or choose physical join and scan
+/// strategies).
 ///
 /// # Example
 ///
-/// A four-node plan with a fan-out / fan-in shape: one scan feeds two filters whose
-/// outputs are unioned. The `nodes` `Vec<PlanNode>`:
+/// A five-node plan: two independent scans, each filtered, then unioned. The `nodes`
+/// `Vec<PlanNode>`:
 ///
 /// ```text
 /// Plan {
 ///     nodes: vec![
 ///         PlanNode { kind: ScanParquet(..), inputs: vec![],                   output: RefId(0) },
-///         PlanNode { kind: Filter(..),      inputs: vec![RefId(0)],           output: RefId(1) },
+///         PlanNode { kind: ScanParquet(..), inputs: vec![],                   output: RefId(1) },
 ///         PlanNode { kind: Filter(..),      inputs: vec![RefId(0)],           output: RefId(2) },
-///         PlanNode { kind: UnionAll(..),    inputs: vec![RefId(1), RefId(2)], output: RefId(3) },
+///         PlanNode { kind: Filter(..),      inputs: vec![RefId(1)],           output: RefId(3) },
+///         PlanNode { kind: UnionAll(..),    inputs: vec![RefId(2), RefId(3)], output: RefId(4) },
 ///     ],
 /// }
 /// ```
@@ -75,28 +86,27 @@ pub struct PlanNode {
 /// The dataflow DAG this encodes:
 ///
 /// ```text
-///             ScanParquet [RefId(0)]
-///                    |
-///         +----------+----------+
-///         v                     v
-///    Filter [RefId(1)]     Filter [RefId(2)]
-///         |                     |
-///         +----------+----------+
-///                    v
-///              UnionAll [RefId(3)]   <-- terminal: Plan::result() == Some(RefId(3))
+///    ScanParquet [RefId(0)]     ScanParquet [RefId(1)]
+///              |                          |
+///              v                          v
+///       Filter [RefId(2)]          Filter [RefId(3)]
+///              |                          |
+///              +------------+-------------+
+///                           v
+///                 UnionAll [RefId(4)]   <-- terminal: Plan::result() == Some(RefId(4))
 /// ```
 ///
-/// The engine evaluates the nodes in slice order -- `RefId(0)` first (no inputs),
-/// then `RefId(1)` and `RefId(2)` (both consuming `RefId(0)`), then `RefId(3)` --
-/// and streams the rows produced at the terminal node to the caller.
+/// The engine evaluates the nodes in slice order -- `RefId(0)` and `RefId(1)` first
+/// (sources), then `RefId(2)` and `RefId(3)`, then `RefId(4)` -- and streams the rows
+/// produced at the terminal node to the caller.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub nodes: Vec<PlanNode>,
 }
 
 impl Plan {
-    /// Returns the terminal node's output [`RefId`] -- the value the engine streams
-    /// to the caller -- or `None` if the plan has no nodes.
+    /// Returns the last node's `output` [`RefId`] -- the plan terminal whose rows the
+    /// engine streams to the caller -- or `None` if `nodes` is empty.
     pub fn result(&self) -> Option<RefId> {
         self.nodes.last().map(|node| node.output)
     }
