@@ -39,9 +39,9 @@ impl NearestTimestamp {
 /// Represents errors that can occur when converting commit timestamps to versions.
 #[derive(Debug, thiserror::Error)]
 pub enum LogHistoryError {
-    /// No published commit files were found in the log directory.
-    #[error("No published commits found in log directory {log_root}")]
-    NoPublishedCommits {
+    /// No commit files were found in the log directory.
+    #[error("No commits found in log directory {log_root}")]
+    NoCommitsFound {
         /// The log directory URL that was searched.
         log_root: Url,
     },

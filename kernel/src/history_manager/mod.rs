@@ -601,8 +601,7 @@ pub fn timestamp_range_to_versions(
 ///
 /// # Errors
 /// - Propagates any error from listing the log directory.
-/// - [`LogHistoryError::NoPublishedCommits`] when the log directory contains no published commit
-///   files
+/// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits.
 /// - [`DeltaError::Generic`] when there is no publised file-system commit and the earliest ratified
 ///   CCv2 commit is v0. For a catalog-managed table, v0 must be a published file-system commit
 ///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
@@ -629,7 +628,7 @@ fn get_earliest_published_commit_version(
                        but the log listing returned no commits"
                 ));
             }
-            DeltaError::from(LogHistoryError::NoPublishedCommits {
+            DeltaError::from(LogHistoryError::NoCommitsFound {
                 log_root: log_root.clone(),
             })
         })
@@ -1594,7 +1593,7 @@ mod tests {
 
     enum Expected {
         Version(Version),
-        NoPublishedCommits,
+        NoCommitsFound,
         CCv2MissingV0FilesystemCommit,
     }
 
@@ -1603,8 +1602,8 @@ mod tests {
     #[case::no_ratified_commit(3, None, None, Expected::Version(0))]
     #[case::ratified_commit_version_0(3, Some(0), None, Expected::Version(0))]
     #[case::ratified_commit_version_greater_than_0(3, Some(2), None, Expected::Version(0))]
-    #[case::log_listing_empty_no_ratified_commit(0, None, None, Expected::NoPublishedCommits)]
-    #[case::log_listing_empty_ratified_commit(0, Some(2), None, Expected::NoPublishedCommits)]
+    #[case::log_listing_empty_no_ratified_commit(0, None, None, Expected::NoCommitsFound)]
+    #[case::log_listing_empty_ratified_commit(0, Some(2), None, Expected::NoCommitsFound)]
     #[case::log_listing_empty_ratified_commit_v0(
         0,
         Some(0),
@@ -1638,8 +1637,8 @@ mod tests {
         );
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
-            Expected::NoPublishedCommits => assert!(
-                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoPublishedCommits { .. })),
+            Expected::NoCommitsFound => assert!(
+                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
                 "{res:?}"
             ),
             Expected::CCv2MissingV0FilesystemCommit => {
