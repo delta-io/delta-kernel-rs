@@ -20,17 +20,18 @@ impl QueryPlanBuilder {
     /// Construct a [`QueryPlanNode::ScanJson`] over the given files.
     ///
     /// See [`QueryPlanNode::ScanJson`] and [`crate::plans::ir::nodes::ScanJson`] for parameter
-    /// semantics. Validates file-constant invariants in [`Self::build`].
+    /// semantics. File-constant columns are not supported by the default plan executor yet;
+    /// `file_constant_columns` is always empty. Validates file-constant invariants in
+    /// [`Self::build`].
     pub fn scan_json(
-        files: Vec<ScanFile>,
-        file_constant_columns: Vec<ColumnName>,
+        files: Vec<FileMeta>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> Self {
         Self {
             node: QueryPlanNode::ScanJson {
-                files,
-                file_constant_columns,
+                files: files.into_iter().map(ScanFile::from).collect(),
+                file_constant_columns: Vec::new(),
                 physical_schema,
                 predicate,
             },
@@ -65,20 +66,6 @@ impl QueryPlanBuilder {
         predicate: Option<PredicateRef>,
     ) -> Self {
         Self::scan_parquet(
-            files.into_iter().map(ScanFile::from).collect(),
-            Vec::new(),
-            physical_schema,
-            predicate,
-        )
-    }
-
-    /// Like [`Self::scan_json`], but wraps bare [`FileMeta`] entries with no file-constant columns.
-    pub fn scan_json_files(
-        files: Vec<FileMeta>,
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> Self {
-        Self::scan_json(
             files.into_iter().map(ScanFile::from).collect(),
             Vec::new(),
             physical_schema,
@@ -174,7 +161,7 @@ mod tests {
         let schema = test_schema();
         let files = vec![test_file("file:///a.json"), test_file("file:///b.json")];
 
-        let node = QueryPlanBuilder::scan_json_files(
+        let node = QueryPlanBuilder::scan_json(
             files.iter().map(|f| f.meta.clone()).collect(),
             schema.clone(),
             None,

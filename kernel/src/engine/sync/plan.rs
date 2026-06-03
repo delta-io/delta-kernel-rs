@@ -14,17 +14,19 @@ use super::json::SyncJsonHandler;
 use super::parquet::SyncParquetHandler;
 use super::storage::SyncStorageHandler;
 use crate::object_store::DynObjectStore;
-use crate::plans::{
-    scan_execute::{execute_scan_json, execute_scan_parquet},
-    IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanNode,
+use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanNode};
+use crate::{
+    DeltaResult, Error, FileMeta, JsonHandler as _, ParquetHandler as _, StorageHandler as _,
 };
-use crate::{DeltaResult, FileMeta, ParquetHandler as _, StorageHandler as _};
 
 /// A synchronous, test-only [`PlanExecutor`] that delegates to [`SyncStorageHandler`],
 /// [`SyncJsonHandler`], and [`SyncParquetHandler`].
 ///
 /// All I/O is performed synchronously via [`futures::executor::block_on`]; cloud-backed
 /// stores are not supported (see [`super`] module docs).
+///
+/// [`QueryPlanNode::ScanJson`] and [`QueryPlanNode::ScanParquet`] do not support file-constant
+/// columns yet: non-empty `file_constant_columns` returns [`Error::unsupported`].
 pub(crate) struct SyncPlanExecutor {
     storage: SyncStorageHandler,
     json: SyncJsonHandler,
@@ -111,13 +113,13 @@ impl SyncPlanExecutor {
                 physical_schema,
                 predicate,
             } => {
-                let iter = execute_scan_json(
-                    &self.json,
-                    files,
-                    file_constant_columns,
-                    physical_schema,
-                    predicate,
-                )?;
+                if !file_constant_columns.is_empty() {
+                    return Err(Error::unsupported(
+                        "SyncPlanExecutor does not support file-constant columns on ScanJson yet",
+                    ));
+                }
+                let metas: Vec<FileMeta> = files.into_iter().map(|f| f.meta).collect();
+                let iter = self.json.read_json_files(&metas, physical_schema, predicate)?;
                 Ok(PlanResult::Data(iter))
             }
             QueryPlanNode::ScanParquet {
@@ -126,13 +128,16 @@ impl SyncPlanExecutor {
                 physical_schema,
                 predicate,
             } => {
-                let iter = execute_scan_parquet(
-                    &self.parquet,
-                    files,
-                    file_constant_columns,
-                    physical_schema,
-                    predicate,
-                )?;
+                if !file_constant_columns.is_empty() {
+                    return Err(Error::unsupported(
+                        "SyncPlanExecutor does not support file-constant columns on ScanParquet \
+                         yet",
+                    ));
+                }
+                let metas: Vec<FileMeta> = files.into_iter().map(|f| f.meta).collect();
+                let iter = self
+                    .parquet
+                    .read_parquet_files(&metas, physical_schema, predicate)?;
                 Ok(PlanResult::Data(iter))
             }
         }
