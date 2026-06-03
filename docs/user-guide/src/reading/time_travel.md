@@ -161,14 +161,9 @@ to `at_version`.
 
 | Function | Returns |
 |----------|---------|
-| `latest_version_as_of(snapshot, engine, timestamp)` | A `Commit` for the latest version with a timestamp at or before `timestamp`. |
-| `first_version_after(snapshot, engine, timestamp)` | A `Commit` for the first version with a timestamp at or after `timestamp`. |
+| `latest_version_as_of(snapshot, engine, timestamp)` | The `CommitAt` for the latest version with a timestamp at or before `timestamp`. |
+| `first_version_after(snapshot, engine, timestamp)` | The `CommitAt` for the first version with a timestamp at or after `timestamp`. |
 | `timestamp_range_to_versions(snapshot, engine, start, end)` | A `(start_version, end_version)` pair covering the timestamp range. |
-
-`latest_version_as_of` and `first_version_after` return a `Commit`, which
-pairs the matched `version` with the `timestamp` of that commit. The
-`timestamp` is the commit's in-commit timestamp when In-Commit Timestamps are
-enabled, otherwise the monotonized file modification time.
 
 Each helper takes a `Snapshot` reference, which defines the searchable
 version range. You typically pass the latest snapshot so the search covers
@@ -205,7 +200,7 @@ println!(
 # }
 ```
 
-`first_version_after` is the symmetric variant. It returns a `Commit` for the
+`first_version_after` is the symmetric variant. It returns a `CommitAt` for the
 earliest version whose timestamp is at or after the requested timestamp, which
 is useful for picking up changes that happened after a known point in time.
 
