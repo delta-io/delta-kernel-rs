@@ -281,7 +281,7 @@ pub struct Values {
 ///
 /// # Example
 ///
-/// Input `{ id, first, last, add: { path, size, modificationTime } }` projected to
+/// Input `{ id, first, last, add: { path, size, stats_parsed: { numRecords } } }` projected to
 /// `{ id, name, file_meta }` -- passthrough, concatenation, nested input access, and a
 /// struct output column:
 ///
@@ -293,7 +293,7 @@ pub struct Values {
 ///         Expression::Struct([
 ///             col("add.path"),
 ///             col("add.size"),
-///             col("add.stats.numRecords"),
+///             col("add.stats_parsed.numRecords"),
 ///         ]),
 ///     ],
 ///     output_schema: {
@@ -335,22 +335,20 @@ pub struct LoadColumnFileMeta {
     /// Column on the upstream relation holding the per-row file path /
     /// URL fragment. Joined to [`Load::base_url`] when set.
     pub path_column: ColumnName,
-    /// Column with the file's total size in bytes (nullable per row).
+    /// Column with the file's total size in bytes. This may be NULL on any given row.
     pub file_size_column: ColumnName,
-    /// Column with the file's row-count, parquet-encoded `numRecords` (nullable per row).
+    /// Column with the file's row-count, parquet-encoded `numRecords`. This may be NULL on any given row.
     pub num_records_column: ColumnName,
 }
 
 /// Reads data files identified by an upstream stream of file-metadata tuples. Each
 /// input row describes one file. `file_meta` names the path, file-size, and row-count
 /// columns on the upstream relation (all required; size and row-count nullable per row).
-/// The engine resolves each path against
-/// `base_url`, opens the file as `file_type`, and reads columns matching `file_schema`
-/// from it.
+/// The engine resolves each path against `base_url`, opens the file as
+/// `file_type`, and reads columns matching `file_schema` from it.
 ///
 /// `metadata_derived_columns` lists columns on the upstream row whose values are
-/// broadcast onto every emitted file row (e.g. `version` for table-changes scans, or
-/// partition values).
+/// broadcast onto every emitted file row. See the example below for an example.
 ///
 /// `dv_column` names a (nullable) column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
@@ -411,11 +409,6 @@ pub struct LoadColumnFileMeta {
 ///     |  3 |  c   |       8
 ///     |  4 |  d   |       8
 /// ```
-///
-/// # Errors
-///
-/// [`Error::FileNotFound`](crate::Error::FileNotFound) -- a file does not exist.
-/// [`Error::IOError`](crate::Error::IOError) -- an error occurred while reading the file.
 #[derive(Debug, Clone)]
 pub struct Load {
     pub file_schema: SchemaRef,
@@ -429,45 +422,33 @@ pub struct Load {
 // === MaxByVersion ===========================================================
 
 /// Per group, keep the input row with the greatest `version_column` value and project
-/// the columns named in `output_schema` from that row. This is the plan-IR form of
-/// "top 1 per group by version desc" that kernel uses when reconciling duplicate keys
+/// the columns named in `output_schema` from that row. Kernel uses this for dedupe
 /// across table versions (e.g. latest `add` per path in scan metadata).
 ///
-/// Each `output_schema` field selects a column from the winning row; its declared type
-/// must match that column's type in the input. Group-by expressions and the version
-/// column are not implicitly projected -- include them in `output_schema` when needed.
+/// Each `output_schema` field selects a column from the winning row; group-by keys and
+/// the version column must appear in `output_schema` when they should be emitted.
 ///
-/// # When this operator fits
+/// # SQL equivalents
 ///
-/// The operator scales cleanly when there is **one** version column and the goal is to
-/// carry **several columns from the same winning row** -- no other aggregates (`MIN`,
-/// `MAX`, etc.) on different columns. That matches kernel's common dedupe pattern.
+/// The same semantics are expressible as SQL `MAX BY` (Spark, BigQuery, Snowflake,
+/// DuckDB, Trino, etc.) or as a nested query with `ROW_NUMBER()`. `MAX BY` stays
+/// compact when many columns must come from the winning row; the window rewrite
+/// grows quickly because every projected column must be named explicitly in the
+/// outer `SELECT`, while `MAX BY` repeats one aggregate per output column.
 ///
-/// Engines that support SQL `MAX BY` can implement the same semantics more directly:
+/// Preferred form when the engine supports it:
 ///
 /// ```sql
 /// SELECT
 ///     <group_by fields>,
-///     MAX_BY(col_a, version_column),
-///     MAX_BY(col_b, version_column),
+///     MAX_BY(col_a, <version_column>),
+///     MAX_BY(col_b, <version_column>),
 ///     ...
 /// FROM input
-/// GROUP BY <group_by>
+/// GROUP BY <group_by fields>
 /// ```
 ///
-/// A nested query plus `ROW_NUMBER()` (or `QUALIFY`) is equivalent but grows verbose
-/// when many columns must come from the winner; `MAX BY` (or this node) stays compact.
-///
-/// When a plan needs **multiple version columns** or **mixed aggregates** on the same
-/// group, prefer a general `GROUP BY` plan (or an engine rewrite) instead of
-/// `MaxByVersion`.
-///
-/// # Tiebreaking
-///
-/// If multiple input rows share the same group keys and the same `version_column`
-/// value, which row wins is unspecified.
-///
-/// # Equivalent SQL (window form)
+/// Equivalent window rewrite (engines without `MAX BY` may lower to this):
 ///
 /// ```sql
 /// SELECT <output_schema fields>
@@ -522,40 +503,9 @@ pub struct MaxByVersion {
     pub output_schema: SchemaRef,
 }
 
-// ============================================================================
-// Binary operators (2 inputs)
-// ============================================================================
-
-/// Equi-join two inputs (`inputs.len() == 2`, convention `[probe, build]`) and emit a
-/// subset of probe rows -- a SQL `SEMI JOIN` (`inverted = false`) or `ANTI JOIN`
-/// (`inverted = true`). The build side filters but never contributes columns; output
-/// schema equals the probe input's schema unchanged.
-///
-/// `probe_keys[i]` is matched for equality against `build_keys[i]` for each `i`;
-/// the two vectors must have the same length (builder-enforced). A probe row "matches"
-/// iff there exists at least one build row whose key tuple equals the probe row's
-/// key tuple.
-///
-/// - `inverted = false` (semi join): emit each probe row that has at least one match.
-/// - `inverted = true` (anti join): emit each probe row that has zero matches.
-///
-/// ```sql
-/// -- inverted = false: SEMI JOIN
-/// SELECT probe.*
-/// FROM probe
-/// WHERE EXISTS (
-///     SELECT 1 FROM build
-///     WHERE probe.k1 = build.k1 AND ... AND probe.kN = build.kN
-/// );
-///
-/// -- inverted = true: ANTI JOIN
-/// SELECT probe.*
-/// FROM probe
-/// WHERE NOT EXISTS (
-///     SELECT 1 FROM build
-///     WHERE probe.k1 = build.k1 AND ... AND probe.kN = build.kN
-/// );
-/// ```
+/// Performs a semi join between two inputs (`inputs.len() == 2`, convention `[probe, build]`) and emits a
+/// subset of probe rows -- a SQL `SEMI JOIN` (`inverted = false`) or `ANTI JOIN` (`inverted = true`).
+/// The build side filters but never contributes columns; output schema is the same as the probe input's schema.
 ///
 /// # Example
 ///
@@ -587,22 +537,32 @@ pub struct SemiJoin {
     pub build_keys: Vec<ColumnName>,
 }
 
-// ============================================================================
-// N-ary operators (variable inputs)
-// ============================================================================
 
-/// Concatenates N inputs (`inputs.len() >= 1`). All input schemas must agree.
+/// Concatenates N input relations into a single relation. All input schemas must agree.
 ///
 /// # Example
 ///
-/// `UnionAll` over two inputs with schema `{ id: int }`:
+/// `UnionAll` over two relations with schema `{ id: int }`:
 ///
 /// ```text
-/// input 0       input 1
-/// id            id
-/// --            --
-///  1             3
-///  2             4
+/// UnionAll {
+///     inputs: [
+///         { id: int },
+///         { id: int },
+///     ],
+/// }
+///
+/// input 0:
+/// id
+/// --
+///  1
+///  2
+///
+/// input 1:
+/// id
+/// --
+///  3
+///  4
 ///
 /// output:
 /// id
@@ -613,4 +573,4 @@ pub struct SemiJoin {
 ///  4
 /// ```
 #[derive(Debug, Clone)]
-pub struct UnionAll();
+pub struct UnionAll;
