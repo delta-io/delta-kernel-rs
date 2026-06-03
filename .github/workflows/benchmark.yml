@@ -25,7 +25,7 @@
 #   out PR code.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
   issue_comment:
     types: [created, edited]
@@ -56,11 +56,10 @@ jobs:
 
   run-benchmark:
     name: Run benchmarks
-    # Auto-trigger: every PR event (including drafts -- regressions can land in
-    # drafts too). /bench-trigger: only the literal /bench or /bench-with-args.
-    # Both share the same job body.
+    # Auto-trigger: PR push events, skipping drafts. Comment-trigger: a
+    # literal /bench, optionally followed by args (e.g. /bench --tags base).
     if: >
-      github.event_name == 'pull_request_target'
+      (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
       || (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
           (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench ')))
     runs-on: ubuntu-latest
