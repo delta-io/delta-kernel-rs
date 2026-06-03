@@ -1214,4 +1214,171 @@ mod tests {
         drop(pred);
         assert_eq!(FREED.load(Ordering::SeqCst), 1, "free_state must fire once");
     }
+
+    /// End to end: build an opaque `IN_RANGE(id, 25)` predicate through the
+    /// `visit_predicate_opaque_with_eval` FFI symbol, then run a real `DefaultEngine` scan over a
+    /// 3-file in-memory table with disjoint `id` ranges. The engine callback prunes files whose
+    /// [min, max] excludes 25, so only the file covering [20, 30] survives -- proving the symbol ->
+    /// rewrite -> StatsMode dispatch -> file pruning chain works against a real log.
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opaque_predicate_prunes_files_end_to_end() {
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::arrow::array::{
+            Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StructArray,
+        };
+        use delta_kernel::engine::default::DefaultEngineBuilder;
+        use delta_kernel::object_store::memory::InMemory;
+        use delta_kernel::scan::state::ScanFile;
+        use delta_kernel::Snapshot;
+        use test_utils::add_commit;
+
+        use crate::engine_data::ArrowFFIData;
+        use crate::expressions::opaque_eval::{
+            create_opaque_eval_context, free_opaque_eval_context, EvalMode, OpaqueEvalCallbacks,
+        };
+        use crate::OptionalValue;
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        // StatsMode `IN_RANGE`: keep a file iff the target (arg1) falls within the column's
+        // [min, max] (arg0 slots 0 and 1); null bounds keep the file.
+        unsafe extern "C" fn engine_in_range(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            mode: EvalMode,
+            _inverted: bool,
+        ) -> OptionalValue<*mut ArrowFFIData> {
+            assert_eq!(mode, EvalMode::StatsMode);
+            CALLS.fetch_add(1, Ordering::SeqCst);
+
+            let array =
+                std::mem::replace(unsafe { &mut (*args_in).array }, FFI_ArrowArray::empty());
+            let schema =
+                std::mem::replace(unsafe { &mut (*args_in).schema }, FFI_ArrowSchema::empty());
+            let data = unsafe { from_ffi(array, &schema) }.unwrap();
+            let batch: RecordBatch = StructArray::from(data).into();
+
+            let stats = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let min = stats
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let max = stats
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let target = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            let keep: BooleanArray = (0..batch.num_rows())
+                .map(|i| {
+                    if min.is_null(i) || max.is_null(i) {
+                        return Some(true);
+                    }
+                    let t = target.value(i);
+                    Some(min.value(i) <= t && t <= max.value(i))
+                })
+                .collect();
+
+            let arr: ArrayRef = Arc::new(keep);
+            let array_data = arr.to_data();
+            let out_array = FFI_ArrowArray::new(&array_data);
+            let out_schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
+            OptionalValue::Some(Box::into_raw(Box::new(ArrowFFIData {
+                array: out_array,
+                schema: out_schema,
+            })))
+        }
+        unsafe extern "C" fn noop_free(_: *mut c_void) {}
+
+        // Build the predicate through the FFI symbol, then extract the kernel `Predicate`.
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
+        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let (_keep, mut it) = make_iter(vec![col_id, target]);
+        let ctx = unsafe {
+            create_opaque_eval_context(OpaqueEvalCallbacks {
+                engine_state: std::ptr::null_mut(),
+                eval_pred: engine_in_range,
+                free_state: noop_free,
+            })
+        };
+        let name = "IN_RANGE";
+        let id = ok_or_panic(unsafe {
+            visit_predicate_opaque_with_eval(
+                &mut state,
+                kernel_string_slice!(name),
+                &mut it,
+                ctx.shallow_copy(),
+                allocate_err,
+            )
+        });
+        // The built predicate holds its own Arc ref, so we can release our handle now.
+        unsafe { free_opaque_eval_context(ctx) };
+        let predicate = Arc::new(unwrap_kernel_predicate(&mut state, id).unwrap());
+
+        // 3-file table: A=[0,10], B=[20,30], C=[100,110]. Only B covers 25.
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}"#;
+        let add = |path: &str, lo: i64, hi: i64| {
+            format!(
+                r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":10,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\":{lo}}},\"maxValues\":{{\"id\":{hi}}}}}"}}}}"#
+            )
+        };
+        let commit = [
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+            format!(
+                r#"{{"metaData":{{"id":"t","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{schema}","partitionColumns":[],"configuration":{{}},"createdTime":1587968586000}}}}"#
+            ),
+            add("a.parquet", 0, 10),
+            add("b.parquet", 20, 30),
+            add("c.parquet", 100, 110),
+        ]
+        .join("\n");
+        add_commit(table_root, storage.as_ref(), 0, commit)
+            .await
+            .unwrap();
+
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()
+            .unwrap();
+
+        fn push_path(paths: &mut Vec<String>, scan_file: ScanFile) {
+            paths.push(scan_file.path);
+        }
+        let mut paths: Vec<String> = Vec::new();
+        for sm in scan.scan_metadata(&engine).unwrap() {
+            paths = sm.unwrap().visit_scan_files(paths, push_path).unwrap();
+        }
+
+        assert_eq!(
+            paths,
+            vec!["b.parquet".to_string()],
+            "only [20,30] covers 25"
+        );
+        assert!(
+            CALLS.load(Ordering::SeqCst) >= 1,
+            "engine callback must fire in StatsMode"
+        );
+    }
 }

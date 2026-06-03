@@ -122,33 +122,40 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 /// Bare ops (`Predicate::opaque(NamedOpaquePredicateOp::new(...))`) have no callback attached
 /// and so abstain from file pruning. Scalar / partition-pruning paths always abstain.
 ///
-/// The StatsMode rewrite abstains (keeps all files) when: the op is inverted (`inverted == true`,
-/// since per-op negation isn't expressible), a `Column` arg has no sibling literal to infer its
-/// type from, or an arg is some kind other than `Column`, `Literal`, or `Predicate`.
+/// Inverted predicates (`NOT op`) are rewritten too: the inversion is recorded on the op and
+/// forwarded to the engine callback's `inverted` flag, which must reason about the negated op (see
+/// [`EngineEvalPredFn`]). The StatsMode rewrite abstains (keeps all files) when a `Column` arg has
+/// no sibling literal to infer its type from, or an arg is some kind other than `Column`,
+/// `Literal`, or `Predicate`.
 ///
 /// [`OpaqueEvalCallbacks`]: opaque_eval::OpaqueEvalCallbacks
 /// [`EngineEvalPredFn`]: opaque_eval::EngineEvalPredFn
 #[derive(Debug, Clone)]
-pub struct NamedOpaquePredicateOp {
+pub(crate) struct NamedOpaquePredicateOp {
     name: String,
     #[cfg(feature = "default-engine-base")]
-    #[allow(dead_code)] // read via callbacks_clone() under default-engine-base
     callbacks: Option<Arc<OpaqueEvalCallbacks>>,
     /// Mode forwarded to the engine callback during eval. Defaults to `RowMode`.
     #[cfg(feature = "default-engine-base")]
     mode: EvalMode,
+    /// Whether the op is negated. Set by the StatsMode rewrite so the eval callback can reason
+    /// about the negated op (see [`EngineEvalPredFn`]); XORed with the eval-time `inverted`.
+    #[cfg(feature = "default-engine-base")]
+    inverted: bool,
 }
 
 impl NamedOpaquePredicateOp {
     /// Build an op identified by `name`, without any engine integrations.
     /// Kernel keeps every file and row.
-    pub fn new(name: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             #[cfg(feature = "default-engine-base")]
             callbacks: None,
             #[cfg(feature = "default-engine-base")]
             mode: EvalMode::RowMode,
+            #[cfg(feature = "default-engine-base")]
+            inverted: false,
         }
     }
 
@@ -162,6 +169,7 @@ impl NamedOpaquePredicateOp {
             name: name.into(),
             callbacks: Some(callbacks),
             mode: EvalMode::RowMode,
+            inverted: false,
         }
     }
 
@@ -169,6 +177,13 @@ impl NamedOpaquePredicateOp {
     #[cfg(feature = "default-engine-base")]
     pub(crate) fn with_mode(mut self, mode: EvalMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Consume `self` and return it with `inverted` overridden.
+    #[cfg(feature = "default-engine-base")]
+    pub(crate) fn with_inverted(mut self, inverted: bool) -> Self {
+        self.inverted = inverted;
         self
     }
 
@@ -186,17 +201,23 @@ impl NamedOpaquePredicateOp {
     pub(crate) fn mode(&self) -> EvalMode {
         self.mode
     }
+
+    #[cfg(feature = "default-engine-base")]
+    pub(crate) fn inverted(&self) -> bool {
+        self.inverted
+    }
 }
 
 impl PartialEq for NamedOpaquePredicateOp {
     fn eq(&self, other: &Self) -> bool {
-        // The name identifies the op. Under `default-engine-base` the op also carries an eval mode
-        // and a callback bundle, both of which change how it evaluates, so equality must include
-        // them: same mode, and the same callbacks by `Arc` pointer identity (callbacks aren't
-        // otherwise comparable).
+        // The name identifies the op. Under `default-engine-base` the op also carries an eval mode,
+        // an inversion flag, and a callback bundle, all of which change how it evaluates, so
+        // equality must include them: same mode, same inversion, and the same callbacks by `Arc`
+        // pointer identity (callbacks aren't otherwise comparable).
         let names_eq = self.name == other.name;
         #[cfg(feature = "default-engine-base")]
         let extras_eq = self.mode == other.mode
+            && self.inverted == other.inverted
             && match (&self.callbacks, &other.callbacks) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => true,
@@ -248,20 +269,8 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
     }
 }
 
-// === Note on opaque expressions ===============================================
-//
-// This FFI deliberately exposes only opaque PREDICATES, not opaque expressions. Engine-defined
-// expression-level functions (e.g. `LOWER`, `UPPER`) can always be represented by folding them
-// into a composite opaque predicate. For `STARTS_WITH(LOWER(col), "foo")`, the engine names a
-// composite op and builds:
-//
-//     Predicate::Opaque("STARTS_WITH_LOWER", [Column("col"), Literal("foo")])
-//
-// Kernel pre-evaluates each arg natively (col -> column data, literal -> broadcast column) and
-// hands them to the engine's `eval_pred` callback, which applies LOWER then STARTS_WITH
-// internally. The combinator only fails for engine-defined expressions appearing inside
-// kernel-native predicates (e.g. `Eq(LOWER(col), "FOO")`); engines can always re-shape such
-// queries as a single opaque predicate.
+// This FFI exposes only opaque predicates, not opaque expressions; see the `opaque_eval` module
+// docs for why (expression-level functions fold into composite opaque predicates).
 
 #[cfg(test)]
 mod tests {
@@ -322,6 +331,12 @@ mod tests {
             assert_ne!(
                 NamedOpaquePredicateOp::new("OP"),
                 NamedOpaquePredicateOp::new("OP").with_mode(EvalMode::StatsMode)
+            );
+
+            // Same name, different inversion -> not equal.
+            assert_ne!(
+                NamedOpaquePredicateOp::new("OP"),
+                NamedOpaquePredicateOp::new("OP").with_inverted(true)
             );
 
             // Same callbacks Arc (cloned) -> equal; distinct Arcs -> not equal (pointer identity).

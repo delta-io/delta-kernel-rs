@@ -46,13 +46,6 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
         })
         .collect::<DeltaResult<_>>()?;
 
-    let fields: Vec<Field> = arrays
-        .iter()
-        .enumerate()
-        .map(|(i, a)| Field::new(format!("arg{i}"), a.data_type().clone(), true))
-        .collect();
-    let schema = Arc::new(Schema::new(fields));
-
     // Zero-arg ops (e.g. NOW(), RAND()): empty-schema batch with explicit row count so the
     // engine knows how many rows to emit.
     if arrays.is_empty() {
@@ -64,6 +57,13 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
         )
         .map_err(|e| Error::Generic(format!("zero-arg opaque eval batch construction: {e}")));
     }
+
+    let fields: Vec<Field> = arrays
+        .iter()
+        .enumerate()
+        .map(|(i, a)| Field::new(format!("arg{i}"), a.data_type().clone(), true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
 
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| Error::Generic(format!("opaque eval batch construction: {e}")))
@@ -201,13 +201,11 @@ fn require_boolean_array(arr: ArrayRef) -> DeltaResult<BooleanArray> {
 fn call_eval_pred(
     cb: &OpaqueEvalCallbacks,
     op_name: &str,
-    args: &[Expression],
-    batch: &RecordBatch,
+    args_batch: &RecordBatch,
     mode: EvalMode,
     inverted: bool,
 ) -> DeltaResult<BooleanArray> {
-    let args_batch = evaluate_args(args, batch)?;
-    let mut args_ffi = ArrowFFIData::try_from_record_batch(&args_batch)?;
+    let mut args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
 
     // SAFETY: callback was supplied by the engine. We pass a writable args slot; the engine takes
     // ownership of the Arrow FFI handles by moving them out of it.
@@ -258,7 +256,28 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
                 self.op_name()
             ))
         })?;
-        call_eval_pred(&cb, self.op_name(), args, batch, self.mode(), inverted)
+
+        // Materialize the args batch. In StatsMode this can fail when the rewrite referenced a
+        // stats column the batch doesn't carry -- e.g. an opaque op pairs a min/max-ineligible
+        // column (boolean, binary, or a complex type) with an eligible literal, so the lifted type
+        // hint points at an absent minValues/maxValues field. File pruning is best-effort, so
+        // abstain (keep every file) rather than abort the scan. RowMode has no safe abstain, so its
+        // errors propagate.
+        let args_batch = match evaluate_args(args, batch) {
+            Ok(args_batch) => args_batch,
+            Err(e) if self.mode() == EvalMode::StatsMode => {
+                tracing::debug!(
+                    "opaque predicate `{}` stats args could not be materialized ({e}); keeping all files",
+                    self.op_name()
+                );
+                return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
+            }
+            Err(e) => return Err(e),
+        };
+        // The StatsMode rewrite records inversion on the op (the stats predicate is then evaluated
+        // non-inverted by kernel); RowMode carries it via the eval-time flag. XOR composes both.
+        let inverted = inverted ^ self.inverted();
+        call_eval_pred(&cb, self.op_name(), &args_batch, self.mode(), inverted)
     }
 
     fn eval_pred_scalar(
@@ -288,11 +307,6 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
-        // Per-op negation semantics aren't expressible without engine input. Abstain to keep
-        // pruning sound: kernel will fall back to "keep the file".
-        if inverted {
-            return None;
-        }
         // Without callbacks the rewritten predicate would error at evaluation time (the
         // arrow eval_pred above requires callbacks). Abstain so the surrounding junction
         // logic correctly drops this branch from the stats predicate.
@@ -307,9 +321,16 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
             .map(|arg| rewrite_stat_arg(evaluator, arg, type_hint.as_ref()))
             .collect::<Option<Vec<_>>>()?;
 
+        // Record the inversion on the op (kernel evaluates the stats predicate non-inverted, so the
+        // flag rides on the op rather than a surrounding NOT -- a `Predicate::not` here would make
+        // kernel flip the boolean verdict, which is unsound for stats). The engine callback must
+        // reason about the negated op, NOT flip its non-inverted verdict; see `EngineEvalPredFn`.
         // arrow_opaque (not bare opaque) so runtime dispatch reaches our callback via the
         // ArrowOpaquePredicateOpAdaptor.
-        let stats_op = self.clone().with_mode(EvalMode::StatsMode);
+        let stats_op = self
+            .clone()
+            .with_mode(EvalMode::StatsMode)
+            .with_inverted(inverted);
         Some(Predicate::arrow_opaque(stats_op, rewritten))
     }
 }
@@ -634,6 +655,8 @@ mod tests {
     mod rewrite {
         use std::cmp::Ordering;
 
+        use delta_kernel::arrow::array::Int64Array;
+        use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
         use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp as _;
         use delta_kernel::expressions::{
             column_expr, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
@@ -667,6 +690,49 @@ mod tests {
 
         fn stats_col_numrecords() -> Expression {
             Expression::from(ColumnName::new(["stats_parsed", "numRecords"]))
+        }
+
+        /// Single-file stats batch: `stats_parsed { minValues.col=1, maxValues.col=10,
+        /// numRecords=1 }`. Shared by the rewrite-dispatch tests below.
+        fn single_col_int64_stats_batch() -> RecordBatch {
+            let col_field = Arc::new(Field::new("col", ArrowDataType::Int64, true));
+            let min_struct = StructArray::from(vec![(
+                col_field.clone(),
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            )]);
+            let max_struct = StructArray::from(vec![(
+                col_field,
+                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+            )]);
+            let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
+            let stats_parsed = StructArray::from(vec![
+                (
+                    Arc::new(Field::new(
+                        "minValues",
+                        min_struct.data_type().clone(),
+                        true,
+                    )),
+                    Arc::new(min_struct) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "maxValues",
+                        max_struct.data_type().clone(),
+                        true,
+                    )),
+                    Arc::new(max_struct) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                    num_records,
+                ),
+            ]);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "stats_parsed",
+                stats_parsed.data_type().clone(),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(stats_parsed) as ArrayRef]).unwrap()
         }
 
         impl DataSkippingPredicateEvaluator for StatsRewriter {
@@ -791,10 +857,76 @@ mod tests {
         }
 
         #[test]
-        fn abstains_when_inverted() {
-            let op = op_with_callbacks("STARTS_WITH");
-            let args = [column_expr!("col")];
-            assert!(rewrite(&op, &args, &rewriter(), true).is_none());
+        fn inverted_range_op_prunes_complement() {
+            use std::ffi::c_void;
+
+            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+
+            // Range op `GE(col, t)`: non-inverted keeps a file iff some value could be `>= t`
+            // (max >= t); inverted (`col < t`) keeps iff some value could be `< t` (min < t).
+            // Same stats, different computation -- not a verdict flip.
+            unsafe extern "C" fn engine_ge(
+                _state: *mut c_void,
+                _op_name: KernelStringSlice,
+                args_in: *mut ArrowFFIData,
+                mode: EvalMode,
+                inverted: bool,
+            ) -> OptionalValue<*mut ArrowFFIData> {
+                assert_eq!(mode, EvalMode::StatsMode);
+                let batch = unsafe { take_ffi_record_batch(args_in) };
+                let stats = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let min = stats
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let max = stats
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let target = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let keep: BooleanArray = (0..batch.num_rows())
+                    .map(|i| {
+                        let t = target.value(i);
+                        Some(if inverted {
+                            min.value(i) < t
+                        } else {
+                            max.value(i) >= t
+                        })
+                    })
+                    .collect();
+                make_result(Arc::new(keep))
+            }
+
+            // Stats batch: a single file with id in [1, 10]. Target 11 is above the whole range.
+            let op = NamedOpaquePredicateOp::with_callbacks("GE", callbacks_for(engine_ge));
+            let args = [column_expr!("col"), Expression::literal(11i64)];
+            let stats_batch = single_col_int64_stats_batch();
+
+            // GE(col, 11): max 10 < 11 -> prune.
+            let non_inverted =
+                rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+            let r = evaluate_predicate(&non_inverted, &stats_batch, false).unwrap();
+            assert!(!r.value(0), "GE(col,11): max 10 < 11 prunes the file");
+
+            // NOT GE(col, 11) == col < 11: min 1 < 11 -> keep. Inverted is forwarded, not
+            // abstained.
+            let inverted =
+                rewrite(&op, &args, &rewriter(), true).expect("inverted rewrite should succeed");
+            let r = evaluate_predicate(&inverted, &stats_batch, false).unwrap();
+            assert!(
+                r.value(0),
+                "NOT GE(col,11) == col < 11: min 1 < 11 keeps the file"
+            );
         }
 
         #[test]
@@ -948,8 +1080,6 @@ mod tests {
             use std::ffi::c_void;
             use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-            use delta_kernel::arrow::array::{Int64Array, StructArray};
-            use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
             use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
 
             static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -973,46 +1103,7 @@ mod tests {
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
 
-            // stats_parsed: { minValues: { col }, maxValues: { col }, numRecords }
-            let col_field = Arc::new(Field::new("col", ArrowDataType::Int64, true));
-            let min_struct = StructArray::from(vec![(
-                col_field.clone(),
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-            )]);
-            let max_struct = StructArray::from(vec![(
-                col_field,
-                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
-            )]);
-            let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
-            let stats_parsed = StructArray::from(vec![
-                (
-                    Arc::new(Field::new(
-                        "minValues",
-                        min_struct.data_type().clone(),
-                        true,
-                    )),
-                    Arc::new(min_struct) as ArrayRef,
-                ),
-                (
-                    Arc::new(Field::new(
-                        "maxValues",
-                        max_struct.data_type().clone(),
-                        true,
-                    )),
-                    Arc::new(max_struct) as ArrayRef,
-                ),
-                (
-                    Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-                    num_records,
-                ),
-            ]);
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "stats_parsed",
-                stats_parsed.data_type().clone(),
-                true,
-            )]));
-            let stats_batch =
-                RecordBatch::try_new(schema, vec![Arc::new(stats_parsed) as ArrayRef]).unwrap();
+            let stats_batch = single_col_int64_stats_batch();
 
             CALL_COUNT.store(0, AtomicOrdering::SeqCst);
             let result = evaluate_predicate(&rewritten, &stats_batch, false).unwrap();
@@ -1032,8 +1123,6 @@ mod tests {
             use std::ffi::c_void;
             use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-            use delta_kernel::arrow::array::{Int64Array, StructArray};
-            use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
             use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
 
             static SAW_NULLCOUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1075,47 +1164,9 @@ mod tests {
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
 
-            // Stats batch only carries min/max; the rewriter's literal-null nullcount/rowcount
-            // resolves entirely in-expression without needing schema columns for them.
-            let col_field = Arc::new(Field::new("col", ArrowDataType::Int64, true));
-            let min_struct = StructArray::from(vec![(
-                col_field.clone(),
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-            )]);
-            let max_struct = StructArray::from(vec![(
-                col_field,
-                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
-            )]);
-            let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
-            let stats_parsed = StructArray::from(vec![
-                (
-                    Arc::new(Field::new(
-                        "minValues",
-                        min_struct.data_type().clone(),
-                        true,
-                    )),
-                    Arc::new(min_struct) as ArrayRef,
-                ),
-                (
-                    Arc::new(Field::new(
-                        "maxValues",
-                        max_struct.data_type().clone(),
-                        true,
-                    )),
-                    Arc::new(max_struct) as ArrayRef,
-                ),
-                (
-                    Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-                    num_records,
-                ),
-            ]);
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "stats_parsed",
-                stats_parsed.data_type().clone(),
-                true,
-            )]));
-            let stats_batch =
-                RecordBatch::try_new(schema, vec![Arc::new(stats_parsed) as ArrayRef]).unwrap();
+            // Stats batch carries only min/max; the rewriter's literal-null nullcount/rowcount
+            // resolve in-expression without needing schema columns for them.
+            let stats_batch = single_col_int64_stats_batch();
 
             SAW_NULLCOUNT.store(0, AtomicOrdering::SeqCst);
             let result = evaluate_predicate(&rewritten, &stats_batch, false).unwrap();
@@ -1147,6 +1198,75 @@ mod tests {
             assert_eq!(
                 *fields[3],
                 Expression::literal(Scalar::Null(DataType::LONG))
+            );
+        }
+
+        #[test]
+        fn type_hint_picks_first_literal_when_multiple_present() {
+            let exprs = [
+                column_expr!("c"),
+                Expression::literal("s"),
+                Expression::literal(1i64),
+            ];
+            assert_eq!(
+                super::super::pick_column_type_hint(&exprs),
+                Some(DataType::STRING),
+                "the first literal's type wins"
+            );
+        }
+
+        /// A min/max-ineligible column paired with an eligible literal makes the rewrite emit a
+        /// min/max stats ref the batch doesn't carry. Materializing the args fails, so StatsMode
+        /// abstains (keeps every file) instead of aborting the scan -- and the engine callback
+        /// never fires.
+        #[test]
+        fn stats_eval_abstains_when_min_max_ref_is_unbacked() {
+            use std::ffi::c_void;
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+            unsafe extern "C" fn engine_count(
+                _state: *mut c_void,
+                _op_name: KernelStringSlice,
+                args_in: *mut ArrowFFIData,
+                _mode: EvalMode,
+                _inverted: bool,
+            ) -> OptionalValue<*mut ArrowFFIData> {
+                let batch = unsafe { take_ffi_record_batch(args_in) };
+                CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+                make_result(Arc::new(BooleanArray::from(vec![true; batch.num_rows()])))
+            }
+
+            let op = NamedOpaquePredicateOp::with_callbacks("OP", callbacks_for(engine_count));
+            let args = [column_expr!("col"), Expression::literal(5i64)];
+            let rewritten =
+                rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
+
+            // Stats batch carries only numRecords -- no minValues/maxValues -- so materializing the
+            // rewritten min/max refs fails and StatsMode abstains.
+            let num_records: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
+            let stats_parsed = StructArray::from(vec![(
+                Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                num_records,
+            )]);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "stats_parsed",
+                stats_parsed.data_type().clone(),
+                true,
+            )]));
+            let stats_batch =
+                RecordBatch::try_new(schema, vec![Arc::new(stats_parsed) as ArrayRef]).unwrap();
+
+            CALLS.store(0, AtomicOrdering::SeqCst);
+            let result = evaluate_predicate(&rewritten, &stats_batch, false).unwrap();
+            assert!(result.value(0), "abstain keeps the file");
+            assert_eq!(
+                CALLS.load(AtomicOrdering::SeqCst),
+                0,
+                "callback must not fire when the args can't be materialized"
             );
         }
     }

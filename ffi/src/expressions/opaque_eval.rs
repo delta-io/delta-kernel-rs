@@ -72,6 +72,17 @@ pub enum EvalMode {
 /// Returns `OptionalValue::None` to signal a (non-fatal) evaluation failure; kernel surfaces an
 /// `Err` upstream.
 ///
+/// # Inversion (`inverted`)
+///
+/// When `inverted` is true, evaluate the *negated* op (`NOT op`). This is **not** a flip of the
+/// non-inverted verdict. In `RowMode` it's exact per-row negation. In `StatsMode` the question
+/// becomes "could any value consistent with these stats satisfy `NOT op`?" -- a different
+/// computation over the conservative bounds, not `!verdict`. Returning the flipped non-inverted
+/// answer is unsound and will prune files that must be kept. Engines that can't soundly reason
+/// about the negated op (e.g. equality/prefix ops, where the answer is a near-always-true
+/// universal) should keep every file (`true`) for the inverted case; order/range ops can prune
+/// (e.g. `NOT (col >= v)` prunes when `min >= v`).
+///
 /// # Panics
 ///
 /// The callback must not panic or otherwise unwind across the FFI boundary -- it is invoked
@@ -89,18 +100,27 @@ pub enum EvalMode {
 /// - `Column` (primitive): `StructArray[min, max, nullcount, rowcount]`. Index by position:
 ///   - 0 = min, 1 = max (column's eligible type)
 ///   - 2 = nullcount (`Int64`; all-null if the column has no nullcount stats)
-///   - 3 = rowcount (`Int64`; all-null only in checkpoint-only batches that lack it)
+///   - 3 = rowcount (`Int64`; all-null when the batch lacks a rowcount stat, e.g. checkpoint-only
+///     batches, and always for partition columns -- see the partition bullet below)
 ///
 ///   Inner field names are not part of the contract.
 /// - `Column` (struct): same 4-field shape; min/max mirror the column's nested schema. Delta tracks
 ///   min/max per leaf only.
-/// - `Column` (map/array): not stats-eligible; the rewrite abstains and the engine never sees a
-///   wrapper for this slot (the entire predicate is dropped from the stats predicate).
+/// - `Column` (min/max-ineligible: map, array, boolean, binary): min/max can't be read. With no
+///   sibling literal the predicate abstains at rewrite time; with one, see the stats-type inference
+///   note below -- the op abstains (keeps every file) at evaluation rather than erroring.
 /// - `Column` (partition): same 4-field shape; min and max are the partition value (exact),
 ///   nullcount is NULL (Delta doesn't carry nullcount for partition columns), rowcount is NULL
 ///   because partition-only stats batches omit `stats_parsed`.
 /// - `Literal`: broadcast array, same as row mode.
 /// - `Predicate`: `BooleanArray` of per-file verdicts (nulls = keep).
+///
+/// Stats-type inference: kernel reads a `Column` arg's min/max at the type of a sibling `Literal`
+/// in the same predicate (mirroring `col < val`, which reads stats at `val`'s type). The engine
+/// should keep column and literal types compatible, as a well-typed comparison would. If they
+/// aren't -- e.g. a min/max-ineligible column paired with an eligible literal -- the rewrite emits
+/// a min/max stats reference the batch doesn't carry; the op then abstains (keeps every file) for
+/// that batch instead of pruning. It never aborts the scan and never drops a file.
 ///
 /// All four are conservative, never something the engine can treat as exact. `min`/`max` are
 /// *containing* bounds (valid regardless of the file's `tightBounds` flag): any value outside
@@ -110,6 +130,10 @@ pub enum EvalMode {
 /// *any* value in `[min, max]`, and must not treat `min`/`max` as present or `nullcount`/`rowcount`
 /// as exact. This matches kernel-native data skipping, which treats the same stats as conservative
 /// bounds.
+///
+/// The per-file `tightBounds` flag is not forwarded -- treat every file's stats as wide
+/// (`tightBounds = false`). Kernel-native skipping likewise ignores it, so there is no tight-bounds
+/// fast path (e.g. exact-equality pruning) to exploit here.
 ///
 /// Engine returns one bool per file: `false` = prune, `true` or `null` = keep.
 ///
@@ -158,7 +182,8 @@ impl std::fmt::Debug for OpaqueEvalCallbacks {
 impl Drop for OpaqueEvalCallbacks {
     fn drop(&mut self) {
         // SAFETY: engine_state was provided by the engine alongside the free_state callback; we
-        // promise to call it exactly once when the last Arc reference drops.
+        // promise to call it exactly once when the last Arc reference drops. free_state must not
+        // panic: drop can run while kernel is already unwinding, and unwinding into kernel aborts.
         unsafe { (self.free_state)(self.engine_state) };
     }
 }
