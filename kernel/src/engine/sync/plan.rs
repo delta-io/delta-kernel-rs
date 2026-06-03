@@ -14,8 +14,11 @@ use super::json::SyncJsonHandler;
 use super::parquet::SyncParquetHandler;
 use super::storage::SyncStorageHandler;
 use crate::object_store::DynObjectStore;
-use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanNode};
-use crate::{DeltaResult, FileMeta, JsonHandler as _, ParquetHandler as _, StorageHandler as _};
+use crate::plans::{
+    scan_execute::{execute_scan_json, execute_scan_parquet},
+    IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanNode,
+};
+use crate::{DeltaResult, FileMeta, ParquetHandler as _, StorageHandler as _};
 
 /// A synchronous, test-only [`PlanExecutor`] that delegates to [`SyncStorageHandler`],
 /// [`SyncJsonHandler`], and [`SyncParquetHandler`].
@@ -104,22 +107,32 @@ impl SyncPlanExecutor {
         match query {
             QueryPlanNode::ScanJson {
                 files,
+                file_constant_columns,
                 physical_schema,
                 predicate,
             } => {
-                let iter = self
-                    .json
-                    .read_json_files(&files, physical_schema, predicate)?;
+                let iter = execute_scan_json(
+                    &self.json,
+                    files,
+                    file_constant_columns,
+                    physical_schema,
+                    predicate,
+                )?;
                 Ok(PlanResult::Data(iter))
             }
             QueryPlanNode::ScanParquet {
                 files,
+                file_constant_columns,
                 physical_schema,
                 predicate,
             } => {
-                let iter = self
-                    .parquet
-                    .read_parquet_files(&files, physical_schema, predicate)?;
+                let iter = execute_scan_parquet(
+                    &self.parquet,
+                    files,
+                    file_constant_columns,
+                    physical_schema,
+                    predicate,
+                )?;
                 Ok(PlanResult::Data(iter))
             }
         }

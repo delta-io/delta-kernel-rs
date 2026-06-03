@@ -187,6 +187,7 @@ pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{
     IoOperation, Operation, PlanExecutor, PlanResult, QueryPlan, QueryPlanBuilder, QueryPlanNode,
+    ScanFile,
 };
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};

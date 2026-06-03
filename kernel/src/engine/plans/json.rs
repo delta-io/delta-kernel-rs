@@ -40,8 +40,12 @@ impl JsonHandler for PlanBasedJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let query =
-            QueryPlanBuilder::scan_json(files.to_vec(), physical_schema, predicate).build()?;
+        let query = QueryPlanBuilder::scan_json_files(
+            files.to_vec(),
+            physical_schema,
+            predicate,
+        )
+        .build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()

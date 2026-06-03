@@ -3,8 +3,14 @@
 //! This module is opt-in behind the `declarative-plans` feature flag.
 pub mod ir;
 mod query_builder;
+// Wired from [`engine::sync::plan::SyncPlanExecutor`]; may be unused until a connector adopts
+// [`PlanBasedEngine`](crate::engine::plans::PlanBasedEngine).
+#[allow(dead_code)]
+pub(crate) mod scan_execute;
+mod validate;
 
 use bytes::Bytes;
+pub use ir::nodes::ScanFile;
 pub use ir::{IoOperation, Operation, QueryPlan, QueryPlanNode};
 pub use query_builder::QueryPlanBuilder;
 

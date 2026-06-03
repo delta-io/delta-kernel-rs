@@ -31,8 +31,12 @@ impl ParquetHandler for PlanBasedParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let query =
-            QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema, predicate).build()?;
+        let query = QueryPlanBuilder::scan_parquet_files(
+            files.to_vec(),
+            physical_schema,
+            predicate,
+        )
+        .build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -93,6 +97,73 @@ mod tests {
         let file_meta = file_meta_for(path);
         let schema = Arc::new(batch.schema().as_ref().try_into_kernel().unwrap());
         (file_meta, schema)
+    }
+
+    #[test]
+    fn test_read_parquet_files_with_file_constants() {
+        use std::sync::Arc;
+
+        use crate::engine::sync::plan::SyncPlanExecutor;
+        use crate::expressions::{column_name, Scalar};
+        use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder, ScanFile};
+        use crate::schema::{DataType, StructField, StructType};
+
+        let temp_dir = tempdir().unwrap();
+        let read_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("value", DataType::LONG),
+            StructField::not_null("part", DataType::STRING),
+        ]));
+
+        let mut scan_files = Vec::new();
+        for (part, rows) in [("east", vec![1i64]), ("west", vec![2i64, 3i64])] {
+            let path = temp_dir.path().join(format!("{part}.parquet"));
+            let batch = RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(rows)) as Arc<dyn Array>,
+            )])
+            .unwrap();
+            let (file_meta, _) = make_test_parquet_file(&path, &batch);
+            scan_files.push(ScanFile {
+                meta: file_meta,
+                file_constants: vec![Scalar::String(part.into())],
+            });
+        }
+
+        let query = QueryPlanBuilder::scan_parquet(
+            scan_files,
+            vec![column_name!("part")],
+            read_schema,
+            None,
+        )
+        .build()
+        .unwrap();
+        let executor = SyncPlanExecutor::new();
+        let batches: Vec<RecordBatch> = executor
+            .execute_op(Operation::QueryPlan(query))
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .map(|r| {
+                ArrowEngineData::try_from_engine_data(r.unwrap())
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[1].num_rows(), 2);
+        let parts = batches
+            .iter()
+            .map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<crate::arrow::array::StringArray>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parts, vec!["east", "west"]);
     }
 
     #[test]

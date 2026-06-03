@@ -6,6 +6,8 @@
 use bytes::Bytes;
 use url::Url;
 
+use crate::expressions::ColumnName;
+use crate::plans::ir::ScanFile;
 use crate::schema::SchemaRef;
 use crate::{FileMeta, FileSlice, PredicateRef};
 
@@ -127,19 +129,22 @@ pub enum QueryPlanNode {
     ///
     /// [`JsonHandler::read_json_files`]: crate::JsonHandler::read_json_files
     ScanJson {
-        files: Vec<FileMeta>,
+        files: Vec<ScanFile>,
+        file_constant_columns: Vec<ColumnName>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     },
     /// Read and parse Apache Parquet files, returning columnar data.
     ///
     /// Returns [`PlanResult::Data`](crate::plans::PlanResult::Data) with columns matching the
-    /// provided `physical_schema`. See [`ParquetHandler::read_parquet_files`] for more details on
-    /// column resolution rules and ordering contracts.
+    /// provided `physical_schema`. See [`ParquetHandler::read_parquet_files`] and
+    /// [`ScanParquet`] for column resolution, file-constant broadcast, and ordering contracts.
     ///
     /// [`ParquetHandler::read_parquet_files`]: crate::ParquetHandler::read_parquet_files
+    /// [`ScanParquet`]: crate::plans::ir::nodes::ScanParquet
     ScanParquet {
-        files: Vec<FileMeta>,
+        files: Vec<ScanFile>,
+        file_constant_columns: Vec<ColumnName>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     },

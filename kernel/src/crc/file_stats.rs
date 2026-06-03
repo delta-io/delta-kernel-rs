@@ -20,7 +20,7 @@ use crate::{DeltaResult, EngineData, Error, RowVisitor};
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
 /// Obtained via [`Snapshot::get_or_load_file_stats`], [`Snapshot::get_file_stats_if_loaded`],
-/// or [`Crc::file_stats()`](super::Crc::file_stats). Returns `None` when the source CRC's
+/// or `Crc::file_stats()`. Returns `None` when the source CRC's
 /// `file_stats_state` is not `Complete`.
 ///
 /// [`Snapshot::get_or_load_file_stats`]: crate::snapshot::Snapshot::get_or_load_file_stats
