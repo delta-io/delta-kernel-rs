@@ -1,10 +1,15 @@
-# Benchmarks run on two triggers:
+# Benchmarks run on three triggers:
 #   - pull_request_target: every push to a PR auto-runs with BENCH_TAGS=base
 #   - issue_comment: a /bench [--tags ...] [--filter ...] comment runs with
 #                    the supplied flags
-# Both triggers funnel into the same jobs and update the same PR comment via
-# a hidden marker (<!-- delta-kernel-bench-comment -->) so reviewers always
-# see one current comment instead of a stack.
+#   - merge_group: declared so this workflow can be added to branch protection
+#                  as a required status check later. Currently a no-op (no
+#                  benching happens on merge queue events), since the result
+#                  has no PR conversation to post to and no automated
+#                  regression-detection threshold to act as a hard gate.
+# pull_request_target and issue_comment funnel into the same jobs and update
+# the same PR comment via a hidden marker (<!-- delta-kernel-bench-comment
+# -->) so reviewers always see one current comment instead of a stack.
 #
 # SECURITY MODEL
 # --------------
@@ -21,6 +26,7 @@
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
+  merge_group:
   issue_comment:
     types: [created, edited]
 
@@ -31,12 +37,23 @@ name: Benchmarking PR performance
 permissions: {}
 
 # Safe because Criterion baselines live under benchmarks/target/ (not cached) so a mid-run cancel
-# can't leave poisoned state.
+# can't leave poisoned state. Group key falls back to the merge_group head ref
+# when neither PR-number field is populated (merge queue events).
 concurrency:
-  group: bench-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: bench-${{ github.event.pull_request.number || github.event.issue.number || github.event.merge_group.head_ref }}
   cancel-in-progress: true
 
 jobs:
+  bench-merge-queue-noop:
+    # Placeholder job for the merge_group trigger so the workflow can be wired
+    # up as a required status check later without restructuring. Does nothing
+    # meaningful today (see top-level comment for rationale).
+    name: Bench (merge queue no-op)
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Benchmark workflow is a no-op on merge queue events."
+
   run-benchmark:
     name: Run benchmarks
     # Auto-trigger: every PR event (including drafts -- regressions can land in
