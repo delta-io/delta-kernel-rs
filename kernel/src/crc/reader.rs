@@ -1,6 +1,8 @@
 //! CRC file reading functionality.
 
-use tracing::instrument;
+use std::sync::Arc;
+
+use tracing::{instrument, warn};
 
 use super::Crc;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
@@ -26,6 +28,26 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
         .ok_or_else(|| Error::generic("CRC file read returned no data"))??;
     tracing::Span::current().record("bytes_read", data.len() as u64);
     Crc::try_from_json_bytes(&data, crc_path.version)
+}
+
+/// Read a CRC file, returning `None` and logging a `warn` if it cannot be read.
+///
+/// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
+/// it.
+pub(crate) fn read_crc_file_or_none(
+    engine: &dyn Engine,
+    crc_file: &ParsedLogPath,
+) -> Option<Arc<Crc>> {
+    match try_read_crc_file(engine, crc_file) {
+        Ok(crc) => Some(Arc::new(crc)),
+        Err(e) => {
+            warn!(
+                "Failed to read CRC file {:?}: {e}.",
+                crc_file.location.location
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

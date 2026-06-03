@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.23.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.24.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -118,8 +118,14 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# Declarative plan execution via PlanExecutor trait (experimental)
-declarative-plans = []
+# Declarative plan execution via PlanExecutor trait (experimental).
+# note: there is a dependency on arrow because PlanBasedEngine assumes the use of Arrow EngineData
+#       for JSON parsing
+declarative-plans = ["arrow-conversion", "arrow-expression"]
+
+# Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
+# work. TODO(#2630): remove once full column-defaults support ships.
+column-defaults-in-dev = []
 
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls

@@ -21,15 +21,15 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
-use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name,
+    column_mapping_mode, get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
     LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
     MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -222,7 +222,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
-        validate_iceberg_compat_v3_no_legacy_nested_id(&table_config)?;
+        validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
         Ok(table_config)
     }
@@ -624,7 +624,6 @@ impl TableConfiguration {
                 check(&self.protocol, &self.table_properties, operation)?;
             }
         };
-
         self.validate_feature_requirements(feature)
     }
 
@@ -1847,6 +1846,25 @@ mod test {
             ],
         );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    // A catalog-managed table requires inCommitTimestamp to be enabled.
+    #[rstest]
+    #[case::catalog_managed(
+        TableFeature::CatalogManaged,
+        "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"
+    )]
+    #[case::catalog_owned_preview(
+        TableFeature::CatalogOwnedPreview,
+        "Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled"
+    )]
+    fn test_catalog_managed_requires_in_commit_timestamp(
+        #[case] feature: TableFeature,
+        #[case] expected_error: &str,
+    ) {
+        let config = create_mock_table_config(&[], &[feature]);
+        let result = config.ensure_operation_supported(Operation::Write);
+        assert_result_error_with_message(result, expected_error);
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization

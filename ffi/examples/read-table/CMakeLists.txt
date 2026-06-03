@@ -23,6 +23,7 @@ add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/nested_type
 add_test(NAME read_and_print_nested_cols COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types-cols.expected -cmap,struct,array)
 add_test(NAME read_and_print_basic_partitioned COMMAND ${TestRunner} ${DatPath}/basic_partitioned/delta/ ${ExpectedPath}/basic-partitioned.expected)
 add_test(NAME read_and_print_with_dv_small COMMAND ${TestRunner} ${KernelTestPath}/table-with-dv-small/ ${ExpectedPath}/table-with-dv-small.expected)
+add_test(NAME read_and_print_with_short_dv COMMAND ${TestRunner} ${KernelTestPath}/with-short-dv/ ${ExpectedPath}/with-short-dv.expected)
 # Exercises the Arrow batch-mode scan metadata path (scan_metadata_next_arrow). The arrow path
 # does not call read_parquet_file, so the data section is "[No data]"; this test still
 # requires PRINT_DATA=ON because iterate_scan_metadata_arrow is gated behind it.

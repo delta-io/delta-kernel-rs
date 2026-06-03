@@ -8,7 +8,9 @@ use bytes::Bytes;
 pub use ir::{IoOperation, Operation, QueryPlan, QueryPlanNode};
 pub use query_builder::QueryPlanBuilder;
 
-use crate::{AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta};
+use crate::{
+    AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,
+};
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
 ///
@@ -29,11 +31,15 @@ pub enum PlanResult {
     FileMeta(DeltaResultIteratorStatic<FileMeta>),
     /// A stream of raw byte buffers.
     Bytes(DeltaResultIteratorStatic<Bytes>),
+    /// Metadata extracted from a Parquet file footer.
+    ParquetFooter(ParquetFooter),
     /// Represents the successful completion of a plan, but with no return value.
     Unit,
 }
 
 impl PlanResult {
+    /// Consumes the PlanResult and extracts the inner iterator of EngineData (assuming that it is a
+    /// PlanResult::Data variant). Returns an error if the PlanResult is not the expected variant.
     pub fn into_data(self) -> DeltaResult<DeltaResultIteratorStatic<Box<dyn EngineData>>> {
         match self {
             Self::Data(iter) => Ok(iter),
@@ -41,6 +47,9 @@ impl PlanResult {
         }
     }
 
+    /// Consumes the PlanResult and extracts the inner iterator of FileMeta (assuming that it is a
+    /// PlanResult::FileMeta variant). Returns an error if the PlanResult is not the expected
+    /// variant.
     pub fn into_file_meta(self) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         match self {
             Self::FileMeta(iter) => Ok(iter),
@@ -48,6 +57,9 @@ impl PlanResult {
         }
     }
 
+    /// Consumes the PlanResult and extracts the inner iterator of Bytes (assuming that it is a
+    /// PlanResult::Bytes variant). Returns an error if the PlanResult is not a PlanResult::Bytes
+    /// variant.
     pub fn into_bytes(self) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         match self {
             Self::Bytes(iter) => Ok(iter),
@@ -55,6 +67,18 @@ impl PlanResult {
         }
     }
 
+    /// Consumes the PlanResult and extracts the inner [`ParquetFooter`] (assuming that it is a
+    /// PlanResult::ParquetFooter variant). Returns an error if the PlanResult is not the expected
+    /// variant.
+    pub fn into_parquet_footer(self) -> DeltaResult<ParquetFooter> {
+        match self {
+            Self::ParquetFooter(footer) => Ok(footer),
+            other => Err(other.type_mismatch("ParquetFooter")),
+        }
+    }
+
+    /// Consumes the PlanResult, verifying that it is a PlanResult::Unit variant. Returns an error
+    /// if the PlanResult is not the expected variant.
     pub fn into_unit(self) -> DeltaResult<()> {
         match self {
             Self::Unit => Ok(()),
@@ -67,6 +91,7 @@ impl PlanResult {
             Self::Data(_) => "Data",
             Self::FileMeta(_) => "FileMeta",
             Self::Bytes(_) => "Bytes",
+            Self::ParquetFooter(_) => "ParquetFooter",
             Self::Unit => "Unit",
         }
     }

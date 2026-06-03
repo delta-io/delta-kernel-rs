@@ -15,7 +15,7 @@ use crate::actions::{
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta, LazyCrc};
+use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
@@ -485,7 +485,7 @@ impl<S> Transaction<S> {
                 let bin_boundaries = self
                     .read_snapshot_opt
                     .as_ref()
-                    .and_then(|snap| snap.get_file_stats_if_loaded())
+                    .and_then(|snap| snap.get_file_stats_if_present())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
                 let crc_delta = self.build_crc_delta(
@@ -1224,8 +1224,8 @@ impl<S> Transaction<S> {
                 let snapshot = Snapshot::new_with_crc(
                     log_segment,
                     self.effective_table_config,
-                    Arc::new(LazyCrc::new_precomputed(crc, 0)),
-                );
+                    Some(Arc::new(crc)),
+                )?;
                 (stats, Arc::new(snapshot))
             }
         };
