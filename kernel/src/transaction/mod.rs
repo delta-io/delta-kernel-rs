@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
@@ -266,8 +266,6 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // See `shared_write_state()` method.
-    shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -875,7 +873,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
-    fn generate_logical_to_physical(&self) -> Expression {
+    fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
         let partition_cols = self.effective_table_config.partition_columns().to_vec();
         // Check if partition columns should be materialized into data files.
         let should_materialize_partition_columns = self
@@ -889,7 +887,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 patch = patch.with_dropped_field_if_exists(col);
             }
         }
-        Expression::struct_patch(patch)
+        Ok(Expression::struct_patch(patch))
     }
 
     /// Returns the logical partition column names for this table.
@@ -897,25 +895,21 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.effective_table_config.partition_columns()
     }
 
-    /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
-    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
-        self.shared_write_state.get_or_init(|| {
-            let table_config = &self.effective_table_config;
-            let props = table_config.table_properties();
-            let randomize_file_prefixes = props.should_randomize_file_prefixes();
-            let random_prefix_length = props.random_prefix_length();
-            Arc::new(SharedWriteState {
-                table_root: table_config.table_root().clone(),
-                logical_schema: table_config.logical_schema(),
-                physical_schema: table_config.physical_write_schema(),
-                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
-                column_mapping_mode: table_config.column_mapping_mode(),
-                stats_columns: self.stats_columns(),
-                logical_partition_columns: table_config.partition_columns().to_vec(),
-                randomize_file_prefixes,
-                random_prefix_length,
-            })
-        })
+    /// Builds the [`SharedWriteState`] for a write context.
+    fn shared_write_state(&self) -> DeltaResult<Arc<SharedWriteState>> {
+        let table_config = &self.effective_table_config;
+        let props = table_config.table_properties();
+        Ok(Arc::new(SharedWriteState {
+            table_root: table_config.table_root().clone(),
+            logical_schema: table_config.logical_schema(),
+            physical_schema: table_config.physical_write_schema(),
+            logical_to_physical: Arc::new(self.generate_logical_to_physical()?),
+            column_mapping_mode: table_config.column_mapping_mode(),
+            stats_columns: self.stats_columns(),
+            logical_partition_columns: table_config.partition_columns().to_vec(),
+            randomize_file_prefixes: props.should_randomize_file_prefixes(),
+            random_prefix_length: props.random_prefix_length(),
+        }))
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -959,7 +953,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
             !shared.logical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
@@ -996,7 +990,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         }
 
         Ok(WriteContext {
-            shared: shared.clone(),
+            shared,
             physical_partition_values: serialized,
         })
     }
@@ -1007,13 +1001,13 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
             shared.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
         Ok(WriteContext {
-            shared: shared.clone(),
+            shared,
             physical_partition_values: HashMap::new(),
         })
     }
@@ -1842,6 +1836,55 @@ mod tests {
         let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
         let abs_path3 = dv_path3.absolute_path()?;
         assert_ne!(abs_path2, abs_path3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_context_reflects_updated_effective_table_config(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_non_dv_table();
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("default engine");
+
+        // Regression coverage for stale SharedWriteState caching: keep the first context alive
+        // while the transaction's effective table config changes.
+        let initial_write_context = txn.unpartitioned_write_context()?;
+        assert!(!initial_write_context
+            .logical_schema()
+            .contains("fresh_column"));
+
+        let mut evolved_fields: Vec<StructField> = txn
+            .effective_table_config
+            .logical_schema()
+            .fields()
+            .cloned()
+            .collect();
+        evolved_fields.push(StructField::nullable("fresh_column", DataType::INTEGER));
+        let evolved_schema = Arc::new(StructType::new_unchecked(evolved_fields));
+        let evolved_metadata = txn
+            .effective_table_config
+            .metadata()
+            .clone()
+            .with_schema(evolved_schema.clone())?;
+        txn.effective_table_config = TableConfiguration::try_new_with_schema(
+            &txn.effective_table_config,
+            evolved_metadata,
+            evolved_schema,
+        )?;
+
+        let updated_write_context = txn.unpartitioned_write_context()?;
+        assert!(updated_write_context
+            .logical_schema()
+            .contains("fresh_column"));
+        assert!(updated_write_context
+            .physical_schema()
+            .contains("fresh_column"));
+        assert!(!initial_write_context
+            .logical_schema()
+            .contains("fresh_column"));
 
         Ok(())
     }

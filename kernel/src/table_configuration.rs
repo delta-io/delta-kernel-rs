@@ -70,6 +70,22 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     }
 }
 
+fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> DeltaResult<()> {
+    let mut seen = HashSet::new();
+    for col in metadata.partition_columns() {
+        if !seen.insert(col) {
+            return Err(Error::generic(format!(
+                "Duplicate partition column: '{col}'"
+            )));
+        }
+        require!(
+            logical_schema.field(col).is_some(),
+            Error::generic(format!("Partition column '{col}' not found in schema"))
+        );
+    }
+    Ok(())
+}
+
 /// Physical schema variants for a table.
 ///
 /// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
@@ -200,6 +216,8 @@ impl TableConfiguration {
             table_root,
             version,
         };
+
+        validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
 
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
@@ -994,6 +1012,52 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn table_configuration_rejects_partition_column_missing_from_schema() {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["missing".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+
+        assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
+    }
+
+    #[test]
+    fn table_configuration_rejects_duplicate_partition_columns() {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("value", DataType::INTEGER),
+            StructField::nullable("part", DataType::STRING),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part".to_string(), "part".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+
+        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
     }
 
     #[test]
@@ -2069,6 +2133,25 @@ mod test {
             inner.field("phys_part_b").is_none(),
             "Partition column b should be excluded"
         );
+    }
+
+    #[test]
+    fn test_partition_columns_are_logical_under_column_mapping() {
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+
+        assert_eq!(config.partition_columns(), ["part_a", "part_b"]);
+        let partition_schema = config
+            .build_partition_values_parsed_schema()
+            .expect("partition schema should be present");
+        assert!(partition_schema.field("phys_part_a").is_some());
+        assert!(partition_schema.field("phys_part_b").is_some());
+        assert!(partition_schema.field("part_a").is_none());
+        assert!(partition_schema.field("part_b").is_none());
     }
 
     /// Verifies that the lazily-computed physical-without-partition schema is shared across
