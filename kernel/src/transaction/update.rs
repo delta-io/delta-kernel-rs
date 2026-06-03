@@ -494,8 +494,7 @@ impl<S> Transaction<S> {
             nullable_restored_add_schema().clone().into(),
         )?;
         let with_data_change_patch = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new().with_inserted_field_after_at(
-                ["add"],
+            ExpressionStructPatchBuilder::new_nested(["add"]).with_inserted_field_after(
                 "modificationTime",
                 Expression::literal(self.data_change).into(),
             ),

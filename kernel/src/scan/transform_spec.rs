@@ -197,7 +197,7 @@ pub(crate) fn get_transform_expr(
         }
     }
 
-    Ok(Arc::new(Expression::StructPatch(patch.build()?)))
+    Ok(Arc::new(Expression::struct_patch(patch)?))
 }
 
 // Adapter that converts the insert_after option into a method call on the patch.

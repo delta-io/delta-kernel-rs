@@ -111,6 +111,10 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     )
     .unwrap();
 
+    // NOTE: This convoluted example cannot directly use nested builder helpers, because the fields
+    // of `foo.bar.baz` are hoisted up as the new top-level columns while the original top-level
+    // struct becomes a child of `foo.bar.baz`, inserted after `a`. Which means a hypothetical child
+    // `t` of `foo.bar.baz` will appear twice in the output (as `foo.bar.baz.t` and also as `t`).
     let nested_patch = ExpressionStructPatchBuilder::new()
         .with_dropped_field("gone")
         .with_replaced_field("stub", Expr::literal("replaced").into())
