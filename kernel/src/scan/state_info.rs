@@ -935,6 +935,7 @@ pub(crate) mod tests {
         );
         let res = StateInfo::try_new(
             read_schema,
+            table_configuration.logical_schema(),
             &table_configuration,
             None,
             StatsOutputMode::default(),
