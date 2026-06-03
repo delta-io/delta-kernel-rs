@@ -395,45 +395,21 @@ impl ExpressionStructPatch {
     }
 }
 
-/// Builds a raw [`ExpressionStructPatch`] from an ordered list of requested patch operations.
+/// Builds a raw [`ExpressionStructPatch`] from a sequence of requested patch operations.
 ///
 /// The builder records user intent, checks for conflicting destructive operations, and lowers
 /// nested field paths into recursive raw struct patches. The resulting raw patch only needs to
 /// describe whether each input field is kept and which expressions are emitted at that field's
 /// output position.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug)]
 pub struct ExpressionStructPatchBuilder {
+    /// None for a top-level patch; otherwise the path of the nested struct this patch targets.
     input_path: Option<ColumnName>,
-    /// Recorded operations, each paired with the path of the (possibly nested) struct it targets.
-    /// An empty path targets this builder's input struct directly.
-    operations: Vec<(ColumnName, ExpressionStructPatchOperation)>,
-}
-
-/// A single operation local to the struct identified by its paired path. The target struct path is
-/// tracked separately (see [`ExpressionStructPatchBuilder::operations`]) so each operation only
-/// describes what to do, not where to find the struct to act on.
-#[derive(Debug, Clone, PartialEq)]
-enum ExpressionStructPatchOperation {
-    Prepend(ExpressionRef),
-    Append(ExpressionRef),
-    InsertAfter {
-        field_name: String,
-        expr: ExpressionRef,
-    },
-    InputFieldAction {
-        field_name: String,
-        action: InputFieldAction,
-    },
-}
-
-impl ExpressionStructPatchOperation {
-    // Convenience constructor for an input field action operation.
-    fn input_field_action(field_name: impl Into<String>, action: InputFieldAction) -> Self {
-        Self::InputFieldAction {
-            field_name: field_name.into(),
-            action,
-        }
-    }
+    /// The patch tree assembled so far, with each `with_*` call applied eagerly.
+    root: PatchNode,
+    /// The first error produced by a `with_*` call, surfaced by [`build`](Self::build). Once set,
+    /// later `with_*` calls are skipped so the original (most relevant) error is preserved.
+    error: DeltaResult<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -445,7 +421,7 @@ struct PatchNode {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 struct FieldPatchBuildState {
-    input_field_action: InputFieldAction,
+    action: InputFieldAction,
     insert_after: Vec<ExpressionRef>,
 }
 
@@ -468,8 +444,13 @@ impl InputFieldAction {
 
 impl ExpressionStructPatchBuilder {
     /// Creates a new top-level patch builder.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            input_path: None,
+            root: PatchNode::default(),
+            error: Ok(()),
+        }
     }
 
     /// Creates a new builder that operates on fields of a nested struct identified by `path`.
@@ -479,7 +460,8 @@ impl ExpressionStructPatchBuilder {
     {
         Self {
             input_path: Some(ColumnName::new(path)),
-            operations: Vec::new(),
+            root: PatchNode::default(),
+            error: Ok(()),
         }
     }
 
@@ -497,13 +479,7 @@ impl ExpressionStructPatchBuilder {
     where
         ColumnName: FromIterator<A>,
     {
-        self.record(
-            struct_path,
-            ExpressionStructPatchOperation::input_field_action(
-                field_name,
-                InputFieldAction::Drop { optional: false },
-            ),
-        )
+        self.apply_at(struct_path, |node| node.drop(field_name, false))
     }
 
     /// Records an optional field drop.
@@ -520,13 +496,7 @@ impl ExpressionStructPatchBuilder {
     where
         ColumnName: FromIterator<A>,
     {
-        self.record(
-            struct_path,
-            ExpressionStructPatchOperation::input_field_action(
-                field_name,
-                InputFieldAction::Drop { optional: true },
-            ),
-        )
+        self.apply_at(struct_path, |node| node.drop(field_name, true))
     }
 
     /// Records a field replacement.
@@ -544,13 +514,9 @@ impl ExpressionStructPatchBuilder {
     where
         ColumnName: FromIterator<A>,
     {
-        self.record(
-            struct_path,
-            ExpressionStructPatchOperation::input_field_action(
-                field_name,
-                InputFieldAction::Replace(expr),
-            ),
-        )
+        self.apply_at(struct_path, |node| {
+            node.set_action(field_name, InputFieldAction::Replace(expr))
+        })
     }
 
     /// Records an expression to emit before processing the first input field.
@@ -567,7 +533,10 @@ impl ExpressionStructPatchBuilder {
     where
         ColumnName: FromIterator<A>,
     {
-        self.record(struct_path, ExpressionStructPatchOperation::Prepend(expr))
+        self.apply_at(struct_path, |node| {
+            node.prepended_fields.push(expr);
+            Ok(())
+        })
     }
 
     /// Records an expression to insert after the field identified by `path`.
@@ -589,13 +558,7 @@ impl ExpressionStructPatchBuilder {
     where
         ColumnName: FromIterator<A>,
     {
-        self.record(
-            struct_path,
-            ExpressionStructPatchOperation::InsertAfter {
-                field_name: field_name.into(),
-                expr,
-            },
-        )
+        self.apply_at(struct_path, |node| node.insert_after(field_name, expr))
     }
 
     /// Records an expression to append after all input fields and field-specific insertions.
@@ -612,21 +575,28 @@ impl ExpressionStructPatchBuilder {
     where
         ColumnName: FromIterator<A>,
     {
-        self.record(struct_path, ExpressionStructPatchOperation::Append(expr))
+        self.apply_at(struct_path, |node| {
+            node.appended_fields.push(expr);
+            Ok(())
+        })
     }
 
-    // Records an operation against the struct identified by `struct_path` (empty targets the input
-    // struct directly).
-    fn record<A>(
+    // Applies `op` to the (possibly nested) struct node identified by `struct_path` (an empty path
+    // targets the input struct directly). Errors are deferred: the first failure is stashed in
+    // `self.error` and surfaced by `build`, and once set, later operations are skipped so the
+    // original error is preserved.
+    fn apply_at<A>(
         mut self,
         struct_path: impl IntoIterator<Item = A>,
-        operation: ExpressionStructPatchOperation,
+        op: impl FnOnce(&mut PatchNode) -> DeltaResult<()>,
     ) -> Self
     where
         ColumnName: FromIterator<A>,
     {
-        self.operations
-            .push((ColumnName::new(struct_path), operation));
+        if self.error.is_ok() {
+            let path = ColumnName::new(struct_path);
+            self.error = self.root.node_at_mut(&path).and_then(op);
+        }
         self
     }
 
@@ -634,15 +604,12 @@ impl ExpressionStructPatchBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error when the builder contains multiple drop/replace requests for the same
-    /// field, or when a destructive operation on one field overlaps with an operation on a nested
-    /// child field.
+    /// Returns an error when a `with_*` call requested multiple drop/replace operations for the
+    /// same field, or when a destructive operation on one field overlapped with an operation on a
+    /// nested child field.
     pub fn build(self) -> DeltaResult<ExpressionStructPatch> {
-        let mut root = PatchNode::default();
-        for (struct_path, operation) in self.operations {
-            root.apply_operation(&struct_path, operation)?;
-        }
-        root.into_raw_patch(self.input_path)
+        self.error?;
+        self.root.into_raw_patch(self.input_path)
     }
 }
 
@@ -655,47 +622,51 @@ impl TryFrom<ExpressionStructPatchBuilder> for ExpressionStructPatch {
 }
 
 impl PatchNode {
-    fn apply_operation(
+    /// Records an expression to insert immediately after the named input field.
+    fn insert_after(
         &mut self,
-        struct_path: &ColumnName,
-        operation: ExpressionStructPatchOperation,
+        field_name: impl Into<String>,
+        expr: ExpressionRef,
     ) -> DeltaResult<()> {
-        let node = self.node_at_mut(struct_path)?;
-        match operation {
-            ExpressionStructPatchOperation::Prepend(expr) => {
-                node.prepended_fields.push(expr);
+        let entry = self.field_state_mut(field_name.into(), |field_name, entry| {
+            if entry.action.is_optional_drop() {
+                return Err(Error::generic(format!(
+                    "Field '{field_name}' cannot combine optional drop with insert-after"
+                )));
             }
-            ExpressionStructPatchOperation::Append(expr) => {
-                node.appended_fields.push(expr);
+            Ok(())
+        })?;
+        entry.insert_after.push(expr);
+        Ok(())
+    }
+
+    /// Records a drop of the named input field. `optional` tolerates an absent field at evaluation
+    /// time, but cannot combine with insertions after that field.
+    fn drop(&mut self, field_name: impl Into<String>, optional: bool) -> DeltaResult<()> {
+        self.set_action(field_name, InputFieldAction::Drop { optional })
+    }
+
+    /// Records the input field action (drop/replace/patch) for the named input field. Only one such
+    /// action is allowed per field.
+    fn set_action(
+        &mut self,
+        field_name: impl Into<String>,
+        action: InputFieldAction,
+    ) -> DeltaResult<()> {
+        let entry = self.field_state_mut(field_name.into(), |field_name, entry| {
+            if entry.action != InputFieldAction::Keep {
+                return Err(Error::generic(format!(
+                    "Field '{field_name}' has multiple input field actions"
+                )));
             }
-            ExpressionStructPatchOperation::InsertAfter { field_name, expr } => {
-                let entry = node.field_state_mut(field_name, |field_name, entry| {
-                    if entry.input_field_action.is_optional_drop() {
-                        return Err(Error::generic(format!(
-                            "Field '{field_name}' cannot combine optional drop with insert-after"
-                        )));
-                    }
-                    Ok(())
-                })?;
-                entry.insert_after.push(expr);
+            if action.is_optional_drop() && !entry.insert_after.is_empty() {
+                return Err(Error::generic(format!(
+                    "Field '{field_name}' cannot combine optional drop with insert-after"
+                )));
             }
-            ExpressionStructPatchOperation::InputFieldAction { field_name, action } => {
-                let entry = node.field_state_mut(field_name, |field_name, entry| {
-                    if entry.input_field_action != InputFieldAction::Keep {
-                        return Err(Error::generic(format!(
-                            "Field '{field_name}' has multiple input field actions"
-                        )));
-                    }
-                    if action.is_optional_drop() && !entry.insert_after.is_empty() {
-                        return Err(Error::generic(format!(
-                            "Field '{field_name}' cannot combine optional drop with insert-after"
-                        )));
-                    }
-                    Ok(())
-                })?;
-                entry.input_field_action = action;
-            }
-        }
+            Ok(())
+        })?;
+        entry.action = action;
         Ok(())
     }
 
@@ -729,14 +700,14 @@ impl PatchNode {
     }
 
     fn into_raw_patch(self, input_path: Option<ColumnName>) -> DeltaResult<ExpressionStructPatch> {
-        let fields = self.fields.into_iter();
-        let field_patches = fields.map(|(field_name, state)| -> DeltaResult<_> {
+        let mut field_patches = HashMap::with_capacity(self.fields.len());
+        for (field_name, state) in self.fields {
             let patch = state.into_raw_field_patch(input_path.as_ref(), &field_name)?;
-            Ok((field_name, patch))
-        });
+            field_patches.insert(field_name, patch);
+        }
 
         Ok(ExpressionStructPatch {
-            field_patches: field_patches.try_collect()?,
+            field_patches,
             prepended_fields: self.prepended_fields,
             appended_fields: self.appended_fields,
             input_path,
@@ -748,10 +719,10 @@ impl FieldPatchBuildState {
     /// Every ancestor field of a field we want to patch must have a Patch field action. We can
     /// convert from Keep (no-op or insert-after) to Patch, but not Drop or Replace.
     fn patch_node_mut(&mut self, field_name: &str) -> DeltaResult<&mut PatchNode> {
-        if self.input_field_action == InputFieldAction::Keep {
-            self.input_field_action = InputFieldAction::Patch(Box::default());
+        if self.action == InputFieldAction::Keep {
+            self.action = InputFieldAction::Patch(Box::default());
         }
-        let InputFieldAction::Patch(node) = &mut self.input_field_action else {
+        let InputFieldAction::Patch(node) = &mut self.action else {
             return Err(Error::generic(format!(
                 "Cannot patch nested fields under dropped/replaced field '{field_name}'"
             )));
@@ -765,7 +736,7 @@ impl FieldPatchBuildState {
         field_name: &str,
     ) -> DeltaResult<ExpressionFieldPatch> {
         let mut insertions = self.insert_after;
-        let (keep_input, optional) = match self.input_field_action {
+        let (keep_input, optional) = match self.action {
             InputFieldAction::Keep => {
                 if insertions.is_empty() {
                     return Err(Error::generic(format!(
@@ -1710,7 +1681,7 @@ mod tests {
     #[test]
     fn struct_patch_builder_rejects_impossible_empty_nested_patch() {
         let result = FieldPatchBuildState {
-            input_field_action: InputFieldAction::Patch(Box::<PatchNode>::default()),
+            action: InputFieldAction::Patch(Box::<PatchNode>::default()),
             insert_after: vec![],
         }
         .into_raw_field_patch(None, "add");
