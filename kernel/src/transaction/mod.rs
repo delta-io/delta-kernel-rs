@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
@@ -19,7 +19,9 @@ use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta, LazyCr
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
+use crate::expressions::{
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
+};
 use crate::log_segment::LogSegment;
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
@@ -266,8 +268,6 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // See `shared_write_state()` method.
-    shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -303,7 +303,7 @@ where
     let evaluation_handler = engine.evaluation_handler();
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
-            ExpressionStructPatch::new_top_level()
+            ExpressionStructPatchBuilder::new()
                 .with_inserted_field_after(
                     "modificationTime",
                     Expression::literal(data_change).into(),
@@ -312,7 +312,7 @@ where
                     "stats",
                     Expression::unary(ToJson, Expression::column(["stats"])).into(),
                 ),
-        );
+        )?;
         let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
@@ -875,17 +875,16 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
-    fn generate_logical_to_physical(&self) -> Expression {
-        let partition_cols = self.effective_table_config.partition_columns().to_vec();
+    fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
         // Check if partition columns should be materialized into data files.
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
         // Build a StructPatch expression that drops partition columns from the input
         // (unless they should be materialized).
-        let mut patch = ExpressionStructPatch::new_top_level();
+        let mut patch = ExpressionStructPatchBuilder::new();
         if !should_materialize_partition_columns {
-            for col in &partition_cols {
+            for col in self.effective_table_config.partition_columns() {
                 patch = patch.with_dropped_field_if_exists(col);
             }
         }
@@ -897,25 +896,21 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.effective_table_config.partition_columns()
     }
 
-    /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
-    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
-        self.shared_write_state.get_or_init(|| {
-            let table_config = &self.effective_table_config;
-            let props = table_config.table_properties();
-            let randomize_file_prefixes = props.should_randomize_file_prefixes();
-            let random_prefix_length = props.random_prefix_length();
-            Arc::new(SharedWriteState {
-                table_root: table_config.table_root().clone(),
-                logical_schema: table_config.logical_schema(),
-                physical_schema: table_config.physical_write_schema(),
-                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
-                column_mapping_mode: table_config.column_mapping_mode(),
-                stats_columns: self.stats_columns(),
-                logical_partition_columns: table_config.partition_columns().to_vec(),
-                randomize_file_prefixes,
-                random_prefix_length,
-            })
-        })
+    /// Builds the [`SharedWriteState`] for a write context.
+    fn shared_write_state(&self) -> DeltaResult<Arc<SharedWriteState>> {
+        let table_config = &self.effective_table_config;
+        let props = table_config.table_properties();
+        Ok(Arc::new(SharedWriteState {
+            table_root: table_config.table_root().clone(),
+            logical_schema: table_config.logical_schema(),
+            physical_schema: table_config.physical_write_schema(),
+            logical_to_physical: Arc::new(self.generate_logical_to_physical()?),
+            column_mapping_mode: table_config.column_mapping_mode(),
+            stats_columns: self.stats_columns(),
+            logical_partition_columns: table_config.partition_columns().to_vec(),
+            randomize_file_prefixes: props.should_randomize_file_prefixes(),
+            random_prefix_length: props.random_prefix_length(),
+        }))
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -959,7 +954,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
             !shared.logical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
@@ -1007,7 +1002,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
             shared.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
@@ -1351,8 +1346,8 @@ impl<S> Transaction<S> {
                 self.data_change,
                 columns_to_drop,
                 coalesce_stats_with_parsed,
-            );
-            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)]));
+            )?;
+            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
@@ -1401,8 +1396,8 @@ fn build_remove_struct_patch(
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
-) -> ExpressionStructPatch {
-    let mut patch = ExpressionStructPatch::new_top_level()
+) -> DeltaResult<ExpressionStructPatch> {
+    let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
         .with_inserted_field_after("path", Expression::literal(commit_timestamp).into())
         // dataChange
@@ -1447,7 +1442,7 @@ fn build_remove_struct_patch(
         patch = patch.with_dropped_field(*column_to_drop);
     }
 
-    patch
+    patch.build()
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to

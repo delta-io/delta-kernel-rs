@@ -116,7 +116,7 @@ use crate::actions::{
     SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{Expression, ExpressionStructPatch, Scalar, StructData};
+use crate::expressions::{Expression, ExpressionStructPatchBuilder, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
@@ -742,14 +742,14 @@ impl CheckpointWriter {
         )?);
 
         // Use a struct patch to set just the checkpointMetadata field, keeping others null
-        let patch = ExpressionStructPatch::new_top_level().with_replaced_field(
+        let patch = ExpressionStructPatchBuilder::new().with_replaced_field(
             CHECKPOINT_METADATA_NAME,
             Arc::new(Expression::literal(checkpoint_metadata_value)),
         );
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             schema.clone(),
-            Arc::new(Expression::struct_patch(patch)),
+            Arc::new(Expression::struct_patch(patch)?),
             schema.clone().into(),
         )?;
 

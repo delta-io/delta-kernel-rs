@@ -85,7 +85,7 @@ pub(crate) fn build_checkpoint_transform(
     stats_schema: &SchemaRef,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<ExpressionRef> {
-    let mut patch_builder = ExpressionStructPatchBuilder::new_top_level();
+    let mut patch_builder = ExpressionStructPatchBuilder::new();
 
     // Handle stats field
     if config.write_stats_as_json {
@@ -127,7 +127,7 @@ pub(crate) fn build_checkpoint_transform(
         }
     }
 
-    Ok(Arc::new(Expression::struct_patch(patch_builder.build()?)))
+    Ok(Arc::new(Expression::struct_patch(patch_builder)?))
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`

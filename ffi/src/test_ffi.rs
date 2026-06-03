@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use delta_kernel::expressions::{
     column_expr, column_name, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-    Expression as Expr, ExpressionStructPatch, MapData, OpaqueExpressionOp, OpaquePredicateOp,
-    Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData,
+    Expression as Expr, ExpressionStructPatchBuilder, MapData, OpaqueExpressionOp,
+    OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData,
 };
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -111,19 +111,27 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     )
     .unwrap();
 
-    let nested_patch = ExpressionStructPatch::new_top_level()
+    let nested_patch = ExpressionStructPatchBuilder::new()
         .with_dropped_field("gone")
         .with_replaced_field("stub", Expr::literal("replaced").into())
         .with_inserted_field_after("x", Expr::literal(true).into())
-        .with_inserted_field_after("y", Expr::literal(false).into());
-    let top_level_patch = ExpressionStructPatch::new_nested(column_name!("foo.bar.baz"))
+        .with_inserted_field_after("y", Expr::literal(false).into())
+        .build()
+        .unwrap();
+    let top_level_patch = ExpressionStructPatchBuilder::new_nested(column_name!("foo.bar.baz"))
         .with_dropped_field("dropme")
         .with_replaced_field("replaceme", Expr::literal(42).into())
         .with_prepended_field(Expr::literal("prepended").into())
         .with_inserted_field_after("a", Expr::literal("first").into())
-        .with_inserted_field_after("a", Expr::struct_patch(nested_patch).into())
+        .with_inserted_field_after("a", Expr::struct_patch(nested_patch).unwrap().into())
         .with_inserted_field_after("a", Expr::literal("third").into())
-        .with_appended_field(Expr::literal("appended").into());
+        .with_appended_field(Expr::literal("appended").into())
+        .build()
+        .unwrap();
+    let empty_top_level_patch = ExpressionStructPatchBuilder::new().build().unwrap();
+    let empty_nested_patch = ExpressionStructPatchBuilder::new_nested(column_name!("empty.nested"))
+        .build()
+        .unwrap();
 
     let mut sub_exprs = vec![
         column_expr!("col"),
@@ -149,6 +157,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::null_literal(DataType::SHORT),
         Scalar::Struct(top_level_struct).into(),
         Expr::StructPatch(top_level_patch),
+        Expr::StructPatch(empty_top_level_patch),
+        Expr::StructPatch(empty_nested_patch),
         Scalar::Array(array_data).into(),
         Scalar::Map(map_data).into(),
         Expr::struct_from([Expr::literal(5_i32), Expr::literal(20_i64)]),

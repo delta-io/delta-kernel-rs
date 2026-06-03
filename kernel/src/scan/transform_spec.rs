@@ -11,7 +11,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::{
-    BinaryExpressionOp, Expression, ExpressionRef, ExpressionStructPatch, Scalar,
+    BinaryExpressionOp, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar,
 };
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
@@ -127,7 +127,7 @@ pub(crate) fn get_transform_expr(
     physical_schema: &StructType,
     base_row_id: Option<i64>,
 ) -> DeltaResult<ExpressionRef> {
-    let mut patch = ExpressionStructPatch::new_top_level();
+    let mut patch = ExpressionStructPatchBuilder::new();
 
     for field_transform in transform_spec {
         use FieldTransformSpec::*;
@@ -197,15 +197,15 @@ pub(crate) fn get_transform_expr(
         }
     }
 
-    Ok(Arc::new(Expression::StructPatch(patch)))
+    Ok(Arc::new(Expression::StructPatch(patch.build()?)))
 }
 
 // Adapter that converts the insert_after option into a method call on the patch.
 fn apply_insert_after(
-    patch: ExpressionStructPatch,
+    patch: ExpressionStructPatchBuilder,
     insert_after: &Option<String>,
     expr: ExpressionRef,
-) -> ExpressionStructPatch {
+) -> ExpressionStructPatchBuilder {
     match insert_after {
         Some(predecessor) => patch.with_inserted_field_after(predecessor, expr),
         None => patch.with_prepended_field(expr),

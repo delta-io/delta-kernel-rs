@@ -119,10 +119,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_n_spaces(depth + 1);
       printf("field_name: %s\n", field_patch->field_name);
       print_non_empty_expression_item_list_field(
-          "replacement_expr", field_patch->replacement_expr, depth + 1);
-      print_non_empty_expression_item_list_field(
           "insertions", field_patch->insertions, depth + 1);
-      print_bool_field("is_drop", field_patch->is_drop, depth + 1);
+      print_bool_field("keep_input", field_patch->keep_input, depth + 1);
       print_bool_field("optional", field_patch->optional, depth + 1);
       break;
     }

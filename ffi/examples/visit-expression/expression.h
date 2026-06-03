@@ -100,9 +100,8 @@ struct StructPatchExpression {
 };
 struct FieldPatch {
   char* field_name;
-  ExpressionItemList replacement_expr;
   ExpressionItemList insertions;
-  bool is_drop;
+  bool keep_input;
   bool optional;
 };
 struct OpaqueExpression {
@@ -360,16 +359,14 @@ void visit_field_patch(
     void* data,
     uintptr_t sibling_list_id,
     KernelStringSlice field_name,
-    uintptr_t replacement_expr_list_id,
     uintptr_t insertion_expr_list_id,
-    bool is_drop,
+    bool keep_input,
     bool optional)
 {
   struct FieldPatch* field_patch = malloc(sizeof(struct FieldPatch));
   field_patch->field_name = allocate_string(field_name);
-  field_patch->replacement_expr = get_expr_list(data, replacement_expr_list_id);
   field_patch->insertions = get_expr_list(data, insertion_expr_list_id);
-  field_patch->is_drop = is_drop;
+  field_patch->keep_input = keep_input;
   field_patch->optional = optional;
   put_expr_item(data, sibling_list_id, field_patch, FieldPatch);
 }
@@ -599,7 +596,6 @@ void free_expression_item(ExpressionItem ref) {
     case FieldPatch: {
       struct FieldPatch* field_patch = ref.ref;
       free(field_patch->field_name);
-      free_expression_list(field_patch->replacement_expr);
       free_expression_list(field_patch->insertions);
       free(field_patch);
       break;

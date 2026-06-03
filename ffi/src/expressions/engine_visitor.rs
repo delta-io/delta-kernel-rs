@@ -225,18 +225,17 @@ pub struct EngineExpressionVisitor {
     /// Visits one named field patch of a `StructPatch` expression that owns the list identified by
     /// `sibling_list_id`.
     ///
-    /// The `replacement_expr_list_id` identifies a zero-or-one expression list used to replace the
-    /// original field. If no replacement was specified but `is_drop` is true, the original field
-    /// is dropped without replacement. The `insertion_expr_list_id` identifies expressions to
-    /// emit after this field's output position. The `optional` flag indicates that the patch
-    /// is silently ignored when the input field does not exist.
+    /// The `insertion_expr_list_id` identifies expressions to emit after this field's output
+    /// position. If `keep_input` is true, the original input field is emitted before these
+    /// insertions. If `keep_input` is false, the original input field is omitted and the first
+    /// insertion, if present, occupies the input field's output position. The `optional` flag
+    /// indicates that the patch is silently ignored when the input field does not exist.
     pub visit_field_patch: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
         field_name: KernelStringSlice,
-        replacement_expr_list_id: usize,
         insertion_expr_list_id: usize,
-        is_drop: bool,
+        keep_input: bool,
         optional: bool,
     ),
     /// Visits the operator (`op`) and children (`child_list_id`) of an opaque expression belonging
@@ -439,17 +438,14 @@ fn visit_expression_struct_patch(
     // engines should apply field patches according to input schema order.
     let field_patch_list_id = call!(visitor, make_field_list, patch.field_patches.len());
     for (field_name, field_patch) in &patch.field_patches {
-        let replacement_exprs = field_patch.replacement_expr.as_slice();
-        let replacement_expr_list_id = visit_expression_list(visitor, replacement_exprs);
         let insertion_expr_list_id = visit_expression_list(visitor, &field_patch.insertions);
         call!(
             visitor,
             visit_field_patch,
             field_patch_list_id,
             kernel_string_slice!(field_name),
-            replacement_expr_list_id,
             insertion_expr_list_id,
-            field_patch.is_drop,
+            field_patch.keep_input,
             field_patch.optional
         );
     }

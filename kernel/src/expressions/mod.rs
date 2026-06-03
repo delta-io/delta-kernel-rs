@@ -344,8 +344,7 @@ pub struct ExpressionFieldPatch {
     /// input field is omitted and the first insertion, if present, occupies the input field's
     /// output position.
     pub keep_input: bool,
-    /// Insertions provided by calls to [`ExpressionStructPatch::with_inserted_field_after`], or by
-    /// builder lowering for replacement and nested patch operations.
+    /// Expressions emitted after this field's output position.
     pub insertions: Vec<ExpressionRef>,
     /// If true, this patch is silently ignored when the input field does not exist. Otherwise, a
     /// missing input field produces an error.
@@ -383,85 +382,16 @@ pub struct ExpressionStructPatch {
 }
 
 impl ExpressionStructPatch {
-    /// Creates a new empty top-level patch. The various `with_xxx` helper methods can be
-    /// used to add specific field patches.
-    pub fn new_top_level() -> Self {
-        Self::default()
-    }
-
-    /// Creates a new empty patch that operates on fields of a nested struct identified by
-    /// `path`. The various `with_xxx` helper methods can be used to add specific field patches.
-    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
-        Self {
-            input_path: Some(ColumnName::new(path)),
-            ..Default::default()
-        }
-    }
-
-    /// Specifies a field to drop.
-    pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
-        let field_patch = self.field_patch(name);
-        field_patch.keep_input = false;
-        self
-    }
-
-    /// Like [`Self::with_dropped_field`], but silently ignored if the field does not exist.
-    pub fn with_dropped_field_if_exists(mut self, name: impl Into<String>) -> Self {
-        let field_patch = self.field_patch(name);
-        field_patch.keep_input = false;
-        field_patch.optional = true;
-        self
-    }
-
-    /// Specifies an expression to replace a field with.
-    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
-        let field_patch = self.field_patch(name);
-        field_patch.keep_input = false;
-        field_patch.insertions.insert(0, expr);
-        self
-    }
-
-    /// Specifies an expression to emit before processing the first input field.
-    pub fn with_prepended_field(mut self, expr: ExpressionRef) -> Self {
-        self.prepended_fields.push(expr);
-        self
-    }
-
-    /// Specifies an expression to insert after `predecessor`. Multiple fields can be inserted after
-    /// the same predecessor, and they will be emitted in the same order they were registered.
-    pub fn with_inserted_field_after(
-        mut self,
-        predecessor: impl Into<String>,
-        expr: ExpressionRef,
-    ) -> Self {
-        self.field_patch(predecessor).insertions.push(expr);
-        self
-    }
-
-    /// Specifies an expression to append after all input fields and field-specific insertions.
-    pub fn with_appended_field(mut self, expr: ExpressionRef) -> Self {
-        self.appended_fields.push(expr);
-        self
-    }
-
-    /// True if this patch makes no changes.
+    /// True if this patch makes no changes to the selected input struct.
     pub fn is_empty(&self) -> bool {
         self.prepended_fields.is_empty()
             && self.appended_fields.is_empty()
             && self.field_patches.is_empty()
     }
 
-    /// None, if this is a top-level patch. Otherwise, the path of this nested patch.
+    /// None if this is a top-level patch. Otherwise, the path of this nested patch.
     pub fn input_path(&self) -> Option<&ColumnName> {
         self.input_path.as_ref()
-    }
-
-    // Gets or creates the field patch for a named input field.
-    fn field_patch(&mut self, field_name: impl Into<String>) -> &mut ExpressionFieldPatch {
-        self.field_patches.entry(field_name.into()).or_default()
     }
 }
 
@@ -538,7 +468,7 @@ impl InputFieldAction {
 
 impl ExpressionStructPatchBuilder {
     /// Creates a new top-level patch builder.
-    pub fn new_top_level() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -716,6 +646,14 @@ impl ExpressionStructPatchBuilder {
     }
 }
 
+impl TryFrom<ExpressionStructPatchBuilder> for ExpressionStructPatch {
+    type Error = Error;
+
+    fn try_from(builder: ExpressionStructPatchBuilder) -> DeltaResult<Self> {
+        builder.build()
+    }
+}
+
 impl PatchNode {
     fn apply_operation(
         &mut self,
@@ -842,6 +780,15 @@ impl FieldPatchBuildState {
                 (false, false)
             }
             InputFieldAction::Patch(node) => {
+                if node.prepended_fields.is_empty()
+                    && node.appended_fields.is_empty()
+                    && node.fields.is_empty()
+                {
+                    return Err(Error::generic(format!(
+                        "Internal error: builder produced an empty nested patch for field \
+                         '{field_name}'"
+                    )));
+                }
                 let field_name = ColumnName::new([field_name]);
                 let child_input_path = match parent_input_path {
                     Some(parent) => parent.join(&field_name),
@@ -1118,9 +1065,21 @@ impl Expression {
         )
     }
 
-    /// Create a new struct patch expression.
-    pub fn struct_patch(patch: ExpressionStructPatch) -> Self {
-        Self::StructPatch(patch)
+    /// Creates a new struct patch expression from a raw patch or patch builder.
+    ///
+    /// Returns an expression that applies the supplied sparse patch to an input struct. Passing a
+    /// raw [`ExpressionStructPatch`] is infallible; passing an [`ExpressionStructPatchBuilder`]
+    /// validates and lowers the recorded operations before constructing the expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supplied patch builder contains conflicting operations.
+    pub fn struct_patch<P>(patch: P) -> DeltaResult<Self>
+    where
+        P: TryInto<ExpressionStructPatch>,
+        Error: From<P::Error>,
+    {
+        Ok(Self::StructPatch(patch.try_into()?))
     }
 
     /// Create a new predicate `self IS NULL`
@@ -1616,7 +1575,7 @@ mod tests {
 
     use super::{
         column_expr, column_pred, Expression as Expr, ExpressionStructPatchBuilder,
-        Predicate as Pred,
+        FieldPatchBuildState, InputFieldAction, PatchNode, Predicate as Pred,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1691,7 +1650,7 @@ mod tests {
 
     #[test]
     fn struct_patch_builder_lowers_nested_paths_to_raw_patches() {
-        let patch = ExpressionStructPatchBuilder::new_top_level()
+        let patch = ExpressionStructPatchBuilder::new()
             .with_dropped_field_at(["add"], "gone")
             .with_replaced_field_at(["add"], "stub", Arc::new(Expr::literal("replaced")))
             .with_inserted_field_after_at(["add"], "x", Arc::new(Expr::literal(true)))
@@ -1730,14 +1689,65 @@ mod tests {
     }
 
     #[test]
+    fn struct_patch_builder_allows_empty_root_patches() {
+        let patch = ExpressionStructPatchBuilder::new().build().unwrap();
+        assert!(patch.is_empty());
+        assert!(patch.input_path().is_none());
+
+        let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
+            .build()
+            .unwrap();
+        assert!(nested_patch.is_empty());
+        assert_eq!(
+            nested_patch
+                .input_path()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("nested")
+        );
+    }
+
+    #[test]
+    fn struct_patch_builder_rejects_impossible_empty_nested_patch() {
+        let result = FieldPatchBuildState {
+            input_field_action: InputFieldAction::Patch(Box::<PatchNode>::default()),
+            insert_after: vec![],
+        }
+        .into_raw_field_patch(None, "add");
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("empty nested patch"));
+    }
+
+    #[test]
     fn struct_patch_builder_rejects_destructive_overlaps() {
-        let result = ExpressionStructPatchBuilder::new_top_level()
+        let result = ExpressionStructPatchBuilder::new()
+            .with_dropped_field("a")
+            .with_replaced_field("a", Arc::new(Expr::literal(1)))
+            .build();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("multiple input field actions"));
+
+        let result = ExpressionStructPatchBuilder::new()
+            .with_replaced_field("a", Arc::new(Expr::literal(1)))
+            .with_dropped_field("a")
+            .build();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("multiple input field actions"));
+
+        let result = ExpressionStructPatchBuilder::new()
             .with_dropped_field("add")
             .with_inserted_field_after_at(["add"], "x", Arc::new(Expr::literal(true)))
             .build();
         assert!(result.unwrap_err().to_string().contains("nested fields"));
 
-        let result = ExpressionStructPatchBuilder::new_top_level()
+        let result = ExpressionStructPatchBuilder::new()
             .with_replaced_field_at(["add"], "x", Arc::new(Expr::literal("one")))
             .with_dropped_field_at(["add"], "x")
             .build();
@@ -1756,7 +1766,7 @@ mod tests {
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, ExpressionStructPatch, Predicate, Scalar, UnaryExpressionOp,
+            Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::utils::test_utils::assert_result_error_with_message;
@@ -1935,28 +1945,32 @@ mod tests {
         fn test_transform_expressions_roundtrip() {
             let cases: Vec<Expression> = vec![
                 // Identity transform
-                Expression::struct_patch(ExpressionStructPatch::new_top_level()),
+                Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
                 // Drop field
                 Expression::struct_patch(
-                    ExpressionStructPatch::new_top_level().with_dropped_field("old_column"),
-                ),
+                    ExpressionStructPatchBuilder::new().with_dropped_field("old_column"),
+                )
+                .unwrap(),
                 // Replace field
                 Expression::struct_patch(
-                    ExpressionStructPatch::new_top_level()
+                    ExpressionStructPatchBuilder::new()
                         .with_replaced_field("original", Arc::new(Expression::literal(0))),
-                ),
+                )
+                .unwrap(),
                 // Insert fields
                 Expression::struct_patch(
-                    ExpressionStructPatch::new_top_level()
+                    ExpressionStructPatchBuilder::new()
                         .with_inserted_field_after("after_col", Arc::new(column_expr!("new_col")))
                         .with_prepended_field(Arc::new(Expression::literal("prepended")))
                         .with_appended_field(Arc::new(Expression::literal("appended"))),
-                ),
+                )
+                .unwrap(),
                 // Nested transform
                 Expression::struct_patch(
-                    ExpressionStructPatch::new_nested(["parent", "child"])
+                    ExpressionStructPatchBuilder::new_nested(["parent", "child"])
                         .with_dropped_field("to_drop"),
-                ),
+                )
+                .unwrap(),
             ];
 
             for expr in &cases {

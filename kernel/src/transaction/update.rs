@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
@@ -25,7 +25,7 @@ use crate::engine_data::{
 };
 use crate::error::Error;
 use crate::expressions::{
-    column_name, ArrayData, ColumnName, ExpressionStructPatch, Scalar, StructData,
+    column_name, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
@@ -96,7 +96,6 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
-            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }
@@ -477,13 +476,13 @@ impl<S> Transaction<S> {
         // it is not expected by the transforms used in generate_remove_actions() which
         // expect only the scan row schema fields.
         let with_new_dv_expr = Expression::struct_patch(
-            ExpressionStructPatch::new_top_level()
+            ExpressionStructPatchBuilder::new()
                 .with_replaced_field(
                     "deletionVector",
                     Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
                 )
                 .with_dropped_field(NEW_DELETION_VECTOR_NAME),
-        );
+        )?;
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
             Arc::new(with_new_dv_expr),
@@ -494,12 +493,14 @@ impl<S> Transaction<S> {
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
         )?;
-        let with_data_change_expr = Arc::new(Expression::struct_from([Expression::struct_patch(
-            ExpressionStructPatch::new_nested(["add"]).with_inserted_field_after(
+        let with_data_change_patch = Expression::struct_patch(
+            ExpressionStructPatchBuilder::new().with_inserted_field_after_at(
+                ["add"],
                 "modificationTime",
                 Expression::literal(self.data_change).into(),
             ),
-        )]));
+        )?;
+        let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(
             nullable_restored_add_schema().clone(),
             with_data_change_expr,

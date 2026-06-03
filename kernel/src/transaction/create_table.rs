@@ -32,7 +32,6 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::marker::PhantomData;
-use std::sync::OnceLock;
 
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
@@ -171,7 +170,6 @@ impl CreateTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
-            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }
