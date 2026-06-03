@@ -1,15 +1,14 @@
 //! Read a contiguous range of raw Delta commits.
 //!
 //! A [`CommitRange`] holds an inclusive `[start_version, end_version]` range and the list of
-//! commit files; reads are lazy (no JSON I/O until [`CommitRange::commits`] or
-//! [`CommitRange::actions`] is called).
+//! commit files; reads are lazy (no JSON I/O until [`CommitRange::commits`] is called).
 //!
 //! Two construction paths, differing only in how `_delta_log/` is listed at build time:
 //! - [`CommitRange::builder_for`]: lists `_delta_log/` for the requested range.
 //! - [`CommitRange::builder_from`]: reuses an existing snapshot's `LogSegment`, avoiding the
 //!   listing.
 //!
-//! Both [`CommitRange::commits`] and [`CommitRange::actions`] take a list of [`DeltaAction`]
+//! [`CommitRange::commits`] takes a list of [`DeltaAction`]
 //! and an optional `start_snapshot`. When the snapshot is supplied, the iterator seeds its
 //! `latest_protocol` / `latest_metadata` from it and the snapshot's version must match the
 //! range's `start_version` (in ascending order) or `end_version` (in descending order). When
@@ -198,7 +197,7 @@ impl CommitRange {
 pub(crate) struct CommitActionsIterator {
     engine: Arc<dyn Engine>,
     table_root: Url,
-    log_path_iter: std::vec::IntoIter<ParsedLogPath>, // impl IntoIter<ParsedLog>
+    log_path_iter: std::vec::IntoIter<ParsedLogPath>,
     commit_ordering: CommitOrdering,
     read_schema: SchemaRef,
     latest_protocol: Option<Protocol>,

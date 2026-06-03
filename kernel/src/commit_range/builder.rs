@@ -51,8 +51,8 @@ impl CommitRangeBuilder {
         self
     }
 
-    /// Set the order in which [`CommitRange::commits`] and [`CommitRange::actions`] yield
-    /// commits. Defaults to [`CommitOrdering::AscendingOrder`].
+    /// Set the order in which [`CommitRange::commits`] yields commits. Defaults to
+    /// [`CommitOrdering::AscendingOrder`].
     pub fn with_ordering(mut self, commit_ordering: CommitOrdering) -> Self {
         self.commit_ordering = commit_ordering;
         self
@@ -129,7 +129,7 @@ impl CommitRangeBuilder {
     }
 }
 
-/// Direction in which [`CommitRange::commits`] / [`CommitRange::actions`] yield commits.
+/// Direction in which [`CommitRange::commits`] yields commits.
 /// Default is [`CommitOrdering::AscendingOrder`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOrdering {
