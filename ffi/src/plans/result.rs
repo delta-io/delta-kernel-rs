@@ -3,7 +3,7 @@
 use delta_kernel::Error;
 
 use super::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
-use crate::error::EngineError;
+use crate::error::{EngineError, ExternResult};
 use crate::scan::EngineSchema;
 use crate::NullableCvoid;
 
@@ -38,20 +38,29 @@ pub enum CPlanResult {
     ParquetFooter(CParquetFooter),
 }
 
-/// An engine-allocated wrapper around a [`CPlanResult`].
+/// An engine-allocated wrapper around an [`ExternResult<CPlanResult>`].
 ///
 /// This wrapper allows the engine to attach an opaque `state` pointer and a `free` callback,
-/// letting the kernel free all associated engine resources (including nested iterator
-/// data) when the result is no longer needed. `state` is opaque to kernel and is passed verbatim
+/// letting the kernel free all associated engine resources (i.e nested iterators and ExternResults)
+/// when the result is no longer needed. `state` is opaque to kernel and is passed verbatim
 /// back to `free`. Using a single wrapper + free callback allows the engine to conveniently
 /// maintain a single arena per plan execution, rather than tracking resources separately for each
 /// inner item of the PlanResult.
 ///
-/// On the Rust-side, the wrapper should be converted into a `PlanResultCleanup` guard to
-/// ensure the free callback is invoked properly.
+/// This wrapper additionally attaches an opaque `state` pointer and a `free` callback so kernel
+/// can release all engine-side resources (nested iterator state, error allocations, etc.) when the
+/// result is no longer needed. `state` is opaque to kernel and is passed verbatim to `free`.
+///
+/// A single wrapper + `free` callback lets the engine maintain one arena per plan execution rather
+/// than tracking resources separately for each inner item of the `CPlanResult`. On the Rust-side,
+/// the `state` + `free` pair should be converted into a `PlanResultCleanup` guard to ensure the
+/// free callback is invoked properly.
+///
+/// # Safety
+/// The engine must ensure that the `state` and `free` pointers are safe to send between threads.
 #[repr(C)]
 pub struct CPlanResultWrapper {
-    pub result: CPlanResult,
+    pub result: ExternResult<CPlanResult>,
     pub state: NullableCvoid,
     pub free: extern "C" fn(state: NullableCvoid),
 }
@@ -74,7 +83,8 @@ impl Drop for PlanResultCleanup {
     }
 }
 
-// SAFETY: the engine is expected to provide thread-safe state + free function pointers.
+// # Safety
+// The engine must ensure that all raw pointers sent are Send-safe
 unsafe impl Send for PlanResultCleanup {}
 
 #[cfg(test)]

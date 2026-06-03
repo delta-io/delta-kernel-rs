@@ -2,8 +2,7 @@
 //! execution.
 //!
 //! Each `C*Iterator` type contains an opaque engine `state` pointer with a `next` function
-//! pointer that yields one iterator item per call. The state pointer and next function pointer must
-//! be threadsafe.
+//! pointer that yields one iterator item per call.
 //!
 //! //! # `next()` protocol
 //!
@@ -12,28 +11,43 @@
 //!     - The outer Option represents whether iteration is complete
 //!     - The inner Result represents the DeltaResult yielded by the iterator
 //!
-//! # Iterator State Cleanup
+//! # Iterator Memory Management
+//! There are 3 aspects to iterator memory management:
 //!
-//! The iterator state is owned by the engine and must be freed by the kernel when it is done with
-//! it. However the `C*Iterator` types do NOT contain their own release/free functions; instead,
-//! the Engine provides a single `free` function for the entire PlanResult (see
-//! [`super::result::CPlanResultWrapper`]). This is handled on the Rust side by
-//! embedding `PlanResultCleanup` inside of each `Ffi*Iter` adapter so that the free function is
-//! called when the adapter is dropped.
+//! 1. Iterator State - owned by the engine and must be freed by the kernel when it is done with it.
+//!    The kernel performs this cleanup by using the `free` function pointer associated with the
+//!    containing PlanResult (see [`super::result::CPlanResultWrapper`]). Each `Ffi*Iter` adapter
+//!    takes care of this by embedding `PlanResultCleanup`, which will invoke the `free` function
+//!    pointer when the adapter is dropped.
+//!
+//! 2. Iterator Items - each data item (e.g EngineData, Bytes, FileMeta) yielded by the iterator has
+//!    its own separate lifetime and may have its own memory management rules. However we generally
+//!    use FFI_ArrowArray as a carrier for the item (which internally manages its own release
+//!    callback).
+//!
+//! 3. Item Wrappers (i.e OptionalValue, ExternResult, EngineError) - each yielded item is wrapped
+//!    in an OptionalValue + ExternResult which must also be freed. We expect these to be released
+//!    when the entire iterator is dropped (through the same `PlanResultCleanup` guard that frees
+//!    the iterator state).
+//!
+//! # Safety
+//! The engine is responsible for ensuring that all `state`, `next`, and `free` pointers
+//! are safe to send between threads.
 
 use bytes::Bytes;
 use delta_kernel::arrow::array::ffi::{self as arrow_ffi, FFI_ArrowArray, FFI_ArrowSchema};
-use delta_kernel::arrow::array::{self as arrow_array, Array, BinaryArray};
-use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
+use delta_kernel::arrow::array::{
+    self as arrow_array, Array, BinaryArray, Int64Array, StringArray, StructArray, UInt64Array,
+};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 use delta_kernel::{DeltaResult, EngineData, Error};
 use url::Url;
 
 use super::result::PlanResultCleanup;
-use crate::engine_funcs::FileMeta as CFileMeta;
 use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::plans::result::engine_error_to_kernel;
-use crate::{ExclusiveEngineData, NullableCvoid, OptionalValue, TryFromStringSlice};
+use crate::{ExclusiveEngineData, NullableCvoid, OptionalValue};
 
 // ============================================================================
 // repr(C) iterator types
@@ -41,9 +55,7 @@ use crate::{ExclusiveEngineData, NullableCvoid, OptionalValue, TryFromStringSlic
 
 /// An engine-owned iterator of [`EngineData`] batches.
 ///
-/// Each EngineData batch has its own separate lifetime and must be freed. Once the iterator yields
-/// a batch, the ownership of it is transferred to the Kernel and Kernel is now responsible
-/// for freeing it (this is handled transparently by the `FfiEngineDataIter` adapter).
+/// See module level docs for memory management and safety requirements.
 #[repr(C)]
 pub struct CEngineDataIterator {
     pub state: NullableCvoid,
@@ -53,6 +65,8 @@ pub struct CEngineDataIterator {
 }
 
 /// An engine-owned iterator of byte buffers.
+///
+/// See module level docs for memory management and safety requirements.
 ///
 /// Each byte array is transferred across the FFI boundary as an [`FFI_ArrowArray`].
 /// Invocation of `next` MUST yield an Arrow array that is a `BinaryArray` containing a single
@@ -72,13 +86,17 @@ pub struct CBytesIterator {
 
 /// An engine-owned iterator of [`FileMeta`](delta_kernel::FileMeta) entries.
 ///
-/// Unlike `CEngineDataIterator` and `CBytesIterator`, CFileMeta does not maintain it's own `free`
-/// callback. Instead, we expect the engine to free the entire iterator of FileMeta entries when the
-/// iterator itself is dropped (through the `PlanResultCleanup` guard).
+/// See module level docs for memory management and safety requirements.
+///
+/// Similar to `CBytesIterator`, CFileMetaIterator uses `FFI_ArrowArray`` as a convenient continer
+/// for passing FileMeta entries across the FFI boundary. Each FileMeta is passed as an
+/// a `StructArray` of length 1 whose fields are `{location: Utf8, last_modified: Int64, size:
+/// UInt64}`, all non-null. Kernel assumes this fixed schema when converting into FileMeta (the
+/// schema is NOT passed along through FFI).
 #[repr(C)]
 pub struct CFileMetaIterator {
     pub state: NullableCvoid,
-    pub next: extern "C" fn(state: NullableCvoid) -> OptionalValue<ExternResult<CFileMeta>>,
+    pub next: extern "C" fn(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>>,
 }
 
 // ============================================================================
@@ -121,7 +139,8 @@ impl Iterator for FfiEngineDataIter {
     }
 }
 
-// SAFETY: the engine is expected to provide thread-safe state + free function pointers.
+// # Safety
+// The engine must ensure that all raw pointers sent are Send-safe (see module level docs)
 unsafe impl Send for FfiEngineDataIter {}
 
 /// Provides the Rust `Iterator` trait for [`Bytes`] buffers on top of a [`CBytesIterator`].
@@ -177,7 +196,8 @@ impl Iterator for FfiBytesIter {
     }
 }
 
-// SAFETY: the engine is expected to provide thread-safe state + free function pointers.
+// # Safety
+// The engine must ensure that all raw pointers sent are Send-safe (see module level docs)
 unsafe impl Send for FfiBytesIter {}
 
 /// Provides the Rust `Iterator` trait for [`FileMeta`] entries on top of a
@@ -195,16 +215,67 @@ impl FfiFileMetaIter {
         }
     }
 
-    fn convert_file_meta(raw: CFileMeta) -> DeltaResult<delta_kernel::FileMeta> {
-        let path: &str = unsafe { TryFromStringSlice::try_from_slice(&raw.path) }?;
-        let location = Url::parse(path)?;
-        let size: delta_kernel::FileSize = raw.size.try_into().map_err(|_| {
-            Error::generic("unable to convert CFileMeta.size (usize) to FileMeta.size (u64)")
-        })?;
+    /// The fixed Arrow type expected by [`CFileMetaIterator`]: a non-null struct of
+    /// `{location: Utf8, last_modified: Int64, size: UInt64}`, all non-null.
+    fn arrow_schema() -> DeltaResult<FFI_ArrowSchema> {
+        let schema = ArrowDataType::Struct(Fields::from(vec![
+            ArrowField::new("location", ArrowDataType::Utf8, false),
+            ArrowField::new("last_modified", ArrowDataType::Int64, false),
+            ArrowField::new("size", ArrowDataType::UInt64, false),
+        ]));
+        Ok(FFI_ArrowSchema::try_from(&schema)?)
+    }
+
+    fn arrow_array_to_file_meta(array: FFI_ArrowArray) -> DeltaResult<delta_kernel::FileMeta> {
+        let schema = Self::arrow_schema()?;
+        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
+        let array = arrow_array::make_array(array_data);
+
+        let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() else {
+            return Err(Error::generic(format!(
+                "CFileMetaIterator must yield StructArray, got {:?}",
+                array.data_type()
+            )));
+        };
+        if struct_array.len() != 1 {
+            return Err(Error::generic(format!(
+                "CFileMetaIterator array must contain exactly one row, got {}",
+                struct_array.len()
+            )));
+        }
+
+        // The fixed schema guarantees three columns in this order, all non-null. `from_ffi`
+        // above already validated the per-column data types match what we synthesized, so the
+        // downcasts cannot fail; the `ok_or_else` arms exist only to keep the converter
+        // panic-free.
+        let location_col = struct_array
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::generic("CFileMetaIterator: location column is not Utf8"))?;
+        let last_modified_col = struct_array
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                Error::generic("CFileMetaIterator: last_modified column is not Int64")
+            })?;
+        let size_col = struct_array
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::generic("CFileMetaIterator: size column is not UInt64"))?;
+
+        if location_col.is_null(0) || last_modified_col.is_null(0) || size_col.is_null(0) {
+            return Err(Error::generic(
+                "CFileMetaIterator row must not contain null fields",
+            ));
+        }
+
         Ok(delta_kernel::FileMeta {
-            location,
-            last_modified: raw.last_modified,
-            size,
+            location: Url::parse(location_col.value(0))?,
+            last_modified: last_modified_col.value(0),
+            size: size_col.value(0),
         })
     }
 }
@@ -216,12 +287,15 @@ impl Iterator for FfiFileMetaIter {
         match (self.iter.next)(self.iter.state) {
             OptionalValue::None => None,
             OptionalValue::Some(ExternResult::Err(err)) => Some(Err(engine_error_to_kernel(err))),
-            OptionalValue::Some(ExternResult::Ok(raw)) => Some(Self::convert_file_meta(raw)),
+            OptionalValue::Some(ExternResult::Ok(array)) => {
+                Some(Self::arrow_array_to_file_meta(array))
+            }
         }
     }
 }
 
-// SAFETY: the engine is expected to provide thread-safe state + free function pointers.
+// # Safety
+// The engine must ensure that all raw pointers sent are Send-safe (see module level docs)
 unsafe impl Send for FfiFileMetaIter {}
 
 #[cfg(test)]
@@ -232,7 +306,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use delta_kernel::arrow::array::{ffi as arrow_ffi, BinaryArray, Int32Array, RecordBatch};
+    use delta_kernel::arrow::array::{
+        ffi as arrow_ffi, ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
+        StructArray, UInt64Array,
+    };
     use delta_kernel::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
@@ -244,28 +321,35 @@ mod tests {
 
     // === Shared Test Helpers ===
 
-    type MockIter<T> = Mutex<VecDeque<OptionalValue<ExternResult<T>>>>;
-
-    fn make_iter<T>(items: Vec<OptionalValue<ExternResult<T>>>) -> MockIter<T> {
-        Mutex::new(VecDeque::from(items))
+    struct MockIter<T> {
+        items: Mutex<VecDeque<OptionalValue<ExternResult<T>>>>,
+        cleanup_called: Arc<AtomicBool>,
     }
 
-    fn iter_state<T>(iter: &MockIter<T>) -> NullableCvoid {
-        NonNull::new(iter as *const MockIter<T> as *mut c_void)
+    impl<T> Drop for MockIter<T> {
+        fn drop(&mut self) {
+            let previously_set = self.cleanup_called.swap(true, Ordering::SeqCst);
+            assert!(!previously_set, "MockIter dropped more than once");
+        }
     }
 
-    // A mock cleanup function which sets a flag on an AtomicBool so tests can verify whether drop
-    // was called. Panics if invoked more than once, enforcing the contract that
-    // `PlanResultCleanup` fires `free` exactly once.
-    extern "C" fn set_cleanup_flag(state: NullableCvoid) {
-        let flag = unsafe { &*(state.unwrap().as_ptr() as *const AtomicBool) };
-        let previously_set = flag.swap(true, Ordering::SeqCst);
-        assert!(!previously_set, "set_cleanup_flag invoked more than once");
+    // Makes a mock iterator with the given items and returns the iterator + a cleanup flag for
+    // verifying that the iterator was dropped properly.
+    //
+    // Can be dropped using `free_mock_iter`.
+    fn make_mock_iter<T>(
+        items: Vec<OptionalValue<ExternResult<T>>>,
+    ) -> (Box<MockIter<T>>, Arc<AtomicBool>) {
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        let iter = Box::new(MockIter {
+            items: Mutex::new(VecDeque::from(items)),
+            cleanup_called: Arc::clone(&cleanup_called),
+        });
+        (iter, cleanup_called)
     }
 
-    fn make_cleanup(flag: &AtomicBool) -> PlanResultCleanup {
-        let cleanup_flag_state = NonNull::new(flag as *const AtomicBool as *mut c_void);
-        PlanResultCleanup::new(cleanup_flag_state, set_cleanup_flag)
+    extern "C" fn free_mock_iter<T>(state: NullableCvoid) {
+        let _ = unsafe { Box::from_raw(state.unwrap().as_ptr() as *mut MockIter<T>) };
     }
 
     fn err_ptr(err: &EngineError) -> *mut EngineError {
@@ -289,25 +373,24 @@ mod tests {
 
     #[test]
     fn ffi_engine_data_iter_drains_and_runs_cleanup() {
-        let cleanup_called = AtomicBool::new(false);
         let err = EngineError {
             etype: KernelError::GenericError,
         };
-        let mock_iter = make_iter::<Handle<ExclusiveEngineData>>(vec![
+        let (mock_iter, cleanup_called) = make_mock_iter::<Handle<ExclusiveEngineData>>(vec![
             OptionalValue::Some(ExternResult::Ok(make_data_handle(3))),
             OptionalValue::Some(ExternResult::Err(err_ptr(&err))),
             OptionalValue::Some(ExternResult::Ok(make_data_handle(5))),
         ]);
+        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
 
         extern "C" fn next(
             state: NullableCvoid,
         ) -> OptionalValue<ExternResult<Handle<ExclusiveEngineData>>> {
-            // SAFETY: state aliases a `MockIter<Handle<ExclusiveEngineData>>` borrowed for the
-            // lifetime of the enclosing test.
             let mock_iter = unsafe {
                 &*(state.unwrap().as_ptr() as *const MockIter<Handle<ExclusiveEngineData>>)
             };
             mock_iter
+                .items
                 .lock()
                 .unwrap()
                 .pop_front()
@@ -315,11 +398,8 @@ mod tests {
         }
 
         let mut iter = FfiEngineDataIter::new(
-            CEngineDataIterator {
-                state: iter_state(&mock_iter),
-                next,
-            },
-            make_cleanup(&cleanup_called),
+            CEngineDataIterator { state, next },
+            PlanResultCleanup::new(state, free_mock_iter::<Handle<ExclusiveEngineData>>),
         );
 
         let first = iter.next().expect("first item").expect("first ok");
@@ -355,22 +435,21 @@ mod tests {
 
     #[test]
     fn ffi_bytes_iter_drains_and_runs_cleanup() {
-        let cleanup_called = AtomicBool::new(false);
         let err = EngineError {
             etype: KernelError::GenericError,
         };
-        let mock_iter = make_iter::<FFI_ArrowArray>(vec![
+        let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
             OptionalValue::Some(ExternResult::Ok(make_binary_ffi_array(b"hello"))),
             OptionalValue::Some(ExternResult::Err(err_ptr(&err))),
             OptionalValue::Some(ExternResult::Ok(make_binary_ffi_array(b"world!"))),
         ]);
+        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
 
         extern "C" fn next(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>> {
-            // SAFETY: state aliases a `MockIter<FFI_ArrowArray>` borrowed for the lifetime of the
-            // enclosing test.
             let mock_iter =
                 unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
             mock_iter
+                .items
                 .lock()
                 .unwrap()
                 .pop_front()
@@ -378,11 +457,8 @@ mod tests {
         }
 
         let mut iter = FfiBytesIter::new(
-            CBytesIterator {
-                state: iter_state(&mock_iter),
-                next,
-            },
-            make_cleanup(&cleanup_called),
+            CBytesIterator { state, next },
+            PlanResultCleanup::new(state, free_mock_iter::<FFI_ArrowArray>),
         );
 
         let first = iter.next().expect("first item").expect("first ok");
@@ -403,41 +479,56 @@ mod tests {
 
     // === FfiFileMetaIter Test ===
 
-    /// Helper for building each yielded FileMeta entry
-    fn make_file_meta(path: &'static str, size: usize, last_modified: i64) -> CFileMeta {
-        let path_slice = unsafe { crate::KernelStringSlice::new_unsafe(path) };
-        CFileMeta {
-            path: path_slice,
-            last_modified,
-            size,
-        }
+    /// Helper for building each yielded FileMeta entry. Constructs a single-row `StructArray`
+    /// matching the fixed schema kernel synthesizes in `FfiFileMetaIter::arrow_data_type`.
+    fn make_file_meta_ffi_array(location: &str, last_modified: i64, size: u64) -> FFI_ArrowArray {
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("location", ArrowDataType::Utf8, false)),
+                Arc::new(StringArray::from(vec![location])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    "last_modified",
+                    ArrowDataType::Int64,
+                    false,
+                )),
+                Arc::new(Int64Array::from(vec![last_modified])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("size", ArrowDataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![size])) as ArrayRef,
+            ),
+        ]);
+        let (ffi_array, _ffi_schema) = arrow_ffi::to_ffi(&struct_array.into_data()).unwrap();
+        ffi_array
     }
 
     #[test]
     fn ffi_file_meta_iter_drains_and_runs_cleanup() {
-        let cleanup_called = AtomicBool::new(false);
         let err = EngineError {
             etype: KernelError::GenericError,
         };
-        let mock_iter = make_iter::<CFileMeta>(vec![
-            OptionalValue::Some(ExternResult::Ok(make_file_meta(
+        let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
+            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(
                 "file:///a.parquet",
-                100,
                 1,
+                100,
             ))),
             OptionalValue::Some(ExternResult::Err(err_ptr(&err))),
-            OptionalValue::Some(ExternResult::Ok(make_file_meta(
+            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(
                 "file:///b.parquet",
-                200,
                 2,
+                200,
             ))),
         ]);
+        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
 
-        extern "C" fn next(state: NullableCvoid) -> OptionalValue<ExternResult<CFileMeta>> {
-            // SAFETY: state aliases a `MockIter<CFileMeta>` borrowed for the lifetime of the
-            // enclosing test.
-            let mock_iter = unsafe { &*(state.unwrap().as_ptr() as *const MockIter<CFileMeta>) };
+        extern "C" fn next(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>> {
+            let mock_iter =
+                unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
             mock_iter
+                .items
                 .lock()
                 .unwrap()
                 .pop_front()
@@ -445,25 +536,22 @@ mod tests {
         }
 
         let mut iter = FfiFileMetaIter::new(
-            CFileMetaIterator {
-                state: iter_state(&mock_iter),
-                next,
-            },
-            make_cleanup(&cleanup_called),
+            CFileMetaIterator { state, next },
+            PlanResultCleanup::new(state, free_mock_iter::<FFI_ArrowArray>),
         );
 
         let first = iter.next().expect("first item").expect("first ok");
         assert_eq!(first.location.as_str(), "file:///a.parquet");
-        assert_eq!(first.size, 100);
         assert_eq!(first.last_modified, 1);
+        assert_eq!(first.size, 100);
 
         let second = iter.next().expect("second item");
         assert!(second.is_err(), "second item should be Err");
 
         let third = iter.next().expect("third item").expect("third ok");
         assert_eq!(third.location.as_str(), "file:///b.parquet");
-        assert_eq!(third.size, 200);
         assert_eq!(third.last_modified, 2);
+        assert_eq!(third.size, 200);
 
         assert!(iter.next().is_none(), "iterator should be exhausted");
         assert!(!cleanup_called.load(Ordering::SeqCst));
