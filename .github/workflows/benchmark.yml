@@ -18,8 +18,10 @@
 #   job is read-only even under pull_request_target (which would otherwise
 #   hand out a full-scope token in the base-branch context). Do not add
 #   other secrets to that job and do not grant additional permissions.
-# - The Swatinem/rust-cache `save-if: github.ref == 'refs/heads/main'`
-#   guard MUST stay; without it a malicious PR could poison the main cache.
+# - The Swatinem/rust-cache `save-if` guard MUST stay restricted to push
+#   events on main. This workflow has no `push` trigger, so it never writes
+#   the cache; that is what prevents a malicious PR from poisoning it. Do
+#   not relax the `github.event_name == 'push'` clause.
 # - `post-comment` and `post-failure-comment` only touch the markdown
 #   artifact (string data) and run pinned-by-SHA actions. They never check
 #   out PR code.
@@ -35,13 +37,6 @@ name: Benchmarking PR performance
 # Start from an empty default; each job opts into the minimum scopes it needs.
 # Adding a new job without thinking about permissions inherits zero, not full.
 permissions: {}
-
-# Safe because Criterion baselines live under benchmarks/target/ (not cached) so a mid-run cancel
-# can't leave poisoned state. Group key falls back to the merge_group head ref
-# when neither PR-number field is populated (merge queue events).
-concurrency:
-  group: bench-${{ github.event.pull_request.number || github.event.issue.number || github.event.merge_group.head_ref }}
-  cancel-in-progress: true
 
 jobs:
   bench-merge-queue-noop:
@@ -62,6 +57,11 @@ jobs:
       (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
       || (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
           (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench ')))
+    # Job-level (not workflow-level) so unrelated PR comments don't join the
+    # group and cancel an in-flight bench via cancel-in-progress.
+    concurrency:
+      group: bench-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: read
