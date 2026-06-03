@@ -269,6 +269,14 @@ Keep this list updated when new protocol features are added to kernel.
   Reserve `StructField::new` for cases where nullability is a runtime value.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
+- Prefer the free constructors `col(name)` and `lit(value)` over
+  `Expression::column(...)` / `Expression::literal(...)` when building expressions
+  inline. Use `col(["a", "b"])` for explicit multi-segment paths (segments are
+  taken as-is, no dot-splitting). When the path is a known string literal that
+  should be split on dots, use the compile-time `column_expr!("a.b")` /
+  `column_name!("a.b")` macros instead. Chain `.to_json()` for the
+  `Unary(ToJson, _)` pattern and the standard `+ - * /` operators for binary
+  arithmetic on `Expression`.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 

@@ -10,9 +10,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{
-    BinaryExpressionOp, Expression, ExpressionRef, ExpressionStructPatch, Scalar,
-};
+use crate::expressions::{col, lit, Expression, ExpressionRef, ExpressionStructPatch, Scalar};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
@@ -144,12 +142,8 @@ pub(crate) fn get_transform_expr(
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
                 let expr = Arc::new(Expression::coalesce([
-                    Expression::column([field_name]),
-                    Expression::binary(
-                        BinaryExpressionOp::Plus,
-                        Expression::literal(base_row_id),
-                        Expression::column([row_index_field_name]),
-                    ),
+                    col(field_name),
+                    lit(base_row_id) + col(row_index_field_name),
                 ]));
                 patch.with_replaced_field(field_name.clone(), expr)
             }
@@ -179,10 +173,7 @@ pub(crate) fn get_transform_expr(
                     // This ensures consistent column ordering across file types
                     patch = patch
                         .with_dropped_field(physical_name.clone())
-                        .with_inserted_field(
-                            insert_after.clone(),
-                            Arc::new(Expression::column([physical_name.clone()])),
-                        );
+                        .with_inserted_field(insert_after.clone(), col(physical_name));
                     patch
                 } else {
                     // Column doesn't exist physically - treat as partition column
@@ -368,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_get_transform_expr_static_transforms() {
-        let expr = Arc::new(Expression::literal(42));
+        let expr = Arc::new(lit(42));
         let transform_spec = vec![
             FieldTransformSpec::StaticInsert {
                 insert_after: Some("col1".to_string()),
@@ -595,12 +586,8 @@ mod tests {
         assert!(row_id_patch.is_replace);
 
         let expeceted_expr = Arc::new(Expression::coalesce([
-            Expression::column(["row_id_col"]),
-            Expression::binary(
-                BinaryExpressionOp::Plus,
-                Expression::literal(4i64),
-                Expression::column(["row_index_col"]),
-            ),
+            col("row_id_col"),
+            lit(4i64) + col("row_index_col"),
         ]));
         assert_eq!(row_id_patch.exprs.len(), 1);
         let expr = &row_id_patch.exprs[0];

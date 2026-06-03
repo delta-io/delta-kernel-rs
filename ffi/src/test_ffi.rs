@@ -113,19 +113,16 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
 
     let nested_patch = ExpressionStructPatch::new_top_level()
         .with_dropped_field("gone")
-        .with_replaced_field("stub", Expr::literal("replaced").into())
-        .with_inserted_field(Some("x".to_string()), Expr::literal(true).into())
-        .with_inserted_field(Some("y".to_string()), Expr::literal(false).into());
+        .with_replaced_field("stub", Expr::literal("replaced"))
+        .with_inserted_field(Some("x".to_string()), Expr::literal(true))
+        .with_inserted_field(Some("y".to_string()), Expr::literal(false));
     let top_level_patch = ExpressionStructPatch::new_nested(column_name!("foo.bar.baz"))
         .with_dropped_field("dropme")
-        .with_replaced_field("replaceme", Expr::literal(42).into())
-        .with_inserted_field(None::<&str>, Expr::literal("prepended").into())
-        .with_inserted_field(Some("a".to_string()), Expr::literal("first").into())
-        .with_inserted_field(
-            Some("a".to_string()),
-            Expr::struct_patch(nested_patch).into(),
-        )
-        .with_inserted_field(Some("a".to_string()), Expr::literal("third").into());
+        .with_replaced_field("replaceme", Expr::literal(42))
+        .with_inserted_field(None::<&str>, Expr::literal("prepended"))
+        .with_inserted_field(Some("a".to_string()), Expr::literal("first"))
+        .with_inserted_field(Some("a".to_string()), Expr::struct_patch(nested_patch))
+        .with_inserted_field(Some("a".to_string()), Expr::literal("third"));
 
     let mut sub_exprs = vec![
         column_expr!("col"),

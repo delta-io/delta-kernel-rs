@@ -16,7 +16,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::ADD_NAME;
-use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatch, UnaryExpressionOp};
+use crate::expressions::{col, Expression, ExpressionRef, ExpressionStructPatch};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
@@ -212,11 +212,8 @@ pub(crate) fn build_checkpoint_output_schema(
 /// ["add", "stats"] instead of just ["stats"].
 fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
-        Expression::parse_json(
-            Expression::column([ADD_NAME, STATS_FIELD]),
-            stats_schema.clone(),
-        ),
+        col([ADD_NAME, STATS_PARSED_FIELD]),
+        Expression::parse_json(col([ADD_NAME, STATS_FIELD]), stats_schema.clone()),
     ]))
 }
 
@@ -233,8 +230,8 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// `["add", "partitionValues"]` instead of just `["partitionValues"]`.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
-        Expression::map_to_struct(Expression::column([ADD_NAME, PARTITION_VALUES_FIELD])),
+        col([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
+        Expression::map_to_struct(col([ADD_NAME, PARTITION_VALUES_FIELD])),
     ]))
 }
 
@@ -245,11 +242,8 @@ fn build_partition_values_parsed_expr() -> ExpressionRef {
 /// ["add", "stats"] instead of just ["stats"].
 static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, STATS_FIELD]),
-        Expression::unary(
-            UnaryExpressionOp::ToJson,
-            Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
-        ),
+        col([ADD_NAME, STATS_FIELD]),
+        col([ADD_NAME, STATS_PARSED_FIELD]).to_json(),
     ]))
 });
 

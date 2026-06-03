@@ -25,7 +25,7 @@ use crate::engine_data::{
 };
 use crate::error::Error;
 use crate::expressions::{
-    column_name, ArrayData, ColumnName, ExpressionStructPatch, Scalar, StructData,
+    col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch, Scalar, StructData,
 };
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
@@ -478,10 +478,7 @@ impl<S> Transaction<S> {
         // expect only the scan row schema fields.
         let with_new_dv_expr = Expression::struct_patch(
             ExpressionStructPatch::new_top_level()
-                .with_replaced_field(
-                    "deletionVector",
-                    Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
-                )
+                .with_replaced_field("deletionVector", col(NEW_DELETION_VECTOR_NAME))
                 .with_dropped_field(NEW_DELETION_VECTOR_NAME),
         );
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
@@ -495,10 +492,8 @@ impl<S> Transaction<S> {
             nullable_restored_add_schema().clone().into(),
         )?;
         let with_data_change_expr = Arc::new(Expression::struct_from([Expression::struct_patch(
-            ExpressionStructPatch::new_nested(["add"]).with_inserted_field(
-                Some("modificationTime"),
-                Expression::literal(self.data_change).into(),
-            ),
+            ExpressionStructPatch::new_nested(["add"])
+                .with_inserted_field(Some("modificationTime"), lit(self.data_change)),
         )]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(
             nullable_restored_add_schema().clone(),

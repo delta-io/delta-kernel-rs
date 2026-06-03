@@ -14,7 +14,7 @@ use crate::actions::{
     METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
-use crate::expressions::ColumnName;
+use crate::expressions::{col, ColumnName};
 use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -28,8 +28,8 @@ use crate::schema::compare::SchemaComparison;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
+    Version,
 };
 
 mod crc_replay;
@@ -146,9 +146,7 @@ fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> 
         .fields()
         .map(|f| action_identifying_column(f.name()))
         .collect::<Option<_>>()?;
-    let mut predicates = columns
-        .into_iter()
-        .map(|col| Expression::column(col).is_not_null());
+    let mut predicates = columns.into_iter().map(|name| col(name).is_not_null());
     let first = predicates.next()?;
     Some(Arc::new(predicates.fold(first, Predicate::or)))
 }

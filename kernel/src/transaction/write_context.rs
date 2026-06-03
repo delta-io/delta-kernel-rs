@@ -303,7 +303,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::Expression;
+    use crate::expressions::lit;
     use crate::schema::{DataType, StructField, StructType};
 
     fn make_write_context(
@@ -321,7 +321,7 @@ mod tests {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             logical_schema: schema.clone(),
             physical_schema: schema.clone(),
-            logical_to_physical: Arc::new(Expression::literal(true)),
+            logical_to_physical: Arc::new(lit(true)),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,

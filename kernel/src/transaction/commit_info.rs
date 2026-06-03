@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::Transaction;
 use crate::actions::{get_log_commit_info_schema, CommitInfo, COMMIT_INFO_NAME};
-use crate::expressions::{ExpressionStructPatch, MapData, Scalar};
+use crate::expressions::{lit, ExpressionStructPatch, MapData, Scalar};
 use crate::schema::{MapType, StructField, StructType, ToSchema};
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
 
@@ -15,44 +15,28 @@ fn commit_info_literal_exprs(
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
     let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let literal_exprs = vec![
-        (
-            "timestamp",
-            Arc::new(Expression::literal(commit_info.timestamp)),
-        ),
+        ("timestamp", Arc::new(lit(commit_info.timestamp))),
         (
             "inCommitTimestamp",
-            Arc::new(Expression::literal(commit_info.in_commit_timestamp)),
+            Arc::new(lit(commit_info.in_commit_timestamp)),
         ),
-        (
-            "operation",
-            Arc::new(Expression::literal(commit_info.operation)),
-        ),
+        ("operation", Arc::new(lit(commit_info.operation))),
         (
             "operationParameters",
-            Arc::new(Expression::literal(
-                match commit_info.operation_parameters {
-                    Some(map) => Scalar::Map(MapData::try_new(
-                        op_params_map_type,
-                        map.into_iter()
-                            .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
-                    )?),
-                    None => Scalar::Null(DataType::Map(Box::new(op_params_map_type))),
-                },
-            )),
+            match commit_info.operation_parameters {
+                Some(map) => lit(Scalar::Map(MapData::try_new(
+                    op_params_map_type,
+                    map.into_iter()
+                        .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
+                )?))
+                .into(),
+                None => lit(Scalar::Null(DataType::Map(Box::new(op_params_map_type)))).into(),
+            },
         ),
-        (
-            "kernelVersion",
-            Arc::new(Expression::literal(commit_info.kernel_version)),
-        ),
-        (
-            "isBlindAppend",
-            Arc::new(Expression::literal(commit_info.is_blind_append)),
-        ),
-        (
-            "engineInfo",
-            Arc::new(Expression::literal(commit_info.engine_info)),
-        ),
-        ("txnId", Arc::new(Expression::literal(commit_info.txn_id))),
+        ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
+        ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),
+        ("engineInfo", Arc::new(lit(commit_info.engine_info))),
+        ("txnId", Arc::new(lit(commit_info.txn_id))),
     ];
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
