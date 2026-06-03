@@ -14,7 +14,9 @@ use std::sync::{Arc, LazyLock};
 use tracing::{instrument, warn};
 
 use super::LogSegment;
-use crate::actions::visitors::{visit_metadata_at, visit_protocol_at};
+use crate::actions::visitors::{
+    visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
+};
 use crate::actions::{
     DomainMetadata, Metadata, Protocol, SetTransaction, ADD_NAME, COMMIT_INFO_NAME,
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
@@ -335,11 +337,6 @@ const COL_TXN_VERSION: usize = 10;
 const COL_TXN_LAST_UPDATED: usize = 11;
 const N_FIXED_COLS: usize = COL_TXN_LAST_UPDATED + 1;
 
-static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
-    LazyLock::new(|| Protocol::to_schema().leaves(PROTOCOL_NAME));
-static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
-    LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
-
 /// Thin shim that pulls leaf values from `getters` and forwards them to the accumulator's
 /// `on_*` methods. All behavior lives in [`CrcReplayAccumulator`].
 struct CrcReplayVisitor<'a> {
@@ -431,16 +428,12 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             }
 
             if self.acc.delta.protocol.is_none() {
-                let cols = &getters[N_FIXED_COLS..N_FIXED_COLS + n_protocol_leaves];
-                if let Some(p) = visit_protocol_at(i, cols)? {
-                    self.acc.delta.protocol = Some(p);
-                }
+                self.acc.delta.protocol =
+                    visit_protocol_at(i, &getters[N_FIXED_COLS..N_FIXED_COLS + n_protocol_leaves])?;
             }
             if self.acc.delta.metadata.is_none() {
-                let cols = &getters[N_FIXED_COLS + n_protocol_leaves..];
-                if let Some(m) = visit_metadata_at(i, cols)? {
-                    self.acc.delta.metadata = Some(m);
-                }
+                self.acc.delta.metadata =
+                    visit_metadata_at(i, &getters[N_FIXED_COLS + n_protocol_leaves..])?;
             }
         }
         Ok(())
