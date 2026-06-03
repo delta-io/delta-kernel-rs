@@ -98,16 +98,19 @@ def main():
                 chg_ms      = to_ms(chg_p[0],  chg_p[2])
                 chg_err_ms  = to_ms(chg_p[1],  chg_p[2])
 
-                ratio = chg_ms / base_ms
-                if abs(ratio - 1.0) < 1e-9:
-                    difference = '1.00x'
-                elif ratio > 1:
-                    difference = f'{ratio:.2f}x slower'
+                if base_ms == 0 or chg_ms == 0:
+                    difference = 'N/A'
                 else:
-                    difference = f'{1.0 / ratio:.2f}x faster'
+                    ratio = chg_ms / base_ms
+                    if abs(ratio - 1.0) < 1e-9:
+                        difference = '1.00x'
+                    elif ratio > 1:
+                        difference = f'{ratio:.2f}x slower'
+                    else:
+                        difference = f'{1.0 / ratio:.2f}x faster'
 
-                if is_significant(chg_ms, chg_err_ms, base_ms, base_err_ms):
-                    difference = f'**{difference}**'
+                    if is_significant(chg_ms, chg_err_ms, base_ms, base_err_ms):
+                        difference = f'**{difference}**'
 
         print(f'| {name} | {base_display} | {chg_display} | {difference} |')
 
