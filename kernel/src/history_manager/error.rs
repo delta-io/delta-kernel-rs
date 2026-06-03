@@ -76,10 +76,7 @@ pub enum LogHistoryError {
         /// `NearestTimestamp::Earliest(100)`.
         nearest_timestamp: NearestTimestamp,
     },
-    /// The log directory contains no commit files. Either the directory is empty or it
-    /// contains only checkpoint files. Returned by [`get_earliest_recreatable_commit`].
-    ///
-    /// [`get_earliest_recreatable_commit`]: super::get_earliest_recreatable_commit
+    /// The log directory contains no commit files.
     #[error("No commit files found at {log_root}")]
     NoCommitsFound {
         /// The log root URL that was scanned.
@@ -87,9 +84,6 @@ pub enum LogHistoryError {
     },
     /// Commit files exist in the log but the table cannot be reconstructed: commit version 0
     /// is missing and no complete checkpoint is present to anchor the surviving commits.
-    /// Returned by [`get_earliest_recreatable_commit`].
-    ///
-    /// [`get_earliest_recreatable_commit`]: super::get_earliest_recreatable_commit
     #[error(
         "No recreatable commits found at {log_root}: commits exist but version 0 is missing \
          and no complete checkpoint is present"
