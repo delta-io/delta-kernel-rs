@@ -3,7 +3,8 @@
 //! unchanged.
 //!
 //! ```ignore
-//! let engine: Arc<dyn Engine> = Arc::new(MeteredDeltaEngine::new(MyEngine::build()?));
+//! let inner: Arc<dyn Engine> = Arc::new(MyEngine::build()?);
+//! let engine: Arc<dyn Engine> = Arc::new(MeteredDeltaEngine::new(inner));
 //! ```
 
 use std::sync::Arc;
@@ -12,15 +13,15 @@ use crate::metrics::MeteredStorageHandler;
 use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
 /// Decorator over any [`Engine`] that meters its storage handler. See module docs.
-pub struct MeteredDeltaEngine<E: Engine> {
-    inner: E,
+pub struct MeteredDeltaEngine {
+    inner: Arc<dyn Engine>,
     storage: Arc<dyn StorageHandler>,
 }
 
-impl<E: Engine> MeteredDeltaEngine<E> {
+impl MeteredDeltaEngine {
     /// Wrap `inner`. Debug-asserts that `inner`'s storage handler is not already
     /// metered, so the resulting engine emits each storage span exactly once.
-    pub fn new(inner: E) -> Self {
+    pub fn new(inner: Arc<dyn Engine>) -> Self {
         let inner_storage = inner.storage_handler();
         debug_assert!(
             !inner_storage.any_ref().is::<MeteredStorageHandler>(),
@@ -32,15 +33,13 @@ impl<E: Engine> MeteredDeltaEngine<E> {
     }
 }
 
-impl<E: Engine + std::fmt::Debug> std::fmt::Debug for MeteredDeltaEngine<E> {
+impl std::fmt::Debug for MeteredDeltaEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MeteredDeltaEngine")
-            .field("inner", &self.inner)
-            .finish()
+        f.debug_struct("MeteredDeltaEngine").finish_non_exhaustive()
     }
 }
 
-impl<E: Engine> Engine for MeteredDeltaEngine<E> {
+impl Engine for MeteredDeltaEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.inner.evaluation_handler()
     }
@@ -159,7 +158,7 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(Arc::clone(&reporter) as _);
 
-        let engine = MeteredDeltaEngine::new(StubEngine::new());
+        let engine = MeteredDeltaEngine::new(Arc::new(StubEngine::new()));
         let url = Url::parse("memory:///_delta_log/").unwrap();
         let iter = engine.storage_handler().list_from(&url).unwrap();
         let _: Vec<_> = iter.collect();
@@ -178,7 +177,7 @@ mod tests {
 
     #[test]
     fn other_handlers_pass_through() {
-        let inner = StubEngine::new();
+        let inner: Arc<dyn Engine> = Arc::new(StubEngine::new());
         let inner_eval = inner.evaluation_handler();
         let inner_json = inner.json_handler();
         let inner_parquet = inner.parquet_handler();
@@ -213,6 +212,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "storage_handler is already a MeteredStorageHandler")]
     fn new_panics_when_inner_already_metered() {
-        let _ = MeteredDeltaEngine::new(AlreadyMeteredEngine(StubEngine::new()));
+        let _ = MeteredDeltaEngine::new(Arc::new(AlreadyMeteredEngine(StubEngine::new())));
     }
 }

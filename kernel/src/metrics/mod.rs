@@ -72,8 +72,9 @@
 pub(crate) mod events;
 mod metered_engine;
 mod metered_storage;
+mod precounted_metrics_iterator;
 pub(crate) mod reporter;
-mod storage_iterator;
+mod streaming_metrics_iterator;
 
 use std::sync::Arc;
 
@@ -86,8 +87,9 @@ pub use events::{
 };
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_storage::MeteredStorageHandler;
+pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
-pub(crate) use storage_iterator::{emit_storage_span, MetricsIterator};
+pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;

@@ -1,63 +1,16 @@
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Instant;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
-use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::events::{StorageCopyCompleted, StorageListCompleted, StorageReadCompleted};
-use crate::metrics::{emit_storage_span, MetricsIterator};
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
-
-// Async `Stream` impls for the shared `MetricsIterator`. They live in this file rather
-// than next to the struct because `futures` is an optional dep gated on the default-engine
-// feature; the sync `Iterator` impls (always available) live in `metrics::storage_iterator`.
-
-impl<I> Stream for MetricsIterator<I, FileMeta>
-where
-    I: Stream<Item = DeltaResult<FileMeta>> + Unpin,
-{
-    type Item = I::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-            Some(item) => {
-                if item.is_ok() {
-                    self.record_file();
-                }
-                Poll::Ready(Some(item))
-            }
-            None => Poll::Ready(None),
-        }
-    }
-}
-
-impl<I> Stream for MetricsIterator<I, Bytes>
-where
-    I: Stream<Item = DeltaResult<Bytes>> + Unpin,
-{
-    type Item = I::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-            Some(item) => {
-                if let Ok(ref bytes) = item {
-                    self.record_bytes(bytes.len() as u64);
-                }
-                Poll::Ready(Some(item))
-            }
-            None => Poll::Ready(None),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -83,13 +36,17 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     }
 }
 
-/// Native async implementation for list_from
+/// Native async implementation for list_from.
+///
+/// Storage metrics are emitted by the outer [`MeteredStorageHandler`] wrapping this
+/// handler (e.g. inside `DefaultEngine`'s `storage_handler()`), so this function just
+/// returns the raw stream.
+///
+/// [`MeteredStorageHandler`]: crate::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
-    let start = Instant::now();
-
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
     // directory-like, because it strips trailing /, so we're reduced to manually checking the
@@ -126,16 +83,10 @@ async fn list_from_impl(
         // Local filesystem doesn't return sorted list - need to collect and sort
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
-        // Wrap in MetricsIterator so the metric fires in Drop on the caller's thread
-        // (not here on the background thread where no tracing subscriber is installed).
-        let stream = MetricsIterator::new(
-            stream::iter(items.into_iter().map(Ok::<FileMeta, crate::Error>)),
-            StorageListCompleted::NAME,
-            start,
-        );
-        Ok(Box::pin(stream))
+        Ok(Box::pin(stream::iter(
+            items.into_iter().map(Ok::<FileMeta, crate::Error>),
+        )))
     } else {
-        let stream = MetricsIterator::new(stream, StorageListCompleted::NAME, start);
         Ok(Box::pin(stream))
     }
 }
@@ -146,7 +97,6 @@ async fn read_files_impl(
     files: Vec<FileSlice>,
     readahead: usize,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
-    let start = Instant::now();
     let files = stream::iter(files).map(move |(url, range)| {
         let store = store.clone();
         async move {
@@ -177,11 +127,7 @@ async fn read_files_impl(
 
     // We allow executing up to `readahead` futures concurrently and
     // buffer the results. This allows us to achieve async concurrency.
-    Ok(Box::pin(MetricsIterator::new(
-        files.buffered(readahead),
-        StorageReadCompleted::NAME,
-        start,
-    )))
+    Ok(Box::pin(files.buffered(readahead)))
 }
 
 /// Native async implementation for copy_atomic
@@ -190,21 +136,17 @@ async fn copy_atomic_impl(
     src_path: Path,
     dest_path: Path,
 ) -> DeltaResult<()> {
-    let start = Instant::now();
-
     // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
     // necessarily atomic, but since the source file is immutable, we aren't exposed to the
     // possibility of source file changing while we do the PUT.
     let data = store.get(&src_path).await?.bytes().await?;
-    let result = store
+    store
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
-        .await;
-    emit_storage_span(StorageCopyCompleted::NAME, start.elapsed(), 0, 0);
-
-    result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
-        e => e.into(),
-    })?;
+        .await
+        .map_err(|e| match e {
+            object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
+            e => e.into(),
+        })?;
     Ok(())
 }
 
