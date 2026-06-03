@@ -12,5 +12,4 @@ pub mod nodes;
 pub mod operation;
 pub mod plan;
 
-pub use nodes::ScanFile;
 pub use operation::{IoOperation, Operation, QueryPlan, QueryPlanNode};

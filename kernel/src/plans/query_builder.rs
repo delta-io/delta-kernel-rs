@@ -1,7 +1,6 @@
 //! Builder API for constructing a [`QueryPlan`].
 
 use super::ir::QueryPlanNode;
-use super::ir::ScanFile;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileMeta, PredicateRef, QueryPlan};
 
@@ -25,8 +24,7 @@ impl QueryPlanBuilder {
     ) -> Self {
         Self {
             node: QueryPlanNode::ScanJson {
-                files: files.into_iter().map(ScanFile::from).collect(),
-                file_constant_columns: Vec::new(),
+                files,
                 physical_schema,
                 predicate,
             },
@@ -43,8 +41,7 @@ impl QueryPlanBuilder {
     ) -> Self {
         Self {
             node: QueryPlanNode::ScanParquet {
-                files: files.into_iter().map(ScanFile::from).collect(),
-                file_constant_columns: Vec::new(),
+                files,
                 physical_schema,
                 predicate,
             },
@@ -101,21 +98,13 @@ mod tests {
 
         let QueryPlanNode::ScanParquet {
             files: scan_files,
-            file_constant_columns,
             physical_schema,
             predicate,
         } = node
         else {
             panic!("expected ScanParquet, got {node:?}");
         };
-        assert_eq!(
-            scan_files
-                .into_iter()
-                .map(|f| f.meta)
-                .collect::<Vec<_>>(),
-            files
-        );
-        assert!(file_constant_columns.is_empty());
+        assert_eq!(scan_files, files);
         assert!(Arc::ptr_eq(&physical_schema, &schema));
         assert!(predicate.is_none());
     }
@@ -131,21 +120,13 @@ mod tests {
 
         let QueryPlanNode::ScanJson {
             files: scan_files,
-            file_constant_columns,
             physical_schema,
             predicate,
         } = node
         else {
             panic!("expected ScanJson, got {node:?}");
         };
-        assert_eq!(
-            scan_files
-                .into_iter()
-                .map(|f| f.meta)
-                .collect::<Vec<_>>(),
-            files
-        );
-        assert!(file_constant_columns.is_empty());
+        assert_eq!(scan_files, files);
         assert!(Arc::ptr_eq(&physical_schema, &schema));
         assert!(predicate.is_none());
     }

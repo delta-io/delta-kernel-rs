@@ -53,14 +53,14 @@ pub struct PlanNode {
 /// A `Plan` has at least one node. The **terminal node** is always the
 /// last entry in `nodes`: it is the only node whose `output` no other node lists in
 /// `inputs`, and `Plan::result()` returns that node's `output` RefId -- the value the
-/// engine streams to the caller. 
-/// 
+/// engine streams to the caller.
+///
 /// # Execution
-/// 
+///
 /// Because `nodes` is topologically sorted, an engine can evaluate the nodes in
-/// the order specified in `nodes`.  Each node's inputs are guaranteed bound by
+/// the order specified in `nodes`. Each node's inputs are guaranteed bound by
 /// the time the node is evaluated.
-/// 
+///
 /// For the best performance, connectors are encouraged to run kernel-produced
 /// plans through their query optimizer before execution (e.g. to fold adjacent
 /// filters, merge scans over the same files, or choose physical join and scan

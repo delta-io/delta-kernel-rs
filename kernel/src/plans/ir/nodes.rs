@@ -84,18 +84,18 @@ impl From<FileMeta> for ScanFile {
 ///
 /// 1. **Metadata columns** -- if the field is annotated as a metadata column (e.g. via
 ///    [`StructField::create_metadata_column`] with [`MetadataColumnSpec::RowIndex`], or the
-///    reserved [`FILE_NAME`] field ID), the engine populates it from the read context rather
-///    than from the Parquet file. See [Metadata columns] below.
+///    reserved [`FILE_NAME`] field ID), the engine populates it from the read context rather than
+///    from the Parquet file. See [Metadata columns] below.
 /// 2. **File-constant columns** -- if the field's name appears in [`Self::file_constant_columns`],
 ///    the engine broadcasts the corresponding entry from [`ScanFile::file_constants`] for the file
 ///    being read (not from Parquet bytes). See [File-constant columns] below.
-/// 3. **Data columns** -- otherwise the engine attempts to locate the field in the Parquet
-///    file, in this order:
+/// 3. **Data columns** -- otherwise the engine attempts to locate the field in the Parquet file, in
+///    this order:
 ///    - **Field ID**: if the field carries a Parquet field ID via
-///      [`ColumnMetadataKey::ParquetFieldId`] metadata, match it against the Parquet column
-///      with the same field id.
-///    - **Field name**: otherwise, or if no Parquet column has the requested field id, fall
-///      back to matching by column name.
+///      [`ColumnMetadataKey::ParquetFieldId`] metadata, match it against the Parquet column with
+///      the same field id.
+///    - **Field name**: otherwise, or if no Parquet column has the requested field id, fall back to
+///      matching by column name.
 ///
 ///    If no Parquet column matches, the output column is filled with NULLs when the field is
 ///    nullable, or an error is returned when it is non-nullable.
@@ -176,8 +176,8 @@ impl From<FileMeta> for ScanFile {
 /// # Invariants
 ///
 /// - `files[i].file_constants.len() == file_constant_columns.len()` for every `i`.
-/// - Every name in `file_constant_columns` resolves to a field in `schema` that is not a
-///   metadata column.
+/// - Every name in `file_constant_columns` resolves to a field in `schema` that is not a metadata
+///   column.
 /// - Each scalar in `file_constants` is compatible with its schema field's type.
 #[derive(Debug, Clone)]
 pub struct ScanParquet {
@@ -337,7 +337,8 @@ pub struct LoadColumnFileMeta {
     pub path_column: ColumnName,
     /// Column with the file's total size in bytes. This may be NULL on any given row.
     pub file_size_column: ColumnName,
-    /// Column with the file's row-count, parquet-encoded `numRecords`. This may be NULL on any given row.
+    /// Column with the file's row-count, parquet-encoded `numRecords`. This may be NULL on any
+    /// given row.
     pub num_records_column: ColumnName,
 }
 
@@ -503,9 +504,10 @@ pub struct MaxByVersion {
     pub output_schema: SchemaRef,
 }
 
-/// Performs a semi join between two inputs (`inputs.len() == 2`, convention `[probe, build]`) and emits a
-/// subset of probe rows -- a SQL `SEMI JOIN` (`inverted = false`) or `ANTI JOIN` (`inverted = true`).
-/// The build side filters but never contributes columns; output schema is the same as the probe input's schema.
+/// Performs a semi join between two inputs (`inputs.len() == 2`, convention `[probe, build]`) and
+/// emits a subset of probe rows -- a SQL `SEMI JOIN` (`inverted = false`) or `ANTI JOIN` (`inverted
+/// = true`). The build side filters but never contributes columns; output schema is the same as the
+/// probe input's schema.
 ///
 /// # Example
 ///
@@ -536,7 +538,6 @@ pub struct SemiJoin {
     pub probe_keys: Vec<ColumnName>,
     pub build_keys: Vec<ColumnName>,
 }
-
 
 /// Concatenates N input relations into a single relation. All input schemas must agree.
 ///
