@@ -606,7 +606,6 @@ impl TableConfiguration {
                 check(&self.protocol, &self.table_properties, operation)?;
             }
         };
-
         self.validate_feature_requirements(feature)
     }
 
@@ -1783,6 +1782,25 @@ mod test {
             ],
         );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    // A catalog-managed table requires inCommitTimestamp to be enabled.
+    #[rstest]
+    #[case::catalog_managed(
+        TableFeature::CatalogManaged,
+        "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"
+    )]
+    #[case::catalog_owned_preview(
+        TableFeature::CatalogOwnedPreview,
+        "Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled"
+    )]
+    fn test_catalog_managed_requires_in_commit_timestamp(
+        #[case] feature: TableFeature,
+        #[case] expected_error: &str,
+    ) {
+        let config = create_mock_table_config(&[], &[feature]);
+        let result = config.ensure_operation_supported(Operation::Write);
+        assert_result_error_with_message(result, expected_error);
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization
