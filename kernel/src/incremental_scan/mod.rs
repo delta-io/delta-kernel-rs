@@ -203,8 +203,7 @@ impl IncrementalScanStream {
     /// data structure they prefer.
     ///
     /// # Errors
-    /// - [`Error::IOError`], `Error::ObjectStore`, or `Error::Reqwest` (the latter two require
-    ///   `default-engine-base`) on transient I/O while
+    /// - [`Error::IOError`], [`Error::ObjectStore`], or [`Error::Reqwest`] on transient I/O while
     ///   reading commit JSONs. Retryable by rebuilding the stream.
     /// - [`Error::FileNotFound`] if a commit was vacuumed between [`IncrementalScanBuilder::build`]
     ///   and stream consumption. Rebuilding will likely return `Ok(None)` (commits unavailable);

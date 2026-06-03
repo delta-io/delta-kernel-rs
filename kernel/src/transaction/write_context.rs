@@ -46,16 +46,18 @@ pub(super) struct SharedWriteState {
 /// (serialized partition values with physical column names as keys). How you use a
 /// `WriteContext` depends on your engine:
 ///
-/// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet` (requires
-///   `default-engine-base`), which handles everything (transform, write, partition metadata).
-/// - **Arrow-based custom engines**: write parquet yourself, then call `build_add_file_metadata`
-///   (requires `default-engine-base`) with the resulting `DataFileMetadata` and this
-///   `WriteContext` to produce the Add action `EngineData` for [`Transaction::add_files`].
+/// - **`DefaultEngine` consumers**: pass this to [`DefaultEngine::write_parquet`], which handles
+///   everything (transform, write, partition metadata).
+/// - **Arrow-based custom engines**: write parquet yourself, then call [`build_add_file_metadata`]
+///   with the resulting `DataFileMetadata` and this `WriteContext` to produce the Add action
+///   `EngineData` for [`Transaction::add_files`].
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
 /// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
 /// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
+/// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+/// [`build_add_file_metadata`]: crate::engine::default::build_add_file_metadata
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: WriteContext::physical_partition_values
 #[derive(Debug)]
@@ -106,10 +108,10 @@ impl WriteContext {
     ///    file, pass the full (still-encoded) file URL — this URL plus the generated filename — to
     ///    [`WriteContext::resolve_file_path`] to produce `add.path`. `make_relative` preserves the
     ///    URI-encoded form, which is what the Delta protocol requires. Arrow-based engines can use
-    ///    `build_add_file_metadata` which handles this step.
+    ///    [`build_add_file_metadata`] which handles this step.
     ///
-    /// `DefaultEngine::write_parquet` handles both steps automatically via `object_store`
-    /// and `build_add_file_metadata`.
+    /// [`DefaultEngine::write_parquet`] handles both steps automatically via `object_store`
+    /// and [`build_add_file_metadata`].
     ///
     /// # Layout
     ///
@@ -130,6 +132,8 @@ impl WriteContext {
     /// Each call generates a fresh prefix. The alphanumeric charset is RFC 3986
     /// unreserved, so the prefix is URI-safe at any length.
     ///
+    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+    /// [`build_add_file_metadata`]: crate::engine::default::build_add_file_metadata
     // TODO(#2436): revisit this API shape. Returning a `Url` forces callers to URI-decode
     // before filesystem writes and keep it encoded for `add.path`, which is unintuitive.
     pub fn write_dir(&self) -> Url {
@@ -223,7 +227,7 @@ impl WriteContext {
     /// Computes the relative `add.path` value for the Delta log from a file's absolute URL.
     ///
     /// Custom engines that write parquet files themselves (bypassing
-    /// `DefaultEngine::write_parquet`) should call this after writing each file to produce
+    /// [`DefaultEngine::write_parquet`]) should call this after writing each file to produce
     /// the path for their Add action metadata.
     ///
     /// # Examples
@@ -234,6 +238,7 @@ impl WriteContext {
     ///
     /// Returns an error if the file is not under the table root.
     ///
+    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {
         let relative = self
             .shared
