@@ -895,17 +895,42 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_partition_column() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let table_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("part_col", DataType::STRING),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            table_schema,
+            vec!["part_col".to_string()],
+            10,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_configuration = TableConfiguration::try_new(
+            metadata,
+            Protocol::try_new_legacy(2, 5).unwrap(),
+            Url::parse("s3://my-table").unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let read_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
         )]));
-        let res = get_state_info(
-            schema.clone(),
-            vec!["part_col".to_string()],
+        let read_schema = Arc::new(
+            read_schema
+                .add_metadata_column("part_col", MetadataColumnSpec::RowId)
+                .expect("Couldn't add metadata col"),
+        );
+        let res = StateInfo::try_new(
+            read_schema,
+            &table_configuration,
             None,
-            &[], // no table features
-            HashMap::new(),
-            vec![("part_col", MetadataColumnSpec::RowId)],
+            StatsOutputMode::default(),
+            (),
         );
         assert_result_error_with_message(
             res,

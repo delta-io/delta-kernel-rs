@@ -1841,6 +1841,55 @@ mod tests {
     }
 
     #[test]
+    fn write_context_reflects_updated_effective_table_config(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_non_dv_table();
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("default engine");
+
+        // Regression coverage for stale SharedWriteState caching: keep the first context alive
+        // while the transaction's effective table config changes.
+        let initial_write_context = txn.unpartitioned_write_context()?;
+        assert!(!initial_write_context
+            .logical_schema()
+            .contains("fresh_column"));
+
+        let mut evolved_fields: Vec<StructField> = txn
+            .effective_table_config
+            .logical_schema()
+            .fields()
+            .cloned()
+            .collect();
+        evolved_fields.push(StructField::nullable("fresh_column", DataType::INTEGER));
+        let evolved_schema = Arc::new(StructType::new_unchecked(evolved_fields));
+        let evolved_metadata = txn
+            .effective_table_config
+            .metadata()
+            .clone()
+            .with_schema(evolved_schema.clone())?;
+        txn.effective_table_config = TableConfiguration::try_new_with_schema(
+            &txn.effective_table_config,
+            evolved_metadata,
+            evolved_schema,
+        )?;
+
+        let updated_write_context = txn.unpartitioned_write_context()?;
+        assert!(updated_write_context
+            .logical_schema()
+            .contains("fresh_column"));
+        assert!(updated_write_context
+            .physical_schema()
+            .contains("fresh_column"));
+        assert!(!initial_write_context
+            .logical_schema()
+            .contains("fresh_column"));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
