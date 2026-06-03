@@ -307,10 +307,9 @@ fn binary_search_ict_timestamps(
     match binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound) {
         Ok(idx) => {
             let version = commits[idx].version;
-            // TODO(#ISSUE): `binary_search_by_key_with_bounds` already evaluated the key at
-            // `idx` during the search, but discards it. Re-reading it here repeats engine IO
-            // (`read_in_commit_timestamp`). Have the search return the matched key alongside
-            // the index so we can avoid this second read.
+            // TODO(#2687): reading in_commit_timestamp is an expensive operation since it require
+            // an engine I/O. An optimization is to have the `binary_search_by_key_with_bounds`
+            // return the search result's index and key value to avoid calling commit_to_ict
             let timestamp = commit_to_ict(&commits[idx])?;
             Ok(CommitAt::new(version, timestamp))
         }
