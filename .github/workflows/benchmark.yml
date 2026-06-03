@@ -1,16 +1,51 @@
-# issue_comment is used here to trigger on PR comments, as opposed to pull_request_review
-# (review submissions) or pull_request_review_comment (comments on the diff itself)
-# we want to trigger this on comment creation or edit
+# Benchmarks run on two triggers:
+#   - pull_request_target: every push to a PR auto-runs with BENCH_TAGS=base
+#   - issue_comment: a /bench [--tags ...] [--filter ...] comment runs with
+#                    the supplied flags
+# Both triggers funnel into the same jobs and update the same PR comment via
+# a hidden marker (<!-- delta-kernel-bench-comment -->) so reviewers always
+# see one current comment instead of a stack.
+#
+# SECURITY MODEL
+# --------------
+# - `run-benchmark` checks out and executes untrusted PR code. It declares
+#   `permissions: { contents: read }` so the GITHUB_TOKEN visible to that
+#   job is read-only even under pull_request_target (which would otherwise
+#   hand out a full-scope token in the base-branch context). Do not add
+#   other secrets to that job and do not grant additional permissions.
+# - The Swatinem/rust-cache `save-if: github.ref == 'refs/heads/main'`
+#   guard MUST stay; without it a malicious PR could poison the main cache.
+# - `post-comment` and `post-failure-comment` only touch the markdown
+#   artifact (string data) and run pinned-by-SHA actions. They never check
+#   out PR code.
 on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
   issue_comment:
     types: [created, edited]
+
 name: Benchmarking PR performance
+
+# Start from an empty default; each job opts into the minimum scopes it needs.
+# Adding a new job without thinking about permissions inherits zero, not full.
+permissions: {}
+
+# Safe because Criterion baselines live under benchmarks/target/ (not cached) so a mid-run cancel
+# can't leave poisoned state.
+concurrency:
+  group: bench-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   run-benchmark:
     name: Run benchmarks
+    # Auto-trigger: every PR event (including drafts -- regressions can land in
+    # drafts too). /bench-trigger: only the literal /bench or /bench-with-args.
+    # Both share the same job body.
     if: >
-      github.event.issue.pull_request &&
-      (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
+      github.event_name == 'pull_request_target'
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+          (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench ')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -22,16 +57,49 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER:   ${{ github.event.pull_request.number }}
         run: |
-          PR_DATA=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
-          HEAD_SHA=$(echo "$PR_DATA" | jq -r .head.sha)
-          BASE_REF=$(echo "$PR_DATA" | jq -r .base.ref)
-          [[ "$HEAD_SHA" == *$'\n'* || "$BASE_REF" == *$'\n'* ]] && { echo "Unexpected newline in API response" >&2; exit 1; }
-          [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.-]+$ ]] || { echo "Invalid BASE_REF: $BASE_REF" >&2; exit 1; }
+          # GitHub Actions runs bash with -eo pipefail by default; -u catches
+          # typos / unset variables. All four fields below are then validated
+          # against strict allowlists before being used or emitted -- the PR
+          # head sha and base ref are attacker-controllable (fork PR author),
+          # and the issue/PR number is concatenated into a gh api URL.
+          set -u
+          if [[ "$EVENT_NAME" == "issue_comment" ]]; then
+            # /bench path: the issue_comment payload doesn't include the PR
+            # head/base, so look it up via the API. Validate the number first
+            # so a malformed value cannot inject path segments into the URL.
+            [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] \
+              || { echo "Invalid ISSUE_NUMBER: $ISSUE_NUMBER" >&2; exit 1; }
+            PR_DATA=$(gh api "repos/$REPO/pulls/$ISSUE_NUMBER")
+            HEAD_SHA=$(echo "$PR_DATA" | jq -r .head.sha)
+            BASE_REF=$(echo "$PR_DATA" | jq -r .base.ref)
+            NUM="$ISSUE_NUMBER"
+          else
+            # Auto-trigger path: pull_request_target payload has everything.
+            HEAD_SHA="$PR_HEAD_SHA"
+            BASE_REF="$PR_BASE_REF"
+            NUM="$PR_NUMBER"
+            [[ "$NUM" =~ ^[1-9][0-9]*$ ]] \
+              || { echo "Invalid PR_NUMBER: $NUM" >&2; exit 1; }
+          fi
+          # HEAD_SHA must be a hex Git SHA (40 char SHA-1 or 64 char SHA-256).
+          # The allowlist also catches the empty-string case if jq somehow
+          # returned no value.
+          [[ "$HEAD_SHA" =~ ^[a-f0-9]{40,64}$ ]] \
+            || { echo "Invalid HEAD_SHA: $HEAD_SHA" >&2; exit 1; }
+          # BASE_REF is a Git ref name; standard ref-name allowlist (letters,
+          # digits, slash, dot, dash, underscore). Both regexes exclude
+          # newlines, so no separate newline check is needed.
+          [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.-]+$ ]] \
+            || { echo "Invalid BASE_REF: $BASE_REF" >&2; exit 1; }
           printf 'head_sha=%s\n' "$HEAD_SHA" >> "$GITHUB_OUTPUT"
           printf 'base_ref=%s\n'  "$BASE_REF"  >> "$GITHUB_OUTPUT"
-          printf 'pr_number=%s\n' "$PR_NUMBER"  >> "$GITHUB_OUTPUT"
+          printf 'pr_number=%s\n' "$NUM"      >> "$GITHUB_OUTPUT"
       - name: Install critcmp
         # Installed before checkout so the PR's .cargo/config.toml cannot
         # redirect the registry to a malicious source. The runner's
@@ -42,6 +110,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ steps.pr.outputs.head_sha }}
+          persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
@@ -53,8 +122,11 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Run benchmarks
         # The comment is posted in the post-comment job after this job completes.
+        # COMMENT is only meaningful under issue_comment; under pull_request_target
+        # the expression resolves to "" and the script treats that as bare /bench.
         env:
           COMMENT:  ${{ github.event.comment.body }}
+          TRIGGER:  ${{ github.event_name == 'issue_comment' && '/bench' || 'auto-push' }}
           BASE_REF: ${{ steps.pr.outputs.base_ref }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: bash benchmarks/ci/run-benchmarks.sh
@@ -76,9 +148,55 @@ jobs:
         with:
           name: bench-comment
           path: /tmp/
-      - name: Post results as PR comment
+      - name: Find existing bench comment
+        id: find
+        uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e # v3.1.0
+        with:
+          issue-number: ${{ needs.run-benchmark.outputs.pr_number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- delta-kernel-bench-comment -->'
+      - name: Post or update PR comment
+        # When `comment-id` is empty (no prior comment) this creates one;
+        # otherwise it replaces the existing body. Either way only one bench
+        # comment exists on the PR.
+        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043 # v4.0.0
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ needs.run-benchmark.outputs.pr_number }}
+          edit-mode: replace
+          body-path: /tmp/bench-comment.md
+
+  post-failure-comment:
+    name: Post failure note to PR
+    needs: run-benchmark
+    # Runs only when run-benchmark failed (not when it was cancelled by the
+    # concurrency group -- a superseding run will post its own update). Without
+    # this job, a previous green comment would mislead reviewers after a push
+    # that breaks the bench itself.
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Find existing bench comment
+        id: find
+        uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e # v3.1.0
+        with:
+          # Pulled directly from the event payload because run-benchmark may
+          # have failed before publishing its pr_number output.
+          issue-number: ${{ github.event.pull_request.number || github.event.issue.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- delta-kernel-bench-comment -->'
+      - name: Post or update failure note
+        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043 # v4.0.0
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ needs.run-benchmark.outputs.pr_number }}
-          REPO: ${{ github.repository }}
-        run: gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/bench-comment.md
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number || github.event.issue.number }}
+          edit-mode: replace
+          body: |
+            <!-- delta-kernel-bench-comment -->
+            ## Benchmark results
+
+            <sub>Benchmark run failed. [See workflow run](${{ env.RUN_URL }}) for details.</sub>

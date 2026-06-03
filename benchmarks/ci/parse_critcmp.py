@@ -3,9 +3,10 @@
 Parse critcmp output and format it as a GitHub-flavoured Markdown table.
 
 Reads the output of `critcmp base changes` from stdin and writes a table
-with columns: Test | Base | PR | %, where the faster side and the % cell
-are bolded when the difference is statistically significant (i.e. the
-error bounds do not overlap).
+with columns: Test | Base | PR | Change, where Change expresses the PR
+timing as a ratio of the base timing (e.g. `1.50x slower`, `2.00x faster`,
+`1.00x`). The Change cell is bolded when the difference is statistically
+significant (i.e. the error bounds do not overlap).
 
 Usage:
     critcmp base changes | python3 benchmarks/ci/parse_critcmp.py
@@ -52,12 +53,12 @@ def main():
     # Expected output (GitHub-flavored markdown table):
     # Throughput/bandwidth columns from critcmp are ignored; output is the same either way.
     #
-    # | Test                       | Base       | PR              | %      |
-    # |----------------------------|------------|-----------------|--------|
-    # | bench_name                 | 1.2±0.01µs | **1.3±0.02µs**  | **+8.33%** |
+    # | Test                       | Base       | PR          | Change             |
+    # |----------------------------|------------|-------------|--------------------|
+    # | bench_name                 | 1.2±0.01µs | 1.3±0.02µs  | **1.08x slower**   |
     lines = sys.stdin.read().splitlines()
-    print("| Test | Base         | PR               | % |")
-    print("|------|--------------|------------------|---|")
+    print("| Test | Base         | PR               | Change |")
+    print("|------|--------------|------------------|--------|")
 
     for line in lines[2:]:  # skip critcmp header rows
         if not line.strip():
@@ -68,7 +69,12 @@ def main():
         # Locate duration fields by the presence of "±" rather than hardcoding indices,
         # so the script works correctly regardless of whether bandwidth columns are present.
         fields = re.split(r'  +', line)
-        name = fields[0].strip().replace('|', r'\|') if fields else ''
+        # Benchmark names are attacker-controllable (PR can introduce workloads
+        # with crafted names). Strip backticks (so the name can't break out of
+        # the code span) then wrap in backticks so markdown link syntax inside
+        # the name doesn't render as a real link.
+        name = fields[0].strip().replace('`', '').replace('|', r'\|') if fields else ''
+        name = f'`{name}`' if name else ''
         dur_fields = [f.strip() for f in fields[1:] if '±' in f]
         base_dur_str = dur_fields[0] if len(dur_fields) > 0 else None
         chg_dur_str  = dur_fields[1] if len(dur_fields) > 1 else None
@@ -81,7 +87,6 @@ def main():
         chg_display  = chg_dur_str  or 'N/A'
         difference   = 'N/A'
 
-        # Only compute a percentage change when both runs have a measurement for this benchmark.
         if base_dur_str and chg_dur_str:
             # Parse each duration string into (mean, error, units), e.g. "1.2±0.01µs" -> (1.2, 0.01, "µs").
             base_p = parse_duration(base_dur_str)
@@ -93,18 +98,15 @@ def main():
                 chg_ms      = to_ms(chg_p[0],  chg_p[2])
                 chg_err_ms  = to_ms(chg_p[1],  chg_p[2])
 
-                # Compute relative change: negative means faster, positive means slower.
-                pct    = -(1 - chg_ms / base_ms) * 100
-                prefix = '' if chg_ms <= base_ms else '+'
-                difference = f'{prefix}{pct:.2f}%'
+                ratio = chg_ms / base_ms
+                if abs(ratio - 1.0) < 1e-9:
+                    difference = '1.00x'
+                elif ratio > 1:
+                    difference = f'{ratio:.2f}x slower'
+                else:
+                    difference = f'{1.0 / ratio:.2f}x faster'
 
-                # Bold the slower of the two durations to draw attention to what changed,
-                # and always bold the difference column when the change is significant.
                 if is_significant(chg_ms, chg_err_ms, base_ms, base_err_ms):
-                    if chg_ms < base_ms:
-                        chg_display = f'**{chg_dur_str}**'
-                    elif chg_ms > base_ms:
-                        base_display = f'**{base_dur_str}**'
                     difference = f'**{difference}**'
 
         print(f'| {name} | {base_display} | {chg_display} | {difference} |')

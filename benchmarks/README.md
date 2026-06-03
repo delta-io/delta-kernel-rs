@@ -101,7 +101,12 @@ BENCH_TAGS=base,my-feature cargo bench -p delta_kernel_benchmarks
 
 ### Running benchmarking on a PR
 
-To trigger benchmarks on a pull request, post a comment using the following syntax:
+Benchmarks run automatically on every push to a PR (including drafts) with `BENCH_TAGS=base`, no filter.
+Results are posted as a single PR comment that updates in place on each push, so the latest
+comment always reflects the latest commit. To override the tags or filter, post a `/bench`
+comment as documented below -- it updates the same comment that the auto-trigger uses.
+
+To trigger benchmarks on a pull request manually, post a comment using the following syntax:
 
 ```
 /bench [--tags <comma separated list of tags>] [--filter <regex>]

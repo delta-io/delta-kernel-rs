@@ -7,9 +7,13 @@
 #
 # Expects the following environment variables:
 #
-#   COMMENT    - the /bench PR comment body
 #   BASE_REF   - base branch ref (e.g. "main")
 #   HEAD_SHA   - full SHA of the PR head commit
+#   COMMENT    - (optional) /bench PR comment body. Unset under the
+#                pull_request_target auto-trigger path; set to the comment
+#                body under the issue_comment path.
+#   TRIGGER    - (optional) human-readable label for what kicked off the run
+#                ("auto-push" or "/bench"). Used in the comment header.
 
 set -euo pipefail
 shopt -s extglob
@@ -18,9 +22,13 @@ shopt -s extglob
 # 1. Parse the /bench comment
 #    Syntax: /bench [--tags <csv>] [--filter <regex>]
 #      --tags    sets BENCH_TAGS (comma-separated tag list); defaults to "base"
-#                when the comment is just /bench
+#                when the comment is just /bench (or COMMENT is unset, i.e.
+#                the auto-trigger path)
 #      --filter  Criterion name regex passed as a positional arg to cargo bench
 # ---------------------------------------------------------------------------
+
+# Auto-trigger path leaves COMMENT unset; treat that the same as a bare /bench.
+COMMENT="${COMMENT:-}"
 
 ARGS="${COMMENT#/bench}"
 ARGS="${ARGS##+( )}"
@@ -76,9 +84,9 @@ git checkout FETCH_HEAD
 
 # ---------------------------------------------------------------------------
 # 4. Compare baselines with critcmp and format as a markdown table.
-#      - Parses actual duration values (not rank factors) for the % column
-#      - Bolds the faster duration and % cell when the difference is
-#        statistically significant (error bounds do not overlap)
+#      - Parses actual duration values (not rank factors) to compute a ratio
+#      - Bolds the Change cell when the difference is statistically
+#        significant (error bounds do not overlap)
 # ---------------------------------------------------------------------------
 # Use `critcmp` to compare the criterion output for `base` and `changes`. We use `critcmp` instead of manually
 # parsing criterion outputs because criterion may update its output format. By using `critcmp`, we inherit all
@@ -92,16 +100,21 @@ COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/par
 # ---------------------------------------------------------------------------
 SHORT_SHA="${HEAD_SHA:0:7}"
 
-SUMMARY=""
-[[ -n "$TAGS" ]]   && SUMMARY="tags: \`${TAGS}\`"
-[[ -n "$FILTER" ]] && SUMMARY+="${SUMMARY:+ | }filter: \`${FILTER}\`"
+# Metadata line shows commit + what fired this run + the active tags/filter so
+# a reviewer can tell at a glance which configuration produced the displayed
+# numbers (the same comment is reused across auto-trigger and /bench runs).
+SUMMARY="Commit: \`${SHORT_SHA}\` &middot; Trigger: ${TRIGGER:-auto-push}"
+[[ -n "$TAGS" ]]   && SUMMARY+=" &middot; Tags: \`${TAGS}\`"
+[[ -n "$FILTER" ]] && SUMMARY+=" &middot; Filter: \`${FILTER}\`"
 
+# Leading marker is an HTML comment, invisible to readers; the post-comment
+# job uses it as a stable identifier for find-and-update so each push reuses
+# the same comment instead of stacking new ones.
 {
-  echo "## Benchmark for ${SHORT_SHA}"
-  echo "<details>"
-  echo "<summary>${SUMMARY}</summary>"
+  echo "<!-- delta-kernel-bench-comment -->"
+  echo "## Benchmark results"
+  echo ""
+  echo "<sub>${SUMMARY}</sub>"
   echo ""
   echo "$COMPARISON"
-  echo ""
-  echo "</details>"
 } > /tmp/bench-comment.md
