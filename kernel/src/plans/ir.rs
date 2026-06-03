@@ -62,17 +62,28 @@ pub enum IoOperation {
     /// [`Error::FileAlreadyExists`](crate::Error::FileAlreadyExists) without modifying it.
     /// Returns [`PlanResult::Unit`](super::PlanResult::Unit) on success.
     AtomicCopy { source: Url, destination: Url },
+    /// Read the footer of a Parquet file.
+    ///
+    /// Returns [`PlanResult::ParquetFooter`](super::PlanResult::ParquetFooter) containing the
+    /// file's footer metadata (schema and any future extensions). See
+    /// [`ParquetHandler::read_parquet_footer`] for the full contract.
+    ///
+    /// [`ParquetHandler::read_parquet_footer`]: crate::ParquetHandler::read_parquet_footer
+    ParquetFooter { file: FileMeta },
 }
 
 impl IoOperation {
+    /// Constructs an [`IoOperation::FileListing`] for the given URL.
     pub fn file_listing(url: Url) -> Self {
         Self::FileListing { url }
     }
 
+    /// Constructs an [`IoOperation::ReadBytes`] for the given file slices.
     pub fn read_bytes(files: Vec<FileSlice>) -> Self {
         Self::ReadBytes { files }
     }
 
+    /// Constructs an [`IoOperation::WriteBytes`] for the given URL, data, and overwrite flag.
     pub fn write_bytes(url: Url, data: Bytes, overwrite: bool) -> Self {
         Self::WriteBytes {
             url,
@@ -81,15 +92,22 @@ impl IoOperation {
         }
     }
 
+    /// Constructs an [`IoOperation::HeadFile`] for the given URL.
     pub fn head_file(url: Url) -> Self {
         Self::HeadFile { url }
     }
 
+    /// Constructs an [`IoOperation::AtomicCopy`] for the given source and destination URLs.
     pub fn atomic_copy(source: Url, destination: Url) -> Self {
         Self::AtomicCopy {
             source,
             destination,
         }
+    }
+
+    /// Constructs an [`IoOperation::ParquetFooter`] for the given file metadata.
+    pub fn parquet_footer(file: FileMeta) -> Self {
+        Self::ParquetFooter { file }
     }
 }
 

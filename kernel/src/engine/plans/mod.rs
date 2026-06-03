@@ -5,6 +5,10 @@
 //!
 //! This allows a PlanExecutor to become the single surface for connector optimizations,
 //! while still allowing kernel to use existing Engine trait APIs.
+//!
+//! ### Arrow Requirement:
+//! The PlanBasedEngine implementation assumes the use of ArrowEngineData during JSON parsing, so it
+//! is only compatible with `PlanExecutor`'s which return ArrowEngineData.
 
 use std::sync::Arc;
 

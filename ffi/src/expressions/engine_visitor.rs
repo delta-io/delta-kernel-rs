@@ -201,6 +201,10 @@ pub struct EngineExpressionVisitor {
     /// Visits the `Coalesce` variadic operator belonging to the list identified by
     /// `sibling_list_id`. The operands will be in a list identified by `child_list_id`
     pub visit_coalesce: VisitVariadicFn,
+    /// Visits the `Array` variadic constructor belonging to the list identified by
+    /// `sibling_list_id`. The element expressions will be in a list identified by
+    /// `child_list_id`.
+    pub visit_array: VisitVariadicFn,
     /// Visits the `column` belonging to the list identified by `sibling_list_id`.
     pub visit_column:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
@@ -632,6 +636,7 @@ fn visit_expression_impl(
             }
             let visit_fn = match op {
                 VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
+                VariadicExpressionOp::Array => visitor.visit_array,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }

@@ -3,6 +3,7 @@
 mod append;
 mod cdf;
 mod clustered;
+mod column_defaults;
 mod column_mapping;
 mod commit_info;
 mod domain_metadata;

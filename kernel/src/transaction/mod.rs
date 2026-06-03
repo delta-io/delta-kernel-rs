@@ -15,7 +15,7 @@ use crate::actions::{
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta, LazyCrc};
+use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
@@ -487,7 +487,7 @@ impl<S> Transaction<S> {
                 let bin_boundaries = self
                     .read_snapshot_opt
                     .as_ref()
-                    .and_then(|snap| snap.get_file_stats_if_loaded())
+                    .and_then(|snap| snap.get_file_stats_if_present())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
                 let crc_delta = self.build_crc_delta(
@@ -991,7 +991,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         }
 
         Ok(WriteContext {
-            shared: shared.clone(),
+            shared,
             physical_partition_values: serialized,
         })
     }
@@ -1008,7 +1008,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
         Ok(WriteContext {
-            shared: shared.clone(),
+            shared,
             physical_partition_values: HashMap::new(),
         })
     }
@@ -1225,8 +1225,8 @@ impl<S> Transaction<S> {
                 let snapshot = Snapshot::new_with_crc(
                     log_segment,
                     self.effective_table_config,
-                    Arc::new(LazyCrc::new_precomputed(crc, 0)),
-                );
+                    Some(Arc::new(crc)),
+                )?;
                 (stats, Arc::new(snapshot))
             }
         };
@@ -1829,6 +1829,55 @@ mod tests {
         let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
         let abs_path3 = dv_path3.absolute_path()?;
         assert_ne!(abs_path2, abs_path3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_context_reflects_updated_effective_table_config(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_non_dv_table();
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("default engine");
+
+        // Regression coverage for stale SharedWriteState caching: keep the first context alive
+        // while the transaction's effective table config changes.
+        let initial_write_context = txn.unpartitioned_write_context()?;
+        assert!(!initial_write_context
+            .logical_schema()
+            .contains("fresh_column"));
+
+        let mut evolved_fields: Vec<StructField> = txn
+            .effective_table_config
+            .logical_schema()
+            .fields()
+            .cloned()
+            .collect();
+        evolved_fields.push(StructField::nullable("fresh_column", DataType::INTEGER));
+        let evolved_schema = Arc::new(StructType::new_unchecked(evolved_fields));
+        let evolved_metadata = txn
+            .effective_table_config
+            .metadata()
+            .clone()
+            .with_schema(evolved_schema.clone())?;
+        txn.effective_table_config = TableConfiguration::try_new_with_schema(
+            &txn.effective_table_config,
+            evolved_metadata,
+            evolved_schema,
+        )?;
+
+        let updated_write_context = txn.unpartitioned_write_context()?;
+        assert!(updated_write_context
+            .logical_schema()
+            .contains("fresh_column"));
+        assert!(updated_write_context
+            .physical_schema()
+            .contains("fresh_column"));
+        assert!(!initial_write_context
+            .logical_schema()
+            .contains("fresh_column"));
 
         Ok(())
     }

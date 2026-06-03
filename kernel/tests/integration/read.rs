@@ -762,6 +762,68 @@ fn predicate_on_letter_and_number(
     Ok(())
 }
 
+// Regression test for issue #2468
+#[rstest::rstest]
+#[case::predicate_on_unprojected_data_column_in_table_schema_succeeds(
+    // `number` is a data column not present in the projected schema (`a_float`).
+    column_expr!("number").gt(Expr::literal(4i64)),
+    vec![
+        "+---------+",
+        "| a_float |",
+        "+---------+",
+        "| 5.5     |",
+        "| 6.6     |",
+        "+---------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::predicate_on_partition_column_in_table_schema_succeeds(
+    column_expr!("letter").eq(Expr::literal("a")),
+    vec![
+        "+---------+",
+        "| a_float |",
+        "+---------+",
+        "| 1.1     |",
+        "| 4.4     |",
+        "+---------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::predicate_on_mixed_projected_and_unprojected_columns_succeeds(
+    // a_float is projected, number is unprojected
+    Pred::and(
+        column_expr!("a_float").gt(Expr::literal(4.0)),
+        column_expr!("number").lt(Expr::literal(6i64)),
+    ),
+    vec![
+        "+---------+",
+        "| a_float |",
+        "+---------+",
+        "| 4.4     |",
+        "| 5.5     |",
+        "+---------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+fn predicate_on_unprojected_column(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float"]),
+        Some(pred),
+        expected,
+    )?;
+    Ok(())
+}
+
 /// Test partition pruning on a table with a checkpoint containing `partitionValues_parsed`.
 /// This exercises the checkpoint code path where typed partition values are read directly
 /// from the parquet column rather than parsed from the string map via `MapToStruct`.
@@ -967,6 +1029,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
 #[case::partition_only(
     // Partition-only predicate: category = 'A' prunes the category=B file
     Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    None,
     1
 )]
 #[case::mixed_partition_and_data(
@@ -976,11 +1039,29 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
         Pred::eq(column_expr!("category"), Expr::literal("A")),
         Pred::gt(column_expr!("val"), Expr::literal("z")),
     )),
+    None,
+    1
+)]
+#[case::predicate_on_unprojected_data_column(
+    // Project only "category"; predicate references unprojected "val" (logical) whose
+    // physical name is "phys_val". Kernel must resolve to phys_val via the full table
+    // schema and prune both files: max(phys_val)='z' is NOT > 'z'.
+    Arc::new(Pred::gt(column_expr!("val"), Expr::literal("z"))),
+    Some(vec!["category"]),
+    0
+)]
+#[case::predicate_on_unprojected_partition_column(
+    // Project only "val"; predicate references unprojected partition column "category"
+    // (logical, physical name "phys_category"). Partition pruning must still kick in
+    // using the physical partition name, keeping only the category=A file.
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    Some(vec!["val"]),
     1
 )]
 #[tokio::test]
-async fn partition_pruning_with_column_mapping(
+async fn test_partition_pruning_with_column_mapping(
     #[case] predicate: Arc<Pred>,
+    #[case] select_cols: Option<Vec<&'static str>>,
     #[case] expected_files: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_array())])?;
@@ -1025,18 +1106,45 @@ async fn partition_pruning_with_column_mapping(
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
-    // Predicates use logical column names -- kernel must map to physical names
-    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    // Predicates use logical column names -- kernel must map to physical names. The
+    // optional projection narrows the output schema; when set, the predicate may still
+    // reference columns outside it
+    let projection = select_cols
+        .as_ref()
+        .map(|cols| snapshot.schema().project(cols))
+        .transpose()?;
+    let scan = snapshot
+        .scan_builder()
+        .with_schema_opt(projection)
+        .with_predicate(predicate)
+        .build()?;
 
     let stream = scan.execute(engine)?;
     let mut files_scanned = 0;
+    // "category" is in the output iff there's no projection (SELECT *) or the projection
+    // explicitly includes it.
+    let expect_category = select_cols
+        .as_ref()
+        .is_none_or(|cols| cols.contains(&"category"));
     for engine_data in stream {
         let result_batch = into_record_batch(engine_data?);
-        // The "category" partition column should be filled with "A"
-        let category_idx = result_batch.schema().index_of("category")?;
-        let category_col = result_batch.column(category_idx).as_string::<i32>();
-        for i in 0..result_batch.num_rows() {
-            assert_eq!(category_col.value(i), "A");
+        // The "category" partition column should be present exactly when projected, and
+        // should be 'A' for every surviving row.
+        match result_batch.schema().index_of("category") {
+            Ok(category_idx) => {
+                assert!(
+                    expect_category,
+                    "category present but not expected in projection"
+                );
+                let category_col = result_batch.column(category_idx).as_string::<i32>();
+                for i in 0..result_batch.num_rows() {
+                    assert_eq!(category_col.value(i), "A");
+                }
+            }
+            Err(_) => assert!(
+                !expect_category,
+                "category missing but expected in projection"
+            ),
         }
         files_scanned += 1;
     }

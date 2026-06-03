@@ -148,7 +148,6 @@ impl CreateTableTransaction {
             path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
-
         Ok(Transaction {
             span,
             read_snapshot_opt: None,

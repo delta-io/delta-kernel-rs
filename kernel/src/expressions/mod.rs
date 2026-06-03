@@ -83,6 +83,15 @@ pub enum BinaryExpressionOp {
 pub enum VariadicExpressionOp {
     /// Collapse multiple values into one by taking the first non-null value
     Coalesce,
+    /// Construct an Array by evaluating each input expression. For example, the expression
+    /// `Array(1, (1 + 2), col("my_int_col"))` evaluates to the array
+    /// `[1, 3, <my_int_col value>]` per row. All inputs must share the same element type.
+    /// Requires at least one element; the element type is inferred from the inputs.
+    ///
+    /// For static array literals whose elements are all compile-time constants, use
+    /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
+    /// `Scalar::Array` is evaluated at compile time.
+    Array,
 }
 
 /// A junction (AND/OR) predicate operator.
@@ -687,6 +696,11 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Coalesce, exprs)
     }
 
+    /// Creates a new Array constructor expression. See [`VariadicExpressionOp::Array`].
+    pub fn array(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
+        Self::variadic(VariadicExpressionOp::Array, exprs)
+    }
+
     /// Creates a new opaque expression
     pub fn opaque(
         op: impl OpaqueExpressionOp,
@@ -912,6 +926,7 @@ impl Display for VariadicExpressionOp {
         use VariadicExpressionOp::*;
         match self {
             Coalesce => write!(f, "COALESCE"),
+            Array => write!(f, "ARRAY"),
         }
     }
 }
@@ -1123,6 +1138,10 @@ mod tests {
                 Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
                 "Struct(Column(x), 2, 10)",
             ),
+            (
+                Expr::array([column_expr!("x"), column_expr!("y"), Expr::literal(0)]),
+                "ARRAY(Column(x), Column(y), 0)",
+            ),
         ];
 
         for (expr, expected) in cases {
@@ -1325,6 +1344,17 @@ mod tests {
                 column_expr!("b"),
                 Expression::literal("default"),
             ]);
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        #[case::array_single(Expression::array([Expression::literal(7i32)]))]
+        #[case::array_mixed(Expression::array([
+            column_expr!("a"),
+            column_expr!("b"),
+            Expression::literal(42i64),
+        ]))]
+        fn test_array_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
         }
 
