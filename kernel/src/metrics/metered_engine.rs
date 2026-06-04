@@ -1,6 +1,6 @@
-//! [`MeteredDeltaEngine`] wraps any [`Engine`] so its `storage_handler` emits the
-//! kernel's standard `"storage"` tracing spans. Other handler accessors pass through
-//! unchanged.
+//! [`MeteredDeltaEngine`] wraps any [`Engine`] so its `storage_handler`,
+//! `json_handler`, and `parquet_handler` emit the kernel's standard handler-completion
+//! tracing spans. `evaluation_handler` passes through unchanged.
 //!
 //! ```ignore
 //! let inner: Arc<dyn Engine> = Arc::new(MyEngine::build()?);
@@ -9,18 +9,21 @@
 
 use std::sync::Arc;
 
-use crate::metrics::MeteredStorageHandler;
+use crate::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
 use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
-/// Decorator over any [`Engine`] that meters its storage handler. See module docs.
+/// Decorator over any [`Engine`] that meters its storage, JSON, and Parquet handlers.
+/// See module docs.
 pub struct MeteredDeltaEngine {
     inner: Arc<dyn Engine>,
     storage: Arc<dyn StorageHandler>,
+    json: Arc<dyn JsonHandler>,
+    parquet: Arc<dyn ParquetHandler>,
 }
 
 impl MeteredDeltaEngine {
-    /// Wrap `inner`. Debug-asserts that `inner`'s storage handler is not already
-    /// metered, so the resulting engine emits each storage span exactly once.
+    /// Wrap `inner`. Debug-asserts that none of `inner`'s metered handlers are already
+    /// metered wrappers, so the resulting engine emits each span exactly once.
     pub fn new(inner: Arc<dyn Engine>) -> Self {
         let inner_storage = inner.storage_handler();
         debug_assert!(
@@ -28,8 +31,27 @@ impl MeteredDeltaEngine {
             "MeteredDeltaEngine wraps an engine whose storage_handler is already a \
              MeteredStorageHandler; remove the outer wrap to avoid double-counting metrics",
         );
+        let inner_json = inner.json_handler();
+        debug_assert!(
+            !inner_json.any_ref().is::<MeteredJsonHandler>(),
+            "MeteredDeltaEngine wraps an engine whose json_handler is already a \
+             MeteredJsonHandler; remove the outer wrap to avoid double-counting metrics",
+        );
+        let inner_parquet = inner.parquet_handler();
+        debug_assert!(
+            !inner_parquet.any_ref().is::<MeteredParquetHandler>(),
+            "MeteredDeltaEngine wraps an engine whose parquet_handler is already a \
+             MeteredParquetHandler; remove the outer wrap to avoid double-counting metrics",
+        );
         let storage = Arc::new(MeteredStorageHandler::new(inner_storage));
-        Self { inner, storage }
+        let json = Arc::new(MeteredJsonHandler::new(inner_json));
+        let parquet = Arc::new(MeteredParquetHandler::new(inner_parquet));
+        Self {
+            inner,
+            storage,
+            json,
+            parquet,
+        }
     }
 }
 
@@ -49,11 +71,11 @@ impl Engine for MeteredDeltaEngine {
     }
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
+        Arc::clone(&self.json)
     }
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.inner.parquet_handler()
+        Arc::clone(&self.parquet)
     }
 }
 
@@ -174,42 +196,92 @@ mod tests {
     }
 
     #[test]
-    fn other_handlers_pass_through() {
+    fn evaluation_handler_passes_through() {
         let inner: Arc<dyn Engine> = Arc::new(StubEngine::new());
         let inner_eval = inner.evaluation_handler();
-        let inner_json = inner.json_handler();
-        let inner_parquet = inner.parquet_handler();
 
         let engine = MeteredDeltaEngine::new(inner);
         assert!(Arc::ptr_eq(&inner_eval, &engine.evaluation_handler()));
-        assert!(Arc::ptr_eq(&inner_json, &engine.json_handler()));
-        assert!(Arc::ptr_eq(&inner_parquet, &engine.parquet_handler()));
     }
 
-    /// Engine that returns an already-metered storage handler; used to verify the
-    /// debug-time double-wrap guard.
-    struct AlreadyMeteredEngine(StubEngine);
+    #[test]
+    fn json_and_parquet_handlers_are_metered() {
+        use crate::metrics::{MeteredJsonHandler, MeteredParquetHandler};
 
-    impl Engine for AlreadyMeteredEngine {
+        let engine = MeteredDeltaEngine::new(Arc::new(StubEngine::new()));
+        assert!(engine.json_handler().any_ref().is::<MeteredJsonHandler>());
+        assert!(engine
+            .parquet_handler()
+            .any_ref()
+            .is::<MeteredParquetHandler>());
+    }
+
+    /// Engine that pre-meters a single handler; lets each double-wrap test target one
+    /// guard without tripping the others.
+    struct PreMeteredEngine {
+        inner: StubEngine,
+        meter_storage: bool,
+        meter_json: bool,
+        meter_parquet: bool,
+    }
+
+    impl Engine for PreMeteredEngine {
         fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            self.0.evaluation_handler()
+            self.inner.evaluation_handler()
         }
         fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            Arc::new(crate::metrics::MeteredStorageHandler::new(
-                self.0.storage_handler(),
-            ))
+            if self.meter_storage {
+                Arc::new(crate::metrics::MeteredStorageHandler::new(
+                    self.inner.storage_handler(),
+                ))
+            } else {
+                self.inner.storage_handler()
+            }
         }
         fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            self.0.json_handler()
+            if self.meter_json {
+                Arc::new(crate::metrics::MeteredJsonHandler::new(
+                    self.inner.json_handler(),
+                ))
+            } else {
+                self.inner.json_handler()
+            }
         }
         fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            self.0.parquet_handler()
+            if self.meter_parquet {
+                Arc::new(crate::metrics::MeteredParquetHandler::new(
+                    self.inner.parquet_handler(),
+                ))
+            } else {
+                self.inner.parquet_handler()
+            }
+        }
+    }
+
+    fn pre_metered(storage: bool, json: bool, parquet: bool) -> PreMeteredEngine {
+        PreMeteredEngine {
+            inner: StubEngine::new(),
+            meter_storage: storage,
+            meter_json: json,
+            meter_parquet: parquet,
         }
     }
 
     #[test]
     #[should_panic(expected = "storage_handler is already a MeteredStorageHandler")]
-    fn new_panics_when_inner_already_metered() {
-        let _ = MeteredDeltaEngine::new(Arc::new(AlreadyMeteredEngine(StubEngine::new())));
+    fn new_panics_when_inner_storage_already_metered() {
+        let _ = MeteredDeltaEngine::new(Arc::new(pre_metered(true, false, false)));
+    }
+
+    #[test]
+    #[should_panic(expected = "json_handler is already a MeteredJsonHandler")]
+    fn new_panics_when_inner_json_already_metered() {
+        let _ = MeteredDeltaEngine::new(Arc::new(pre_metered(false, true, false)));
+    }
+
+    #[test]
+    #[should_panic(expected = "parquet_handler is already a MeteredParquetHandler")]
+    fn new_panics_when_inner_parquet_already_metered() {
+        let _ = MeteredDeltaEngine::new(Arc::new(pre_metered(false, false, true)));
     }
 }

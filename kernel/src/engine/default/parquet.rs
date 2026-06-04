@@ -24,7 +24,6 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
 use crate::expressions::ColumnName;
-use crate::metrics::{emit_parquet_read_completed, PrecountedMetricsIterator};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
@@ -306,21 +305,13 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let num_files = files.len() as u64;
-        let bytes_read = files.iter().map(|f| f.size).sum();
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
             physical_schema,
             predicate,
         );
-        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(Box::new(PrecountedMetricsIterator::new(
-            inner,
-            num_files,
-            bytes_read,
-            emit_parquet_read_completed,
-        )))
+        super::stream_future_to_iter(self.task_executor.clone(), future)
     }
 
     /// Writes engine data to a Parquet file at the specified location.

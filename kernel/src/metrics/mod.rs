@@ -56,23 +56,25 @@
 //! }
 //! ```
 //!
-//! # Storage Metrics
+//! # Handler Metrics
 //!
-//! Storage operations (list, read, copy) emit `StorageListCompleted`,
-//! `StorageReadCompleted`, and `StorageCopyCompleted` events tracking latencies at the
-//! storage layer. `DefaultEngine` wraps its storage handler in [`MeteredStorageHandler`]
-//! at construction; any other engine gets the same coverage by wrapping its [`Engine`]
-//! in [`MeteredDeltaEngine`] at construction.
+//! Storage, JSON, and Parquet handler operations emit one event per call:
+//! `StorageListCompleted` / `StorageReadCompleted` / `StorageCopyCompleted` for storage,
+//! `JsonReadCompleted` for JSON `read_*_files`, and `ParquetReadCompleted` for Parquet
+//! `read_*_files`. `DefaultEngine` wraps its three handlers in [`MeteredStorageHandler`],
+//! [`MeteredJsonHandler`], and [`MeteredParquetHandler`] at construction; any other
+//! engine gets the same coverage by wrapping its [`Engine`] in [`MeteredDeltaEngine`].
 //!
-//! These metrics are standalone and track aggregate storage performance without
+//! These metrics are standalone and track aggregate handler performance without
 //! correlating to specific Snapshot/Transaction operations.
 //!
 //! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
 mod metered_engine;
+mod metered_json;
+mod metered_parquet;
 mod metered_storage;
-#[cfg(feature = "default-engine-base")]
 mod precounted_metrics_iterator;
 pub(crate) mod reporter;
 mod streaming_metrics_iterator;
@@ -87,8 +89,9 @@ pub use events::{
     StorageReadCompleted,
 };
 pub use metered_engine::MeteredDeltaEngine;
+pub use metered_json::MeteredJsonHandler;
+pub use metered_parquet::MeteredParquetHandler;
 pub use metered_storage::MeteredStorageHandler;
-#[cfg(feature = "default-engine-base")]
 pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
 pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};

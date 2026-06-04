@@ -12,14 +12,12 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
-use delta_kernel::{Engine, Error as KernelError, Snapshot};
+use delta_kernel::{Error as KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
@@ -267,10 +265,7 @@ async fn test_append_variant(
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
-        .parquet_handler()
-        .as_any()
-        .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
-        .unwrap()
+        .default_parquet_handler()
         .write_parquet_file(Box::new(ArrowEngineData::new(data.clone())), &write_context)
         .await?;
 
@@ -434,10 +429,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
-        .parquet_handler()
-        .as_any()
-        .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
-        .unwrap()
+        .default_parquet_handler()
         .write_parquet_file(Box::new(ArrowEngineData::new(data.clone())), &write_context)
         .await?;
 
