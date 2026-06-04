@@ -45,7 +45,7 @@ pub struct PlanNode {
 /// the nodes whose outputs it consumes, so an engine can evaluate `nodes` in slice
 /// order; each node's inputs are guaranteed bound by the time the node is reached.
 ///
-/// A `Plan` has at least one node. The **terminal node** is always the
+/// A well-formed `Plan` has at least one node. The **terminal node** is always the
 /// last entry in `nodes`: it is the only node whose `output` no other node lists in
 /// `inputs`, and `Plan::result()` returns that node's `output` RefId, the value the
 /// engine streams to the caller.
