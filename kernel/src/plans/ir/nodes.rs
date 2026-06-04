@@ -128,19 +128,12 @@ impl From<FileMeta> for ScanFile {
 /// The returned data contains exactly 3 columns in schema order:
 /// `{i_logical: parquet[1], s: NULL.., i2: parquet[0]}`.
 ///
-/// ## Row Index Column
+/// # Metadata columns
 ///
-/// When a column in `schema` is marked as a row index metadata column (via
-/// [`StructField::create_metadata_column`] with [`MetadataColumnSpec::RowIndex`]), the engine
-/// must populate it with the 0-based row position within the Parquet file:
-///
-/// - **Column name**: User-specified (commonly `"row_index"` or `"_metadata.row_index"`)
-/// - **Type**: `LONG` (non-nullable)
-/// - **Values**: Sequential integers starting at 0 for each file
-/// - **Use case**: Track row positions for downstream processing, or internally used to compute Row
-///   IDs
-///
-/// Example: A file with 5 rows would have row_index values `[0, 1, 2, 3, 4]`.
+/// A field marked as a row index metadata column (via [`StructField::create_metadata_column`]
+/// with [`MetadataColumnSpec::RowIndex`]) is populated by the engine with the 0-based row
+/// position within the file (`LONG`, non-nullable); a file with 5 rows yields `[0, 1, 2, 3, 4]`.
+/// The column name is caller-chosen (commonly `"row_index"`).
 ///
 /// # File-constant columns
 ///
@@ -324,7 +317,7 @@ pub struct LoadColumnFileMeta {
 /// `dv_column` names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
 /// and drops file rows whose row index appears in the DV. A NULL value for a given
-/// input row means "no DV for this file", so all file rows are emitted. 
+/// input row means "no DV for this file", so all file rows are emitted.
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
