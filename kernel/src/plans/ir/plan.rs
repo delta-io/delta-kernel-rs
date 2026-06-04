@@ -9,8 +9,7 @@ pub use super::nodes::NodeKind;
 /// Plan-scoped opaque identifier for a node's output value.
 ///
 /// Engines must treat RefIds as opaque keys: equality and hashing are the only meaningful
-/// operations. The numeric representation and how RefIds are minted are implementation
-/// details that may change without notice; engines must not depend on them.
+/// operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RefId(pub u32);
 
@@ -41,14 +40,12 @@ pub struct PlanNode {
 /// - `output` is the RefId the operator produces.
 ///
 /// A node depends on another when one of its `inputs` matches that node's `output`.
-/// The `inputs`/`output` cross-references encode the dataflow DAG, and `nodes` is
-/// stored in a topological order over those edges: every node appears after the
-/// nodes whose outputs it consumes. Engines may therefore evaluate `nodes` in slice
-/// order without further sorting -- each node's inputs are guaranteed bound by the
+/// Each RefId is bound exactly once. The `inputs`/`output` cross-references
+/// encode the dataflow DAG, and `nodes` is stored in a topological order over
+/// those edges: every node appears after the nodes whose outputs it consumes.
+/// Engines may therefore evaluate `nodes` in the order specified in `nodes`
+/// without further sorting -- each node's inputs are guaranteed bound by the
 /// time the node is reached.
-///
-/// Each RefId is bound exactly once -- single-static-assignment (SSA) form. Callers
-/// preserve this invariant; the IR does not validate it.
 ///
 /// A `Plan` has at least one node. The **terminal node** is always the
 /// last entry in `nodes`: it is the only node whose `output` no other node lists in

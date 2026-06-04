@@ -49,11 +49,6 @@ impl QueryPlanBuilder {
     }
 
     /// Consume the builder and produce a [`QueryPlan`].
-    ///
-    /// # Errors
-    ///
-    /// Currently infallible; returns `DeltaResult` for a stable signature as the builder
-    /// grows multi-node validation in follow-up work.
     pub fn build(self) -> DeltaResult<QueryPlan> {
         Ok(self.node)
     }

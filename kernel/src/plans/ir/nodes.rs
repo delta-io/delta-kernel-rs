@@ -282,14 +282,14 @@ pub struct Values {
 /// # Example
 ///
 /// Input `{ id, first, last, add: { path, size, stats_parsed: { numRecords } } }` projected to
-/// `{ id, name, file_meta }` -- passthrough, concatenation, nested input access, and a
+/// `{ id, names, file_meta }` -- passthrough, array construction, nested input access, and a
 /// struct output column:
 ///
 /// ```text
 /// Project {
 ///     exprs: [
 ///         col("id"),
-///         concat(col("first"), " ", col("last")),
+///         Expression::array([col("first"), col("last")]),
 ///         Expression::Struct([
 ///             col("add.path"),
 ///             col("add.size"),
@@ -298,7 +298,7 @@ pub struct Values {
 ///     ],
 ///     output_schema: {
 ///         id: int,
-///         name: string,
+///         names: array<string>,
 ///         file_meta: { path: string, size: long, num_records: long },
 ///     },
 /// }
