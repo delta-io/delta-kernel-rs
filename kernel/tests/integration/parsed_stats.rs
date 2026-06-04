@@ -1,22 +1,13 @@
-//! Integration test for `Scan::include_all_stats_columns` across column-mapping modes.
+//! Integration test for `Scan::include_all_stats_columns`.
 //!
-//! Builds a table at runtime via the `test_utils` table-builder with
-//! `delta.checkpoint.writeStatsAsStruct=true` so the checkpoint carries `stats_parsed`,
-//! then verifies the parsed-stats struct column matches the JSON `stats` string row-by-row.
-//! The table-builder's `default_schema` includes a nested struct column, so each case
-//! exercises the recursive nested-stats path called out in issue #1766 (paths like
-//! `minValues.nested_col.a`).
-//!
-//! Complementary to the unit test `test_scan_metadata_with_stats_columns` in
-//! `kernel/src/scan/tests.rs`, which exercises a different code path: reading a
-//! pre-existing Spark-written checkpoint with `stats_parsed` already on disk.
+//! Builds a table with `delta.checkpoint.writeStatsAsStruct=true` and a nested schema,
+//! then verifies the parsed-stats struct column matches the JSON `stats` string.
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{
     Array, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -27,9 +18,6 @@ use test_utils::{get_column, test_context};
 
 /// Validate that JSON stats object values match the corresponding parsed struct array.
 ///
-/// Recurses into nested struct sub-fields so paths like `minValues.info.age` are checked.
-/// `field_path` is the dotted path used in assertion messages at this recursion
-/// level (e.g. `"minValues"` at the top level; `"minValues.info.age"` when recursing).
 /// Panics on missing fields to surface regressions where the parsed-stats schema drops a column.
 fn assert_stats_struct_matches_json(
     struct_array: &StructArray,
@@ -97,7 +85,7 @@ fn assert_stats_struct_matches_json(
 }
 
 /// Validate only nested-struct entries, not primitives.
-fn validate_nested_columns(
+fn validate_struct_stats(
     parsed: &StructArray,
     json_obj: &serde_json::Map<String, serde_json::Value>,
     row_idx: usize,
@@ -165,52 +153,12 @@ fn scan_metadata_with_stats_columns_kernel_written(
         let filtered_batch =
             filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
 
-        let schema = filtered_batch.schema();
-        let field = schema
-            .field_with_name(STATS_PARSED_COL)
-            .expect("Schema should contain stats_parsed column");
-        assert!(
-            matches!(field.data_type(), ArrowDataType::Struct(_)),
-            "stats_parsed should be a struct type, got: {:?}",
-            field.data_type()
-        );
-
-        let stats_parsed = filtered_batch
-            .column_by_name(STATS_PARSED_COL)
-            .expect("stats_parsed column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("stats_parsed is a StructArray");
-        let num_records = stats_parsed
-            .column_by_name(NUM_RECORDS)
-            .expect("numRecords sub-field")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("numRecords is Int64Array");
-        let min_values = stats_parsed
-            .column_by_name(MIN_VALUES)
-            .expect("minValues sub-field")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("minValues is StructArray");
-        let max_values = stats_parsed
-            .column_by_name(MAX_VALUES)
-            .expect("maxValues sub-field")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("maxValues is StructArray");
-        let null_count = stats_parsed
-            .column_by_name(NULL_COUNT)
-            .expect("nullCount sub-field")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("nullCount is StructArray");
-        let stats_json = filtered_batch
-            .column_by_name("stats")
-            .expect("stats column")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("stats is StringArray");
+        let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
+        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
+        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
+        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
+        let stats_json = get_column!(filtered_batch, "stats", StringArray);
 
         for i in 0..stats_json.len() {
             if stats_parsed.is_null(i) || stats_json.is_null(i) {
@@ -234,25 +182,27 @@ fn scan_metadata_with_stats_columns_kernel_written(
                 .get(MIN_VALUES)
                 .and_then(|v| v.as_object())
                 .expect("stats JSON must contain minValues object");
-            validate_nested_columns(min_values, min_obj, i, MIN_VALUES);
+            validate_struct_stats(min_values, min_obj, i, MIN_VALUES);
 
             let max_obj = json_stats
                 .get(MAX_VALUES)
                 .and_then(|v| v.as_object())
                 .expect("stats JSON must contain maxValues object");
-            validate_nested_columns(max_values, max_obj, i, MAX_VALUES);
+            validate_struct_stats(max_values, max_obj, i, MAX_VALUES);
 
             let null_obj = json_stats
                 .get(NULL_COUNT)
                 .and_then(|v| v.as_object())
                 .expect("stats JSON must contain nullCount object");
-            validate_nested_columns(null_count, null_obj, i, NULL_COUNT);
+            validate_struct_stats(null_count, null_obj, i, NULL_COUNT);
 
             total_num_records += num_records.value(i);
             file_count += 1;
         }
     }
 
-    assert!(file_count > 0, "Should have processed at least one file");
-    assert!(total_num_records > 0, "Should have non-zero numRecords");
+    // The builder writes one data commit (v=1; v=0 is create-table with no data) of one
+    // file with the default 10 rows.
+    assert_eq!(file_count, 1, "Should have processed exactly one file");
+    assert_eq!(total_num_records, 10, "Should have exactly 10 numRecords");
 }
