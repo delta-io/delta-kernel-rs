@@ -8,8 +8,8 @@ use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::column_names::{
-    column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
+    joined_column_name, ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -27,6 +27,19 @@ mod scalars;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
+
+/// Build an [`Expression::Literal`] from anything that converts into a [`Scalar`].
+///
+/// Concise alternative to [`Expression::literal`] for plan builders. Accepts the same value
+/// types [`Scalar`] does (`i32`, `i64`, `&str`, `bool`, ...).
+///
+/// ```
+/// use delta_kernel::expressions::lit;
+/// let _zero = lit(0i64);
+/// ```
+pub fn lit(value: impl Into<Scalar>) -> Expression {
+    Expression::literal(value)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
