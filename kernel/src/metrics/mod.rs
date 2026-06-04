@@ -72,6 +72,7 @@
 pub(crate) mod events;
 mod metered_engine;
 mod metered_storage;
+#[cfg(feature = "default-engine-base")]
 mod precounted_metrics_iterator;
 pub(crate) mod reporter;
 mod streaming_metrics_iterator;
@@ -87,6 +88,7 @@ pub use events::{
 };
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_storage::MeteredStorageHandler;
+#[cfg(feature = "default-engine-base")]
 pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
 pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};
