@@ -303,8 +303,7 @@ pub enum FileType {
 /// Names the columns a [`Load`] reads from each upstream row to locate and size each file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadColumnFileMeta {
-    /// Non-nullable column holding the per-row file path / URL fragment. Joined to
-    /// [`Load::base_url`] when set.
+    /// Non-nullable column holding the per-row file path / URL fragment.
     pub path_column: ColumnName,
     /// Nullable column with the file's total size in bytes. Engines use non-NULL size and
     /// row-count values as split-sizing / pruning hints.
