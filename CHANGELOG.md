@@ -1,5 +1,242 @@
 # Changelog
 
+## [v0.24.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.24.0/) (2026-05-29)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.23.0...v0.24.0)
+
+
+### 🏗️ Breaking changes
+
+1. Reorganize `metrics` module for better cohesion ([#2604])
+   - `MetricEvent` variants are tuple variants wrapping a per-event struct (e.g.
+     `MetricEvent::ScanMetadataCompleted(ScanMetadataCompleted { .. })`). Callers matching on
+     `MetricEvent` must match the wrapped struct instead of inline named fields.
+2. Add CRC read metrics via tracing instrumentation ([#2540])
+   - Adds the `MetricEvent::CrcReadCompleted` event and a `has_latest_crc_file` field on
+     `LogSegmentLoaded`. Exhaustive matches on `MetricEvent` must handle the new variant.
+3. Add file size metrics for scans ([#2585])
+   - `ScanMetadataCompleted` gains an `active_add_files_bytes: u64` field (total size of add
+     files surviving log replay). Callers constructing or exhaustively matching it must account
+     for the new field.
+4. Re-add `nearest_timestamp` to `LogHistoryError` ([#2600])
+   - The `LogHistoryError::TimestampOutOfRange` variant gains a `nearest_timestamp` field.
+     Callers matching this variant with named fields must add `nearest_timestamp` (or `..`).
+5. Rename `Plan` enum to `Operation` ([#2635])
+   - Rename `Plan` to `Operation` at all call sites (exported from `delta_kernel::plans` under
+     the `declarative-plans` feature). Variant names are unchanged.
+6. Introduce `DomainMetadataState` typed enum ([#2567])
+   - The `Crc` field `domain_metadata: Option<HashMap<..>>` becomes
+     `domain_metadata_state: DomainMetadataState` (`Complete` / `Partial`). Affects consumers of
+     the `crc` module, which is public only under the `test-utils` feature.
+7. Introduce `SetTransactionState` typed enum ([#2570])
+   - The `Crc` field `set_transactions: Option<HashMap<..>>` becomes
+     `set_transaction_state: SetTransactionState` (`Complete` / `Partial`). Affects consumers of
+     the `crc` module, which is public only under the `test-utils` feature.
+8. Support `variantShredding` as a feature ([#2594])
+   - Kernel now supports the `variantShredding` table feature (previously only
+     `variantShredding-preview`). Tables enabling it are read and written instead of rejected as
+     an unsupported feature.
+
+### 🚀 Features / new APIs
+
+1. *(ffi)* Expose transaction deletion vector updates ([#2495])
+2. Allow fields with same physical name and different physical path ([#2576])
+3. Enforce CRC ICT consistency on write ([#2584])
+4. Support creating Delta tables with empty schema ([#2545])
+5. Two tiny CRC refactors ([#2597])
+6. Block read and blind-append on empty-schema Delta tables ([#2546])
+7. Introduce PlanExecutor trait + basic plan IR ([#2590])
+8. Reverse incremental CRC replay accumulator + visitor ([#2602])
+9. Introduce PlanBasedEngine and a SyncPlanExecutor ([#2621])
+
+### 🐛 Bug Fixes
+
+1. Block removeFile for some row tracking table ([#2539])
+2. Coerce field names during parquet field-id matching ([#2558])
+3. Surface numRecords from struct-stats-only checkpoints via ScanFile.stats ([#2542])
+4. Drop predicate refs to non-stats columns during rewrite ([#2575])
+
+### 📚 Documentation
+
+1. Update list_from doc ([#2581])
+2. Minor user guide README update ([#2601])
+
+### 🚜 Refactor
+
+1. Move apply_schema out of arrow_expression ([#2580])
+2. Create stat field name constants ([#2586])
+3. Reshape CrcDelta, get it ready for incremental visitor and accumulator ([#2583])
+4. CRC test infra / setup ([#2616])
+5. Use DeltaResultIterator where possible ([#2622])
+6. Rename ScopedDeltaResultIterator ([#2632])
+7. Add snapshot/incremental.rs; snapshot section headers ([#2647])
+
+### 🧪 Testing
+
+1. Support nested structs in table-builder data generation ([#2648])
+
+
+[#2567]: https://github.com/delta-io/delta-kernel-rs/pull/2567
+[#2495]: https://github.com/delta-io/delta-kernel-rs/pull/2495
+[#2539]: https://github.com/delta-io/delta-kernel-rs/pull/2539
+[#2570]: https://github.com/delta-io/delta-kernel-rs/pull/2570
+[#2558]: https://github.com/delta-io/delta-kernel-rs/pull/2558
+[#2580]: https://github.com/delta-io/delta-kernel-rs/pull/2580
+[#2581]: https://github.com/delta-io/delta-kernel-rs/pull/2581
+[#2540]: https://github.com/delta-io/delta-kernel-rs/pull/2540
+[#2542]: https://github.com/delta-io/delta-kernel-rs/pull/2542
+[#2576]: https://github.com/delta-io/delta-kernel-rs/pull/2576
+[#2584]: https://github.com/delta-io/delta-kernel-rs/pull/2584
+[#2586]: https://github.com/delta-io/delta-kernel-rs/pull/2586
+[#2583]: https://github.com/delta-io/delta-kernel-rs/pull/2583
+[#2575]: https://github.com/delta-io/delta-kernel-rs/pull/2575
+[#2545]: https://github.com/delta-io/delta-kernel-rs/pull/2545
+[#2597]: https://github.com/delta-io/delta-kernel-rs/pull/2597
+[#2546]: https://github.com/delta-io/delta-kernel-rs/pull/2546
+[#2594]: https://github.com/delta-io/delta-kernel-rs/pull/2594
+[#2601]: https://github.com/delta-io/delta-kernel-rs/pull/2601
+[#2590]: https://github.com/delta-io/delta-kernel-rs/pull/2590
+[#2585]: https://github.com/delta-io/delta-kernel-rs/pull/2585
+[#2616]: https://github.com/delta-io/delta-kernel-rs/pull/2616
+[#2622]: https://github.com/delta-io/delta-kernel-rs/pull/2622
+[#2602]: https://github.com/delta-io/delta-kernel-rs/pull/2602
+[#2621]: https://github.com/delta-io/delta-kernel-rs/pull/2621
+[#2632]: https://github.com/delta-io/delta-kernel-rs/pull/2632
+[#2635]: https://github.com/delta-io/delta-kernel-rs/pull/2635
+[#2604]: https://github.com/delta-io/delta-kernel-rs/pull/2604
+[#2600]: https://github.com/delta-io/delta-kernel-rs/pull/2600
+[#2647]: https://github.com/delta-io/delta-kernel-rs/pull/2647
+[#2648]: https://github.com/delta-io/delta-kernel-rs/pull/2648
+
+
+## [v0.23.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.23.0/) (2026-05-15)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.22.1...v0.23.0)
+
+
+### 🏗️ Breaking changes
+
+1. Add `delta.parquet.compression.codec` table property ([#2523])
+   - Adds `parquet_compression_codec: Option<ParquetCompressionCodec>` field to
+     `TableProperties`. Callers using exhaustive struct construction must add
+     `parquet_compression_codec: None`. Parsing is case-insensitive and accepts `none` as an
+     alias for `uncompressed`, matching the protocol.
+2. Schema and expression transforms use generic carriers ([#2151])
+   - `ExpressionTransform` and `SchemaTransform` traits now use a generic `Carrier<T>` type
+     instead of being hard-wired to `Option<Cow<...>>`. Implementations must declare the new
+     associated types -- use the `transform_output_type!` macro and pick a carrier that
+     matches the transform's behavior (`Option<Cow>` for filtering, `Cow` for non-filtering,
+     `()` for infallible visitors, `Result<(), ()>` for short-circuiting visitors,
+     `DeltaResult<()>` for fallible validators, etc.). Existing transforms can usually be
+     simplified once ported to the appropriate carrier.
+### 🚀 Features / new APIs
+
+1. Materialize partition values when `icebergCompatV3` enabled ([#2504])
+2. Enforce and test non-null column invariant on writes ([#2483])
+3. Block alter table when `icebergCompatV3` enabled ([#2505])
+4. Write parquet id for nested items in map/array according to metadata ([#2508])
+5. Validate `stats.numRecords` on writes for icebergCompatV3 tables ([#2512])
+6. Expose LastCheckpointHint's path() under internal-api ([#2487])
+7. Add with_operation in ffi ([#2532])
+8. Support `icebergCompatV3` for create table ([#2517])
+9. Support `icebergCompatV3`  ([#2518])
+10. Respect randomizeFilePrefixes and randomPrefixLength in write_dir ([#2513])
+11. Lazily create default executor in DefaultEngineBuilder ([#2536])
+12. Expose CommittedTransaction with post-commit snapshot ([#2488])
+13. Expose ffi accessors for column mapping write path ([#2509])
+14. Preserve pre-existing column mapping metadata on writes ([#2500])
+15. Add IncrementalScanBuilder (raw streaming) ([#2519])
+16. Classify metadata-only re-adds on incremental scan ([#2520])
+
+### 🐛 Bug Fixes
+
+1. Optimize incremental snapshot updates on new checkpoint discovery ([#2351])
+2. Handle `LargeStringArray` in `parse_json` ([#1938])
+3. Accumulate warnings so reporter no longer has deadlock risk ([#2550])
+4. Put correct msrv badge in readme ([#2556])
+5. Share without_partition physical schema across TableConfiguration clones ([#2560])
+
+### 📚 Documentation
+
+1. Add kernel rust user guide ([#2479])
+
+### 🚜 Refactor
+
+1. Enhance SyncEngine with ObjectStore support ([#2396])
+2. Cleanup `crc/mod.rs` ([#2559])
+3. Introduce `FileStatsState` typed enum ([#2562])
+
+### 🧪 Testing
+
+1. Cover non-catalog-managed UC tables in read/write examples ([#2463])
+2. Cover partitionValues_parsed in partitioned write tests ([#2467])
+3. Fix flaky metrics tests caused by tracing callsite cache poisoning ([#2484])
+4. Add multi-checkpoint support to TestTableBuilder ([#2284])
+5. Consolidate some test lines + script to check ([#2348])
+6. Add post-cleanup for TestTableBuilder ([#2543])
+7. Add LastCheckpointHintState (Present/Missing/Stale) for TestTableBuilder ([#2521])
+
+### ⚙️ Chores/CI
+
+1. Clean full target before user-guide doc tests ([#2548])
+2. Bump object_store 0.13.1 -> 0.13.2 ([#2366])
+3. Bring changelog up to date for 0.22.1 ([#2554])
+4. Disable rust-cache cache-bin to fix macOS runner ([#2566])
+5. *(deps)* Bump openssl from 0.10.76 to 0.10.79 ([#2563])
+
+
+[#2479]: https://github.com/delta-io/delta-kernel-rs/pull/2479
+[#2151]: https://github.com/delta-io/delta-kernel-rs/pull/2151
+[#2504]: https://github.com/delta-io/delta-kernel-rs/pull/2504
+[#2483]: https://github.com/delta-io/delta-kernel-rs/pull/2483
+[#2505]: https://github.com/delta-io/delta-kernel-rs/pull/2505
+[#2508]: https://github.com/delta-io/delta-kernel-rs/pull/2508
+[#2512]: https://github.com/delta-io/delta-kernel-rs/pull/2512
+[#2463]: https://github.com/delta-io/delta-kernel-rs/pull/2463
+[#2467]: https://github.com/delta-io/delta-kernel-rs/pull/2467
+[#2484]: https://github.com/delta-io/delta-kernel-rs/pull/2484
+[#2487]: https://github.com/delta-io/delta-kernel-rs/pull/2487
+[#2351]: https://github.com/delta-io/delta-kernel-rs/pull/2351
+[#2532]: https://github.com/delta-io/delta-kernel-rs/pull/2532
+[#2517]: https://github.com/delta-io/delta-kernel-rs/pull/2517
+[#2523]: https://github.com/delta-io/delta-kernel-rs/pull/2523
+[#2518]: https://github.com/delta-io/delta-kernel-rs/pull/2518
+[#2513]: https://github.com/delta-io/delta-kernel-rs/pull/2513
+[#1938]: https://github.com/delta-io/delta-kernel-rs/pull/1938
+[#2536]: https://github.com/delta-io/delta-kernel-rs/pull/2536
+[#2284]: https://github.com/delta-io/delta-kernel-rs/pull/2284
+[#2348]: https://github.com/delta-io/delta-kernel-rs/pull/2348
+[#2488]: https://github.com/delta-io/delta-kernel-rs/pull/2488
+[#2548]: https://github.com/delta-io/delta-kernel-rs/pull/2548
+[#2509]: https://github.com/delta-io/delta-kernel-rs/pull/2509
+[#2366]: https://github.com/delta-io/delta-kernel-rs/pull/2366
+[#2550]: https://github.com/delta-io/delta-kernel-rs/pull/2550
+[#2396]: https://github.com/delta-io/delta-kernel-rs/pull/2396
+[#2554]: https://github.com/delta-io/delta-kernel-rs/pull/2554
+[#2500]: https://github.com/delta-io/delta-kernel-rs/pull/2500
+[#2556]: https://github.com/delta-io/delta-kernel-rs/pull/2556
+[#2543]: https://github.com/delta-io/delta-kernel-rs/pull/2543
+[#2566]: https://github.com/delta-io/delta-kernel-rs/pull/2566
+[#2562]: https://github.com/delta-io/delta-kernel-rs/pull/2562
+[#2519]: https://github.com/delta-io/delta-kernel-rs/pull/2519
+[#2560]: https://github.com/delta-io/delta-kernel-rs/pull/2560
+[#2520]: https://github.com/delta-io/delta-kernel-rs/pull/2520
+[#2563]: https://github.com/delta-io/delta-kernel-rs/pull/2563
+[#2559]: https://github.com/delta-io/delta-kernel-rs/pull/2559
+[#2521]: https://github.com/delta-io/delta-kernel-rs/pull/2521
+
+
+## [v0.22.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.22.1/) (2026-01-20)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.22.0...v0.22.1)
+
+### 🐛 Bug Fixes
+
+1. fix: accumulate warnings so reporter no longer has deadlock risk. Previous the `warn!` in some
+   reporter code could cause deadlocks. (#2550)
+
+[#2550]: https://github.com/delta-io/delta-kernel-rs/pull/2550
+
 ## [v0.22.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.22.0/) (2026-04-29)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.21.0...v0.22.0)

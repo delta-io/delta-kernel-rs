@@ -18,12 +18,13 @@ use crate::engine::arrow_utils::{
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::metrics::emit_json_read_completed;
+use crate::metrics::{emit_json_read_completed, PrecountedMetricsIterator};
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    JsonHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -173,7 +174,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.buffer_size,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(Box::new(super::ReadMetricsIterator::new(
+        Ok(Box::new(PrecountedMetricsIterator::new(
             inner,
             num_files,
             bytes_read,
@@ -185,7 +186,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         self.task_executor.block_on(write_json_file_impl(
@@ -945,5 +946,19 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    // === JsonHandler contract tests ===
+    //
+    // Calls the shared contract helper in `engine::tests` against `DefaultJsonHandler` (the
+    // matching `SyncJsonHandler` invocation lives in `engine/sync/json.rs`).
+
+    #[test]
+    fn json_handler_file_path_contract() {
+        let handler = DefaultJsonHandler::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        crate::engine::tests::test_json_handler_file_path_contract(&handler);
     }
 }

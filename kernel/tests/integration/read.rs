@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{AsArray as _, RecordBatch, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{ArrayRef, AsArray as _, RecordBatch, TimestampMicrosecondArray};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
-    Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
@@ -762,6 +763,68 @@ fn predicate_on_letter_and_number(
     Ok(())
 }
 
+// Regression test for issue #2468
+#[rstest::rstest]
+#[case::predicate_on_unprojected_data_column_in_table_schema_succeeds(
+    // `number` is a data column not present in the projected schema (`a_float`).
+    column_expr!("number").gt(Expr::literal(4i64)),
+    vec![
+        "+---------+",
+        "| a_float |",
+        "+---------+",
+        "| 5.5     |",
+        "| 6.6     |",
+        "+---------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::predicate_on_partition_column_in_table_schema_succeeds(
+    column_expr!("letter").eq(Expr::literal("a")),
+    vec![
+        "+---------+",
+        "| a_float |",
+        "+---------+",
+        "| 1.1     |",
+        "| 4.4     |",
+        "+---------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::predicate_on_mixed_projected_and_unprojected_columns_succeeds(
+    // a_float is projected, number is unprojected
+    Pred::and(
+        column_expr!("a_float").gt(Expr::literal(4.0)),
+        column_expr!("number").lt(Expr::literal(6i64)),
+    ),
+    vec![
+        "+---------+",
+        "| a_float |",
+        "+---------+",
+        "| 4.4     |",
+        "| 5.5     |",
+        "+---------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+fn predicate_on_unprojected_column(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float"]),
+        Some(pred),
+        expected,
+    )?;
+    Ok(())
+}
+
 /// Test partition pruning on a table with a checkpoint containing `partitionValues_parsed`.
 /// This exercises the checkpoint code path where typed partition values are read directly
 /// from the parquet column rather than parsed from the string map via `MapToStruct`.
@@ -967,6 +1030,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
 #[case::partition_only(
     // Partition-only predicate: category = 'A' prunes the category=B file
     Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    None,
     1
 )]
 #[case::mixed_partition_and_data(
@@ -976,11 +1040,29 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
         Pred::eq(column_expr!("category"), Expr::literal("A")),
         Pred::gt(column_expr!("val"), Expr::literal("z")),
     )),
+    None,
+    1
+)]
+#[case::predicate_on_unprojected_data_column(
+    // Project only "category"; predicate references unprojected "val" (logical) whose
+    // physical name is "phys_val". Kernel must resolve to phys_val via the full table
+    // schema and prune both files: max(phys_val)='z' is NOT > 'z'.
+    Arc::new(Pred::gt(column_expr!("val"), Expr::literal("z"))),
+    Some(vec!["category"]),
+    0
+)]
+#[case::predicate_on_unprojected_partition_column(
+    // Project only "val"; predicate references unprojected partition column "category"
+    // (logical, physical name "phys_category"). Partition pruning must still kick in
+    // using the physical partition name, keeping only the category=A file.
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    Some(vec!["val"]),
     1
 )]
 #[tokio::test]
-async fn partition_pruning_with_column_mapping(
+async fn test_partition_pruning_with_column_mapping(
     #[case] predicate: Arc<Pred>,
+    #[case] select_cols: Option<Vec<&'static str>>,
     #[case] expected_files: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_array())])?;
@@ -1025,18 +1107,45 @@ async fn partition_pruning_with_column_mapping(
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
-    // Predicates use logical column names -- kernel must map to physical names
-    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    // Predicates use logical column names -- kernel must map to physical names. The
+    // optional projection narrows the output schema; when set, the predicate may still
+    // reference columns outside it
+    let projection = select_cols
+        .as_ref()
+        .map(|cols| snapshot.schema().project(cols))
+        .transpose()?;
+    let scan = snapshot
+        .scan_builder()
+        .with_schema_opt(projection)
+        .with_predicate(predicate)
+        .build()?;
 
     let stream = scan.execute(engine)?;
     let mut files_scanned = 0;
+    // "category" is in the output iff there's no projection (SELECT *) or the projection
+    // explicitly includes it.
+    let expect_category = select_cols
+        .as_ref()
+        .is_none_or(|cols| cols.contains(&"category"));
     for engine_data in stream {
         let result_batch = into_record_batch(engine_data?);
-        // The "category" partition column should be filled with "A"
-        let category_idx = result_batch.schema().index_of("category")?;
-        let category_col = result_batch.column(category_idx).as_string::<i32>();
-        for i in 0..result_batch.num_rows() {
-            assert_eq!(category_col.value(i), "A");
+        // The "category" partition column should be present exactly when projected, and
+        // should be 'A' for every surviving row.
+        match result_batch.schema().index_of("category") {
+            Ok(category_idx) => {
+                assert!(
+                    expect_category,
+                    "category present but not expected in projection"
+                );
+                let category_col = result_batch.column(category_idx).as_string::<i32>();
+                for i in 0..result_batch.num_rows() {
+                    assert_eq!(category_col.value(i), "A");
+                }
+            }
+            Err(_) => assert!(
+                !expect_category,
+                "category missing but expected in projection"
+            ),
         }
         files_scanned += 1;
     }
@@ -2063,6 +2172,57 @@ fn checkpoint_stats_skipping(
     Ok(())
 }
 
+// Verifies ScanFile.stats is populated from struct stats in checkpoints.
+// Tables have writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
+// schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
+// include_all_stats_columns() forces stats_parsed into the scan output so the COALESCE
+// fallback (ToJson(stats_parsed)) produces a JSON stats string for ScanFile.stats.
+#[rstest::rstest]
+#[test]
+fn struct_stats_surfaced_in_scan_file(
+    #[values(
+        "v1-single-part",
+        "v1-multi-part",
+        "v2-parquet-sidecars",
+        "v2-json-sidecars",
+        "v2-classic-parquet"
+    )]
+    checkpoint_type: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_path = format!("./tests/data/{checkpoint_type}-struct-stats-only/");
+    let path = std::fs::canonicalize(PathBuf::from(table_path))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .include_all_stats_columns()
+        .build()?;
+
+    let mut scan_files = vec![];
+    for res in scan.scan_metadata(engine.as_ref())? {
+        let scan_metadata = res?;
+        scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
+    }
+
+    assert_eq!(scan_files.len(), 5, "expected 5 files in checkpoint");
+    for scan_file in &scan_files {
+        assert!(
+            scan_file.stats.is_some(),
+            "ScanFile.stats should be populated from struct stats, path: {}",
+            scan_file.path
+        );
+        assert_eq!(
+            scan_file.stats.as_ref().unwrap().num_records,
+            1,
+            "each file has exactly 1 row, path: {}",
+            scan_file.path
+        );
+    }
+    Ok(())
+}
+
 // Multi-part V1 checkpoint with partitionValues_parsed on a partitioned table.
 // Schema: (id: long, value: string, part: int) partitioned by part.
 // Each commit inserts one row with part = i % 3 (parts 0, 1, 2).
@@ -2249,6 +2409,61 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
     Ok(())
 }
 
+// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/739
+// Void columns should be present in scan results as all-null columns.
+#[tokio::test]
+async fn read_table_with_void_column() -> Result<(), Box<dyn std::error::Error>> {
+    // Parquet batch has only the non-void column (parquet cannot represent void)
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"void_col\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // The table schema has both "id" and "void_col"
+    assert!(snapshot.schema().field("void_col").is_some());
+    assert!(snapshot.schema().field("id").is_some());
+
+    let scan = snapshot.scan_builder().build()?;
+
+    // The scan's logical schema should contain the void column (returned as null)
+    let logical_schema = scan.logical_schema();
+    assert!(logical_schema.field("void_col").is_some());
+    assert!(logical_schema.field("id").is_some());
+    assert_eq!(logical_schema.fields().count(), 2);
+
+    // Execute the scan and verify void column appears as all-null
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_columns(), 2);
+    assert_eq!(batches[0].schema().field(0).name(), "id");
+    assert_eq!(batches[0].schema().field(1).name(), "void_col");
+    assert_eq!(batches[0].num_rows(), 3);
+    // void column should be Arrow Null type
+    assert_eq!(
+        *batches[0].schema().field(1).data_type(),
+        ArrowDataType::Null
+    );
+
+    Ok(())
+}
+
 // End-to-end tests using a Spark-written Delta table with real truncated JSON stats.
 // Table has three files:
 //   file 1: id=[1,2], ts_col=[1s, 2s]           -- max at ms boundary
@@ -2277,6 +2492,174 @@ fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>
             "| 5  | 1970-01-01T00:00:07Z        |",
             "| 6  | 1970-01-01T00:00:08Z        |",
             "+----+-----------------------------+",
+        ],
+    )
+}
+
+// Verify that an explicit projection including a void column returns it as null.
+#[tokio::test]
+async fn explicit_projection_with_void_column_returns_nulls(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"void_col\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // Explicitly request both columns, including the void one
+    let schema = snapshot.schema();
+    let scan = snapshot.scan_builder().with_schema(schema).build()?;
+
+    // The void column should be present in the logical schema (returned as null)
+    let logical_schema = scan.logical_schema();
+    assert!(logical_schema.field("void_col").is_some());
+    assert!(logical_schema.field("id").is_some());
+    assert_eq!(logical_schema.fields().count(), 2);
+
+    // Execute and verify void column appears as all-null
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_columns(), 2);
+    assert_eq!(batches[0].schema().field(0).name(), "id");
+    assert_eq!(batches[0].schema().field(1).name(), "void_col");
+    assert_eq!(
+        *batches[0].schema().field(1).data_type(),
+        ArrowDataType::Null
+    );
+
+    Ok(())
+}
+
+// Verify that void fields inside nested structs are preserved in the scan schema and data.
+// Delta schema: {id: int, info: struct<name: string, v: void>}
+// Parquet schema: {id: int, info: struct<name: string>} (void field missing from Parquet)
+// Result: void field appears as all-null in the returned data.
+#[tokio::test]
+async fn read_table_with_void_in_nested_struct() -> Result<(), Box<dyn std::error::Error>> {
+    // Parquet batch: {id: int, info: struct<name: string>} (without the void field)
+    let name_array: ArrayRef = Arc::new(delta_kernel::arrow::array::StringArray::from(vec![
+        "alice", "bob",
+    ]));
+    let inner_fields = vec![delta_kernel::arrow::datatypes::Field::new(
+        "name",
+        ArrowDataType::Utf8,
+        true,
+    )];
+    let struct_array =
+        delta_kernel::arrow::array::StructArray::new(inner_fields.into(), vec![name_array], None);
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(delta_kernel::arrow::array::Int32Array::from(vec![1, 2])) as ArrayRef,
+        ),
+        ("info", Arc::new(struct_array) as ArrayRef),
+    ])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void-nested","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"info\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"v\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // Table schema has the void field inside nested struct
+    let table_schema = snapshot.schema();
+    let info_field = table_schema.field("info").expect("info should exist");
+    if let DataType::Struct(inner) = info_field.data_type() {
+        assert!(
+            inner.field("v").is_some(),
+            "table schema should have void field 'v'"
+        );
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+
+    // Scan logical schema should preserve the void field in the nested struct
+    let logical_schema = scan.logical_schema();
+    let info_field = logical_schema
+        .field("info")
+        .expect("info should exist in scan");
+    if let DataType::Struct(inner) = info_field.data_type() {
+        assert!(
+            inner.field("v").is_some(),
+            "void field 'v' should be preserved"
+        );
+        assert!(
+            inner.field("name").is_some(),
+            "non-void field 'name' should remain"
+        );
+        assert_eq!(inner.fields().count(), 2);
+    } else {
+        panic!("info should be a struct type");
+    }
+
+    // Execute the scan and verify void field appears as null in the struct
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+
+    // The info struct should have 2 fields: name (string) and v (null)
+    let info_col = batches[0].column_by_name("info").expect("info column");
+    let info_struct = info_col
+        .as_any()
+        .downcast_ref::<delta_kernel::arrow::array::StructArray>()
+        .expect("info should be struct");
+    assert_eq!(info_struct.num_columns(), 2);
+    assert_eq!(info_struct.column_by_name("name").unwrap().len(), 2);
+    let v_col = info_struct
+        .column_by_name("v")
+        .expect("v field should exist");
+    assert_eq!(*v_col.data_type(), ArrowDataType::Null);
+    assert_eq!(v_col.len(), 2);
+
+    Ok(())
+}
+
+// Integration test using a real Delta table created by Spark with a void column.
+// Verifies that the kernel returns void column as all-null on reads.
+#[test]
+fn read_spark_table_with_void_column() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/void-column",
+        None, // SELECT * -- void column should appear as null
+        None,
+        vec![
+            "+----+----------+",
+            "| id | void_col |",
+            "+----+----------+",
+            "| 1  |          |",
+            "| 2  |          |",
+            "| 3  |          |",
+            "+----+----------+",
         ],
     )
 }
@@ -2370,4 +2753,332 @@ fn timestamp_truncation_real_table_eq() -> Result<(), Box<dyn std::error::Error>
             "+----+-----------------------------+",
         ],
     )
+}
+
+async fn scan_with_void_schema(
+    schema_string: &str,
+    table_id: &str,
+    num_rows: i32,
+) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let batch = generate_batch(vec![(
+        "id",
+        (1..=num_rows).collect::<Vec<_>>().into_array(),
+    )])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        format!(
+            r#"{{"metaData":{{"id":"{table_id}","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{schema_string}","partitionColumns":[],"configuration":{{}},"createdTime":1587968585495}}}}"#
+        ),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        ),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    Ok(read_scan(&scan, engine)?)
+}
+
+// Verify that a table with void nested inside an Array can be read at runtime.
+// Write-time validation rejects void-in-array, but reads and metadata ops always work.
+// The arr column is absent from the Parquet schema; kernel synthesizes a null column at read
+// time (the entire column is NULL, not an array of null elements).
+#[tokio::test]
+async fn read_void_in_array_type_ok() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_string = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"arr\",\"type\":{\"type\":\"array\",\"elementType\":\"void\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}"#;
+    let batches = scan_with_void_schema(schema_string, "test-void-array", 2).await?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+
+    let arr_col = batches[0]
+        .column_by_name("arr")
+        .expect("arr column must be in RecordBatch");
+    assert_eq!(
+        arr_col.null_count(),
+        arr_col.len(),
+        "entire column should be null"
+    );
+    match arr_col.data_type() {
+        ArrowDataType::List(elem) => assert_eq!(*elem.data_type(), ArrowDataType::Null),
+        other => panic!("expected List<Null>, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+// Verify that a table with void nested inside a Map value can be read at runtime.
+// Write-time validation rejects void-in-map, but reads and metadata ops always work.
+// The m column is absent from the Parquet schema; kernel synthesizes a null column at read
+// time (the entire column is NULL, not a map with null entries).
+#[tokio::test]
+async fn read_void_in_map_type_ok() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_string = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"m\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"void\",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}"#;
+    let batches = scan_with_void_schema(schema_string, "test-void-map", 2).await?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+
+    let m_col = batches[0]
+        .column_by_name("m")
+        .expect("m column must be in RecordBatch");
+    assert_eq!(
+        m_col.null_count(),
+        m_col.len(),
+        "entire column should be null"
+    );
+    match m_col.data_type() {
+        ArrowDataType::Map(entries, _) => {
+            let entries = entries.data_type();
+            match entries {
+                ArrowDataType::Struct(fields) => {
+                    assert_eq!(*fields[0].data_type(), ArrowDataType::Utf8);
+                    assert_eq!(*fields[1].data_type(), ArrowDataType::Null);
+                }
+                other => panic!("expected Struct inside Map, got {other:?}"),
+            }
+        }
+        other => panic!("expected Map<String,Null>, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+// Verify runtime read of a struct where all fields are void.
+// Delta schema: {id: int, s: struct<x: void, y: void>}
+// Parquet has only {id} — the entire struct is missing and must materialize as null.
+#[tokio::test]
+async fn read_all_void_struct() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_string = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"s\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"x\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}},{\"name\":\"y\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}"#;
+    let batches = scan_with_void_schema(schema_string, "test-all-void-struct", 3).await?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 3);
+
+    let s_col = batches[0].column_by_name("s").expect("s column");
+    let s_struct = s_col
+        .as_any()
+        .downcast_ref::<delta_kernel::arrow::array::StructArray>()
+        .expect("s should be struct");
+    assert_eq!(s_struct.num_columns(), 2);
+
+    let x_col = s_struct.column_by_name("x").expect("x field");
+    let y_col = s_struct.column_by_name("y").expect("y field");
+    assert_eq!(*x_col.data_type(), ArrowDataType::Null);
+    assert_eq!(*y_col.data_type(), ArrowDataType::Null);
+    assert_eq!(x_col.len(), 3);
+    assert_eq!(y_col.len(), 3);
+
+    Ok(())
+}
+
+// Verify that a table where ALL field are void can still be read (returns all-null rows).
+// Reads always succeed; only writes fail for all-void tables.
+#[tokio::test]
+async fn read_all_void_table() -> Result<(), Box<dyn std::error::Error>> {
+    // Empty Parquet file (no columns) — the row count comes from the Parquet metadata
+    let batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-all-void","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"a\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}},{\"name\":\"b\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // Schema should contain both void columns
+    assert_eq!(snapshot.schema().fields().count(), 2);
+    assert!(snapshot.schema().field("a").is_some());
+    assert!(snapshot.schema().field("b").is_some());
+
+    let scan = snapshot.scan_builder().build()?;
+    let logical_schema = scan.logical_schema();
+    assert_eq!(logical_schema.fields().count(), 2);
+
+    // Execute read_scan — runtime must not crash even with all-void schema.
+    // Parquet file has 0 columns/0 rows → empty row group → reader produces no batches.
+    // The key verification is that read_scan() doesn't error.
+    let batches = read_scan(&scan, engine)?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 0);
+
+    Ok(())
+}
+
+// Verify that a void column used as a partition column works on reads.
+// The partition value is missing (null), so parse_partition_value_raw returns Scalar::Null(VOID).
+#[tokio::test]
+async fn read_table_with_void_partition_column() -> Result<(), Box<dyn std::error::Error>> {
+    // Parquet file has only the non-partition, non-void column
+    let batch = generate_batch(vec![("id", vec![1, 2].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[\"void_part\"]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void-part","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"void_part\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["void_part"],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    let scan = snapshot.scan_builder().build()?;
+    let logical_schema = scan.logical_schema();
+    assert!(logical_schema.field("void_part").is_some());
+    assert!(logical_schema.field("id").is_some());
+
+    // Execute and verify both columns appear
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    // void partition column should appear as Null type
+    let void_col = batches[0]
+        .column_by_name("void_part")
+        .expect("void partition column");
+    assert_eq!(*void_col.data_type(), ArrowDataType::Null);
+    assert_eq!(void_col.len(), 2);
+
+    Ok(())
+}
+
+// Verify that predicate pushdown on a void column works correctly.
+// A predicate like `void_col IS NULL` is always true for void columns, so no rows are skipped.
+#[tokio::test]
+async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::Error>> {
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void-pred","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"void_col\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // Predicate: void_col IS NULL — always true for void, should return all rows
+    let predicate = Arc::new(column_expr!("void_col").is_null());
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()?;
+
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "IS NULL on void should return all rows");
+
+    // Predicate: void_col IS NOT NULL — always false for void. The Add action above has no
+    // `stats` string, so kernel has nothing to skip on. All rows are returned.
+    // Skipping driven by `nullCount` is exercised by `void_predicate_skips_via_null_count`.
+    let predicate_not_null = Arc::new(column_expr!("void_col").is_not_null());
+    let scan_not_null = snapshot
+        .scan_builder()
+        .with_predicate(predicate_not_null)
+        .build()?;
+    let batches_not_null = read_scan(&scan_not_null, engine)?;
+    let total_rows_not_null: usize = batches_not_null.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows_not_null, 3,
+        "IS NOT NULL on void: no row-level filtering, all rows returned"
+    );
+
+    Ok(())
+}
+
+// File-level skipping via the `nullCount` Delta stat for void columns. The Spark fixture's 3
+// Add actions each carry stats with `nullCount.void_col == numRecords == 1`, so kernel can prune
+// every file for `IS NOT NULL`. Contrast with `read_with_predicate_on_void_column`, whose Add
+// action has no `stats` and consequently returns all 3 rows for the same predicate -- confirming
+// that pruning (not row-level filtering) is what produces the empty result here.
+#[rstest::rstest]
+#[case::is_null(
+    column_expr!("void_col").is_null(),
+    vec![
+        "+----+----------+",
+        "| id | void_col |",
+        "+----+----------+",
+        "| 1  |          |",
+        "| 2  |          |",
+        "| 3  |          |",
+        "+----+----------+",
+    ]
+)]
+#[case::is_not_null(column_expr!("void_col").is_not_null(), vec![])]
+fn void_predicate_skips_via_null_count(
+    #[case] predicate: Pred,
+    #[case] expected: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str("./tests/data/void-column", None, Some(predicate), expected)
+}
+
+// Direct evidence that void-column predicates drive file-level pruning: count the surviving
+// ScanFiles after `scan_metadata` rather than relying on the empty-batches contrast. With the
+// Spark fixture's `nullCount.void_col == numRecords` stats, `IS NOT NULL` prunes all 3 files
+// and `IS NULL` keeps all 3.
+#[rstest::rstest]
+#[case::is_null_keeps_all(column_expr!("void_col").is_null(), 3)]
+#[case::is_not_null_prunes_all(column_expr!("void_col").is_not_null(), 0)]
+fn void_predicate_pruning_scan_file_count(
+    #[case] predicate: Pred,
+    #[case] expected_files: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/void-column"))?;
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut scan_files: Vec<ScanFile> = vec![];
+    for res in scan.scan_metadata(engine.as_ref())? {
+        scan_files = res?.visit_scan_files(scan_files, scan_metadata_callback)?;
+    }
+    assert_eq!(scan_files.len(), expected_files);
+    Ok(())
 }

@@ -7,10 +7,10 @@
 
 use std::sync::LazyLock;
 
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
-use crate::scan::data_skipping::stats_schema::STATS_NUM_RECORDS;
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
 use crate::DeltaResult;
@@ -56,10 +56,10 @@ impl StatsColumnVerifier {
     ) -> DeltaResult<()> {
         let column_names = vec![
             ColumnName::new(["path"]),
-            ColumnName::new(["stats", "numRecords"]),
-            build_stat_path(column, "nullCount"),
-            build_stat_path(column, "minValues"),
-            build_stat_path(column, "maxValues"),
+            ColumnName::new(["stats", NUM_RECORDS]),
+            build_stat_path(column, NULL_COUNT),
+            build_stat_path(column, MIN_VALUES),
+            build_stat_path(column, MAX_VALUES),
         ];
         let types = column_types_for(data_type)?;
 
@@ -187,9 +187,13 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => Err(
-            Error::internal_error(format!("Unsupported data type for stats validation: {dt}")),
-        ),
+        &DataType::VOID
+        | DataType::Struct(_)
+        | DataType::Array(_)
+        | DataType::Map(_)
+        | DataType::Variant(_) => Err(Error::internal_error(format!(
+            "Unsupported data type for stats validation: {dt}"
+        ))),
     }
 }
 
@@ -217,11 +221,13 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => {
-            Err(Error::internal_error(format!(
-                "Unsupported data type for stats presence check: {data_type}"
-            )))
-        }
+        &DataType::VOID
+        | DataType::Struct(_)
+        | DataType::Array(_)
+        | DataType::Map(_)
+        | DataType::Variant(_) => Err(Error::internal_error(format!(
+            "Unsupported data type for stats presence check: {data_type}"
+        ))),
     }
 }
 
@@ -251,8 +257,8 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 
         for row_idx in 0..row_count {
             let path: String = getters[0].get(row_idx, "path")?;
-            let num_records = getters[1].get_long(row_idx, "numRecords")?;
-            let null_count = getters[2].get_long(row_idx, "nullCount")?;
+            let num_records = getters[1].get_long(row_idx, NUM_RECORDS)?;
+            let null_count = getters[2].get_long(row_idx, NULL_COUNT)?;
 
             // When all rows are null (or the file is empty), minValues/maxValues are
             // expected to be null since there are no non-null values to aggregate.
@@ -280,7 +286,7 @@ pub(crate) fn verify_num_records_present(
 ) -> DeltaResult<()> {
     let column_names = vec![
         ColumnName::new(["path"]),
-        ColumnName::new(["stats", STATS_NUM_RECORDS]),
+        ColumnName::new(["stats", NUM_RECORDS]),
     ];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
@@ -321,7 +327,7 @@ impl RowVisitor for NumRecordsValidator<'_> {
             ))
         );
         for row_idx in 0..row_count {
-            if getters[1].get_long(row_idx, STATS_NUM_RECORDS)?.is_none() {
+            if getters[1].get_long(row_idx, NUM_RECORDS)?.is_none() {
                 *self.first_missing = Some(getters[0].get(row_idx, "path")?);
                 return Ok(());
             }
@@ -399,10 +405,10 @@ mod tests {
         };
 
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            inner_struct_type("nullCount"),
-            inner_struct_type("minValues"),
-            inner_struct_type("maxValues"),
+            ArrowField::new(NUM_RECORDS, ArrowDataType::Int64, true),
+            inner_struct_type(NULL_COUNT),
+            inner_struct_type(MIN_VALUES),
+            inner_struct_type(MAX_VALUES),
         ]);
         let stats_struct = StructArray::new(
             stats_fields.clone(),
@@ -454,9 +460,9 @@ mod tests {
     #[test]
     fn test_verify_missing_stat_category() {
         let cases = [
-            ("nullCount", vec![None], vec![Some(1)], vec![Some(100)]),
-            ("minValues", vec![Some(0)], vec![None], vec![Some(100)]),
-            ("maxValues", vec![Some(0)], vec![Some(1)], vec![None]),
+            (NULL_COUNT, vec![None], vec![Some(1)], vec![Some(100)]),
+            (MIN_VALUES, vec![Some(0)], vec![None], vec![Some(100)]),
+            (MAX_VALUES, vec![Some(0)], vec![Some(1)], vec![None]),
         ];
         for (category, null_counts, min_values, max_values) in cases {
             let batch = create_add_file_batch(
@@ -548,7 +554,7 @@ mod tests {
         let result = verifier.verify(&[batch]);
         assert!(matches!(result, Err(Error::StatsValidation(_))));
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("minValues"));
+        assert!(err.contains(MIN_VALUES));
     }
 
     /// Creates test data with two columns (col_a, col_b) in stats, both LONG.
@@ -589,10 +595,10 @@ mod tests {
             ArrowField::new("col_b", ArrowDataType::Int64, true),
         ]));
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            ArrowField::new("nullCount", inner_type.clone(), true),
-            ArrowField::new("minValues", inner_type.clone(), true),
-            ArrowField::new("maxValues", inner_type, true),
+            ArrowField::new(NUM_RECORDS, ArrowDataType::Int64, true),
+            ArrowField::new(NULL_COUNT, inner_type.clone(), true),
+            ArrowField::new(MIN_VALUES, inner_type.clone(), true),
+            ArrowField::new(MAX_VALUES, inner_type, true),
         ]);
         let stats_struct = StructArray::new(
             stats_fields.clone(),
@@ -654,7 +660,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_msg.contains("col_b"));
-        assert!(err_msg.contains("minValues"));
+        assert!(err_msg.contains(MIN_VALUES));
         assert!(!err_msg.contains("col_a"));
     }
 
@@ -715,7 +721,7 @@ mod tests {
 
         // numRecords should match row count
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -724,7 +730,7 @@ mod tests {
 
         // All-null/empty columns are present in minValues/maxValues with null values
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -732,7 +738,7 @@ mod tests {
         assert!(min_values.column_by_name("col").unwrap().is_null(0));
 
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -991,10 +997,10 @@ mod tests {
             )
         };
         let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            inner_struct_type("nullCount"),
-            inner_struct_type("minValues"),
-            inner_struct_type("maxValues"),
+            ArrowField::new(NUM_RECORDS, ArrowDataType::Int64, true),
+            inner_struct_type(NULL_COUNT),
+            inner_struct_type(MIN_VALUES),
+            inner_struct_type(MAX_VALUES),
         ]);
         let zero_inner_struct_array = StructArray::new(
             Fields::from(vec![col_field]),

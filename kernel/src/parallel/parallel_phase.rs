@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
@@ -229,7 +229,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
         let json_adds = add_paths
@@ -316,7 +316,7 @@ mod tests {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
         let sidecar1_data = parse_json_batch(vec![
@@ -971,7 +971,7 @@ mod tests {
         let scan_events: Vec<&ScanType> = events
             .iter()
             .filter_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted { scan_type, .. } => Some(scan_type),
+                MetricEvent::ScanMetadataCompleted(s) => Some(&s.scan_type),
                 _ => None,
             })
             .collect();
@@ -1008,11 +1008,11 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::SequentialPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s)
+                    if s.scan_type == ScanType::SequentialPhase =>
+                {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected SequentialPhase ScanMetadataCompleted event after finish()");
@@ -1028,11 +1028,9 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::ParallelPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s) if s.scan_type == ScanType::ParallelPhase => {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected ParallelPhase ScanMetadataCompleted event after log_metrics()");

@@ -1,16 +1,93 @@
-# issue_comment is used here to trigger on PR comments, as opposed to pull_request_review
-# (review submissions) or pull_request_review_comment (comments on the diff itself)
-# we want to trigger this on comment creation or edit
+# IMPORTANT: this workflow runs untrusted PR code and has a non-obvious
+# security model documented at ../SECURITY_MODEL.md. Anyone editing this
+# file -- or reviewing changes to it -- MUST read that document first.
+# Several constraints below (permissions blocks, save-if expressions, the
+# step ordering around actions/checkout, the bench-pr-number upload) look
+# like style choices but are load-bearing.
+#
+# Benchmarks run on four triggers:
+#   - pull_request: every push to a non-draft PR auto-runs with BENCH_TAGS=base
+#   - push (main only): warms the rust-cache so PR runs restore a warm target/
+#   - issue_comment: a /bench [--tags ...] [--filter ...] comment runs with
+#                    the supplied flags (including on draft PRs)
+#   - merge_group: declared so this workflow can be added to branch protection
+#                  as a required status check later. Currently a no-op.
+# Comment posting lives in a separate workflow_run-triggered workflow at
+# .github/workflows/benchmark-post-comment.yml (mirroring the pr-validator /
+# comment-on-title-failure split). This workflow uploads /tmp/bench-comment.md
+# as an artifact; that workflow downloads it and posts/updates the PR comment
+# in base-branch context (which has the write scope this workflow lacks under
+# pull_request from a fork).
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  merge_group:
   issue_comment:
     types: [created, edited]
+
 name: Benchmarking PR performance
+
+# Start from an empty default; each job opts into the minimum scopes it needs.
+# Adding a new job without thinking about permissions inherits zero, not full.
+permissions: {}
+
 jobs:
+  warm-bench-cache:
+    # On every push to main, compile the bench harness (no measurement) so
+    # rust-cache saves a warm target/ under main's scope. PR runs then restore
+    # this entry instead of compiling cold every time. Rapid main pushes
+    # dedupe via the concurrency group.
+    name: Warm bench cache
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: warm-bench-cache
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+      # shared-key keeps this and `run-benchmark` in the same cache namespace
+      # so PR runs can restore what we save here.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          shared-key: bench
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Compile bench harness
+        run: (cd benchmarks && cargo bench --locked --bench workload_bench --no-run)
+
+  bench-merge-queue-noop:
+    # Placeholder job for the merge_group trigger so the workflow can be wired
+    # up as a required status check later without restructuring. Does nothing
+    # meaningful today (see top-level comment for rationale).
+    name: Bench (merge queue no-op)
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "Benchmark workflow is a no-op on merge queue events."
+
   run-benchmark:
     name: Run benchmarks
+    # Auto-trigger: PR push events, skipping drafts. Comment-trigger: a
+    # literal /bench, optionally followed by args (e.g. /bench --tags base).
     if: >
-      github.event.issue.pull_request &&
-      (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+          (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench ')))
+    # Job-level (not workflow-level) so unrelated PR comments don't join the
+    # group and cancel an in-flight bench via cancel-in-progress.
+    concurrency:
+      group: bench-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -22,16 +99,75 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER:   ${{ github.event.pull_request.number }}
         run: |
-          PR_DATA=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
-          HEAD_SHA=$(echo "$PR_DATA" | jq -r .head.sha)
-          BASE_REF=$(echo "$PR_DATA" | jq -r .base.ref)
-          [[ "$HEAD_SHA" == *$'\n'* || "$BASE_REF" == *$'\n'* ]] && { echo "Unexpected newline in API response" >&2; exit 1; }
-          [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.-]+$ ]] || { echo "Invalid BASE_REF: $BASE_REF" >&2; exit 1; }
+          # GitHub Actions runs bash with -eo pipefail by default; -u catches
+          # typos / unset variables. All four fields below are then validated
+          # against strict allowlists before being used or emitted -- the PR
+          # head sha and base ref are attacker-controllable (fork PR author),
+          # and the issue/PR number is concatenated into a gh api URL.
+          set -u
+          if [[ "$EVENT_NAME" == "issue_comment" ]]; then
+            # /bench path: the issue_comment payload doesn't include the PR
+            # head/base, so look it up via the API. Validate the number first
+            # so a malformed value cannot inject path segments into the URL.
+            [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] \
+              || { echo "Invalid ISSUE_NUMBER: $ISSUE_NUMBER" >&2; exit 1; }
+            PR_DATA=$(gh api "repos/$REPO/pulls/$ISSUE_NUMBER")
+            HEAD_SHA=$(echo "$PR_DATA" | jq -r .head.sha)
+            BASE_REF=$(echo "$PR_DATA" | jq -r .base.ref)
+            NUM="$ISSUE_NUMBER"
+          else
+            # Auto-trigger path: pull_request payload has everything.
+            HEAD_SHA="$PR_HEAD_SHA"
+            BASE_REF="$PR_BASE_REF"
+            NUM="$PR_NUMBER"
+            [[ "$NUM" =~ ^[1-9][0-9]*$ ]] \
+              || { echo "Invalid PR_NUMBER: $NUM" >&2; exit 1; }
+          fi
+          # HEAD_SHA must be a hex Git SHA (40 char SHA-1 or 64 char SHA-256).
+          # The allowlist also catches the empty-string case if jq somehow
+          # returned no value.
+          [[ "$HEAD_SHA" =~ ^[a-f0-9]{40,64}$ ]] \
+            || { echo "Invalid HEAD_SHA: $HEAD_SHA" >&2; exit 1; }
+          # BASE_REF is a Git ref name; standard ref-name allowlist (letters,
+          # digits, slash, dot, dash, underscore). Both regexes exclude
+          # newlines, so no separate newline check is needed.
+          [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.-]+$ ]] \
+            || { echo "Invalid BASE_REF: $BASE_REF" >&2; exit 1; }
           printf 'head_sha=%s\n' "$HEAD_SHA" >> "$GITHUB_OUTPUT"
           printf 'base_ref=%s\n'  "$BASE_REF"  >> "$GITHUB_OUTPUT"
-          printf 'pr_number=%s\n' "$PR_NUMBER"  >> "$GITHUB_OUTPUT"
+          printf 'pr_number=%s\n' "$NUM"      >> "$GITHUB_OUTPUT"
+      - name: Stash PR number for the post-comment workflow
+        # Written to /tmp/pr-number.txt and uploaded as its own artifact in
+        # the next step. The two-step shape (write then upload) keeps the
+        # value out of /tmp by the time PR-controlled code runs below; see
+        # the upload step for the security rationale.
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: printf '%s\n' "$PR_NUMBER" > /tmp/pr-number.txt
+      - name: Upload PR number (trusted, pre-checkout)
+        # Uploaded BEFORE checking out the PR head so the artifact's contents
+        # cannot be tampered with by PR-controlled code that runs in later
+        # steps. Once stored on GitHub Actions storage the artifact is
+        # immutable, and this job's contents:read token has no actions:write
+        # scope, so the bench script cannot delete or replace it.
+        #
+        # The post-comment workflow trusts this artifact only for the
+        # `issue_comment` upstream path, where benchmark.yml itself is
+        # served from the default branch (trusted) -- the fork cannot
+        # influence what gets written. For `pull_request` upstream the
+        # workflow YAML is fork-controlled, so the post-comment workflow
+        # ignores this artifact and derives the PR number from the trusted
+        # workflow_run.head_branch instead.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-pr-number
+          path: /tmp/pr-number.txt
       - name: Install critcmp
         # Installed before checkout so the PR's .cargo/config.toml cannot
         # redirect the registry to a malicious source. The runner's
@@ -42,41 +178,39 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ steps.pr.outputs.head_sha }}
+          persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      # See build.yml top-level comment for why save-if is restricted to main.
+      # See build.yml top-level comment for why save-if is restricted to main
+      # and why cache-bin is disabled. `shared-key: bench` keeps this aligned
+      # with `warm-bench-cache` so PR runs restore the entry that main pushes
+      # save -- without the shared-key, each job's cache lives in a separate
+      # namespace and the warming would not benefit PRs.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
+          shared-key: bench
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Run benchmarks
-        # The comment is posted in the post-comment job after this job completes.
+        # The benchmark-post-comment workflow picks up the uploaded artifact
+        # and posts the PR comment in base-branch context (which has the
+        # write scope this workflow lacks on fork PRs).
+        # COMMENT is only meaningful under issue_comment; under pull_request
+        # the expression resolves to "" and the script treats that as bare /bench.
         env:
           COMMENT:  ${{ github.event.comment.body }}
+          TRIGGER:  ${{ github.event_name == 'issue_comment' && '/bench' || 'auto-push' }}
           BASE_REF: ${{ steps.pr.outputs.base_ref }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: bash benchmarks/ci/run-benchmarks.sh
-      - name: Upload benchmark comment
+      - name: Upload bench comment
+        # Default `if: success()` -- a bench failure leaves no body to post.
+        # The post-failure-comment workflow doesn't need this artifact; it
+        # uses the separately-uploaded bench-pr-number artifact (or the
+        # workflow_run.head_branch lookup, depending on upstream event) to
+        # learn which PR to post the static failure note on.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-comment
           path: /tmp/bench-comment.md
-
-  post-comment:
-    name: Post benchmark results
-    needs: run-benchmark
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-    steps:
-      - name: Download benchmark comment
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: bench-comment
-          path: /tmp/
-      - name: Post results as PR comment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ needs.run-benchmark.outputs.pr_number }}
-          REPO: ${{ github.repository }}
-        run: gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/bench-comment.md

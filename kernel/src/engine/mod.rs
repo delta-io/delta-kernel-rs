@@ -40,6 +40,9 @@ pub use self::arrow_utils::{parse_json, to_json_bytes};
 #[cfg(feature = "default-engine-base")]
 pub mod default;
 
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
+
 #[cfg(test)]
 pub(crate) mod sync;
 
@@ -57,6 +60,3 @@ pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-#[cfg(test)]
-mod cross_engine_tests;

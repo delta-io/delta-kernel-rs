@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -20,7 +21,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
-use test_utils::{read_scan, test_table_setup_mt, write_batch_to_table};
+use test_utils::{begin_transaction, read_scan, test_table_setup_mt, write_batch_to_table};
 
 // ==============================================================================
 // Tests
@@ -777,9 +778,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
         .with_engine_info("default engine");
 
     // Build the input logical batch with all schema columns, including the partition column.
@@ -809,23 +808,23 @@ async fn test_materialized_partition_columns_excluded_from_stats(
 
     // Stats should contain the data column but NOT the partition column.
     assert!(
-        stats["minValues"].get("number").is_some(),
+        stats[MIN_VALUES].get("number").is_some(),
         "data column 'number' should have minValues"
     );
     assert!(
-        stats["maxValues"].get("number").is_some(),
+        stats[MAX_VALUES].get("number").is_some(),
         "data column 'number' should have maxValues"
     );
     assert!(
-        stats["minValues"].get(partition_col).is_none(),
+        stats[MIN_VALUES].get(partition_col).is_none(),
         "partition column should not have minValues even when materialized"
     );
     assert!(
-        stats["maxValues"].get(partition_col).is_none(),
+        stats[MAX_VALUES].get(partition_col).is_none(),
         "partition column should not have maxValues even when materialized"
     );
     assert!(
-        stats["nullCount"].get(partition_col).is_none(),
+        stats[NULL_COUNT].get(partition_col).is_none(),
         "partition column should not have nullCount even when materialized"
     );
 
@@ -896,8 +895,7 @@ async fn test_partition_null_validation_non_materialized(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    let result = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let result = begin_transaction(snapshot, engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([("p".to_string(), value)]));
 
@@ -951,26 +949,21 @@ async fn test_partition_null_validation_mixed_nullability(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
             ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
         ]))?;
 
-    snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
             ("p_optional".to_string(), Scalar::String(String::new())),
         ]))?;
 
-    let err = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let err = begin_transaction(snapshot, engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::Null(DataType::STRING)),
@@ -1019,9 +1012,7 @@ async fn test_partition_null_validation_in_batch_materialized(
     // being filtered out), so the NOT NULL enforcement seam moves into the engine: a null
     // in a `nullable: false` field is rejected at batch construction below, independent of
     // whatever value the mock map carries here.
-    let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("default engine");
+    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
     let _write_context = txn.partitioned_write_context(HashMap::from([(
         "p".to_string(),
         Scalar::String("a".into()),

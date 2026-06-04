@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
     LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
@@ -431,6 +432,21 @@ fn compute_column_stats(
                 max_value: None,
             })
         }
+        // Void columns (Arrow `Null` / kernel `VOID`): every value is null by definition,
+        // and the column has no parquet representation. We still need to publish nullCount
+        // for IS NULL / IS NOT NULL data skipping, so synthesize it from the array length.
+        // Use `column.len()` rather than `column.null_count()` because `NullArray` has no
+        // null buffer and the inherited `Array::null_count` default returns 0.
+        DataType::Null => {
+            if !filter.contains_prefix_of(path) {
+                return Ok(ColumnStats::default());
+            }
+            Ok(ColumnStats {
+                null_count: Some(Arc::new(Int64Array::from(vec![column.len() as i64]))),
+                min_value: None,
+                max_value: None,
+            })
+        }
         _ => {
             // Leaf: check filter, compute all stats together
             if !filter.contains_prefix_of(path) {
@@ -511,9 +527,9 @@ pub(crate) fn collect_stats(
     let schema = batch.schema();
 
     // Collect all stats in a single traversal
-    let mut null_counts = StatsAccumulator::new("nullCount");
-    let mut min_values = StatsAccumulator::new("minValues");
-    let mut max_values = StatsAccumulator::new("maxValues");
+    let mut null_counts = StatsAccumulator::new(NULL_COUNT);
+    let mut min_values = StatsAccumulator::new(MIN_VALUES);
+    let mut max_values = StatsAccumulator::new(MAX_VALUES);
 
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let mut path = vec![field.name().to_string()];
@@ -534,7 +550,7 @@ pub(crate) fn collect_stats(
     }
 
     // Build output struct
-    let mut fields = vec![Field::new("numRecords", DataType::Int64, true)];
+    let mut fields = vec![Field::new(NUM_RECORDS, DataType::Int64, true)];
     let mut arrays: Vec<Arc<dyn Array>> =
         vec![Arc::new(Int64Array::from(vec![batch.num_rows() as i64]))];
 
@@ -546,7 +562,7 @@ pub(crate) fn collect_stats(
     }
 
     // tightBounds
-    fields.push(Field::new("tightBounds", DataType::Boolean, true));
+    fields.push(Field::new(TIGHT_BOUNDS, DataType::Boolean, true));
     arrays.push(Arc::new(BooleanArray::from(vec![true])));
 
     StructArray::try_new(fields.into(), arrays, None)
@@ -557,7 +573,8 @@ pub(crate) fn collect_stats(
 mod tests {
     use super::*;
     use crate::arrow::array::{
-        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, NullArray,
+        StringArray,
     };
     use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
     use crate::arrow::compute::concat_batches;
@@ -577,7 +594,7 @@ mod tests {
 
         assert_eq!(stats.len(), 1);
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -605,7 +622,7 @@ mod tests {
 
         // Check nullCount struct
         let null_count = stats
-            .column_by_name("nullCount")
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -650,7 +667,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id")]).unwrap();
 
         let null_count = stats
-            .column_by_name("nullCount")
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -686,7 +703,7 @@ mod tests {
 
         // Check minValues
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -710,7 +727,7 @@ mod tests {
 
         // Check maxValues
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -755,7 +772,7 @@ mod tests {
 
         // numRecords should be 3
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -764,7 +781,7 @@ mod tests {
 
         // nullCount should be 3
         let null_count = stats
-            .column_by_name("nullCount")
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -782,7 +799,7 @@ mod tests {
         // check nullCount == numRecords. The JSON serializer omits null fields, so
         // the on-disk format still matches Spark's ignoreNullFields behavior.
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -791,13 +808,110 @@ mod tests {
         assert!(min_col.is_null(0));
 
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
         let max_col = max_values.column_by_name("value").unwrap();
         assert!(max_col.is_null(0));
+    }
+
+    // A void column reaches stats only if a connector or direct caller bypasses the
+    // kernel-side physical write schema, which strips void columns. Even so, we must
+    // publish nullCount = numRecords rather than 0, because `NullArray` has no null
+    // buffer and the inherited `Array::null_count` default returns 0. Min/max are not
+    // meaningful for void.
+    #[rstest::rstest]
+    #[case::non_empty(5)]
+    #[case::empty(0)]
+    fn test_collect_stats_void_column_synthesizes_full_null_count(#[case] length: usize) {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(length))]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("v")]).unwrap();
+
+        let null_count = stats
+            .column_by_name("nullCount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let v_null_count = null_count
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v_null_count.value(0), length as i64);
+
+        // Void columns do not participate in min/max stats. With void as the only stats
+        // column, both struct accumulators stay empty and the fields are omitted entirely.
+        assert!(stats.column_by_name("minValues").is_none());
+        assert!(stats.column_by_name("maxValues").is_none());
+    }
+
+    #[test]
+    fn test_collect_stats_void_column_nested_in_struct() {
+        // Worst realistic shape for the latent bug: void buried inside a struct alongside
+        // a non-void sibling. The recursion must reach the `DataType::Null` arm so that
+        // `s.v` records `nullCount = numRecords`, while `s.a` still gets full min/max.
+        let inner_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("v", DataType::Null, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(inner_fields.clone()),
+            false,
+        )]));
+        let inner = StructArray::try_new(
+            inner_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                Arc::new(NullArray::new(4)) as ArrayRef,
+            ],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(inner) as ArrayRef]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("s.a"), column_name!("s.v")]).unwrap();
+
+        let s_null_count = stats
+            .column_by_name("nullCount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let v_null_count = s_null_count
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v_null_count.value(0), 4);
+
+        // `s.a` keeps its min/max; `s.v` does not appear under min/max because void has no
+        // ordering.
+        let s_min = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(s_min.column_by_name("a").is_some());
+        assert!(s_min.column_by_name("v").is_none());
     }
 
     #[test]
@@ -811,13 +925,13 @@ mod tests {
         let stats = collect_stats(&batch, &[]).unwrap();
 
         // Should still have numRecords and tightBounds
-        assert!(stats.column_by_name("numRecords").is_some());
-        assert!(stats.column_by_name("tightBounds").is_some());
+        assert!(stats.column_by_name(NUM_RECORDS).is_some());
+        assert!(stats.column_by_name(TIGHT_BOUNDS).is_some());
 
         // Should not have nullCount, minValues, maxValues
-        assert!(stats.column_by_name("nullCount").is_none());
-        assert!(stats.column_by_name("minValues").is_none());
-        assert!(stats.column_by_name("maxValues").is_none());
+        assert!(stats.column_by_name(NULL_COUNT).is_none());
+        assert!(stats.column_by_name(MIN_VALUES).is_none());
+        assert!(stats.column_by_name(MAX_VALUES).is_none());
     }
 
     #[test]
@@ -836,7 +950,7 @@ mod tests {
 
         // Check minValues - should be truncated to exactly 32 chars
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -854,7 +968,7 @@ mod tests {
 
         // Check maxValues - should be 32 chars + 0x7F tie-breaker (since 'a' < 0x7F)
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -889,7 +1003,7 @@ mod tests {
 
         // Check maxValues - should use UTF8_MAX_CHAR since 'À' (the truncated char) >= 0x7F
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -922,7 +1036,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
 
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -938,7 +1052,7 @@ mod tests {
         assert_eq!(text_min.value(0), short_string);
 
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1044,7 +1158,7 @@ mod tests {
 
         // Check nullCount.nested.a = 0, nullCount.nested.b = 1
         let null_count = stats
-            .column_by_name("nullCount")
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1075,7 +1189,7 @@ mod tests {
 
         // Check minValues.nested.a = 5, minValues.nested.b = "apple"
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1106,7 +1220,7 @@ mod tests {
 
         // Check maxValues.nested.a = 20, maxValues.nested.b = "zebra"
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1171,7 +1285,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("list_col")]).unwrap();
 
         let null_count = stats
-            .column_by_name("nullCount")
+            .column_by_name(NULL_COUNT)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1197,7 +1311,7 @@ mod tests {
 
         // minValues should have id but NOT list_col
         let min_values = stats
-            .column_by_name("minValues")
+            .column_by_name(MIN_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1207,7 +1321,7 @@ mod tests {
 
         // maxValues should have id but NOT list_col
         let max_values = stats
-            .column_by_name("maxValues")
+            .column_by_name(MAX_VALUES)
             .unwrap()
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1265,14 +1379,14 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("map_col")]).unwrap();
 
         // === THEN: map_col has nullCount=1 but no min/max ===
-        let null_count = child_struct(&stats, "nullCount");
+        let null_count = child_struct(&stats, NULL_COUNT);
         let map_nulls = null_count
             .column_by_name("map_col")
             .unwrap()
             .as_primitive::<Int64Type>();
         assert_eq!(map_nulls.value(0), 1);
 
-        let min_values = child_struct(&stats, "minValues");
+        let min_values = child_struct(&stats, MIN_VALUES);
         assert!(min_values.column_by_name("id").is_some());
         assert!(min_values.column_by_name("map_col").is_none());
     }
@@ -1322,7 +1436,7 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("v")]).unwrap();
 
         // === THEN: v has nullCount=1 at the struct level, no recursion, no min/max ===
-        let null_count = child_struct(&stats, "nullCount");
+        let null_count = child_struct(&stats, NULL_COUNT);
         let v_nulls = null_count
             .column_by_name("v")
             .unwrap()
@@ -1333,7 +1447,7 @@ mod tests {
         assert!(null_count.column_by_name("metadata").is_none());
         assert!(null_count.column_by_name("value").is_none());
 
-        let min_values = child_struct(&stats, "minValues");
+        let min_values = child_struct(&stats, MIN_VALUES);
         assert!(min_values.column_by_name("id").is_some());
         assert!(min_values.column_by_name("v").is_none());
     }
@@ -1391,31 +1505,31 @@ mod tests {
 
         // nullCount includes struct-level nulls
         assert_eq!(
-            get_stat::<Int64Type>(&stats, "nullCount", "my_struct", "a"),
+            get_stat::<Int64Type>(&stats, NULL_COUNT, "my_struct", "a"),
             2
         );
         assert_eq!(
-            get_stat::<Int64Type>(&stats, "nullCount", "my_struct", "b"),
+            get_stat::<Int64Type>(&stats, NULL_COUNT, "my_struct", "b"),
             3
         );
 
         // minValues excludes values from null struct rows
         assert_eq!(
-            get_stat::<Int32Type>(&stats, "minValues", "my_struct", "a"),
+            get_stat::<Int32Type>(&stats, MIN_VALUES, "my_struct", "a"),
             2
         );
         assert_eq!(
-            get_stat::<Int32Type>(&stats, "minValues", "my_struct", "b"),
+            get_stat::<Int32Type>(&stats, MIN_VALUES, "my_struct", "b"),
             20
         );
 
         // maxValues excludes values from null struct rows
         assert_eq!(
-            get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "a"),
+            get_stat::<Int32Type>(&stats, MAX_VALUES, "my_struct", "a"),
             3
         );
         assert_eq!(
-            get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "b"),
+            get_stat::<Int32Type>(&stats, MAX_VALUES, "my_struct", "b"),
             20
         );
     }
@@ -1670,12 +1784,12 @@ mod tests {
         // ===== THEN =====
         // Kernel stats must match Spark's numRecords, nullCount, minValues, and maxValues.
         assert_eq!(
-            spark_stats["numRecords"], kernel_stats["numRecords"],
+            spark_stats[NUM_RECORDS], kernel_stats[NUM_RECORDS],
             "numRecords mismatch"
         );
 
         // Compare nullCount, minValues, maxValues (only keys present in Spark's stats)
-        for section in &["nullCount", "minValues", "maxValues"] {
+        for section in &[NULL_COUNT, MIN_VALUES, MAX_VALUES] {
             if let Some(spark_section) = spark_stats.get(*section) {
                 let kernel_section = kernel_stats
                     .get(*section)

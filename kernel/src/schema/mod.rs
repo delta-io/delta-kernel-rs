@@ -16,7 +16,9 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
-use crate::table_features::{get_field_column_mapping_info, ColumnMappingMode};
+use crate::table_features::{
+    validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
+};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -31,6 +33,7 @@ pub mod derive_macro_utils;
 pub(crate) mod derive_macro_utils;
 pub(crate) mod validation;
 pub(crate) mod variant_utils;
+pub(crate) mod void_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -236,6 +239,18 @@ pub struct StructField {
     pub metadata: HashMap<String, MetadataValue>,
 }
 
+/// Parsed (and validated) pre-existing column-mapping annotations on a single field, as
+/// returned by [`StructField::validate_and_extract_existing_column_mapping_annotations`].
+/// Either, both, or neither of the two fields may be present; a field with neither set has no
+/// pre-populated column-mapping metadata.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExistingColumnMappingAnnotations<'a> {
+    /// Parsed `delta.columnMapping.id`, if present. Guaranteed non-negative.
+    pub id: Option<i64>,
+    /// Borrowed `delta.columnMapping.physicalName`, if present. Guaranteed non-empty.
+    pub physical_name: Option<&'a str>,
+}
+
 impl StructField {
     /// The name of the default row index metadata column.
     ///
@@ -367,6 +382,66 @@ impl StructField {
             MetadataValue::Number(n) => Some(*n),
             _ => None,
         }
+    }
+
+    /// Validates and extracts pre-existing column-mapping annotations on this field, returning
+    /// the parsed `id` and `physical_name` borrowed from the field's metadata. Returning the
+    /// parsed values lets the column-mapping assignment dispatch match on
+    /// `(Option<i64>, Option<&str>)` directly, which makes the dispatch total and obviates a
+    /// catch-all panic for malformed annotations the validator already rejects.
+    ///
+    /// Rejects:
+    /// - `delta.columnMapping.id` is present but not a `MetadataValue::Number`,
+    /// - `delta.columnMapping.id` is a `Number` but lies outside the protocol's 32-bit non-negative
+    ///   range (negative or `> i32::MAX`); see
+    ///   [`crate::table_features::validate_column_mapping_id`],
+    /// - `delta.columnMapping.physicalName` is present but not a `MetadataValue::String`,
+    /// - `delta.columnMapping.physicalName` is an empty `String`.
+    ///
+    /// Empty-name, negative-id, and over-`i32::MAX` id are stricter than delta-spark (which
+    /// accepts the first two and historically truncates the third); kernel fails fast at
+    /// write time so a connector that supplies bad metadata learns about it on the call that
+    /// produced it. Wrong-typed `id` errors take precedence over wrong-typed `physicalName`
+    /// errors (a connector that fixes the `id` and retries will then see the `physicalName`
+    /// error).
+    pub(crate) fn validate_and_extract_existing_column_mapping_annotations(
+        &self,
+    ) -> DeltaResult<ExistingColumnMappingAnnotations<'_>> {
+        let id = match self.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+            Some(MetadataValue::Number(n)) => {
+                validate_column_mapping_id(*n)
+                    .map_err(|e| Error::schema(format!("Field '{}': {e}", self.name)))?;
+                Some(*n)
+            }
+            None => None,
+            Some(_) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-numeric `{}` annotation",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                )));
+            }
+        };
+        let physical_name =
+            match self.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                Some(MetadataValue::String(s)) if s.is_empty() => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has an empty `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+                Some(MetadataValue::String(s)) => Some(s.as_str()),
+                None => None,
+                Some(_) => {
+                    return Err(Error::schema(format!(
+                        "Field '{}' has a non-string `{}` annotation",
+                        self.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    )));
+                }
+            };
+        Ok(ExistingColumnMappingAnnotations { id, physical_name })
     }
 
     /// Recursively collects every `delta.columnMapping.id` reachable from this field --
@@ -515,8 +590,8 @@ impl StructField {
     /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
     ///
     /// NOTE: Caller affirms that `self` was already validated by
-    /// [`crate::table_features::get_field_column_mapping_info`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`], to ensure that
+    /// annotations are always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
@@ -529,7 +604,8 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `get_field_column_mapping_info` should have verified that this has a field Id
+                    // `validate_and_extract_column_mapping_annotations` should have verified that
+                    // this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -1665,6 +1741,7 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
+    Void,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
@@ -1771,6 +1848,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "date" => Ok(PrimitiveType::Date),
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            "void" => Ok(PrimitiveType::Void),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1823,6 +1901,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
+            PrimitiveType::Void => write!(f, "void"),
         }
     }
 }
@@ -1954,6 +2033,7 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
+    pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -2101,31 +2181,47 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
 
 struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
-    path: Vec<&'a str>,
-    seen: HashMap<i64, &'a str>,
+    /// Logical path of current field's parent, used for error messages.
+    logical_path: Vec<&'a str>,
+    /// `delta.columnMapping.id` -> first claimer logical name.
+    seen_ids: HashMap<i64, &'a str>,
+    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
+    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
+    /// pushed in `transform_struct` (root struct included) and popped after iterating its
+    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
+    /// elements / keys / values are anonymous.
+    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
         Self {
             column_mapping_mode,
-            path: vec![],
-            seen: HashMap::new(),
+            logical_path: vec![],
+            seen_ids: HashMap::new(),
+            sibling_names_stack: vec![],
         }
     }
 
     fn transform_inner<T>(
         &mut self,
-        field_name: &'a str,
+        logical_name: &'a str,
         transform: impl FnOnce(&mut Self) -> DeltaResult<T>,
     ) -> DeltaResult<T> {
-        self.path.push(field_name);
+        self.logical_path.push(logical_name);
         let result = transform(self);
-        self.path.pop();
+        self.logical_path.pop();
         result
     }
 }
 impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
+
+    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
+        self.sibling_names_stack.push(HashMap::new());
+        let result = self.recurse_into_struct(stype);
+        self.sibling_names_stack.pop();
+        result
+    }
 
     fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<array element>", |this| this.transform(etype))
@@ -2140,18 +2236,19 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         &mut self,
         field: &'a StructField,
     ) -> DeltaResult<Cow<'a, StructField>> {
+        let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
+            field,
+            self.column_mapping_mode,
+            &self.logical_path,
+            Some(&mut self.seen_ids),
+            self.sibling_names_stack.last_mut(),
+        )?;
+
+        if field.is_metadata_column() {
+            return Ok(Cow::Borrowed(field));
+        }
+
         self.transform_inner(field.name(), |this| {
-            let (physical_name, _id) = get_field_column_mapping_info(
-                field,
-                this.column_mapping_mode,
-                &this.path,
-                Some(&mut this.seen),
-            )?;
-
-            if field.is_metadata_column() {
-                return Ok(Cow::Borrowed(field));
-            }
-
             let field = this.recurse_into_struct_field(field)?;
 
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
@@ -2176,7 +2273,8 @@ mod tests {
     use super::*;
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::{
-        assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
+        assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
+        test_deep_nested_schema_missing_leaf_cm,
     };
 
     fn example_schema_metadata() -> &'static str {
@@ -2322,6 +2420,53 @@ mod tests {
             json_str,
             r#"{"name":"v","type":"variant","nullable":false,"metadata":{}}"#
         );
+    }
+
+    #[test]
+    fn test_roundtrip_void() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_void_non_nullable() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+        assert!(!field.nullable);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":false,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_void_display() {
+        assert_eq!(PrimitiveType::Void.to_string(), "void");
+        assert_eq!(DataType::VOID.to_string(), "void");
     }
 
     #[test]
@@ -2558,6 +2703,44 @@ mod tests {
             schema.make_physical(ColumnMappingMode::Id),
             "Duplicate column mapping ID",
         );
+    }
+
+    #[rstest]
+    #[case::accepted_same_phy_name_different_paths(fixtures::same_phy_name_different_paths(), /*expected_error_substring*/None)]
+    #[case::rejected_deeply_nested_repeat_physical_paths(
+        fixtures::deeply_nested_repeat_physical_paths(),
+        Some({
+            let (a, b) =
+                fixtures::deeply_nested_collider_paths();
+            format!("assigned to both '{a}' and '{b}'")
+        }),
+    )]
+    #[case::multiple_physical_name_collisions_reports_first(
+        fixtures::multiple_physical_name_collisions(),
+        Some("'p' assigned to both 'a' and 'b'".to_string()),
+    )]
+    fn test_make_physical_dup_physical_name(
+        #[case] schema: StructType,
+        #[case] expected_error_substring: Option<String>,
+    ) {
+        // The same dedup rules should apply under both CM modes.
+        for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
+            let result = schema.make_physical(mode);
+            match &expected_error_substring {
+                None => {
+                    result.expect("The input schema should be valid");
+                }
+                Some(substr) => {
+                    assert_result_error_with_message(result.as_ref().map(|_| ()), substr);
+                    if let Err(e) = &result {
+                        assert!(
+                            !e.to_string().contains("'q'"),
+                            "walker must short-circuit on first collision under {mode:?}; got: {e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

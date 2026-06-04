@@ -11,13 +11,11 @@ use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
@@ -90,7 +88,7 @@ fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u
 async fn build_log_with_paths_and_checkpoint(
     paths: &[Path],
     checkpoint_metadata: Option<&LastCheckpointHint>,
-) -> (Box<dyn StorageHandler>, Url) {
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
 
     let data = bytes::Bytes::from("kernel-data");
@@ -114,11 +112,12 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let engine = SyncEngine::new_with_store(store);
+    let storage = engine.storage_handler();
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
-    (Box::new(storage), log_root)
+    (storage, log_root)
 }
 
 // Create an in-memory store and return the store and the URL for the store's _delta_log directory.
@@ -1052,7 +1051,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let sidecar1_size = add_sidecar_to_store(
@@ -1100,7 +1099,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1119,7 +1118,10 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
     let err = iter.next().unwrap();
-    assert_result_error_with_message(err, "Arrow error: External: Object at location _delta_log/_sidecars/sidecarfile1.parquet not found: No data in memory found. Location: _delta_log/_sidecars/sidecarfile1.parquet");
+    assert_result_error_with_message(
+        err,
+        "File not found: _delta_log/_sidecars/sidecarfile1.parquet",
+    );
 
     Ok(())
 }
@@ -1127,7 +1129,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     // Add a sidecar file with only add actions
@@ -1171,7 +1173,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are
@@ -1225,7 +1227,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1303,7 +1305,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     add_checkpoint_to_store(
         &store,
@@ -1360,7 +1362,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1423,7 +1425,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Write sidecars first so we can get their actual sizes
     let sidecar1_size = add_sidecar_to_store(
@@ -2005,12 +2007,18 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         .await
         .expect("put empty compaction");
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let engine = SyncEngine::new_with_store(store);
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
 
-    let log_segment =
-        LogSegment::for_snapshot_impl(&storage, log_root.clone(), vec![], None, None).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        engine.storage_handler().as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         log_segment.listed.ascending_compaction_files.len(),
@@ -2781,7 +2789,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     #[case] expect_hint_schema_used: bool,
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Build a checkpoint with an initial v1 schema
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
@@ -2855,20 +2863,20 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 #[tokio::test]
 async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
     // Build a V1 checkpoint schema with stats_parsed containing an integer column.
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "minValues",
+            MIN_VALUES,
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
         ),
         StructField::nullable(
-            "maxValues",
+            MAX_VALUES,
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
         ),
     ]);
@@ -3046,12 +3054,12 @@ async fn test_max_published_version_checkpoint_only() {
 // Helper to create a checkpoint schema with stats_parsed for testing
 fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         StructField::nullable(
-            "minValues",
+            MIN_VALUES,
             StructType::new_unchecked(min_values_fields.clone()),
         ),
-        StructField::nullable("maxValues", StructType::new_unchecked(min_values_fields)),
+        StructField::nullable(MAX_VALUES, StructType::new_unchecked(min_values_fields)),
     ]);
 
     let add_schema = StructType::new_unchecked([
@@ -3065,12 +3073,9 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 // Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
 fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
     StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
-        StructField::nullable(
-            "minValues",
-            StructType::new_unchecked(column_fields.clone()),
-        ),
-        StructField::nullable("maxValues", StructType::new_unchecked(column_fields)),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
+        StructField::nullable(MIN_VALUES, StructType::new_unchecked(column_fields.clone())),
+        StructField::nullable(MAX_VALUES, StructType::new_unchecked(column_fields)),
     ])
 }
 
@@ -3213,7 +3218,7 @@ fn test_schema_has_compatible_stats_parsed_multiple_columns() {
 fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
     // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         // No minValues or maxValues fields
     ]);
 
@@ -3237,10 +3242,10 @@ fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
 fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
     let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
         // minValues is a primitive type instead of a Struct
-        StructField::nullable("minValues", DataType::STRING),
-        StructField::nullable("maxValues", DataType::STRING),
+        StructField::nullable(MIN_VALUES, DataType::STRING),
+        StructField::nullable(MAX_VALUES, DataType::STRING),
     ]);
 
     let add_schema = StructType::new_unchecked([
@@ -3571,7 +3576,7 @@ fn test_stats_parsed_mixed_with_one_incompatible_rejects_all() {
 
 /// Creates a checkpoint batch with `add.partitionValues_parsed` in the parquet schema.
 fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
+    let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![
         r#"{"add":{"path":"part-00000.parquet","partitionValues":{"id":"1"},"partitionValues_parsed":{"id":1},"size":635,"modificationTime":1677811178336,"dataChange":true}}"#,
         r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["id"],"configuration":{},"createdTime":1677811175819}}"#,
@@ -3586,7 +3591,7 @@ fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<Arrow
 #[tokio::test]
 async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Build a schema that includes add.partitionValues_parsed.id: integer
     let partition_parsed_struct =
@@ -3699,7 +3704,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
 #[tokio::test]
 async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Write a checkpoint WITHOUT partitionValues_parsed
     add_checkpoint_to_store(
@@ -4174,7 +4179,7 @@ async fn test_get_unpublished_catalog_commits() {
 }
 
 // ============================================================================
-// Tests: segment_after_crc / segment_through_crc
+// Tests: segment_after_crc
 // ============================================================================
 
 fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
@@ -4203,8 +4208,6 @@ struct CrcPruningCase {
     crc_version: u64,
     after_commits: &'static [u64],
     after_compactions: &'static [(u64, u64)],
-    through_commits: &'static [u64],
-    through_compactions: &'static [(u64, u64)],
 }
 
 #[rstest::rstest]
@@ -4212,7 +4215,6 @@ struct CrcPruningCase {
 // commits:             x  x  x  x  x  x  x  x  x  x
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
 #[case::only_deltas_no_checkpoint(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[],
@@ -4220,15 +4222,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // checkpoint:                |
 // commits:                      x  x  x  x  x  x  x
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:              x  x
 #[case::only_deltas_with_checkpoint(CrcPruningCase {
     commits: &[3, 4, 5, 6, 7, 8, 9],
     compactions: &[],
@@ -4236,8 +4235,6 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
@@ -4245,7 +4242,6 @@ struct CrcPruningCase {
 // crc:                             |
 // after commits:                      x  x  x  x  x
 // after compactions:                  [-----]
-// through commits:     x  x  x  x  x
 #[case::compaction_after_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(5, 7)],
@@ -4253,16 +4249,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[], // TODO(#2337): restore to &[(5, 7)] when re-enabled
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
 // compactions:               [-----------]
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
-// through compactions:
 #[case::compaction_overlaps_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(2, 6)],
@@ -4270,16 +4262,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
 // compactions:         [-----]
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
-// through compactions: [-----]
 #[case::compaction_before_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(0, 2)],
@@ -4287,8 +4275,6 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[], // TODO(#2337): restore to &[(0, 2)] when re-enabled
 })]
 #[tokio::test]
 async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
@@ -4305,14 +4291,6 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
     assert!(after.checkpoint_version.is_none());
     assert!(after.listed.checkpoint_parts.is_empty());
-
-    let through = seg.segment_through_crc(case.crc_version);
-    assert_eq!(extract_commit_versions(&through), case.through_commits);
-    assert_eq!(
-        extract_compaction_ranges(&through),
-        case.through_compactions
-    );
-    assert_eq!(through.checkpoint_version, case.checkpoint);
 }
 
 #[rstest::rstest]
@@ -4478,7 +4456,7 @@ async fn read_actions_with_null_map_values(
         .unwrap();
 
     // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = SyncEngine::new_with_store(store);
     let log_segment =
         LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
             .unwrap();

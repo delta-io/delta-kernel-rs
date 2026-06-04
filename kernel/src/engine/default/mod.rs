@@ -19,6 +19,7 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::metrics::MeteredStorageHandler;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
@@ -83,68 +84,11 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
-/// Wraps a [`crate::FileDataReadResultIterator`] to emit a metrics event exactly once when the
-/// iterator is either exhausted or dropped.
-///
-/// Used by the JSON and Parquet handlers to report the number of files and bytes requested per
-/// `read_*_files` call. The `emit_fn` is called with `(num_files, bytes_read)` and is expected
-/// to create and immediately drop a tracing span, which triggers the `ReportGeneratorLayer` to
-/// fire the appropriate [`crate::metrics::MetricEvent`] to any registered reporter.
-pub(super) struct ReadMetricsIterator {
-    inner: crate::FileDataReadResultIterator,
-    num_files: u64,
-    bytes_read: u64,
-    emitted: bool,
-    emit_fn: fn(u64, u64),
-}
-
-impl ReadMetricsIterator {
-    pub(super) fn new(
-        inner: crate::FileDataReadResultIterator,
-        num_files: u64,
-        bytes_read: u64,
-        emit_fn: fn(u64, u64),
-    ) -> Self {
-        Self {
-            inner,
-            num_files,
-            bytes_read,
-            emitted: false,
-            emit_fn,
-        }
-    }
-
-    fn emit_once(&mut self) {
-        if !self.emitted {
-            self.emitted = true;
-            (self.emit_fn)(self.num_files, self.bytes_read);
-        }
-    }
-}
-
-impl Iterator for ReadMetricsIterator {
-    type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let item = self.inner.next();
-        if item.is_none() {
-            self.emit_once();
-        }
-        item
-    }
-}
-
-impl Drop for ReadMetricsIterator {
-    fn drop(&mut self) {
-        self.emit_once();
-    }
-}
-
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    storage: Arc<ObjectStoreStorageHandler<E>>,
+    storage: Arc<MeteredStorageHandler>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
@@ -169,35 +113,48 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///     .build();
 /// ```
 #[derive(Debug)]
-pub struct DefaultEngineBuilder<E: TaskExecutor> {
+pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
-    task_executor: Arc<E>,
+    /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
+    task_executor: E,
 }
 
-impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+/// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
+/// instantiations.
+pub struct DefaultTaskExecutor;
+
+impl DefaultEngineBuilder<DefaultTaskExecutor> {
     /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
-            task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+            task_executor: DefaultTaskExecutor,
         }
+    }
+
+    /// Build the [`DefaultEngine`] instance.
+    pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+        let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        DefaultEngine::new_with_opts(self.object_store, task_executor)
     }
 }
 
-impl<E: TaskExecutor> DefaultEngineBuilder<E> {
+impl<E> DefaultEngineBuilder<E> {
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
     pub fn with_task_executor<F: TaskExecutor>(
         self,
         task_executor: Arc<F>,
-    ) -> DefaultEngineBuilder<F> {
+    ) -> DefaultEngineBuilder<Arc<F>> {
         DefaultEngineBuilder {
             object_store: self.object_store,
             task_executor,
         }
     }
+}
 
+impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
         DefaultEngine::new_with_opts(self.object_store, self.task_executor)
@@ -210,20 +167,19 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    pub fn builder(
-        object_store: Arc<DynObjectStore>,
-    ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+    pub fn builder(object_store: Arc<DynObjectStore>) -> DefaultEngineBuilder<DefaultTaskExecutor> {
         DefaultEngineBuilder::new(object_store)
     }
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
     fn new_with_opts(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+        let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
+            object_store.clone(),
+            task_executor.clone(),
+        ));
         Self {
-            storage: Arc::new(ObjectStoreStorageHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
+            storage: Arc::new(MeteredStorageHandler::new(raw_storage)),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
                 task_executor.clone(),

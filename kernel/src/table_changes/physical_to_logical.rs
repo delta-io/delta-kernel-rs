@@ -73,7 +73,7 @@ pub(crate) fn scan_file_physical_schema(
 
 // Get the transform expression for a CDF scan file
 //
-// Returns None when no transformation is needed (identity transform), otherwise returns Some(expr).
+// Returns None when no transformation is needed, otherwise returns Some(expr).
 //
 // Note: parse_partition_values returns null values for missing partition columns,
 // and CDF metadata columns (commit_timestamp, commit_version, change_type) are then
@@ -98,7 +98,7 @@ pub(crate) fn get_cdf_transform_expr(
         .map(|ts| ts.as_ref())
         .unwrap_or(&empty_spec);
 
-    // Return None for identity transforms to avoid unnecessary expression evaluation
+    // Return None for an empty transform spec to avoid unnecessary expression evaluation.
     if transform_spec.is_empty() {
         return Ok(None);
     }
@@ -127,7 +127,7 @@ pub(crate) fn get_cdf_transform_expr(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use super::*;
@@ -188,6 +188,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         }
     }
 
@@ -220,24 +221,24 @@ mod tests {
         let expr_opt = result.unwrap();
         assert!(expr_opt.is_some(), "Expected Some(expr) but got None");
         let expr = expr_opt.unwrap();
-        let Expression::Transform(transform) = expr.as_ref() else {
-            panic!("Expected Transform expression");
+        let Expression::StructPatch(patch) = expr.as_ref() else {
+            panic!("Expected StructPatch expression");
         };
 
-        // Should have transform for "id" field with CDF metadata
-        assert!(transform.field_transforms.contains_key("id"));
-        let id_transform = &transform.field_transforms["id"];
-        assert!(!id_transform.is_replace);
-        assert_eq!(id_transform.exprs.len(), 2);
+        // Should have a patch for the "id" field with CDF metadata
+        assert!(patch.field_patches.contains_key("id"));
+        let id_patch = &patch.field_patches["id"];
+        assert!(!id_patch.is_replace);
+        assert_eq!(id_patch.exprs.len(), 2);
 
         // Verify _change_type is "insert" for Add files
-        let Expression::Literal(change_type) = id_transform.exprs[0].as_ref() else {
+        let Expression::Literal(change_type) = id_patch.exprs[0].as_ref() else {
             panic!("Expected literal for _change_type");
         };
         assert_eq!(change_type, &Scalar::String("insert".to_string()));
 
         // Verify _commit_version
-        let Expression::Literal(version) = id_transform.exprs[1].as_ref() else {
+        let Expression::Literal(version) = id_patch.exprs[1].as_ref() else {
             panic!("Expected literal for _commit_version");
         };
         assert_eq!(version, &Scalar::Long(100));
@@ -266,15 +267,15 @@ mod tests {
         let expr_opt = result.unwrap();
         assert!(expr_opt.is_some(), "Expected Some(expr) but got None");
         let expr = expr_opt.unwrap();
-        let Expression::Transform(transform) = expr.as_ref() else {
-            panic!("Expected Transform expression");
+        let Expression::StructPatch(patch) = expr.as_ref() else {
+            panic!("Expected StructPatch expression");
         };
 
-        let name_transform = &transform.field_transforms["name"];
-        assert_eq!(name_transform.exprs.len(), 1);
+        let name_patch = &patch.field_patches["name"];
+        assert_eq!(name_patch.exprs.len(), 1);
 
         // Verify _change_type is "delete" for Remove files
-        let Expression::Literal(change_type) = name_transform.exprs[0].as_ref() else {
+        let Expression::Literal(change_type) = name_patch.exprs[0].as_ref() else {
             panic!("Expected literal for _change_type");
         };
         assert_eq!(change_type, &Scalar::String("delete".to_string()));
@@ -315,14 +316,14 @@ mod tests {
         let expr_opt = result.unwrap();
         assert!(expr_opt.is_some(), "Expected Some(expr) but got None");
         let expr = expr_opt.unwrap();
-        let Expression::Transform(transform) = expr.as_ref() else {
-            panic!("Expected Transform expression");
+        let Expression::StructPatch(patch) = expr.as_ref() else {
+            panic!("Expected StructPatch expression");
         };
 
         // Should have age partition value
-        let id_transform = &transform.field_transforms["id"];
-        assert_eq!(id_transform.exprs.len(), 1);
-        let Expression::Literal(age_value) = id_transform.exprs[0].as_ref() else {
+        let id_patch = &patch.field_patches["id"];
+        assert_eq!(id_patch.exprs.len(), 1);
+        let Expression::Literal(age_value) = id_patch.exprs[0].as_ref() else {
             panic!("Expected literal for age");
         };
         assert_eq!(age_value, &Scalar::Long(30));
@@ -330,11 +331,11 @@ mod tests {
         // For CDC files with DynamicColumn, _change_type is handled as physical
         // The transform spec has DynamicColumn which becomes a Column expression for CDC files
         // (not a literal metadata value)
-        let name_transform = &transform.field_transforms["name"];
-        assert_eq!(name_transform.exprs.len(), 1);
+        let name_patch = &patch.field_patches["name"];
+        assert_eq!(name_patch.exprs.len(), 1);
         // Should be a Column expression, not a Literal
         assert!(matches!(
-            name_transform.exprs[0].as_ref(),
+            name_patch.exprs[0].as_ref(),
             Expression::Column(_)
         ));
     }
@@ -375,7 +376,7 @@ mod tests {
     #[test]
     fn test_get_cdf_transform_expr_returns_none_for_identity() {
         // When there's no transform spec and no CDF metadata columns in the schema,
-        // the function should return None (identity transform)
+        // the function should return None.
         let scan_file = CdfScanFile {
             path: "test/file.parquet".to_string(),
             partition_values: HashMap::new(),
@@ -398,7 +399,7 @@ mod tests {
             StructField::nullable("name", DataType::STRING),
         ]);
 
-        // Empty transform spec - no transformations needed
+        // Empty transform spec - no transformation needed.
         let transform_spec = vec![];
 
         let state_info = StateInfo {
@@ -409,6 +410,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
@@ -417,7 +419,7 @@ mod tests {
         let expr_opt = result.unwrap();
         assert!(
             expr_opt.is_none(),
-            "Expected None for identity transform but got Some(expr)"
+            "Expected None for empty transform spec but got Some(expr)"
         );
     }
 }

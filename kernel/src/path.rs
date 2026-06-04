@@ -109,6 +109,14 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 }
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
+    /// Estimated heap size in bytes, best-effort estimate.
+    ///
+    /// The Url(self.location) is measured via `len()` because it doesn't expose the capacity of its
+    /// internal `serialization` String. Any String capacity slack on it is not counted.
+    pub(crate) fn estimated_heap_size_bytes(&self) -> usize {
+        self.filename.capacity() + self.extension.capacity() + self.location.as_url().as_str().len()
+    }
+
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is
     // local.
     #[internal_api]
@@ -376,6 +384,7 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new `ParsedLogPath<Url>` for a version checksum (CRC) file.
+    #[internal_api]
     pub(crate) fn new_crc(table_root: &Url, version: Version) -> DeltaResult<Self> {
         let filename = format!("{version:020}.crc");
         let path = Self::create_path(table_root, filename)?;
@@ -484,7 +493,6 @@ pub(crate) mod tests {
     use test_utils::add_commit;
 
     use super::*;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1058,7 +1066,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 
@@ -1088,7 +1096,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 

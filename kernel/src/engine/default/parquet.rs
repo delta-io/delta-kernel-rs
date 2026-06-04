@@ -24,7 +24,7 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
 use crate::expressions::ColumnName;
-use crate::metrics::emit_parquet_read_completed;
+use crate::metrics::{emit_parquet_read_completed, PrecountedMetricsIterator};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
@@ -34,8 +34,8 @@ use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter}
 use crate::schema::{SchemaRef, StructType};
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
+    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -315,7 +315,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             predicate,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(Box::new(super::ReadMetricsIterator::new(
+        Ok(Box::new(PrecountedMetricsIterator::new(
             inner,
             num_files,
             bytes_read,
@@ -340,7 +340,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         let store = self.store.clone();
 
@@ -475,14 +475,13 @@ async fn open_parquet_file(
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.with_batch_size(batch_size).build()?;
 
-    let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
-            Some(&arrow_schema),
+            Some(&table_schema),
         )
         .map(Into::into)
     });
@@ -558,7 +557,6 @@ impl FileOpener for PresignedUrlOpener {
             let reader = builder.with_batch_size(batch_size).build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-            let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(
@@ -566,7 +564,7 @@ impl FileOpener for PresignedUrlOpener {
                     &requested_ordering,
                     row_indexes.as_mut(),
                     Some(&file_location),
-                    Some(&arrow_schema),
+                    Some(&table_schema),
                 )
                 .map(Into::into)
             });
@@ -585,6 +583,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -598,7 +597,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
     use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::EngineData;
@@ -721,8 +720,8 @@ mod tests {
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
         let stats = StructArray::try_new(
             vec![
-                Field::new("numRecords", ArrowDataType::Int64, true),
-                Field::new("tightBounds", ArrowDataType::Boolean, true),
+                Field::new(NUM_RECORDS, ArrowDataType::Int64, true),
+                Field::new(TIGHT_BOUNDS, ArrowDataType::Boolean, true),
             ]
             .into(),
             vec![
@@ -846,7 +845,7 @@ mod tests {
 
         // Check numRecords from stats
         let num_records = stats
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -923,7 +922,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Test writing through the trait method
@@ -1072,7 +1071,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the data
@@ -1314,8 +1313,6 @@ mod tests {
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     #[test]
     fn test_read_parquet_with_field_id_matching() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
-
         // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
         // The kernel will transform these to parquet.field.id when reading
         let fields = vec![
@@ -1384,6 +1381,12 @@ mod tests {
         // Verify data was correctly matched by field ID
         assert_eq!(data.len(), 1);
         let batch = &data[0];
+
+        // Verify columns were renamed to match the kernel schema (the names from the parquet
+        // file's schema are discarded; the matching agreed on field IDs only).
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).name(), "user_id");
+        assert_eq!(schema.field(1).name(), "user_name");
 
         let id_col = batch
             .column(0)
@@ -1455,7 +1458,7 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // WHEN we write a parquet file to that path
@@ -1484,5 +1487,57 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(col.values(), &[1, 2, 3]);
+    }
+
+    // === ParquetHandler contract tests ===
+    //
+    // These call the shared contract helpers in `engine::tests` against `DefaultParquetHandler`
+    // (the matching `SyncParquetHandler` invocations live in `engine/sync/parquet.rs`).
+
+    fn default_parquet_handler() -> DefaultParquetHandler<TokioBackgroundExecutor> {
+        DefaultParquetHandler::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+    }
+
+    #[test]
+    fn parquet_handler_reads_footer() {
+        crate::engine::tests::test_parquet_handler_reads_footer(&default_parquet_handler());
+    }
+
+    #[test]
+    fn parquet_handler_footer_errors_on_missing_file() {
+        crate::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_footer_preserves_field_ids() {
+        crate::engine::tests::test_parquet_handler_footer_preserves_field_ids(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_write_always_overwrites() {
+        crate::engine::tests::test_parquet_handler_write_always_overwrites(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_write_omits_arrow_schema() {
+        crate::engine::tests::test_parquet_handler_write_omits_arrow_schema(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_reads_file_with_arrow_schema() {
+        crate::engine::tests::test_parquet_handler_reads_file_with_arrow_schema(
+            &default_parquet_handler(),
+        );
     }
 }

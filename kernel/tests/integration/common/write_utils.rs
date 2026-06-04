@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -28,7 +28,7 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
-use test_utils::{create_add_files_metadata, create_table, engine_store_setup};
+use test_utils::{begin_transaction, create_add_files_metadata, create_table, engine_store_setup};
 use url::Url;
 use uuid::Uuid;
 
@@ -204,10 +204,7 @@ pub async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
+    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), engine.as_ref())?
         .with_data_change(true);
 
     // create two new arrow record batches to append
@@ -349,11 +346,11 @@ pub fn assert_min_max_stats(
     expected_max: impl Into<serde_json::Value>,
 ) {
     assert_eq!(
-        *resolve_json_path(&stats["minValues"], physical_path),
+        *resolve_json_path(&stats[MIN_VALUES], physical_path),
         expected_min.into()
     );
     assert_eq!(
-        *resolve_json_path(&stats["maxValues"], physical_path),
+        *resolve_json_path(&stats[MAX_VALUES], physical_path),
         expected_max.into()
     );
 }
@@ -389,9 +386,7 @@ pub async fn create_dv_table_with_files(
 
     // Write files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("WRITE".to_string())
         .with_data_change(true);

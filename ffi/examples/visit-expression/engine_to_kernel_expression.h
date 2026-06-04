@@ -249,8 +249,8 @@ uintptr_t convert_engine_to_kernel_expression_item(
           state, m2s->child_expr.list[0]);
       return visit_expression_map_to_struct(state, child);
     }
-    case Transform:
-    case FieldTransform:
+    case StructPatch:
+    case FieldPatch:
     case OpaqueExpression:
     case OpaquePredicate:
       fprintf(stderr,

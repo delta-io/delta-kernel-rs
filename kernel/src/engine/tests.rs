@@ -17,11 +17,13 @@ use url::Url;
 
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::object_store::path::Path;
+use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
 use crate::schema::{
     column_name, ColumnMetadataKey, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
@@ -260,6 +262,82 @@ pub(crate) fn test_parquet_handler_write_always_overwrites(handler: &dyn Parquet
             .unwrap()
             .values(),
         &[10, 20]
+    );
+}
+
+/// Contract: [`ParquetHandler::write_parquet_file`] must not embed the Arrow IPC schema
+/// (`ARROW:schema`) in the file's key/value metadata.
+pub(crate) fn test_parquet_handler_write_omits_arrow_schema(handler: &dyn ParquetHandler) {
+    let temp_dir = tempdir().unwrap();
+    let file_path = temp_dir.path().join("no_arrow_schema.parquet");
+    let url = Url::from_file_path(&file_path).unwrap();
+
+    let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+        RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
+        )])
+        .unwrap(),
+    ));
+    handler
+        .write_parquet_file(url, Box::new(std::iter::once(Ok(data))))
+        .unwrap();
+
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&file_path).unwrap()).unwrap();
+    let kv = builder.metadata().file_metadata().key_value_metadata();
+    let has = kv
+        .map(|kv| kv.iter().any(|e| e.key == ARROW_SCHEMA_META_KEY))
+        .unwrap_or(false);
+    assert!(
+        !has,
+        "Parquet file should not contain embedded Arrow schema metadata"
+    );
+}
+
+/// Contract: [`ParquetHandler::read_parquet_files`] must successfully read a file whose
+/// metadata contains an embedded Arrow IPC schema (e.g. one produced by [`ArrowWriter`]
+/// without explicit options to skip it).
+pub(crate) fn test_parquet_handler_reads_file_with_arrow_schema(handler: &dyn ParquetHandler) {
+    let temp_dir = tempdir().unwrap();
+    let file_path = temp_dir.path().join("with_arrow_schema.parquet");
+
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
+    )])
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&file_path).unwrap(),
+        batch.schema(),
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let file_meta = file_meta_for(&file_path);
+    let schema = Arc::new(batch.schema().as_ref().try_into_kernel().unwrap());
+    let batches: Vec<RecordBatch> = handler
+        .read_parquet_files(&[file_meta], schema, None)
+        .unwrap()
+        .map(|r| {
+            ArrowEngineData::try_from_engine_data(r.unwrap())
+                .unwrap()
+                .into()
+        })
+        .collect();
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 3);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[10, 20, 30]
     );
 }
 

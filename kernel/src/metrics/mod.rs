@@ -11,7 +11,6 @@
 //! # Example: Implementing a Custom MetricsReporter
 //!
 //! ```
-//! use std::sync::Arc;
 //! use delta_kernel::metrics::{MetricsReporter, MetricEvent};
 //!
 //! #[derive(Debug)]
@@ -20,14 +19,14 @@
 //! impl MetricsReporter for LoggingReporter {
 //!     fn report(&self, event: MetricEvent) {
 //!         match event {
-//!             MetricEvent::LogSegmentLoaded { operation_id, duration, num_commit_files, .. } => {
-//!                 println!("Log segment loaded in {:?}: {} commits", duration, num_commit_files);
+//!             MetricEvent::LogSegmentLoaded(e) => {
+//!                 println!("Log segment loaded in {:?}: {} commits", e.duration, e.num_commit_files);
 //!             }
-//!             MetricEvent::SnapshotCompleted { operation_id, version, total_duration } => {
-//!                 println!("Snapshot completed: v{} in {:?}", version, total_duration);
+//!             MetricEvent::SnapshotCompleted(e) => {
+//!                 println!("Snapshot completed: v{} in {:?}", e.version, e.duration);
 //!             }
-//!             MetricEvent::SnapshotFailed { operation_id, duration } => {
-//!                 println!("Snapshot failed: {} after {:?}", operation_id, duration);
+//!             MetricEvent::SnapshotFailed(e) => {
+//!                 println!("Snapshot failed: {} after {:?}", e.operation_id, e.duration);
 //!             }
 //!             _ => {}
 //!         }
@@ -59,24 +58,40 @@
 //!
 //! # Storage Metrics
 //!
-//! Storage operations (list, read, copy) are automatically instrumented when using
-//! `DefaultEngine` with a metrics reporter. The default storage handler implementation
-//! emits `StorageListCompleted`, `StorageReadCompleted`, and `StorageCopyCompleted`
-//! events that track latencies at the storage layer.
+//! Storage operations (list, read, copy) emit `StorageListCompleted`,
+//! `StorageReadCompleted`, and `StorageCopyCompleted` events tracking latencies at the
+//! storage layer. `DefaultEngine` wraps its storage handler in [`MeteredStorageHandler`]
+//! at construction; any other engine gets the same coverage by wrapping its [`Engine`]
+//! in [`MeteredDeltaEngine`] at construction.
 //!
 //! These metrics are standalone and track aggregate storage performance without
 //! correlating to specific Snapshot/Transaction operations.
+//!
+//! [`Engine`]: crate::Engine
 
-mod events;
+pub(crate) mod events;
+mod metered_engine;
+mod metered_storage;
+#[cfg(feature = "default-engine-base")]
+mod precounted_metrics_iterator;
 pub(crate) mod reporter;
+mod streaming_metrics_iterator;
 
 use std::sync::Arc;
 
-pub use events::{MetricEvent, MetricId, ScanType};
-pub use reporter::{
-    emit_json_read_completed, emit_parquet_read_completed, LoggingMetricsReporter, MetricsReporter,
-    ReportGeneratorLayer,
+pub use events::{
+    emit_json_read_completed, emit_parquet_read_completed, CrcReadCompleted, DomainMetadataLoaded,
+    JsonReadCompleted, LogSegmentLoaded, MetricEvent, MetricId, ParquetReadCompleted,
+    ProtocolMetadataLoaded, ScanMetadataCompleted, ScanType, SetTransactionLoaded,
+    SnapshotCompleted, SnapshotFailed, StorageCopyCompleted, StorageListCompleted,
+    StorageReadCompleted,
 };
+pub use metered_engine::MeteredDeltaEngine;
+pub use metered_storage::MeteredStorageHandler;
+#[cfg(feature = "default-engine-base")]
+pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
+pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
+pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;

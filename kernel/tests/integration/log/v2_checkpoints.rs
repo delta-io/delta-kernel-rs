@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray,
     StructArray,
@@ -23,8 +24,8 @@ use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
 use test_utils::{
-    create_add_files_metadata, create_table_and_load_snapshot, insert_data, load_test_data,
-    read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
+    begin_transaction, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
+    load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
 use crate::common::write_utils::{
@@ -360,8 +361,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     .await?
     .unwrap_post_commit_snapshot();
 
-    let post_ckpt_snapshot = post_ckpt_snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let post_ckpt_snapshot = begin_transaction(post_ckpt_snapshot, engine.as_ref())?
         .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -623,7 +623,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
         let stats_parsed = get_struct_column_from_struct_array(add_col, "stats_parsed");
 
         let num_records_col = stats_parsed
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .expect("stats_parsed should have numRecords");
         for &row in &add_rows {
             all_record_counts.push(
@@ -633,7 +633,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
             );
         }
 
-        let min_values = get_struct_column_from_struct_array(stats_parsed, "minValues");
+        let min_values = get_struct_column_from_struct_array(stats_parsed, MIN_VALUES);
         let min_id_col = min_values
             .column_by_name("id")
             .expect("minValues should have id");
@@ -645,7 +645,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
             );
         }
 
-        let max_values = get_struct_column_from_struct_array(stats_parsed, "maxValues");
+        let max_values = get_struct_column_from_struct_array(stats_parsed, MAX_VALUES);
         let max_id_col = max_values
             .column_by_name("id")
             .expect("maxValues should have id");
@@ -699,7 +699,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
         .iter()
         .map(|s| serde_json::from_str(s).expect("add.stats should be valid JSON"))
         .collect();
-    parsed_stats.sort_by_key(|v| v["numRecords"].as_i64().unwrap());
+    parsed_stats.sort_by_key(|v| v[NUM_RECORDS].as_i64().unwrap());
     assert_eq!(
         parsed_stats,
         vec![
@@ -930,8 +930,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
 
     // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
     // sidecar splitter. Sets two domains initially.
-    snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    snapshot = begin_transaction(snapshot, engine.as_ref())?
         .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
         .with_domain_metadata(
             "app.feature_flags".to_string(),
@@ -942,8 +941,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
     // picks the latest value, and adds a new domain.
-    snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    snapshot = begin_transaction(snapshot, engine.as_ref())?
         .with_domain_metadata(
             "app.analytics".to_string(),
             r#"{"tracking":false}"#.to_string(),
@@ -955,8 +953,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
     // plus a second update to `app1` to verify reconciliation picks the latest version.
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
-        snapshot = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        snapshot = begin_transaction(snapshot, engine.as_ref())?
             .with_transaction_id(app_id.to_string(), version)
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
@@ -964,8 +961,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
 
     // Remove all 8 files -> 8 remove tombstones
     let scan = snapshot.clone().scan_builder().build()?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(true);
     for sm in scan.scan_metadata(engine.as_ref())? {
@@ -1442,6 +1438,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.deletionVectors", "supported"),
+            ("delta.enableDeletionVectors", "true"),
             ("delta.enableRowTracking", "true"),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1475,9 +1472,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .scan_metadata(engine.as_ref())?
         .map_ok(|sm| sm.scan_files)
         .try_collect()?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_data_change(true);
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     txn.update_deletion_vectors(
         HashMap::from([(path, dv.clone())]),
         scan_files.into_iter().map(Ok),
@@ -1544,9 +1539,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     for c in 0..COMMITS {
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
         let add_files_schema = txn.add_files_schema().clone();
         let paths: Vec<String> = (0..PER_COMMIT)
             .map(|i| format!("part-{c:03}-{i:04}.parquet"))

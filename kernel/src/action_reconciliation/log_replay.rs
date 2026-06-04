@@ -34,14 +34,14 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::log_replay::deduplicator::Deduplicator as _;
+use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
 };
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -129,15 +129,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(
-        inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
-    ) -> Self {
+    pub(crate) fn new(inner: DeltaResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
@@ -351,26 +349,27 @@ impl ActionReconciliationVisitor<'_> {
     // Projected columns in the same order as `selected_column_names_and_types()`.
     // DV columns are defined individually for completeness, even when accessed via a start index.
     const ADD_PATH: GetterColumn = GetterColumn::new(0, "add.path");
+    const ADD_SIZE: GetterColumn = GetterColumn::new(1, "add.size");
     const ADD_DV_STORAGE_TYPE: GetterColumn =
-        GetterColumn::new(1, "add.deletionVector.storageType");
+        GetterColumn::new(2, "add.deletionVector.storageType");
     const ADD_DV_PATH_OR_INLINE_DV: GetterColumn =
-        GetterColumn::new(2, "add.deletionVector.pathOrInlineDv");
-    const ADD_DV_OFFSET: GetterColumn = GetterColumn::new(3, "add.deletionVector.offset");
-    const REMOVE_PATH: GetterColumn = GetterColumn::new(4, "remove.path");
+        GetterColumn::new(3, "add.deletionVector.pathOrInlineDv");
+    const ADD_DV_OFFSET: GetterColumn = GetterColumn::new(4, "add.deletionVector.offset");
+    const REMOVE_PATH: GetterColumn = GetterColumn::new(5, "remove.path");
     const REMOVE_DELETION_TIMESTAMP: GetterColumn =
-        GetterColumn::new(5, "remove.deletionTimestamp");
+        GetterColumn::new(6, "remove.deletionTimestamp");
     const REMOVE_DV_STORAGE_TYPE: GetterColumn =
-        GetterColumn::new(6, "remove.deletionVector.storageType");
+        GetterColumn::new(7, "remove.deletionVector.storageType");
     const REMOVE_DV_PATH_OR_INLINE_DV: GetterColumn =
-        GetterColumn::new(7, "remove.deletionVector.pathOrInlineDv");
-    const REMOVE_DV_OFFSET: GetterColumn = GetterColumn::new(8, "remove.deletionVector.offset");
-    const METADATA_ID: GetterColumn = GetterColumn::new(9, "metaData.id");
+        GetterColumn::new(8, "remove.deletionVector.pathOrInlineDv");
+    const REMOVE_DV_OFFSET: GetterColumn = GetterColumn::new(9, "remove.deletionVector.offset");
+    const METADATA_ID: GetterColumn = GetterColumn::new(10, "metaData.id");
     const PROTOCOL_MIN_READER_VERSION: GetterColumn =
-        GetterColumn::new(10, "protocol.minReaderVersion");
-    const TXN_APP_ID: GetterColumn = GetterColumn::new(11, "txn.appId");
-    const TXN_LAST_UPDATED: GetterColumn = GetterColumn::new(12, "txn.lastUpdated");
-    const DOMAIN_METADATA_DOMAIN: GetterColumn = GetterColumn::new(13, "domainMetadata.domain");
-    const DOMAIN_METADATA_REMOVED: GetterColumn = GetterColumn::new(14, "domainMetadata.removed");
+        GetterColumn::new(11, "protocol.minReaderVersion");
+    const TXN_APP_ID: GetterColumn = GetterColumn::new(12, "txn.appId");
+    const TXN_LAST_UPDATED: GetterColumn = GetterColumn::new(13, "txn.lastUpdated");
+    const DOMAIN_METADATA_DOMAIN: GetterColumn = GetterColumn::new(14, "domainMetadata.domain");
+    const DOMAIN_METADATA_REMOVED: GetterColumn = GetterColumn::new(15, "domainMetadata.removed");
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
@@ -389,6 +388,7 @@ impl ActionReconciliationVisitor<'_> {
                 seen_file_keys,
                 is_log_batch,
                 Self::ADD_PATH.index,
+                Self::ADD_SIZE.index,
                 Self::REMOVE_PATH.index,
                 Self::ADD_DV_STORAGE_TYPE.index,
                 Self::REMOVE_DV_STORAGE_TYPE.index,
@@ -442,7 +442,11 @@ impl ActionReconciliationVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
         // Extract the file action and handle errors immediately
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(i, getters, false)?
+        let Some(FileActionInfo {
+            key: file_key,
+            is_add,
+            ..
+        }) = self.deduplicator.extract_file_action(i, getters, false)?
         else {
             return Ok(None); // No file action found, continue checking other types
         };
@@ -639,6 +643,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
             let types_and_names = vec![
                 // File action columns
                 (STRING, column_name!("add.path")),
+                (LONG, column_name!("add.size")),
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
@@ -663,9 +668,9 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 15,
+            getters.len() == 16,
             Error::InternalError(format!(
-                "Wrong number of visitor getters: {}",
+                "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
             ))
         );
@@ -1266,7 +1271,7 @@ mod tests {
         error_field: &'static str,
         error_type: &'static str,
     ) -> Vec<MockErrorGetData> {
-        (0..15)
+        (0..16)
             .map(|i| {
                 if i == error_index {
                     MockErrorGetData::new(error_field, error_type)
@@ -1297,14 +1302,14 @@ mod tests {
         // Test 2: Basic type mismatch errors using parameterized approach
         let test_cases = [
             (0, "add.path", "str", "add.path is not of type str"),
-            (9, "metaData.id", "str", "metaData.id is not of type str"),
+            (10, "metaData.id", "str", "metaData.id is not of type str"),
             (
-                10,
+                11,
                 "protocol.minReaderVersion",
                 "int",
                 "protocol.minReaderVersion is not of type i32",
             ),
-            (11, "txn.appId", "str", "txn.appId is not of type str"),
+            (12, "txn.appId", "str", "txn.appId is not of type str"),
         ];
 
         for (getter_index, field_name, error_type, expected_error_text) in test_cases {
@@ -1337,7 +1342,7 @@ mod tests {
             &mut seen_domains,
             Some(1000),
         );
-        let defaults = (0..11)
+        let defaults = (0..12)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
         let error_mock = FlexibleMock {
@@ -1353,10 +1358,8 @@ mod tests {
         getters.push(&domain_removed_default); // domainMetadata.removed
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("lastUpdated is not of type i64"));
+        let err_str = result.unwrap_err().to_string();
+        assert!(err_str.contains("lastUpdated is not of type i64"));
 
         // Test remove.deletionTimestamp
         let mut seen_file_keys = HashSet::new();
@@ -1364,7 +1367,7 @@ mod tests {
         let mut seen_domains = HashSet::new();
         let mut visitor =
             create_test_visitor(&mut seen_file_keys, &mut seen_txns, &mut seen_domains, None);
-        let defaults = (0..4)
+        let defaults = (0..5)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
         let error_mock = FlexibleMock {

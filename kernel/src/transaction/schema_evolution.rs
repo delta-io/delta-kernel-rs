@@ -12,7 +12,8 @@ use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, ColumnMappingMode,
+    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
+    ColumnMappingMode,
 };
 use crate::DeltaResult;
 
@@ -109,6 +110,19 @@ pub(crate) fn apply_schema_operations(
 ) -> DeltaResult<SchemaEvolutionResult> {
     let cm_enabled = column_mapping_mode != ColumnMappingMode::None;
 
+    // Reject a persisted seed that already violates the protocol's 32-bit non-negative bound
+    // before it propagates into the allocator. A negative or above-i32::MAX seed almost
+    // certainly indicates a non-conforming writer; bail out rather than silently letting the
+    // allocator either trip the per-field validator on every preserved sibling or produce
+    // out-of-range fresh ids.
+    if let Some(seed) = current_max_column_id {
+        validate_column_mapping_id(seed).map_err(|e| {
+            Error::invalid_protocol(format!(
+                "Table property `delta.columnMapping.maxColumnId`: {e}"
+            ))
+        })?;
+    }
+
     // When column mapping is enabled and the property is set, defensively take the max with
     // the schema's actual max in case a non-conforming writer left the property stale.
     let mut max_id = if cm_enabled {
@@ -189,8 +203,8 @@ pub(crate) fn apply_schema_operations(
 
     validate_schema(&schema, column_mapping_mode)?;
 
-    // `max_id` is only ever incremented by `try_assign_field_column_mapping`. If it grew, the
-    // new value must be persisted; if it went backwards, that's a bug.
+    // `max_id` is only ever incremented by `try_assign_flat_column_mapping_info`. If it grew,
+    // the new value must be persisted; if it went backwards, that's a bug.
     let new_max_column_id = match max_id.cmp(&current_max_column_id) {
         Ordering::Greater => max_id,
         Ordering::Equal => None,
@@ -658,33 +672,111 @@ mod tests {
         );
     }
 
-    fn field_with_stray_cm_id(name: &str, ty: DataType) -> StructField {
+    fn field_with_id_only(name: &str, ty: DataType, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-            MetadataValue::Number(99),
+            MetadataValue::Number(id),
         );
         f
     }
 
-    /// CM-enabled: stray CM annotations on a new column are rejected at any nesting depth.
+    /// CM-enabled: a connector may pre-populate `delta.columnMapping.id` on the new column,
+    /// even at nested depth. The id is preserved and the missing `physicalName` is filled in,
+    /// matching delta-spark's `assignColumnIdAndPhysicalName`.
     #[rstest]
-    #[case::top_level(field_with_stray_cm_id("tainted", DataType::STRING))]
+    #[case::top_level(field_with_id_only("tainted", DataType::STRING, 99))]
     #[case::nested_in_struct(StructField::nullable(
         "outer",
         DataType::Struct(Box::new(
-            StructType::try_new(vec![field_with_stray_cm_id("inner", DataType::STRING)]).unwrap(),
+            StructType::try_new(vec![field_with_id_only("inner", DataType::STRING, 99)]).unwrap(),
         )),
     ))]
-    fn add_column_with_preexisting_cm_metadata_is_rejected_under_cm(#[case] field: StructField) {
+    fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn { field }];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("pre-populated"));
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2), // current_max_column_id
+        )
+        .unwrap();
+
+        // The preserved id=99 must surface as the schema's max, even though the persisted
+        // maxColumnId was only 2 going in.
+        assert_eq!(find_max_column_id_in_schema(&result.schema), Some(99));
+        assert_eq!(result.new_max_column_id, Some(99));
+    }
+
+    /// CM-enabled, only `physicalName` provided: id is allocated as `max_id + 1` and the
+    /// physical name is preserved.
+    #[test]
+    fn add_column_with_only_physical_name_allocates_id() {
+        let mut field = StructField::nullable("named", DataType::STRING);
+        field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName
+                .as_ref()
+                .to_string(),
+            MetadataValue::String("user-supplied-name".to_string()),
+        );
+        let ops = vec![SchemaOperation::AddColumn { field }];
+        let result =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(7))
+                .unwrap();
+        let added = result.schema.field("named").unwrap();
+        assert_eq!(get_cm_id(added), 8);
+        assert_eq!(
+            added.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            Some(&MetadataValue::String("user-supplied-name".to_string()))
+        );
+        assert_eq!(result.new_max_column_id, Some(8));
+    }
+
+    /// A persisted `delta.columnMapping.maxColumnId` above the protocol's 32-bit cap is
+    /// rejected before evolution starts, so the allocator never sees an out-of-range seed.
+    /// `i64::MAX` and `i32::MAX + 1` both cross the bound; the negative case ensures the
+    /// `0..=MAX_COLUMN_MAPPING_ID` range is closed on the low end too.
+    #[rstest]
+    #[case::above_protocol_max(i32::MAX as i64 + 1)]
+    #[case::i64_max(i64::MAX)]
+    #[case::negative(-1)]
+    fn alter_with_out_of_range_persisted_max_column_id_is_rejected(#[case] seed: i64) {
+        let ops = vec![SchemaOperation::AddColumn {
+            field: StructField::nullable("anything", DataType::INTEGER),
+        }];
+        let err =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(seed))
+                .unwrap_err()
+                .to_string();
         assert!(
-            msg.contains("delta.columnMapping.id"),
-            "error should name the offending annotation, got: {msg}"
+            err.contains("Invalid column mapping id")
+                && err.contains("Table property `delta.columnMapping.maxColumnId`")
+                && err.contains(&seed.to_string()),
+            "expected canonical out-of-range rejection naming the seed location and value, \
+             got: {err}",
+        );
+    }
+
+    /// CM-enabled, wrong-typed `delta.columnMapping.id` annotation: error.
+    #[test]
+    fn add_column_with_wrong_typed_id_is_rejected() {
+        let mut field = StructField::nullable("bad", DataType::STRING);
+        field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            MetadataValue::String("not-a-number".to_string()),
+        );
+        let ops = vec![SchemaOperation::AddColumn { field }];
+        let err = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2), // current_max_column_id
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("non-numeric") && err.contains("delta.columnMapping.id"),
+            "error should name the wrong-typed id annotation, got: {err}"
         );
     }
 

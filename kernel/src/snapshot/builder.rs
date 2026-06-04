@@ -4,6 +4,7 @@ use tracing::{info, instrument};
 
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
+use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::MetricId;
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
@@ -42,6 +43,10 @@ pub struct SnapshotBuilder {
 }
 
 impl SnapshotBuilder {
+    // ============================================================================
+    // Constructors
+    // ============================================================================
+
     pub(crate) fn new_for(table_root: impl AsRef<str>) -> Self {
         Self {
             table_root: Some(table_root.as_ref().to_string()),
@@ -61,6 +66,10 @@ impl SnapshotBuilder {
             max_catalog_version: None,
         }
     }
+
+    // ============================================================================
+    // Chainable configuration
+    // ============================================================================
 
     /// Set the target version of the [`Snapshot`]. When omitted, the Snapshot is created at the
     /// latest version of the table.
@@ -105,6 +114,10 @@ impl SnapshotBuilder {
         self
     }
 
+    // ============================================================================
+    // Terminal: build the Snapshot
+    // ============================================================================
+
     /// Create a new [`Snapshot`]. This returns a [`SnapshotRef`] (`Arc<Snapshot>`), perhaps
     /// returning a reference to an existing snapshot if the request to build a new snapshot
     /// matches the version of an existing snapshot.
@@ -117,9 +130,8 @@ impl SnapshotBuilder {
     ///
     /// [`MetricEvent::SnapshotCompleted`]: crate::metrics::MetricEvent::SnapshotCompleted
     /// [`MetricEvent::SnapshotFailed`]: crate::metrics::MetricEvent::SnapshotFailed
-    // Span name must match `SNAP_BUILD_SPAN` in `metrics::reporter`.
     #[instrument(
-        name = "snap.build",
+        name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
         fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = tracing::field::Empty),
         err
@@ -144,6 +156,9 @@ impl SnapshotBuilder {
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
+        // TODO(#2605): this late `record` is silently dropped by the metrics layer, so every
+        //              `SnapshotCompleted` event carries a nil operation_id. Bind eagerly via a
+        //              `build_inner(self, engine, operation_id)` helper instead.
         tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
         // Pre-build validations for catalog-managed tables
@@ -163,14 +178,8 @@ impl SnapshotBuilder {
                     effective_version,
                     operation_id,
                 )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    operation_id,
-                    None,
-                )
-                .map(Into::into)
+                Snapshot::try_new_from_log_segment(table_url, log_segment, engine, operation_id)
+                    .map(Into::into)
             })
         } else {
             existing_snapshot
@@ -200,6 +209,10 @@ impl SnapshotBuilder {
         }
         result
     }
+
+    // ============================================================================
+    // Helpers
+    // ============================================================================
 
     // ===== Catalog-managed Validations =====
 
@@ -331,22 +344,17 @@ mod tests {
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::sync::SyncEngine;
     use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
-    fn setup_test() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<DynObjectStore>,
-        String,
-    ) {
+    fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
         (engine, store, table_root)
     }
 
@@ -483,13 +491,13 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
             "expected SnapshotFailed event on build failure"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
             "should not emit SnapshotCompleted on failure"
         );
         Ok(())
@@ -513,26 +521,15 @@ mod tests {
         assert_eq!(snap_v1.version(), 1);
 
         let events = reporter.events();
-        let (version, total_duration) = events
+        let (version, duration) = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::SnapshotCompleted {
-                    version,
-                    total_duration,
-                    ..
-                } = e
-                {
-                    Some((*version, *total_duration))
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::SnapshotCompleted(s) => Some((s.version, s.duration)),
+                _ => None,
             })
             .expect("expected SnapshotCompleted event");
         assert_eq!(version, 1, "version should match the updated snapshot");
-        assert!(
-            total_duration > Duration::ZERO,
-            "total_duration should be non-zero"
-        );
+        assert!(duration > Duration::ZERO, "duration should be non-zero");
         Ok(())
     }
 
@@ -560,20 +557,20 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
             "expected SnapshotFailed when version update goes backwards"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
             "should not emit SnapshotCompleted when version update fails"
         );
         Ok(())
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_completed_total_duration_exceeds_log_segment_load_duration(
+    async fn snapshot_completed_duration_exceeds_log_segment_load_duration(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
@@ -582,34 +579,28 @@ mod tests {
         let _snap = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
 
         let events = reporter.events();
-        let total_duration = events
+        let snap_duration = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::SnapshotCompleted { total_duration, .. } = e {
-                    Some(*total_duration)
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::SnapshotCompleted(s) => Some(s.duration),
+                _ => None,
             })
             .expect("expected SnapshotCompleted event");
         let segment_duration = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::LogSegmentLoaded { duration, .. } = e {
-                    Some(*duration)
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoaded(s) => Some(s.duration),
+                _ => None,
             })
             .expect("expected LogSegmentLoaded event");
 
         assert!(
-            total_duration > Duration::ZERO,
-            "total_duration should be non-zero"
+            snap_duration > Duration::ZERO,
+            "duration should be non-zero"
         );
         assert!(
-            total_duration >= segment_duration,
-            "SnapshotCompleted.total_duration ({total_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
+            snap_duration >= segment_duration,
+            "SnapshotCompleted.duration ({snap_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
         );
         Ok(())
     }
@@ -638,11 +629,7 @@ mod tests {
 
         /// Creates an in-memory engine, store, and table root with an initial catalog-managed
         /// commit at version 0 (protocol + metadata).
-        async fn setup_catalog_managed_test() -> (
-            Arc<DefaultEngine<TokioBackgroundExecutor>>,
-            Arc<DynObjectStore>,
-            String,
-        ) {
+        async fn setup_catalog_managed_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
             let (engine, store, table_root) = setup_test();
             let actions = vec![TestAction::Metadata];
             add_commit(

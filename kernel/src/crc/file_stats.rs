@@ -19,13 +19,12 @@ use crate::{DeltaResult, EngineData, Error, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
-/// Obtained via [`Snapshot::get_or_load_file_stats`], [`Snapshot::get_file_stats_if_loaded`],
-/// or [`Crc::file_stats()`](super::Crc::file_stats). Returns `None` when the stats are not
-/// known to be valid.
+/// Obtained via [`Snapshot::get_file_stats_if_present`] or [`Crc::file_stats()`]. Returns
+/// `None` when the source CRC's `file_stats_state` is not `Complete`.
 ///
-/// [`Snapshot::get_or_load_file_stats`]: crate::snapshot::Snapshot::get_or_load_file_stats
-/// [`Snapshot::get_file_stats_if_loaded`]: crate::snapshot::Snapshot::get_file_stats_if_loaded
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`Snapshot::get_file_stats_if_present`]: crate::snapshot::Snapshot::get_file_stats_if_present
+/// [`Crc::file_stats()`]: super::Crc::file_stats
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileStats {
     /// Number of active [`Add`](crate::actions::Add) file actions in this table version.
     pub(crate) num_files: i64,
@@ -68,30 +67,30 @@ pub(crate) struct FileStatsDelta {
     pub(crate) net_histogram: Option<FileSizeHistogram>,
 }
 
+const INCREMENTAL_SAFE_OPS: &[&str] = &[
+    "WRITE",
+    "MERGE",
+    "UPDATE",
+    "DELETE",
+    "OPTIMIZE",
+    "CREATE TABLE",
+    "REPLACE TABLE",
+    "CREATE TABLE AS SELECT",
+    "REPLACE TABLE AS SELECT",
+    "CREATE OR REPLACE TABLE AS SELECT",
+];
+
+/// Returns `true` if the given operation can be safely tracked by incremental file stats.
+///
+/// Incremental-safe operations produce add/remove actions whose net counts give correct file
+/// stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE STATS
+/// re-adds existing files with updated statistics; naively counting those adds would
+/// double-count file stats.
+pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
+    INCREMENTAL_SAFE_OPS.contains(&operation)
+}
+
 impl FileStatsDelta {
-    /// Returns `true` if the given operation can be safely tracked by incremental file stats.
-    ///
-    /// Incremental-safe operations produce add/remove actions whose net counts give correct
-    /// file stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE
-    /// STATS re-adds existing files with updated statistics -- if we naively counted those
-    /// adds, we'd double count file stats.
-    const INCREMENTAL_SAFE_OPS: &[&str] = &[
-        "WRITE",
-        "MERGE",
-        "UPDATE",
-        "DELETE",
-        "OPTIMIZE",
-        "CREATE TABLE",
-        "REPLACE TABLE",
-        "CREATE TABLE AS SELECT",
-        "REPLACE TABLE AS SELECT",
-        "CREATE OR REPLACE TABLE AS SELECT",
-    ];
-
-    pub(crate) fn is_incremental_safe(operation: &str) -> bool {
-        Self::INCREMENTAL_SAFE_OPS.contains(&operation)
-    }
-
     /// Compute file stats and a delta histogram from a transaction's staged add and remove
     /// metadata.
     ///

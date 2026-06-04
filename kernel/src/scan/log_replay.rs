@@ -13,8 +13,9 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+    UnaryExpressionOp,
 };
-use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
+use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
     ParallelLogReplayProcessor,
@@ -45,6 +46,13 @@ struct InternalScanState {
     skip_stats: bool,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
+    /// Physical leaf paths which are expected to have stats collected. Carried alongside
+    /// `physical_stats_schema` so the distributed `DataSkippingFilter` rebuilds the same
+    /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable:
+    /// an empty set drops every data-column reference, which means no skipping but is
+    /// still correct.
+    #[serde(default)]
+    physical_stats_columns: HashSet<ColumnName>,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -97,9 +105,9 @@ pub struct SerializableScanState {
 /// - Transformation: Applies a built-in transformation (`log_transform` or `checkpoint_transform`)
 ///   to convert selected Add actions into [`ScanMetadata`], the intermediate format passed to the
 ///   engine.
-/// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those
-///   derived from projection or filters) are preserved and passed through to the engine, which
-///   applies them as part of its scan execution logic.
+/// - Row StructPatch passthrough: Any user-provided row-level transformation expressions (e.g.
+///   those derived from projection or filters) are preserved and passed through to the engine,
+///   which applies them as part of its scan execution logic.
 ///
 /// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
 /// `process_actions_batch` method, which applies these steps to each batch of log actions and
@@ -109,10 +117,10 @@ pub struct SerializableScanState {
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
-    /// Transform for log batches (commit files) - uses ParseJson for stats and MapToStruct
+    /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
     log_transform: Arc<dyn ExpressionEvaluator>,
-    /// Transform for checkpoint batches - reads pre-parsed stats_parsed and
+    /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
@@ -133,10 +141,11 @@ impl ScanLogReplayProcessor {
     // `selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
     const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
-    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
+    const ADD_SIZE_INDEX: usize = 2; // Position of "add.size" in getters
+    const ADD_DV_START_INDEX: usize = 3; // Start position of add deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 6; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 7; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 8; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(
@@ -223,6 +232,7 @@ impl ScanLogReplayProcessor {
                 partition_schema_for_transform.as_ref(),
                 column_expr_ref!("partitionValues_parsed"),
                 output_schema.clone(),
+                &state_info.physical_stats_columns,
                 Some(metrics.clone()),
             )
         };
@@ -294,6 +304,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             physical_partition_schema,
+            physical_stats_columns,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -312,6 +323,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema,
             skip_stats: self.skip_stats,
             physical_partition_schema,
+            physical_stats_columns,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
@@ -368,6 +380,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
+            physical_stats_columns: internal_state.physical_stats_columns,
         });
 
         Self::new_with_seen_files(
@@ -410,17 +423,26 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(
+        &mut self,
+        row: usize,
+        getters: &[&'b dyn GetData<'b>],
+    ) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
-        // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
-        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at
-        //   indexes 6-8
+        // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
+        //   3-5
+        // - For Remove actions (in log batches only): path is at index 7, followed by DV fields at
+        //   indexes 8-10
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
-            i,
+        let Some(FileActionInfo {
+            key: file_key,
+            size,
+            is_add,
+        }) = self.deduplicator.extract_file_action(
+            row,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
@@ -441,7 +463,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(i, "add.partitionValues")?;
+                    .get(row, "add.partitionValues")?;
                 parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -457,26 +479,26 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             return Ok(false);
         }
         let base_row_id: Option<i64> =
-            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
-        let transform = self
+            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
+        let patch_expr = self
             .state_info
             .transform_spec
             .as_ref()
-            .map(|transform| {
+            .map(|transform_spec| {
                 get_transform_expr(
-                    transform,
+                    transform_spec,
                     partition_values,
                     &self.state_info.physical_schema,
                     base_row_id,
                 )
             })
             .transpose()?;
-        if transform.is_some() {
+        if patch_expr.is_some() {
             // fill in any needed `None`s for previous rows
-            self.row_transform_exprs.resize_with(i, Default::default);
-            self.row_transform_exprs.push(transform);
+            self.row_transform_exprs.resize_with(row, Default::default);
+            self.row_transform_exprs.push(patch_expr);
         }
-        self.metrics.incr_active_add_files();
+        self.metrics.record_active_add_file(size);
         Ok(true)
     }
 }
@@ -492,6 +514,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (ss_map, column_name!("add.partitionValues")),
+                (LONG, column_name!("add.size")),
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
@@ -510,7 +533,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
-            (&names[..6], &types[..6])
+            (&names[..7], &types[..7])
         }
     }
 
@@ -518,7 +541,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 10 } else { 6 };
+        let expected_getters = if is_log_batch { 11 } else { 7 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -527,9 +550,9 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             ))
         );
 
-        for i in 0..row_count {
-            if self.selection_vector[i] {
-                self.selection_vector[i] = self.is_valid_add(i, getters)?;
+        for row in 0..row_count {
+            if self.selection_vector[row] {
+                self.selection_vector[row] = self.is_valid_add(row, getters)?;
             }
         }
 
@@ -612,7 +635,9 @@ fn scan_row_schema_with_parsed_columns(
 /// # Parameters
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
 ///   names), or None if stats should not be included in output.
-/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true, stats
+///   output uses COALESCE(add.stats, ToJson(add.stats_parsed)) so that ScanFile.stats is populated
+///   even when the checkpoint lacks JSON stats (writeStatsAsJson=false).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
@@ -632,6 +657,16 @@ fn get_add_transform_expr(
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+    } else if has_stats_parsed {
+        // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
+        // serializing stats_parsed so ScanFile.stats is populated either way.
+        Arc::new(Expression::coalesce([
+            Expression::column(["add", "stats"]),
+            Expression::unary(
+                UnaryExpressionOp::ToJson,
+                Expression::column(["add", "stats_parsed"]),
+            ),
+        ]))
     } else {
         column_expr_ref!("add.stats")
     };
@@ -755,6 +790,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
         )?;
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -833,6 +869,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &mut self.seen_file_keys,
             is_log_batch,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::REMOVE_PATH_INDEX,
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
@@ -1023,6 +1060,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -1063,26 +1101,26 @@ mod tests {
         )
         .unwrap();
 
-        fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
-            assert!(transform.is_some());
-            let Expr::Transform(transform) = transform.unwrap().as_ref() else {
-                panic!("Transform should always be a Transform expr");
+        fn validate_patch(patch_expr: Option<&ExpressionRef>, expected_date_offset: i32) {
+            assert!(patch_expr.is_some());
+            let Expr::StructPatch(patch) = patch_expr.unwrap().as_ref() else {
+                panic!("Expression should always be a StructPatch expr");
             };
 
-            // With sparse transforms, we expect only one insertion for the partition column
-            assert!(transform.prepended_fields.is_empty());
-            let mut field_transforms = transform.field_transforms.iter();
-            let (field_name, field_transform) = field_transforms.next().unwrap();
+            // With sparse patches, we expect only one insertion for the partition column.
+            assert!(patch.prepended_fields.is_empty());
+            let mut field_patches = patch.field_patches.iter();
+            let (field_name, field_patch) = field_patches.next().unwrap();
             assert_eq!(field_name, "value");
-            assert!(!field_transform.is_replace);
-            let [expr] = &field_transform.exprs[..] else {
+            assert!(!field_patch.is_replace);
+            let [expr] = &field_patch.exprs[..] else {
                 panic!("Expected a single insertion");
             };
             let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {
                 panic!("Expected a literal date");
             };
             assert_eq!(*date_offset, expected_date_offset);
-            assert!(field_transforms.next().is_none());
+            assert!(field_patches.next().is_none());
         }
 
         for res in iter {
@@ -1093,13 +1131,13 @@ mod tests {
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");
             assert!(transforms[0].is_none(), "transform at [0] should be None");
             assert!(transforms[2].is_none(), "transform at [2] should be None");
-            validate_transform(transforms[1].as_ref(), 17511);
-            validate_transform(transforms[3].as_ref(), 17510);
+            validate_patch(transforms[1].as_ref(), 17511);
+            validate_patch(transforms[3].as_ref(), 17510);
         }
     }
 
     #[test]
-    fn test_row_id_transform() {
+    fn test_row_id_patch() {
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
             "value",
             DataType::INTEGER,
@@ -1152,15 +1190,15 @@ mod tests {
             let scan_metadata = res.unwrap();
             let transforms = scan_metadata.scan_file_transforms;
             assert_eq!(transforms.len(), 1, "Should have 1 transform");
-            if let Some(Expr::Transform(transform_expr)) = transforms[0].as_ref().map(Arc::as_ref) {
-                assert!(transform_expr.input_path.is_none());
-                let row_id_transform = transform_expr
-                    .field_transforms
+            if let Some(Expr::StructPatch(patch)) = transforms[0].as_ref().map(Arc::as_ref) {
+                assert!(patch.input_path.is_none());
+                let row_id_patch = patch
+                    .field_patches
                     .get("row_id_col")
-                    .expect("Should have row_id_col transform");
-                assert!(row_id_transform.is_replace);
-                assert_eq!(row_id_transform.exprs.len(), 1);
-                let expr = &row_id_transform.exprs[0];
+                    .expect("Should have row_id_col patch");
+                assert!(row_id_patch.is_replace);
+                assert_eq!(row_id_patch.exprs.len(), 1);
+                let expr = &row_id_patch.exprs[0];
                 let expeceted_expr = Arc::new(Expr::coalesce([
                     Expr::column(["row_id_col"]),
                     Expr::binary(
@@ -1171,7 +1209,7 @@ mod tests {
                 ]));
                 assert_eq!(expr, &expeceted_expr);
             } else {
-                panic!("Should have been a transform expression");
+                panic!("Should have been a StructPatch expression");
             }
         }
     }
@@ -1351,6 +1389,7 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
                 physical_partition_schema: None,
+                physical_stats_columns: HashSet::new(),
             });
             let checkpoint_info = test_checkpoint_info();
             let processor =
@@ -1383,6 +1422,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         });
         let processor =
             ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone(), false)
@@ -1428,6 +1468,7 @@ mod tests {
             physical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1460,6 +1501,7 @@ mod tests {
             physical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
