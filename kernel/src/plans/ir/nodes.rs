@@ -16,12 +16,13 @@ use crate::FileMeta;
 
 /// Plan node operator kinds.
 ///
-/// Sources take zero inputs; unary operators take one; binary operators take two;
-/// n-ary operators take a variable number. Output schemas are stored on the payload
-/// struct for operators whose caller declares them (`ScanParquet`, `ScanJson`,
-/// `Values`, `Load`, `Project`, `MaxByVersion`); the remaining operators pass an
-/// input's schema through unchanged (`Filter` from its input; `UnionAll` from its
-/// inputs' common schema; `SemiJoin` from the probe input).
+/// Output schemas are stored on the payload struct for operators whose caller
+/// declares them (`ScanParquet`, `ScanJson`, `Values`, `Load`, `Project`,
+/// `MaxByVersion`); the remaining operators pass an input's schema through
+/// unchanged:
+/// - `Filter` from its input.
+/// - `UnionAll` from its inputs' common schema.
+/// - `SemiJoin` from the probe input.
 #[derive(Debug, Clone, Display)]
 pub enum NodeKind {
     // === Source operators (0 inputs) =========================================
@@ -267,7 +268,7 @@ pub struct Values {
 ///     exprs: [
 ///         col("id"),
 ///         Expression::array([col("first"), col("last")]),
-///         Expression::Struct([
+///         Expression::struct_from([
 ///             col("add.path"),
 ///             col("add.size"),
 ///             col("add.stats_parsed.numRecords"),
@@ -387,8 +388,6 @@ pub struct Load {
     pub dv_column: ColumnName,
 }
 
-// === MaxByVersion ===========================================================
-
 /// Per group, keep the input row with the greatest `version_column` value and project
 /// the columns named in `output_schema` from that row. Kernel uses this for dedupe
 /// across table versions (e.g. latest `add` per path in scan metadata).
@@ -483,7 +482,7 @@ pub struct MaxByVersion {
 /// # Example
 ///
 /// ```text
-/// SemiJoin { inverted: true, probe_keys: ["path"], build_keys: ["path"] }
+/// SemiJoin { probe_keys: ["path"], build_keys: ["path"] }
 ///
 /// probe               build
 /// path | version      path
@@ -519,13 +518,6 @@ pub struct SemiJoin {
 /// `UnionAll` over two relations with schema `{ id: int }`:
 ///
 /// ```text
-/// UnionAll {
-///     inputs: [
-///         { id: int },
-///         { id: int },
-///     ],
-/// }
-///
 /// input 0:
 /// id
 /// --
