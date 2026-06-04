@@ -16,6 +16,9 @@ use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Sche
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
+
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct MetadataVisitor {
@@ -24,9 +27,7 @@ pub(crate) struct MetadataVisitor {
 
 impl RowVisitor for MetadataVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
-        NAMES_AND_TYPES.as_ref()
+        METADATA_LEAVES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
@@ -72,6 +73,9 @@ impl RowVisitor for SelectionVectorVisitor {
     }
 }
 
+pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| Protocol::to_schema().leaves(PROTOCOL_NAME));
+
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct ProtocolVisitor {
@@ -80,9 +84,7 @@ pub(crate) struct ProtocolVisitor {
 
 impl RowVisitor for ProtocolVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| Protocol::to_schema().leaves(PROTOCOL_NAME));
-        NAMES_AND_TYPES.as_ref()
+        PROTOCOL_LEAVES.as_ref()
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
