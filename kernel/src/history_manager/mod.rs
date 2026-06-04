@@ -22,11 +22,14 @@
 use std::cmp::Ordering;
 
 use error::{LogHistoryError, NearestTimestamp};
+use itertools::Itertools;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use tracing::{info, trace, warn};
+use url::Url;
 
 use crate::log_segment::LogSegment;
-use crate::path::ParsedLogPath;
+use crate::log_segment_files::list_from_storage;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
@@ -584,10 +587,57 @@ pub fn timestamp_range_to_versions(
     Ok((start_version, end_version))
 }
 
+/// Returns the earliest published commit version available on the file system for this table.
+///
+/// The returned version is the version of the lowest-numbered `*.json` commit file present in
+/// `log_root`. The returned version is not guaranteed to exist by the time the caller
+/// acts on it: a concurrent log-cleanup operation may delete the file.
+///
+/// # Parameters
+/// - `engine`: kernel engine used to list `log_root`.
+/// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
+/// - `earliest_ratified_commit_version`: For catalog-managed tables, it is the earliest version the
+///   catalog has ratified commit. Pass `None` for filesystem-only tables.
+///
+/// # Errors
+/// - Propagates any error from listing the log directory.
+/// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits.
+/// - [`DeltaError::Generic`] when there is no publised file-system commit and the earliest ratified
+///   CCv2 commit is v0. For a catalog-managed table, v0 must be a published file-system commit
+///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
+///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
+///   indicates a broken invariant rather than a normal missing version.
+// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
+// this helper lands.
+#[allow(unused)]
+#[tracing::instrument(skip(engine), ret)]
+fn get_earliest_published_commit_version(
+    engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+) -> DeltaResult<Version> {
+    list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+        .next()
+        .transpose()?
+        .map(|f| f.version)
+        .ok_or_else(|| {
+            if earliest_ratified_commit_version == Some(0) {
+                return DeltaError::generic(format!(
+                    "expected a published v0 commit for catalog-managed table {log_root}, \
+                       but the log listing returned no commits"
+                ));
+            }
+            DeltaError::from(LogHistoryError::NoCommitsFound {
+                log_root: log_root.clone(),
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::OpenOptions;
+    use std::fs::{remove_file, OpenOptions};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
@@ -1539,5 +1589,81 @@ mod tests {
             Ok(v) => assert_eq!(res.unwrap(), v),
             Err(()) => assert!(res.is_err(), "{res:?}"),
         }
+    }
+
+    enum Expected {
+        Version(Version),
+        NoCommitsFound,
+        CCv2MissingV0FilesystemCommit,
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::no_ratified_commit(3, None, None, Expected::Version(0))]
+    #[case::ratified_commit_version_0(3, Some(0), None, Expected::Version(0))]
+    #[case::ratified_commit_version_greater_than_0(3, Some(2), None, Expected::Version(0))]
+    #[case::log_listing_empty_no_ratified_commit(0, None, None, Expected::NoCommitsFound)]
+    #[case::log_listing_empty_ratified_commit(0, Some(2), None, Expected::NoCommitsFound)]
+    #[case::log_listing_empty_ratified_commit_v0(
+        0,
+        Some(0),
+        None,
+        Expected::CCv2MissingV0FilesystemCommit
+    )]
+    async fn test_get_earliest_published_commit_version(
+        #[case] num_commits: usize,
+        #[case] earliest_ratified_commit_version: Option<Version>,
+        #[case] last_cleanup_version: Option<Version>,
+        #[case] expected: Expected,
+    ) {
+        let timestamps = (0..num_commits)
+            .map(|i| (i as i64, None))
+            .collect::<Vec<_>>();
+        let table = mock_table_with_timestamps(&timestamps, None).await;
+        let engine = SyncEngine::new();
+        let log_root = Url::from_directory_path(table.table_root().join("_delta_log")).unwrap();
+
+        if let Some(last_cleanup_version) = last_cleanup_version {
+            for version in 0..=last_cleanup_version {
+                let filename = format!("{version:020}.json");
+                remove_file(log_root.to_file_path().unwrap().join(filename)).unwrap();
+            }
+        }
+
+        let res = get_earliest_published_commit_version(
+            &engine,
+            &log_root,
+            earliest_ratified_commit_version,
+        );
+        match expected {
+            Expected::Version(v) => assert_eq!(res.unwrap(), v),
+            Expected::NoCommitsFound => assert!(
+                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
+                "{res:?}"
+            ),
+            Expected::CCv2MissingV0FilesystemCommit => {
+                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_earliest_published_commit_version_ignores_staged_commits() {
+        let timestamps = vec![(0, None)];
+        let table = mock_table_with_timestamps(&timestamps, None).await;
+        let engine = SyncEngine::new();
+        let log_dir = table.table_root().join("_delta_log");
+        let log_root = Url::from_directory_path(&log_dir).unwrap();
+
+        // Write a staged commit at v1 with a fixed UUID. Staged commits should NOT influence
+        // the earliest-published-commit result.
+        let staged_dir = log_dir.join("_staged_commits");
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        let staged_file =
+            staged_dir.join("00000000000000000001.01234567-89ab-cdef-0123-456789abcdef.json");
+        std::fs::write(&staged_file, "{}").unwrap();
+
+        let res = get_earliest_published_commit_version(&engine, &log_root, None);
+        assert_eq!(res.unwrap(), 0);
     }
 }
