@@ -269,6 +269,11 @@ Keep this list updated when new protocol features are added to kernel.
   Reserve `StructField::new` for cases where nullability is a runtime value.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
+- Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
+  `Expression::literal(...)` when building expressions inline. `col!` has two forms: a single
+  string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
+  same as `column_expr!`); one or more comma-separated args build a column with each segment taken
+  verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 

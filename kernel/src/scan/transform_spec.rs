@@ -10,9 +10,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{
-    BinaryExpressionOp, Expression, ExpressionRef, ExpressionStructPatch, Scalar,
-};
+use crate::expressions::{col, lit, Expression, ExpressionRef, ExpressionStructPatch, Scalar};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
@@ -144,12 +142,8 @@ pub(crate) fn get_transform_expr(
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
                 let expr = Arc::new(Expression::coalesce([
-                    Expression::column([field_name]),
-                    Expression::binary(
-                        BinaryExpressionOp::Plus,
-                        Expression::literal(base_row_id),
-                        Expression::column([row_index_field_name]),
-                    ),
+                    col!(field_name),
+                    lit(base_row_id) + col!(row_index_field_name),
                 ]));
                 patch.with_replaced_field(field_name.clone(), expr)
             }
@@ -179,10 +173,7 @@ pub(crate) fn get_transform_expr(
                     // This ensures consistent column ordering across file types
                     patch = patch
                         .with_dropped_field(physical_name.clone())
-                        .with_inserted_field(
-                            insert_after.clone(),
-                            Arc::new(Expression::column([physical_name.clone()])),
-                        );
+                        .with_inserted_field(insert_after.clone(), Arc::new(col!(physical_name)));
                     patch
                 } else {
                     // Column doesn't exist physically - treat as partition column
@@ -221,6 +212,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::expressions::BinaryExpressionOp;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
