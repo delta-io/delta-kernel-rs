@@ -1,3 +1,10 @@
+# IMPORTANT: this workflow runs untrusted PR code and has a non-obvious
+# security model documented at ../SECURITY_MODEL.md. Anyone editing this
+# file -- or reviewing changes to it -- MUST read that document first.
+# Several constraints below (permissions blocks, save-if expressions, the
+# step ordering around actions/checkout, the bench-pr-number upload) look
+# like style choices but are load-bearing.
+#
 # Benchmarks run on four triggers:
 #   - pull_request: every push to a non-draft PR auto-runs with BENCH_TAGS=base
 #   - push (main only): warms the rust-cache so PR runs restore a warm target/
@@ -11,26 +18,6 @@
 # as an artifact; that workflow downloads it and posts/updates the PR comment
 # in base-branch context (which has the write scope this workflow lacks under
 # pull_request from a fork).
-#
-# SECURITY MODEL
-# --------------
-# - `run-benchmark` checks out and executes untrusted PR code under
-#   `permissions: { contents: read }`. Fork PRs get a read-only GITHUB_TOKEN
-#   under `pull_request` by default (per GitHub workflow-syntax docs), which
-#   is sufficient since nothing here writes to the repo. Do not add other
-#   secrets or grant write permissions to this job.
-# - The Swatinem/rust-cache `save-if` guard MUST stay restricted to push
-#   events on main. PR runs read-only-restore from main's cache; they don't
-#   save. Relaxing the `github.event_name == 'push'` clause would let
-#   PR-controlled compile artifacts land in main's cache scope (poisoning)
-#   or fill the cache budget and evict main's shared entries.
-# - The PR number we comment on must come from a trusted source. The
-#   `bench-pr-number` artifact is uploaded BEFORE the PR-head checkout so
-#   PR code cannot tamper with it; benchmark-post-comment.yml trusts that
-#   artifact only on the `issue_comment` upstream path (where this YAML is
-#   served from the default branch) and derives the number from
-#   workflow_run.head_branch on the `pull_request` path. See the SECURITY
-#   MODEL block in benchmark-post-comment.yml for the full rationale.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
