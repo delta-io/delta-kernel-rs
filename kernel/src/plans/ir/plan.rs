@@ -10,14 +10,14 @@ pub use super::nodes::NodeKind;
 ///
 /// Engines must treat RefIds as opaque keys: equality and hashing are the only meaningful
 /// operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RefId(pub u32);
 
 /// One node in a plan: an operator kind, its input RefIds, and its output RefId.
 ///
-/// `inputs` order matters and is documented per [`NodeKind`] (e.g. for
-/// `NodeKind::SemiJoin` the convention is `[probe, build]`;
-/// for `NodeKind::UnionAll` inputs are concatenated in order).
+/// `inputs` order is interpreted per [`NodeKind`] (e.g. for `NodeKind::SemiJoin` the
+/// convention is `[probe, build]`). `NodeKind::UnionAll` emits the rows of all inputs
+/// regardless of input order.
 #[derive(Debug, Clone)]
 pub struct PlanNode {
     pub kind: NodeKind,
@@ -40,12 +40,10 @@ pub struct PlanNode {
 /// - `output` is the RefId the operator produces.
 ///
 /// A node depends on another when one of its `inputs` matches that node's `output`.
-/// Each RefId is bound exactly once. The `inputs`/`output` cross-references
-/// encode the dataflow DAG, and `nodes` is stored in a topological order over
-/// those edges: every node appears after the nodes whose outputs it consumes.
-/// Engines may therefore evaluate `nodes` in the order specified in `nodes`
-/// without further sorting -- each node's inputs are guaranteed bound by the
-/// time the node is reached.
+/// Each RefId is bound exactly once. These input/output cross references encode the
+/// dataflow DAG, and `nodes` is stored in topological order: every node appears after
+/// the nodes whose outputs it consumes, so an engine can evaluate `nodes` in slice
+/// order -- each node's inputs are guaranteed bound by the time the node is reached.
 ///
 /// A `Plan` has at least one node. The **terminal node** is always the
 /// last entry in `nodes`: it is the only node whose `output` no other node lists in
@@ -53,10 +51,6 @@ pub struct PlanNode {
 /// engine streams to the caller.
 ///
 /// # Execution
-///
-/// Because `nodes` is topologically sorted, an engine can evaluate the nodes in
-/// the order specified in `nodes`. Each node's inputs are guaranteed bound by
-/// the time the node is evaluated.
 ///
 /// For the best performance, connectors are encouraged to run kernel-produced
 /// plans through their query optimizer before execution (e.g. to fold adjacent
@@ -93,10 +87,10 @@ pub struct PlanNode {
 ///                 UnionAll [RefId(4)]   <-- terminal: Plan::result() == Some(RefId(4))
 /// ```
 ///
-/// The engine evaluates the nodes in slice order -- `RefId(0)` and `RefId(1)` first
-/// (sources), then `RefId(2)` and `RefId(3)`, then `RefId(4)` -- and streams the rows
-/// produced at the terminal node to the caller.
-#[derive(Debug, Clone, Default)]
+/// The engine evaluates the nodes in the order of the `nodes` vector: `RefId(0)` and `RefId(1)`
+/// first (sources), then `RefId(2)` and `RefId(3)`, then `RefId(4)`. The engine streams the
+/// rows produced at the terminal node to the caller.
+#[derive(Debug, Clone)]
 pub struct Plan {
     pub nodes: Vec<PlanNode>,
 }

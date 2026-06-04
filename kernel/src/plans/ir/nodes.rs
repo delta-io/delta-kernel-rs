@@ -20,8 +20,8 @@ use crate::FileMeta;
 /// n-ary operators take a variable number. Output schemas are stored on the payload
 /// struct for operators whose caller declares them (`ScanParquet`, `ScanJson`,
 /// `Values`, `Load`, `Project`, `MaxByVersion`); the remaining operators pass an
-/// input's schema through unchanged (`Filter` and `UnionAll` from the sole/first
-/// input; `SemiJoin` from the probe input).
+/// input's schema through unchanged (`Filter` from its input; `UnionAll` from its
+/// inputs' common schema; `SemiJoin` from the probe input).
 #[derive(Debug, Clone, Display)]
 pub enum NodeKind {
     // === Source operators (0 inputs) =========================================
@@ -74,8 +74,7 @@ impl From<FileMeta> for ScanFile {
 /// columns named by `schema`, in schema order.
 ///
 /// Output row order is unspecified: the engine is free to read `files` in any order, in
-/// parallel, and to interleave rows from different files. Downstream nodes that depend on
-/// a specific ordering must impose it explicitly.
+/// parallel, and to interleave rows from different files.
 ///
 /// # Column resolution
 ///
@@ -83,9 +82,9 @@ impl From<FileMeta> for ScanFile {
 /// output:
 ///
 /// 1. **Metadata columns** -- if the field is annotated as a metadata column (e.g. via
-///    [`StructField::create_metadata_column`] with [`MetadataColumnSpec::RowIndex`], or the
-///    reserved [`FILE_NAME`] field ID), the engine populates it from the read context rather than
-///    from the Parquet file. See [Metadata columns] below.
+///    [`StructField::create_metadata_column`] with [`MetadataColumnSpec::RowIndex`]), the engine
+///    populates it from the read context rather than from the Parquet file. See [Metadata columns]
+///    below.
 /// 2. **File-constant columns** -- if the field's name appears in [`Self::file_constant_columns`],
 ///    the engine broadcasts the corresponding entry from [`ScanFile::file_constants`] for the file
 ///    being read (not from Parquet bytes). See [File-constant columns] below.
@@ -94,11 +93,10 @@ impl From<FileMeta> for ScanFile {
 ///    - **Field ID**: if the field carries a Parquet field ID via
 ///      [`ColumnMetadataKey::ParquetFieldId`] metadata, match it against the Parquet column with
 ///      the same field id.
-///    - **Field name**: otherwise, or if no Parquet column has the requested field id, fall back to
-///      matching by column name.
-///
-///    If no Parquet column matches, the output column is filled with NULLs when the field is
-///    nullable, or an error is returned when it is non-nullable.
+///    - **Field name**: otherwise, or if no Parquet column has the requested field id, match by
+///      column name.
+///    - **No match**: the output column is filled with NULLs when the field is nullable, or an
+///      error is returned when it is non-nullable.
 ///
 /// Parquet columns not referenced by any `schema` field are ignored.
 ///
@@ -106,7 +104,6 @@ impl From<FileMeta> for ScanFile {
 /// [File-constant columns]: #file-constant-columns
 /// [`StructField::create_metadata_column`]: crate::schema::StructField::create_metadata_column
 /// [`MetadataColumnSpec::RowIndex`]: crate::schema::MetadataColumnSpec::RowIndex
-/// [`FILE_NAME`]: crate::reserved_field_ids::FILE_NAME
 /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
 ///
 /// ## Example
@@ -130,11 +127,6 @@ impl From<FileMeta> for ScanFile {
 /// The returned data contains exactly 3 columns in schema order:
 /// `{i_logical: parquet[1], s: NULL.., i2: parquet[0]}`.
 ///
-/// # Metadata Columns
-///
-/// The engine must support virtual metadata columns that provide additional information about
-/// each row. These columns are not stored in the Parquet file but are generated at read time.
-///
 /// ## Row Index Column
 ///
 /// When a column in `schema` is marked as a row index metadata column (via
@@ -149,19 +141,6 @@ impl From<FileMeta> for ScanFile {
 ///
 /// Example: A file with 5 rows would have row_index values `[0, 1, 2, 3, 4]`.
 ///
-/// ## File Name Column (Reserved Field ID)
-///
-/// When a column in `schema` has the reserved field ID [`FILE_NAME`] (2147483646), the engine
-/// must populate it with the file path/name:
-///
-/// - **Column name**: `"_file"`
-/// - **Type**: `STRING` (non-nullable)
-/// - **Field ID**: 2147483646 (reserved)
-/// - **Values**: The file path/URL (e.g., `"s3://bucket/path/file.parquet"`)
-/// - **Use case**: Track which file each row came from in multi-file reads
-///
-/// Example: All rows from the same file would have the same `_file` value.
-///
 /// # File-constant columns
 ///
 /// [`Self::file_constant_columns`] names output fields whose values are identical for every row
@@ -169,9 +148,8 @@ impl From<FileMeta> for ScanFile {
 /// nullability come from [`Self::schema`]; [`ScanFile::file_constants`] supplies the per-file
 /// literals in the same order as `file_constant_columns`.
 ///
-/// File-constant columns are distinct from [metadata columns] (engine-generated, such as row
-/// index or `_file`) and from [`Load::metadata_derived_columns`] (values taken from an
-/// upstream metadata row at read time).
+/// File-constant columns are distinct from [metadata columns], which are engine-generated
+/// (such as row index). [`Load::file_constant_columns`] is the same concept for the [`Load`] node.
 ///
 /// # Invariants
 ///
@@ -195,8 +173,7 @@ pub struct ScanParquet {
 /// non-nullable fields.
 ///
 /// Output row order is unspecified: the engine is free to read `files` in any order, in
-/// parallel, and to interleave rows from different files. Downstream nodes that depend on
-/// a specific ordering must impose it explicitly.
+/// parallel, and to interleave rows from different files.
 ///
 /// # File-constant columns
 ///
@@ -323,39 +300,35 @@ pub enum FileType {
     Json,
 }
 
-/// Column names a [`Load`] reads from each upstream row to resolve which file to
-/// open. All three columns must be present on the upstream relation; `file_size_column`
-/// and `num_records_column` may be NULL on any given row. Engines use non-NULL size and
-/// row-count values as split-sizing / pruning hints.
-///
-/// All three are [`ColumnName`]s and may reference nested fields (e.g. `add.path` on
-/// a Delta-checkpoint upstream).
+/// Column names a [`Load`] reads from each upstream row to resolve which file to open.
+/// `path_column` references a non-nullable column; `file_size_column` and
+/// `num_records_column` reference nullable columns whose non-NULL values engines use as
+/// split-sizing / pruning hints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadColumnFileMeta {
-    /// Column on the upstream relation holding the per-row file path /
+    /// Non-nullable column on the upstream relation holding the per-row file path /
     /// URL fragment. Joined to [`Load::base_url`] when set.
     pub path_column: ColumnName,
-    /// Column with the file's total size in bytes. This may be NULL on any given row.
+    /// Nullable column with the file's total size in bytes.
     pub file_size_column: ColumnName,
-    /// Column with the file's row-count, parquet-encoded `numRecords`. This may be NULL on any
-    /// given row.
+    /// Nullable column with the file's row-count.
     pub num_records_column: ColumnName,
 }
 
 /// Reads data files identified by an upstream stream of file-metadata tuples. Each
 /// input row describes one file. `file_meta` names the path, file-size, and row-count
-/// columns on the upstream relation (all required; size and row-count nullable per row).
-/// The engine resolves each path against `base_url`, opens the file as
-/// `file_type`, and reads columns matching `file_schema` from it.
+/// columns on the upstream relation. The engine resolves each path against `base_url`,
+/// opens the file as `file_type`, and reads columns matching `file_schema` from it.
 ///
-/// `metadata_derived_columns` lists columns on the upstream row whose values are
-/// broadcast onto every emitted file row. See the example below for an example.
+/// `file_constant_columns` lists upstream columns whose per-file values are broadcast onto
+/// every emitted file row -- file-constant metadata, the same concept as
+/// [`ScanParquet::file_constant_columns`]. See the example below.
 ///
-/// `dv_column` names a (nullable) column on the upstream row holding a Delta
+/// `dv_column` names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
 /// and drops file rows whose row index appears in the DV. A NULL value for a given
 /// input row means "no DV for this file" -- all file rows are emitted. Tables that
-/// never use deletion vectors should plumb an all-NULL upstream column.
+/// never use deletion vectors can plumb an all-NULL upstream column.
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
@@ -363,15 +336,13 @@ pub struct LoadColumnFileMeta {
 ///
 /// - **`Some(base)`**: each path column value is treated as a path relative to `base` and resolved
 ///   via [`Url::join`]. Paths that are themselves absolute URLs (any scheme prefix) bypass the join
-///   and are used as-is, matching the Delta protocol convention for `Add.path`
-///   (relative-to-table-root OR a fully-qualified URI).
+///   and are used as-is.
 /// - **`None`**: every path column value must already be an absolute URL; the engine errors on
 ///   relative paths.
 ///
 /// Output row order is unspecified: the engine is free to read files in any order, in
 /// parallel, and to interleave rows from different files. The relative order of upstream
-/// rows is not preserved. Downstream nodes that depend on a specific ordering must impose
-/// it explicitly.
+/// rows is not preserved.
 ///
 /// # Example
 ///
@@ -389,7 +360,7 @@ pub struct LoadColumnFileMeta {
 ///     file_schema: { id: int, name: string },
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
-///     metadata_derived_columns: ["version"],
+///     file_constant_columns: ["version"],
 ///     file_meta: {
 ///         path_column: "path",
 ///         file_size_column: "size",
@@ -405,17 +376,17 @@ pub struct LoadColumnFileMeta {
 /// ```text
 ///     | id | name | version
 ///     +----+------+--------
-///     |  1 |  a   |       7
-///     |  2 |  b   |       7
 ///     |  3 |  c   |       8
+///     |  2 |  b   |       7
 ///     |  4 |  d   |       8
+///     |  1 |  a   |       7
 /// ```
 #[derive(Debug, Clone)]
 pub struct Load {
     pub file_schema: SchemaRef,
     pub file_type: FileType,
     pub base_url: Option<Url>,
-    pub metadata_derived_columns: Vec<ColumnName>,
+    pub file_constant_columns: Vec<ColumnName>,
     pub file_meta: LoadColumnFileMeta,
     pub dv_column: ColumnName,
 }
@@ -431,13 +402,11 @@ pub struct Load {
 ///
 /// # SQL equivalents
 ///
-/// The same semantics are expressible as SQL `MAX BY` (Spark, BigQuery, Snowflake,
-/// DuckDB, Trino, etc.) or as a nested query with `ROW_NUMBER()`. `MAX BY` stays
-/// compact when many columns must come from the winning row; the window rewrite
-/// grows quickly because every projected column must be named explicitly in the
-/// outer `SELECT`, while `MAX BY` repeats one aggregate per output column.
+/// The same semantics are expressible as SQL `MAX BY` or as a query with
+/// `ROW_NUMBER()`. Both express the same "keep the row with the greatest
+/// `version_column` per group" behavior over a single ordering column.
 ///
-/// Preferred form when the engine supports it:
+/// As `MAX BY`:
 ///
 /// ```sql
 /// SELECT
@@ -449,7 +418,7 @@ pub struct Load {
 /// GROUP BY <group_by fields>
 /// ```
 ///
-/// Equivalent window rewrite (engines without `MAX BY` may lower to this):
+/// Equivalent window rewrite:
 ///
 /// ```sql
 /// SELECT <output_schema fields>
@@ -504,10 +473,16 @@ pub struct MaxByVersion {
     pub output_schema: SchemaRef,
 }
 
-/// Performs a semi join between two inputs (`inputs.len() == 2`, convention `[probe, build]`) and
-/// emits a subset of probe rows -- a SQL `SEMI JOIN` (`inverted = false`) or `ANTI JOIN` (`inverted
-/// = true`). The build side filters but never contributes columns; output schema is the same as the
-/// probe input's schema.
+/// Performs a semi join between two inputs, `inputs.len() == 2`, the child
+/// nodes are `[probe, build]` in this order. It emits a subset of probe rows
+/// and the build side acts as a filter and never contributes columns. This is
+/// analogous to a SQL `SEMI JOIN` (`inverted = false`) or `ANTI JOIN`
+/// (`inverted = true`). A semi join finds all probe rows that are present in
+/// the build side, and an anti join finds all probe rows **not** present in the
+/// build side. This is analogous to set intersection and set difference,
+/// respectively.
+///
+/// The output schema is the schema of the probe input.
 ///
 /// # Example
 ///
@@ -539,7 +514,9 @@ pub struct SemiJoin {
     pub build_keys: Vec<ColumnName>,
 }
 
-/// Concatenates N input relations into a single relation. All input schemas must agree.
+/// The unordered bag union of N input relations. All rows of all inputs appear in the
+/// output, in arbitrary order. All input schemas must agree, and the output schema
+/// is the common schema of the inputs.
 ///
 /// # Example
 ///
@@ -558,20 +535,24 @@ pub struct SemiJoin {
 /// --
 ///  1
 ///  2
+///  3
 ///
 /// input 1:
 /// id
 /// --
 ///  3
 ///  4
+///  5
 ///
-/// output:
+/// output (arbitrary order; bag semantics keep the duplicate 3):
 /// id
 /// --
-///  1
-///  2
-///  3
 ///  4
+///  1
+///  3
+///  2
+///  5
+///  3
 /// ```
 #[derive(Debug, Clone)]
 pub struct UnionAll;
