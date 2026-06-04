@@ -129,6 +129,7 @@ impl Iterator for FfiEngineDataIter {
     fn next(&mut self) -> Option<Self::Item> {
         match (self.iter.next)(self.iter.state) {
             OptionalValue::None => None,
+            // TODO: re-evaluate memory management; errors are currently freed by PlanResultCleanup
             OptionalValue::Some(ExternResult::Err(err)) => Some(Err(engine_error_to_kernel(err))),
             OptionalValue::Some(ExternResult::Ok(handle)) => {
                 // into_inner transfers ownership of the EngineData to kernel, and kernel
@@ -190,6 +191,7 @@ impl Iterator for FfiBytesIter {
     fn next(&mut self) -> Option<Self::Item> {
         match (self.iter.next)(self.iter.state) {
             OptionalValue::None => None,
+            // TODO: re-evaluate memory management; errors are currently freed by PlanResultCleanup
             OptionalValue::Some(ExternResult::Err(err)) => Some(Err(engine_error_to_kernel(err))),
             OptionalValue::Some(ExternResult::Ok(array)) => Some(Self::arrow_array_to_bytes(array)),
         }
@@ -286,6 +288,7 @@ impl Iterator for FfiFileMetaIter {
     fn next(&mut self) -> Option<Self::Item> {
         match (self.iter.next)(self.iter.state) {
             OptionalValue::None => None,
+            // TODO: re-evaluate memory management; errors are currently freed by PlanResultCleanup
             OptionalValue::Some(ExternResult::Err(err)) => Some(Err(engine_error_to_kernel(err))),
             OptionalValue::Some(ExternResult::Ok(array)) => {
                 Some(Self::arrow_array_to_file_meta(array))
