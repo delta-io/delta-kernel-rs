@@ -118,11 +118,11 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# Declarative plan execution via PlanExecutor trait (experimental). The IR uses
-# kernel-internal types (notably `schema::ToSchema`) hidden under `#[internal_api]`, and
-# PlanBasedEngine assumes Arrow EngineData for JSON parsing, so it pulls in the Arrow interop
-# features as well.
-declarative-plans = ["internal-api", "arrow", "arrow-conversion", "arrow-expression"]
+# Declarative plan IR (experimental). The IR uses kernel-internal types (notably
+# `schema::ToSchema`) hidden under `#[internal_api]`, and is otherwise Arrow-free. The
+# Arrow-based PlanBasedEngine that executes these plans is gated on
+# `default-engine-base` + `declarative-plans`.
+declarative-plans = ["internal-api"]
 
 # Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
 # work. TODO(#2630): remove once full column-defaults support ships.

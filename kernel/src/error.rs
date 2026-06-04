@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
-#[cfg(any(feature = "default-engine-base", feature = "declarative-plans"))]
+#[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
@@ -41,7 +41,7 @@ pub enum Error {
     },
 
     /// An error performing operations on arrow data
-    #[cfg(any(feature = "default-engine-base", feature = "declarative-plans"))]
+    #[cfg(feature = "default-engine-base")]
     #[error(transparent)]
     Arrow(ArrowError),
 
@@ -378,7 +378,7 @@ from_with_backtrace!(
     (std::io::Error, IOError)
 );
 
-#[cfg(any(feature = "default-engine-base", feature = "declarative-plans"))]
+#[cfg(feature = "default-engine-base")]
 impl From<ArrowError> for Error {
     fn from(value: ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()

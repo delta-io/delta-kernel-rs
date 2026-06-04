@@ -28,10 +28,7 @@ pub(crate) fn writer_options() -> ArrowWriterOptions {
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
 
-#[cfg(all(
-    feature = "arrow-expression",
-    any(feature = "default-engine-base", feature = "declarative-plans")
-))]
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
 #[cfg(all(feature = "arrow-expression", feature = "internal-api"))]
 pub mod arrow_utils;
@@ -43,20 +40,17 @@ pub use self::arrow_utils::{parse_json, to_json_bytes};
 #[cfg(feature = "default-engine-base")]
 pub mod default;
 
-#[cfg(feature = "declarative-plans")]
+#[cfg(all(feature = "default-engine-base", feature = "declarative-plans"))]
 pub mod plans;
 
 #[cfg(test)]
 pub(crate) mod sync;
 
-#[cfg(any(feature = "default-engine-base", feature = "declarative-plans"))]
+#[cfg(feature = "default-engine-base")]
 pub mod arrow_data;
-#[cfg(any(feature = "default-engine-base", feature = "declarative-plans"))]
+#[cfg(feature = "default-engine-base")]
 pub(crate) mod arrow_get_data;
-#[cfg(all(
-    any(feature = "default-engine-base", feature = "declarative-plans"),
-    feature = "internal-api"
-))]
+#[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
 pub mod ensure_data_types;
 #[cfg(all(feature = "default-engine-base", not(feature = "internal-api")))]
 pub(crate) mod ensure_data_types;
