@@ -119,9 +119,8 @@ arrow-expression = ["need-arrow"]
 schema-diff = []
 
 # Declarative plan IR (experimental). The IR uses kernel-internal types hidden 
-# under `#[internal_api]`, and is otherwise Arrow-free. The Arrow-based 
-# PlanBasedEngine that executes these plans is gated on `default-engine-base` + 
-# `declarative-plans`.
+# under `#[internal_api]` The Arrow-based PlanBasedEngine that executes these 
+# plans is gated on `default-engine-base` + `declarative-plans`.
 declarative-plans = ["internal-api"]
 
 # Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
