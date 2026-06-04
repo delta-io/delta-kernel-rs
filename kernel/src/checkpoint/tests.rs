@@ -20,8 +20,11 @@ use crate::checkpoint::{
 };
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
+use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
@@ -911,7 +914,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
     assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
 
     // ===== Write checkpoint =====
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // ===== Verify tombstoned domain is NOT present after loading from checkpoint =====
     let snapshot = Snapshot::builder_for(table_url)
