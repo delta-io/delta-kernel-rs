@@ -324,8 +324,7 @@ pub struct LoadColumnFileMeta {
 /// `dv_column` names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
 /// and drops file rows whose row index appears in the DV. A NULL value for a given
-/// input row means "no DV for this file", so all file rows are emitted. Tables that
-/// never use deletion vectors can plumb an all-NULL upstream column.
+/// input row means "no DV for this file", so all file rows are emitted. 
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
