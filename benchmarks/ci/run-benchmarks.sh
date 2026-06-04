@@ -3,14 +3,15 @@
 #
 # Called by .github/workflows/benchmark.yml (run-benchmark job) after the repo
 # has been checked out at the PR head. Writes the formatted markdown comparison
-# to /tmp/bench-comment.md; the post-comment job picks it up and posts it.
+# to /tmp/bench-comment.md; the companion benchmark-post-comment.yml workflow
+# downloads it as an artifact and posts the PR comment in base-branch context.
 #
 # Expects the following environment variables:
 #
 #   BASE_REF   - base branch ref (e.g. "main")
 #   HEAD_SHA   - full SHA of the PR head commit
 #   COMMENT    - (optional) /bench PR comment body. Unset under the
-#                pull_request_target auto-trigger path; set to the comment
+#                pull_request auto-trigger path; set to the comment
 #                body under the issue_comment path.
 #   TRIGGER    - (optional) human-readable label for what kicked off the run
 #                ("auto-push" or "/bench"). Used in the comment header.
@@ -95,8 +96,8 @@ COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/par
 
 # ---------------------------------------------------------------------------
 # 5. Write results to /tmp/bench-comment.md
-#    The post-comment job in benchmark.yml downloads this file as an artifact
-#    and posts it as a PR comment using a step that holds GH_TOKEN.
+#    benchmark.yml uploads this as an artifact; benchmark-post-comment.yml
+#    downloads it and posts the PR comment in base-branch context.
 # ---------------------------------------------------------------------------
 SHORT_SHA="${HEAD_SHA:0:7}"
 

@@ -101,10 +101,13 @@ BENCH_TAGS=base,my-feature cargo bench -p delta_kernel_benchmarks
 
 ### Running benchmarking on a PR
 
-Benchmarks run automatically on every push to a PR (including drafts) with `BENCH_TAGS=base`, no filter.
+Benchmarks run automatically on every push to a non-draft PR with `BENCH_TAGS=base`, no filter.
 Results are posted as a single PR comment that updates in place on each push, so the latest
-comment always reflects the latest commit. To override the tags or filter, post a `/bench`
-comment as documented below -- it updates the same comment that the auto-trigger uses.
+comment always reflects the latest commit. The comment is posted by a companion
+`workflow_run`-triggered workflow ([benchmark-post-comment.yml](../.github/workflows/benchmark-post-comment.yml)),
+so the bench job itself runs with a read-only token even on fork PRs. To bench a draft PR or
+override the tags or filter, post a `/bench` comment as documented below -- it updates the
+same comment that the auto-trigger uses.
 
 To trigger benchmarks on a pull request manually, post a comment using the following syntax:
 

@@ -98,6 +98,10 @@ def main():
                 chg_ms      = to_ms(chg_p[0],  chg_p[2])
                 chg_err_ms  = to_ms(chg_p[1],  chg_p[2])
 
+                # Float-equality on zero is safe here: to_ms only multiplies/divides
+                # by powers of ten, so a zero output strictly implies a zero input.
+                # Do NOT replace with an epsilon -- that would tag legitimately fast
+                # benches (sub-nanosecond rounding) as N/A.
                 if base_ms == 0 or chg_ms == 0:
                     difference = 'N/A'
                 else:
