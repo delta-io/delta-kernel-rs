@@ -34,7 +34,7 @@ pub struct PlanNode {
 /// A [`RefId`] is an opaque value handle naming the output of one plan node. Each
 /// [`PlanNode`] is a triple `(kind, inputs, output)`:
 ///
-/// - `kind` ([`NodeKind`]) is the operator -- a source like `ScanParquet` or a transform like
+/// - `kind` ([`NodeKind`]) is the operator: a source like `ScanParquet` or a transform like
 ///   `Project`.
 /// - `inputs` is a `Vec<RefId>` naming the upstream values the operator reads from.
 /// - `output` is the RefId the operator produces.
@@ -43,11 +43,11 @@ pub struct PlanNode {
 /// Each RefId is bound exactly once. These input/output cross references encode the
 /// dataflow DAG, and `nodes` is stored in topological order: every node appears after
 /// the nodes whose outputs it consumes, so an engine can evaluate `nodes` in slice
-/// order -- each node's inputs are guaranteed bound by the time the node is reached.
+/// order; each node's inputs are guaranteed bound by the time the node is reached.
 ///
 /// A `Plan` has at least one node. The **terminal node** is always the
 /// last entry in `nodes`: it is the only node whose `output` no other node lists in
-/// `inputs`, and `Plan::result()` returns that node's `output` RefId -- the value the
+/// `inputs`, and `Plan::result()` returns that node's `output` RefId, the value the
 /// engine streams to the caller.
 ///
 /// # Execution
@@ -96,8 +96,8 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Returns the last node's `output` [`RefId`] -- the plan terminal whose rows the
-    /// engine streams to the caller -- or `None` if `nodes` is empty.
+    /// Returns the last node's `output` [`RefId`], the plan terminal whose rows the
+    /// engine streams to the caller, or `None` if `nodes` is empty.
     pub fn result(&self) -> Option<RefId> {
         self.nodes.last().map(|node| node.output)
     }

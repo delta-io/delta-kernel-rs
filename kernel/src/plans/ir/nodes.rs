@@ -11,7 +11,7 @@ use crate::schema::SchemaRef;
 use crate::FileMeta;
 
 // ============================================================================
-// NodeKind -- enumerates every operator kind
+// NodeKind: enumerates every operator kind
 // ============================================================================
 
 /// Plan node operator kinds.
@@ -81,14 +81,14 @@ impl From<FileMeta> for ScanFile {
 /// The engine iterates `schema`'s fields in order; for each field it produces one column of
 /// output:
 ///
-/// 1. **Metadata columns** -- if the field is annotated as a metadata column (e.g. via
+/// 1. **Metadata columns**: if the field is annotated as a metadata column (e.g. via
 ///    [`StructField::create_metadata_column`] with [`MetadataColumnSpec::RowIndex`]), the engine
 ///    populates it from the read context rather than from the Parquet file. See [Metadata columns]
 ///    below.
-/// 2. **File-constant columns** -- if the field's name appears in [`Self::file_constant_columns`],
+/// 2. **File-constant columns**: if the field's name appears in [`Self::file_constant_columns`],
 ///    the engine broadcasts the corresponding entry from [`ScanFile::file_constants`] for the file
 ///    being read (not from Parquet bytes). See [File-constant columns] below.
-/// 3. **Data columns** -- otherwise the engine attempts to locate the field in the Parquet file, in
+/// 3. **Data columns**: otherwise the engine attempts to locate the field in the Parquet file, in
 ///    this order:
 ///    - **Field ID**: if the field carries a Parquet field ID via
 ///      [`ColumnMetadataKey::ParquetFieldId`] metadata, match it against the Parquet column with
@@ -192,7 +192,7 @@ pub struct ScanJson {
 /// Inline literal rows. Each `rows[i]` carries one [`Scalar`] per **top-level** field
 /// of `schema`, in field order; `rows[i].len() == schema.fields().count()` for every
 /// row. Nested struct values are encoded as [`Scalar::Struct`], and array / map
-/// values as [`Scalar::Array`] / [`Scalar::Map`] -- nested leaves are not flattened
+/// values as [`Scalar::Array`] / [`Scalar::Map`]; nested leaves are not flattened
 /// into the row vec.
 ///
 /// # Example (flat)
@@ -253,13 +253,13 @@ pub struct Values {
 /// `exprs.len() == output_schema.fields().count()`. For each output index `i`, the engine
 /// evaluates `exprs[i]` against an input row and binds the result to the **logical name**
 /// `output_schema.fields()[i].name`. Output column names always come from `output_schema`,
-/// not from the expression tree -- expressions only supply values. Downstream nodes see the
+/// not from the expression tree; expressions only supply values. Downstream nodes see the
 /// logical field names declared in `output_schema`.
 ///
 /// # Example
 ///
 /// Input `{ id, first, last, add: { path, size, stats_parsed: { numRecords } } }` projected to
-/// `{ id, names, file_meta }` -- passthrough, array construction, nested input access, and a
+/// `{ id, names, file_meta }`, showing passthrough, array construction, nested input access, and a
 /// struct output column:
 ///
 /// ```text
@@ -300,34 +300,31 @@ pub enum FileType {
     Json,
 }
 
-/// Column names a [`Load`] reads from each upstream row to resolve which file to open.
-/// `path_column` references a non-nullable column; `file_size_column` and
-/// `num_records_column` reference nullable columns whose non-NULL values engines use as
-/// split-sizing / pruning hints.
+/// Names the columns a [`Load`] reads from each upstream row to locate and size each file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadColumnFileMeta {
-    /// Non-nullable column on the upstream relation holding the per-row file path /
-    /// URL fragment. Joined to [`Load::base_url`] when set.
+    /// Non-nullable column holding the per-row file path / URL fragment. Joined to
+    /// [`Load::base_url`] when set.
     pub path_column: ColumnName,
-    /// Nullable column with the file's total size in bytes.
+    /// Nullable column with the file's total size in bytes. Engines use non-NULL size and
+    /// row-count values as split-sizing / pruning hints.
     pub file_size_column: ColumnName,
     /// Nullable column with the file's row-count.
     pub num_records_column: ColumnName,
 }
 
-/// Reads data files identified by an upstream stream of file-metadata tuples. Each
-/// input row describes one file. `file_meta` names the path, file-size, and row-count
-/// columns on the upstream relation. The engine resolves each path against `base_url`,
-/// opens the file as `file_type`, and reads columns matching `file_schema` from it.
+/// Reads data files from an upstream stream of file-metadata tuples, one input row per file.
+/// For each row, `file_meta` locates and sizes the file, the engine resolves its path against
+/// `base_url` (see below), opens it as `file_type`, and reads columns matching `file_schema`.
 ///
 /// `file_constant_columns` lists upstream columns whose per-file values are broadcast onto
-/// every emitted file row -- file-constant metadata, the same concept as
+/// every emitted file row. This is file-constant metadata, the same concept as
 /// [`ScanParquet::file_constant_columns`]. See the example below.
 ///
 /// `dv_column` names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
 /// and drops file rows whose row index appears in the DV. A NULL value for a given
-/// input row means "no DV for this file" -- all file rows are emitted. Tables that
+/// input row means "no DV for this file", so all file rows are emitted. Tables that
 /// never use deletion vectors can plumb an all-NULL upstream column.
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
@@ -482,7 +479,7 @@ pub struct MaxByVersion {
 /// build side. This is analogous to set intersection and set difference,
 /// respectively.
 ///
-/// The output schema is the schema of the probe input.
+/// The output schema is the same as the probe input's schema.
 ///
 /// # Example
 ///
