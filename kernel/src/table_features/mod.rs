@@ -500,7 +500,7 @@ static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
@@ -513,7 +513,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
