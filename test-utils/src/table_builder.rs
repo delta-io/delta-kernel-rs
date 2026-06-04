@@ -412,16 +412,17 @@ pub fn two_checkpoints_stale_hint_post_cleanup() -> LogState {
     two_checkpoints_stale_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
 }
 
-pub fn checkpoint_at_end_crc_at_end_post_cleanup() -> LogState {
-    checkpoint_at_end_post_cleanup().with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
-}
-
-pub fn checkpoint_at_end_crc_at_mid_post_cleanup() -> LogState {
-    checkpoint_at_end_post_cleanup().with_crc_at([DEFAULT_SWEEP_MID_VERSION])
-}
-
 pub fn checkpoint_mid_crc_at_mid_post_cleanup() -> LogState {
     checkpoint_mid_post_cleanup().with_crc_at([DEFAULT_SWEEP_MID_VERSION])
+}
+
+pub fn checkpoint_mid_crc_above_mid_post_cleanup() -> LogState {
+    // Version 8 lies strictly between MID=5 and LATEST=10.
+    checkpoint_mid_post_cleanup().with_crc_at([8])
+}
+
+pub fn checkpoint_mid_crc_at_end_post_cleanup() -> LogState {
+    checkpoint_mid_post_cleanup().with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
 }
 
 /// Extract the version from a versioned log file. Returns `None` for unversioned
