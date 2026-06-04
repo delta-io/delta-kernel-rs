@@ -449,6 +449,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 ///   "delta.columnMapping.physicalName": "<pname>"
 /// }
 /// ```
+#[delta_kernel_derive::internal_api]
 pub(crate) fn assign_column_mapping_metadata(
     schema: &StructType,
     max_id: &mut i64,
@@ -731,6 +732,7 @@ fn insert_nested_field_ids_metadata(field: &mut StructField, ids: NestedFieldIds
 /// Returns the largest column mapping id found anywhere in `schema`. This includes both
 /// per-field `delta.columnMapping.id` annotations and the nested ids in
 /// `delta.columnMapping.nested.ids` metadata.
+#[delta_kernel_derive::internal_api]
 pub(crate) fn find_max_column_id_in_schema(schema: &StructType) -> Option<i64> {
     let mut visitor = MaxColumnId(None);
     visitor.transform_struct(schema);

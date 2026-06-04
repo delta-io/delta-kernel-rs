@@ -14,33 +14,56 @@ use std::sync::{Arc, LazyLock};
 use tracing::{instrument, warn};
 
 use super::LogSegment;
+use crate::actions::visitors::{
+    visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
+};
 use crate::actions::{
-    get_commit_schema, DomainMetadata, Metadata, Protocol, SetTransaction, ADD_NAME,
-    COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME,
+    DomainMetadata, Metadata, Protocol, SetTransaction, ADD_NAME, COMMIT_INFO_NAME,
+    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::crc::{is_incremental_safe_operation, Crc, CrcDelta, FileSizeHistogram, FileStatsDelta};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{
     column_name, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
+    StructField, StructType, ToSchema as _,
 };
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, RowVisitor, Version};
 
 #[allow(clippy::expect_used)]
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let projected = get_commit_schema()
-        .project_as_struct(&[
-            ADD_NAME,
-            REMOVE_NAME,
-            PROTOCOL_NAME,
-            METADATA_NAME,
-            SET_TRANSACTION_NAME,
-            DOMAIN_METADATA_NAME,
-            COMMIT_INFO_NAME,
-        ])
-        .expect("project_as_struct on commit schema");
-    let with_file = projected
+    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
+    // an Add row.
+    let add = StructField::nullable(
+        ADD_NAME,
+        StructType::new_unchecked([StructField::not_null("size", DataType::LONG)]),
+    );
+    // remove.size is optional, so we read remove.path (required) to know a row is a Remove
+    // before reading its size.
+    let remove = StructField::nullable(
+        REMOVE_NAME,
+        StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
+        ]),
+    );
+    let commit_info = StructField::nullable(
+        COMMIT_INFO_NAME,
+        StructType::new_unchecked([
+            StructField::nullable("operation", DataType::STRING),
+            StructField::nullable("inCommitTimestamp", DataType::LONG),
+        ]),
+    );
+    let base = StructType::new_unchecked([
+        add,
+        remove,
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+        commit_info,
+    ]);
+    let with_file = base
         .add_metadata_column("_file", MetadataColumnSpec::FilePath)
         .expect("add _file metadata column");
     Arc::new(with_file)
@@ -113,20 +136,10 @@ impl LogSegment {
             .read_json_files(&files, REPLAY_SCHEMA.clone(), None)?;
 
         for batch_result in batches {
-            let data = batch_result?;
-            let data = data.as_ref();
-
-            if acc.delta.protocol.is_none() {
-                acc.delta.protocol = Protocol::try_new_from_data(data)?;
-            }
-            if acc.delta.metadata.is_none() {
-                acc.delta.metadata = Metadata::try_new_from_data(data)?;
-            }
-
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
             let mut visitor = CrcReplayVisitor { acc: &mut acc };
-            visitor.visit_rows_of(data)?;
+            visitor.visit_rows_of(batch_result?.as_ref())?;
         }
 
         // Run the per-commit invariant on the final (oldest) commit; no successor batch
@@ -322,6 +335,7 @@ const COL_DM_REMOVED: usize = 8;
 const COL_TXN_APP_ID: usize = 9;
 const COL_TXN_VERSION: usize = 10;
 const COL_TXN_LAST_UPDATED: usize = 11;
+const N_FIXED_COLS: usize = COL_TXN_LAST_UPDATED + 1;
 
 /// Thin shim that pulls leaf values from `getters` and forwards them to the accumulator's
 /// `on_*` methods. All behavior lives in [`CrcReplayAccumulator`].
@@ -335,7 +349,7 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             const STRING: DataType = DataType::STRING;
             const LONG: DataType = DataType::LONG;
             const BOOLEAN: DataType = DataType::BOOLEAN;
-            let types_and_names = vec![
+            let fixed = vec![
                 (STRING, column_name!("_file")),
                 (STRING, column_name!("commitInfo.operation")),
                 (LONG, column_name!("commitInfo.inCommitTimestamp")),
@@ -349,15 +363,22 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 (LONG, column_name!("txn.version")),
                 (LONG, column_name!("txn.lastUpdated")),
             ];
-            let (types, names): (Vec<_>, Vec<_>) = types_and_names.into_iter().unzip();
+            let (mut types, mut names): (Vec<_>, Vec<_>) = fixed.into_iter().unzip();
+            for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
+                let (leaf_names, leaf_types) = leaves.as_ref();
+                names.extend_from_slice(leaf_names);
+                types.extend_from_slice(leaf_types);
+            }
             (names, types).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
+        let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
         require!(
-            getters.len() == COL_TXN_LAST_UPDATED + 1,
+            getters.len() == N_FIXED_COLS + n_protocol_leaves + n_metadata_leaves,
             Error::internal_error(format!(
                 "Wrong number of CrcReplayVisitor getters: {}",
                 getters.len()
@@ -404,6 +425,15 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 let last_updated: Option<i64> =
                     getters[COL_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
                 self.acc.on_set_transaction(app_id, version, last_updated);
+            }
+
+            if self.acc.delta.protocol.is_none() {
+                self.acc.delta.protocol =
+                    visit_protocol_at(i, &getters[N_FIXED_COLS..N_FIXED_COLS + n_protocol_leaves])?;
+            }
+            if self.acc.delta.metadata.is_none() {
+                self.acc.delta.metadata =
+                    visit_metadata_at(i, &getters[N_FIXED_COLS + n_protocol_leaves..])?;
             }
         }
         Ok(())
@@ -565,8 +595,10 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         let visitor = CrcReplayVisitor { acc: &mut acc };
         let (names, types) = visitor.selected_column_names_and_types();
-        assert_eq!(names.len(), COL_TXN_LAST_UPDATED + 1);
-        assert_eq!(types.len(), COL_TXN_LAST_UPDATED + 1);
+        let expected =
+            N_FIXED_COLS + PROTOCOL_LEAVES.as_ref().0.len() + METADATA_LEAVES.as_ref().0.len();
+        assert_eq!(names.len(), expected);
+        assert_eq!(types.len(), expected);
     }
 
     // ===== Commit-boundary state machine: direct accumulator tests =====

@@ -3,13 +3,16 @@ pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
+#[internal_api]
+pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
-    get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
     validate_column_mapping_id,
 };
 use delta_kernel_derive::internal_api;
+pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -25,6 +28,7 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+mod iceberg_compat;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -442,7 +446,8 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///   always use INT64; INT96 is forbidden.
 /// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
 ///   disable IcebergCompatV3 on an existing table.
-/// - Void type: when supported, it must not appear inside map or array types.
+/// - Void type: when delta-spark supports VOID type on icebergCompatV3 tables, add it to V3's type
+///   allowlist (`is_v3_supported_type` in `iceberg_compat::v3`).
 ///
 /// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
@@ -496,7 +501,7 @@ static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
@@ -509,7 +514,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
