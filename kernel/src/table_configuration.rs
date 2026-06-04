@@ -25,11 +25,11 @@ use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
-    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
+    get_any_level_column_physical_name, validate_timestamp_ntz_feature_support, ColumnMappingMode,
+    EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
+    LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -614,7 +614,7 @@ impl TableConfiguration {
     /// For table features protocol (v3), returns the explicit reader_features list.
     /// For legacy protocol (v1-2), infers features from the version number.
     fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
-        crate::table_features::enabled_reader_features(&self.protocol)
+        extract_enabled_reader_features(&self.protocol)
     }
 
     /// Returns all writer features enabled for this table based on protocol version.
@@ -656,7 +656,7 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        crate::table_features::check_reader_version_range(&self.protocol)?;
+        check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
         for feature in self.get_enabled_reader_features() {

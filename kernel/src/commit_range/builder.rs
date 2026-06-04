@@ -12,9 +12,8 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end version
 /// and the commit ordering. [`Self::build`] performs delta-log listing and contiguity
 /// validation.
-///
-/// TODO: support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
-/// `with_max_catalog_version(self, Version)`
+// TODO: support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
+// `with_max_catalog_version(self, Version)`
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
@@ -149,8 +148,7 @@ fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
     Ok(())
 }
 
-/// Ensure `start_version` is the first commit in the snapshot's log segment; otherwise
-/// surface the earliest available commit so the caller knows where the gap begins.
+/// Ensure `start_version` is the first commit in the snapshot's log segment.
 fn validate_start_version_available(
     start_version: Version,
     first_commit: Option<&ParsedLogPath>,
@@ -274,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_based_with_explicit_end_version_is_honored() {
+    fn build_snapshot_based_with_explicit_end_version() {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(table_root.as_str())
