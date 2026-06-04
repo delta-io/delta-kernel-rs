@@ -24,7 +24,7 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
 use crate::expressions::ColumnName;
-use crate::metrics::emit_parquet_read_completed;
+use crate::metrics::{emit_parquet_read_completed, PrecountedMetricsIterator};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
@@ -315,7 +315,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             predicate,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(Box::new(super::ReadMetricsIterator::new(
+        Ok(Box::new(PrecountedMetricsIterator::new(
             inner,
             num_files,
             bytes_read,

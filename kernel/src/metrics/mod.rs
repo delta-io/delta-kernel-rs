@@ -58,16 +58,24 @@
 //!
 //! # Storage Metrics
 //!
-//! Storage operations (list, read, copy) are automatically instrumented when using
-//! `DefaultEngine` with a metrics reporter. The default storage handler implementation
-//! emits `StorageListCompleted`, `StorageReadCompleted`, and `StorageCopyCompleted`
-//! events that track latencies at the storage layer.
+//! Storage operations (list, read, copy) emit `StorageListCompleted`,
+//! `StorageReadCompleted`, and `StorageCopyCompleted` events tracking latencies at the
+//! storage layer. `DefaultEngine` wraps its storage handler in [`MeteredStorageHandler`]
+//! at construction; any other engine gets the same coverage by wrapping its [`Engine`]
+//! in [`MeteredDeltaEngine`] at construction.
 //!
 //! These metrics are standalone and track aggregate storage performance without
 //! correlating to specific Snapshot/Transaction operations.
+//!
+//! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
+mod metered_engine;
+mod metered_storage;
+#[cfg(feature = "default-engine-base")]
+mod precounted_metrics_iterator;
 pub(crate) mod reporter;
+mod streaming_metrics_iterator;
 
 use std::sync::Arc;
 
@@ -78,7 +86,12 @@ pub use events::{
     SnapshotCompleted, SnapshotFailed, StorageCopyCompleted, StorageListCompleted,
     StorageReadCompleted,
 };
+pub use metered_engine::MeteredDeltaEngine;
+pub use metered_storage::MeteredStorageHandler;
+#[cfg(feature = "default-engine-base")]
+pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
+pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
