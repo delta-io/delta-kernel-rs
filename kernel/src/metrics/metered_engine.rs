@@ -70,11 +70,9 @@ mod tests {
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::{DeltaResult, FileMeta, FileSlice};
 
-    // The tests below intentionally avoid `DefaultEngine` so the wrapper is exercised on a
-    // handler that is *not* already self-metering -- the whole point of `MeteredDeltaEngine`
-    // is to add metering to engines that don't ship with it. `StubEngine` returns a
-    // `StubStorageHandler` with a deterministic two-file listing, letting us assert the
-    // resulting span carries `num_files == 2` without building any on-disk table.
+    // Use a stub engine so the wrapper sees an un-metered storage handler. `DefaultEngine`
+    // already exposes `MeteredStorageHandler` from `storage_handler()`, which would trip
+    // the double-wrap guard in `MeteredDeltaEngine::new`.
 
     /// Minimal storage handler used in tests: returns N preconfigured FileMeta items.
     #[derive(Debug)]

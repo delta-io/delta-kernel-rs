@@ -60,9 +60,9 @@
 //!
 //! Storage operations (list, read, copy) emit `StorageListCompleted`,
 //! `StorageReadCompleted`, and `StorageCopyCompleted` events tracking latencies at the
-//! storage layer. `DefaultEngine`'s built-in storage handler emits these natively; any
-//! other engine gets the same coverage by wrapping its [`Engine`] in
-//! [`MeteredDeltaEngine`] at construction.
+//! storage layer. `DefaultEngine` wraps its storage handler in [`MeteredStorageHandler`]
+//! at construction; any other engine gets the same coverage by wrapping its [`Engine`]
+//! in [`MeteredDeltaEngine`] at construction.
 //!
 //! These metrics are standalone and track aggregate storage performance without
 //! correlating to specific Snapshot/Transaction operations.
