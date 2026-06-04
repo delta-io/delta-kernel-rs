@@ -46,8 +46,11 @@
 //! ```
 //!
 //! Requires `Snapshot` and `DefaultEngineBuilder` to be in scope at the call site.
-//! The macros expand there, so types resolve to the caller's kernel crate -- avoiding
-//! the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests.
+//! Catalog-managed loads additionally require `LogPath` and `FileMeta` (the macro
+//! constructs `LogPath` values from URL strings so kernel's `with_log_tail` accepts
+//! them as the caller's crate type). The macros expand at the call site so types
+//! resolve to the caller's kernel crate -- avoiding the type mismatch between
+//! `test_utils`'s kernel and `kernel/src/` unit tests.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -60,7 +63,9 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::committer::{
+    CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
+};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::{
@@ -76,7 +81,9 @@ use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, Stru
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{
+    DeltaResult, DeltaResultIterator, Engine, FilteredEngineData, Snapshot, Version,
+};
 
 // ===========================================================================
 // Sweep constants
@@ -177,6 +184,65 @@ impl fmt::Display for LastCheckpointHintState {
     }
 }
 
+/// Materialization state of the catalog tail for catalog-managed tables.
+///
+/// A catalog-managed table's most recent commits live in `_delta_log/_staged_commits/`
+/// until the catalog ratifies them by moving them to `_delta_log/{version}.json`. The
+/// kernel reaches staged commits via `Snapshot::builder_for(..).with_log_tail(..)`.
+///
+/// - [`None`](Self::None): no staged files; all commits are published JSONs. The default.
+/// - [`StagedOnly`](Self::StagedOnly): the last `num_versions` commits exist only as staged files.
+///   The corresponding `{version}.json` files are absent and the log tail points at the staged
+///   commits. Models a fully-unratified tail.
+/// - [`StagedAndPublished`](Self::StagedAndPublished): the last `num_versions` commits exist as
+///   both staged and published files on disk. The log tail interleaves the two forms per version,
+///   stress-testing log_tail resolution against filesystem discovery. Real catalogs ratify in
+///   commit order (contiguous published prefix, staged suffix); this variant deliberately
+///   interleaves. Requires `num_versions >= 2` so both forms appear in the tail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogTailState {
+    #[default]
+    None,
+    StagedOnly {
+        num_versions: u64,
+    },
+    StagedAndPublished {
+        num_versions: u64,
+    },
+}
+
+impl CatalogTailState {
+    /// Number of versions this state places in the catalog tail. Returns `0` for `None`.
+    pub fn num_staged(&self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::StagedOnly { num_versions } | Self::StagedAndPublished { num_versions } => {
+                *num_versions
+            }
+        }
+    }
+
+    /// Whether this state requires the table to be catalog-managed.
+    pub fn requires_catalog_managed(&self) -> bool {
+        matches!(
+            self,
+            Self::StagedOnly { .. } | Self::StagedAndPublished { .. }
+        )
+    }
+}
+
+impl fmt::Display for CatalogTailState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "no_tail"),
+            Self::StagedOnly { num_versions } => write!(f, "{num_versions}_staged_only"),
+            Self::StagedAndPublished { num_versions } => {
+                write!(f, "{num_versions}_staged_and_published")
+            }
+        }
+    }
+}
+
 /// Shape of a Delta table's `_delta_log/` directory.
 #[derive(Clone, Debug)]
 pub struct LogState {
@@ -192,6 +258,8 @@ pub struct LogState {
     cleanup_before: Option<u64>,
     /// State of the `_last_checkpoint` hint file. Defaults to `Present`.
     last_checkpoint_hint: LastCheckpointHintState,
+    /// Catalog-managed tail materialization. Defaults to `None`.
+    catalog_tail: CatalogTailState,
 }
 
 impl LogState {
@@ -204,6 +272,7 @@ impl LogState {
             checkpoint_format: CheckpointFormat::Default,
             cleanup_before: None,
             last_checkpoint_hint: LastCheckpointHintState::Present,
+            catalog_tail: CatalogTailState::None,
         }
     }
 
@@ -270,6 +339,16 @@ impl LogState {
         self
     }
 
+    /// Set the catalog-managed tail materialization state.
+    ///
+    /// Non-`None` states require the paired [`FeatureSet`] to enable `catalog_managed()`
+    /// and require `num_versions <= latest_version` (v=0 is the create-table commit and
+    /// cannot be staged). The builder asserts on these preconditions at `build()` time.
+    pub fn with_catalog_tail(mut self, state: CatalogTailState) -> Self {
+        self.catalog_tail = state;
+        self
+    }
+
     /// Latest version on the table. The total number of commits on disk is
     /// `latest_version + 1` (or fewer if
     /// [`with_cleanup_commits_before`](Self::with_cleanup_commits_before) removed earlier
@@ -296,6 +375,11 @@ impl LogState {
     /// State of the `_last_checkpoint` hint file on the built table.
     pub(crate) fn last_checkpoint_hint(&self) -> LastCheckpointHintState {
         self.last_checkpoint_hint
+    }
+
+    /// Catalog-managed tail materialization state.
+    pub(crate) fn catalog_tail(&self) -> CatalogTailState {
+        self.catalog_tail
     }
 }
 
@@ -372,7 +456,7 @@ async fn read_hint_bytes(store: &Arc<DynObjectStore>, path: &Path) -> DeltaResul
 
 /// Up-front validation so panics surface on the caller's thread, not through
 /// `block_on_sync`'s worker-thread join boundary.
-fn validate_log_state(log_state: &LogState) {
+fn validate_log_state(log_state: &LogState, features: &FeatureSet) {
     if let Some(n) = log_state.cleanup_before() {
         assert!(
             n >= 1,
@@ -395,6 +479,39 @@ fn validate_log_state(log_state: &LogState) {
             "Stale hint requires at least 2 checkpoints (one to be stale relative to); \
              pair with `with_checkpoint_at` at two distinct versions",
         );
+    }
+    let catalog_tail = log_state.catalog_tail();
+    if catalog_tail.requires_catalog_managed() {
+        let num_versions = catalog_tail.num_staged();
+        assert!(
+            num_versions >= 1,
+            "catalog_tail num_versions must be >= 1, got {num_versions}",
+        );
+        assert!(
+            num_versions <= log_state.latest_version(),
+            "catalog_tail num_versions ({num_versions}) must be <= latest_version ({}); \
+             v=0 is the create-table commit and cannot be staged",
+            log_state.latest_version(),
+        );
+        if matches!(catalog_tail, CatalogTailState::StagedAndPublished { .. }) {
+            assert!(
+                num_versions >= 2,
+                "StagedAndPublished requires num_versions >= 2 (at num_versions=1 the \
+                 alternation degenerates to staged-only); use StagedOnly instead",
+            );
+        }
+        assert!(
+            features.is_catalog_managed(),
+            "catalog_tail requires `FeatureSet::catalog_managed()` to be enabled",
+        );
+        let staged_start = log_state.latest_version() - num_versions + 1;
+        for &cp in log_state.checkpoints_at() {
+            assert!(
+                cp < staged_start,
+                "checkpoint at v={cp} overlaps the catalog tail [{staged_start}..]; \
+                 checkpoints inside the staged range are not supported",
+            );
+        }
     }
 }
 
@@ -419,6 +536,9 @@ impl fmt::Display for LogState {
             } => write!(f, "+sidecars")?,
             CheckpointFormat::Default => {}
         }
+        if self.catalog_tail != CatalogTailState::None {
+            write!(f, "+catalog_tail({})", self.catalog_tail)?;
+        }
         Ok(())
     }
 }
@@ -426,6 +546,9 @@ impl fmt::Display for LogState {
 // ===========================================================================
 // FeatureSet
 // ===========================================================================
+
+/// Property key used to enable the `catalogManaged` reader+writer feature.
+const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 
 /// Which Delta table features to enable. Methods chain for composability.
 ///
@@ -522,6 +645,21 @@ impl FeatureSet {
         self
     }
 
+    /// Enable the `catalogManaged` reader+writer feature. Pairs with `inCommitTimestamp`,
+    /// which `create_table` enables automatically as a dependency.
+    pub fn catalog_managed(mut self) -> Self {
+        self.table_properties
+            .push((CATALOG_MANAGED_PROPERTY.into(), "supported".into()));
+        self
+    }
+
+    /// Whether this feature set enables `catalogManaged`.
+    pub fn is_catalog_managed(&self) -> bool {
+        self.table_properties
+            .iter()
+            .any(|(k, _)| k == CATALOG_MANAGED_PROPERTY)
+    }
+
     /// Set an arbitrary table property. Useful for properties that don't have a
     /// dedicated method.
     pub fn with_property(mut self, key: &str, value: &str) -> Self {
@@ -547,6 +685,10 @@ impl FeatureSet {
                 "delta.enableRowTracking" => {
                     out.push(TableFeature::RowTracking);
                     out.push(TableFeature::DomainMetadata); // row tracking depends on DM
+                }
+                k if k == CATALOG_MANAGED_PROPERTY => {
+                    out.push(TableFeature::CatalogManaged);
+                    out.push(TableFeature::InCommitTimestamp); // catalogManaged depends on ICT
                 }
                 _ => {}
             }
@@ -1060,7 +1202,7 @@ impl TestTableBuilder {
     /// Panics if [`LastCheckpointHintState::Stale`] is paired with fewer than two
     /// checkpoints.
     pub fn build(self) -> DeltaResult<TestTable> {
-        validate_log_state(&self.log_state);
+        validate_log_state(&self.log_state, &self.features);
         block_on_sync(|| self.build_async())
     }
 
@@ -1076,6 +1218,7 @@ impl TestTableBuilder {
                 .build(),
         );
         let schema = self.schema;
+        let is_catalog_managed = self.features.is_catalog_managed();
 
         // Resolve the checkpoint spec once. `V2WithSidecarsIfEnabled` falls back to
         // `None` (kernel default: V1 or V2-NoSidecar based on the feature flag) when
@@ -1125,7 +1268,7 @@ impl TestTableBuilder {
         let mut stale_hint_bytes: Option<Vec<u8>> = None;
 
         let mut snapshot = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build(engine.as_ref(), make_committer(is_catalog_managed))?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
         if checkpoints_at.contains(&0) {
@@ -1145,6 +1288,7 @@ impl TestTableBuilder {
                 self.rows_per_file,
                 &self.partition_columns,
                 v,
+                is_catalog_managed,
             )
             .await?
             .unwrap_post_commit_snapshot();
@@ -1173,6 +1317,15 @@ impl TestTableBuilder {
             }
         }
 
+        // Lay out the on-disk staged-commits shape per the requested [`CatalogTailState`].
+        let catalog_tail_paths = materialize_catalog_tail(
+            &store,
+            table_root,
+            self.log_state.latest_version(),
+            self.log_state.catalog_tail(),
+        )
+        .await?;
+
         // Simulate log cleanup by deleting versioned log files at v < n. Unversioned
         // files like `_last_checkpoint` are skipped.
         if let Some(n) = self.log_state.cleanup_before() {
@@ -1192,9 +1345,14 @@ impl TestTableBuilder {
             }
         }
 
+        let max_catalog_version = is_catalog_managed.then_some(self.log_state.latest_version());
+
         Ok(TestTable {
             store,
             table_root: table_root.to_string(),
+            log_tail_paths: catalog_tail_paths,
+            max_catalog_version,
+            is_catalog_managed,
             description: if self.table_config.table_properties.is_empty() {
                 format!("{} + {}", self.log_state, self.features)
             } else {
@@ -1223,13 +1381,14 @@ async fn write_data_commit<E: TaskExecutor>(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
+    is_catalog_managed: bool,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction(make_committer(is_catalog_managed), engine)?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
@@ -1269,6 +1428,127 @@ async fn write_data_commit<E: TaskExecutor>(
     }
 
     txn.commit(engine)
+}
+
+/// Construct a committer that matches the requested table type. For non-catalog-managed
+/// tables this is the standard [`FileSystemCommitter`]; for catalog-managed tables this is
+/// a minimal in-process catalog committer that bypasses ratification (see
+/// [`TestCatalogCommitter`]).
+fn make_committer(is_catalog_managed: bool) -> Box<dyn Committer> {
+    if is_catalog_managed {
+        Box::new(TestCatalogCommitter)
+    } else {
+        Box::new(FileSystemCommitter::new())
+    }
+}
+
+// ===========================================================================
+// Test catalog committer
+// ===========================================================================
+
+/// A minimal [`Committer`] that writes commits to the published path (matching
+/// [`FileSystemCommitter`]) while reporting `is_catalog_committer() == true` so
+/// kernel accepts it for catalog-managed tables. The post-build catalog tail
+/// materialization step creates any staged files the layout needs.
+///
+/// For tests that need separate stage-then-publish semantics matching
+/// `UCCommitter`, use a more faithful committer.
+#[derive(Debug, Default)]
+struct TestCatalogCommitter;
+
+impl Committer for TestCatalogCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let version = commit_metadata.version();
+        let published = commit_metadata.published_commit_path()?;
+        match engine
+            .json_handler()
+            .write_json_file(&published, Box::new(actions), false)
+        {
+            Ok(()) => {
+                let file_meta = engine.storage_handler().head(&published)?;
+                Ok(CommitResponse::Committed { file_meta })
+            }
+            Err(delta_kernel::Error::FileAlreadyExists(_)) => {
+                Ok(CommitResponse::Conflict { version })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        true
+    }
+
+    /// No-op: this committer publishes eagerly during [`commit`](Self::commit).
+    fn publish(&self, _engine: &dyn Engine, _metadata: PublishMetadata) -> DeltaResult<()> {
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Catalog-managed tail materialization
+// ===========================================================================
+
+/// Whether a given offset within a [`CatalogTailState::StagedAndPublished`] tail uses
+/// the staged form. Alternates per version starting with staged at offset 0.
+fn mixed_tail_uses_staged(offset: u64) -> bool {
+    offset.is_multiple_of(2)
+}
+
+/// Copy published commits into `_staged_commits/`, optionally remove the published forms,
+/// and return the log tail entries the catalog would track for the result. The returned
+/// paths are object-store paths relative to the table root, sorted ascending by version.
+async fn materialize_catalog_tail(
+    store: &Arc<DynObjectStore>,
+    table_root: &str,
+    latest_version: u64,
+    state: CatalogTailState,
+) -> DeltaResult<Vec<(Version, Path)>> {
+    let (always_staged, delete_published) = match state {
+        CatalogTailState::None => return Ok(Vec::new()),
+        CatalogTailState::StagedOnly { .. } => (true, true),
+        CatalogTailState::StagedAndPublished { .. } => (false, false),
+    };
+    let num_versions = state.num_staged();
+    let staged_start = latest_version - num_versions + 1;
+
+    let mut out = Vec::with_capacity(num_versions as usize);
+    for (offset, v) in (staged_start..=latest_version).enumerate() {
+        let offset = offset as u64;
+        let published = crate::delta_path_for_version(v, "json");
+        let resolved_published = crate::resolve_table_path(table_root, &published)?;
+        let bytes = store
+            .get(&resolved_published)
+            .await
+            .map_err(delta_kernel::Error::from)?
+            .bytes()
+            .await
+            .map_err(delta_kernel::Error::from)?;
+
+        let staged = crate::staged_commit_path_for_version(v);
+        let resolved_staged = crate::resolve_table_path(table_root, &staged)?;
+        store
+            .put(&resolved_staged, bytes.into())
+            .await
+            .map_err(delta_kernel::Error::from)?;
+
+        let use_staged = always_staged || mixed_tail_uses_staged(offset);
+        let picked = if use_staged { staged } else { published };
+        out.push((v, picked));
+
+        if delete_published {
+            store
+                .delete(&resolved_published)
+                .await
+                .map_err(delta_kernel::Error::from)?;
+        }
+    }
+    Ok(out)
 }
 
 /// Generate a constant column where all rows have the same value derived from `seed`.
@@ -1433,6 +1713,14 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
 pub struct TestTable {
     store: Arc<DynObjectStore>,
     table_root: String,
+    /// Catalog tail entries the kernel would receive via `SnapshotBuilder::with_log_tail`.
+    /// Empty when the table is not catalog-managed or when the catalog tail is `None`.
+    /// Sorted ascending by version; one entry per version in the tail.
+    log_tail_paths: Vec<(Version, Path)>,
+    /// Maximum catalog-ratified version. `Some` iff the table is catalog-managed.
+    max_catalog_version: Option<Version>,
+    /// Whether the table was built with the `catalogManaged` feature enabled.
+    is_catalog_managed: bool,
     description: String,
 }
 
@@ -1452,6 +1740,41 @@ impl TestTable {
     /// Useful in assert messages to identify which config failed.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Whether the table was built with the `catalogManaged` feature enabled.
+    pub fn is_catalog_managed(&self) -> bool {
+        self.is_catalog_managed
+    }
+
+    /// Highest version the catalog knows about. `Some(latest_version)` iff the table is
+    /// catalog-managed. Threaded into the kernel via
+    /// `SnapshotBuilder::with_max_catalog_version`.
+    pub fn max_catalog_version(&self) -> Option<Version> {
+        self.max_catalog_version
+    }
+
+    /// Catalog tail entries the kernel must receive via `SnapshotBuilder::with_log_tail`.
+    /// Returns `(version, object_store_path)` pairs sorted ascending by version. Empty
+    /// when the table is not catalog-managed or has [`CatalogTailState::None`].
+    pub fn log_tail_paths(&self) -> &[(Version, Path)] {
+        &self.log_tail_paths
+    }
+
+    /// Catalog tail entries as `(version, absolute_url_string)` pairs. The
+    /// `build_snapshot!` macro consumes these to construct `LogPath` values at the
+    /// caller's crate so cross-crate type mismatches don't surface.
+    pub fn log_tail_urls(&self) -> DeltaResult<Vec<(Version, String)>> {
+        let table_url = delta_kernel::try_parse_uri(&self.table_root)?;
+        self.log_tail_paths
+            .iter()
+            .map(|(v, p)| {
+                let joined = table_url
+                    .join(p.as_ref())
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                Ok((*v, joined.to_string()))
+            })
+            .collect()
     }
 
     /// Create a `DefaultEngine` backed by this table's store.
@@ -1500,29 +1823,85 @@ pub fn test_table(
 ///
 /// Expands at the call site so `Snapshot` resolves to the caller's crate. This avoids
 /// the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests' kernel.
-/// Requires `Snapshot` to be in scope at the call site.
+/// Requires `Snapshot` to be in scope. For catalog-managed tables, also requires
+/// `LogPath` and `FileMeta` in scope; the macro threads `with_log_tail` and
+/// `with_max_catalog_version` through every builder arm.
 #[macro_export]
 macro_rules! build_snapshot {
-    ($version_target:expr, $table_root:expr, $engine:expr) => {
+    ($version_target:expr, $table:expr, $engine:expr $(,)?) => {{
+        let __tb_table: &$crate::table_builder::TestTable = $table;
+        let __tb_root = __tb_table.table_root();
+        let __tb_engine = $engine;
+        let __tb_log_tail: Vec<LogPath> = if __tb_table.is_catalog_managed() {
+            __tb_table
+                .log_tail_urls()
+                .expect("failed to compute log tail URLs")
+                .into_iter()
+                .map(|(_, url_str)| {
+                    let location = ::url::Url::parse(&url_str).expect("valid log tail URL");
+                    LogPath::try_new(FileMeta {
+                        location,
+                        last_modified: 0,
+                        size: 0,
+                    })
+                    .expect("valid log path")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let __tb_mcv = __tb_table.max_catalog_version();
         match &$version_target {
-            $crate::table_builder::VersionTarget::Latest => {
-                Snapshot::builder_for($table_root).build($engine).unwrap()
-            }
-            $crate::table_builder::VersionTarget::AtVersion(v) => {
-                Snapshot::builder_for($table_root)
-                    .at_version(*v)
-                    .build($engine)
-                    .unwrap()
-            }
+            $crate::table_builder::VersionTarget::Latest => $crate::__apply_catalog_builder!(
+                Snapshot::builder_for(__tb_root),
+                __tb_log_tail,
+                __tb_mcv
+            )
+            .build(__tb_engine)
+            .unwrap(),
+            $crate::table_builder::VersionTarget::AtVersion(v) => $crate::__apply_catalog_builder!(
+                Snapshot::builder_for(__tb_root).at_version(*v),
+                __tb_log_tail,
+                __tb_mcv
+            )
+            .build(__tb_engine)
+            .unwrap(),
             $crate::table_builder::VersionTarget::IncrementalToLatest { from } => {
-                let base = Snapshot::builder_for($table_root)
-                    .at_version(*from)
-                    .build($engine)
-                    .unwrap();
-                Snapshot::builder_from(base).build($engine).unwrap()
+                let __tb_base = $crate::__apply_catalog_builder!(
+                    Snapshot::builder_for(__tb_root).at_version(*from),
+                    __tb_log_tail.clone(),
+                    __tb_mcv
+                )
+                .build(__tb_engine)
+                .unwrap();
+                $crate::__apply_catalog_builder!(
+                    Snapshot::builder_from(__tb_base),
+                    __tb_log_tail,
+                    __tb_mcv
+                )
+                .build(__tb_engine)
+                .unwrap()
             }
         }
-    };
+    }};
+}
+
+/// Internal helper for [`build_snapshot`]: thread `with_log_tail` and
+/// `with_max_catalog_version` into a `SnapshotBuilder` chain when present.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __apply_catalog_builder {
+    ($builder:expr, $log_tail:expr, $mcv:expr) => {{
+        let mut __tb_b = $builder;
+        let __tb_tail = $log_tail;
+        if !__tb_tail.is_empty() {
+            __tb_b = __tb_b.with_log_tail(__tb_tail);
+        }
+        if let Some(__tb_mcv_val) = $mcv {
+            __tb_b = __tb_b.with_max_catalog_version(__tb_mcv_val);
+        }
+        __tb_b
+    }};
 }
 
 /// Build a table, engine, and snapshot from rstest parameters in one call.
@@ -1564,7 +1943,7 @@ macro_rules! test_context {
             $table_config,
         );
         let engine = ($engine_factory)(table.store().clone());
-        let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
+        let snap = $crate::build_snapshot!($version_target, &table, &engine);
         (engine, snap, table)
     }};
 }
@@ -1666,6 +2045,7 @@ pub(crate) fn default_schema() -> SchemaRef {
 mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
+    use delta_kernel::{FileMeta, LogPath};
     use rstest::rstest;
 
     use super::*;
@@ -2225,5 +2605,273 @@ mod tests {
                 .filter_map(|m| m.location.filename().map(|s| s.to_string()))
                 .collect())
         })
+    }
+
+    // ===========================================================================
+    // Catalog-managed tests
+    // ===========================================================================
+
+    #[test]
+    fn test_catalog_managed_no_tail_round_trip() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(3))
+            .with_features(FeatureSet::new().catalog_managed())
+            .build()?;
+        assert!(table.is_catalog_managed());
+        assert_eq!(table.max_catalog_version(), Some(3));
+        assert!(table.log_tail_paths().is_empty());
+
+        let engine = table.engine();
+        let snap = build_snapshot!(VersionTarget::Latest, &table, &engine);
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_staged_only_tail_emits_staged_files_and_absent_published() -> DeltaResult<()> {
+        let num_versions = 2;
+        let latest = 4;
+        let table = TestTableBuilder::new()
+            .with_log_state(
+                LogState::with_latest_version(latest)
+                    .with_catalog_tail(CatalogTailState::StagedOnly { num_versions }),
+            )
+            .with_features(FeatureSet::new().catalog_managed())
+            .build()?;
+
+        let published = list_log_dir_filenames(table.store())?;
+        for v in latest - num_versions + 1..=latest {
+            let json = format!("{v:020}.json");
+            assert!(
+                !published.iter().any(|n| n == &json),
+                "expected {json} absent under StagedOnly tail; got {published:?}",
+            );
+        }
+        for v in 0..=latest - num_versions {
+            let json = format!("{v:020}.json");
+            assert!(
+                published.iter().any(|n| n == &json),
+                "expected {json} present outside the staged tail; got {published:?}",
+            );
+        }
+
+        let staged = list_dir_filenames(table.store(), "_delta_log/_staged_commits")?;
+        for v in latest - num_versions + 1..=latest {
+            let prefix = format!("{v:020}.");
+            assert!(
+                staged
+                    .iter()
+                    .any(|n| n.starts_with(&prefix) && n.ends_with(".json")),
+                "expected staged commit for v={v}; got {staged:?}",
+            );
+        }
+
+        let tail = table.log_tail_paths();
+        let versions: Vec<u64> = tail.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            versions,
+            (latest - num_versions + 1..=latest).collect::<Vec<_>>()
+        );
+        for (_, path) in tail {
+            assert!(
+                path.as_ref().contains("_staged_commits"),
+                "StagedOnly tail entries must point at staged files, got {path}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_staged_and_published_tail_keeps_both_forms_and_alternates() -> DeltaResult<()> {
+        let num_versions = 3;
+        let latest = 4;
+        let table = TestTableBuilder::new()
+            .with_log_state(
+                LogState::with_latest_version(latest)
+                    .with_catalog_tail(CatalogTailState::StagedAndPublished { num_versions }),
+            )
+            .with_features(FeatureSet::new().catalog_managed())
+            .build()?;
+
+        let published = list_log_dir_filenames(table.store())?;
+        for v in 0..=latest {
+            let json = format!("{v:020}.json");
+            assert!(
+                published.iter().any(|n| n == &json),
+                "expected {json} present under StagedAndPublished tail; got {published:?}",
+            );
+        }
+
+        let staged = list_dir_filenames(table.store(), "_delta_log/_staged_commits")?;
+        for v in latest - num_versions + 1..=latest {
+            let prefix = format!("{v:020}.");
+            assert!(
+                staged.iter().any(|n| n.starts_with(&prefix)),
+                "expected staged commit for v={v}; got {staged:?}",
+            );
+        }
+
+        let tail = table.log_tail_paths();
+        let staged_start = latest - num_versions + 1;
+        for (i, (v, path)) in tail.iter().enumerate() {
+            let offset = *v - staged_start;
+            let expect_staged = mixed_tail_uses_staged(offset);
+            let is_staged = path.as_ref().contains("_staged_commits");
+            assert_eq!(
+                is_staged, expect_staged,
+                "tail[{i}] for v={v} (offset={offset}): expected staged={expect_staged}, got {path}",
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::no_tail_no_checkpoint(CatalogTailState::None, vec![])]
+    #[case::no_tail_checkpoint_at_end(CatalogTailState::None, vec![4])]
+    #[case::no_tail_checkpoint_mid(CatalogTailState::None, vec![2])]
+    #[case::staged_only_no_checkpoint(
+        CatalogTailState::StagedOnly { num_versions: 2 }, vec![]
+    )]
+    #[case::staged_only_checkpoint_before_tail(
+        CatalogTailState::StagedOnly { num_versions: 2 }, vec![2]
+    )]
+    #[case::staged_only_full_tail(
+        CatalogTailState::StagedOnly { num_versions: 4 }, vec![]
+    )]
+    #[case::staged_and_published_no_checkpoint(
+        CatalogTailState::StagedAndPublished { num_versions: 2 }, vec![]
+    )]
+    #[case::staged_and_published_checkpoint_before_tail(
+        CatalogTailState::StagedAndPublished { num_versions: 2 }, vec![2]
+    )]
+    fn test_catalog_managed_tail_x_checkpoint_loads_to_latest(
+        #[case] tail: CatalogTailState,
+        #[case] checkpoints_at: Vec<u64>,
+    ) -> DeltaResult<()> {
+        let latest = 4;
+        let log_state = LogState::with_latest_version(latest)
+            .with_checkpoint_at(checkpoints_at)
+            .with_catalog_tail(tail);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state)
+            .with_features(FeatureSet::new().catalog_managed())
+            .build()?;
+        let engine = table.engine();
+        let snap = build_snapshot!(VersionTarget::Latest, &table, &engine);
+        assert_eq!(
+            snap.version(),
+            latest,
+            "rebuild lost commits for {}",
+            table.description(),
+        );
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::latest(VersionTarget::Latest, 4)]
+    #[case::at_version_zero(VersionTarget::AtVersion(0), 0)]
+    #[case::at_version_below_tail(VersionTarget::AtVersion(2), 2)]
+    #[case::at_version_inside_tail(VersionTarget::AtVersion(3), 3)]
+    #[case::at_version_latest(VersionTarget::AtVersion(4), 4)]
+    #[case::incremental_from_zero(VersionTarget::IncrementalToLatest { from: 0 }, 4)]
+    #[case::incremental_from_below_tail(VersionTarget::IncrementalToLatest { from: 2 }, 4)]
+    #[case::incremental_from_inside_tail(VersionTarget::IncrementalToLatest { from: 3 }, 4)]
+    #[case::incremental_from_latest(VersionTarget::IncrementalToLatest { from: 4 }, 4)]
+    fn test_catalog_managed_version_targets_across_tails(
+        #[case] target: VersionTarget,
+        #[case] expected: u64,
+        #[values(
+            CatalogTailState::StagedOnly { num_versions: 2 },
+            CatalogTailState::StagedAndPublished { num_versions: 2 },
+        )]
+        tail: CatalogTailState,
+    ) -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(4).with_catalog_tail(tail))
+            .with_features(FeatureSet::new().catalog_managed())
+            .build()?;
+        let engine = table.engine();
+        let snap = build_snapshot!(target, &table, &engine);
+        assert_eq!(snap.version(), expected);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::staged_only(CatalogTailState::StagedOnly { num_versions: 2 })]
+    #[case::staged_and_published(CatalogTailState::StagedAndPublished { num_versions: 2 })]
+    #[case::no_tail(CatalogTailState::None)]
+    fn test_catalog_managed_tail_round_trip_reads_all_rows(
+        #[case] tail: CatalogTailState,
+    ) -> DeltaResult<()> {
+        const ROWS_PER_COMMIT: usize = 5;
+        let latest = 4;
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(latest).with_catalog_tail(tail))
+            .with_features(FeatureSet::new().catalog_managed())
+            .with_data(1, ROWS_PER_COMMIT)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = build_snapshot!(VersionTarget::Latest, &table, engine.as_ref());
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, latest as usize * ROWS_PER_COMMIT);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::missing_feature(
+        LogState::with_latest_version(2)
+            .with_catalog_tail(CatalogTailState::StagedOnly { num_versions: 1 }),
+        FeatureSet::new(),
+        "catalog_tail requires `FeatureSet::catalog_managed()`",
+    )]
+    #[case::num_versions_zero(
+        LogState::with_latest_version(2)
+            .with_catalog_tail(CatalogTailState::StagedOnly { num_versions: 0 }),
+        FeatureSet::new().catalog_managed(),
+        "catalog_tail num_versions must be >= 1",
+    )]
+    #[case::num_versions_exceeds_latest(
+        LogState::with_latest_version(2)
+            .with_catalog_tail(CatalogTailState::StagedOnly { num_versions: 3 }),
+        FeatureSet::new().catalog_managed(),
+        "catalog_tail num_versions (3) must be <= latest_version",
+    )]
+    #[case::checkpoint_in_staged_range(
+        LogState::with_latest_version(4)
+            .with_checkpoint_at([3])
+            .with_catalog_tail(CatalogTailState::StagedOnly { num_versions: 2 }),
+        FeatureSet::new().catalog_managed(),
+        "overlaps the catalog tail",
+    )]
+    #[case::staged_and_published_requires_two(
+        LogState::with_latest_version(2)
+            .with_catalog_tail(CatalogTailState::StagedAndPublished { num_versions: 1 }),
+        FeatureSet::new().catalog_managed(),
+        "StagedAndPublished requires num_versions >= 2",
+    )]
+    fn test_catalog_tail_validation_panics(
+        #[case] log_state: LogState,
+        #[case] features: FeatureSet,
+        #[case] expected_substr: &str,
+    ) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = TestTableBuilder::new()
+                .with_log_state(log_state)
+                .with_features(features)
+                .build();
+        }));
+        let payload = result.expect_err("expected build to panic");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            msg.contains(expected_substr),
+            "panic message {msg:?} did not contain {expected_substr:?}",
+        );
     }
 }
