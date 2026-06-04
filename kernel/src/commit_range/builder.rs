@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn build_path_based_succeeds() {
+    fn test_build_path_based_succeeds() {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let range = CommitRange::builder_for(table_root.as_str(), 0)
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_based_succeeds() {
+    fn test_build_snapshot_based_succeeds() {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(table_root.as_str())
@@ -247,7 +247,7 @@ mod tests {
         Some(99),
         &["99", "snapshot"],
     )]
-    fn build_errors_on_version_past_snapshot_version(
+    fn test_build_errors_on_version_past_snapshot_version(
         #[case] start: Version,
         #[case] end: Option<Version>,
         #[case] expected_substrings: &[&str],
@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_based_with_explicit_end_version() {
+    fn test_build_snapshot_based_with_explicit_end_version() {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(table_root.as_str())
@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn build_path_based_without_end_version_extends_to_latest() {
+    fn test_build_path_based_without_end_version_extends_to_latest() {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let range = CommitRange::builder_for(table_root.as_str(), 0)
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn build_descending_ordering_yields_commits_in_reverse_order() {
+    fn test_build_descending_ordering_yields_commits_in_reverse_order() {
         let table_root = dv_small_table_root();
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let actions = [DeltaAction::Add, DeltaAction::Remove];

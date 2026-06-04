@@ -26,6 +26,7 @@ pub enum DeltaAction {
     Protocol,
     CommitInfo,
     Cdc,
+    DomainMetadata,
 }
 
 /// Read schema for extracting protocol+metadata from a single commit JSON.

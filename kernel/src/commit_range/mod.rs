@@ -54,8 +54,8 @@ pub use builder::{CommitOrdering, CommitRangeBuilder};
 use url::Url;
 
 use crate::actions::{
-    Add, Cdc, CommitInfo, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    Add, Cdc, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
+    COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
@@ -108,42 +108,15 @@ impl CommitRange {
         &self.table_root
     }
 
-    /// Iterator over commits in the range. Each yielded [`CommitAction`] exposes the
-    /// commit's version, timestamp (currently the file's `last_modified`), its effective
-    /// `Protocol` / `Metadata`, and a re-buildable iterator over the commit's action
-    /// batches projected to `actions`.
+    /// Iterator over the commits in the range, yielding one [`CommitAction`] per commit.
     ///
-    /// `actions` drives the user-facing read schema literally: the engine projects each
-    /// commit JSON to a struct with one nullable field per requested [`DeltaAction`].
-    /// Callers should pass distinct kinds; duplicates would produce duplicate read-schema
-    /// fields. The iterator separately reads `[protocol, metadata]` once per commit for
-    /// validation; that extra read is not visible to the caller.
+    /// - `engine`: performs the per-commit JSON reads.
+    /// - `start_snapshot`: optional snapshot whose version anchors the range and seeds
+    ///   protocol/metadata validation; `None` validates from the commits alone.
+    /// - `actions`: the action kinds to project into each commit's read schema.
     ///
-    /// I/O cost: one `[protocol, metadata]` read per commit yielded by the iterator,
-    /// plus one additional read per `CommitAction::get_actions()` call by the caller.
-    ///
-    /// `start_snapshot` is optional:
-    /// - When `Some`, its table configuration seeds the iterator's accumulated `latest_protocol` /
-    ///   `latest_metadata`. Its version must equal `self.start_version()` for
-    ///   [`CommitOrdering::AscendingOrder`] or `self.end_version()` for
-    ///   [`CommitOrdering::DescendingOrder`].
-    /// - When `None`, the iterator starts with no seeded state; validation is purely commit-driven
-    ///   and is `Ok` until the iterator encounters a commit whose `Protocol` (with optional
-    ///   `Metadata`) is unsupported.
-    ///
-    /// In [`CommitOrdering::AscendingOrder`], the iterator accumulates `latest_*` across
-    /// commits so each commit is validated against the cumulative state. In
-    /// [`CommitOrdering::DescendingOrder`], `latest_*` are not carried across commits
-    /// (the cumulative state cannot evolve backwards); each commit is validated against
-    /// only the `Protocol` / `Metadata` it carries.
-    ///
-    /// Validation errors surface from `iter.next()`; the iterator stops on the first
-    /// unsupported commit.
-    ///
-    /// Returns `Err` eagerly if:
-    /// - `actions` is empty,
-    /// - `start_snapshot` is supplied but its version does not match the expected anchor, or
-    /// - `start_snapshot` is supplied but its table configuration does not support scanning.
+    /// Returns `Err` if `actions` is empty, or if `start_snapshot`'s version does not match the
+    /// range anchor or its table does not support scanning.
     pub fn commits(
         &self,
         engine: Arc<dyn Engine>,
@@ -217,7 +190,7 @@ impl CommitActionsIterator {
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
         );
-        let (extracted_p, extracted_m) = commit_action
+        let (extracted_protocol, extracted_metadata) = commit_action
             .get_protocol_and_metadata()
             .map_err(|e| with_version_context(version, e))?;
         commit_action
@@ -225,10 +198,10 @@ impl CommitActionsIterator {
             .map_err(|e| with_version_context(version, e))?;
 
         if self.commit_ordering == CommitOrdering::AscendingOrder {
-            if let Some(p) = extracted_p {
+            if let Some(p) = extracted_protocol {
                 self.latest_protocol = Some(p);
             }
-            if let Some(m) = extracted_m {
+            if let Some(m) = extracted_metadata {
                 self.latest_metadata = Some(m);
             }
         }
@@ -265,6 +238,9 @@ fn action_to_field(action: DeltaAction) -> StructField {
         DeltaAction::Protocol => StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
         DeltaAction::CommitInfo => StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
         DeltaAction::Cdc => StructField::nullable(CDC_NAME, Cdc::to_schema()),
+        DeltaAction::DomainMetadata => {
+            StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema())
+        }
     }
 }
 
@@ -312,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn commits_yields_one_per_commit_in_range() {
+    fn test_commits_yields_one_per_commit_in_range() {
         let (range, engine, anchor_snapshot) = open_test_range_at(0);
         let files = &range.commit_files;
         assert_eq!(
@@ -372,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn commits_actions_project_to_requested_schema() {
+    fn test_commits_actions_project_to_requested_schema() {
         // v=1 of table-with-dv-small contains commitInfo + remove + add (DV rewrite).
         // The remove and add reference the same physical file path.
         let (range, engine, anchor_snapshot) = open_test_range_at(1);
@@ -438,33 +414,28 @@ mod tests {
         Ok(())
     }
 
-    /// Assert that draining the range surfaces an `Error::Unsupported` whose message
-    /// contains `expected_substring`.
-    fn assert_unsupported_with_substring(
-        range: &CommitRange,
-        engine: Arc<dyn Engine>,
-        start_snapshot: Option<SnapshotRef>,
-        actions: &[DeltaAction],
-        expected_substring: &str,
-    ) {
-        let err = drain_commits(range, engine, start_snapshot, actions)
-            .expect_err("validation must reject");
-        match &err {
-            Error::Unsupported(msg) => assert!(
-                msg.contains(expected_substring),
-                "expected message to contain {expected_substring:?}, got: {msg}",
-            ),
-            other => panic!("expected Error::Unsupported, got: {other:?}"),
-        }
-    }
-
     const VALID_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#;
+    const UNSUPPORTED_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#;
     const VALID_METADATA_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
+    /// Like [`VALID_METADATA_LINE`] but with a non-empty `configuration` (`foo=bar`), used to
+    /// forge a metadata-only change in a later commit.
+    const METADATA_CONFIG_CHANGE_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"foo":"bar"},"createdTime":2000}}"#;
 
+    #[rstest::rstest]
+    #[case::too_high_reader_version(
+        r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
+        |err: &Error| matches!(err, Error::Unsupported(_)),
+    )]
+    #[case::too_low_reader_version(
+        r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
+        |err: &Error| matches!(err, Error::InvalidProtocol(_)),
+    )]
     #[tokio::test]
-    async fn commits_errors_on_too_high_reader_version() {
+    async fn test_commits_errors_on_unsupported_reader_version(
+        #[case] v1: &str,
+        #[case] is_expected_err: fn(&Error) -> bool,
+    ) {
         let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
-        let v1 = r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#;
         let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
 
         let range = CommitRange::builder_for(table_root, 0)
@@ -478,47 +449,16 @@ mod tests {
             .unwrap();
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
-        assert_unsupported_with_substring(&range, engine, Some(anchor_snapshot), &actions, "99");
-    }
-
-    #[tokio::test]
-    async fn commits_errors_on_too_low_reader_version() {
-        let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
-        let v1 = r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#;
-        let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(1)
-            .build(engine.as_ref())
-            .expect("build should succeed");
-
-        let anchor_snapshot = Snapshot::builder_for(table_root)
-            .at_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::Add, DeltaAction::Remove];
         let err = drain_commits(&range, engine, Some(anchor_snapshot), &actions)
             .expect_err("v=1 reader version must be rejected");
-        match &err {
-            Error::InvalidProtocol(msg) => assert!(msg.contains('0'), "got: {msg}"),
-            other => panic!("expected Error::InvalidProtocol, got: {other:?}"),
-        }
+        assert!(is_expected_err(&err), "unexpected error variant: {err:?}");
     }
 
-    /// Per-commit validation runs in both orderings:
-    /// - ascending: `latest_*` accumulate; each commit is validated against the cumulative
-    ///   `(Protocol, Metadata)` state.
-    /// - descending: `latest_*` are not carried across commits; each commit is validated against
-    ///   the seed (from `start_snapshot`) overlaid with its own `Protocol` / `Metadata`.
-    ///
-    /// Each case forges a 2-commit log and asserts whether the iterator surfaces an error
-    /// (with `Some(needle)`) or drains cleanly (with `None`).
     #[rstest::rstest]
     #[case::ascending_rejects_unsupported_feature(
         CommitOrdering::AscendingOrder,
         format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE),
-        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#.to_string(),
+        UNSUPPORTED_PROTOCOL_LINE.to_string(),
         0,
         Some("futureFeature"),
     )]
@@ -526,7 +466,7 @@ mod tests {
         CommitOrdering::DescendingOrder,
         format!(
             "{}\n{}",
-            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
+            UNSUPPORTED_PROTOCOL_LINE,
             VALID_METADATA_LINE,
         ),
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#.to_string(),
@@ -536,12 +476,12 @@ mod tests {
     #[case::ascending_metadata_change(
         CommitOrdering::AscendingOrder,
         format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE),
-        r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"foo":"bar"},"createdTime":2000}}"#.to_string(),
+        METADATA_CONFIG_CHANGE_LINE.to_string(),
         0,
         None,
     )]
     #[tokio::test]
-    async fn commits_validation_governed_by_ordering(
+    async fn test_commits_validation_governed_by_ordering(
         #[case] ordering: CommitOrdering,
         #[case] v0: String,
         #[case] v1: String,
@@ -578,7 +518,7 @@ mod tests {
     #[rstest::rstest]
     #[case::ascending_with_snapshot_at_end(CommitOrdering::AscendingOrder, 1, "start_version")]
     #[case::descending_with_snapshot_at_start(CommitOrdering::DescendingOrder, 0, "end_version")]
-    fn commits_errors_on_anchor_snapshot_mismatched(
+    fn test_commits_errors_on_anchor_snapshot_mismatched(
         #[case] ordering: CommitOrdering,
         #[case] snapshot_version: Version,
         #[case] expected_anchor_name: &str,
@@ -606,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn commits_errors_on_empty_actions() {
+    fn test_commits_errors_on_empty_actions() {
         let (range, engine, anchor_snapshot) = open_test_range_at(0);
         let err = range
             .commits(engine, Some(anchor_snapshot), &[])
@@ -619,15 +559,15 @@ mod tests {
     #[rstest::rstest]
     #[case::caller_requested_add_remove(
         &[DeltaAction::Add, DeltaAction::Remove],
-        &["add", "remove"],
+        ["add", "remove"].into_iter().map(String::from).collect::<Vec<_>>(),
     )]
     #[case::caller_requested_with_protocol(
         &[DeltaAction::Add, DeltaAction::Remove, DeltaAction::Protocol],
-        &["add", "remove", "protocol"],
+        ["add", "remove", "protocol"].into_iter().map(String::from).collect::<Vec<_>>(),
     )]
-    fn commits_emitted_schema_matches_caller_actions(
+    fn test_commits_emitted_schema_matches_caller_actions(
         #[case] actions: &[DeltaAction],
-        #[case] expected_columns: &[&str],
+        #[case] expected_columns: Vec<String>,
     ) {
         let (range, engine, anchor_snapshot) = open_test_range_at(0);
         let mut saw_batch = false;
@@ -649,80 +589,17 @@ mod tests {
                     .iter()
                     .map(|f| f.name().to_string())
                     .collect::<Vec<_>>();
-                let expected = expected_columns
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect::<Vec<_>>();
-                assert_eq!(names, expected, "emitted schema must match caller actions");
+                assert_eq!(
+                    names, expected_columns,
+                    "emitted schema must match caller actions"
+                );
                 saw_batch = true;
             }
         }
         assert!(saw_batch, "expected at least one emitted batch");
     }
 
-    #[tokio::test]
-    async fn commits_iter_yields_ok_then_err_on_downstream_bad_protocol() {
-        let v0 = format!(
-            "{}\n{}",
-            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":[]}}"#,
-            VALID_METADATA_LINE,
-        );
-        let v1 = r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#;
-        let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(1)
-            .build(engine.as_ref())
-            .expect("build should succeed");
-
-        let anchor_snapshot = Snapshot::builder_for(table_root)
-            .at_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::Add, DeltaAction::Remove];
-        let mut iter = range
-            .commits(engine, Some(anchor_snapshot), &actions)
-            .unwrap();
-
-        let v0_commit = iter.next().expect("v=0 commit").unwrap();
-        let v0_batches: DeltaResult<Vec<_>> = v0_commit.get_actions().unwrap().collect();
-        v0_batches.expect("v=0 must drain cleanly");
-
-        let v1_result = iter.next().expect("v=1 commit yield slot");
-        match v1_result {
-            Ok(_) => panic!("v=1 must reject during iter.next()"),
-            Err(Error::Unsupported(msg)) => assert!(msg.contains("99"), "got: {msg}"),
-            Err(other) => panic!("expected Error::Unsupported, got: {other:?}"),
-        }
-    }
-
-    /// Count the rows in a single batch iterator returned by `get_actions`.
-    fn count_rows(it: crate::FileDataReadResultIterator) -> DeltaResult<usize> {
-        let mut total = 0;
-        for batch_res in it {
-            total += batch_res?.len();
-        }
-        Ok(total)
-    }
-
-    #[test]
-    fn get_actions_callable_multiple_times() {
-        let (range, engine, anchor_snapshot) = open_test_range_at(0);
-
-        let actions = [DeltaAction::Add, DeltaAction::Remove];
-        let mut iter = range
-            .commits(engine, Some(anchor_snapshot), &actions)
-            .unwrap();
-        let commit = iter.next().expect("v=0 commit").unwrap();
-
-        let first = count_rows(commit.get_actions().unwrap()).unwrap();
-        let second = count_rows(commit.get_actions().unwrap()).unwrap();
-        assert!(first > 0, "v=0 should have at least one row");
-        assert_eq!(first, second, "get_actions must be idempotent");
-    }
-
-    /// Collect every (add.path, remove.path) row from `commit.get_actions()`.
+    // Collect every (add.path, remove.path) row from `commit.get_actions()`.
     fn collect_add_remove_rows(
         commit: &CommitAction,
     ) -> DeltaResult<Vec<(Option<String>, Option<String>)>> {
@@ -734,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn get_actions_returns_same_content_each_call() {
+    fn test_get_actions_returns_same_content_each_call() {
         let (range, engine, anchor_snapshot) = open_test_range_at(0);
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
@@ -753,16 +630,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commits_rejects_snapshot_unsupported_for_scan() {
-        // Forge v=0 with an Unknown reader feature ("futureFeature"). Building a Snapshot
-        // succeeds because TableConfiguration::try_new does not enforce operation support;
-        // `commits()` then eagerly fails because the snapshot's table_configuration does
-        // not support Operation::Scan.
-        let v0 = format!(
-            "{}\n{}",
-            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
-            VALID_METADATA_LINE,
-        );
+    async fn test_error_on_start_snapshot_unsupported_for_scan() {
+        let v0 = format!("{}\n{}", UNSUPPORTED_PROTOCOL_LINE, VALID_METADATA_LINE,);
         let (engine, table_root) = engine_with_commits(&[(0, &v0)]).await;
 
         let snapshot = Snapshot::builder_for(table_root)
@@ -779,74 +648,67 @@ mod tests {
         let err = range
             .commits(engine, Some(snapshot), &actions)
             .err()
-            .expect("commits must reject before iteration begins");
+            .expect(
+                "commits must reject snapshot with unsupported feature before iteration begins",
+            );
         match err {
             Error::Unsupported(msg) => assert!(msg.contains("futureFeature"), "got: {msg}"),
             other => panic!("expected Error::Unsupported, got: {other:?}"),
         }
     }
 
+    #[rstest::rstest]
+    #[case::validates_first_commit_pm(
+        vec![
+            (0u64, format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE)),
+            (1, METADATA_CONFIG_CHANGE_LINE.to_string()),
+        ],
+        &[DeltaAction::Add, DeltaAction::Remove],
+        false,
+    )]
+    #[case::rejects_unsupported_protocol(
+        vec![(0u64, r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#.to_string())],
+        &[DeltaAction::Add],
+        true,
+    )]
+    #[case::skip_when_neither_pm(
+        vec![(0u64, r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE"}}"#.to_string())],
+        &[DeltaAction::CommitInfo],
+        false,
+    )]
     #[tokio::test]
-    async fn commits_without_snapshot_validates_first_commit_pm() {
-        // v=0 carries P+M; v=1 carries only a metadata config change. With no snapshot,
-        // the iterator's latest_* start as None and become populated from v=0.
-        let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
-        let v1 = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"foo":"bar"},"createdTime":2000}}"#;
-        let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
+    async fn test_protocol_validation_is_commit_driven(
+        #[case] commits: Vec<(u64, String)>,
+        #[case] actions: &[DeltaAction],
+        #[case] expects_unsupported: bool,
+    ) {
+        let commit_refs: Vec<(u64, &str)> = commits
+            .iter()
+            .map(|(v, body)| (*v, body.as_str()))
+            .collect();
+        let end_version = commit_refs.last().expect("at least one commit").0;
+        let (engine, table_root) = engine_with_commits(&commit_refs).await;
 
         let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(1)
+            .with_end_version(end_version)
             .build(engine.as_ref())
             .unwrap();
 
-        let actions = [DeltaAction::Add, DeltaAction::Remove];
-        drain_commits(&range, engine, None, &actions).expect("snapshot-less range must drain");
+        let result = drain_commits(&range, engine, None, actions);
+        if expects_unsupported {
+            let err = result.expect_err("commit-driven validation must reject");
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "expected Error::Unsupported, got: {err:?}",
+            );
+        } else {
+            result.expect("snapshot-less range must drain cleanly");
+        }
     }
 
     #[tokio::test]
-    async fn commits_without_snapshot_rejects_unsupported_protocol() {
-        // v=0 carries only an unsupported Protocol (no metadata). With no snapshot,
-        // protocol_validation falls through to the stateless `validate_protocol`
-        // which rejects min_reader_version > MAX_VALID_READER_VERSION.
-        let v0 = r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#;
-        let (engine, table_root) = engine_with_commits(&[(0, v0)]).await;
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::Add];
-        assert_unsupported_with_substring(&range, engine, None, &actions, "99");
-    }
-
-    #[tokio::test]
-    async fn commits_without_snapshot_skip_when_neither_pm() {
-        // v=0 carries only a CommitInfo (no Protocol, no Metadata). With no snapshot,
-        // the effective state stays None and validation is skipped.
-        let v0 = r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE"}}"#;
-        let (engine, table_root) = engine_with_commits(&[(0, v0)]).await;
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::CommitInfo];
-        drain_commits(&range, engine, None, &actions).expect("validation must be skipped");
-    }
-
-    #[tokio::test]
-    async fn commits_descending_validates_each_commit_independently() {
-        // Newest commit (v=1) has plain protocol; older commit (v=0) carries an
-        // unsupported feature. Descending order visits v=1 first (yields Ok), then
-        // v=0 (yields Err). Without a snapshot seed, each commit is validated only
-        // against its own carried P/M.
-        let v0 = format!(
-            "{}\n{}",
-            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
-            VALID_METADATA_LINE,
-        );
+    async fn test_commits_descending_validates_each_commit_independently() {
+        let v0 = format!("{}\n{}", UNSUPPORTED_PROTOCOL_LINE, VALID_METADATA_LINE,);
         let v1 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#;
         let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
 
@@ -859,11 +721,9 @@ mod tests {
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let mut iter = range.commits(engine, None, &actions).unwrap();
 
-        // v=1 yields first under descending ordering.
         let v1_commit = iter.next().expect("v=1 commit").unwrap();
         assert_eq!(v1_commit.version(), 1);
 
-        // v=0 yields next and errors on the unsupported feature.
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
