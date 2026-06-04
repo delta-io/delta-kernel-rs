@@ -50,7 +50,7 @@ pub struct PlanNode {
 /// `inputs`, and `Plan::result()` returns that node's `output` RefId, the value the
 /// engine streams to the caller.
 ///
-/// # Execution
+/// # Optimization
 ///
 /// For the best performance, connectors are encouraged to run kernel-produced
 /// plans through their query optimizer before execution (e.g. to fold adjacent

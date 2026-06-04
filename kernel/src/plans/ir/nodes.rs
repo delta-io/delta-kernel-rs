@@ -461,8 +461,8 @@ pub struct MaxByVersion {
 }
 
 /// Performs a semi join between two inputs, `inputs.len() == 2`, the child
-/// nodes are `[probe, build]` in this order. It emits a subset of probe rows
-/// and the build side acts as a filter and never contributes columns. This is
+/// nodes are `[probe, build]` in this order. It emits a subset of probe rows;
+/// the build side acts as a filter and never contributes columns. This is
 /// analogous to a SQL `SEMI JOIN` (`inverted = false`) or `ANTI JOIN`
 /// (`inverted = true`). A semi join finds all probe rows that are present in
 /// the build side, and an anti join finds all probe rows **not** present in the
