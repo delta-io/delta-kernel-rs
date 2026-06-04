@@ -119,6 +119,37 @@ impl ColumnName {
     }
 }
 
+/// Builds a [`ColumnName`] from an explicit list of segments.
+///
+/// Each element is taken verbatim as one segment -- dots are **not** path separators, so
+/// `ColumnName::from(["a.b"])` is a single segment named `"a.b"`. To split a dot-separated literal
+/// known at compile time, use the [`column_name!`] / [`column_expr!`] macros instead.
+///
+/// There is deliberately no `From<&str>`/`From<String>`: a bare string has two equally reasonable
+/// readings (split into a path vs. a single verbatim segment), so it is not a canonical conversion.
+/// Callers must say which they mean -- `["a.b"]` for one segment, `column_name!("a.b")` to split.
+///
+/// [`column_name!`]: crate::expressions::column_name
+/// [`column_expr!`]: crate::expressions::column_expr
+impl<A: Into<String>, const N: usize> From<[A; N]> for ColumnName {
+    fn from(segments: [A; N]) -> Self {
+        ColumnName::new(segments)
+    }
+}
+
+impl<A: Into<String>> From<Vec<A>> for ColumnName {
+    fn from(segments: Vec<A>) -> Self {
+        ColumnName::new(segments)
+    }
+}
+
+// Borrowed slice of segments, cloning each into an owned segment.
+impl<A: Into<String> + Clone> From<&[A]> for ColumnName {
+    fn from(segments: &[A]) -> Self {
+        ColumnName::new(segments.iter().cloned())
+    }
+}
+
 /// Creates a new column name from a path of field names. Each field name is taken as-is, and may
 /// contain arbitrary characters (including periods, spaces, etc.).
 impl<A: Into<String>> FromIterator<A> for ColumnName {
@@ -709,5 +740,18 @@ mod test {
                 _ => panic!("Expected {input} to parse as {expected_output:?}, got {output:?}"),
             }
         }
+    }
+
+    #[test]
+    fn column_name_from_segment_shapes() {
+        let expected = ColumnName::new(["a", "b", "c"]);
+        // Arrays, `Vec`s, and borrowed slices of string-like segments convert via `From`.
+        assert_eq!(ColumnName::from(["a", "b", "c"]), expected);
+        assert_eq!(ColumnName::from(vec!["a", "b", "c"]), expected);
+        let slice: &[&str] = &["a", "b", "c"];
+        assert_eq!(ColumnName::from(slice), expected);
+        // The same shapes are reachable through the `Into<ColumnName>` bound on `column()`.
+        let via_into: ColumnName = ["a", "b", "c"].into();
+        assert_eq!(via_into, expected);
     }
 }

@@ -130,7 +130,7 @@ fn synthesize_expr(schema: &Schema, expr: &PExpr) -> Option<(KExpr, DataType)> {
                 .last()?
                 .data_type()
                 .clone();
-            let expr = KExpr::column(parts.iter().map(|p| p.value.clone()));
+            let expr = KExpr::column(col_name);
             Some((expr, ty))
         }
         PExpr::Value(v) => match &v.value {

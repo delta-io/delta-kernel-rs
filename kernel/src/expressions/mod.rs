@@ -657,12 +657,9 @@ impl Expression {
         references.0
     }
 
-    /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Expression
-    where
-        ColumnName: FromIterator<A>,
-    {
-        ColumnName::new(field_names).into()
+    /// Create a new column reference expression.
+    pub fn column(name: impl Into<ColumnName>) -> Expression {
+        Expression::Column(name.into())
     }
 
     /// Create a new expression for a literal value
@@ -828,11 +825,9 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Predicate
-    where
-        ColumnName: FromIterator<A>,
-    {
-        Self::from_expr(ColumnName::new(field_names))
+    pub fn column(name: impl Into<ColumnName>) -> Predicate {
+        let name: ColumnName = name.into();
+        Self::from_expr(name)
     }
 
     /// Create a new literal boolean value
