@@ -19,7 +19,7 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
-use crate::metrics::MeteredStorageHandler;
+use crate::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
@@ -89,8 +89,12 @@ pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     storage: Arc<MeteredStorageHandler>,
-    json: Arc<DefaultJsonHandler<E>>,
-    parquet: Arc<DefaultParquetHandler<E>>,
+    json: Arc<MeteredJsonHandler>,
+    parquet: Arc<MeteredParquetHandler>,
+    /// Concrete parquet handler retained so [`Self::write_parquet`] and
+    /// [`Self::default_parquet_handler`] can reach the inherent `write_parquet_file`
+    /// helper, which the [`ParquetHandler`] trait surface doesn't expose.
+    raw_parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
@@ -178,16 +182,19 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             object_store.clone(),
             task_executor.clone(),
         ));
+        let raw_json: Arc<dyn JsonHandler> = Arc::new(DefaultJsonHandler::new(
+            object_store.clone(),
+            task_executor.clone(),
+        ));
+        let raw_parquet = Arc::new(DefaultParquetHandler::new(
+            object_store.clone(),
+            task_executor.clone(),
+        ));
         Self {
             storage: Arc::new(MeteredStorageHandler::new(raw_storage)),
-            json: Arc::new(DefaultJsonHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
-            parquet: Arc::new(DefaultParquetHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
+            json: Arc::new(MeteredJsonHandler::new(raw_json)),
+            parquet: Arc::new(MeteredParquetHandler::new(raw_parquet.clone())),
+            raw_parquet,
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
@@ -207,6 +214,16 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
         Some(self.object_store.clone())
+    }
+
+    /// Returns the concrete [`DefaultParquetHandler`] for callers that need the inherent
+    /// async `write_parquet_file` helper not exposed by the [`ParquetHandler`] trait.
+    /// For the metered trait surface used by reads, use [`Self::parquet_handler`].
+    ///
+    /// TODO(#2701): lift the inherent helper onto [`DefaultEngine`] so this accessor
+    /// (and the `raw_parquet` field) can be removed.
+    pub fn default_parquet_handler(&self) -> Arc<DefaultParquetHandler<E>> {
+        self.raw_parquet.clone()
     }
 
     /// Write `data` as a parquet file using the provided `write_context`.
@@ -231,7 +248,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        self.parquet
+        self.raw_parquet
             .write_parquet_file(physical_data, write_context)
             .await
     }
