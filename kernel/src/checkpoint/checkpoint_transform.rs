@@ -15,14 +15,13 @@
 
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::ADD_NAME;
+use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatch, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 pub(crate) const STATS_FIELD: &str = "stats";
-pub(crate) const STATS_PARSED_FIELD: &str = "stats_parsed";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
 pub(crate) const PARTITION_VALUES_PARSED_FIELD: &str = "partitionValues_parsed";
 

@@ -3,7 +3,7 @@
 //! Builds a table with `delta.checkpoint.writeStatsAsStruct=true` and a nested schema,
 //! then verifies the parsed-stats struct column matches the JSON `stats` string.
 
-use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
 use delta_kernel::arrow::array::{
     Array, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
 };
@@ -85,6 +85,7 @@ fn assert_stats_struct_matches_json(
 }
 
 /// Validate only nested-struct entries, not primitives.
+// TODO(#2673): also validate primitive stats.
 fn validate_struct_stats(
     parsed: &StructArray,
     json_obj: &serde_json::Map<String, serde_json::Value>,
@@ -110,8 +111,6 @@ fn scan_metadata_with_stats_columns_kernel_written(
     )]
     cm_mode: ColumnMappingMode,
 ) {
-    const STATS_PARSED_COL: &str = "stats_parsed";
-
     let cm_str = match cm_mode {
         ColumnMappingMode::None => "none",
         ColumnMappingMode::Id => "id",
@@ -153,7 +152,7 @@ fn scan_metadata_with_stats_columns_kernel_written(
         let filtered_batch =
             filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
 
-        let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
+        let stats_parsed = get_column!(filtered_batch, STATS_PARSED, StructArray);
         let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
         let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
         let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
