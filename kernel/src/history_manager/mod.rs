@@ -676,6 +676,7 @@ fn get_earliest_published_commit_version(
 /// `log_root`. This is either commit version 0 (if `00...00.json` exists), or the version
 /// of the earliest complete checkpoint. The returned version is not guaranteed to exist by the
 /// time the caller acts on it: a concurrent log-cleanup operation may delete the file.
+/// This method assumes that the commits are contiguous.
 ///
 /// # Parameters
 /// - `engine`: kernel engine used to list `log_root`.
@@ -718,6 +719,10 @@ fn get_earliest_recreatable_commit(
 
                 if let Some(checkpoint_version) = last_complete_checkpoint {
                     if checkpoint_version + 1 >= smallest_commit_version {
+                        // Given the contiguity assumption of delta_log commits,
+                        // when a full checkpoint has contiguous commits starting before or at
+                        // (checkpoint_version + 1) that table can be
+                        // recreated at checkpoint_version.
                         return Ok(checkpoint_version);
                     }
                 }
@@ -1737,6 +1742,31 @@ mod tests {
                 .expect("put log file");
         }
         (engine, Url::parse("memory:///_delta_log/").unwrap())
+    }
+
+    #[test]
+    fn __probe_shapes() {
+        for (name, paths) in [
+            ("cp5+commits6-8", {
+                let mut p = vec![single_part_checkpoint_path(5)];
+                p.extend(commit_path(6..=8));
+                p
+            }),
+            ("cp5+commits7-8(gap6)", {
+                let mut p = vec![single_part_checkpoint_path(5)];
+                p.extend(commit_path(7..=8));
+                p
+            }),
+            ("cp5+commits5-9", {
+                let mut p = vec![single_part_checkpoint_path(5)];
+                p.extend(commit_path(5..=9));
+                p
+            }),
+        ] {
+            let (engine, log_root) = engine_with_log_files(&paths);
+            let r = get_earliest_recreatable_commit(&engine, &log_root, None);
+            eprintln!("PROBE {name} => {r:?}");
+        }
     }
 
     fn commit_path(version_range: RangeInclusive<Version>) -> Vec<String> {
