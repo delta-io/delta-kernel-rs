@@ -637,11 +637,14 @@ mod tests {
                 999,
             )]))),
         ]);
-        // Hold a borrow of the queue so we can inspect it after iteration without recovering
-        // the box.
-        let items_ptr: *const Mutex<VecDeque<OptionalValue<ExternResult<FFI_ArrowArray>>>> =
-            &mock_iter.items;
         let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
+
+        // Helper fn for checking the queue length from `state` pointer
+        let queue_len = || {
+            let mock_iter =
+                unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
+            mock_iter.items.lock().unwrap().len()
+        };
 
         let mut iter = FfiFileMetaIter::new(
             CFileMetaIterator {
@@ -655,15 +658,14 @@ mod tests {
         assert!(first.is_err(), "empty batch must surface as Err");
 
         // The final entry is still queued.
-        let remaining = unsafe { &*items_ptr }.lock().unwrap().len();
-        assert_eq!(remaining, 1, "final entry must remain unconsumed");
+        assert_eq!(queue_len(), 1, "final entry must remain unconsumed");
 
         // Further polls return `None` without re-invoking the engine.
         assert!(iter.next().is_none(), "iterator should be terminated");
         assert!(iter.next().is_none(), "iterator should stay terminated");
-        let remaining_after = unsafe { &*items_ptr }.lock().unwrap().len();
         assert_eq!(
-            remaining_after, 1,
+            queue_len(),
+            1,
             "final entry must still be unconsumed after extra polls"
         );
 
