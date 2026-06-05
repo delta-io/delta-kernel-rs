@@ -2072,7 +2072,7 @@ mod tests {
 
     // === find_max_column_id_in_schema tests ===
 
-    fn field_with_id(name: &str, ty: DataType, id: i64) -> StructField {
+    fn field_with_id(name: &str, ty: impl Into<DataType>, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
@@ -2173,7 +2173,7 @@ mod tests {
     fn find_max_column_id_picks_up_nested_ids_metadata() {
         let mut field = field_with_id(
             "m",
-            DataType::from(MapType::new(DataType::INTEGER, DataType::INTEGER, false)),
+            MapType::new(DataType::INTEGER, DataType::INTEGER, false),
             1,
         );
         field.metadata.insert(

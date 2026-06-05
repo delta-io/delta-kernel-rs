@@ -180,7 +180,7 @@ mod tests {
 
     // === LegacyNestedIdsVisitor: parquet.field.nested.ids detection ===
 
-    fn field_with_metadata(name: &str, dtype: DataType, key: &str) -> StructField {
+    fn field_with_metadata(name: &str, dtype: impl Into<DataType>, key: &str) -> StructField {
         let mut f = StructField::nullable(name, dtype);
         f.metadata.insert(
             key.to_string(),
@@ -199,7 +199,7 @@ mod tests {
     fn schema_with_good_nested_ids() -> StructType {
         StructType::new_unchecked(vec![field_with_metadata(
             "x",
-            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+            ArrayType::new(DataType::INTEGER, true),
             ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
         )])
     }
@@ -207,7 +207,7 @@ mod tests {
     fn schema_with_legacy_at(name: &str) -> StructType {
         StructType::new_unchecked(vec![field_with_metadata(
             name,
-            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+            ArrayType::new(DataType::INTEGER, true),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )])
     }
@@ -215,7 +215,7 @@ mod tests {
     fn schema_struct_with_legacy_at_inner() -> StructType {
         let inner = StructType::new_unchecked(vec![field_with_metadata(
             "inner",
-            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+            ArrayType::new(DataType::INTEGER, true),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )]);
         StructType::new_unchecked(vec![StructField::nullable("parent", inner)])
@@ -224,7 +224,7 @@ mod tests {
     fn schema_array_struct_with_legacy_at_inner() -> StructType {
         let inner = StructType::new_unchecked(vec![field_with_metadata(
             "inner",
-            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+            ArrayType::new(DataType::INTEGER, true),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )]);
         StructType::new_unchecked(vec![StructField::nullable(
@@ -236,7 +236,7 @@ mod tests {
     fn schema_map_value_struct_with_legacy_at_inner() -> StructType {
         let inner = StructType::new_unchecked(vec![field_with_metadata(
             "inner",
-            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+            ArrayType::new(DataType::INTEGER, true),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )]);
         StructType::new_unchecked(vec![StructField::nullable(
@@ -249,12 +249,12 @@ mod tests {
         StructType::new_unchecked(vec![
             field_with_metadata(
                 "a",
-                DataType::from(ArrayType::new(DataType::INTEGER, true)),
+                ArrayType::new(DataType::INTEGER, true),
                 ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
             ),
             field_with_metadata(
                 "b",
-                DataType::from(ArrayType::new(DataType::INTEGER, true)),
+                ArrayType::new(DataType::INTEGER, true),
                 ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
             ),
         ])
