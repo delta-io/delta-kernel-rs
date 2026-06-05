@@ -201,9 +201,13 @@ UUID that uniquely identifies an operation instance. All events from the same
 snapshot load share the same `MetricId`, so you can group them to reconstruct
 a timeline:
 
-1. `LogSegmentLoadSuccess` (how long listing took, how many files)
-2. `ProtocolMetadataLoadSuccess` (how long protocol/metadata parsing took)
+1. `LogSegmentLoadSuccess` or `LogSegmentLoadFailure` (listing the log segment)
+2. `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure` (reading protocol and metadata)
 3. `SnapshotBuildSuccess` or `SnapshotBuildFailure` (final outcome and total duration)
+
+Each step emits a success or failure variant carrying the shared `operation_id`. When a
+step fails, the snapshot build fails too, so the terminal `SnapshotBuildFailure` carries
+the same id and you can see which step broke from the buffered group.
 
 You can store the `MetricId` in your monitoring system as a trace ID or
 correlation key. Because everything flows through `tracing`, you can also
@@ -231,41 +235,49 @@ impl CorrelatingReporter {
     fn new() -> Self {
         Self { pending: Mutex::new(HashMap::new()) }
     }
+
+    // Buffer an intermediate step under its operation_id.
+    fn buffer(&self, operation_id: MetricId, event: MetricEvent) {
+        self.pending.lock().unwrap().entry(operation_id).or_default().push(event);
+    }
+
+    // Drain the buffered steps for a finished operation.
+    fn drain(&self, operation_id: MetricId) -> Vec<MetricEvent> {
+        self.pending.lock().unwrap().remove(&operation_id).unwrap_or_default()
+    }
 }
 
 impl MetricsReporter for CorrelatingReporter {
     fn report(&self, event: MetricEvent) {
         match event {
-            // 1. Buffer intermediate events, grouped by their shared operation_id. Bind with
-            //    `ref` so the event can still be moved into the buffer.
-            MetricEvent::LogSegmentLoadSuccess(ref e) => {
-                let id = e.operation_id;
-                self.pending.lock().unwrap().entry(id).or_default().push(event);
-            }
-            MetricEvent::ProtocolMetadataLoadSuccess(ref e) => {
-                let id = e.operation_id;
-                self.pending.lock().unwrap().entry(id).or_default().push(event);
-            }
-            // 2. When the terminal event arrives, drain the group and
-            //    compute aggregates (here, a count of sub-events).
+            // 1. Buffer each intermediate step, success OR failure, under its operation_id.
+            //    `ref e` borrows the id so `event` can still move into the buffer.
+            MetricEvent::LogSegmentLoadSuccess(ref e) => self.buffer(e.operation_id, event),
+            MetricEvent::LogSegmentLoadFailure(ref e) => self.buffer(e.operation_id, event),
+            MetricEvent::ProtocolMetadataLoadSuccess(ref e) => self.buffer(e.operation_id, event),
+            MetricEvent::ProtocolMetadataLoadFailure(ref e) => self.buffer(e.operation_id, event),
+
+            // 2. The terminal event drains the group. The buffered steps reconstruct the
+            //    timeline; on failure, the last step shows where the build broke.
             MetricEvent::SnapshotBuildSuccess(e) => {
-                let mut map = self.pending.lock().unwrap();
-                if let Some(events) = map.remove(&e.operation_id) {
-                    println!(
-                        "Snapshot v{} completed in {:?} ({} sub-events)",
-                        e.version,
-                        e.duration,
-                        events.len()
-                    );
-                }
+                let steps = self.drain(e.operation_id);
+                println!(
+                    "Snapshot v{} completed in {:?} ({} sub-events)",
+                    e.version,
+                    e.duration,
+                    steps.len()
+                );
             }
-            // On failure, discard the buffered group for this operation.
             MetricEvent::SnapshotBuildFailure(e) => {
-                let mut map = self.pending.lock().unwrap();
-                map.remove(&e.operation_id);
-                println!("Snapshot failed for operation {}", e.operation_id);
+                let steps = self.drain(e.operation_id);
+                println!(
+                    "Snapshot {} failed after {} sub-events; last step: {:?}",
+                    e.operation_id,
+                    steps.len(),
+                    steps.last()
+                );
             }
-            // Storage and scan events don't participate in snapshot correlation.
+            // Storage, scan, and post-build loads don't participate in snapshot correlation.
             _ => {}
         }
     }
