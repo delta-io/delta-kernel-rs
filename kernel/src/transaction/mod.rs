@@ -1380,8 +1380,8 @@ impl<S> Transaction<S> {
         // Build two evaluators: one for the common case where scan files do not include a
         // stats_parsed column, and one for predicate-based scans that include stats_parsed.
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
-        // case where stats is null (e.g., when skip_stats=true was used) and then drops the
-        // stats_parsed column.
+        // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
+        // then drops the stats_parsed column.
         let base_eval = Arc::new(make_eval(false)?);
         let stats_parsed_eval = Arc::new(make_eval(true)?);
         let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
@@ -1408,8 +1408,8 @@ impl<S> Transaction<S> {
 ///
 /// - `stats_parsed`: when `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
 ///   `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. The coalesce handles
-///   cases where `stats` is null (e.g., `skip_stats=true` or V2 checkpoints with
-///   `writeStatsAsJson=false`) by reconstructing the JSON from the parsed representation.
+///   cases where `stats` is null (e.g., V2 checkpoints with `writeStatsAsJson=false`) by
+///   reconstructing the JSON from the parsed representation.
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.
