@@ -219,6 +219,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// Returns the concrete [`DefaultParquetHandler`] for callers that need the inherent
     /// async `write_parquet_file` helper not exposed by the [`ParquetHandler`] trait.
     /// For the metered trait surface used by reads, use [`Self::parquet_handler`].
+    ///
+    /// TODO: lift the inherent helper onto [`DefaultEngine`] so this accessor (and the
+    /// `raw_parquet` field) can be removed.
     pub fn default_parquet_handler(&self) -> Arc<DefaultParquetHandler<E>> {
         self.raw_parquet.clone()
     }

@@ -22,8 +22,13 @@ pub struct MeteredDeltaEngine {
 }
 
 impl MeteredDeltaEngine {
-    /// Wrap `inner`. Debug-asserts that none of `inner`'s metered handlers are already
-    /// metered wrappers, so the resulting engine emits each span exactly once.
+    /// Wrap `inner`. Debug-asserts that none of `inner`'s handlers are already metered
+    /// wrappers, so the resulting engine emits each span exactly once.
+    ///
+    /// The check is shallow: it inspects the immediate concrete type returned by each
+    /// handler accessor and does not walk intermediate wrapper types. Wrapping a metered
+    /// handler behind a non-metered wrapper before re-wrapping (e.g.
+    /// `Metered(Foo(Metered(...)))`) silently double-counts.
     pub fn new(inner: Arc<dyn Engine>) -> Self {
         let inner_storage = inner.storage_handler();
         debug_assert!(
@@ -225,27 +230,21 @@ mod tests {
         }
         fn storage_handler(&self) -> Arc<dyn StorageHandler> {
             if self.meter_storage {
-                Arc::new(crate::metrics::MeteredStorageHandler::new(
-                    self.inner.storage_handler(),
-                ))
+                Arc::new(MeteredStorageHandler::new(self.inner.storage_handler()))
             } else {
                 self.inner.storage_handler()
             }
         }
         fn json_handler(&self) -> Arc<dyn JsonHandler> {
             if self.meter_json {
-                Arc::new(crate::metrics::MeteredJsonHandler::new(
-                    self.inner.json_handler(),
-                ))
+                Arc::new(MeteredJsonHandler::new(self.inner.json_handler()))
             } else {
                 self.inner.json_handler()
             }
         }
         fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
             if self.meter_parquet {
-                Arc::new(crate::metrics::MeteredParquetHandler::new(
-                    self.inner.parquet_handler(),
-                ))
+                Arc::new(MeteredParquetHandler::new(self.inner.parquet_handler()))
             } else {
                 self.inner.parquet_handler()
             }
