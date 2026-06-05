@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, StatsOptions};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
@@ -271,6 +271,7 @@ impl ReadMetadataRunner {
             .clone()
             .scan_builder()
             .with_predicate(self.predicate.clone())
+            .with_stats(StatsOptions::all())
             .build()?;
         let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
         for result in metadata_iter {
@@ -290,6 +291,7 @@ impl ReadMetadataRunner {
             .clone()
             .scan_builder()
             .with_predicate(self.predicate.clone())
+            .with_stats(StatsOptions::all())
             .build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
