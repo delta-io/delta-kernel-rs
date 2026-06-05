@@ -49,12 +49,19 @@ fn test_cross_product_read_write(
         Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
     let snap = build_snapshot!(version_target, table.table_root(), engine.as_ref());
 
+    // `AtTimestamp(i64::MAX)` always resolves to latest (every commit's timestamp is
+    // less than `i64::MAX`). Other timestamp values depend on the table's actual commit
+    // timestamps and are exercised by `test_at_timestamp_resolves_to_intermediate_version`.
     let expected_version = match &version_target {
-        VersionTarget::Latest
-        | VersionTarget::IncrementalToLatest { .. }
-        | VersionTarget::AtTimestamp(_) => log_state.latest_version(),
+        VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => {
+            log_state.latest_version()
+        }
+        VersionTarget::AtTimestamp(ts) if *ts == i64::MAX => log_state.latest_version(),
         VersionTarget::AtVersion(v) => *v,
         VersionTarget::IncrementalFrom { to, .. } => *to,
+        VersionTarget::AtTimestamp(ts) => {
+            panic!("sweep only uses AtTimestamp(i64::MAX), got {ts}")
+        }
     };
     assert_eq!(snap.version(), expected_version);
 

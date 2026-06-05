@@ -1020,8 +1020,9 @@ pub fn version_incremental_to_latest() -> VersionTarget {
         from: DEFAULT_SWEEP_MID_VERSION,
     }
 }
-/// Incremental update from `mid` to `latest - 1`, exercising the partial-replay path to a
-/// non-latest target version (Case F).
+/// Incremental update from `mid` to `latest - 1`. Targets a non-latest `to` to exercise
+/// the partial-replay path that `version_incremental_to_latest()` cannot cover (that one
+/// always goes to latest, which is the same as a non-incremental load).
 pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
     VersionTarget::IncrementalFrom {
         from: DEFAULT_SWEEP_MID_VERSION,
@@ -1842,11 +1843,13 @@ mod tests {
             version_target
         );
         let expected = match &version_target {
-            VersionTarget::Latest
-            | VersionTarget::IncrementalToLatest { .. }
-            | VersionTarget::AtTimestamp(_) => 4,
+            VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
+            VersionTarget::AtTimestamp(ts) if *ts == i64::MAX => 4,
             VersionTarget::AtVersion(v) => *v,
             VersionTarget::IncrementalFrom { to, .. } => *to,
+            VersionTarget::AtTimestamp(ts) => {
+                panic!("test only uses AtTimestamp(i64::MAX), got {ts}")
+            }
         };
         assert_eq!(snap.version(), expected);
     }
