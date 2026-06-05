@@ -183,9 +183,7 @@ use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
-pub use plans::{
-    IoOperation, Operation, PlanExecutor, PlanResult, QueryPlan, QueryPlanBuilder, QueryPlanNode,
-};
+pub use plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanBuilder};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
