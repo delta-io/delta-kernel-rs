@@ -242,13 +242,13 @@ pub struct Values {
     pub rows: Vec<Vec<Scalar>>,
 }
 
-/// Projects the single input through `exprs` into rows of `output_schema`.
+/// Projects the single input through `exprs` into rows of `schema`.
 ///
-/// `exprs.len() == output_schema.fields().count()`. For each output index `i`, the engine
+/// `exprs.len() == schema.fields().count()`. For each output index `i`, the engine
 /// evaluates `exprs[i]` against an input row and binds the result to the **logical name**
-/// `output_schema.fields()[i].name`. Output column names always come from `output_schema`,
+/// `schema.fields()[i].name`. Output column names always come from `schema`,
 /// not from the expression tree; expressions only supply values. Downstream nodes see the
-/// logical field names declared in `output_schema`.
+/// logical field names declared in `schema`.
 ///
 /// # Example
 ///
@@ -267,7 +267,7 @@ pub struct Values {
 ///             col("add.stats_parsed.numRecords"),
 ///         ]),
 ///     ],
-///     output_schema: {
+///     schema: {
 ///         id: int,
 ///         names: array<string>,
 ///         file_meta: { path: string, size: long, num_records: long },
@@ -277,7 +277,7 @@ pub struct Values {
 #[derive(Debug, Clone)]
 pub struct Project {
     pub exprs: Vec<ExpressionRef>,
-    pub output_schema: SchemaRef,
+    pub schema: SchemaRef,
 }
 
 /// Keeps input rows where `predicate` evaluates true (SQL null semantics).
@@ -308,7 +308,7 @@ pub struct LoadColumnFileMeta {
 
 /// Reads data files from an upstream stream of file-metadata tuples, one input row per file.
 /// For each row, `file_meta` locates and sizes the file, the engine resolves its path against
-/// `base_url` (see below), opens it as `file_type`, and reads columns matching `file_schema`.
+/// `base_url` (see below), opens it as `file_type`, and reads columns matching `schema`.
 ///
 /// `file_constant_columns` lists upstream columns whose per-file values are broadcast onto
 /// every emitted file row. This is file-constant metadata, the same concept as
@@ -346,7 +346,7 @@ pub struct LoadColumnFileMeta {
 /// ```
 /// ```text
 /// Load {
-///     file_schema: { id: int, name: string },
+///     schema: { id: int, name: string },
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
 ///     file_constant_columns: ["version"],
@@ -372,7 +372,7 @@ pub struct LoadColumnFileMeta {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Load {
-    pub file_schema: SchemaRef,
+    pub schema: SchemaRef,
     pub file_type: FileType,
     pub base_url: Option<Url>,
     pub file_constant_columns: Vec<ColumnName>,
@@ -381,11 +381,11 @@ pub struct Load {
 }
 
 /// Per group, keep the input row with the greatest `version_column` value and project
-/// the columns named in `output_schema` from that row. Kernel uses this for dedupe
+/// the columns named in `schema` from that row. Kernel uses this for dedupe
 /// across table versions (e.g. latest `add` per path in scan metadata).
 ///
-/// Each `output_schema` field selects a column from the winning row; group-by keys and
-/// the version column must appear in `output_schema` when they should be emitted.
+/// Each `schema` field selects a column from the winning row; group-by keys and
+/// the version column must appear in `schema` when they should be emitted.
 ///
 /// # SQL equivalents
 ///
@@ -408,7 +408,7 @@ pub struct Load {
 /// Equivalent window rewrite:
 ///
 /// ```sql
-/// SELECT <output_schema fields>
+/// SELECT <schema fields>
 /// FROM (
 ///     SELECT *,
 ///            ROW_NUMBER() OVER (
@@ -425,7 +425,7 @@ pub struct Load {
 /// MaxByVersion {
 ///     group_by: [col("person")],
 ///     version_column: "year",
-///     output_schema: { person: string, year: int, likes_to_eat: string },
+///     schema: { person: string, year: int, likes_to_eat: string },
 /// }
 /// ```
 ///
@@ -457,7 +457,7 @@ pub struct Load {
 pub struct MaxByVersion {
     pub group_by: Vec<ExpressionRef>,
     pub version_column: ColumnName,
-    pub output_schema: SchemaRef,
+    pub schema: SchemaRef,
 }
 
 /// Performs a semi join between two inputs, `inputs.len() == 2`, the child
