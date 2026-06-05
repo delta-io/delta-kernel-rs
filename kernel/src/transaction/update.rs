@@ -576,7 +576,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         rows: RowIndexIterator<'_>,
     ) -> DeltaResult<()> {
         static NULL_DV: LazyLock<Scalar> =
-            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+            LazyLock::new(|| Scalar::null(DeletionVectorDescriptor::to_schema()));
         static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
             DeletionVectorDescriptor::to_schema()
                 .into_fields()

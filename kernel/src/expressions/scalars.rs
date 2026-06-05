@@ -285,6 +285,17 @@ impl Scalar {
         matches!(self, Self::Null(_))
     }
 
+    /// Constructs a null `Scalar` of the given type. Accepts anything convertible into a
+    /// [`DataType`], so container types like [`StructType`], [`ArrayType`], and [`MapType`]
+    /// can be passed directly without an explicit `DataType::from(...)` wrapper.
+    ///
+    /// [`StructType`]: crate::schema::StructType
+    /// [`ArrayType`]: crate::schema::ArrayType
+    /// [`MapType`]: crate::schema::MapType
+    pub fn null(data_type: impl Into<DataType>) -> Self {
+        Self::Null(data_type.into())
+    }
+
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;

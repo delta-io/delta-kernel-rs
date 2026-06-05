@@ -292,10 +292,7 @@ fn test_literal_complex_type_array() {
             map_type.clone(),
             [
                 ("array".to_string(), array_value.clone()),
-                (
-                    "null_array".to_string(),
-                    Scalar::Null(array_type.clone().into()),
-                ),
+                ("null_array".to_string(), Scalar::null(array_type.clone())),
             ],
         )
         .unwrap(),
@@ -314,9 +311,9 @@ fn test_literal_complex_type_array() {
             vec![
                 Scalar::Integer(42),
                 array_value,
-                Scalar::Null(array_type.clone().into()),
+                Scalar::null(array_type.clone()),
                 map_value,
-                Scalar::Null(map_type.clone().into()),
+                Scalar::null(map_type.clone()),
             ],
         )
         .unwrap(),
@@ -327,7 +324,7 @@ fn test_literal_complex_type_array() {
             nested_array_type.clone(),
             vec![
                 struct_value.clone(),
-                Scalar::Null(struct_type.clone().into()),
+                Scalar::null(struct_type.clone()),
                 struct_value.clone(),
             ],
         )
@@ -1052,7 +1049,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
-    let null_scalar_map = Scalar::Null(KernelDataType::from(map_type));
+    let null_scalar_map = Scalar::null(map_type);
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 

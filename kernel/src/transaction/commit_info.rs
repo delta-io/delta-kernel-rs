@@ -36,7 +36,7 @@ fn commit_info_literal_exprs(
                         map.into_iter()
                             .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
                     )?),
-                    None => Scalar::Null(DataType::from(op_params_map_type)),
+                    None => Scalar::null(op_params_map_type),
                 },
             )),
         ),
