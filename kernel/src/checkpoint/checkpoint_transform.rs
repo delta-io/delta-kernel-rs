@@ -17,7 +17,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{
-    Expression, ExpressionRef, ExpressionStructPatchBuilder, UnaryExpressionOp,
+    Expression, ExpressionRef, ExpressionStructPatchBuilder, SchemaStructPatchBuilder,
+    UnaryExpressionOp,
 };
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_properties::TableProperties;
@@ -160,17 +161,17 @@ pub(crate) fn build_checkpoint_read_schema(
                 "partitionValues_parsed field already exists in Add schema",
             ));
         }
-        let mut result = add_struct.clone().with_field_inserted_after(
-            Some(STATS_FIELD),
+        let mut patch = SchemaStructPatchBuilder::new().with_inserted_field_after(
+            STATS_FIELD,
             StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
-        )?;
+        );
         if let Some(pv_schema) = partition_schema {
-            result = result.with_field_inserted_after(
-                Some(PARTITION_VALUES_FIELD),
+            patch = patch.with_inserted_field_after(
+                PARTITION_VALUES_FIELD,
                 StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
-            )?;
+            );
         }
-        Ok(result)
+        patch.build(add_struct)
     })
 }
 
@@ -297,25 +298,24 @@ fn build_add_output_schema(
     stats_schema: &StructType,
     partition_schema: Option<&StructType>,
 ) -> DeltaResult<StructType> {
-    let mut new_schema = add_schema.clone();
+    let mut patch = SchemaStructPatchBuilder::new();
     if config.write_stats_as_struct {
-        new_schema = new_schema.with_field_inserted_after(
-            Some(STATS_FIELD),
+        patch = patch.with_inserted_field_after(
+            STATS_FIELD,
             StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
-        )?;
+        );
         if let Some(pv_schema) = partition_schema {
-            new_schema = new_schema.with_field_inserted_after(
-                Some(PARTITION_VALUES_FIELD),
+            patch = patch.with_inserted_field_after(
+                PARTITION_VALUES_FIELD,
                 StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
-            )?;
+            );
         }
     }
 
-    if config.write_stats_as_json {
-        Ok(new_schema)
-    } else {
-        Ok(new_schema.with_field_removed(STATS_FIELD))
+    if !config.write_stats_as_json {
+        patch = patch.with_dropped_field(STATS_FIELD);
     }
+    patch.build(add_schema)
 }
 
 #[cfg(test)]

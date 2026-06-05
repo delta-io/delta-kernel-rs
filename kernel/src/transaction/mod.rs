@@ -22,6 +22,7 @@ use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
+    SchemaStructPatchBuilder,
 };
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
@@ -165,14 +166,14 @@ fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
-    StructTypeBuilder::from_schema(schema)
-        .add_field(StructField::nullable("baseRowId", DataType::LONG))
-        .add_field(StructField::nullable(
+fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
+    let patch = SchemaStructPatchBuilder::new()
+        .with_appended_field(StructField::nullable("baseRowId", DataType::LONG))
+        .with_appended_field(StructField::nullable(
             "defaultRowCommitVersion",
             DataType::LONG,
-        ))
-        .build_arc_unchecked()
+        ));
+    Ok(Arc::new(patch.build(schema)?))
 }
 
 /// Marker type for transactions on existing tables.
@@ -1247,8 +1248,10 @@ impl<S> Transaction<S> {
                 let commit_versions_array =
                     ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
+                let row_tracking_schema =
+                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![])))?;
                 add_files_batch.append_columns(
-                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
+                    row_tracking_schema,
                     vec![base_row_ids_array, commit_versions_array],
                 )
             },
@@ -1258,8 +1261,8 @@ impl<S> Transaction<S> {
         let add_actions = build_add_actions(
             engine,
             extended_add_files,
-            with_row_tracking_cols(self.add_files_schema()),
-            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+            with_row_tracking_cols(self.add_files_schema())?,
+            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()))?,
             self.data_change,
         );
 

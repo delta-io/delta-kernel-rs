@@ -13,7 +13,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
-    UnaryExpressionOp,
+    SchemaStructPatchBuilder, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -238,7 +238,7 @@ impl ScanLogReplayProcessor {
         let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
-        );
+        )?;
 
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
@@ -637,25 +637,25 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
-) -> SchemaRef {
+) -> DeltaResult<SchemaRef> {
     let needs_extra = stats_schema.is_some() || partition_schema.is_some();
     if !needs_extra {
-        return SCAN_ROW_SCHEMA.clone();
+        return Ok(SCAN_ROW_SCHEMA.clone());
     }
-    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+    let mut patch = SchemaStructPatchBuilder::new();
     if let Some(schema) = stats_schema {
-        fields.push(StructField::nullable(
+        patch = patch.with_appended_field(StructField::nullable(
             STATS_PARSED_NAME,
             schema.as_ref().clone(),
         ));
     }
     if let Some(schema) = partition_schema {
-        fields.push(StructField::nullable(
+        patch = patch.with_appended_field(StructField::nullable(
             PARTITION_VALUES_PARSED_NAME,
             schema.as_ref().clone(),
         ));
     }
-    Arc::new(StructType::new_unchecked(fields))
+    Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
 /// Build the add transform expression with optional stats and partition value parsing.

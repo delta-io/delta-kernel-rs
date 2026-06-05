@@ -13,6 +13,7 @@ pub use self::column_names::{
 };
 pub use self::patches::{
     ExpressionFieldPatch, ExpressionStructPatch, ExpressionStructPatchBuilder,
+    SchemaStructPatchBuilder, StructPatchBuilder,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
