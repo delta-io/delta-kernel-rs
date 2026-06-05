@@ -20,6 +20,41 @@ macro_rules! require {
 
 pub(crate) use require;
 
+/// Dual of the `FromIterator` trait, similar to how `Into` is the dual of `From`. It is
+/// automatically implemented for any iterable whose items collect into `T`, and can drastically
+/// simplify type bounds. For example, `CollectInto` allows to write this:
+///
+/// ```
+/// # use delta_kernel::CollectInto;
+/// # struct Foo;
+/// fn foo(arg: impl CollectInto<Foo>) -> Foo {
+///     arg.collect_into()
+/// }
+/// ```
+///
+/// instead of the much more verbose:
+///
+/// ```
+/// # struct Foo;
+/// fn foo<T>(arg: impl IntoIterator<Item = T>) -> Foo
+/// where
+///     Foo: FromIterator<T>,
+/// {
+///     Foo::from_iter(arg)
+/// }
+/// ```
+pub trait CollectInto<T>: IntoIterator + Sized {
+    /// Collects this iterable into a `T`
+    fn collect_into(self) -> T;
+}
+
+// blanket impl
+impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
+    fn collect_into(self) -> T {
+        T::from_iter(self)
+    }
+}
+
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.
 #[allow(unused)]
