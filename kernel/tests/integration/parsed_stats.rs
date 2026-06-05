@@ -1,4 +1,4 @@
-//! Integration test for `Scan::include_all_stats_columns`.
+//! Integration test for `StatsOptions::all` parsed-stats output.
 //!
 //! Builds a table with `delta.checkpoint.writeStatsAsStruct=true` and a nested schema,
 //! then verifies the parsed-stats struct column matches the JSON `stats` string.
@@ -10,6 +10,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::Snapshot;
 use rstest::rstest;
@@ -126,7 +127,7 @@ fn scan_metadata_with_stats_columns_kernel_written(
 
     let scan = snapshot
         .scan_builder()
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
         .build()
         .unwrap();
 
