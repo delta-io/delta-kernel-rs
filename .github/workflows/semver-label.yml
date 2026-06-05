@@ -78,7 +78,7 @@ jobs:
 
       # Create an artifact for pr-title-validator, which is triggered by this workflow via
       # workflow_run. Due to how it's triggered, that run will have no idea what PR it's running
-      # against, so we output it here so it can do it's job
+      # against, so we output it here so it can do its job
       - name: Record PR number
         if: steps.pr-context.outputs.number != ''
         env:
