@@ -125,9 +125,10 @@ If you skip `with_predicate`, no filtering is applied.
 
 > [!NOTE]
 > Predicates on the CDF metadata columns (`_change_type`, `_commit_version`,
-> `_commit_timestamp`) are not currently supported. Apply predicates only to regular table
-> columns. Filtering on CDF columns after the scan returns is still possible in your
-> connector code.
+> `_commit_timestamp`) are accepted but have no effect. Kernel doesn't apply them during
+> file pruning because CDF metadata is synthesized during scan execution, not read from
+> data files. Apply such filters in your connector code after the scan returns. See
+> [issue #525](https://github.com/delta-io/delta-kernel-rs/issues/525).
 
 > [!NOTE]
 > Like regular scans, CDF filtering is best-effort. The scan may return rows that do not

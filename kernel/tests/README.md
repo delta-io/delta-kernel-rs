@@ -152,8 +152,8 @@ The golden V2 checkpoint tables have a different protocol (v1/v2, no table featu
 
 | Table | Location | Schema | Protocol (R/W) | Features | Description | Tests |
 |-------|----------|--------|----------|----------|-------------|-------|
-| `crc-full` | data/ | `id: long` | v3/v7 | r:`deletionVectors` w:`domainMetadata,deletionVectors,rowTracking` | Full CRC with `allFiles` (10 files), 2 `setTransactions`, `domainMetadata`, `fileSizeHistogram` | `crc/reader.rs::test_read_crc`, `crc/lazy.rs::test_lazy_crc` |
-| `crc-malformed` | data/ | N/A | N/A | | CRC file contains only `"malformed"` | `crc/lazy.rs::test_lazy_crc_malformed_file`, `crc/reader.rs` error test |
+| `crc-full` | data/ | `id: long` | v3/v7 | r:`deletionVectors` w:`domainMetadata,deletionVectors,rowTracking` | Full CRC with `allFiles` (10 files), 2 `setTransactions`, `domainMetadata`, `fileSizeHistogram` | `crc/reader.rs::test_read_crc_file`, `metrics/snapshot_load.rs::snapshot_with_crc_at_target_version_skips_json_replay` |
+| `crc-malformed` | data/ | N/A | N/A | | CRC file contains only `"malformed"` | `crc/reader.rs::test_read_malformed_crc_file_emits_metric_then_fails` |
 
 ## Partitioning & Write Path
 

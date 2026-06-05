@@ -222,13 +222,19 @@ impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
-    /// `logical_schema` - The logical schema of the scan output, which includes partition columns
+    /// `logical_read_schema` - The logical schema of the scan output
+    /// `table_schema` - The schema against which predicate column references are resolved.
+    /// Must contain every column the predicate may legitimately reference (typically the full
+    /// table schema, or full CDF-extended schema for CDF scans). Currently, we do not carry
+    /// over any metadata columns from the `logical_read_schema` to the `table_schema` (issue
+    /// 2633).
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
     /// `stats_output_mode` - Controls how file statistics are handled during the scan
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
-        logical_schema: SchemaRef,
+        logical_read_schema: SchemaRef,
+        table_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
         stats_output_mode: StatsOutputMode,
@@ -236,14 +242,14 @@ impl StateInfo {
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
-        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut transform_spec = Vec::with_capacity(logical_schema.num_fields());
+        let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
+        let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
 
-        let metadata_info = validate_metadata_columns(&logical_schema, table_configuration)?;
+        let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
 
         // Loop over all selected fields and build both the physical schema and transform spec
-        for (index, logical_field) in logical_schema.fields().enumerate() {
+        for (index, logical_field) in logical_read_schema.fields().enumerate() {
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
             {
@@ -269,7 +275,7 @@ impl StateInfo {
                                 // ensure we have a column name that isn't already in our schema
                                 let index_column_name = (0..)
                                     .map(|i| format!("row_indexes_for_row_id_{i}"))
-                                    .find(|name| logical_schema.field(name).is_none())
+                                    .find(|name| logical_read_schema.field(name).is_none())
                                     .ok_or(Error::generic(
                                         "Couldn't generate row index column name",
                                     ))?;
@@ -333,8 +339,9 @@ impl StateInfo {
             .map(|p| p.references().into_iter().cloned().collect())
             .unwrap_or_default();
 
+        // We use table_schema here as predicate can reference columns outside projection.
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &table_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
@@ -349,7 +356,7 @@ impl StateInfo {
             let dropped: Vec<&ColumnName> = predicate_column_names
                 .iter()
                 .filter(|c| {
-                    get_any_level_column_physical_name(&logical_schema, c, column_mapping_mode)
+                    get_any_level_column_physical_name(&table_schema, c, column_mapping_mode)
                         .ok()
                         .is_some_and(|physical| !physical_stats_columns.contains(&physical))
                 })
@@ -405,7 +412,7 @@ impl StateInfo {
             };
 
         Ok(StateInfo {
-            logical_schema,
+            logical_schema: logical_read_schema,
             physical_schema,
             physical_predicate,
             transform_spec,
@@ -529,6 +536,7 @@ pub(crate) mod tests {
 
         StateInfo::try_new(
             schema.clone(),
+            table_configuration.logical_schema(),
             &table_configuration,
             predicate,
             stats_output_mode,
@@ -895,17 +903,43 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_partition_column() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let table_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("part_col", DataType::STRING),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            table_schema,
+            vec!["part_col".to_string()],
+            10,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_configuration = TableConfiguration::try_new(
+            metadata,
+            Protocol::try_new_legacy(2, 5).unwrap(),
+            Url::parse("s3://my-table").unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let read_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
         )]));
-        let res = get_state_info(
-            schema.clone(),
-            vec!["part_col".to_string()],
+        let read_schema = Arc::new(
+            read_schema
+                .add_metadata_column("part_col", MetadataColumnSpec::RowId)
+                .expect("Couldn't add metadata col"),
+        );
+        let res = StateInfo::try_new(
+            read_schema,
+            table_configuration.logical_schema(),
+            &table_configuration,
             None,
-            &[], // no table features
-            HashMap::new(),
-            vec![("part_col", MetadataColumnSpec::RowId)],
+            StatsOutputMode::default(),
+            (),
         );
         assert_result_error_with_message(
             res,

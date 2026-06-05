@@ -160,6 +160,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         ),
         Expr::unknown("mystery"),
         Expr::map_to_struct(column_expr!("pv")),
+        Expr::coalesce([column_expr!("col"), Expr::literal(0_i32)]),
+        Expr::array([Expr::literal(1_i32), Expr::literal(2_i32)]),
     ];
     sub_exprs.extend(
         [
