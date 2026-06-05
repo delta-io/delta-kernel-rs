@@ -324,8 +324,8 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::engine::tests::test_arrow_engine;
     use delta_kernel::object_store::local::LocalFileSystem;
+    use test_utils::engine_contract::test_arrow_engine;
 
     use super::*;
 

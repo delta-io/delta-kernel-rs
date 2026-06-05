@@ -235,3 +235,28 @@ where
         .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
     Ok(Box::new(result))
 }
+
+// TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
+// call them without the kernel-cfg-test cycle issue.
+//
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use crate::engine::tests::test_arrow_engine;
+//
+//     #[test]
+//     fn test_sync_engine() {
+//         let tmp = tempfile::tempdir().unwrap();
+//         let url = Url::from_directory_path(tmp.path()).unwrap();
+//         let engine = SyncEngine::new();
+//         test_arrow_engine(&engine, &url);
+//     }
+//
+//     #[test]
+//     fn test_sync_engine_with_store() {
+//         let store = Arc::new(crate::object_store::memory::InMemory::new());
+//         let engine = SyncEngine::new_with_store(store);
+//         let url = Url::parse("memory:///test/").unwrap();
+//         test_arrow_engine(&engine, &url);
+//     }
+// }

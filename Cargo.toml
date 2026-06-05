@@ -3,6 +3,7 @@ members = [
     "acceptance",
     "benchmarks",
     "default-engine",
+    "default-engine/test-utils",
     "derive-macros",
     "ffi",
     "kernel",

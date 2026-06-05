@@ -152,4 +152,12 @@ mod tests {
             &[1, 2, 3]
         );
     }
+
+    // TODO(#2618): Restore once `PlanBasedJsonHandler` moves to delta_kernel_default_engine and
+    // can use the test_utils::engine_contract helpers without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn test_file_path_contract() {
+    //     test_json_handler_file_path_contract(&make_handler());
+    // }
 }

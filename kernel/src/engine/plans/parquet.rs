@@ -134,4 +134,27 @@ mod tests {
             &[10, 20, 30]
         );
     }
+
+    // TODO(#2618): Restore once `PlanBasedParquetHandler` moves to delta_kernel_default_engine
+    // and can use the test_utils::engine_contract helpers without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn test_parquet_handler_reads_contract() {
+    //     test_parquet_handler_reads_file_with_arrow_schema(&make_handler());
+    // }
+    //
+    // #[test]
+    // fn test_read_parquet_footer_contract() {
+    //     test_parquet_handler_reads_footer(&make_handler());
+    // }
+    //
+    // #[test]
+    // fn test_read_parquet_footer_missing_file_contract() {
+    //     test_parquet_handler_footer_errors_on_missing_file(&make_handler());
+    // }
+    //
+    // #[test]
+    // fn test_read_parquet_footer_preserves_field_ids_contract() {
+    //     test_parquet_handler_footer_preserves_field_ids(&make_handler());
+    // }
 }

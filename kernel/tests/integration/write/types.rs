@@ -22,8 +22,6 @@ use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-use test_utils::delta_kernel_default_engine::parquet::DefaultParquetHandler;
 use test_utils::{
     begin_transaction, create_add_files_metadata, create_table, engine_store_setup, test_read,
     test_table_setup,

@@ -332,4 +332,37 @@ mod tests {
             .collect();
         assert_eq!(field_names, vec!["id".to_string(), "name".to_string()]);
     }
+
+    // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
+    // call them without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn parquet_handler_reads_footer() {
+    //     test_parquet_handler_reads_footer(&SyncParquetHandler::new(None));
+    // }
+    //
+    // #[test]
+    // fn parquet_handler_footer_errors_on_missing_file() {
+    //     test_parquet_handler_footer_errors_on_missing_file(&SyncParquetHandler::new(None));
+    // }
+    //
+    // #[test]
+    // fn parquet_handler_footer_preserves_field_ids() {
+    //     test_parquet_handler_footer_preserves_field_ids(&SyncParquetHandler::new(None));
+    // }
+    //
+    // #[test]
+    // fn parquet_handler_write_always_overwrites() {
+    //     test_parquet_handler_write_always_overwrites(&SyncParquetHandler::new(None));
+    // }
+    //
+    // #[test]
+    // fn parquet_handler_write_omits_arrow_schema() {
+    //     test_parquet_handler_write_omits_arrow_schema(&SyncParquetHandler::new(None));
+    // }
+    //
+    // #[test]
+    // fn parquet_handler_reads_file_with_arrow_schema() {
+    //     test_parquet_handler_reads_file_with_arrow_schema(&SyncParquetHandler::new(None));
+    // }
 }

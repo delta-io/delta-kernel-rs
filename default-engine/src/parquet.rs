@@ -587,23 +587,24 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
-    use delta_kernel::utils::current_time_ms;
-    use delta_kernel::utils::test_utils::assert_result_error_with_message;
     use delta_kernel::EngineData;
+    use delta_kernel_default_engine_test_utils::{
+        assert_result_error_with_message, current_time_ms,
+        try_into_record_batch as into_record_batch,
+    };
     use itertools::Itertools;
+    use test_utils::engine_contract::{
+        test_parquet_handler_footer_errors_on_missing_file,
+        test_parquet_handler_footer_preserves_field_ids,
+        test_parquet_handler_reads_file_with_arrow_schema, test_parquet_handler_reads_footer,
+        test_parquet_handler_write_always_overwrites,
+        test_parquet_handler_write_omits_arrow_schema,
+    };
     use url::Url;
 
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
-
-    fn into_record_batch(
-        engine_data: DeltaResult<Box<dyn EngineData>>,
-    ) -> DeltaResult<RecordBatch> {
-        engine_data
-            .and_then(ArrowEngineData::try_from_engine_data)
-            .map(Into::into)
-    }
 
     async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
@@ -1497,41 +1498,34 @@ mod tests {
 
     #[test]
     fn parquet_handler_reads_footer() {
-        delta_kernel::engine::tests::test_parquet_handler_reads_footer(&default_parquet_handler());
+        let checkpoint = PathBuf::from(
+            "../kernel/tests/data/parsed-stats/_delta_log/00000000000000000003.checkpoint.parquet",
+        );
+        test_parquet_handler_reads_footer(&default_parquet_handler(), &checkpoint);
     }
 
     #[test]
     fn parquet_handler_footer_errors_on_missing_file() {
-        delta_kernel::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
-            &default_parquet_handler(),
-        );
+        test_parquet_handler_footer_errors_on_missing_file(&default_parquet_handler());
     }
 
     #[test]
     fn parquet_handler_footer_preserves_field_ids() {
-        delta_kernel::engine::tests::test_parquet_handler_footer_preserves_field_ids(
-            &default_parquet_handler(),
-        );
+        test_parquet_handler_footer_preserves_field_ids(&default_parquet_handler());
     }
 
     #[test]
     fn parquet_handler_write_always_overwrites() {
-        delta_kernel::engine::tests::test_parquet_handler_write_always_overwrites(
-            &default_parquet_handler(),
-        );
+        test_parquet_handler_write_always_overwrites(&default_parquet_handler());
     }
 
     #[test]
     fn parquet_handler_write_omits_arrow_schema() {
-        delta_kernel::engine::tests::test_parquet_handler_write_omits_arrow_schema(
-            &default_parquet_handler(),
-        );
+        test_parquet_handler_write_omits_arrow_schema(&default_parquet_handler());
     }
 
     #[test]
     fn parquet_handler_reads_file_with_arrow_schema() {
-        delta_kernel::engine::tests::test_parquet_handler_reads_file_with_arrow_schema(
-            &default_parquet_handler(),
-        );
+        test_parquet_handler_reads_file_with_arrow_schema(&default_parquet_handler());
     }
 }

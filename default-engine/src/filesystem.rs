@@ -258,8 +258,8 @@ mod tests {
 
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::utils::current_time_duration;
     use delta_kernel::Engine as _;
+    use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
     use test_utils::delta_path_for_version;
 

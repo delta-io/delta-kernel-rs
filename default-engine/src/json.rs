@@ -281,22 +281,15 @@ mod tests {
         PutOptions, PutPayload, PutResult, Result,
     };
     use delta_kernel::schema::{DataType as DeltaDataType, Schema, StructField};
-    use delta_kernel::utils::test_utils::string_array_to_engine_data;
+    use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
     use serde_json::json;
+    use test_utils::engine_contract::test_json_handler_file_path_contract;
     use tracing::info;
 
-    use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
-
-    // TODO: should just use the one from test_utils, but running into dependency issues
-    fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
-        ArrowEngineData::try_from_engine_data(engine_data)
-            .unwrap()
-            .into()
-    }
-
     use super::*;
+    use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
 
     // A wrapper trait that allows us to work with the ObjectStore trait, without directly importing
     // it and the ambiguous method errors it would bring.
@@ -950,6 +943,6 @@ mod tests {
             Arc::new(LocalFileSystem::new()),
             Arc::new(TokioBackgroundExecutor::new()),
         );
-        delta_kernel::engine::tests::test_json_handler_file_path_contract(&handler);
+        test_json_handler_file_path_contract(&handler);
     }
 }

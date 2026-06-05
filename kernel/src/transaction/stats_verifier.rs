@@ -7,8 +7,6 @@
 
 use std::sync::LazyLock;
 
-use delta_kernel_derive::internal_api;
-
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::Error;
@@ -22,15 +20,13 @@ use crate::DeltaResult;
 /// For each required column, validates that `nullCount` is present (non-null) and that
 /// `minValues` and `maxValues` are present unless the column is all-null
 /// (`nullCount == numRecords`).
-#[internal_api]
-pub(crate) struct StatsColumnVerifier {
+pub struct StatsColumnVerifier {
     required_columns: Vec<(ColumnName, DataType)>,
 }
 
 impl StatsColumnVerifier {
     /// Create a new verifier that checks statistics for the given required columns and types.
-    #[internal_api]
-    pub(crate) fn new(required_columns: Vec<(ColumnName, DataType)>) -> Self {
+    pub fn new(required_columns: Vec<(ColumnName, DataType)>) -> Self {
         Self { required_columns }
     }
 
@@ -38,8 +34,7 @@ impl StatsColumnVerifier {
     ///
     /// For each required column, extracts all three stat columns (nullCount, minValues,
     /// maxValues) in a single `visit_rows` call per batch.
-    #[internal_api]
-    pub(crate) fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
+    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
         if self.required_columns.is_empty() {
             return Ok(());
         }
@@ -286,10 +281,7 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
-#[internal_api]
-pub(crate) fn verify_num_records_present(
-    add_files: &[Box<dyn crate::EngineData>],
-) -> DeltaResult<()> {
+pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
     let column_names = vec![
         ColumnName::new(["path"]),
         ColumnName::new(["stats", NUM_RECORDS]),
