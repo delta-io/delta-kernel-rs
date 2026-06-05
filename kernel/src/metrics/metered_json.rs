@@ -1,10 +1,7 @@
 //! [`MeteredJsonHandler`] wraps any [`JsonHandler`] so its `read_json_files` emits the
-//! kernel's standard `JsonReadCompleted` tracing span. `parse_json` and `write_json_file`
-//! pass through.
-//!
-//! Counts are known up-front from the `files: &[FileMeta]` argument, so the wrapper uses
-//! [`PrecountedMetricsIterator`] to emit `(num_files, bytes_read)` exactly once when the
-//! returned iterator is exhausted or dropped.
+//! kernel's standard `JsonReadCompleted` span, carrying `(num_files, bytes_read)` exactly
+//! once when the returned iterator is exhausted or dropped. `parse_json` and
+//! `write_json_file` pass through.
 
 use std::sync::Arc;
 
@@ -84,22 +81,20 @@ impl JsonHandler for MeteredJsonHandler {
 mod tests {
     use std::sync::Arc;
 
-    use bytes::Bytes;
     use url::Url;
 
     use super::*;
+    use crate::arrow::array::RecordBatch;
+    use crate::arrow::datatypes::Schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::metrics::MetricEvent;
+    use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
-    use crate::FileSlice;
 
-    /// Stub `JsonHandler` that returns a fixed number of empty batches from `read_json_files`.
     #[derive(Debug)]
     struct StubJsonHandler;
 
     fn empty_batch() -> Box<dyn EngineData> {
-        use crate::arrow::array::RecordBatch;
-        use crate::arrow::datatypes::Schema;
         Box::new(ArrowEngineData::new(RecordBatch::new_empty(Arc::new(
             Schema::empty(),
         ))))
@@ -148,7 +143,6 @@ mod tests {
     }
 
     fn delta_schema() -> SchemaRef {
-        use crate::schema::{DataType, StructField, StructType};
         Arc::new(StructType::try_new([StructField::nullable("x", DataType::INTEGER)]).unwrap())
     }
 
@@ -177,14 +171,56 @@ mod tests {
     }
 
     #[test]
+    fn read_json_files_emits_on_drop_without_consumption() {
+        let (reporter, _guard) = install_capture();
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler);
+        let handler = MeteredJsonHandler::new(inner);
+
+        let files = vec![fake_file("0.json", 100), fake_file("1.json", 50)];
+        {
+            let _iter = handler
+                .read_json_files(&files, delta_schema(), None)
+                .unwrap();
+        }
+
+        let events = reporter.events();
+        let read = events
+            .iter()
+            .find(|e| matches!(e, MetricEvent::JsonReadCompleted(_)))
+            .expect("expected JsonReadCompleted event on drop");
+        let MetricEvent::JsonReadCompleted(e) = read else {
+            unreachable!();
+        };
+        assert_eq!(e.num_files, 2);
+        assert_eq!(e.bytes_read, 150);
+    }
+
+    #[test]
+    fn read_json_files_emits_zero_event_for_empty_input() {
+        let (reporter, _guard) = install_capture();
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler);
+        let handler = MeteredJsonHandler::new(inner);
+
+        let iter = handler.read_json_files(&[], delta_schema(), None).unwrap();
+        let _: Vec<_> = iter.collect();
+
+        let events = reporter.events();
+        let read = events
+            .iter()
+            .find(|e| matches!(e, MetricEvent::JsonReadCompleted(_)))
+            .expect("expected zero-valued JsonReadCompleted");
+        let MetricEvent::JsonReadCompleted(e) = read else {
+            unreachable!();
+        };
+        assert_eq!(e.num_files, 0);
+        assert_eq!(e.bytes_read, 0);
+    }
+
+    #[test]
     #[should_panic(expected = "wraps another MeteredJsonHandler")]
     fn new_panics_on_double_wrap() {
         let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler);
         let once: Arc<dyn JsonHandler> = Arc::new(MeteredJsonHandler::new(inner));
         let _twice = MeteredJsonHandler::new(once);
     }
-
-    // Silences unused-warning in this `cfg(test)` module.
-    #[allow(dead_code)]
-    fn _force_use(_: Bytes, _: FileSlice) {}
 }

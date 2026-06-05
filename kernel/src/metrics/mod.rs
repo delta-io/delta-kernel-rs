@@ -58,12 +58,14 @@
 //!
 //! # Handler Metrics
 //!
-//! Storage, JSON, and Parquet handler operations emit one event per call:
+//! Storage, JSON, and Parquet handler operations emit one event per read or copy
+//! operation, fired when the returned iterator is exhausted or dropped:
 //! `StorageListCompleted` / `StorageReadCompleted` / `StorageCopyCompleted` for storage,
-//! `JsonReadCompleted` for JSON `read_*_files`, and `ParquetReadCompleted` for Parquet
-//! `read_*_files`. `DefaultEngine` wraps its three handlers in [`MeteredStorageHandler`],
-//! [`MeteredJsonHandler`], and [`MeteredParquetHandler`] at construction; any other
-//! engine gets the same coverage by wrapping its [`Engine`] in [`MeteredDeltaEngine`].
+//! `JsonReadCompleted` for `JsonHandler::read_json_files`, and `ParquetReadCompleted`
+//! for `ParquetHandler::read_parquet_files`. `DefaultEngine` wraps its three handlers
+//! in [`MeteredStorageHandler`], [`MeteredJsonHandler`], and [`MeteredParquetHandler`]
+//! at construction; any other engine gets the same coverage by wrapping its [`Engine`]
+//! in [`MeteredDeltaEngine`].
 //!
 //! These metrics are standalone and track aggregate handler performance without
 //! correlating to specific Snapshot/Transaction operations.

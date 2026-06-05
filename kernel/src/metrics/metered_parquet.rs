@@ -1,10 +1,7 @@
 //! [`MeteredParquetHandler`] wraps any [`ParquetHandler`] so its `read_parquet_files`
-//! emits the kernel's standard `ParquetReadCompleted` tracing span.
-//! `read_parquet_footer` and `write_parquet_file` pass through.
-//!
-//! Counts are known up-front from the `files: &[FileMeta]` argument, so the wrapper uses
-//! [`PrecountedMetricsIterator`] to emit `(num_files, bytes_read)` exactly once when the
-//! returned iterator is exhausted or dropped.
+//! emits the kernel's standard `ParquetReadCompleted` span, carrying
+//! `(num_files, bytes_read)` exactly once when the returned iterator is exhausted or
+//! dropped. `read_parquet_footer` and `write_parquet_file` pass through.
 
 use std::sync::Arc;
 
@@ -83,8 +80,8 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::engine::arrow_data::ArrowEngineData;
     use crate::metrics::MetricEvent;
+    use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     #[derive(Debug)]
@@ -128,7 +125,6 @@ mod tests {
     }
 
     fn delta_schema() -> SchemaRef {
-        use crate::schema::{DataType, StructField, StructType};
         Arc::new(StructType::try_new([StructField::nullable("x", DataType::INTEGER)]).unwrap())
     }
 
@@ -157,14 +153,58 @@ mod tests {
     }
 
     #[test]
+    fn read_parquet_files_emits_on_drop_without_consumption() {
+        let (reporter, _guard) = install_capture();
+        let inner: Arc<dyn ParquetHandler> = Arc::new(StubParquetHandler);
+        let handler = MeteredParquetHandler::new(inner);
+
+        let files = vec![fake_file("a.parquet", 256), fake_file("b.parquet", 1024)];
+        {
+            let _iter = handler
+                .read_parquet_files(&files, delta_schema(), None)
+                .unwrap();
+        }
+
+        let events = reporter.events();
+        let read = events
+            .iter()
+            .find(|e| matches!(e, MetricEvent::ParquetReadCompleted(_)))
+            .expect("expected ParquetReadCompleted event on drop");
+        let MetricEvent::ParquetReadCompleted(e) = read else {
+            unreachable!();
+        };
+        assert_eq!(e.num_files, 2);
+        assert_eq!(e.bytes_read, 1280);
+    }
+
+    #[test]
+    fn read_parquet_files_emits_zero_event_for_empty_input() {
+        let (reporter, _guard) = install_capture();
+        let inner: Arc<dyn ParquetHandler> = Arc::new(StubParquetHandler);
+        let handler = MeteredParquetHandler::new(inner);
+
+        let iter = handler
+            .read_parquet_files(&[], delta_schema(), None)
+            .unwrap();
+        let _: Vec<_> = iter.collect();
+
+        let events = reporter.events();
+        let read = events
+            .iter()
+            .find(|e| matches!(e, MetricEvent::ParquetReadCompleted(_)))
+            .expect("expected zero-valued ParquetReadCompleted");
+        let MetricEvent::ParquetReadCompleted(e) = read else {
+            unreachable!();
+        };
+        assert_eq!(e.num_files, 0);
+        assert_eq!(e.bytes_read, 0);
+    }
+
+    #[test]
     #[should_panic(expected = "wraps another MeteredParquetHandler")]
     fn new_panics_on_double_wrap() {
         let inner: Arc<dyn ParquetHandler> = Arc::new(StubParquetHandler);
         let once: Arc<dyn ParquetHandler> = Arc::new(MeteredParquetHandler::new(inner));
         let _twice = MeteredParquetHandler::new(once);
     }
-
-    // Silence unused-import warning.
-    #[allow(dead_code)]
-    fn _force_use(_: ArrowEngineData) {}
 }

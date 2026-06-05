@@ -92,10 +92,6 @@ mod tests {
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::{DeltaResult, FileMeta, FileSlice};
 
-    // Use a stub engine so the wrapper sees an un-metered storage handler. `DefaultEngine`
-    // already exposes `MeteredStorageHandler` from `storage_handler()`, which would trip
-    // the double-wrap guard in `MeteredDeltaEngine::new`.
-
     /// Minimal storage handler used in tests: returns N preconfigured FileMeta items.
     #[derive(Debug)]
     struct StubStorageHandler {
@@ -206,8 +202,6 @@ mod tests {
 
     #[test]
     fn json_and_parquet_handlers_are_metered() {
-        use crate::metrics::{MeteredJsonHandler, MeteredParquetHandler};
-
         let engine = MeteredDeltaEngine::new(Arc::new(StubEngine::new()));
         assert!(engine.json_handler().any_ref().is::<MeteredJsonHandler>());
         assert!(engine

@@ -91,10 +91,10 @@ pub struct DefaultEngine<E: TaskExecutor> {
     storage: Arc<MeteredStorageHandler>,
     json: Arc<MeteredJsonHandler>,
     parquet: Arc<MeteredParquetHandler>,
-    /// Concrete parquet handler retained so [`Self::write_parquet`] can call its
-    /// inherent `write_parquet_file` helper, which the [`ParquetHandler`] trait
-    /// surface doesn't expose.
-    parquet_raw: Arc<DefaultParquetHandler<E>>,
+    /// Concrete parquet handler retained so [`Self::write_parquet`] and
+    /// [`Self::default_parquet_handler`] can reach the inherent `write_parquet_file`
+    /// helper, which the [`ParquetHandler`] trait surface doesn't expose.
+    raw_parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
@@ -186,15 +186,15 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             object_store.clone(),
             task_executor.clone(),
         ));
-        let parquet_raw = Arc::new(DefaultParquetHandler::new(
+        let raw_parquet = Arc::new(DefaultParquetHandler::new(
             object_store.clone(),
             task_executor.clone(),
         ));
         Self {
             storage: Arc::new(MeteredStorageHandler::new(raw_storage)),
             json: Arc::new(MeteredJsonHandler::new(raw_json)),
-            parquet: Arc::new(MeteredParquetHandler::new(parquet_raw.clone())),
-            parquet_raw,
+            parquet: Arc::new(MeteredParquetHandler::new(raw_parquet.clone())),
+            raw_parquet,
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
@@ -216,12 +216,11 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         Some(self.object_store.clone())
     }
 
-    /// Returns the concrete [`DefaultParquetHandler`]. Use this when you need the
-    /// inherent async `write_parquet_file` helper (which is not part of the
-    /// [`ParquetHandler`] trait surface) -- e.g. tests and shredded-variant write paths.
-    /// Prefer [`Self::parquet_handler`] for the trait-level metered surface.
+    /// Returns the concrete [`DefaultParquetHandler`] for callers that need the inherent
+    /// async `write_parquet_file` helper not exposed by the [`ParquetHandler`] trait.
+    /// For the metered trait surface used by reads, use [`Self::parquet_handler`].
     pub fn default_parquet_handler(&self) -> Arc<DefaultParquetHandler<E>> {
-        self.parquet_raw.clone()
+        self.raw_parquet.clone()
     }
 
     /// Write `data` as a parquet file using the provided `write_context`.
@@ -246,7 +245,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        self.parquet_raw
+        self.raw_parquet
             .write_parquet_file(physical_data, write_context)
             .await
     }
