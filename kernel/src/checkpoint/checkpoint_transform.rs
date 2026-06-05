@@ -17,10 +17,9 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{
-    Expression, ExpressionRef, ExpressionStructPatchBuilder, SchemaStructPatchBuilder,
-    UnaryExpressionOp,
+    Expression, ExpressionRef, ExpressionStructPatchBuilder, UnaryExpressionOp,
 };
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 

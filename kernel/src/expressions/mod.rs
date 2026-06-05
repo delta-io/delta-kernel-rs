@@ -11,23 +11,19 @@ pub use self::column_names::{
     col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
     joined_column_name, ColumnName,
 };
-pub use self::patches::{
-    ExpressionFieldPatch, ExpressionStructPatch, ExpressionStructPatchBuilder,
-    SchemaStructPatchBuilder, StructPatchBuilder,
-};
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
+pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::CollectInto;
 use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
-mod patches;
 pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
 
@@ -46,6 +42,11 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 pub fn lit(value: impl Into<Scalar>) -> Expression {
     Expression::literal(value)
 }
+
+/// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are
+/// expressions, lowered into an [`ExpressionStructPatch`] that can be embedded in an
+/// [`Expression`].
+pub type ExpressionStructPatchBuilder = crate::struct_patch::StructPatchBuilder<ExpressionRef>;
 
 ////////////////////////////////////////////////////////////////////////
 // Operators

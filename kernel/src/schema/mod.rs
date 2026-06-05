@@ -38,6 +38,11 @@ pub(crate) mod void_utils;
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
+/// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
+/// fields, lowered into an output [`StructType`] directly from an input schema via
+/// [`build`](crate::struct_patch::StructPatchBuilder::<StructField>::build).
+pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<StructField>;
+
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
 #[internal_api]

@@ -13,7 +13,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
-    SchemaStructPatchBuilder, UnaryExpressionOp,
+    UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -24,7 +24,8 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
-    ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    StructType, ToSchema as _,
 };
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;

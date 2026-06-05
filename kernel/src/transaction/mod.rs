@@ -22,7 +22,6 @@ use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
-    SchemaStructPatchBuilder,
 };
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
@@ -38,7 +37,10 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
+use crate::schema::{
+    ArrayType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    StructTypeBuilder,
+};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;

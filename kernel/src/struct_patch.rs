@@ -3,19 +3,20 @@
 //! A struct patch keeps, drops, replaces, or inserts fields relative to an input struct without
 //! enumerating untouched fields. Patches are built with a [`StructPatchBuilder`], which validates
 //! conflicting operations and lowers nested field paths into recursive patches. Two flavors share
-//! the same builder surface:
+//! the same builder surface, each surfaced as a type alias in its own domain module:
 //!
-//! * [`ExpressionStructPatchBuilder`] emits expressions and produces an [`ExpressionStructPatch`]
-//!   that is embedded in an [`Expression`] and applied to data at evaluation time.
-//! * [`SchemaStructPatchBuilder`] emits schema fields and produces an output [`StructType`]
-//!   directly from an input schema.
+//! * [`ExpressionStructPatchBuilder`](crate::expressions::ExpressionStructPatchBuilder) emits
+//!   expressions and produces an [`ExpressionStructPatch`] that is embedded in an [`Expression`]
+//!   and applied to data at evaluation time.
+//! * [`SchemaStructPatchBuilder`](crate::schema::SchemaStructPatchBuilder) emits schema fields and
+//!   produces an output [`StructType`] directly from an input schema.
 
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ColumnName, Expression, ExpressionRef};
+use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, StructField, StructType};
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
@@ -75,20 +76,14 @@ impl ExpressionStructPatch {
 
 // === Builder ===
 
-/// A [`StructPatchBuilder`] whose emitted items are expressions, lowered into an
-/// [`ExpressionStructPatch`].
-pub type ExpressionStructPatchBuilder = StructPatchBuilder<ExpressionRef>;
-
-/// A [`StructPatchBuilder`] whose emitted items are schema fields, lowered into an output
-/// [`StructType`] via [`build`](StructPatchBuilder::<StructField>::build).
-pub type SchemaStructPatchBuilder = StructPatchBuilder<StructField>;
-
 /// Builds a sparse struct patch from a sequence of requested patch operations.
 ///
 /// The builder records user intent, checks for conflicting destructive operations, and lowers
 /// nested field paths into recursive struct patches. The same builder surface drives both
-/// expression patching ([`ExpressionStructPatchBuilder`]) and schema patching
-/// ([`SchemaStructPatchBuilder`]); only the terminal `build` step differs.
+/// expression patching
+/// ([`ExpressionStructPatchBuilder`](crate::expressions::ExpressionStructPatchBuilder)) and schema
+/// patching ([`SchemaStructPatchBuilder`](crate::schema::SchemaStructPatchBuilder)); only the
+/// terminal `build` step differs.
 #[derive(Debug)]
 pub struct StructPatchBuilder<Item> {
     /// None for a top-level patch; otherwise the path of the nested struct this patch targets.
@@ -395,10 +390,10 @@ impl StructPatchBuilder<ExpressionRef> {
     }
 }
 
-impl TryFrom<ExpressionStructPatchBuilder> for ExpressionStructPatch {
+impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
     type Error = Error;
 
-    fn try_from(builder: ExpressionStructPatchBuilder) -> DeltaResult<Self> {
+    fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> DeltaResult<Self> {
         builder.build()
     }
 }
@@ -577,12 +572,9 @@ fn resolve_input_schema<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use super::{
-        ExpressionStructPatchBuilder, InputFieldAction, PatchNode, PatchNodeField,
-        SchemaStructPatchBuilder,
-    };
-    use crate::expressions::Expression as Expr;
-    use crate::schema::{DataType, StructField, StructType};
+    use super::{InputFieldAction, PatchNode, PatchNodeField};
+    use crate::expressions::{Expression as Expr, ExpressionStructPatchBuilder};
+    use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
