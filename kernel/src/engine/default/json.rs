@@ -18,7 +18,7 @@ use crate::engine::arrow_utils::{
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::metrics::emit_json_read_completed;
+use crate::metrics::{emit_json_read_completed, PrecountedMetricsIterator};
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use crate::schema::SchemaRef;
@@ -174,7 +174,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.buffer_size,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(Box::new(super::ReadMetricsIterator::new(
+        Ok(Box::new(PrecountedMetricsIterator::new(
             inner,
             num_files,
             bytes_read,

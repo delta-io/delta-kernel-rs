@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
+use crate::engine::arrow_utils;
 use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
@@ -27,12 +28,10 @@ impl PlanBasedJsonHandler {
 impl JsonHandler for PlanBasedJsonHandler {
     fn parse_json(
         &self,
-        _json_strings: Box<dyn EngineData>,
-        _output_schema: SchemaRef,
+        json_strings: Box<dyn EngineData>,
+        output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        Err(Error::unsupported(
-            "PlanBasedJsonHandler does not support parse_json yet",
-        ))
+        arrow_utils::parse_json(json_strings, output_schema)
     }
 
     fn read_json_files(
@@ -67,12 +66,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::PlanBasedJsonHandler;
-    use crate::arrow::array::{Int32Array, RecordBatch};
+    use crate::arrow::array::{Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::tests::{make_temp_json_file, test_json_handler_file_path_contract};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::JsonHandler as _;
+    use crate::{EngineData, JsonHandler as _};
 
     fn make_handler() -> PlanBasedJsonHandler {
         PlanBasedJsonHandler::new(Arc::new(SyncPlanExecutor::new()))
@@ -104,6 +103,36 @@ mod tests {
             &[1, 2, 3]
         );
         assert!(iter.next().is_none(), "expected exactly one batch");
+    }
+
+    #[test]
+    fn test_parse_json() {
+        let json_strings = StringArray::from(vec![r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
+        let input_batch = RecordBatch::try_from_iter(vec![(
+            "json",
+            Arc::new(json_strings) as Arc<dyn crate::arrow::array::Array>,
+        )])
+        .unwrap();
+        let input: Box<dyn EngineData> = Box::new(ArrowEngineData::new(input_batch));
+
+        let output_schema =
+            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+
+        let parsed = make_handler().parse_json(input, output_schema).unwrap();
+        let record_batch: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)
+            .unwrap()
+            .into();
+        assert_eq!(record_batch.num_rows(), 3);
+        assert_eq!(record_batch.num_columns(), 1);
+        assert_eq!(
+            record_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[1, 2, 3]
+        );
     }
 
     #[test]

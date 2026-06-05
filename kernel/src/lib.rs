@@ -89,11 +89,9 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
-// Public under test-utils so integration tests can inspect CRC state via
-// Snapshot::get_current_crc_if_loaded_for_testing.
-#[cfg(feature = "test-utils")]
+#[cfg(feature = "internal-api")]
 pub mod crc;
-#[cfg(not(feature = "test-utils"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;

@@ -93,6 +93,10 @@ impl SyncPlanExecutor {
                 self.storage.copy_atomic(&source, &destination)?;
                 Ok(PlanResult::Unit)
             }
+            IoOperation::ParquetFooter { file } => {
+                let footer = self.parquet.read_parquet_footer(&file)?;
+                Ok(PlanResult::ParquetFooter(footer))
+            }
         }
     }
 

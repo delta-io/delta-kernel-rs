@@ -39,6 +39,12 @@ impl NearestTimestamp {
 /// Represents errors that can occur when converting commit timestamps to versions.
 #[derive(Debug, thiserror::Error)]
 pub enum LogHistoryError {
+    /// No commit files were found in the log directory.
+    #[error("No commits found in log directory {log_root}")]
+    NoCommitsFound {
+        /// The log directory URL that was searched.
+        log_root: Url,
+    },
     /// The provided timestamp range is invalid (start > end).
     #[error("Invalid timestamp range: ({start_timestamp}, {end_timestamp})")]
     InvalidTimestampRange {
@@ -75,12 +81,6 @@ pub enum LogHistoryError {
         /// `GreatestLower` search at timestamp `50`, this is
         /// `NearestTimestamp::Earliest(100)`.
         nearest_timestamp: NearestTimestamp,
-    },
-    /// The log directory contains no commit files.
-    #[error("No commit files found at {log_root}")]
-    NoCommitsFound {
-        /// The log root URL that was scanned.
-        log_root: Url,
     },
     /// Commit files exist in the log but the table cannot be reconstructed: commit version 0
     /// is missing and no complete checkpoint is present to anchor the surviving commits.

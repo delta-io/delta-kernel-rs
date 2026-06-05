@@ -10,17 +10,22 @@ use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructAr
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
+use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
 };
+use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
-use crate::schema::{self, ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{
+    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
+};
+use crate::transaction::create_table::create_table;
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
     FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
@@ -336,6 +341,84 @@ fn test_physical_predicate_case_insensitive_unknown_column() {
         ColumnMappingMode::None,
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
+    let url = "memory:///test_table/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("number", DataType::LONG),
+        StructField::nullable("a_float", DataType::FLOAT),
+    ]));
+    create_table(url, schema, "DefaultEngine")
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
+        .build(&engine)
+        .unwrap();
+
+    let projection = snapshot.schema().project(&["a_float"]).unwrap();
+    let predicate = Arc::new(column_expr!("number").gt(Expr::literal(5_i64)));
+
+    let scan = snapshot
+        .scan_builder()
+        .with_schema(projection)
+        .with_predicate(predicate)
+        .build()
+        .expect("build should accept a predicate referencing a non-projection table column");
+
+    assert_eq!(scan.logical_schema().fields().len(), 1);
+}
+
+#[test]
+fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
+    let url = "memory:///test_table/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+
+    let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "id",
+        DataType::LONG,
+    )]));
+    create_table(url, schema, "DefaultEngine")
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
+        .build(&engine)
+        .unwrap();
+
+    // `my_row_index` is computed during the scan, not stored in the table,
+    // so a predicate can't filter on it
+    let projection = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)
+            .unwrap(),
+    );
+    let predicate = Arc::new(column_expr!("my_row_index").gt(Expr::literal(5_i64)));
+
+    let err = snapshot
+        .scan_builder()
+        .with_schema(projection)
+        .with_predicate(predicate)
+        .build()
+        .expect_err("build should reject predicate referencing a projection-only metadata column");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Predicate references unknown column") && msg.contains("my_row_index"),
+        "unexpected error: {msg}"
+    );
 }
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {

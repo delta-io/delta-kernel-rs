@@ -68,6 +68,12 @@ StructExpression
   Unknown(mystery)
   MapToStruct
     Column(pv)
+  Coalesce
+    Column(col)
+    Integer(0)
+  ArrayConstructor
+    Integer(1)
+    Integer(2)
   Divide
     Integer(0)
     Integer(0)

@@ -84,7 +84,6 @@ macro_rules! define_sweeps {
 }
 
 define_sweeps! {
-    // TODO: CRC at last / stale CRC (needs LogState::with_crc_at).
     // TODO: Log compaction (needs LogState::with_compaction_at, #2337).
     // TODO: Schema history (add/drop/rename) (needs schema-evolution support).
     log_state_values = (
@@ -94,11 +93,17 @@ define_sweeps! {
         checkpoint_mid(),
         checkpoint_mid_no_hint(),
         two_checkpoints_stale_hint(),
+        crc_at_end(),
+        crc_at_mid(),
+        checkpoint_at_end_crc_at_end(),
         checkpoint_at_end_post_cleanup(),
         checkpoint_at_end_no_hint_post_cleanup(),
         checkpoint_mid_post_cleanup(),
         checkpoint_mid_no_hint_post_cleanup(),
-        two_checkpoints_stale_hint_post_cleanup()
+        two_checkpoints_stale_hint_post_cleanup(),
+        checkpoint_mid_crc_at_mid_post_cleanup(),
+        checkpoint_mid_crc_above_mid_post_cleanup(),
+        checkpoint_mid_crc_at_end_post_cleanup()
     ),
     // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
     //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
