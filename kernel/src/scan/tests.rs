@@ -744,7 +744,7 @@ fn assert_stats_struct_matches_json(
     }
 }
 
-/// Test that `with_stats_columns(vec![])` outputs parsed stats in scan_metadata batches.
+/// Test that [`StatsOptions::all`] outputs parsed stats in scan_metadata batches.
 /// Uses a table with a checkpoint that contains stats_parsed for e2e verification.
 #[test]
 fn test_scan_metadata_with_stats_columns() {
@@ -757,7 +757,7 @@ fn test_scan_metadata_with_stats_columns() {
 
     let scan = snapshot
         .scan_builder()
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
         .build()
         .unwrap();
 
@@ -845,7 +845,7 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
-/// Test that `include_all_stats_columns` and `with_predicate` can be used together.
+/// Test that [`StatsOptions::all`] and `with_predicate` can be used together.
 /// The scan should output stats_parsed AND perform data skipping via the predicate.
 #[test]
 fn test_scan_metadata_stats_columns_with_predicate() {
@@ -862,7 +862,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
         .build()
         .expect("Should succeed when using both predicate and stats_columns");
 
@@ -1232,7 +1232,7 @@ fn test_skip_stats_disables_data_skipping() {
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_skip_stats(true)
+        .with_stats(StatsOptions::none())
         .build()
         .unwrap();
 
@@ -1254,46 +1254,42 @@ fn test_skip_stats_disables_data_skipping() {
     assert_eq!(selected_file_count, 6);
 }
 
+/// Calling `with_stats` twice replaces the prior value; the last call wins.
 #[test]
-fn test_skip_stats_after_include_all_stats_columns_wins() {
-    // With StatsOutputMode enum, last call wins. Calling with_skip_stats(true) after
-    // include_all_stats_columns() should result in stats being skipped.
+fn test_with_stats_last_call_wins() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    // First call is `all()` (would emit stats_parsed); last call is `none()` (no output).
     let scan = snapshot
         .scan_builder()
-        .include_all_stats_columns()
-        .with_skip_stats(true)
-        .with_predicate(predicate)
+        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::none())
         .build()
         .unwrap();
 
-    // Stats are skipped, so all files should be returned (no data skipping)
-    let scan_metadata_results: Vec<_> = scan
+    for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    let mut selected_file_count = 0;
-    for scan_metadata in &scan_metadata_results {
-        let selection_vector = scan_metadata.scan_files.selection_vector();
-        selected_file_count += selection_vector
-            .iter()
-            .filter(|&&selected| selected)
-            .count();
+        .unwrap()
+    {
+        let (underlying_data, _) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        assert!(
+            batch.column_by_name("stats_parsed").is_none(),
+            "last call (`none`) should win: no stats_parsed in output"
+        );
     }
-
-    assert_eq!(selected_file_count, 6);
 }
 
 #[test]
-fn test_with_stats_columns_empty_no_stats_output() {
-    // with_stats_columns(vec![]) should produce no stats output
+fn test_default_stats_options_no_struct_output() {
+    // StatsOptions::default() produces no stats_parsed output.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
@@ -1301,7 +1297,7 @@ fn test_with_stats_columns_empty_no_stats_output() {
 
     let scan = snapshot
         .scan_builder()
-        .with_stats_columns(vec![])
+        .with_stats(StatsOptions::default())
         .build()
         .unwrap();
 
@@ -1330,21 +1326,22 @@ fn test_with_stats_columns_empty_no_stats_output() {
     }
 }
 
-/// Test that `with_stats_columns` with specific columns only returns stats for those columns.
-/// Verifies that requesting `vec![col!("id")]` only includes `id` in minValues/maxValues/nullCount.
-#[test]
-fn test_scan_metadata_with_specific_stats_columns() {
+/// Test that requesting a specific column subset (`StructStats::Columns`) only returns
+/// stats for those columns. Covered for both struct-literal construction (json on) and
+/// the [`StatsOptions::struct_columns`] named constructor (json off).
+#[rstest::rstest]
+#[case::with_json(StatsOptions {
+    synthesize_json: true,
+    struct_stats: StructStats::Columns(vec![column_name!("id")]),
+})]
+#[case::struct_columns_ctor(StatsOptions::struct_columns(vec![column_name!("id")]))]
+fn test_scan_metadata_with_specific_stats_columns(#[case] stats: StatsOptions) {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    // Request only "id" column stats
-    let scan = snapshot
-        .scan_builder()
-        .with_stats_columns(vec![column_name!("id")])
-        .build()
-        .unwrap();
+    let scan = snapshot.scan_builder().with_stats(stats).build().unwrap();
 
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
@@ -1370,26 +1367,13 @@ fn test_scan_metadata_with_specific_stats_columns() {
         let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
         let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
 
-        // Check minValues/maxValues/nullCount only have "id"
-        assert_eq!(
-            field_names(min_values),
-            vec!["id"],
-            "minValues should only contain 'id'"
-        );
-        assert_eq!(
-            field_names(max_values),
-            vec!["id"],
-            "maxValues should only contain 'id'"
-        );
-        assert_eq!(
-            field_names(null_count),
-            vec!["id"],
-            "nullCount should only contain 'id'"
-        );
+        assert_eq!(field_names(min_values), vec!["id"]);
+        assert_eq!(field_names(max_values), vec!["id"]);
+        assert_eq!(field_names(null_count), vec!["id"]);
     }
 }
 
-/// Test that `with_stats_columns` with multiple specific columns returns stats for all of them.
+/// Test that [`StructStats::Columns`] with multiple specific columns returns stats for all of them.
 #[test]
 fn test_scan_metadata_with_multiple_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -1400,7 +1384,10 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     // Request "id" and "name" column stats (not "age" or "salary")
     let scan = snapshot
         .scan_builder()
-        .with_stats_columns(vec![column_name!("id"), column_name!("name")])
+        .with_stats(StatsOptions {
+            synthesize_json: true,
+            struct_stats: StructStats::Columns(vec![column_name!("id"), column_name!("name")]),
+        })
         .build()
         .unwrap();
 
@@ -1458,8 +1445,8 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that `with_stats_columns` with a nonexistent column name produces empty stats for that
-/// column.
+/// Test that [`StructStats::Columns`] with a nonexistent column name produces empty stats for
+/// that column.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -1469,7 +1456,10 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
 
     let scan = snapshot
         .scan_builder()
-        .with_stats_columns(vec![column_name!("nonexistent_column")])
+        .with_stats(StatsOptions {
+            synthesize_json: true,
+            struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
+        })
         .build()
         .unwrap();
 

@@ -1107,9 +1107,15 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     let nulls = NullBuffer::union(parent_nulls, nulls.as_ref());
     let columns = columns
         .into_iter()
-        .map(|column| match column.as_struct_opt() {
-            Some(sa) => Arc::new(compute_nested_null_masks(sa.clone(), nulls.as_ref())) as _,
-            None => {
+        .map(|column| match column.data_type() {
+            // NullArray (void columns) does not accept a null buffer — all values are
+            // already null by definition, so propagating the parent null mask is a no-op.
+            ArrowDataType::Null => column,
+            ArrowDataType::Struct(_) => {
+                let sa = column.as_struct();
+                Arc::new(compute_nested_null_masks(sa.clone(), nulls.as_ref())) as _
+            }
+            _ => {
                 let data = column.to_data();
                 let nulls = NullBuffer::union(nulls.as_ref(), data.nulls());
                 let builder = data.into_builder().nulls(nulls);
@@ -2944,8 +2950,7 @@ mod tests {
                                 .with_metadata(column_mapping_metadata(3, mode)),
                             StructField::not_null(logical_name(4), DataType::STRING)
                                 .with_metadata(column_mapping_metadata(4, mode)),
-                        ])
-                        .into(),
+                        ]),
                         false,
                     ),
                 )
@@ -3054,8 +3059,7 @@ mod tests {
                             logical_name(4),
                             DataType::INTEGER,
                         )
-                        .with_metadata(column_mapping_metadata(4, mode))])
-                        .into(),
+                        .with_metadata(column_mapping_metadata(4, mode))]),
                         false,
                     ),
                 )
@@ -3117,8 +3121,7 @@ mod tests {
                                 .with_metadata(column_mapping_metadata(6, mode)),
                             StructField::not_null(logical_name(5), DataType::INTEGER)
                                 .with_metadata(column_mapping_metadata(5, mode)),
-                        ])
-                        .into(),
+                        ]),
                         false,
                     ),
                 )
@@ -4150,13 +4153,13 @@ mod tests {
         let target_schema: SchemaRef =
             Arc::new(StructType::new_unchecked([StructField::nullable(
                 "outer",
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("lst", ArrayType::new(DataType::INTEGER, true)),
                     StructField::nullable(
                         "mp",
                         MapType::new(DataType::STRING, DataType::INTEGER, true),
                     ),
-                ]))),
+                ]),
             )]));
 
         let ordering = [ReorderIndex::identity(0)];
@@ -4243,15 +4246,16 @@ mod tests {
         let target_schema: SchemaRef =
             Arc::new(StructType::new_unchecked([StructField::not_null(
                 "outer",
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::not_null("tgt_x", DataType::INTEGER),
                     StructField::not_null(
                         "tgt_y",
-                        DataType::Struct(Box::new(StructType::new_unchecked([
-                            StructField::not_null("tgt_z", DataType::INTEGER),
-                        ]))),
+                        StructType::new_unchecked([StructField::not_null(
+                            "tgt_z",
+                            DataType::INTEGER,
+                        )]),
                     ),
-                ]))),
+                ]),
             )]));
 
         let ordering = [ReorderIndex::identity(0)];
@@ -4275,5 +4279,61 @@ mod tests {
             other => panic!("expected nested Struct, got {other:?}"),
         };
         assert_eq!(nested_children[0].name(), "tgt_z");
+    }
+
+    /// Verify that `fix_nested_null_masks` handles a struct with a NullArray child column
+    /// (void type) when the parent struct has non-trivial nulls. NullArray does not accept
+    /// a null buffer, so the propagation must skip it without panicking.
+    #[test]
+    fn test_nested_null_masks_with_null_array_child() {
+        use crate::arrow::array::NullArray;
+        use crate::arrow::datatypes::{DataType, Field};
+        use crate::engine::arrow_utils::fix_nested_null_masks;
+
+        // Build: struct<val: int32, void_col: null> with 4 rows, parent null at row 0
+        let int_field = Field::new("val", DataType::Int32, true);
+        let null_field = Field::new("void_col", DataType::Null, true);
+        let fields = ArrowFields::from(vec![int_field, null_field]);
+
+        let int_col: ArrowArrayRef = Arc::new(Int32Array::from(vec![
+            Some(10),
+            Some(20),
+            Some(30),
+            Some(40),
+        ]));
+        let null_col: ArrowArrayRef = Arc::new(NullArray::new(4));
+
+        // Parent struct has row 0 null
+        let parent_nulls = NullBuffer::from(&[false, true, true, true][..]);
+        let sa = StructArray::new(fields.clone(), vec![int_col, null_col], Some(parent_nulls));
+
+        // Wrap in an outer struct (as fix_nested_null_masks expects a top-level StructArray)
+        let outer_field = Field::new("outer", DataType::Struct(fields), true);
+        let outer = StructArray::new(
+            ArrowFields::from(vec![outer_field]),
+            vec![Arc::new(sa)],
+            None,
+        );
+
+        // This should NOT panic — previously it would crash because NullArray rejects null buffers
+        let result = fix_nested_null_masks(outer);
+
+        // Verify the NullArray child survived unchanged
+        let inner = result.column(0).as_struct();
+        assert_eq!(inner.len(), 4);
+
+        let void_col = inner.column(1);
+        assert_eq!(*void_col.data_type(), DataType::Null);
+        assert_eq!(void_col.len(), 4);
+        // NullArray has no null bitmap, so null_count() returns 0 in Arrow even though
+        // all values are conceptually null. Verify the quirk explicitly.
+        assert_eq!(void_col.null_count(), 0);
+
+        // Verify the int column got the parent null propagated (row 0 is now null)
+        let val_col = inner.column(0);
+        assert!(val_col.is_null(0), "row 0 should be null (parent null)");
+        assert!(!val_col.is_null(1));
+        assert!(!val_col.is_null(2));
+        assert!(!val_col.is_null(3));
     }
 }

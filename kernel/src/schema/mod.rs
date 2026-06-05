@@ -33,6 +33,7 @@ pub mod derive_macro_utils;
 pub(crate) mod derive_macro_utils;
 pub(crate) mod validation;
 pub(crate) mod variant_utils;
+pub(crate) mod void_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -1606,10 +1607,10 @@ pub struct ArrayType {
 }
 
 impl ArrayType {
-    pub fn new(element_type: DataType, contains_null: bool) -> Self {
+    pub fn new(element_type: impl Into<DataType>, contains_null: bool) -> Self {
         Self {
             type_name: "array".into(),
-            element_type,
+            element_type: element_type.into(),
             contains_null,
         }
     }
@@ -1740,6 +1741,7 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
+    Void,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
@@ -1846,6 +1848,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "date" => Ok(PrimitiveType::Date),
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            "void" => Ok(PrimitiveType::Void),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1898,6 +1901,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
+            PrimitiveType::Void => write!(f, "void"),
         }
     }
 }
@@ -1994,13 +1998,13 @@ impl<'de> serde::Deserialize<'de> for DataType {
             if let Some(Value::String(type_str)) = map.get("type") {
                 return match type_str.as_str() {
                     "array" => ArrayType::deserialize(value)
-                        .map(|at| DataType::Array(Box::new(at)))
+                        .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
                     "struct" => StructType::deserialize(value)
-                        .map(|st| DataType::Struct(Box::new(st)))
+                        .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
                     "map" => MapType::deserialize(value)
-                        .map(|mt| DataType::Map(Box::new(mt)))
+                        .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
                     _ => Err(Error::custom(format!("Unknown complex type: '{type_str}'"))),
                 };
@@ -2029,6 +2033,7 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
+    pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -2418,6 +2423,53 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_void() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_void_non_nullable() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+        assert!(!field.nullable);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":false,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_void_display() {
+        assert_eq!(PrimitiveType::Void.to_string(), "void");
+        assert_eq!(DataType::VOID.to_string(), "void");
+    }
+
+    #[test]
     fn test_unshredded_variant() {
         let unshredded_variant_type = DataType::unshredded_variant();
 
@@ -2536,18 +2588,18 @@ mod tests {
     #[rstest]
     #[case(
         r#"{"type": "array", "elementType": "integer", "containsNull": false}"#,
-        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false)))
+        DataType::from(ArrayType::new(DataType::INTEGER, false))
     )]
     #[case(
         r#"{"type": "struct", "fields": [{"name": "a", "type": "integer", "nullable": false, "metadata": {}}, {"name": "b", "type": "string", "nullable": true, "metadata": {}}]}"#,
-        DataType::Struct(Box::new(StructType::new_unchecked([
+        DataType::from(StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::STRING, true),
-        ])))
+        ]))
     )]
     #[case(
         r#"{"type": "map", "keyType": "string", "valueType": "integer", "valueContainsNull": true}"#,
-        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, true)))
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true))
     )]
     #[case("\"string\"", DataType::STRING)]
     #[case("\"long\"", DataType::LONG)]
@@ -2572,7 +2624,7 @@ mod tests {
         let field = StructField::nullable(
             "e",
             ArrayType::new(
-                StructType::new_unchecked([StructField::not_null("d", DataType::INTEGER)]).into(),
+                StructType::new_unchecked([StructField::not_null("d", DataType::INTEGER)]),
                 true,
             ),
         );
@@ -2640,11 +2692,7 @@ mod tests {
         ]);
         let schema = StructType::new_unchecked([
             cm_field("a", 1, DataType::INTEGER),
-            cm_field(
-                "b",
-                2,
-                ArrayType::new(DataType::Struct(Box::new(inner)), true),
-            ),
+            cm_field("b", 2, ArrayType::new(inner, true)),
             cm_field("c", 3, DataType::STRING),
         ]);
         assert_result_error_with_message(
@@ -3603,7 +3651,7 @@ mod tests {
 
         let result = StructType::try_new([
             StructField::nullable("regular_col", DataType::STRING),
-            StructField::nullable("nested", DataType::Struct(Box::new(nested_struct))),
+            StructField::nullable("nested", nested_struct),
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
@@ -3625,11 +3673,11 @@ mod tests {
             .collect(),
             metadata_columns: HashMap::new(),
         };
-        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct)), true);
+        let array_type = ArrayType::new(nested_struct, true);
 
         let result = StructType::try_new([
             StructField::nullable("regular_col", DataType::STRING),
-            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
+            StructField::nullable("array_col", array_type),
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
@@ -3653,20 +3701,12 @@ mod tests {
         };
 
         for map_type in [
-            MapType::new(
-                DataType::Struct(Box::new(nested_struct.clone())),
-                DataType::STRING,
-                true,
-            ),
-            MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(nested_struct)),
-                true,
-            ),
+            MapType::new(nested_struct.clone(), DataType::STRING, true),
+            MapType::new(DataType::STRING, nested_struct, true),
         ] {
             let result = StructType::try_new([
                 StructField::nullable("regular_col", DataType::STRING),
-                StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+                StructField::nullable("map_col", map_type),
             ]);
 
             assert_result_error_with_message(result, "only allowed at the top level");
@@ -3837,16 +3877,12 @@ mod tests {
         let nested_struct = StructType::new_unchecked([
             nested_field_with_metadata,
             StructField::new("x", DataType::DOUBLE, true),
-            StructField::new(
-                "inner_struct",
-                DataType::Struct(Box::new(inner_struct)),
-                false,
-            ),
+            StructField::new("inner_struct", inner_struct, false),
         ]);
-        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
+        let array_type = ArrayType::new(nested_struct.clone(), true);
         let map_type = MapType::new(
-            DataType::Struct(Box::new(nested_struct.clone())),
-            DataType::Struct(Box::new(nested_struct.clone())), // kek
+            nested_struct.clone(),
+            nested_struct.clone(), // kek
             true,
         );
         let fields = vec![
@@ -3854,8 +3890,8 @@ mod tests {
             StructField::new("y", DataType::FLOAT, false),
             StructField::new("z", DataType::LONG, true),
             StructField::new("s", nested_struct.clone(), false),
-            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
-            StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+            StructField::nullable("array_col", array_type),
+            StructField::nullable("map_col", map_type),
             StructField::new("a", DataType::LONG, true),
         ];
 
@@ -4134,23 +4170,19 @@ mod tests {
     /// Schema: { a: { b: { c: double } } } — supports walks at depths 1, 2, and 3.
     fn walk_test_schema() -> StructType {
         let l3 = StructType::new_unchecked([StructField::new("c", DataType::DOUBLE, false)]);
-        let l2 = StructType::new_unchecked([StructField::new(
-            "b",
-            DataType::Struct(Box::new(l3)),
-            false,
-        )]);
-        StructType::new_unchecked([StructField::new("a", DataType::Struct(Box::new(l2)), false)])
+        let l2 = StructType::new_unchecked([StructField::new("b", l3, false)]);
+        StructType::new_unchecked([StructField::new("a", l2, false)])
     }
 
     #[rstest::rstest]
-    #[case::single_level(vec!["a"], vec!["a"], DataType::Struct(Box::new(
-        StructType::new_unchecked([StructField::new("b", DataType::Struct(Box::new(
-            StructType::new_unchecked([StructField::new("c", DataType::DOUBLE, false)])
-        )), false)])
-    )))]
-    #[case::nested_2(vec!["a", "b"], vec!["a", "b"], DataType::Struct(Box::new(
-        StructType::new_unchecked([StructField::new("c", DataType::DOUBLE, false)])
-    )))]
+    #[case::single_level(vec!["a"], vec!["a"], DataType::from(StructType::new_unchecked([
+        StructField::new("b", StructType::new_unchecked([
+            StructField::new("c", DataType::DOUBLE, false)
+        ]), false)
+    ])))]
+    #[case::nested_2(vec!["a", "b"], vec!["a", "b"], DataType::from(StructType::new_unchecked([
+        StructField::new("c", DataType::DOUBLE, false)
+    ])))]
     #[case::nested_3(vec!["a", "b", "c"], vec!["a", "b", "c"], DataType::DOUBLE)]
     #[test]
     fn test_walk_column_fields_happy(
@@ -4188,7 +4220,7 @@ mod tests {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("EventDate", DataType::DATE, false),
-            StructField::new("Address", DataType::Struct(Box::new(inner)), false),
+            StructField::new("Address", inner, false),
         ]);
 
         // Mismatched casing -> normalized to schema

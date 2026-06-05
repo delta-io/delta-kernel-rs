@@ -194,8 +194,8 @@ mod tests {
         let inner_b =
             StructType::new_unchecked(vec![StructField::new("CHILD", DataType::STRING, true)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", DataType::Struct(Box::new(inner_a)), false),
-            StructField::new("b", DataType::Struct(Box::new(inner_b)), false),
+            StructField::new("a", inner_a, false),
+            StructField::new("b", inner_b, false),
         ])
     }
 
@@ -229,11 +229,7 @@ mod tests {
             DataType::INTEGER,
             false,
         )]);
-        StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-            false,
-        )])
+        StructType::new_unchecked(vec![StructField::new("parent", inner, false)])
     }
 
     fn schema_array_bad_char() -> StructType {
@@ -241,10 +237,7 @@ mod tests {
             StructType::new_unchecked(vec![StructField::new("bad col", DataType::INTEGER, false)]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             false,
         )])
     }
@@ -254,11 +247,7 @@ mod tests {
             StructType::new_unchecked(vec![StructField::new("bad;val", DataType::INTEGER, false)]);
         StructType::new_unchecked(vec![StructField::new(
             "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            MapType::new(DataType::STRING, inner, true),
             false,
         )])
     }
@@ -267,7 +256,7 @@ mod tests {
         let inner =
             StructType::new_unchecked(vec![StructField::new("x", DataType::INTEGER, false)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", DataType::Struct(Box::new(inner)), false),
+            StructField::new("a", inner, false),
             StructField::new("A", DataType::STRING, true),
         ])
     }
@@ -279,10 +268,7 @@ mod tests {
         ]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             false,
         )])
     }
@@ -322,11 +308,7 @@ mod tests {
     fn schema_nested_invariant() -> StructType {
         let inner =
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )])
+        StructType::new_unchecked(vec![StructField::new("parent", inner, true)])
     }
 
     fn schema_array_nested_invariant() -> StructType {
@@ -334,10 +316,7 @@ mod tests {
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             true,
         )])
     }
@@ -347,11 +326,7 @@ mod tests {
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            MapType::new(DataType::STRING, inner, true),
             true,
         )])
     }

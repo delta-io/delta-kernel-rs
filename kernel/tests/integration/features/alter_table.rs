@@ -214,12 +214,11 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "items",
         ArrayType::new(
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![
-                    StructField::nullable("a", DataType::STRING),
-                    StructField::nullable("b", DataType::INTEGER),
-                ]).unwrap(),
-            )),
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
             true,
         ),
     ),
@@ -230,12 +229,11 @@ async fn add_columns_lifecycle(
         "by_id",
         MapType::new(
             DataType::STRING,
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![
-                    StructField::nullable("a", DataType::STRING),
-                    StructField::nullable("b", DataType::INTEGER),
-                ]).unwrap(),
-            )),
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
             true,
         ),
     ),
@@ -245,12 +243,11 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "lookup",
         MapType::new(
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![
-                    StructField::nullable("a", DataType::STRING),
-                    StructField::nullable("b", DataType::INTEGER),
-                ]).unwrap(),
-            )),
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
             DataType::INTEGER,
             true,
         ),

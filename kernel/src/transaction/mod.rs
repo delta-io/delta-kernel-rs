@@ -33,6 +33,7 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
+use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -373,6 +374,13 @@ impl<S> Transaction<S> {
 
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
+
+        // Validate that the schema supports data writes when files are being added.
+        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
+        // Reads and metadata-only commits are always allowed.
+        if !self.add_files_metadata.is_empty() {
+            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+        }
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -881,19 +889,32 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .effective_table_config
             .should_materialize_partition_columns();
         // Build a StructPatch expression that drops partition columns from the input
-        // (unless they should be materialized).
+        // (unless they should be materialized) and drop void columns at all nesting levels.
         let mut patch = ExpressionStructPatchBuilder::new();
         if !should_materialize_partition_columns {
             for col in self.effective_table_config.partition_columns() {
                 patch = patch.with_dropped_field_if_exists(col);
             }
         }
+        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema(), &[]);
         Expression::struct_patch(patch)
     }
 
     /// Returns the logical partition column names for this table.
     pub fn logical_partition_columns(&self) -> &[String] {
         self.effective_table_config.partition_columns()
+    }
+
+    /// Validates that the table's logical schema supports data writes.
+    ///
+    /// Called at the top of [`partitioned_write_context`](Self::partitioned_write_context) and
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context), before any Parquet is
+    /// written, so connectors fail fast when the schema contains void placements that cannot
+    /// produce valid files (void inside Array/Map, all-void structs, all-void tables).
+    /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
+    /// that reach [`add_files`](Self::add_files) without going through a write context.
+    fn validate_for_data_write(&self) -> DeltaResult<()> {
+        validate_schema_for_write(&self.effective_table_config.logical_schema())
     }
 
     /// Builds the [`SharedWriteState`] for a write context.
@@ -954,6 +975,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -1002,6 +1024,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
             shared.logical_partition_columns.is_empty(),
@@ -1358,8 +1381,8 @@ impl<S> Transaction<S> {
         // Build two evaluators: one for the common case where scan files do not include a
         // stats_parsed column, and one for predicate-based scans that include stats_parsed.
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
-        // case where stats is null (e.g., when skip_stats=true was used) and then drops the
-        // stats_parsed column.
+        // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
+        // then drops the stats_parsed column.
         let base_eval = Arc::new(make_eval(false)?);
         let stats_parsed_eval = Arc::new(make_eval(true)?);
         let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
@@ -1386,8 +1409,8 @@ impl<S> Transaction<S> {
 ///
 /// - `stats_parsed`: when `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
 ///   `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. The coalesce handles
-///   cases where `stats` is null (e.g., `skip_stats=true` or V2 checkpoints with
-///   `writeStatsAsJson=false`) by reconstructing the JSON from the parsed representation.
+///   cases where `stats` is null (e.g., V2 checkpoints with `writeStatsAsJson=false`) by
+///   reconstructing the JSON from the parsed representation.
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.

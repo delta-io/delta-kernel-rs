@@ -12,7 +12,7 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::CheckpointReadInfo;
-use crate::scan::log_replay::scan_action_iter;
+use crate::scan::log_replay::{scan_action_iter, ScanStatsOptions};
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
 use crate::schema::{SchemaRef, StructType};
@@ -176,7 +176,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
             .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
         state_info,
         checkpoint_info,
-        false,
+        ScanStatsOptions::default(),
     )
     .unwrap();
     let mut batch_count = 0;

@@ -76,15 +76,12 @@ mod tests {
             );
         }
         let nested = [
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+            DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            DataType::from(StructType::new_unchecked([StructField::nullable(
+                "x",
                 DataType::INTEGER,
-                true,
-            ))),
-            DataType::Struct(Box::new(StructType::new_unchecked([
-                StructField::nullable("x", DataType::INTEGER),
-            ]))),
+            )])),
             DataType::unshredded_variant(),
         ];
         for dt in nested {
@@ -93,5 +90,12 @@ mod tests {
                 "nested {dt} should be V3-supported"
             );
         }
+    }
+
+    #[test]
+    fn is_v3_supported_type_rejects_void() {
+        // Void is excluded from the V3 allowlist (by omission) to match delta-spark, which
+        // cannot consume an icebergCompatV3 table containing a void column.
+        assert!(!is_v3_supported_type(&DataType::VOID));
     }
 }

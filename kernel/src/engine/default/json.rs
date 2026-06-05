@@ -18,7 +18,6 @@ use crate::engine::arrow_utils::{
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::metrics::emit_json_read_completed;
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use crate::schema::SchemaRef;
@@ -163,8 +162,6 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let num_files = files.len() as u64;
-        let bytes_read = files.iter().map(|f| f.size).sum();
         let future = read_json_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -173,13 +170,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.batch_size,
             self.buffer_size,
         );
-        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(Box::new(super::ReadMetricsIterator::new(
-            inner,
-            num_files,
-            bytes_read,
-            emit_json_read_completed,
-        )))
+        super::stream_future_to_iter(self.task_executor.clone(), future)
     }
 
     // note: for now we just buffer all the data and write it out all at once

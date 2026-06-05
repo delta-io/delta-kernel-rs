@@ -55,11 +55,11 @@ async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
     });
     let schema = StructType::try_new(vec![StructField::nullable(
         "data",
-        DataType::Map(Box::new(MapType::new(
+        MapType::new(
             DataType::INTEGER,
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            ArrayType::new(DataType::INTEGER, true),
             true,
-        ))),
+        ),
     )
     .with_metadata([
         (
@@ -398,20 +398,20 @@ fn complex_nested_data_type() -> DataType {
     let inner_struct = StructType::try_new(vec![
         StructField::nullable(
             "inner_map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            MapType::new(
+                ArrayType::new(DataType::INTEGER, true),
                 DataType::INTEGER,
                 true,
-            ))),
+            ),
         ),
         StructField::nullable("n", DataType::INTEGER),
     ])
     .unwrap();
-    DataType::Map(Box::new(MapType::new(
-        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-        DataType::Struct(Box::new(inner_struct)),
+    DataType::from(MapType::new(
+        ArrayType::new(DataType::INTEGER, true),
+        inner_struct,
         true,
-    )))
+    ))
 }
 
 const ROWS_PER_PARTITION: i32 = 3;

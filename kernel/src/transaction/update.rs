@@ -407,7 +407,7 @@ fn nullable_add_log_schema() -> &'static SchemaRef {
 /// Used when appending DV columns to scan file data.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 static STRUCT_DELETION_VECTOR_SCHEMA: LazyLock<ArrayType> =
-    LazyLock::new(|| ArrayType::new(DeletionVectorDescriptor::to_schema().into(), true));
+    LazyLock::new(|| ArrayType::new(DeletionVectorDescriptor::to_schema(), true));
 
 /// Returns the schema for an array of deletion vector descriptors.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -577,7 +577,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         rows: RowIndexIterator<'_>,
     ) -> DeltaResult<()> {
         static NULL_DV: LazyLock<Scalar> =
-            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+            LazyLock::new(|| Scalar::null(DeletionVectorDescriptor::to_schema()));
         static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
             DeletionVectorDescriptor::to_schema()
                 .into_fields()

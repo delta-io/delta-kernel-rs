@@ -466,29 +466,17 @@ mod tests {
             StructField::new("cc8", DataType::STRING, true),
             StructField::new("s", DataType::STRING, true),
             StructField::new("time_col", DataType::TIMESTAMP, true),
-            StructField::new(
-                "items",
-                DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
-                true,
-            ),
+            StructField::new("items", ArrayType::new(DataType::LONG, true), true),
             // Nested struct for upstream tests
             StructField::new(
                 "null_v_struct",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                    "v",
-                    DataType::LONG,
-                    true,
-                )]))),
+                StructType::new_unchecked(vec![StructField::new("v", DataType::LONG, true)]),
                 true,
             ),
             // Nested structs for nested_columns tests (a.b, a.b.c, b.c.f.i, data.value)
             StructField::new(
                 "data",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                    "value",
-                    DataType::LONG,
-                    true,
-                )]))),
+                StructType::new_unchecked(vec![StructField::new("value", DataType::LONG, true)]),
                 true,
             ),
             // Additional typed columns for type-checking tests
@@ -506,26 +494,18 @@ mod tests {
             // Struct type for nested tests
             StructField::new(
                 "struct_col",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::new("inner_int", DataType::INTEGER, true),
                     StructField::new("inner_str", DataType::STRING, true),
-                ]))),
+                ]),
                 true,
             ),
             // Array type
-            StructField::new(
-                "array_col",
-                DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
-                true,
-            ),
+            StructField::new("array_col", ArrayType::new(DataType::LONG, true), true),
             // Map type
             StructField::new(
                 "map_col",
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::LONG,
-                    true,
-                ))),
+                MapType::new(DataType::STRING, DataType::LONG, true),
                 true,
             ),
         ])

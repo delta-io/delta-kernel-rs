@@ -267,8 +267,25 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer `StructField::nullable` / `StructField::not_null` over
   `StructField::new(name, type, bool)` when nullability is known at compile time.
   Reserve `StructField::new` for cases where nullability is a runtime value.
+- Leverage `impl Into<DataType>` to avoid `DataType::Struct/Array/Map(Box::new(...))`
+  boilerplate. `StructType`, `ArrayType`, and `MapType` all implement `Into<DataType>`,
+  and constructors like `StructField::new`/`nullable`/`not_null`, `ArrayType::new`, and
+  `MapType::new` accept `impl Into<DataType>`. So:
+  - When passing to a parameter that accepts `impl Into<DataType>`, pass the container
+    type directly: `StructField::nullable("a", ArrayType::new(DataType::INTEGER, true))`
+    -- do NOT wrap in `DataType::from(...)` or `.into()` (redundant at best, and an
+    ambiguous-type compile error at worst).
+  - When a concrete `DataType` value is actually required (e.g. a `DataType`-typed
+    binding/field, a `[DataType]`/`Vec<DataType>` element, or a `&DataType` argument),
+    prefer `DataType::from(ArrayType::new(...))` over
+    `DataType::Array(Box::new(ArrayType::new(...)))`.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
+- Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
+  `Expression::literal(...)` when building expressions inline. `col!` has two forms: a single
+  string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
+  same as `column_expr!`); one or more comma-separated args build a column with each segment taken
+  verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 

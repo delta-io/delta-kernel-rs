@@ -76,11 +76,11 @@ fn build_kernel_schema(nested_ids_meta_key: &str) -> StructType {
 
     let array_in_map = with_field_ids(
         "array_in_map",
-        DataType::Map(Box::new(MapType::new(
+        DataType::from(MapType::new(
             DataType::INTEGER,
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            ArrayType::new(DataType::INTEGER, true),
             true,
-        ))),
+        )),
         1,
         &[
             ("array_in_map.key", 100),
@@ -91,14 +91,10 @@ fn build_kernel_schema(nested_ids_meta_key: &str) -> StructType {
 
     let map_in_list = with_field_ids(
         "map_in_list",
-        DataType::Array(Box::new(ArrayType::new(
-            DataType::Map(Box::new(MapType::new(
-                DataType::INTEGER,
-                DataType::INTEGER,
-                true,
-            ))),
+        DataType::from(ArrayType::new(
+            MapType::new(DataType::INTEGER, DataType::INTEGER, true),
             true,
-        ))),
+        )),
         2,
         &[
             ("map_in_list.element", 200),

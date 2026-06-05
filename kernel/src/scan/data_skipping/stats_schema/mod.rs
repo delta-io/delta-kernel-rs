@@ -373,6 +373,10 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 /// Note: Boolean and Binary are intentionally excluded as min/max statistics provide minimal
 /// skipping benefit for low-cardinality or opaque data types.
 ///
+/// Void is also excluded: void columns are never materialized to Parquet, so min/max are not
+/// meaningful. When `nullCount` stats are present for a void column, `eval_pred_is_null` can
+/// use them for `IS NULL` / `IS NOT NULL` file skipping.
+///
 /// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
 pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
@@ -442,7 +446,7 @@ mod tests {
         ]);
         let file_schema = StructType::new_unchecked([
             StructField::not_null("id", DataType::LONG),
-            StructField::not_null("user", DataType::Struct(Box::new(user_struct.clone()))),
+            StructField::not_null("user", user_struct.clone()),
         ]);
         let stats_schema = expected_stats_schema(
             &file_schema,
@@ -478,7 +482,7 @@ mod tests {
         //   - "score" (DOUBLE) - eligible for data skipping
 
         // Create array type for a field that's not eligible for data skipping
-        let array_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, false)));
+        let array_type = DataType::from(ArrayType::new(DataType::STRING, false));
         let metadata_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("tags", array_type),
@@ -486,10 +490,7 @@ mod tests {
         ]);
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable(
-                "metadata",
-                DataType::Struct(Box::new(metadata_struct.clone())),
-            ),
+            StructField::nullable("metadata", metadata_struct.clone()),
         ]);
 
         let stats_schema = expected_stats_schema(
@@ -508,7 +509,7 @@ mod tests {
         ]);
         let expected_null = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("metadata", DataType::Struct(Box::new(expected_null_nested))),
+            StructField::nullable("metadata", expected_null_nested),
         ]);
 
         let expected_nested = StructType::new_unchecked([
@@ -517,7 +518,7 @@ mod tests {
         ]);
         let expected_fields = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("metadata", DataType::Struct(Box::new(expected_nested))),
+            StructField::nullable("metadata", expected_nested),
         ]);
 
         let expected = expected_stats(expected_null, expected_fields);
@@ -539,7 +540,7 @@ mod tests {
         ]);
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user.info", DataType::Struct(Box::new(user_struct.clone()))),
+            StructField::nullable("user.info", user_struct.clone()),
         ]);
 
         let stats_schema = expected_stats_schema(
@@ -552,10 +553,8 @@ mod tests {
 
         let expected_nested =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
-        let expected_fields = StructType::new_unchecked([StructField::nullable(
-            "user.info",
-            DataType::Struct(Box::new(expected_nested)),
-        )]);
+        let expected_fields =
+            StructType::new_unchecked([StructField::nullable("user.info", expected_nested)]);
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_fields)
             .into_owned();
@@ -577,17 +576,10 @@ mod tests {
 
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable(
-                "tags",
-                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
-            ),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, false)),
             StructField::nullable(
                 "metadata",
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
+                MapType::new(DataType::STRING, DataType::STRING, true),
             ),
             StructField::nullable("name", DataType::STRING),
         ]);
@@ -706,7 +698,7 @@ mod tests {
 
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct.clone()))),
+            StructField::nullable("user", user_struct.clone()),
             StructField::nullable("is_deleted", DataType::BOOLEAN), // NOT eligible for min/max
         ]);
 
@@ -727,7 +719,7 @@ mod tests {
         ]);
         let expected_null_count = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(expected_null_user))),
+            StructField::nullable("user", expected_null_user),
             StructField::nullable("is_deleted", DataType::LONG),
         ]);
 
@@ -738,7 +730,7 @@ mod tests {
         ]);
         let expected_min_max = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(expected_minmax_user))),
+            StructField::nullable("user", expected_minmax_user),
         ]);
 
         let expected = expected_stats(expected_null_count, expected_min_max);
@@ -754,10 +746,7 @@ mod tests {
         let file_schema = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::BOOLEAN),
             StructField::nullable("metadata", DataType::BINARY),
-            StructField::nullable(
-                "tags",
-                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
-            ),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, false)),
         ]);
 
         let stats_schema = expected_stats_schema(
@@ -799,17 +788,10 @@ mod tests {
         .into();
 
         let file_schema = StructType::new_unchecked([
-            StructField::nullable(
-                "tags",
-                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
-            ),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, false)),
             StructField::nullable(
                 "metadata",
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
+                MapType::new(DataType::STRING, DataType::STRING, true),
             ),
             StructField::nullable("v", DataType::unshredded_variant()),
             StructField::nullable("col1", DataType::LONG),
@@ -856,10 +838,7 @@ mod tests {
 
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable(
-                "tags",
-                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
-            ),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, false)),
             StructField::nullable("name", DataType::STRING),
         ]);
 
@@ -904,7 +883,7 @@ mod tests {
         ]);
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+            StructField::nullable("user", user_struct),
         ]);
 
         let config = StatsConfig {
@@ -966,7 +945,7 @@ mod tests {
         ]);
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+            StructField::nullable("user", user_struct),
             StructField::nullable("extra", DataType::STRING),
         ]);
 
@@ -989,17 +968,10 @@ mod tests {
 
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable(
-                "tags",
-                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
-            ),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, false)),
             StructField::nullable(
                 "metadata",
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
+                MapType::new(DataType::STRING, DataType::STRING, true),
             ),
             StructField::nullable("v", DataType::unshredded_variant()),
             StructField::nullable("name", DataType::STRING),
@@ -1251,7 +1223,7 @@ mod tests {
         ]);
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+            StructField::nullable("user", user_struct),
         ]);
 
         let columns = [ColumnName::new(["user", "name"])];
@@ -1265,17 +1237,13 @@ mod tests {
 
         let expected_user_nested =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
-        let expected_nested = StructType::new_unchecked([StructField::nullable(
-            "user",
-            DataType::Struct(Box::new(expected_user_nested)),
-        )]);
+        let expected_nested =
+            StructType::new_unchecked([StructField::nullable("user", expected_user_nested)]);
 
         let expected_user_null =
             StructType::new_unchecked([StructField::nullable("name", DataType::LONG)]);
-        let expected_null = StructType::new_unchecked([StructField::nullable(
-            "user",
-            DataType::Struct(Box::new(expected_user_null)),
-        )]);
+        let expected_null =
+            StructType::new_unchecked([StructField::nullable("user", expected_user_null)]);
 
         let expected = expected_stats(expected_null, expected_nested);
 
@@ -1319,7 +1287,7 @@ mod tests {
         ]);
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+            StructField::nullable("user", user_struct),
             StructField::nullable("value", DataType::DOUBLE),
         ]);
 
@@ -1336,17 +1304,14 @@ mod tests {
             StructType::new_unchecked([StructField::nullable("age", DataType::INTEGER)]);
         let expected_nested = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable(
-                "user",
-                DataType::Struct(Box::new(expected_user_nested.clone())),
-            ),
+            StructField::nullable("user", expected_user_nested.clone()),
         ]);
 
         let expected_user_null =
             StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]);
         let expected_null = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
-            StructField::nullable("user", DataType::Struct(Box::new(expected_user_null))),
+            StructField::nullable("user", expected_user_null),
         ]);
 
         let expected = expected_stats(expected_null, expected_nested);
