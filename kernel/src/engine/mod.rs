@@ -34,13 +34,13 @@ pub mod arrow_expression;
 pub mod arrow_utils;
 #[cfg(all(feature = "arrow-expression", not(feature = "internal-api")))]
 pub(crate) mod arrow_utils;
-#[cfg(feature = "internal-api")]
+#[cfg(all(feature = "internal-api", feature = "arrow-expression"))]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
 
-#[cfg(feature = "declarative-plans")]
+#[cfg(all(feature = "default-engine-base", feature = "declarative-plans"))]
 pub mod plans;
 
 #[cfg(test)]
