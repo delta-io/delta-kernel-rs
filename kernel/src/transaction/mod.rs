@@ -896,7 +896,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 patch = patch.with_dropped_field_if_exists(col);
             }
         }
-        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema(), &[]);
+        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema());
         Expression::struct_patch(patch)
     }
 

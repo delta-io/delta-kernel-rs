@@ -11,7 +11,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::{
-    col, lit, BinaryExpressionOp, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar,
+    col, lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar,
 };
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;

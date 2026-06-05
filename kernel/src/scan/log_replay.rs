@@ -1748,11 +1748,12 @@ mod tests {
             Expression::StructPatch(p) => {
                 p.prepended_fields
                     .iter()
+                    .chain(p.appended_fields.iter())
                     .map(|e| count_to_json(e))
                     .sum::<usize>()
                     + p.field_patches
                         .values()
-                        .flat_map(|fp| fp.exprs.iter())
+                        .flat_map(|fp| fp.insertions.iter())
                         .map(|e| count_to_json(e))
                         .sum::<usize>()
             }

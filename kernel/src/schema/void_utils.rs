@@ -12,9 +12,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
-use crate::expressions::ExpressionStructPatch;
+use crate::expressions::ExpressionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error, Expression};
+use crate::{DeltaResult, Error};
 
 /// Returns true when this struct directly contains no non-void fields. The check is local --
 /// it does not recurse into nested structs, because the caller (`ValidateForWrite`) walks every
@@ -158,44 +158,34 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
 pub(crate) fn add_void_stripping(
     patch: ExpressionStructPatchBuilder,
     st: &StructType,
-    path: &[&str],
 ) -> ExpressionStructPatchBuilder {
-    add_void_stripping_inner(patch, st, path).0
+    add_void_stripping_inner(patch, st, &mut Vec::new())
 }
 
-/// Single-pass helper that builds the void-stripping patch and reports whether any field
-/// was actually rewritten. The caller composes child results without a separate `contains_void`
-/// pre-check, avoiding the O(depth^2) walk a naive double-traversal would produce.
+/// Recursive helper that records a drop for every void field in `st`, threading `path` (the field
+/// names from the root struct down to `st`) so nested drops are recorded at their full path.
+///
+/// The builder lowers each `with_dropped_field_at` into the appropriate nested patch and only
+/// materializes a nested patch when a drop actually lands under that path, so structs with no void
+/// fields contribute nothing. `path` is pushed/popped in place to avoid reallocating at each level.
 ///
 /// This intentionally descends only through Struct fields; write validation rejects void
 /// placements inside Array or Map before this patch is used.
-fn add_void_stripping_inner(
+fn add_void_stripping_inner<'a>(
     mut patch: ExpressionStructPatchBuilder,
-    st: &StructType,
-    path: &[&str],
-) -> (ExpressionStructPatchBuilder, bool) {
-    compile_error!(Make this work with the new patch builder);
-    let mut changed = false;
+    st: &'a StructType,
+    path: &mut Vec<&'a str>,
+) -> ExpressionStructPatchBuilder {
     for field in st.fields() {
         if *field.data_type() == DataType::VOID {
-            patch = patch.with_dropped_field(field.name());
-            changed = true;
+            patch = patch.with_dropped_field_at(path.iter().copied(), field.name());
         } else if let DataType::Struct(inner) = field.data_type() {
-            let mut child_path: Vec<&str> = path.to_vec();
-            child_path.push(field.name());
-            let (nested, nested_changed) = add_void_stripping_inner(
-                ExpressionStructPatch::new_nested(child_path.iter().copied()),
-                inner,
-                &child_path,
-            );
-            if nested_changed {
-                let nested = Arc::new(Expression::struct_patch(nested));
-                patch = patch.with_replaced_field(field.name(), nested);
-                changed = true;
-            }
+            path.push(field.name());
+            patch = add_void_stripping_inner(patch, inner, path);
+            path.pop();
         }
     }
-    (patch, changed)
+    patch
 }
 
 #[cfg(test)]

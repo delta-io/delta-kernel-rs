@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::{ColumnName, Expression, ExpressionRef};
-use crate::{DeltaResult, Error};
+use crate::{CollectInto, DeltaResult, Error};
 
 /// A patch affecting a single input field.
 ///
@@ -123,12 +123,9 @@ impl ExpressionStructPatchBuilder {
     }
 
     /// Creates a new builder that operates on fields of a nested struct identified by `path`.
-    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn new_nested(path: impl CollectInto<ColumnName>) -> Self {
         Self {
-            input_path: Some(ColumnName::new(path)),
+            input_path: Some(path.collect_into()),
             root: PatchNode::default(),
             error: Ok(()),
         }
@@ -140,14 +137,11 @@ impl ExpressionStructPatchBuilder {
     }
 
     /// Records a field drop in a nested struct.
-    pub fn with_dropped_field_at<A>(
+    pub fn with_dropped_field_at(
         self,
-        struct_path: impl IntoIterator<Item = A>,
+        struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
-    ) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    ) -> Self {
         self.apply_at(struct_path, |node| node.drop(field_name, false))
     }
 
@@ -157,14 +151,11 @@ impl ExpressionStructPatchBuilder {
     }
 
     /// Records an optional field drop in a nested struct.
-    pub fn with_dropped_field_if_exists_at<A>(
+    pub fn with_dropped_field_if_exists_at(
         self,
-        struct_path: impl IntoIterator<Item = A>,
+        struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
-    ) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    ) -> Self {
         self.apply_at(struct_path, |node| node.drop(field_name, true))
     }
 
@@ -174,15 +165,12 @@ impl ExpressionStructPatchBuilder {
     }
 
     /// Records a field replacement in a nested struct.
-    pub fn with_replaced_field_at<A>(
+    pub fn with_replaced_field_at(
         self,
-        struct_path: impl IntoIterator<Item = A>,
+        struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
         expr: ExpressionRef,
-    ) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    ) -> Self {
         self.apply_at(struct_path, |node| {
             node.set_action(field_name, InputFieldAction::Replace(expr))
         })
@@ -194,14 +182,11 @@ impl ExpressionStructPatchBuilder {
     }
 
     /// Records an expression to emit before processing the first input field of a nested struct.
-    pub fn with_prepended_field_at<A>(
+    pub fn with_prepended_field_at(
         self,
-        struct_path: impl IntoIterator<Item = A>,
+        struct_path: impl CollectInto<ColumnName>,
         expr: ExpressionRef,
-    ) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    ) -> Self {
         self.apply_at(struct_path, |node| {
             node.prepended_fields.push(expr);
             Ok(())
@@ -218,15 +203,12 @@ impl ExpressionStructPatchBuilder {
     }
 
     /// Records an expression to insert after the named field in a nested struct.
-    pub fn with_inserted_field_after_at<A>(
+    pub fn with_inserted_field_after_at(
         self,
-        struct_path: impl IntoIterator<Item = A>,
+        struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
         expr: ExpressionRef,
-    ) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    ) -> Self {
         self.apply_at(struct_path, |node| node.insert_after(field_name, expr))
     }
 
@@ -236,14 +218,11 @@ impl ExpressionStructPatchBuilder {
     }
 
     /// Records an expression to append after all fields of a nested struct.
-    pub fn with_appended_field_at<A>(
+    pub fn with_appended_field_at(
         self,
-        struct_path: impl IntoIterator<Item = A>,
+        struct_path: impl CollectInto<ColumnName>,
         expr: ExpressionRef,
-    ) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    ) -> Self {
         self.apply_at(struct_path, |node| {
             node.appended_fields.push(expr);
             Ok(())
@@ -254,16 +233,13 @@ impl ExpressionStructPatchBuilder {
     // targets the input struct directly). Errors are deferred: the first failure is stashed in
     // `self.error` and surfaced by `build`, and once set, later operations are skipped so the
     // original error is preserved.
-    fn apply_at<A>(
+    fn apply_at(
         mut self,
-        struct_path: impl IntoIterator<Item = A>,
+        struct_path: impl CollectInto<ColumnName>,
         op: impl FnOnce(&mut PatchNode) -> DeltaResult<()>,
-    ) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    ) -> Self {
         if self.error.is_ok() {
-            let path = ColumnName::new(struct_path);
+            let path = struct_path.collect_into();
             self.error = self.root.child_at_mut(&path).and_then(op);
         }
         self
