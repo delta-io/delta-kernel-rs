@@ -1725,10 +1725,6 @@ mod tests {
         }
     }
 
-    // ====================================================================================
-    // Tests for get_earliest_recreatable_commit
-    // ====================================================================================
-
     /// Builds an in-memory store with a mock entry per given log file path and returns
     /// an engine wired to it plus the corresponding `_delta_log/` URL.
     fn engine_with_log_files(paths: &[String]) -> (SyncEngine, Url) {
@@ -1774,12 +1770,12 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::v0_exists(commit_path(0..=5), None, 0)]
-    #[case::truncated_single_part(truncated_log(vec![single_part_checkpoint_path(5)], 5..=9), None, 5)]
-    #[case::truncated_uuid(truncated_log(vec![uuid_checkpoint_path(5)], 5..=9), None, 5)]
-    #[case::truncated_multi_part(truncated_log(multi_part_checkpoint_paths(5, 3), 5..=9), None, 5)]
-    #[case::ratified_zero_with_v0_present(commit_path(0..=3), Some(0), 0)]
-    #[case::non_zero_ratified_falls_through_to_scan(commit_path(0..=3), Some(4), 0)]
+    #[case::v0_exists(commit_path(0..=5), None, Expected::Version(0))]
+    #[case::truncated_single_part(truncated_log(vec![single_part_checkpoint_path(5)], 5..=9), None, Expected::Version(5))]
+    #[case::truncated_uuid(truncated_log(vec![uuid_checkpoint_path(5)], 5..=9), None, Expected::Version(5))]
+    #[case::truncated_multi_part(truncated_log(multi_part_checkpoint_paths(5, 3), 5..=9), None, Expected::Version(5))]
+    #[case::ratified_zero_with_v0_present(commit_path(0..=3), Some(0), Expected::Version(0))]
+    #[case::non_zero_ratified_falls_through_to_scan(commit_path(0..=3), Some(4), Expected::Version(0))]
     #[case::commit_cleanup_before_checkpoint(
         {
             let mut p = commit_path(2..=4);
@@ -1787,7 +1783,7 @@ mod tests {
             p
         },
         None,
-        4
+        Expected::Version(4)
     )]
     #[case::picks_first_anchored_checkpoint(
         {
@@ -1797,7 +1793,7 @@ mod tests {
             p
         },
         None,
-        7,
+        Expected::Version(7),
     )]
     #[case::listing_with_multiple_full_checkpoints(
         {
@@ -1807,7 +1803,7 @@ mod tests {
             p
         },
         None,
-        3,
+        Expected::Version(3),
     )]
     #[case::listing_with_cleanup_checkpoints(
             {
@@ -1818,7 +1814,7 @@ mod tests {
                 p
             },
             None,
-            7,
+            Expected::Version(7),
         )]
     #[case::listing_with_v0_and_full_checkpoint(
         {
@@ -1827,7 +1823,7 @@ mod tests {
             p
         },
         None,
-        0,
+        Expected::Version(0),
     )]
     #[case::checkpoint_before_smallest_commit_anchors(
         {
@@ -1836,60 +1832,43 @@ mod tests {
             p
         },
         None,
-        5,
+        Expected::Version(5),
     )]
-    fn earliest_recreatable_returns_expected_version(
+    #[case::empty_log(vec![], None, Expected::NoCommitsFound)]
+    #[case::crc_only(vec![format!("_delta_log/{:020}.crc", 5)], None, Expected::NoCommitsFound)]
+    #[case::compacted_only(vec![format!("_delta_log/{:020}.{:020}.compacted.json", 0, 5)], None, Expected::NoCommitsFound)]
+    #[case::checkpoint_only(vec![single_part_checkpoint_path(5)], None, Expected::NoCommitsFound)]
+    #[case::non_zero_ratified_on_empty_log(vec![], Some(5), Expected::NoCommitsFound)]
+    #[case::ratified_zero_on_empty_log(vec![], Some(0), Expected::CCv2MissingV0FilesystemCommit)]
+    #[case::commits_have_no_anchor(commit_path(2..=3), None, Expected::NoRecreatableCommit)]
+    #[case::ratified_zero_commits_no_anchor(commit_path(2..=3), Some(0), Expected::NoRecreatableCommit)]
+    fn earliest_recreatable_returns_expected(
         #[case] paths: Vec<String>,
         #[case] ratified: Option<Version>,
-        #[case] expected: Version,
+        #[case] expected: Expected,
     ) {
         let (engine, log_root) = engine_with_log_files(&paths);
-        let v = get_earliest_recreatable_commit(&engine, &log_root, ratified).unwrap();
-        assert_eq!(v, expected);
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    enum ErrKind {
-        NoCommits,
-        NoRecreatable,
-        /// Catalog ratified commit 0 but the filesystem log is empty (broken CCv2 invariant).
-        Ccv2MissingV0,
-    }
-
-    #[rstest::rstest]
-    #[case::empty_log(vec![], None, ErrKind::NoCommits)]
-    #[case::crc_only(vec![format!("_delta_log/{:020}.crc", 5)], None, ErrKind::NoCommits)]
-    #[case::compacted_only(vec![format!("_delta_log/{:020}.{:020}.compacted.json", 0, 5)], None, ErrKind::NoCommits)]
-    #[case::checkpoint_only(vec![single_part_checkpoint_path(5)], None, ErrKind::NoCommits)]
-    #[case::non_zero_ratified_on_empty_log(vec![], Some(5), ErrKind::NoCommits)]
-    #[case::ratified_zero_on_empty_log(vec![], Some(0), ErrKind::Ccv2MissingV0)]
-    #[case::commits_have_no_anchor(commit_path(2..=3), None, ErrKind::NoRecreatable)]
-    #[case::ratified_zero_commits_no_anchor(commit_path(2..=3), Some(0), ErrKind::NoRecreatable)]
-    fn earliest_recreatable_returns_expected_error(
-        #[case] paths: Vec<String>,
-        #[case] ratified: Option<Version>,
-        #[case] expected: ErrKind,
-    ) {
-        let (engine, log_root) = engine_with_log_files(&paths);
-        let err = get_earliest_recreatable_commit(&engine, &log_root, ratified).unwrap_err();
-        let matched = match (&err, expected) {
-            (DeltaError::LogHistory(e), ErrKind::NoCommits) => {
-                matches!(**e, LogHistoryError::NoCommitsFound { .. })
+        let res = get_earliest_recreatable_commit(&engine, &log_root, ratified);
+        match expected {
+            Expected::Version(v) => assert_eq!(res.unwrap(), v),
+            Expected::NoCommitsFound => assert!(
+                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
+                "expected NoCommitsFound error, got {res:?}"
+            ),
+            Expected::NoRecreatableCommit => assert!(
+                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoRecreatableCommit { .. })),
+                "expected NoRecreatableCommit error, got {res:?}"
+            ),
+            Expected::CCv2MissingV0FilesystemCommit => {
+                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
             }
-            (DeltaError::LogHistory(e), ErrKind::NoRecreatable) => {
-                matches!(**e, LogHistoryError::NoRecreatableCommit { .. })
-            }
-            (_, ErrKind::Ccv2MissingV0) => {
-                err.to_string().contains("expected a published v0 commit")
-            }
-            _ => false,
-        };
-        assert!(matched, "unexpected error for {expected:?}: {err}");
+        }
     }
 
     enum Expected {
         Version(Version),
         NoCommitsFound,
+        NoRecreatableCommit,
         CCv2MissingV0FilesystemCommit,
     }
 
@@ -1939,6 +1918,11 @@ mod tests {
             ),
             Expected::CCv2MissingV0FilesystemCommit => {
                 assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+            }
+            Expected::NoRecreatableCommit => {
+                unreachable!(
+                    "get_earliest_published_commit_version never returns NoRecreatableCommit"
+                )
             }
         }
     }
