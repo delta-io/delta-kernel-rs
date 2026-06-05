@@ -84,15 +84,17 @@ pub struct CBytesIterator {
     pub next: extern "C" fn(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>>,
 }
 
-/// An engine-owned iterator of [`FileMeta`](delta_kernel::FileMeta) entries.
+/// An engine-owned iterator of [`FileMeta`](delta_kernel::FileMeta) batches.
 ///
 /// See module level docs for memory management and safety requirements.
 ///
-/// Similar to `CBytesIterator`, CFileMetaIterator uses `FFI_ArrowArray`` as a convenient continer
-/// for passing FileMeta entries across the FFI boundary. Each FileMeta is passed as an
-/// a `StructArray` of length 1 whose fields are `{location: Utf8, last_modified: Int64, size:
-/// UInt64}`, all non-null. Kernel assumes this fixed schema when converting into FileMeta (the
-/// schema is NOT passed along through FFI).
+/// Similar to `CBytesIterator`, CFileMetaIterator uses `FFI_ArrowArray` as a convenient container
+/// for passing FileMeta entries across the FFI boundary. Each `next` invocation MUST yield a batch
+/// of one or more FileMeta rows as a `StructArray` whose fields are
+/// `{location: Utf8, last_modified: Int64, size: UInt64}`, all non-null. Kernel assumes this fixed
+/// schema when converting into FileMeta (the schema is NOT passed along through FFI).
+/// Empty or otherwise invalid batches surface as errors and permanently terminate iteration
+/// (kernel will not call `next` again).
 #[repr(C)]
 pub struct CFileMetaIterator {
     pub state: NullableCvoid,
@@ -204,8 +206,15 @@ unsafe impl Send for FfiBytesIter {}
 
 /// Provides the Rust `Iterator` trait for [`FileMeta`] entries on top of a
 /// [`CFileMetaIterator`].
+///
+/// Buffers each engine-yielded batch and surfaces one row per `Iterator::next` call. Permanantly
+/// terminates if the engine returns None or a batch fails to decode. Errors surfaced directly by
+/// the engine `next` callback are considered transient and do NOT terminate iteration.
 pub(crate) struct FfiFileMetaIter {
     iter: CFileMetaIterator,
+    // Decoded rows from the most recent engine batch
+    buffer: std::vec::IntoIter<delta_kernel::FileMeta>,
+    terminated: bool,
     _cleanup: PlanResultCleanup,
 }
 
@@ -213,6 +222,8 @@ impl FfiFileMetaIter {
     pub(crate) fn new(iter: CFileMetaIterator, cleanup: PlanResultCleanup) -> Self {
         Self {
             iter,
+            buffer: Vec::new().into_iter(),
+            terminated: false,
             _cleanup: cleanup,
         }
     }
@@ -228,7 +239,10 @@ impl FfiFileMetaIter {
         Ok(FFI_ArrowSchema::try_from(&schema)?)
     }
 
-    fn arrow_array_to_file_meta(array: FFI_ArrowArray) -> DeltaResult<delta_kernel::FileMeta> {
+    /// Decodes a single engine batch into a `Vec<FileMeta>`.
+    fn arrow_array_to_file_metas(
+        array: FFI_ArrowArray,
+    ) -> DeltaResult<Vec<delta_kernel::FileMeta>> {
         let schema = Self::arrow_schema()?;
         let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
         let array = arrow_array::make_array(array_data);
@@ -239,11 +253,10 @@ impl FfiFileMetaIter {
                 array.data_type()
             )));
         };
-        if struct_array.len() != 1 {
-            return Err(Error::generic(format!(
-                "CFileMetaIterator array must contain exactly one row, got {}",
-                struct_array.len()
-            )));
+        if struct_array.is_empty() {
+            return Err(Error::generic(
+                "CFileMetaIterator batch must contain at least one row",
+            ));
         }
 
         // The fixed schema guarantees three columns in this order, all non-null. `from_ffi`
@@ -268,17 +281,26 @@ impl FfiFileMetaIter {
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::generic("CFileMetaIterator: size column is not UInt64"))?;
 
-        if location_col.is_null(0) || last_modified_col.is_null(0) || size_col.is_null(0) {
+        // The fixed schema declares every column non-null; reject any batch that violates that
+        // contract up front so the per-row decode below can safely call `value(i)`.
+        if location_col.null_count() != 0
+            || last_modified_col.null_count() != 0
+            || size_col.null_count() != 0
+        {
             return Err(Error::generic(
-                "CFileMetaIterator row must not contain null fields",
+                "CFileMetaIterator batch must not contain null fields",
             ));
         }
 
-        Ok(delta_kernel::FileMeta {
-            location: Url::parse(location_col.value(0))?,
-            last_modified: last_modified_col.value(0),
-            size: size_col.value(0),
-        })
+        (0..struct_array.len())
+            .map(|i| {
+                Ok(delta_kernel::FileMeta {
+                    location: Url::parse(location_col.value(i))?,
+                    last_modified: last_modified_col.value(i),
+                    size: size_col.value(i),
+                })
+            })
+            .collect()
     }
 }
 
@@ -286,12 +308,36 @@ impl Iterator for FfiFileMetaIter {
     type Item = DeltaResult<delta_kernel::FileMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.iter.next)(self.iter.state) {
-            OptionalValue::None => None,
-            // TODO: re-evaluate memory management; errors are currently freed by PlanResultCleanup
-            OptionalValue::Some(ExternResult::Err(err)) => Some(Err(engine_error_to_kernel(err))),
-            OptionalValue::Some(ExternResult::Ok(array)) => {
-                Some(Self::arrow_array_to_file_meta(array))
+        loop {
+            if self.terminated {
+                return None;
+            }
+
+            if let Some(meta) = self.buffer.next() {
+                return Some(Ok(meta));
+            }
+
+            // Buffer drained and iteration is still live; pull the next batch from the engine.
+            match (self.iter.next)(self.iter.state) {
+                OptionalValue::None => {
+                    self.terminated = true;
+                    return None;
+                }
+                // TODO: re-evaluate memory management; errors are currently freed by
+                // PlanResultCleanup
+                OptionalValue::Some(ExternResult::Err(err)) => {
+                    return Some(Err(engine_error_to_kernel(err)))
+                }
+                OptionalValue::Some(ExternResult::Ok(array)) => {
+                    match Self::arrow_array_to_file_metas(array) {
+                        Ok(batch) => self.buffer = batch.into_iter(),
+                        Err(e) => {
+                            // Decoder errors (including empty batches) are fatal
+                            self.terminated = true;
+                            return Some(Err(e));
+                        }
+                    }
+                }
             }
         }
     }
@@ -482,13 +528,16 @@ mod tests {
 
     // === FfiFileMetaIter Test ===
 
-    /// Helper for building each yielded FileMeta entry. Constructs a single-row `StructArray`
-    /// matching the fixed schema kernel synthesizes in `FfiFileMetaIter::arrow_data_type`.
-    fn make_file_meta_ffi_array(location: &str, last_modified: i64, size: u64) -> FFI_ArrowArray {
+    /// Helper for building a yielded FileMeta batch. `rows` may be empty to construct a malformed
+    /// batch for negative tests.
+    fn make_file_meta_ffi_array(rows: &[(&str, i64, u64)]) -> FFI_ArrowArray {
+        let locations: Vec<&str> = rows.iter().map(|(l, _, _)| *l).collect();
+        let last_modifieds: Vec<i64> = rows.iter().map(|(_, t, _)| *t).collect();
+        let sizes: Vec<u64> = rows.iter().map(|(_, _, s)| *s).collect();
         let struct_array = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("location", ArrowDataType::Utf8, false)),
-                Arc::new(StringArray::from(vec![location])) as ArrayRef,
+                Arc::new(StringArray::from(locations)) as ArrayRef,
             ),
             (
                 Arc::new(ArrowField::new(
@@ -496,69 +545,129 @@ mod tests {
                     ArrowDataType::Int64,
                     false,
                 )),
-                Arc::new(Int64Array::from(vec![last_modified])) as ArrayRef,
+                Arc::new(Int64Array::from(last_modifieds)) as ArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("size", ArrowDataType::UInt64, false)),
-                Arc::new(UInt64Array::from(vec![size])) as ArrayRef,
+                Arc::new(UInt64Array::from(sizes)) as ArrayRef,
             ),
         ]);
         let (ffi_array, _ffi_schema) = arrow_ffi::to_ffi(&struct_array.into_data()).unwrap();
         ffi_array
     }
 
+    extern "C" fn file_meta_next(
+        state: NullableCvoid,
+    ) -> OptionalValue<ExternResult<FFI_ArrowArray>> {
+        let mock_iter = unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
+        mock_iter
+            .items
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(OptionalValue::None)
+    }
+
+    /// Exercises batched yields with a multi-row batch, a transient engine error (which does not
+    /// terminate iteration), and a single-row batch. Verifies the Rust-side adapter buffers each
+    /// batch and surfaces one row per `Iterator::next` call.
     #[test]
     fn ffi_file_meta_iter_drains_and_runs_cleanup() {
         let err = EngineError {
             etype: KernelError::GenericError,
         };
         let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
-            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(
-                "file:///a.parquet",
-                1,
-                100,
-            ))),
+            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[
+                ("file:///a.parquet", 1, 100),
+                ("file:///b.parquet", 2, 200),
+            ]))),
             OptionalValue::Some(ExternResult::Err(err_ptr(&err))),
-            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(
-                "file:///b.parquet",
-                2,
-                200,
-            ))),
+            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[(
+                "file:///c.parquet",
+                3,
+                300,
+            )]))),
         ]);
         let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
 
-        extern "C" fn next(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>> {
-            let mock_iter =
-                unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
-            mock_iter
-                .items
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(OptionalValue::None)
-        }
-
         let mut iter = FfiFileMetaIter::new(
-            CFileMetaIterator { state, next },
+            CFileMetaIterator {
+                state,
+                next: file_meta_next,
+            },
             PlanResultCleanup::new(state, free_mock_iter::<FFI_ArrowArray>),
         );
 
+        // First batch contributes two rows.
         let first = iter.next().expect("first item").expect("first ok");
         assert_eq!(first.location.as_str(), "file:///a.parquet");
         assert_eq!(first.last_modified, 1);
         assert_eq!(first.size, 100);
 
-        let second = iter.next().expect("second item");
-        assert!(second.is_err(), "second item should be Err");
+        let second = iter.next().expect("second item").expect("second ok");
+        assert_eq!(second.location.as_str(), "file:///b.parquet");
+        assert_eq!(second.last_modified, 2);
+        assert_eq!(second.size, 200);
 
-        let third = iter.next().expect("third item").expect("third ok");
-        assert_eq!(third.location.as_str(), "file:///b.parquet");
-        assert_eq!(third.last_modified, 2);
-        assert_eq!(third.size, 200);
+        // After draining the first batch the adapter pulls the transient engine error.
+        let third = iter.next().expect("third item");
+        assert!(third.is_err(), "third item should be Err");
+
+        // Transient engine errors do not terminate iteration; the fourth batch is still returned.
+        let fourth = iter.next().expect("fourth item").expect("fourth ok");
+        assert_eq!(fourth.location.as_str(), "file:///c.parquet");
+        assert_eq!(fourth.last_modified, 3);
+        assert_eq!(fourth.size, 300);
 
         assert!(iter.next().is_none(), "iterator should be exhausted");
         assert!(!cleanup_called.load(Ordering::SeqCst));
 
+        drop(iter);
+        assert!(cleanup_called.load(Ordering::SeqCst));
+    }
+
+    /// Verifies that an empty batch surfaces as an error and permanently terminates iteration
+    #[test]
+    fn ffi_file_meta_iter_rejects_empty_batch_and_terminates() {
+        let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
+            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[]))),
+            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[(
+                "file:///trap.parquet",
+                99,
+                999,
+            )]))),
+        ]);
+        // Hold a borrow of the queue so we can inspect it after iteration without recovering
+        // the box.
+        let items_ptr: *const Mutex<VecDeque<OptionalValue<ExternResult<FFI_ArrowArray>>>> =
+            &mock_iter.items;
+        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
+
+        let mut iter = FfiFileMetaIter::new(
+            CFileMetaIterator {
+                state,
+                next: file_meta_next,
+            },
+            PlanResultCleanup::new(state, free_mock_iter::<FFI_ArrowArray>),
+        );
+
+        let first = iter.next().expect("first item");
+        assert!(first.is_err(), "empty batch must surface as Err");
+
+        // The final entry is still queued.
+        let remaining = unsafe { &*items_ptr }.lock().unwrap().len();
+        assert_eq!(remaining, 1, "final entry must remain unconsumed");
+
+        // Further polls return `None` without re-invoking the engine.
+        assert!(iter.next().is_none(), "iterator should be terminated");
+        assert!(iter.next().is_none(), "iterator should stay terminated");
+        let remaining_after = unsafe { &*items_ptr }.lock().unwrap().len();
+        assert_eq!(
+            remaining_after, 1,
+            "final entry must still be unconsumed after extra polls"
+        );
+
+        assert!(!cleanup_called.load(Ordering::SeqCst));
         drop(iter);
         assert!(cleanup_called.load(Ordering::SeqCst));
     }
