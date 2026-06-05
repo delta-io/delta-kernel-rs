@@ -85,11 +85,11 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
+                StructType::new_unchecked([StructField::new(
                     "inner_v",
                     DataType::unshredded_variant(),
                     true,
-                )]))),
+                )]),
                 true,
             ),
         ]);

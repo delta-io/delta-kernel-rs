@@ -41,7 +41,7 @@ pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
         match dt {
             DataType::Struct(s) => {
                 let fields: Vec<_> = s.fields().map(|f| strip_field(f, cm_id, cm_name)).collect();
-                DataType::Struct(Box::new(StructType::new_unchecked(fields)))
+                DataType::from(StructType::new_unchecked(fields))
             }
             DataType::Array(a) => DataType::from(ArrayType::new(
                 strip_data_type(a.element_type(), cm_id, cm_name),
@@ -344,7 +344,7 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
 
     let schema = Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, true),
-        StructField::new("address", DataType::Struct(Box::new(address_type)), true),
+        StructField::new("address", address_type, true),
     ])?);
 
     // Create table and load snapshot (validates column mapping for nested schema on read)
@@ -428,7 +428,7 @@ fn test_column_mapping_schema_with_maps_and_arrays() -> DeltaResult<()> {
             DataType::from(ArrayType::new(DataType::INTEGER, true)),
             true,
         ),
-        StructField::new("metadata", DataType::Struct(Box::new(metadata_type)), true),
+        StructField::new("metadata", metadata_type, true),
     ])?);
 
     // Create table with column mapping and read back the snapshot.
@@ -461,26 +461,14 @@ fn clustering_cm_test_schema() -> DeltaResult<Arc<StructType>> {
         StructField::new("zip", DataType::STRING, true),
     ])?;
     let l4 = StructType::try_new(vec![StructField::new("value", DataType::DOUBLE, true)])?;
-    let l3 = StructType::try_new(vec![StructField::new(
-        "l4",
-        DataType::Struct(Box::new(l4)),
-        true,
-    )])?;
-    let l2 = StructType::try_new(vec![StructField::new(
-        "l3",
-        DataType::Struct(Box::new(l3)),
-        true,
-    )])?;
-    let l1 = StructType::try_new(vec![StructField::new(
-        "l2",
-        DataType::Struct(Box::new(l2)),
-        true,
-    )])?;
+    let l3 = StructType::try_new(vec![StructField::new("l4", l4, true)])?;
+    let l2 = StructType::try_new(vec![StructField::new("l3", l3, true)])?;
+    let l1 = StructType::try_new(vec![StructField::new("l2", l2, true)])?;
     Ok(Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
-        StructField::new("address", DataType::Struct(Box::new(address)), true),
-        StructField::new("l1", DataType::Struct(Box::new(l1)), true),
+        StructField::new("address", address, true),
+        StructField::new("l1", l1, true),
     ])?))
 }
 

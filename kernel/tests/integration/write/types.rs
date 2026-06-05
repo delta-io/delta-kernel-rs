@@ -625,10 +625,10 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable(
             "arr",
             ArrayType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::VOID),
-                ]))),
+                ]),
                 true,
             ),
         ),
@@ -693,10 +693,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "arr",
-            ArrayType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked(Vec::<StructField>::new()))),
-                true,
-            ),
+            ArrayType::new(StructType::new_unchecked(Vec::<StructField>::new()), true),
         ),
     ])),
     "struct nested in Array or Map must contain at least one non-void field"

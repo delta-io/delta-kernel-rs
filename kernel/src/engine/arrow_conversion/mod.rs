@@ -591,27 +591,27 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             )
             .map_err(|e| ArrowError::from_external_error(e.into())),
             ArrowDataType::List(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::ListView(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::LargeList(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::LargeListView(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::FixedSizeList(field, _) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
@@ -904,7 +904,7 @@ mod tests {
             ColumnMetadataKey::ParquetFieldId.as_ref(),
             MetadataValue::Number(5),
         )])])?;
-        let array_type = ArrayType::new(DataType::Struct(Box::new(array_item_struct)), false);
+        let array_type = ArrayType::new(array_item_struct, false);
 
         // Build map with struct key and struct value (both with field IDs)
         let map_key_struct = StructType::try_new(vec![StructField::new(
@@ -925,11 +925,7 @@ mod tests {
             ColumnMetadataKey::ParquetFieldId.as_ref(),
             MetadataValue::Number(8),
         )])])?;
-        let map_type = MapType::new(
-            DataType::Struct(Box::new(map_key_struct)),
-            DataType::Struct(Box::new(map_value_struct)),
-            false,
-        );
+        let map_type = MapType::new(map_key_struct, map_value_struct, false);
 
         // Build top-level struct
         let top_struct = StructType::try_new(vec![
@@ -937,26 +933,18 @@ mod tests {
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(1),
             )]),
-            StructField::new(
-                "nested_struct",
-                DataType::Struct(Box::new(inner_struct_type)),
-                false,
-            )
-            .with_metadata([(
+            StructField::new("nested_struct", inner_struct_type, false).with_metadata([(
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(2),
             )]),
-            StructField::new("array_field", DataType::Array(Box::new(array_type)), false)
-                .with_metadata([(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(4),
-                )]),
-            StructField::new("map_field", DataType::Map(Box::new(map_type)), false).with_metadata(
-                [(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(6),
-                )],
-            ),
+            StructField::new("array_field", array_type, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(4),
+            )]),
+            StructField::new("map_field", map_type, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(6),
+            )]),
         ])?;
 
         // Convert to Arrow schema

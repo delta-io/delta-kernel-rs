@@ -133,17 +133,10 @@ async fn test_write_stats_for_complex_type_columns(
 
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
-        StructField::nullable(
-            "tags",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-        ),
+        StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
         StructField::nullable(
             "props",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::LONG,
-                true,
-            ))),
+            MapType::new(DataType::STRING, DataType::LONG, true),
         ),
         StructField::nullable("v", DataType::unshredded_variant()),
     ])?);
@@ -291,17 +284,10 @@ async fn test_write_stats_nested_complex_types_respect_column_limit(
             "data",
             DataType::try_struct_type(vec![
                 StructField::nullable("name", DataType::STRING),
-                StructField::nullable(
-                    "tags",
-                    DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-                ),
+                StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
                 StructField::nullable(
                     "props",
-                    DataType::Map(Box::new(MapType::new(
-                        DataType::STRING,
-                        DataType::LONG,
-                        true,
-                    ))),
+                    MapType::new(DataType::STRING, DataType::LONG, true),
                 ),
             ])?,
         ),

@@ -66,18 +66,12 @@ fn v3_create_table_rejects_incompatible_props(
 #[case::top_level(StructField::nullable("maybe", DataType::VOID))]
 #[case::in_struct(StructField::nullable(
     "s",
-    DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
-        "x",
-        DataType::VOID,
-    )]))),
+    StructType::new_unchecked([StructField::nullable("x", DataType::VOID)]),
 ))]
-#[case::in_array(StructField::nullable(
-    "arr",
-    DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
-))]
+#[case::in_array(StructField::nullable("arr", ArrayType::new(DataType::VOID, true),))]
 #[case::in_map_value(StructField::nullable(
     "m",
-    DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::VOID, true))),
+    MapType::new(DataType::STRING, DataType::VOID, true),
 ))]
 fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -106,11 +100,11 @@ fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "data",
-        DataType::Map(Box::new(MapType::new(
+        MapType::new(
             DataType::INTEGER,
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            ArrayType::new(DataType::INTEGER, true),
             true,
-        ))),
+        ),
     )])?);
 
     let _ = create_table(&table_path, schema, "Test/1.0")

@@ -76,15 +76,12 @@ mod tests {
             );
         }
         let nested = [
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
+            DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            DataType::from(StructType::new_unchecked([StructField::nullable(
+                "x",
                 DataType::INTEGER,
-                true,
-            ))),
-            DataType::Struct(Box::new(StructType::new_unchecked([
-                StructField::nullable("x", DataType::INTEGER),
-            ]))),
+            )])),
             DataType::unshredded_variant(),
         ];
         for dt in nested {
