@@ -11,7 +11,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::{ColumnName, Expression, ExpressionRef};
-use crate::{CollectInto, DeltaResult, Error};
+use crate::utils::CollectInto;
+use crate::{DeltaResult, Error};
 
 /// A patch affecting a single input field.
 ///
