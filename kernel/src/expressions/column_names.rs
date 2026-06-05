@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
 use std::ops::Deref;
 
+use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
 
 /// A (possibly nested) column name.
@@ -15,11 +16,8 @@ pub struct ColumnName {
 impl ColumnName {
     /// Creates a new column name from input satisfying `FromIterator for ColumnName`. The provided
     /// field names are concatenated into a single path.
-    pub fn new<A>(iter: impl IntoIterator<Item = A>) -> Self
-    where
-        Self: FromIterator<A>,
-    {
-        iter.into_iter().collect()
+    pub fn new(iter: impl CollectInto<Self>) -> Self {
+        iter.collect_into()
     }
 
     /// Naively splits a string at dots to create a column name.
