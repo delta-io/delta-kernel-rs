@@ -1,0 +1,706 @@
+{
+  "$schemas": {
+    "simple_int_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "array_int_mapped_missing_nested_ids": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "arr_col",
+          "type": {"type": "array", "elementType": "integer", "containsNull": true},
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "arr_col"}
+        }
+      ]
+    },
+    "array_int_mapped_non_int_nested_ids": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "arr_col",
+          "type": {"type": "array", "elementType": "integer", "containsNull": true},
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": 2,
+            "delta.columnMapping.physicalName": "arr_col",
+            "parquet.field.nested.ids": {"arr_col.element": "not-an-int"}
+          }
+        }
+      ]
+    },
+    "array_int_mapped_nested_ids_overlap_cm_ids": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "arr_col",
+          "type": {"type": "array", "elementType": "integer", "containsNull": true},
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": 2,
+            "delta.columnMapping.physicalName": "arr_col",
+            "parquet.field.nested.ids": {"arr_col.element": 1}
+          }
+        }
+      ]
+    },
+    "map_string_int_mapped_missing_nested_ids": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "map_col",
+          "type": {
+            "type": "map",
+            "keyType": "string",
+            "valueType": "integer",
+            "valueContainsNull": true
+          },
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "map_col"}
+        }
+      ]
+    },
+    "map_string_int_mapped_non_int_nested_ids": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "map_col",
+          "type": {
+            "type": "map",
+            "keyType": "string",
+            "valueType": "integer",
+            "valueContainsNull": true
+          },
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": 2,
+            "delta.columnMapping.physicalName": "map_col",
+            "parquet.field.nested.ids": {"map_col.key": "not-an-int", "map_col.value": 100}
+          }
+        }
+      ]
+    },
+    "map_string_int_mapped_nested_ids_overlap_cm_ids": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "map_col",
+          "type": {
+            "type": "map",
+            "keyType": "string",
+            "valueType": "integer",
+            "valueContainsNull": true
+          },
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": 2,
+            "delta.columnMapping.physicalName": "map_col",
+            "parquet.field.nested.ids": {"map_col.key": 1, "map_col.value": 2}
+          }
+        }
+      ]
+    },
+    "void_type_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "void_col",
+          "type": "void",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "void_col"}
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "column_mapping_only_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping"]
+    },
+    "column_mapping_only_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping"]
+    },
+    "iceberg_v1_and_v2_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV1", "icebergCompatV2"]
+    },
+    "iceberg_v1_and_v2_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "icebergCompatV1", "icebergCompatV2"]
+    },
+    "iceberg_v2_with_dv_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV2", "deletionVectors"]
+    },
+    "iceberg_v2_with_dv_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping", "deletionVectors"],
+      "writerFeatures": ["columnMapping", "icebergCompatV2", "deletionVectors"]
+    },
+    "iceberg_v2_no_cm_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["icebergCompatV2"]
+    },
+    "iceberg_v2_no_cm_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["icebergCompatV2"]
+    },
+    "no_features_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "iceberg_v2_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV2"]
+    },
+    "iceberg_v2_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "icebergCompatV2"]
+    }
+  },
+  "$notes": {
+    "v2_activation": "icebergCompatV2 is activated by two conditions: (1) the feature listed in writerFeatures, and (2) the table property delta.enableIcebergCompatV2=true. When active, columnMapping must be in name or id mode, and deletion vectors must not be active (DV may be supported but inactive -- contrast with ICv1, which forbids DV support entirely). Additional ICv2 constraints (nested IDs for arrays/maps and allowed-type checks) are covered by dedicated negative cases in this fixture.",
+    "mutual_exclusion": "icebergCompatV1 and icebergCompatV2 are mutually exclusive. V2 explicitly requires that V1 is not active (feature absent or property not true). icebergCompatV3-preview additionally requires that both V1 and V2 are not active."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "iceberg_v2_create_table_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2] table with columnMapping mode=name and delta.enableIcebergCompatV2=true succeeds.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "iceberg_v2_create_table_3_7_no_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "orphan",
+      "description": "Creating a (3,7)+[columnMapping] table with delta.enableIcebergCompatV2=true but icebergCompatV2 absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.column_mapping_only_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "iceberg_v2_read_snapshot_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Reading a (2,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v2_2_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV2": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "iceberg_v2_empty_commit_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Committing to a (2,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v2_2_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV2": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "iceberg_v2_supported_not_active_create_table_3_7_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table without delta.enableIcebergCompatV2=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "iceberg_v2_create_table_3_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (3,7)+[columnMapping in readerFeatures and writerFeatures, icebergCompatV2] table with columnMapping mode=name and delta.enableIcebergCompatV2=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "iceberg_v2_create_table_3_7_missing_column_mapping_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "missing_dependency",
+      "description": "Creating a (3,7)+[icebergCompatV2] table without columnMapping in readerFeatures and writerFeatures fails; icebergCompatV2 support requires columnMapping support.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_no_cm_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV2": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "iceberg_v2_create_table_3_7_column_mapping_not_active_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "missing_required_metadata",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true but no columnMapping mode set fails; enabling icebergCompatV2 requires columnMapping to be active in name or id mode.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV2": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 9,
+      "name": "iceberg_v2_create_table_3_7_with_deletion_vectors_active_fails",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2,deletionVectors] table with delta.enableIcebergCompatV2=true and delta.enableDeletionVectors=true fails; ICv2 requires deletion vectors not be active.",
+      "note": "$errata.iceberg_compat_dv_restriction",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_with_dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true",
+            "delta.enableDeletionVectors": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 10,
+      "name": "iceberg_v2_create_table_3_7_with_deletion_vectors_supported_not_active_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2,deletionVectors] table with delta.enableIcebergCompatV2=true but without delta.enableDeletionVectors=true succeeds; ICv2 only prohibits deletion vectors being active.",
+      "note": "$errata.iceberg_compat_dv_restriction",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_with_dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "iceberg_v1_and_v2_feature_listed_only_v2_property_true_3_7_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV1,icebergCompatV2] table with only delta.enableIcebergCompatV2=true (ICv1 not active) succeeds; the mutual exclusion check fires on ICv1 being active, not merely supported.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_and_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "iceberg_v1_and_v2_create_table_both_active_3_7_fails",
+      "feature": "icebergCompatV2",
+      "description": "Creating a table with both delta.enableIcebergCompatV1=true and delta.enableIcebergCompatV2=true fails; V2 requires that V1 is not active.",
+      "note": "$notes.mutual_exclusion",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_and_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 13,
+      "name": "iceberg_v2_read_snapshot_3_7_no_feature_listed_with_property_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "orphan",
+      "description": "Reading a (3,7)+[columnMapping] table with delta.enableIcebergCompatV2=true but icebergCompatV2 absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.column_mapping_only_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV2": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "iceberg_v2_create_table_3_7_without_column_mapping_protocol_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "missing_dependency",
+      "description": "Creating a (3,7)+[icebergCompatV2] table without columnMapping in readerFeatures and writerFeatures fails, even without delta.enableIcebergCompatV2=true; the spec requires columnMapping support whenever icebergCompatV2 is listed.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_no_cm_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 15,
+      "name": "iceberg_v2_create_table_3_7_no_feature_no_cm_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "orphan",
+      "description": "Creating a (3,7)+[] table with delta.enableIcebergCompatV2=true succeeds; when icebergCompatV2 is absent from protocol, columnMapping dependency checks do not apply.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.no_features_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV2": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 16,
+      "name": "iceberg_v2_supported_not_active_create_table_3_7_with_deletion_vectors_active_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2,deletionVectors] table with delta.enableDeletionVectors=true but without delta.enableIcebergCompatV2=true succeeds; ICv2 deletionVectors restrictions apply only when ICv2 is active.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_with_dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableDeletionVectors": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 17,
+      "name": "iceberg_v2_supported_not_active_create_table_3_7_with_deletion_vectors_supported_not_active_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2,deletionVectors] table without delta.enableIcebergCompatV2=true and without delta.enableDeletionVectors=true succeeds; ICv2 deletionVectors restrictions apply only when ICv2 is active.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_with_dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {"delta.columnMapping.mode": "name"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 18,
+      "name": "iceberg_v2_create_table_3_7_with_void_type_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true and a Void type column fails; ICv2 allows only its listed data types when active.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.void_type_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 19,
+      "name": "iceberg_v2_create_table_3_7_array_missing_nested_ids_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true fails when Array metadata omits required parquet.field.nested.ids entries.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.array_int_mapped_missing_nested_ids",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 20,
+      "name": "iceberg_v2_create_table_3_7_map_missing_nested_ids_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true fails when Map metadata omits required parquet.field.nested.ids entries.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.map_string_int_mapped_missing_nested_ids",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 21,
+      "name": "iceberg_v2_supported_not_active_create_table_3_7_with_void_type_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with a Void type column but without delta.enableIcebergCompatV2=true succeeds; ICv2 type allow-list restrictions apply only when ICv2 is active.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.void_type_mapped",
+          "configuration": {"delta.columnMapping.mode": "name"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 22,
+      "name": "iceberg_v2_create_table_3_7_array_non_integer_nested_ids_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true fails when Array parquet.field.nested.ids values are not integers.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.array_int_mapped_non_int_nested_ids",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 23,
+      "name": "iceberg_v2_create_table_3_7_map_non_integer_nested_ids_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true fails when Map parquet.field.nested.ids values are not integers.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.map_string_int_mapped_non_int_nested_ids",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 24,
+      "name": "iceberg_v2_create_table_3_7_array_nested_ids_overlap_column_mapping_ids_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true fails when Array parquet.field.nested.ids reuse column-mapping IDs.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.array_int_mapped_nested_ids_overlap_cm_ids",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 25,
+      "name": "iceberg_v2_create_table_3_7_map_nested_ids_overlap_column_mapping_ids_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true fails when Map parquet.field.nested.ids reuse column-mapping IDs.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.map_string_int_mapped_nested_ids_overlap_cm_ids",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    }
+  ]
+}

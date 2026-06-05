@@ -1,0 +1,42 @@
+{
+  "orphan_feature_metadata": {
+    "title": "Feature metadata present without the feature listed in protocol",
+    "spec_says": "All behavioral requirements for a feature are scoped to 'when supported'. The spec does not address what readers or writers must do when feature-related metadata (table properties, schema annotations, log actions) is present but the feature is absent from the protocol.",
+    "controversy": "Whether implementations should proactively reject this inconsistent state or silently ignore the unrecognized metadata is unresolved."
+  },
+  "invalid_table_state_reader_rejection": {
+    "title": "Definitively invalid table state; spec silent on whether readers must reject",
+    "spec_says": "The spec defines writer obligations whose violation produces invalid table state. It does not always specify whether readers must detect and reject such states.",
+    "controversy": "When a table violates a writer requirement (e.g. clustered + partitioned, clustering without domainMetadata co-listed), whether readers are obligated to reject is often unspecified. Failure is the expected fixture outcome since the state is definitively invalid."
+  },
+  "domain_metadata_support_term_ambiguity": {
+    "title": "domainMetadata 'support' wording ambiguity",
+    "spec_says": "The spec text for domainMetadata uses 'support' in prose about reader behavior while also defining protocol-level support/enablement concepts elsewhere. It also says readers may ignore unrecognized metadata domains.",
+    "controversy": "It is ambiguous whether 'readers who do not support domain metadata' means readers that do not implement domainMetadata semantics, or readers where protocol-level feature support/enablement is absent. This affects the interpretation of orphan domainMetadata actions and whether they are expressly tolerated or merely not rejected (because the spec says nothing)."
+  },
+  "iceberg_compat_dv_restriction": {
+    "title": "Iceberg compatibility: CM support dependency vs DV activation semantics",
+    "spec_says": "For Iceberg compatibility features, columnMapping is a support dependency (feature-level requirement), while deletionVectors restrictions are scoped to active behavior. ICv1 active requires DV not be supported; ICv2 active requires DV not be active.",
+    "controversy": "For ICv1 and ICv2, CM and DV use different support-vs-enablement boundaries: CM is a support dependency, while DV is activation-scoped. Implementations may incorrectly apply ICv1 DV strictness to ICv2, or treat CM as activation-only in either version."
+  },
+  "nullable_false_invariants": {
+    "title": "nullable=false columns and the invariants/checkConstraints feature requirement",
+    "spec_says": "The spec does not specify what protocol version or feature is required to enforce nullable=false columns. The invariants feature covers delta.invariants metadata expressions, not the nullable field itself.",
+    "controversy": "Some implementations require a constraint feature (invariants or checkConstraints) in writerFeatures before accepting a nullable=false schema at (3,7). Which feature is required, and whether this applies at legacy versions, is unclear from the spec."
+  },
+  "row_tracking_enabled_prerequisites": {
+    "title": "delta.enableRowTracking=true without required materialized column name config keys",
+    "spec_says": "Enabling row tracking (setting delta.enableRowTracking=true) is only allowed when delta.rowTracking.materializedRowIdColumnName and delta.rowTracking.materializedRowCommitVersionColumnName have been assigned in the metaData configuration.",
+    "controversy": "Whether a create_table that sets delta.enableRowTracking=true without these config keys must be rejected, or whether the keys are only required when materializing row IDs as visible columns, is unclear. The spec lists them as hard prerequisites under 'This is only allowed if', but create_table implementations may or may not enforce this at table creation time."
+  },
+  "sql_expression_cm_name_resolution": {
+    "title": "SQL expression features + columnMapping: logical vs physical column names",
+    "spec_says": "Invariant expressions (delta.invariants), check constraint expressions (delta.constraints.*), and generation expressions (delta.generationExpression) are SQL strings stored in schema metadata or table configuration. Under columnMapping, the column's display name ('id') differs from its physical name ('col-1'). The spec does not state whether these expressions reference logical or physical names.",
+    "controversy": "Whether SQL expressions in these features must reference logical names (schema display names) or physical names is unspecified across all three features. A writer using the wrong resolution strategy could silently fail to enforce the expression or raise a resolution error."
+  },
+  "protocol_structural_validity_should_vs_must": {
+    "title": "readerFeatures/writerFeatures placement: 'should' vs 'must' in the spec",
+    "spec_says": "Reader features 'should be listed in both readerFeatures and writerFeatures simultaneously' (should, not must). 'It is not allowed to list a feature only in readerFeatures but not in writerFeatures' (explicit prohibition in one direction only).",
+    "controversy": "For a reader-writer feature listed only in writerFeatures: the spec uses 'should', not 'must'. A lenient reader might ignore the asymmetry. Fixture expects failure on the grounds that a reader cannot safely operate on a protocol it cannot fully interpret."
+  }
+}

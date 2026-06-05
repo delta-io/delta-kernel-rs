@@ -1,0 +1,149 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "vacuum_protocol_check_dv_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["deletionVectors", "vacuumProtocolCheck"],
+      "writerFeatures": ["deletionVectors", "vacuumProtocolCheck"]
+    },
+    "vacuum_protocol_check_writer_only_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["vacuumProtocolCheck"]
+    },
+    "vacuum_protocol_check_reader_only_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["vacuumProtocolCheck"],
+      "writerFeatures": []
+    },
+    "vacuum_protocol_check_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["vacuumProtocolCheck"],
+      "writerFeatures": ["vacuumProtocolCheck"]
+    }
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "vacuum_protocol_check_create_table_3_7_feature_listed_succeeds",
+      "feature": "vacuumProtocolCheck",
+      "description": "Creating a (3,7)+[vacuumProtocolCheck] table succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.vacuum_protocol_check_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "vacuum_protocol_check_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "vacuumProtocolCheck",
+      "description": "Reading a (3,7)+[vacuumProtocolCheck] table succeeds; the feature only constrains VACUUM operations and has no effect on reads.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.vacuum_protocol_check_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "vacuum_protocol_check_empty_commit_3_7_feature_listed_succeeds",
+      "feature": "vacuumProtocolCheck",
+      "description": "Appending to a (3,7)+[vacuumProtocolCheck] table succeeds; the feature only constrains VACUUM operations and has no effect on appends.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.vacuum_protocol_check_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "vacuum_protocol_check_create_table_3_7_reader_only_fails",
+      "feature": "vacuumProtocolCheck",
+      "flavor": "insufficient_protocol",
+      "description": "Creating a (3,7) table with vacuumProtocolCheck in readerFeatures only fails; the spec prohibits listing a feature only in readerFeatures without also listing it in writerFeatures.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.vacuum_protocol_check_reader_only_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 5,
+      "name": "vacuum_protocol_check_create_table_3_7_writer_only_fails",
+      "feature": "vacuumProtocolCheck",
+      "flavor": "insufficient_protocol",
+      "description": "Creating a (3,7) table with vacuumProtocolCheck in writerFeatures only fails; vacuumProtocolCheck is a reader+writer feature and must be listed in both.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.vacuum_protocol_check_writer_only_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 6,
+      "name": "vacuum_protocol_check_dv_create_table_3_7_succeeds",
+      "feature": "vacuumProtocolCheck",
+      "description": "Creating a (3,7)+[deletionVectors,vacuumProtocolCheck] table succeeds; the two features are independent and may be co-listed.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.vacuum_protocol_check_dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableDeletionVectors": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "vacuum_protocol_check_read_snapshot_3_7_reader_only_fails",
+      "feature": "vacuumProtocolCheck",
+      "flavor": "insufficient_protocol",
+      "description": "Reading a (3,7) table with vacuumProtocolCheck in readerFeatures only fails; listing a feature only in readerFeatures is forbidden.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.vacuum_protocol_check_reader_only_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "vacuum_protocol_check_read_snapshot_3_7_writer_only_fails",
+      "feature": "vacuumProtocolCheck",
+      "flavor": "insufficient_protocol",
+      "description": "Reading a (3,7) table with vacuumProtocolCheck in writerFeatures only fails; vacuumProtocolCheck is a reader+writer feature and must be listed in both.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.vacuum_protocol_check_writer_only_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    }
+  ]
+}

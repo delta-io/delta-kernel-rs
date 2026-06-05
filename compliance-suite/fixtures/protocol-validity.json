@@ -1,0 +1,736 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "simple_int_nn": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": false, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "legacy_1_1": {"minReaderVersion": 1, "minWriterVersion": 1},
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "modern_3_7_invariants": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["invariants"]
+    },
+    "modern_2_7_unknown_writer": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["unknownFeature"]
+    },
+    "modern_3_7_unknown_writer_only": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["unknownFeature"]
+    },
+    "legacy_1_2_with_writer_features": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 2,
+      "writerFeatures": []
+    }
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "read_snapshot_legacy_reader_modern_writer_2_7_succeeds",
+      "description": "Reading a valid (2,7) table with no writer features succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 2, "minWriterVersion": 7, "writerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "read_snapshot_3_7_empty_features_succeeds",
+      "description": "Reading a valid (3,7) table with empty readerFeatures and writerFeatures succeeds.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": [],
+              "writerFeatures": []
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "read_snapshot_modern_reader_legacy_writer_3_5_missing_reader_features_fails",
+      "description": "Reading a (3,5) table omitting readerFeatures fails; minReaderVersion=3 requires readerFeatures to be present in the protocol action.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 3, "minWriterVersion": 5}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "read_snapshot_modern_reader_legacy_writer_3_5_fails",
+      "description": "Reading a (3,5) table with readerFeatures present fails; (3,5) is a structurally invalid version pair.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 3, "minWriterVersion": 5, "readerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 5,
+      "name": "read_snapshot_3_7_missing_writer_features_fails",
+      "description": "Reading an invalid (3,7) table omitting writerFeatures fails.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 6,
+      "name": "read_snapshot_2_7_with_reader_features_present_fails",
+      "description": "Reading an invalid (2,7) table with readerFeatures present.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 2,
+              "minWriterVersion": 7,
+              "readerFeatures": [],
+              "writerFeatures": []
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 7,
+      "name": "create_table_reader_v3_writer_v5_fails",
+      "description": "Creating an invalid table with (3,5) fails: minReaderVersion=3 requires minWriterVersion=7.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {"minReaderVersion": 3, "minWriterVersion": 5},
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "read_snapshot_unknown_reader_feature_fails",
+      "flavor": "unknown_feature",
+      "description": "Reading a table with an unknown entry in readerFeatures fails.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": ["unknownFeature"],
+              "writerFeatures": ["unknownFeature"]
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 9,
+      "name": "read_snapshot_unknown_writer_feature_succeeds",
+      "flavor": "unknown_feature",
+      "description": "Reading a table with an unknown entry in writerFeatures only succeeds: readers need not understand writer-only features.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_2_7_unknown_writer"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "empty_commit_unknown_writer_feature_fails",
+      "flavor": "unknown_feature",
+      "description": "Writing to a table with an unknown entry in writerFeatures fails.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_2_7_unknown_writer"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 11,
+      "name": "read_snapshot_reader_writer_feature_only_in_reader_features_fails",
+      "description": "Reading a table with deletionVectors in readerFeatures but not writerFeatures fails: listing a feature only in readerFeatures is forbidden.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": ["deletionVectors"],
+              "writerFeatures": []
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 12,
+      "name": "read_snapshot_reader_writer_feature_only_in_writer_features_fails",
+      "description": "Reading a table with deletionVectors in writerFeatures but not readerFeatures fails: reader-writer features must appear in both lists.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": [],
+              "writerFeatures": ["deletionVectors"]
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 13,
+      "name": "read_snapshot_protocol_version_too_high_fails",
+      "description": "Reading a table with minReaderVersion=999 fails: readers reject unsupported protocol versions.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 999,
+              "minWriterVersion": 999,
+              "readerFeatures": [],
+              "writerFeatures": []
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 14,
+      "name": "read_snapshot_high_writer_version_only_succeeds",
+      "description": "Reading a table with a supported minReaderVersion but unsupported minWriterVersion=999 succeeds: readers check only the reader version.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 2, "minWriterVersion": 999, "writerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "empty_commit_high_writer_version_only_fails",
+      "description": "Writing to a table with minWriterVersion=999 fails even if the reader version is supported.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 2, "minWriterVersion": 999, "writerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 16,
+      "name": "create_table_3_7_empty_features_succeeds",
+      "description": "Creating a valid (3,7) table with empty readerFeatures and writerFeatures succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 3,
+          "minWriterVersion": 7,
+          "readerFeatures": [],
+          "writerFeatures": []
+        },
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 17,
+      "name": "create_table_legacy_reader_modern_writer_2_7_succeeds",
+      "description": "Creating a valid (2,7) table with empty writerFeatures succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {"minReaderVersion": 2, "minWriterVersion": 7, "writerFeatures": []},
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 18,
+      "name": "create_table_high_writer_version_only_fails",
+      "description": "Creating a table with a supported minReaderVersion but unsupported minWriterVersion=999 fails: writers do not commit unsupported protocol versions.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {"minReaderVersion": 2, "minWriterVersion": 999, "writerFeatures": []},
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 19,
+      "name": "create_table_protocol_version_too_high_fails",
+      "description": "Creating a table with minReaderVersion=999 fails: writers do not commit unsupported protocol versions.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 999,
+          "minWriterVersion": 999,
+          "readerFeatures": [],
+          "writerFeatures": []
+        },
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 20,
+      "name": "empty_commit_3_7_empty_features_succeeds",
+      "description": "Appending to a valid (3,7) table with empty readerFeatures and writerFeatures succeeds.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": [],
+              "writerFeatures": []
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 21,
+      "name": "empty_commit_legacy_reader_modern_writer_2_7_succeeds",
+      "description": "Appending to a valid (2,7) table with no writer features succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 2, "minWriterVersion": 7, "writerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 22,
+      "name": "create_table_3_7_missing_writer_features_fails",
+      "description": "Creating a table with (3,7) but no writerFeatures key fails: writerFeatures is required when minWriterVersion=7.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": []},
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 23,
+      "name": "create_table_3_7_missing_reader_features_fails",
+      "description": "Creating a table with (3,7) but no readerFeatures key fails: readerFeatures is required when minReaderVersion=3.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "writerFeatures": []},
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 24,
+      "name": "create_table_2_7_with_reader_features_present_fails",
+      "description": "Creating a table with (2,7) and readerFeatures present fails: readerFeatures is only valid when minReaderVersion=3.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 2,
+          "minWriterVersion": 7,
+          "readerFeatures": [],
+          "writerFeatures": []
+        },
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 25,
+      "name": "empty_commit_3_7_missing_writer_features_fails",
+      "description": "Appending to a (3,7) table missing the writerFeatures key fails.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 26,
+      "name": "empty_commit_2_7_with_reader_features_present_fails",
+      "description": "Appending to a (2,7) table with readerFeatures present fails: the table is in an invalid protocol state.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 2,
+              "minWriterVersion": 7,
+              "readerFeatures": [],
+              "writerFeatures": []
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 27,
+      "name": "empty_commit_modern_reader_legacy_writer_3_5_fails",
+      "description": "Appending to a (3,5) table fails; (3,5) is a structurally invalid version pair.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 3, "minWriterVersion": 5, "readerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 28,
+      "name": "create_table_unknown_reader_feature_fails",
+      "flavor": "unknown_feature",
+      "description": "Creating a table listing an unknown reader feature fails: writers do not commit unknown reader features.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 3,
+          "minWriterVersion": 7,
+          "readerFeatures": ["unknownFeature"],
+          "writerFeatures": ["unknownFeature"]
+        },
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 29,
+      "name": "create_table_unknown_writer_feature_fails",
+      "flavor": "unknown_feature",
+      "description": "Creating a table listing an unknown writer feature fails: writers do not commit unknown writer features.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 2,
+          "minWriterVersion": 7,
+          "writerFeatures": ["unknownFeature"]
+        },
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 30,
+      "name": "empty_commit_unknown_reader_feature_fails",
+      "flavor": "unknown_feature",
+      "description": "Writing to a table with an unknown reader feature fails.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": ["unknownFeature"],
+              "writerFeatures": ["unknownFeature"]
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 31,
+      "name": "create_table_reader_writer_feature_only_in_reader_features_fails",
+      "description": "Creating a table with deletionVectors in readerFeatures but not writerFeatures fails: reader-writer features appear in both lists.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 3,
+          "minWriterVersion": 7,
+          "readerFeatures": ["deletionVectors"],
+          "writerFeatures": []
+        },
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 32,
+      "name": "create_table_reader_writer_feature_only_in_writer_features_fails",
+      "description": "Creating a table with deletionVectors in writerFeatures but not readerFeatures fails: reader-writer features appear in both lists.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 3,
+          "minWriterVersion": 7,
+          "readerFeatures": [],
+          "writerFeatures": ["deletionVectors"]
+        },
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 33,
+      "name": "empty_commit_reader_writer_feature_only_in_reader_features_fails",
+      "description": "Writing to a table with deletionVectors in readerFeatures but not writerFeatures fails.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": ["deletionVectors"],
+              "writerFeatures": []
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 34,
+      "name": "create_table_legacy_1_2_with_writer_features_present_fails",
+      "description": "Creating a (1,2) table with writerFeatures present fails; writerFeatures only exists when minWriterVersion=7.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2_with_writer_features",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 35,
+      "name": "create_table_3_7_unknown_writer_feature_only_fails",
+      "flavor": "unknown_feature",
+      "description": "Creating a (3,7) table with an unknown feature in writerFeatures only fails; writers must not commit features they do not implement.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_unknown_writer_only",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 36,
+      "name": "empty_commit_reader_writer_feature_only_in_writer_features_fails",
+      "description": "Writing to a table with deletionVectors in writerFeatures but not readerFeatures fails.",
+      "setup": {
+        "log_actions": [
+          {
+            "protocol": {
+              "minReaderVersion": 3,
+              "minWriterVersion": 7,
+              "readerFeatures": [],
+              "writerFeatures": ["deletionVectors"]
+            }
+          },
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 37,
+      "name": "nullable_false_legacy_1_1_create_table_succeeds",
+      "note": "$errata.nullable_false_invariants",
+      "description": "Creating a (1,1) table with a nullable=false column succeeds: no constraint feature exists at writer version 1.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_1",
+        "metadata": {"schemaString": "$schemas.simple_int_nn"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 38,
+      "name": "nullable_false_without_constraint_feature_modern_create_table_fails",
+      "note": "$errata.nullable_false_invariants",
+      "description": "Creating a (3,7) table with a nullable=false column but no constraint feature in writerFeatures fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int_nn"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 39,
+      "name": "nullable_false_with_invariants_feature_empty_commit_succeeds",
+      "feature": "invariants",
+      "note": "$errata.nullable_false_invariants",
+      "description": "Appending to a (3,7)+[invariants] table with a nullable=false column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_invariants"},
+          {"metaData": {"schemaString": "$schemas.simple_int_nn"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 40,
+      "name": "read_snapshot_3_7_missing_reader_features_fails",
+      "description": "Reading a (3,7) table with writerFeatures present but no readerFeatures key fails: readerFeatures is required when minReaderVersion=3.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "writerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 41,
+      "name": "empty_commit_3_7_missing_reader_features_fails",
+      "description": "Appending to a (3,7) table with writerFeatures present but no readerFeatures key fails: readerFeatures is required when minReaderVersion=3.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "writerFeatures": []}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 42,
+      "name": "create_table_2_7_missing_writer_features_fails",
+      "description": "Creating a table with (2,7) but no writerFeatures key fails: writerFeatures is required when minWriterVersion=7.",
+      "operation": {
+        "type": "create_table",
+        "protocol": {"minReaderVersion": 2, "minWriterVersion": 7},
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 43,
+      "name": "read_snapshot_2_7_missing_writer_features_fails",
+      "description": "Reading a (2,7) table with no writerFeatures key fails: writerFeatures is required when minWriterVersion=7.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 2, "minWriterVersion": 7}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 44,
+      "name": "empty_commit_2_7_missing_writer_features_fails",
+      "description": "Appending to a (2,7) table with no writerFeatures key fails: writerFeatures is required when minWriterVersion=7.",
+      "setup": {
+        "log_actions": [
+          {"protocol": {"minReaderVersion": 2, "minWriterVersion": 7}},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 45,
+      "name": "read_snapshot_legacy_1_1_succeeds",
+      "description": "Reading a (1,1) table succeeds; this is the baseline legacy protocol with no table feature lists.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_1"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 46,
+      "name": "empty_commit_legacy_1_1_succeeds",
+      "description": "Appending to a (1,1) table succeeds; this is the baseline legacy protocol with no table feature lists.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_1"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    }
+  ]
+}

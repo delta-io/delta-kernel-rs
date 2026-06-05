@@ -1,0 +1,259 @@
+{
+  "$schemas": {
+    "variant_array_col": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "v",
+          "type": {"type": "array", "elementType": {"type": "variant"}, "containsNull": true},
+          "nullable": true,
+          "metadata": {}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "variant_col": {
+      "type": "struct",
+      "fields": [{"name": "v", "type": "variant", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "variant_both_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["variantType-preview", "variantType"],
+      "writerFeatures": ["variantType-preview", "variantType"]
+    },
+    "legacy_1_2": {"minReaderVersion": 1, "minWriterVersion": 2},
+    "variant_preview_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["variantType-preview"],
+      "writerFeatures": ["variantType-preview"]
+    },
+    "variant_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["variantType"],
+      "writerFeatures": ["variantType"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    }
+  },
+  "$notes": {
+    "preview_not_in_spec": "variantType-preview and variantShredding-preview are not described in the ratified Delta protocol spec. The variantType acceptance PR (delta-io/delta#4096) made substantive changes to writer struct-field requirements relative to the original RFC, so preview-era implementations may differ. Cases for preview feature names record observed behavior rather than spec requirements; expected_outcome reflects our best current understanding.",
+    "variant_schema_requires_feature": "The spec requires variantType to be listed in both readerFeatures and writerFeatures when the schema contains variant columns. A variant schema without the feature listed is an explicitly invalid table state, not an ambiguous orphan; failure here is spec-grounded rather than errata."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "variant_type_create_table_3_7_feature_listed_succeeds",
+      "feature": "variantType",
+      "description": "Creating a (3,7)+[variantType] table with a variant column succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.variant_3_7",
+        "metadata": {"schemaString": "$schemas.variant_col"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "variant_type_create_table_1_2_with_variant_schema_fails",
+      "feature": "variantType",
+      "flavor": "insufficient_protocol",
+      "description": "Creating a (1,2) table with a variant column fails; variantType requires minReaderVersion=3, minWriterVersion=7, and the feature listed in both readerFeatures and writerFeatures.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2",
+        "metadata": {"schemaString": "$schemas.variant_col"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "variant_type_create_table_3_7_no_feature_listed_with_schema_fails",
+      "feature": "variantType",
+      "flavor": "orphan",
+      "description": "Creating a (3,7) table with a variant column but variantType absent from both feature lists fails; the spec requires the feature to be listed when the schema contains variant columns.",
+      "note": "$notes.variant_schema_requires_feature",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {"schemaString": "$schemas.variant_col"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "variant_type_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "variantType",
+      "description": "Reading a (3,7)+[variantType] table with a variant column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "variant_type_read_snapshot_3_7_variant_array_column_succeeds",
+      "feature": "variantType",
+      "description": "Reading a (3,7)+[variantType] table with a variant array column succeeds; the spec explicitly shows variant as a valid array element type.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_array_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "variant_type_supported_not_active_read_snapshot_succeeds",
+      "feature": "variantType",
+      "flavor": "supported_not_active",
+      "description": "Reading a (3,7)+[variantType] table with no variant columns in the schema succeeds.",
+      "note": "variantType is active only when the schema contains at least one variant column. A table may list the feature without any variant columns.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "variant_type_read_snapshot_3_7_no_feature_listed_with_schema_fails",
+      "feature": "variantType",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with a variant column but variantType absent from both feature lists fails; the spec requires the feature to be listed when the schema contains variant columns.",
+      "note": "$notes.variant_schema_requires_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "variant_type_empty_commit_3_7_feature_listed_succeeds",
+      "feature": "variantType",
+      "description": "Appending to a (3,7)+[variantType] table with a variant column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "variant_type_empty_commit_supported_not_active_succeeds",
+      "feature": "variantType",
+      "flavor": "supported_not_active",
+      "description": "Appending to a (3,7)+[variantType] table with no variant columns in the schema succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "variant_type_empty_commit_3_7_no_feature_listed_with_schema_fails",
+      "feature": "variantType",
+      "flavor": "orphan",
+      "description": "Appending to a (3,7) table with a variant column but variantType absent from both feature lists fails; the spec requires the feature to be listed when the schema contains variant columns.",
+      "note": "$notes.variant_schema_requires_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 11,
+      "name": "variant_type_preview_create_table_3_7_feature_listed_succeeds",
+      "feature": "variantType-preview",
+      "description": "Creating a (3,7)+[variantType-preview] table with a variant column succeeds.",
+      "note": "$notes.preview_not_in_spec",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.variant_preview_3_7",
+        "metadata": {"schemaString": "$schemas.variant_col"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "variant_type_preview_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "variantType-preview",
+      "description": "Reading a (3,7)+[variantType-preview] table with a variant column succeeds.",
+      "note": "$notes.preview_not_in_spec",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_preview_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "variant_type_preview_read_snapshot_3_7_no_feature_listed_with_schema_fails",
+      "feature": "variantType-preview",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with a variant column but variantType-preview absent from both feature lists fails.",
+      "note": "$notes.preview_not_in_spec",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 14,
+      "name": "variant_type_preview_and_stable_read_snapshot_succeeds",
+      "feature": "variantType",
+      "description": "Reading a (3,7)+[variantType-preview, variantType] table with a variant column succeeds; tables upgraded from preview to stable may carry both feature names.",
+      "note": "$notes.preview_not_in_spec",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_both_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    }
+  ]
+}

@@ -1,0 +1,196 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "ict_1_7": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 7,
+      "writerFeatures": ["inCommitTimestamp"]
+    },
+    "modern_1_7": {"minReaderVersion": 1, "minWriterVersion": 7, "writerFeatures": []}
+  },
+  "$notes": {
+    "ict_activation": "inCommitTimestamp is a writer-only feature with two activation conditions: (1) the feature must be listed in writerFeatures, and (2) the table property delta.enableInCommitTimestamps must be set to true. When active, every commit must include a commitInfo action as the first action with an inCommitTimestamp field set to a monotonically increasing millisecond timestamp.",
+    "ict_reader_not_required": "inCommitTimestamp is writer-only. Readers are not required to check writerFeatures for this feature, nor are they required to fail when delta.enableInCommitTimestamps is set without the feature listed. Readers should use inCommitTimestamp for time-travel when available, but this is a recommendation."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "in_commit_timestamp_create_table_1_7_feature_listed_property_true_succeeds",
+      "feature": "inCommitTimestamp",
+      "description": "Creating a (1,7)+[inCommitTimestamp] table with delta.enableInCommitTimestamps=true succeeds.",
+      "note": "$notes.ict_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.ict_1_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableInCommitTimestamps": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "in_commit_timestamp_create_table_1_7_no_feature_listed_property_true_fails",
+      "feature": "inCommitTimestamp",
+      "flavor": "orphan",
+      "description": "Creating a (1,7) table with delta.enableInCommitTimestamps=true but inCommitTimestamp absent from writerFeatures fails; the active property requires the feature to be listed.",
+      "note": "$notes.ict_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_1_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableInCommitTimestamps": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "in_commit_timestamp_read_snapshot_1_7_feature_listed_property_true_succeeds",
+      "feature": "inCommitTimestamp",
+      "description": "Reading a (1,7)+[inCommitTimestamp] table with delta.enableInCommitTimestamps=true succeeds; ICT is writer-only and readers are not required to understand or enforce ICT writer invariants.",
+      "note": "$notes.ict_reader_not_required",
+      "setup": {
+        "log_actions": [
+          {
+            "commitInfo": {
+              "timestamp": 1704067200000,
+              "inCommitTimestamp": 1704067200000,
+              "operation": "CREATE TABLE",
+              "operationParameters": {}
+            }
+          },
+          {"protocol": "$protocols.ict_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "in_commit_timestamp_read_snapshot_1_7_no_feature_listed_property_true_succeeds",
+      "feature": "inCommitTimestamp",
+      "flavor": "orphan",
+      "description": "Reading a (1,7) table with delta.enableInCommitTimestamps=true but inCommitTimestamp absent from writerFeatures succeeds; ICT is writer-only and readers are not required to fail when the property is present without the feature listed.",
+      "note": "$notes.ict_reader_not_required",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "in_commit_timestamp_empty_commit_1_7_feature_listed_property_true_succeeds",
+      "feature": "inCommitTimestamp",
+      "description": "Appending to a (1,7)+[inCommitTimestamp] table with delta.enableInCommitTimestamps=true succeeds; the writer includes commitInfo with inCommitTimestamp in the new commit.",
+      "note": "The setup log entry includes a commitInfo with inCommitTimestamp so that the table's initial commit is ICT-valid; the spec requires every commit on an ICT-enabled table to carry inCommitTimestamp and the writer must be able to verify monotonicity against the previous commit's value.",
+      "setup": {
+        "log_actions": [
+          {
+            "commitInfo": {
+              "timestamp": 1704067200000,
+              "inCommitTimestamp": 1704067200000,
+              "operation": "CREATE TABLE",
+              "operationParameters": {}
+            }
+          },
+          {"protocol": "$protocols.ict_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "in_commit_timestamp_empty_commit_1_7_no_feature_listed_property_true_fails",
+      "feature": "inCommitTimestamp",
+      "flavor": "orphan",
+      "description": "Appending to a (1,7) table with delta.enableInCommitTimestamps=true but inCommitTimestamp absent from writerFeatures fails; writers must reject tables whose metadata activates a feature not listed in writerFeatures.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 7,
+      "name": "in_commit_timestamp_supported_not_active_create_table_succeeds",
+      "feature": "inCommitTimestamp",
+      "flavor": "supported_not_active",
+      "description": "Creating a (1,7)+[inCommitTimestamp] table without delta.enableInCommitTimestamps=true succeeds; the feature is supported but not active \u2014 both the feature and the property must be present to activate ICT.",
+      "note": "$notes.ict_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.ict_1_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "in_commit_timestamp_supported_not_active_read_snapshot_succeeds",
+      "feature": "inCommitTimestamp",
+      "flavor": "supported_not_active",
+      "description": "Reading a (1,7)+[inCommitTimestamp] table without delta.enableInCommitTimestamps=true succeeds; the feature is supported but not active.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ict_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "in_commit_timestamp_supported_not_active_empty_commit_succeeds",
+      "feature": "inCommitTimestamp",
+      "flavor": "supported_not_active",
+      "description": "Appending to a (1,7)+[inCommitTimestamp] table without delta.enableInCommitTimestamps=true succeeds; ICT writer requirements do not apply when the property is absent.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ict_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    }
+  ]
+}

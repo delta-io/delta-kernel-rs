@@ -1,0 +1,172 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "simple_int_id_col_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-1"}
+        }
+      ]
+    },
+    "simple_int_name_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        }
+      ]
+    },
+    "byte_col_id_col_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "b",
+          "type": "byte",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-1"}
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "iceberg_writer_v1_preview_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV2", "icebergWriterCompatV1-preview"]
+    },
+    "iceberg_writer_v1_preview_no_v2_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergWriterCompatV1-preview"]
+    }
+  },
+  "$notes": {
+    "writer_compat_v1_preview_rfc": "icebergWriterCompatV1 is an RFC-stage feature (protocol_rfcs/iceberg-writer-compat-v1.md) not yet ratified in PROTOCOL.md. Cases use the feature name icebergWriterCompatV1-preview per the pre-ratification naming convention. RFC requires: columnMapping AND icebergCompatV2 in writerFeatures, CM in id mode (tightening of ICv2 which allows name or id), physical names must follow the col-[id] convention, ICv2 must be enabled, no byte or short column types.",
+    "id_mode_required": "icebergWriterCompatV1 tightens ICv2's column mapping mode requirement from name-or-id to id-only, and further requires physical names to exactly follow the col-[id] convention (physicalName == 'col-' + columnMappingId)."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "iceberg_writer_v1_preview_create_table_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergWriterCompatV1-preview",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2,icebergWriterCompatV1-preview] table with id-mode CM, col-[id] physical names, ICv2 active, and delta.enableIcebergWriterCompatV1=true succeeds.",
+      "note": "$notes.writer_compat_v1_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_writer_v1_preview_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_id_col_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.enableIcebergCompatV2": "true",
+            "delta.enableIcebergWriterCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "iceberg_writer_v1_preview_supported_not_active_create_table_succeeds",
+      "feature": "icebergWriterCompatV1-preview",
+      "flavor": "supported_not_active",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2,icebergWriterCompatV1-preview] table without delta.enableIcebergWriterCompatV1=true succeeds; icebergWriterCompatV1-preview writer requirements only apply when the feature is active.",
+      "note": "$notes.writer_compat_v1_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_writer_v1_preview_2_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "iceberg_writer_v1_preview_create_table_2_7_missing_iceberg_compat_v2_fails",
+      "feature": "icebergWriterCompatV1-preview",
+      "flavor": "missing_dependency",
+      "description": "Creating a (2,7)+[columnMapping,icebergWriterCompatV1-preview] table without icebergCompatV2 in writerFeatures and delta.enableIcebergWriterCompatV1=true fails; the RFC requires icebergCompatV2 to be co-listed as a protocol-level prerequisite.",
+      "note": "$notes.writer_compat_v1_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_writer_v1_preview_no_v2_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_id_col_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.enableIcebergWriterCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "iceberg_writer_v1_preview_create_table_2_7_iceberg_compat_v2_not_active_fails",
+      "feature": "icebergWriterCompatV1-preview",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2,icebergWriterCompatV1-preview] table with delta.enableIcebergWriterCompatV1=true but without delta.enableIcebergCompatV2=true fails; the RFC requires ICv2 to be enabled (not merely supported) when icebergWriterCompatV1 is active.",
+      "note": "$notes.writer_compat_v1_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_writer_v1_preview_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_id_col_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.enableIcebergWriterCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 5,
+      "name": "iceberg_writer_v1_preview_create_table_2_7_column_mapping_name_mode_fails",
+      "feature": "icebergWriterCompatV1-preview",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2,icebergWriterCompatV1-preview] table with delta.enableIcebergWriterCompatV1=true and columnMapping mode=name fails; the RFC tightens ICv2's name-or-id requirement to id-only.",
+      "note": "$notes.id_mode_required",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_writer_v1_preview_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_name_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true",
+            "delta.enableIcebergWriterCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 6,
+      "name": "iceberg_writer_v1_preview_create_table_2_7_byte_column_fails",
+      "feature": "icebergWriterCompatV1-preview",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2,icebergWriterCompatV1-preview] table with delta.enableIcebergWriterCompatV1=true and a byte-type column fails; the RFC forbids byte and short column types.",
+      "note": "$notes.writer_compat_v1_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_writer_v1_preview_2_7",
+        "metadata": {
+          "schemaString": "$schemas.byte_col_id_col_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.enableIcebergCompatV2": "true",
+            "delta.enableIcebergWriterCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    }
+  ]
+}

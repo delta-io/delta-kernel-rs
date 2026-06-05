@@ -1,0 +1,111 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "modern_3_7_no_features": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "domain_metadata_1_7": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 7,
+      "writerFeatures": ["domainMetadata"]
+    }
+  },
+  "$notes": {},
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "domain_metadata_create_table_1_7_feature_listed_succeeds",
+      "feature": "domainMetadata",
+      "description": "Creating a (1,7)+[domainMetadata] table succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.domain_metadata_1_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "domain_metadata_read_snapshot_1_7_feature_listed_succeeds",
+      "feature": "domainMetadata",
+      "description": "Reading a (1,7)+[domainMetadata] table succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.domain_metadata_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "domain_metadata_empty_commit_1_7_feature_listed_succeeds",
+      "feature": "domainMetadata",
+      "description": "Committing to a (1,7)+[domainMetadata] table succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.domain_metadata_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "domain_metadata_read_snapshot_1_7_with_user_domain_succeeds",
+      "feature": "domainMetadata",
+      "description": "Reading a (1,7)+[domainMetadata] table with a user-controlled domain action in the log succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.domain_metadata_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}},
+          {"domainMetadata": {"domain": "myApp.config", "configuration": "{}"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "domain_metadata_empty_commit_1_7_with_user_domain_succeeds",
+      "feature": "domainMetadata",
+      "description": "Committing to a (1,7)+[domainMetadata] table with a user-controlled domain action in the log succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.domain_metadata_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}},
+          {"domainMetadata": {"domain": "myApp.config", "configuration": "{}"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "domain_metadata_empty_commit_3_7_orphan_domain_action_succeeds",
+      "feature": "domainMetadata",
+      "flavor": "orphan",
+      "description": "Committing to a (3,7) table containing a domainMetadata action but without domainMetadata in protocol succeeds.",
+      "note": "$errata.domain_metadata_support_term_ambiguity",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_no_features"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}},
+          {"domainMetadata": {"domain": "myApp.config", "configuration": "{}"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    }
+  ]
+}

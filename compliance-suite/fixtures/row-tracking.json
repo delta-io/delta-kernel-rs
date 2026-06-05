@@ -1,0 +1,265 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "row_tracking_no_domain_1_7": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 7,
+      "writerFeatures": ["rowTracking"]
+    },
+    "row_tracking_1_7": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 7,
+      "writerFeatures": ["domainMetadata", "rowTracking"]
+    }
+  },
+  "$notes": {
+    "row_tracking_supported_vs_enabled": "rowTracking has two levels: (1) supported \u2014 feature listed in writerFeatures, writers MUST assign baseRowId and defaultRowCommitVersion in all new add actions (unless suspended); (2) enabled \u2014 feature listed AND delta.enableRowTracking=true, which additionally allows readers to rely on the fields being present. The domainMetadata feature must also be listed in writerFeatures; rowTracking stores its high-water mark in a delta.rowTracking system domain.",
+    "row_tracking_dependency": "The spec explicitly requires domainMetadata to be in writerFeatures whenever rowTracking is listed. A protocol with rowTracking but without domainMetadata is invalid.",
+    "row_tracking_insert_rows_gap": "The mandatory baseRowId/defaultRowCommitVersion assignment on add actions, the domainMetadata high-water mark update, and the backfill prerequisite for enabling row tracking on an existing table all require add actions in the log to exercise. These are not testable with empty_commit and require a future insert_rows operation type."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "row_tracking_create_table_1_7_feature_and_domain_metadata_listed_succeeds",
+      "feature": "rowTracking",
+      "description": "Creating a (1,7)+[rowTracking,domainMetadata] table succeeds; rowTracking is supported but not yet enabled.",
+      "note": "$notes.row_tracking_supported_vs_enabled",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.row_tracking_1_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "row_tracking_create_table_1_7_enabled_with_prerequisites_succeeds",
+      "feature": "rowTracking",
+      "description": "Creating a (1,7)+[rowTracking,domainMetadata] table with delta.enableRowTracking=true and the required materialized column name properties succeeds.",
+      "note": "$errata.row_tracking_enabled_prerequisites",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.row_tracking_1_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "_commit_version"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "row_tracking_create_table_1_7_enabled_missing_prerequisites_fails",
+      "feature": "rowTracking",
+      "description": "Creating a (1,7)+[rowTracking,domainMetadata] table with delta.enableRowTracking=true but without required materialized column name properties fails.",
+      "note": "$errata.row_tracking_enabled_prerequisites",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.row_tracking_1_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableRowTracking": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "row_tracking_create_table_1_7_enabled_materialized_row_id_conflicts_with_schema_column_fails",
+      "feature": "rowTracking",
+      "description": "Creating a (1,7)+[rowTracking,domainMetadata] table with delta.enableRowTracking=true where the materialized row ID column name matches an existing schema column fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.row_tracking_1_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "_commit_version"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 5,
+      "name": "row_tracking_create_table_1_7_enabled_materialized_commit_version_conflicts_with_schema_column_fails",
+      "feature": "rowTracking",
+      "description": "Creating a (1,7)+[rowTracking,domainMetadata] table with delta.enableRowTracking=true where the materialized row commit version column name matches an existing schema column fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.row_tracking_1_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "id"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 6,
+      "name": "row_tracking_create_table_1_7_enabled_materialized_column_names_not_unique_fails",
+      "feature": "rowTracking",
+      "description": "Creating a (1,7)+[rowTracking,domainMetadata] table with delta.enableRowTracking=true where the materialized row ID and row commit version column names are identical fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.row_tracking_1_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "_row_id"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 7,
+      "name": "row_tracking_create_table_1_7_feature_listed_missing_domain_metadata_fails",
+      "feature": "rowTracking",
+      "flavor": "missing_dependency",
+      "description": "Creating a (1,7)+[rowTracking] table without domainMetadata in writerFeatures fails; the spec requires domainMetadata to be co-listed whenever rowTracking is used.",
+      "note": "$notes.row_tracking_dependency",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.row_tracking_no_domain_1_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "row_tracking_read_snapshot_1_7_feature_and_domain_metadata_listed_succeeds",
+      "feature": "rowTracking",
+      "description": "Reading a (1,7)+[rowTracking,domainMetadata] table succeeds; rowTracking is writer-only and does not impose reader requirements.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.row_tracking_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "row_tracking_empty_commit_1_7_feature_and_domain_metadata_listed_succeeds",
+      "feature": "rowTracking",
+      "description": "Appending to a (1,7)+[rowTracking,domainMetadata] table succeeds.",
+      "note": "$notes.row_tracking_insert_rows_gap",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.row_tracking_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "row_tracking_empty_commit_1_7_suspended_succeeds",
+      "feature": "rowTracking",
+      "flavor": "supported_not_active",
+      "description": "Appending to a (1,7)+[rowTracking,domainMetadata] table with delta.rowTrackingSuspended=true succeeds; writers must not assign Row IDs when tracking is suspended.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.row_tracking_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.rowTrackingSuspended": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "row_tracking_read_snapshot_3_7_no_feature_listed_with_property_succeeds",
+      "feature": "rowTracking",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with delta.enableRowTracking=true but rowTracking absent from writerFeatures succeeds; rowTracking is writer-only and the orphan property has no effect on reads.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableRowTracking": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "row_tracking_suspended_and_enabled_empty_commit_fails",
+      "feature": "rowTracking",
+      "description": "Appending to a (1,7)+[rowTracking,domainMetadata] table with both delta.enableRowTracking=true and delta.rowTrackingSuspended=true fails; the two properties are mutually exclusive.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.row_tracking_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {
+                "delta.enableRowTracking": "true",
+                "delta.rowTrackingSuspended": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 13,
+      "name": "row_tracking_supported_and_enabled_empty_commit_missing_prerequisites_fails",
+      "feature": "rowTracking",
+      "description": "Appending to a (1,7)+[rowTracking,domainMetadata] table with delta.enableRowTracking=true but without required materialized column name properties fails; enablement prerequisites are not satisfied.",
+      "note": "$errata.row_tracking_enabled_prerequisites",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.row_tracking_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableRowTracking": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    }
+  ]
+}

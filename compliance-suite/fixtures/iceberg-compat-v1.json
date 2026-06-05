@@ -1,0 +1,542 @@
+{
+  "$schemas": {
+    "simple_int_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "array_int_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "arr_col",
+          "type": {"type": "array", "elementType": "integer", "containsNull": true},
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "arr_col"}
+        }
+      ]
+    },
+    "map_string_int_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "map_col",
+          "type": {
+            "type": "map",
+            "keyType": "string",
+            "valueType": "integer",
+            "valueContainsNull": true
+          },
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "map_col"}
+        }
+      ]
+    },
+    "void_type_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        },
+        {
+          "name": "void_col",
+          "type": "void",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "void_col"}
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "column_mapping_only_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping"]
+    },
+    "column_mapping_only_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping"]
+    },
+    "iceberg_v1_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV1"]
+    },
+    "iceberg_v1_with_dv_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV1", "deletionVectors"]
+    },
+    "iceberg_v1_no_cm_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["icebergCompatV1"]
+    },
+    "iceberg_v1_with_dv_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping", "deletionVectors"],
+      "writerFeatures": ["columnMapping", "icebergCompatV1", "deletionVectors"]
+    },
+    "iceberg_v1_no_cm_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["icebergCompatV1"]
+    },
+    "no_features_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "iceberg_v1_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "icebergCompatV1"]
+    }
+  },
+  "$notes": {
+    "v1_activation": "icebergCompatV1 is activated by two conditions: (1) the feature listed in writerFeatures, and (2) the table property delta.enableIcebergCompatV1=true. When active, columnMapping must be in name or id mode, deletionVectors must not be supported, partition values must be materialized, and Map/Array/Void types are forbidden."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "iceberg_v1_create_table_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV1",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV1] table with columnMapping mode=name and delta.enableIcebergCompatV1=true succeeds.",
+      "note": "$notes.v1_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "iceberg_v1_create_table_3_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV1",
+      "description": "Creating a (3,7)+[columnMapping, icebergCompatV1] table with columnMapping mode=name and delta.enableIcebergCompatV1=true succeeds.",
+      "note": "$notes.v1_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "iceberg_v1_supported_not_active_create_table_succeeds",
+      "feature": "icebergCompatV1",
+      "flavor": "supported_not_active",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV1] table without delta.enableIcebergCompatV1=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_2_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "iceberg_v1_create_table_2_7_no_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV1",
+      "flavor": "orphan",
+      "description": "Creating a (2,7)+[columnMapping] table with delta.enableIcebergCompatV1=true but icebergCompatV1 absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.column_mapping_only_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "iceberg_v1_create_table_2_7_missing_column_mapping_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "missing_dependency",
+      "description": "Creating a (2,7)+[icebergCompatV1] table without columnMapping in writerFeatures and delta.enableIcebergCompatV1=true fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_no_cm_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV1": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 6,
+      "name": "iceberg_v1_create_table_2_7_column_mapping_not_active_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "missing_required_metadata",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true but no columnMapping mode set fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV1": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 7,
+      "name": "iceberg_v1_create_table_2_7_with_deletion_vectors_active_fails",
+      "feature": "icebergCompatV1",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV1,deletionVectors] table with delta.enableIcebergCompatV1=true and delta.enableDeletionVectors=true fails; deletionVectors must not be supported.",
+      "note": "$errata.iceberg_compat_dv_restriction",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_with_dv_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true",
+            "delta.enableDeletionVectors": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "iceberg_v1_create_table_2_7_with_deletion_vectors_supported_not_active_fails",
+      "feature": "icebergCompatV1",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV1,deletionVectors] table with delta.enableIcebergCompatV1=true but without delta.enableDeletionVectors=true fails; deletionVectors must not be supported.",
+      "note": "$errata.iceberg_compat_dv_restriction",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_with_dv_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 9,
+      "name": "iceberg_v1_read_snapshot_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV1",
+      "description": "Reading a (2,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v1_2_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV1": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "iceberg_v1_empty_commit_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV1",
+      "description": "Committing to a (2,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v1_2_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV1": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "iceberg_v1_read_snapshot_3_7_no_feature_listed_with_property_succeeds",
+      "feature": "icebergCompatV1",
+      "flavor": "orphan",
+      "description": "Reading a (3,7)+[columnMapping] table with delta.enableIcebergCompatV1=true but icebergCompatV1 absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.column_mapping_only_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV1": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "iceberg_v1_create_table_3_7_without_column_mapping_protocol_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "missing_dependency",
+      "description": "Creating a (3,7)+[icebergCompatV1] table without columnMapping in readerFeatures and writerFeatures fails, even without delta.enableIcebergCompatV1=true; columnMapping must be supported whenever icebergCompatV1 is supported.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_no_cm_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 13,
+      "name": "iceberg_v1_create_table_3_7_with_array_type_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true and an Array type column fails; ICv1 forbids Array types when active.",
+      "note": "$notes.v1_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_3_7",
+        "metadata": {
+          "schemaString": "$schemas.array_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 14,
+      "name": "iceberg_v1_create_table_3_7_with_map_type_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true and a Map type column fails; ICv1 forbids Map types when active.",
+      "note": "$notes.v1_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_3_7",
+        "metadata": {
+          "schemaString": "$schemas.map_string_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 15,
+      "name": "iceberg_v1_read_snapshot_3_7_with_void_type_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "invalid_metadata_content",
+      "description": "Reading a (3,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true and a Void type column fails; ICv1 forbids Void types when active.",
+      "note": "$notes.v1_activation",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v1_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.void_type_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV1": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 16,
+      "name": "iceberg_v1_read_snapshot_3_7_with_array_type_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "invalid_metadata_content",
+      "description": "Reading a (3,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true and an Array type column fails; ICv1 forbids Array types when active.",
+      "note": "$notes.v1_activation",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v1_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.array_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV1": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 17,
+      "name": "iceberg_v1_read_snapshot_3_7_with_map_type_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "invalid_metadata_content",
+      "description": "Reading a (3,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true and a Map type column fails; ICv1 forbids Map types when active.",
+      "note": "$notes.v1_activation",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v1_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.map_string_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV1": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 18,
+      "name": "iceberg_v1_create_table_3_7_with_void_type_fails",
+      "feature": "icebergCompatV1",
+      "flavor": "invalid_metadata_content",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV1] table with delta.enableIcebergCompatV1=true and a Void type column fails; ICv1 forbids Void types when active.",
+      "note": "$notes.v1_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_3_7",
+        "metadata": {
+          "schemaString": "$schemas.void_type_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 19,
+      "name": "iceberg_v1_supported_not_active_create_table_3_7_with_deletion_vectors_active_succeeds",
+      "feature": "icebergCompatV1",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV1,deletionVectors] table with delta.enableDeletionVectors=true but without delta.enableIcebergCompatV1=true succeeds; ICv1 deletionVectors restrictions apply only when ICv1 is active.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_with_dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableDeletionVectors": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 20,
+      "name": "iceberg_v1_supported_not_active_create_table_3_7_with_deletion_vectors_supported_not_active_succeeds",
+      "feature": "icebergCompatV1",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[columnMapping,icebergCompatV1,deletionVectors] table without delta.enableIcebergCompatV1=true and without delta.enableDeletionVectors=true succeeds; ICv1 deletionVectors restrictions apply only when ICv1 is active.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_with_dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {"delta.columnMapping.mode": "name"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 21,
+      "name": "iceberg_v1_create_table_3_7_no_feature_no_cm_property_true_succeeds",
+      "feature": "icebergCompatV1",
+      "flavor": "orphan",
+      "description": "Creating a (3,7)+[] table with delta.enableIcebergCompatV1=true and delta.enableDeletionVectors=true succeeds; columnMapping dependency checks only apply when icebergCompatV1 is supported.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.no_features_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {
+            "delta.enableIcebergCompatV1": "true",
+            "delta.enableDeletionVectors": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    }
+  ]
+}
