@@ -19,6 +19,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
+use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
 
@@ -38,7 +39,8 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut sequential = SequentialPhase::try_new(processor, log_segment, engine)?;
+/// let mut sequential =
+///     SequentialPhase::try_new(processor, log_segment, engine, checkpoint_read_schema)?;
 ///
 /// // Iterate over sequential batches
 /// for batch in sequential.by_ref() {
@@ -93,14 +95,17 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// Create a new sequential phase log replay.
     ///
     /// # Parameters
-    /// - `processor`: The log replay processor
-    /// - `log_segment`: The log segment to process
-    /// - `engine`: Engine for reading files
+    /// `processor`: The log replay processor
+    /// `log_segment`: The log segment to process
+    /// `engine`: Engine for reading files
+    /// `checkpoint_read_schema`: Physical schema to use when reading a single part checkpoint
+    /// manifest during the sequential phase
     #[internal_api]
     pub(crate) fn try_new(
         processor: P,
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
+        checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let commit_phase = Some(CommitReader::try_new(
             engine.as_ref(),
@@ -111,10 +116,11 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => Some(CheckpointManifestReader::try_new(
+            [single_part] => Some(CheckpointManifestReader::try_new_with_schema(
                 engine,
                 single_part,
                 log_segment.log_root.clone(),
+                checkpoint_read_schema,
             )?),
             _ => None,
         };
@@ -177,6 +183,11 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
                 files: parallel_files,
             })
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn processor(&self) -> &P {
+        &self.processor
     }
 }
 
@@ -339,8 +350,8 @@ mod tests {
     fn test_sequential_checkpoint_no_commits() -> DeltaResult<()> {
         verify_sequential_processing(
             "with_checkpoint_no_last_checkpoint",
-            &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], /* Add from commit 3 */
-            &[], // No sidecars
+            &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"],
+            &[],
         )
     }
 }

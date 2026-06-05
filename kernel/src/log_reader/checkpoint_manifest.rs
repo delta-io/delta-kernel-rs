@@ -24,6 +24,17 @@ pub(crate) struct CheckpointManifestReader {
     manifest_file: FileMeta,
 }
 
+fn manifest_read_schema(checkpoint_read_schema: SchemaRef) -> SchemaRef {
+    let mut fields: Vec<StructField> = checkpoint_read_schema.fields().cloned().collect();
+    if fields.iter().all(|field| field.name() != REMOVE_NAME) {
+        fields.push(StructField::nullable(REMOVE_NAME, Remove::to_schema()));
+    }
+    if fields.iter().all(|field| field.name() != SIDECAR_NAME) {
+        fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+    }
+    Arc::new(StructType::new_unchecked(fields))
+}
+
 impl CheckpointManifestReader {
     /// Create a new manifest phase for a single-part checkpoint.
     ///
@@ -40,23 +51,48 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            Arc::new(StructType::new_unchecked([
-                StructField::nullable(ADD_NAME, Add::to_schema()),
-                StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-                StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-            ]))
+        static DEFAULT_CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                ADD_NAME,
+                Add::to_schema(),
+            )]))
         });
+        Self::try_new_with_schema(
+            engine,
+            manifest,
+            log_root,
+            DEFAULT_CHECKPOINT_READ_SCHEMA.clone(),
+        )
+    }
+
+    /// Create a manifest phase with a checkpoint read schema selected by the caller.
+    ///
+    /// The reader adds `remove` and `sidecar` columns when they are absent so it can
+    /// detect removes and sidecar references. Callers can pass projected schemas with
+    /// fields such as `add.stats_parsed` or `add.partitionValues_parsed`.
+    ///
+    /// # Parameters
+    /// `engine`: Engine for reading files
+    /// `manifest`: The checkpoint manifest file to process
+    /// `log_root`: Root URL for resolving sidecar paths
+    /// `checkpoint_read_schema`: Physical checkpoint schema selected by the caller
+    pub(crate) fn try_new_with_schema(
+        engine: Arc<dyn Engine>,
+        manifest: &ParsedLogPath,
+        log_root: Url,
+        checkpoint_read_schema: SchemaRef,
+    ) -> DeltaResult<Self> {
+        let manifest_read_schema = manifest_read_schema(checkpoint_read_schema);
 
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                manifest_read_schema.clone(),
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                manifest_read_schema,
                 None,
             )?,
             extension => {
