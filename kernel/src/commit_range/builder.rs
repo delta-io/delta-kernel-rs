@@ -157,9 +157,9 @@ fn validate_start_version_available(
     if first_commit.map(|f| f.version) == Some(start_version) {
         return Ok(());
     }
-    let earliest_available_commit = checkpoint_version
-        .map(|v| v + 1)
-        .or_else(|| first_commit.map(|f| f.version))
+    let earliest_available_commit = first_commit
+        .map(|f| f.version)
+        .or_else(|| checkpoint_version.map(|v| v + 1))
         .ok_or_else(|| {
             Error::generic("snapshot's log segment must have a checkpoint or at least one commit")
         })?;

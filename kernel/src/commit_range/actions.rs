@@ -1,7 +1,3 @@
-//! [`DeltaAction`]: selects which Delta log action to read.
-//! [`CommitAction`]: per-commit handle exposing version, timestamp,
-//! and a re-buildable iterator over the commit's action batches.
-
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
@@ -27,6 +23,9 @@ pub enum DeltaAction {
     CommitInfo,
     Cdc,
     DomainMetadata,
+    SetTxn,
+    CheckpointMetadata,
+    Sidecar,
 }
 
 /// Read schema for extracting protocol+metadata from a single commit JSON.
@@ -148,6 +147,9 @@ impl CommitAction {
 
     /// Return an iterator over the commit's action batches projected to the
     /// caller-requested `read_schema`.
+    ///
+    /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
+    /// translation is applied.
     pub fn get_actions(&self) -> DeltaResult<FileDataReadResultIterator> {
         self.engine.json_handler().read_json_files(
             slice::from_ref(&self.log_path.location),

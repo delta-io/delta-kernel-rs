@@ -54,8 +54,10 @@ pub use builder::{CommitOrdering, CommitRangeBuilder};
 use url::Url;
 
 use crate::actions::{
-    Add, Cdc, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
-    COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    Add, Cdc, CheckpointMetadata, CommitInfo, DomainMetadata, Metadata, Protocol, Remove,
+    SetTransaction, Sidecar, ADD_NAME, CDC_NAME, CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME,
+    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME,
 };
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
@@ -115,8 +117,12 @@ impl CommitRange {
     ///   protocol/metadata validation; `None` validates from the commits alone.
     /// - `actions`: the action kinds to project into each commit's read schema.
     ///
-    /// Returns `Err` if `actions` is empty, or if `start_snapshot`'s version does not match the
-    /// range anchor or its table does not support scanning.
+    /// Actions are returned raw, exactly as recorded in the commit JSON; no column-mapping
+    /// translation is applied.
+    ///
+    /// Returns `Err` if `actions` is empty or contains duplicate kinds, or if `start_snapshot`
+    /// belongs to a different table, its version does not match the range anchor, or its table
+    /// does not support scanning.
     pub fn commits(
         &self,
         engine: Arc<dyn Engine>,
@@ -129,6 +135,13 @@ impl CommitRange {
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
+                if snapshot.table_root() != &self.table_root {
+                    return Err(Error::generic(format!(
+                        "snapshot table root ({}) does not match commit range table root ({})",
+                        snapshot.table_root(),
+                        self.table_root,
+                    )));
+                }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
                     CommitOrdering::AscendingOrder => (self.start_version, "start_version"),
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
@@ -149,7 +162,7 @@ impl CommitRange {
             None => (None, None),
         };
 
-        let read_schema = build_read_schema(actions.iter().copied());
+        let read_schema = Arc::new(StructType::try_new(actions.iter().map(action_to_field))?);
 
         Ok(CommitActionsIterator {
             engine,
@@ -230,7 +243,7 @@ impl Iterator for CommitActionsIterator {
 }
 
 /// Build the nullable [`StructField`] that represents this action kind in the read schema.
-fn action_to_field(action: DeltaAction) -> StructField {
+fn action_to_field(action: &DeltaAction) -> StructField {
     match action {
         DeltaAction::Add => StructField::nullable(ADD_NAME, Add::to_schema()),
         DeltaAction::Remove => StructField::nullable(REMOVE_NAME, Remove::to_schema()),
@@ -241,16 +254,14 @@ fn action_to_field(action: DeltaAction) -> StructField {
         DeltaAction::DomainMetadata => {
             StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema())
         }
+        DeltaAction::SetTxn => {
+            StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema())
+        }
+        DeltaAction::CheckpointMetadata => {
+            StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
+        }
+        DeltaAction::Sidecar => StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
     }
-}
-
-/// Build the read schema for a commit JSON: a top-level struct with one nullable field per
-/// requested action kind. Each row of the resulting batch corresponds to one JSON line in
-/// the commit file; at most one column is non-null per row.
-fn build_read_schema(actions: impl IntoIterator<Item = DeltaAction>) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(
-        actions.into_iter().map(action_to_field),
-    ))
 }
 
 #[cfg(test)]
