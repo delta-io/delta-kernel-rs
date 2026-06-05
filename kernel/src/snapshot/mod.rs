@@ -377,7 +377,7 @@ impl Snapshot {
     ///
     /// Uses the CRC fast path when available, otherwise falls back to log replay.
     ///
-    /// Reports metrics: `SetTransactionLoaded`.
+    /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     #[instrument(
         parent = &self.span,
@@ -527,7 +527,7 @@ impl Snapshot {
     /// requested domain is in a Partial cache, also answer from the cache; else full log
     /// replay. `domains == None` means load all.
     ///
-    /// Reports metrics: `DomainMetadataLoaded`.
+    /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
     #[instrument(
         parent = &self.span,
         name = DOMAIN_METADATA_LOADED_SPAN,

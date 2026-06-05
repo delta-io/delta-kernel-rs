@@ -21,7 +21,9 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
-    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, fields(report, operation_id = %operation_id), skip(engine))]
+    ///
+    /// Reports metrics: `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure`.
+    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %operation_id), skip(engine))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,

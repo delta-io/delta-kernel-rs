@@ -72,13 +72,18 @@ impl fmt::Display for MetricId {
 /// Metric events emitted during Delta Kernel operations.
 #[derive(Debug, Clone)]
 pub enum MetricEvent {
-    LogSegmentLoaded(LogSegmentLoaded),
-    ProtocolMetadataLoaded(ProtocolMetadataLoaded),
-    SnapshotCompleted(SnapshotCompleted),
-    SnapshotFailed(SnapshotFailed),
-    DomainMetadataLoaded(DomainMetadataLoaded),
-    SetTransactionLoaded(SetTransactionLoaded),
-    CrcReadCompleted(CrcReadCompleted),
+    LogSegmentLoadSuccess(LogSegmentLoadStats),
+    LogSegmentLoadFailure(LogSegmentLoadFailure),
+    ProtocolMetadataLoadSuccess(ProtocolMetadataLoadStats),
+    ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure),
+    SnapshotBuildSuccess(SnapshotBuildStats),
+    SnapshotBuildFailure(SnapshotBuildFailure),
+    DomainMetadataLoadSuccess(DomainMetadataLoadStats),
+    DomainMetadataLoadFailure,
+    SetTransactionLoadSuccess(SetTransactionLoadStats),
+    SetTransactionLoadFailure,
+    CrcReadSuccess(CrcReadStats),
+    CrcReadFailure,
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -91,21 +96,26 @@ impl MetricEvent {
     /// Set the wall-clock duration on lifecycle events.
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {
-            // Lifecycle: duration must be set by the tracing layer on span close.
-            Self::LogSegmentLoaded(e) => e.set_duration(d),
-            Self::ProtocolMetadataLoaded(e) => e.set_duration(d),
-            Self::SnapshotCompleted(e) => e.set_duration(d),
-            Self::SnapshotFailed(e) => e.set_duration(d),
-            Self::DomainMetadataLoaded(e) => e.set_duration(d),
-            Self::SetTransactionLoaded(e) => e.set_duration(d),
-            Self::CrcReadCompleted(e) => e.set_duration(d),
+            // Lifecycle success: duration must be set by the tracing layer on span close.
+            Self::LogSegmentLoadSuccess(e) => e.set_duration(d),
+            Self::ProtocolMetadataLoadSuccess(e) => e.set_duration(d),
+            Self::SnapshotBuildSuccess(e) => e.set_duration(d),
+            Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
+            Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
+            Self::CrcReadSuccess(e) => e.set_duration(d),
 
-            // Duration already set at construction.
-            Self::ScanMetadataCompleted(_)
+            // Failure events carry no duration; storage/scan events set it at construction;
+            // read events have no duration field.
+            Self::LogSegmentLoadFailure(_)
+            | Self::ProtocolMetadataLoadFailure(_)
+            | Self::SnapshotBuildFailure(_)
+            | Self::DomainMetadataLoadFailure
+            | Self::SetTransactionLoadFailure
+            | Self::CrcReadFailure
+            | Self::ScanMetadataCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_)
-            // No duration field.
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_) => {}
         }
@@ -114,42 +124,76 @@ impl MetricEvent {
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
         match self {
             // Variants with u64 fields set during span lifetime.
-            Self::LogSegmentLoaded(e) => e.record_u64(name, value),
-            Self::SnapshotCompleted(e) => e.record_u64(name, value),
-            Self::DomainMetadataLoaded(e) => e.record_u64(name, value),
-            Self::CrcReadCompleted(e) => e.record_u64(name, value),
+            Self::LogSegmentLoadSuccess(e) => e.record_u64(name, value),
+            Self::SnapshotBuildSuccess(e) => e.record_u64(name, value),
+            Self::DomainMetadataLoadSuccess(e) => e.record_u64(name, value),
+            Self::CrcReadSuccess(e) => e.record_u64(name, value),
 
             // No u64 fields set during span lifetime — a runtime record() on these is a bug.
-            Self::ProtocolMetadataLoaded(_) => Err(ProtocolMetadataLoaded::SPAN_NAME),
-            Self::SnapshotFailed(_) => Err(SnapshotCompleted::SPAN_NAME),
-            Self::SetTransactionLoaded(_) => Err(SetTransactionLoaded::SPAN_NAME),
+            Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadStats::SPAN_NAME),
+            Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadStats::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
+
+            // Failure events are built at span close, after any runtime records.
+            Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadStats::SPAN_NAME),
+            Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadStats::SPAN_NAME),
+            Self::SnapshotBuildFailure(_) => Err(SnapshotBuildStats::SPAN_NAME),
+            Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadStats::SPAN_NAME),
+            Self::SetTransactionLoadFailure => Err(SetTransactionLoadStats::SPAN_NAME),
+            Self::CrcReadFailure => Err(CrcReadStats::SPAN_NAME),
         }
     }
 
     pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
         match self {
             // Variants with bool fields set during span lifetime.
-            Self::LogSegmentLoaded(e) => e.record_bool(name, value),
-            Self::DomainMetadataLoaded(e) => e.record_bool(name, value),
-            Self::SetTransactionLoaded(e) => e.record_bool(name, value),
+            Self::LogSegmentLoadSuccess(e) => e.record_bool(name, value),
+            Self::DomainMetadataLoadSuccess(e) => e.record_bool(name, value),
+            Self::SetTransactionLoadSuccess(e) => e.record_bool(name, value),
 
             // No bool fields set during span lifetime — a runtime record() on these is a bug.
-            Self::ProtocolMetadataLoaded(_) => Err(ProtocolMetadataLoaded::SPAN_NAME),
-            Self::SnapshotCompleted(_) => Err(SnapshotCompleted::SPAN_NAME),
-            Self::SnapshotFailed(_) => Err(SnapshotCompleted::SPAN_NAME),
-            Self::CrcReadCompleted(_) => Err(CrcReadCompleted::SPAN_NAME),
+            Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadStats::SPAN_NAME),
+            Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildStats::SPAN_NAME),
+            Self::CrcReadSuccess(_) => Err(CrcReadStats::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
+
+            // Failure events are built at span close, after any runtime records.
+            Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadStats::SPAN_NAME),
+            Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadStats::SPAN_NAME),
+            Self::SnapshotBuildFailure(_) => Err(SnapshotBuildStats::SPAN_NAME),
+            Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadStats::SPAN_NAME),
+            Self::SetTransactionLoadFailure => Err(SetTransactionLoadStats::SPAN_NAME),
+            Self::CrcReadFailure => Err(CrcReadStats::SPAN_NAME),
+        }
+    }
+
+    pub(crate) fn into_failure(self) -> Self {
+        match self {
+            Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
+                operation_id: e.operation_id,
+            }),
+            Self::ProtocolMetadataLoadSuccess(e) => {
+                Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+                    operation_id: e.operation_id,
+                })
+            }
+            Self::SnapshotBuildSuccess(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
+                operation_id: e.operation_id,
+            }),
+            Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
+            Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
+            Self::CrcReadSuccess(_) => Self::CrcReadFailure,
+            other => other,
         }
     }
 }
@@ -157,13 +201,18 @@ impl MetricEvent {
 impl fmt::Display for MetricEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LogSegmentLoaded(e) => e.fmt(f),
-            Self::ProtocolMetadataLoaded(e) => e.fmt(f),
-            Self::SnapshotCompleted(e) => e.fmt(f),
-            Self::SnapshotFailed(e) => e.fmt(f),
-            Self::DomainMetadataLoaded(e) => e.fmt(f),
-            Self::SetTransactionLoaded(e) => e.fmt(f),
-            Self::CrcReadCompleted(e) => e.fmt(f),
+            Self::LogSegmentLoadSuccess(e) => e.fmt(f),
+            Self::LogSegmentLoadFailure(e) => e.fmt(f),
+            Self::ProtocolMetadataLoadSuccess(e) => e.fmt(f),
+            Self::ProtocolMetadataLoadFailure(e) => e.fmt(f),
+            Self::SnapshotBuildSuccess(e) => e.fmt(f),
+            Self::SnapshotBuildFailure(e) => e.fmt(f),
+            Self::DomainMetadataLoadSuccess(e) => e.fmt(f),
+            Self::DomainMetadataLoadFailure => f.write_str("DomainMetadataLoadFailure"),
+            Self::SetTransactionLoadSuccess(e) => e.fmt(f),
+            Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
+            Self::CrcReadSuccess(e) => e.fmt(f),
+            Self::CrcReadFailure => f.write_str("CrcReadFailure"),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
@@ -175,7 +224,7 @@ impl fmt::Display for MetricEvent {
 }
 
 // ====================================================================
-// LogSegmentLoaded
+// LogSegmentLoad
 // ====================================================================
 //
 // Canonical example for the per-event block pattern. Other events below follow the same
@@ -186,7 +235,7 @@ impl fmt::Display for MetricEvent {
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
 #[derive(Debug, Clone)]
-pub struct LogSegmentLoaded {
+pub struct LogSegmentLoadStats {
     // === Set on span creation ===
     pub operation_id: MetricId,
 
@@ -200,7 +249,7 @@ pub struct LogSegmentLoaded {
     pub duration: Duration,
 }
 
-impl LogSegmentLoaded {
+impl LogSegmentLoadStats {
     pub(crate) const SPAN_NAME: &'static str = LOG_SEGMENT_LOADED_SPAN;
 
     /// Construction-time channel. Extracts fields bound at span creation via
@@ -241,7 +290,7 @@ impl LogSegmentLoaded {
     }
 }
 
-impl fmt::Display for LogSegmentLoaded {
+impl fmt::Display for LogSegmentLoadStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
@@ -253,21 +302,34 @@ impl fmt::Display for LogSegmentLoaded {
         } = self;
         write!(
             f,
-            "LogSegmentLoaded(id={operation_id}, duration={duration:?}, \
+            "LogSegmentLoadSuccess(id={operation_id}, duration={duration:?}, \
              commits={num_commit_files}, checkpoints={num_checkpoint_files}, \
              compactions={num_compaction_files}, has_latest_crc={has_latest_crc_file})"
         )
     }
 }
 
+/// Log segment load failed. Emitted in place of [`LogSegmentLoadStats`] when the
+/// `segment.for_snapshot` span returns `Err`; carries the same `operation_id`.
+#[derive(Debug, Clone)]
+pub struct LogSegmentLoadFailure {
+    pub operation_id: MetricId,
+}
+
+impl fmt::Display for LogSegmentLoadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LogSegmentLoadFailure(id={})", self.operation_id)
+    }
+}
+
 // ====================================================================
-// ProtocolMetadataLoaded
+// ProtocolMetadataLoad
 // ====================================================================
 
 pub(crate) const PROTOCOL_METADATA_LOADED_SPAN: &str = "segment.read_metadata";
 
 #[derive(Debug, Clone)]
-pub struct ProtocolMetadataLoaded {
+pub struct ProtocolMetadataLoadStats {
     // === Set on span creation ===
     pub operation_id: MetricId,
 
@@ -275,7 +337,7 @@ pub struct ProtocolMetadataLoaded {
     pub duration: Duration,
 }
 
-impl ProtocolMetadataLoaded {
+impl ProtocolMetadataLoadStats {
     pub(crate) const SPAN_NAME: &'static str = PROTOCOL_METADATA_LOADED_SPAN;
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
@@ -290,7 +352,7 @@ impl ProtocolMetadataLoaded {
     }
 }
 
-impl fmt::Display for ProtocolMetadataLoaded {
+impl fmt::Display for ProtocolMetadataLoadStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
@@ -298,19 +360,32 @@ impl fmt::Display for ProtocolMetadataLoaded {
         } = self;
         write!(
             f,
-            "ProtocolMetadataLoaded(id={operation_id}, duration={duration:?})"
+            "ProtocolMetadataLoadSuccess(id={operation_id}, duration={duration:?})"
         )
     }
 }
 
+/// Protocol/metadata load failed. Emitted in place of [`ProtocolMetadataLoadStats`] when the
+/// `segment.read_metadata` span returns `Err`; carries the same `operation_id`.
+#[derive(Debug, Clone)]
+pub struct ProtocolMetadataLoadFailure {
+    pub operation_id: MetricId,
+}
+
+impl fmt::Display for ProtocolMetadataLoadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProtocolMetadataLoadFailure(id={})", self.operation_id)
+    }
+}
+
 // ====================================================================
-// SnapshotCompleted
+// SnapshotBuild
 // ====================================================================
 
 pub(crate) const SNAPSHOT_COMPLETED_SPAN: &str = "snap.build";
 
 #[derive(Debug, Clone)]
-pub struct SnapshotCompleted {
+pub struct SnapshotBuildStats {
     // === Set on span creation ===
     pub operation_id: MetricId,
 
@@ -321,7 +396,7 @@ pub struct SnapshotCompleted {
     pub duration: Duration,
 }
 
-impl SnapshotCompleted {
+impl SnapshotBuildStats {
     pub(crate) const SPAN_NAME: &'static str = SNAPSHOT_COMPLETED_SPAN;
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
@@ -343,17 +418,9 @@ impl SnapshotCompleted {
     pub(crate) fn set_duration(&mut self, d: Duration) {
         self.duration = d;
     }
-
-    /// Convert to a [`SnapshotFailed`] when the span fires an `error` field.
-    pub(crate) fn into_failed(self) -> SnapshotFailed {
-        SnapshotFailed {
-            operation_id: self.operation_id,
-            duration: self.duration,
-        }
-    }
 }
 
-impl fmt::Display for SnapshotCompleted {
+impl fmt::Display for SnapshotBuildStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
@@ -362,47 +429,30 @@ impl fmt::Display for SnapshotCompleted {
         } = self;
         write!(
             f,
-            "SnapshotCompleted(id={operation_id}, version={version}, duration={duration:?})"
+            "SnapshotBuildSuccess(id={operation_id}, version={version}, duration={duration:?})"
         )
     }
 }
 
 // ====================================================================
-// SnapshotFailed
+// SnapshotBuildFailure
 // ====================================================================
 
-/// Snapshot creation failed. Emitted in place of [`SnapshotCompleted`] when the `snap.build`
+/// Snapshot creation failed. Emitted in place of [`SnapshotBuildStats`] when the `snap.build`
 /// span returns `Err`; carries the same `operation_id`.
 #[derive(Debug, Clone)]
-pub struct SnapshotFailed {
-    // === Carried over from `SnapshotCompleted` when the span errors ===
+pub struct SnapshotBuildFailure {
     pub operation_id: MetricId,
-
-    // === Set on span close ===
-    pub duration: Duration,
 }
 
-impl SnapshotFailed {
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
-    }
-}
-
-impl fmt::Display for SnapshotFailed {
+impl fmt::Display for SnapshotBuildFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            operation_id,
-            duration,
-        } = self;
-        write!(
-            f,
-            "SnapshotFailed(id={operation_id}, duration={duration:?})"
-        )
+        write!(f, "SnapshotBuildFailure(id={})", self.operation_id)
     }
 }
 
 // ====================================================================
-// DomainMetadataLoaded
+// DomainMetadataLoad
 // ====================================================================
 
 pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "snap.get_domain_metadata";
@@ -411,7 +461,7 @@ pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "snap.get_domain_metadata";
 /// from a log replay. Covers connector-issued loads of user domains and kernel-internal loads of
 /// system (`delta.*`) domains such as clustering or row tracking.
 #[derive(Debug, Clone)]
-pub struct DomainMetadataLoaded {
+pub struct DomainMetadataLoadStats {
     // === Set during span lifetime ===
     pub from_cache: bool,
     pub num_domains_returned: u64,
@@ -420,7 +470,7 @@ pub struct DomainMetadataLoaded {
     pub duration: Duration,
 }
 
-impl DomainMetadataLoaded {
+impl DomainMetadataLoadStats {
     pub(crate) const SPAN_NAME: &'static str = DOMAIN_METADATA_LOADED_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
@@ -452,7 +502,7 @@ impl DomainMetadataLoaded {
     }
 }
 
-impl fmt::Display for DomainMetadataLoaded {
+impl fmt::Display for DomainMetadataLoadStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             from_cache,
@@ -461,14 +511,14 @@ impl fmt::Display for DomainMetadataLoaded {
         } = self;
         write!(
             f,
-            "DomainMetadataLoaded(duration={duration:?}, from_cache={from_cache}, \
+            "DomainMetadataLoadSuccess(duration={duration:?}, from_cache={from_cache}, \
              num_domains_returned={num_domains_returned})"
         )
     }
 }
 
 // ====================================================================
-// SetTransactionLoaded
+// SetTransactionLoad
 // ====================================================================
 
 pub(crate) const SET_TRANSACTION_LOADED_SPAN: &str = "snap.get_app_id_version";
@@ -477,7 +527,7 @@ pub(crate) const SET_TRANSACTION_LOADED_SPAN: &str = "snap.get_app_id_version";
 /// (`from_cache`) or from a log replay. `found` is true when the app id has a committed
 /// transaction version, false when none exists or the existing one is expired.
 #[derive(Debug, Clone)]
-pub struct SetTransactionLoaded {
+pub struct SetTransactionLoadStats {
     // === Set during span lifetime ===
     pub from_cache: bool,
     pub found: bool,
@@ -486,7 +536,7 @@ pub struct SetTransactionLoaded {
     pub duration: Duration,
 }
 
-impl SetTransactionLoaded {
+impl SetTransactionLoadStats {
     pub(crate) const SPAN_NAME: &'static str = SET_TRANSACTION_LOADED_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
@@ -511,7 +561,7 @@ impl SetTransactionLoaded {
     }
 }
 
-impl fmt::Display for SetTransactionLoaded {
+impl fmt::Display for SetTransactionLoadStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             from_cache,
@@ -520,21 +570,20 @@ impl fmt::Display for SetTransactionLoaded {
         } = self;
         write!(
             f,
-            "SetTransactionLoaded(duration={duration:?}, from_cache={from_cache}, found={found})"
+            "SetTransactionLoadSuccess(duration={duration:?}, from_cache={from_cache}, found={found})"
         )
     }
 }
 
 // ====================================================================
-// CrcReadCompleted
+// CrcRead
 // ====================================================================
 
 pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 
-/// Emitted even when JSON parsing fails after a successful storage read.
-/// `bytes_read` is the raw byte count from storage (zero if the storage read itself failed).
+/// A CRC file was read and parsed successfully. `bytes_read` is the raw byte count from storage.
 #[derive(Debug, Clone)]
-pub struct CrcReadCompleted {
+pub struct CrcReadStats {
     // === Set during span lifetime ===
     pub bytes_read: u64,
 
@@ -542,7 +591,7 @@ pub struct CrcReadCompleted {
     pub duration: Duration,
 }
 
-impl CrcReadCompleted {
+impl CrcReadStats {
     pub(crate) const SPAN_NAME: &'static str = CRC_READ_COMPLETED_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
@@ -565,7 +614,7 @@ impl CrcReadCompleted {
     }
 }
 
-impl fmt::Display for CrcReadCompleted {
+impl fmt::Display for CrcReadStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             duration,
@@ -573,7 +622,7 @@ impl fmt::Display for CrcReadCompleted {
         } = self;
         write!(
             f,
-            "CrcReadCompleted(duration={duration:?}, bytes={bytes_read})"
+            "CrcReadSuccess(duration={duration:?}, bytes={bytes_read})"
         )
     }
 }

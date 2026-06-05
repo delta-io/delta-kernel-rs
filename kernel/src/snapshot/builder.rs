@@ -122,14 +122,15 @@ impl SnapshotBuilder {
     /// returning a reference to an existing snapshot if the request to build a new snapshot
     /// matches the version of an existing snapshot.
     ///
-    /// Reports metrics: [`MetricEvent::SnapshotCompleted`] or [`MetricEvent::SnapshotFailed`].
+    /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
+    /// [`MetricEvent::SnapshotBuildFailure`].
     ///
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     ///
-    /// [`MetricEvent::SnapshotCompleted`]: crate::metrics::MetricEvent::SnapshotCompleted
-    /// [`MetricEvent::SnapshotFailed`]: crate::metrics::MetricEvent::SnapshotFailed
+    /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
+    /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
@@ -157,7 +158,7 @@ impl SnapshotBuilder {
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
         // TODO(#2605): this late `record` is silently dropped by the metrics layer, so every
-        //              `SnapshotCompleted` event carries a nil operation_id. Bind eagerly via a
+        //              `SnapshotBuildSuccess` event carries a nil operation_id. Bind eagerly via a
         //              `build_inner(self, engine, operation_id)` helper instead.
         tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
@@ -491,14 +492,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
-            "expected SnapshotFailed event on build failure"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "expected SnapshotBuildFailure event on build failure"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
-            "should not emit SnapshotCompleted on failure"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            "should not emit SnapshotBuildSuccess on failure"
         );
         Ok(())
     }
@@ -524,10 +525,10 @@ mod tests {
         let (version, duration) = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::SnapshotCompleted(s) => Some((s.version, s.duration)),
+                MetricEvent::SnapshotBuildSuccess(s) => Some((s.version, s.duration)),
                 _ => None,
             })
-            .expect("expected SnapshotCompleted event");
+            .expect("expected SnapshotBuildSuccess event");
         assert_eq!(version, 1, "version should match the updated snapshot");
         assert!(duration > Duration::ZERO, "duration should be non-zero");
         Ok(())
@@ -557,14 +558,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
-            "expected SnapshotFailed when version update goes backwards"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "expected SnapshotBuildFailure when version update goes backwards"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
-            "should not emit SnapshotCompleted when version update fails"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            "should not emit SnapshotBuildSuccess when version update fails"
         );
         Ok(())
     }
@@ -582,17 +583,17 @@ mod tests {
         let snap_duration = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::SnapshotCompleted(s) => Some(s.duration),
+                MetricEvent::SnapshotBuildSuccess(s) => Some(s.duration),
                 _ => None,
             })
-            .expect("expected SnapshotCompleted event");
+            .expect("expected SnapshotBuildSuccess event");
         let segment_duration = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::LogSegmentLoaded(s) => Some(s.duration),
+                MetricEvent::LogSegmentLoadSuccess(s) => Some(s.duration),
                 _ => None,
             })
-            .expect("expected LogSegmentLoaded event");
+            .expect("expected LogSegmentLoadSuccess event");
 
         assert!(
             snap_duration > Duration::ZERO,
@@ -600,7 +601,7 @@ mod tests {
         );
         assert!(
             snap_duration >= segment_duration,
-            "SnapshotCompleted.duration ({snap_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
+            "SnapshotBuildSuccess.duration ({snap_duration:?}) should be >= LogSegmentLoadSuccess.duration ({segment_duration:?})"
         );
         Ok(())
     }

@@ -114,9 +114,9 @@ tracing_subscriber::registry()
 When a snapshot loads, you'll see output like:
 
 ```text
-[kernel-metrics] LogSegmentLoaded(id=a1b2c3d4-..., duration=12.34ms, commits=5, checkpoints=1, compactions=0, has_latest_crc=true)
-[kernel-metrics] ProtocolMetadataLoaded(id=a1b2c3d4-..., duration=3.21ms)
-[kernel-metrics] SnapshotCompleted(id=a1b2c3d4-..., version=5, duration=15.55ms)
+[kernel-metrics] LogSegmentLoadSuccess(id=a1b2c3d4-..., duration=12.34ms, commits=5, checkpoints=1, compactions=0, has_latest_crc=true)
+[kernel-metrics] ProtocolMetadataLoadSuccess(id=a1b2c3d4-..., duration=3.21ms)
+[kernel-metrics] SnapshotBuildSuccess(id=a1b2c3d4-..., version=5, duration=15.55ms)
 ```
 
 ## Metric events
@@ -132,10 +132,12 @@ events from the same snapshot load together.
 
 | Event | Fields | What it measures |
 |-------|--------|------------------|
-| `LogSegmentLoaded` | `operation_id`, `duration`, `num_commit_files`, `num_checkpoint_files`, `num_compaction_files`, `has_latest_crc_file` | Time to list and organize log files into a log segment. |
-| `ProtocolMetadataLoaded` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
-| `SnapshotCompleted` | `operation_id`, `version`, `total_duration` | End-to-end snapshot creation, including the table version that was loaded. |
-| `SnapshotFailed` | `operation_id`, `duration` | Snapshot creation failed. Use this to track error rates. |
+| `LogSegmentLoadSuccess` | `operation_id`, `duration`, `num_commit_files`, `num_checkpoint_files`, `num_compaction_files`, `has_latest_crc_file` | Time to list and organize log files into a log segment. |
+| `LogSegmentLoadFailure` | `operation_id` | Log segment load failed. |
+| `ProtocolMetadataLoadSuccess` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
+| `ProtocolMetadataLoadFailure` | `operation_id` | Protocol/metadata load failed. |
+| `SnapshotBuildSuccess` | `operation_id`, `version`, `total_duration` | End-to-end snapshot creation, including the table version that was loaded. |
+| `SnapshotBuildFailure` | `operation_id` | Snapshot creation failed. Use this to track error rates. |
 
 ### Scan metadata events
 
@@ -183,7 +185,8 @@ storage call may serve multiple higher-level operations.
 | `StorageCopyCompleted` | `duration` | A storage copy/rename call. |
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
-| `CrcReadCompleted` | `duration`, `bytes_read` | One CRC file read completed. `bytes_read` is the raw byte count from storage. |
+| `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
+| `CrcReadFailure` | none | A CRC file read or parse failed. The caller falls back to log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
@@ -198,9 +201,9 @@ UUID that uniquely identifies an operation instance. All events from the same
 snapshot load share the same `MetricId`, so you can group them to reconstruct
 a timeline:
 
-1. `LogSegmentLoaded` (how long listing took, how many files)
-2. `ProtocolMetadataLoaded` (how long protocol/metadata parsing took)
-3. `SnapshotCompleted` or `SnapshotFailed` (final outcome and total duration)
+1. `LogSegmentLoadSuccess` (how long listing took, how many files)
+2. `ProtocolMetadataLoadSuccess` (how long protocol/metadata parsing took)
+3. `SnapshotBuildSuccess` or `SnapshotBuildFailure` (final outcome and total duration)
 
 You can store the `MetricId` in your monitoring system as a trace ID or
 correlation key. Because everything flows through `tracing`, you can also
@@ -232,33 +235,36 @@ impl CorrelatingReporter {
 
 impl MetricsReporter for CorrelatingReporter {
     fn report(&self, event: MetricEvent) {
-        match &event {
+        // Pull the operation_id out first so intermediate events can be buffered by group.
+        let operation_id = match &event {
+            MetricEvent::LogSegmentLoadSuccess(e) => Some(e.operation_id),
+            MetricEvent::ProtocolMetadataLoadSuccess(e) => Some(e.operation_id),
+            _ => None,
+        };
+        match event {
             // 1. Buffer intermediate events, grouped by their shared operation_id.
-            MetricEvent::LogSegmentLoaded { operation_id, .. }
-            | MetricEvent::ProtocolMetadataLoaded { operation_id, .. } => {
+            MetricEvent::LogSegmentLoadSuccess(_) | MetricEvent::ProtocolMetadataLoadSuccess(_) => {
                 let mut map = self.pending.lock().unwrap();
-                map.entry(*operation_id).or_default().push(event);
+                map.entry(operation_id.unwrap()).or_default().push(event);
             }
             // 2. When the terminal event arrives, drain the group and
             //    compute aggregates (here, a count of sub-events).
-            MetricEvent::SnapshotCompleted {
-                operation_id,
-                version,
-                total_duration,
-            } => {
+            MetricEvent::SnapshotBuildSuccess(e) => {
                 let mut map = self.pending.lock().unwrap();
-                if let Some(events) = map.remove(operation_id) {
+                if let Some(events) = map.remove(&e.operation_id) {
                     println!(
-                        "Snapshot v{version} completed in {total_duration:?} ({} sub-events)",
+                        "Snapshot v{} completed in {:?} ({} sub-events)",
+                        e.version,
+                        e.duration,
                         events.len()
                     );
                 }
             }
             // On failure, discard the buffered group for this operation.
-            MetricEvent::SnapshotFailed { operation_id, .. } => {
+            MetricEvent::SnapshotBuildFailure(e) => {
                 let mut map = self.pending.lock().unwrap();
-                map.remove(operation_id);
-                println!("Snapshot failed for operation {operation_id}");
+                map.remove(&e.operation_id);
+                println!("Snapshot failed for operation {}", e.operation_id);
             }
             // Storage and scan events don't participate in snapshot correlation.
             _ => {}

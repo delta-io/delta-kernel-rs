@@ -300,7 +300,7 @@ impl LogSegment {
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
-    /// Reports metrics: `LogSegmentLoaded`.
+    /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[instrument(
         name = LOG_SEGMENT_LOADED_SPAN,
         err,
