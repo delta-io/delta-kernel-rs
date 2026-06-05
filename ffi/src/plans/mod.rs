@@ -18,7 +18,7 @@ pub mod result;
 /// Build a [`PlanExecutor`] backed by an engine-provided C callback.
 ///
 /// # Safety
-/// The `context` pointer MUST be thread-safe and MUST remain valid for as long as the
+/// The `context` pointer MUST be thread-safe (Send + Sync) and MUST remain valid for as long as the
 /// executor is used. It is valid to pass NULL as the context.
 #[no_mangle]
 pub unsafe extern "C" fn get_plan_executor(

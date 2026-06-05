@@ -161,6 +161,7 @@ impl KernelBytesSlice {
     ///
     /// # Safety
     /// Caller must guarantee that the source will outlive the created KernelBytesSlice.
+    #[cfg(feature = "declarative-plans")]
     pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
         Self {
             ptr: source.as_ptr(),
