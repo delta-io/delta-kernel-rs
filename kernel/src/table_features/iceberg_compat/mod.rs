@@ -199,7 +199,7 @@ mod tests {
     fn schema_with_good_nested_ids() -> StructType {
         StructType::new_unchecked(vec![field_with_metadata(
             "x",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
             ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
         )])
     }
@@ -207,7 +207,7 @@ mod tests {
     fn schema_with_legacy_at(name: &str) -> StructType {
         StructType::new_unchecked(vec![field_with_metadata(
             name,
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )])
     }
@@ -215,43 +215,33 @@ mod tests {
     fn schema_struct_with_legacy_at_inner() -> StructType {
         let inner = StructType::new_unchecked(vec![field_with_metadata(
             "inner",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )]);
-        StructType::new_unchecked(vec![StructField::nullable(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-        )])
+        StructType::new_unchecked(vec![StructField::nullable("parent", inner)])
     }
 
     fn schema_array_struct_with_legacy_at_inner() -> StructType {
         let inner = StructType::new_unchecked(vec![field_with_metadata(
             "inner",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )]);
         StructType::new_unchecked(vec![StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
         )])
     }
 
     fn schema_map_value_struct_with_legacy_at_inner() -> StructType {
         let inner = StructType::new_unchecked(vec![field_with_metadata(
             "inner",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            DataType::from(ArrayType::new(DataType::INTEGER, true)),
             ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         )]);
         StructType::new_unchecked(vec![StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            MapType::new(DataType::STRING, inner, true),
         )])
     }
 
@@ -259,12 +249,12 @@ mod tests {
         StructType::new_unchecked(vec![
             field_with_metadata(
                 "a",
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+                DataType::from(ArrayType::new(DataType::INTEGER, true)),
                 ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
             ),
             field_with_metadata(
                 "b",
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+                DataType::from(ArrayType::new(DataType::INTEGER, true)),
                 ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
             ),
         ])
@@ -314,38 +304,27 @@ mod tests {
 
     fn schema_struct_with_float_inner() -> StructType {
         let inner = StructType::new_unchecked(vec![StructField::nullable("f", DataType::FLOAT)]);
-        StructType::new_unchecked(vec![StructField::nullable(
-            "s",
-            DataType::Struct(Box::new(inner)),
-        )])
+        StructType::new_unchecked(vec![StructField::nullable("s", inner)])
     }
 
     fn schema_array_of_float() -> StructType {
         StructType::new_unchecked(vec![StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+            ArrayType::new(DataType::FLOAT, true),
         )])
     }
 
     fn schema_map_key_float() -> StructType {
         StructType::new_unchecked(vec![StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::FLOAT,
-                DataType::STRING,
-                true,
-            ))),
+            MapType::new(DataType::FLOAT, DataType::STRING, true),
         )])
     }
 
     fn schema_map_value_float() -> StructType {
         StructType::new_unchecked(vec![StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::FLOAT,
-                true,
-            ))),
+            MapType::new(DataType::STRING, DataType::FLOAT, true),
         )])
     }
 
@@ -361,19 +340,16 @@ mod tests {
         StructType::new_unchecked(vec![
             StructField::nullable(
                 "a",
-                DataType::Array(Box::new(ArrayType::new(
-                    DataType::Map(Box::new(MapType::new(
+                ArrayType::new(
+                    MapType::new(
                         DataType::STRING,
-                        DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+                        ArrayType::new(DataType::FLOAT, true),
                         true,
-                    ))),
+                    ),
                     true,
-                ))),
+                ),
             ),
-            StructField::nullable(
-                "b",
-                DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
-            ),
+            StructField::nullable("b", ArrayType::new(DataType::FLOAT, true)),
         ])
     }
 

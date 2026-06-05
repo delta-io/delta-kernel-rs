@@ -953,9 +953,7 @@ pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
         StructField::new("id", DataType::INTEGER, true),
         StructField::new(
             "nested",
-            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                "inner", dtype, true,
-            )]))),
+            StructType::new_unchecked(vec![StructField::new("inner", dtype, true)]),
             true,
         ),
     ]))

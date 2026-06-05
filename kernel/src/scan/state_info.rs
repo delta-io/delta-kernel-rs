@@ -1388,10 +1388,10 @@ pub(crate) mod tests {
             StructField::nullable("b", DataType::LONG),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("c", DataType::LONG),
                     StructField::nullable("d", DataType::LONG),
-                ]))),
+                ]),
             ),
         ]));
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
@@ -1447,10 +1447,10 @@ pub(crate) mod tests {
             StructField::nullable("b", DataType::LONG),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("c", DataType::LONG),
                     StructField::nullable("d", DataType::LONG),
-                ]))),
+                ]),
             ),
         ]));
         let predicate = Arc::new(Pred::and(
@@ -1505,10 +1505,10 @@ pub(crate) mod tests {
             StructField::nullable("a", DataType::LONG),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("c", DataType::LONG),
                     StructField::nullable("d", DataType::LONG),
-                ]))),
+                ]),
             ),
         ]));
         let state_info = get_state_info(

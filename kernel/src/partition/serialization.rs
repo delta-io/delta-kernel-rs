@@ -257,10 +257,7 @@ mod tests {
     /// columns should be rejected by validation before reaching serialization.
     #[test]
     fn test_null_complex_type_returns_none() {
-        let val = Scalar::Null(DataType::Array(Box::new(ArrayType::new(
-            DataType::INTEGER,
-            false,
-        ))));
+        let val = Scalar::Null(DataType::from(ArrayType::new(DataType::INTEGER, false)));
         assert_eq!(serialize_partition_value(&val).unwrap(), None);
     }
 

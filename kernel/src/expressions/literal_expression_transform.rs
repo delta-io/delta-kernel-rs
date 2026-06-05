@@ -260,8 +260,8 @@ mod tests {
             Scalar::Array(array_data.clone()),
         ];
         let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("map", DeltaDataTypes::Map(Box::new(map_type))),
-            StructField::nullable("array", DeltaDataTypes::Array(Box::new(array_type))),
+            StructField::nullable("map", map_type),
+            StructField::nullable("array", array_type),
         ]));
         let expected = Expr::struct_from(vec![
             Expr::literal(Scalar::Map(map_data)),

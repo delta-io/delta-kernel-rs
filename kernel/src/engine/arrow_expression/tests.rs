@@ -286,11 +286,7 @@ fn test_literal_complex_type_array() {
         )
         .unwrap(),
     );
-    let map_type = MapType::new(
-        KernelDataType::STRING,
-        KernelDataType::Array(Box::new(array_type.clone())),
-        true,
-    );
+    let map_type = MapType::new(KernelDataType::STRING, array_type.clone(), true);
     let map_value = Scalar::Map(
         MapData::try_new(
             map_type.clone(),
@@ -325,7 +321,7 @@ fn test_literal_complex_type_array() {
         )
         .unwrap(),
     );
-    let nested_array_type = ArrayType::new(struct_type.clone().into(), true);
+    let nested_array_type = ArrayType::new(struct_type.clone(), true);
     let nested_array_value = Scalar::Array(
         ArrayData::try_new(
             nested_array_type.clone(),
@@ -1056,7 +1052,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
-    let null_scalar_map = Scalar::Null(KernelDataType::Map(Box::new(map_type)));
+    let null_scalar_map = Scalar::Null(KernelDataType::from(map_type));
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
@@ -1086,10 +1082,10 @@ fn test_apply_schema_column_count_mismatch() {
     ]);
 
     // Create a schema with only 2 fields (mismatch)
-    let schema = KernelDataType::Struct(Box::new(StructType::new_unchecked([
+    let schema = KernelDataType::from(StructType::new_unchecked([
         StructField::not_null("a", KernelDataType::INTEGER),
         StructField::not_null("b", KernelDataType::INTEGER),
-    ])));
+    ]));
 
     let result = apply_schema(&struct_array, &schema);
 
@@ -1288,7 +1284,7 @@ fn test_evaluator_mixed_string_types_identity_transform() {
     let engine_data = ArrowEngineData::new(make_mixed_string_batch());
     let fields = mixed_string_kernel_fields();
     let input_schema = Arc::new(StructType::new_unchecked(fields.clone()));
-    let output_type = KernelDataType::Struct(Box::new(StructType::new_unchecked(fields)));
+    let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
     let handler = ArrowEvaluationHandler;
     let expression: ExpressionRef = Arc::new(Expression::StructPatch(
@@ -1320,7 +1316,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         "st",
         KernelDataType::struct_type_unchecked(fields.clone()),
     )]));
-    let output_type = KernelDataType::Struct(Box::new(StructType::new_unchecked(fields)));
+    let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
     let handler = ArrowEvaluationHandler;
     let expression: ExpressionRef = Arc::new(column_expr!("st"));

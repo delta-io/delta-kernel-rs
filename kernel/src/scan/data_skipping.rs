@@ -236,18 +236,10 @@ impl DataSkippingFilter {
             .map(|s| s.fields().map(|f| f.name().to_string()).collect())
             .unwrap_or_default();
 
-        let stats_field = |stats: &SchemaRef| {
-            StructField::nullable(
-                "stats_parsed",
-                DataType::Struct(Box::new(stats.as_ref().clone())),
-            )
-        };
-        let partition_field = |ps: &SchemaRef| {
-            StructField::nullable(
-                "partitionValues_parsed",
-                DataType::Struct(Box::new(ps.as_ref().clone())),
-            )
-        };
+        let stats_field =
+            |stats: &SchemaRef| StructField::nullable("stats_parsed", stats.as_ref().clone());
+        let partition_field =
+            |ps: &SchemaRef| StructField::nullable("partitionValues_parsed", ps.as_ref().clone());
         let is_add_field = StructField::not_null("is_add", DataType::BOOLEAN);
 
         // When partition columns are present, include an `is_add` boolean so that partition

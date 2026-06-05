@@ -552,11 +552,11 @@ pub(crate) mod test_utils {
     ) -> StructType {
         let array_in_map = StructField::nullable(
             "array_in_map",
-            KernelDataType::Map(Box::new(MapType::new(
+            MapType::new(
                 KernelDataType::INTEGER,
-                KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
+                ArrayType::new(KernelDataType::INTEGER, true),
                 true,
-            ))),
+            ),
         )
         .with_metadata(metadata);
         StructType::try_new(vec![array_in_map]).unwrap()
@@ -750,19 +750,19 @@ pub(crate) mod test_utils {
     }
 
     fn complex_nested_inner_map_type() -> KernelDataType {
-        KernelDataType::Map(Box::new(MapType::new(
+        KernelDataType::from(MapType::new(
             KernelDataType::INTEGER,
-            KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
+            ArrayType::new(KernelDataType::INTEGER, true),
             true,
-        )))
+        ))
     }
 
     fn complex_nested_outer_map_type(struct_value: StructType) -> KernelDataType {
-        KernelDataType::Map(Box::new(MapType::new(
-            KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
-            KernelDataType::Struct(Box::new(struct_value)),
+        KernelDataType::from(MapType::new(
+            ArrayType::new(KernelDataType::INTEGER, true),
+            struct_value,
             true,
-        )))
+        ))
     }
 
     /// Build the kernel schema described by [`complex_nested_with_field_ids`].
@@ -947,11 +947,7 @@ pub(crate) mod test_utils {
             StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "entries",
-                MapType::new(
-                    KernelDataType::STRING,
-                    KernelDataType::Struct(Box::new(value_struct)),
-                    true,
-                ),
+                MapType::new(KernelDataType::STRING, value_struct, true),
             ),
             StructField::nullable("name", KernelDataType::STRING),
         ]))
@@ -980,11 +976,7 @@ pub(crate) mod test_utils {
             with_column_mapping(
                 StructField::nullable(
                     "entries",
-                    MapType::new(
-                        KernelDataType::STRING,
-                        KernelDataType::Struct(Box::new(value_struct)),
-                        true,
-                    ),
+                    MapType::new(KernelDataType::STRING, value_struct, true),
                 ),
                 2,
                 "phys_entries",
@@ -1007,7 +999,7 @@ pub(crate) mod test_utils {
             StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "items",
-                ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+                ArrayType::new(KernelDataType::from(item_struct), true),
             ),
             StructField::nullable("name", KernelDataType::STRING),
         ]))
@@ -1036,7 +1028,7 @@ pub(crate) mod test_utils {
             with_column_mapping(
                 StructField::nullable(
                     "items",
-                    ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+                    ArrayType::new(KernelDataType::from(item_struct), true),
                 ),
                 2,
                 "phys_items",
@@ -1056,17 +1048,13 @@ pub(crate) mod test_utils {
     pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
         let leaf_struct =
             StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
-        let map_type = MapType::new(
-            KernelDataType::STRING,
-            KernelDataType::Struct(Box::new(leaf_struct)),
-            true,
-        );
+        let map_type = MapType::new(KernelDataType::STRING, leaf_struct, true);
         let mid_struct = StructType::new_unchecked([with_column_mapping(
             StructField::nullable("mid_field", map_type),
             2,
             "phys_mid_field",
         )]);
-        let array_type = ArrayType::new(KernelDataType::Struct(Box::new(mid_struct)), true);
+        let array_type = ArrayType::new(KernelDataType::from(mid_struct), true);
         StructType::new_unchecked([with_column_mapping(
             StructField::nullable("top", array_type),
             1,
@@ -1210,7 +1198,7 @@ pub(crate) mod test_utils {
             let nested = StructType::new_unchecked([cm_field("id", 3, "id", DataType::INTEGER)]);
             StructType::new_unchecked([
                 cm_field("id", 1, "id", DataType::INTEGER),
-                cm_field("nested", 2, "nested", DataType::Struct(Box::new(nested))),
+                cm_field("nested", 2, "nested", nested),
             ])
         }
 
@@ -1220,7 +1208,7 @@ pub(crate) mod test_utils {
                 cm_field("a", 2, "x", DataType::INTEGER),
                 cm_field("b", 3, "x", DataType::INTEGER),
             ]);
-            let arr_of_struct = ArrayType::new(DataType::Struct(Box::new(inner)), true);
+            let arr_of_struct = ArrayType::new(inner, true);
             let map_to_arr = MapType::new(DataType::STRING, arr_of_struct, true);
             StructType::new_unchecked([cm_field("outer", 1, "outer", map_to_arr)])
         }
@@ -1249,9 +1237,9 @@ pub(crate) mod test_utils {
                 cm_field("y", 5, "q", DataType::INTEGER),
             ]);
             StructType::new_unchecked([
-                cm_field("a", 1, "p", DataType::Struct(Box::new(a_struct))),
-                cm_field("b", 2, "p", DataType::Struct(Box::new(b_struct))),
-                cm_field("nested", 3, "nested", DataType::Struct(Box::new(nested))),
+                cm_field("a", 1, "p", a_struct),
+                cm_field("b", 2, "p", b_struct),
+                cm_field("nested", 3, "nested", nested),
             ])
         }
 
