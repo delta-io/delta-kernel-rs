@@ -93,6 +93,10 @@ fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
     let CParquetFooter { schema } = footer;
     let mut visitor_state = KernelSchemaVisitorState::default();
     let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+
+    // TODO: we currently use the existing visitor pattern for sending schema, but
+    // to be consistent with how we send the input plan (which includes schema), we could just use
+    // proto to serialize the schema here too.
     let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
     Ok(ParquetFooter {
         schema: Arc::new(schema),
