@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::{DeltaResult, Error};
@@ -57,7 +58,8 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.
 #[allow(unused)]
-pub fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
+#[internal_api]
+pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
     let uri = uri.as_ref();
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
