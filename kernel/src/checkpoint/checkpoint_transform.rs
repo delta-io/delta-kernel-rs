@@ -253,8 +253,6 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
 ///
 /// This helper applies a transformation function to the Add struct and returns
 /// a new schema with the modified Add field.
-// TODO(https://github.com/delta-io/delta-kernel-rs/issues/1820): Replace manual field
-// iteration with StructType helper methods (e.g., with_field_inserted, with_field_removed).
 ///
 /// # Errors
 ///
@@ -278,15 +276,11 @@ fn transform_add_schema(
     };
 
     let modified_add = transform_fn(add_struct)?;
-    let new_schema = base_schema.clone().with_field_replaced(
-        ADD_NAME,
-        StructField {
-            name: ADD_NAME.to_string(),
-            data_type: DataType::from(modified_add),
-            nullable: add_field.nullable,
-            metadata: add_field.metadata.clone(),
-        },
-    )?;
+    let new_add_field = StructField::new(ADD_NAME, modified_add, add_field.nullable)
+        .with_metadata(add_field.metadata.clone());
+    let new_schema = SchemaStructPatchBuilder::new()
+        .with_replaced_field(ADD_NAME, new_add_field)
+        .build(base_schema)?;
 
     Ok(Arc::new(new_schema))
 }
@@ -558,31 +552,6 @@ mod tests {
                 .contains_key(PARTITION_VALUES_PARSED_FIELD),
             "non-partitioned table should not have partitionValues_parsed transform"
         );
-    }
-
-    #[test]
-    fn test_field_inserted_after_in_add_schema() {
-        let add_schema = StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::nullable("stats", DataType::STRING),
-            StructField::nullable("tags", DataType::STRING),
-        ]);
-
-        let injected_schema =
-            StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]);
-
-        let result = add_schema
-            .with_field_inserted_after(
-                Some(STATS_FIELD),
-                StructField::nullable(STATS_PARSED_FIELD, injected_schema),
-            )
-            .expect("inserting stats_parsed should succeed");
-
-        // Should have 4 fields: path, stats, stats_parsed, tags
-        assert_eq!(result.fields().count(), 4);
-
-        let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
-        assert_eq!(field_names, vec!["path", "stats", "stats_parsed", "tags"]);
     }
 
     #[test]
