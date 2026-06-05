@@ -345,9 +345,9 @@ mod tests {
     use std::time::Duration;
 
     use delta_kernel::metrics::{
-        CrcReadStats, DomainMetadataLoadStats, LogSegmentLoadStats, MetricId,
-        ProtocolMetadataLoadStats, SetTransactionLoadStats, SnapshotBuildFailure,
-        SnapshotBuildStats, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
+        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
+        ProtocolMetadataLoadSuccess, SetTransactionLoadSuccess, SnapshotBuildFailure,
+        SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
     };
 
     use super::*;
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn report_snapshot_completed_increments_snapshot_counter() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildStats {
+        reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
             operation_id: MetricId::new(),
             version: 0,
             duration: dur(),
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn report_log_segment_loaded_increments_log_replay_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadStats {
+        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 7,
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn report_log_segment_loaded_without_crc_does_not_increment_crc_counter() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadStats {
+        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 3,
@@ -440,11 +440,11 @@ mod tests {
     #[test]
     fn report_crc_read_completed_increments_crc_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::CrcReadSuccess(CrcReadStats {
+        reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
             bytes_read: 512,
         }));
-        reporter.report(MetricEvent::CrcReadSuccess(CrcReadStats {
+        reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
             bytes_read: 256,
         }));
@@ -456,14 +456,14 @@ mod tests {
     fn report_domain_metadata_loaded_increments_domain_metadata_counters() {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
-            DomainMetadataLoadStats {
+            DomainMetadataLoadSuccess {
                 from_cache: true,
                 num_domains_returned: 3,
                 duration: dur(),
             },
         ));
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
-            DomainMetadataLoadStats {
+            DomainMetadataLoadSuccess {
                 from_cache: false,
                 num_domains_returned: 1,
                 duration: dur(),
@@ -478,14 +478,14 @@ mod tests {
     fn report_set_transaction_loaded_increments_set_transaction_counters() {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::SetTransactionLoadSuccess(
-            SetTransactionLoadStats {
+            SetTransactionLoadSuccess {
                 from_cache: true,
                 found: true,
                 duration: dur(),
             },
         ));
         reporter.report(MetricEvent::SetTransactionLoadSuccess(
-            SetTransactionLoadStats {
+            SetTransactionLoadSuccess {
                 from_cache: false,
                 found: false,
                 duration: dur(),
@@ -500,7 +500,7 @@ mod tests {
     fn report_untracked_events_does_not_panic() {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::ProtocolMetadataLoadSuccess(
-            ProtocolMetadataLoadStats {
+            ProtocolMetadataLoadSuccess {
                 operation_id: MetricId::new(),
                 duration: dur(),
             },
@@ -526,7 +526,7 @@ mod tests {
         reporter.report(MetricEvent::StorageCopyCompleted(StorageCopyCompleted {
             duration: dur(),
         }));
-        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadStats {
+        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 7,
@@ -534,19 +534,19 @@ mod tests {
             num_compaction_files: 1,
             has_latest_crc_file: true,
         }));
-        reporter.report(MetricEvent::CrcReadSuccess(CrcReadStats {
+        reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
             bytes_read: 512,
         }));
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
-            DomainMetadataLoadStats {
+            DomainMetadataLoadSuccess {
                 from_cache: true,
                 num_domains_returned: 2,
                 duration: dur(),
             },
         ));
         reporter.report(MetricEvent::SetTransactionLoadSuccess(
-            SetTransactionLoadStats {
+            SetTransactionLoadSuccess {
                 from_cache: true,
                 found: true,
                 duration: dur(),

@@ -10,9 +10,9 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
 use super::events::{
-    storage_metric_from_attrs, CrcReadStats, DomainMetadataLoadStats, JsonReadCompleted,
-    LogSegmentLoadStats, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadStats,
-    ScanMetadataCompleted, SetTransactionLoadStats, SnapshotBuildStats, STORAGE_SPAN,
+    storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
+    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
+    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess, STORAGE_SPAN,
 };
 
 // ====================================================================
@@ -105,24 +105,26 @@ where
             return;
         };
         let event = match metadata.name() {
-            LogSegmentLoadStats::SPAN_NAME => Some(MetricEvent::LogSegmentLoadSuccess(
-                LogSegmentLoadStats::from_attrs(attrs),
+            LogSegmentLoadSuccess::SPAN_NAME => Some(MetricEvent::LogSegmentLoadSuccess(
+                LogSegmentLoadSuccess::from_attrs(attrs),
             )),
-            ProtocolMetadataLoadStats::SPAN_NAME => Some(MetricEvent::ProtocolMetadataLoadSuccess(
-                ProtocolMetadataLoadStats::from_attrs(attrs),
-            )),
-            SnapshotBuildStats::SPAN_NAME => Some(MetricEvent::SnapshotBuildSuccess(
-                SnapshotBuildStats::from_attrs(attrs),
-            )),
-            DomainMetadataLoadStats::SPAN_NAME => Some(MetricEvent::DomainMetadataLoadSuccess(
-                DomainMetadataLoadStats::from_attrs(attrs),
-            )),
-            SetTransactionLoadStats::SPAN_NAME => Some(MetricEvent::SetTransactionLoadSuccess(
-                SetTransactionLoadStats::from_attrs(attrs),
-            )),
-            CrcReadStats::SPAN_NAME => {
-                Some(MetricEvent::CrcReadSuccess(CrcReadStats::from_attrs(attrs)))
+            ProtocolMetadataLoadSuccess::SPAN_NAME => {
+                Some(MetricEvent::ProtocolMetadataLoadSuccess(
+                    ProtocolMetadataLoadSuccess::from_attrs(attrs),
+                ))
             }
+            SnapshotBuildSuccess::SPAN_NAME => Some(MetricEvent::SnapshotBuildSuccess(
+                SnapshotBuildSuccess::from_attrs(attrs),
+            )),
+            DomainMetadataLoadSuccess::SPAN_NAME => Some(MetricEvent::DomainMetadataLoadSuccess(
+                DomainMetadataLoadSuccess::from_attrs(attrs),
+            )),
+            SetTransactionLoadSuccess::SPAN_NAME => Some(MetricEvent::SetTransactionLoadSuccess(
+                SetTransactionLoadSuccess::from_attrs(attrs),
+            )),
+            CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
+                CrcReadSuccess::from_attrs(attrs),
+            )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),

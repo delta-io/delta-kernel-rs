@@ -505,6 +505,60 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn log_segment_load_failure_emits_metric_on_empty_log(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, _store, table_root) = setup_test();
+        let (reporter, _guard) = measuring_reporter();
+
+        assert!(SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .is_err());
+
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .any(|e| matches!(e, MetricEvent::LogSegmentLoadFailure(_))),
+            "expected LogSegmentLoadFailure when the log has no commits"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn protocol_metadata_load_failure_emits_metric_when_actions_absent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        // A commit with no protocol/metadata: the segment lists fine, then the read fails.
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
+        )
+        .await?;
+        let (reporter, _guard) = measuring_reporter();
+
+        assert!(SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .is_err());
+
+        let events = reporter.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_))),
+            "expected ProtocolMetadataLoadFailure when protocol/metadata are absent"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+            "must not emit ProtocolMetadataLoadSuccess when the load fails"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
     async fn snapshot_update_from_existing_emits_metric() -> Result<(), Box<dyn std::error::Error>>
     {
         let (engine, store, table_root) = setup_test();

@@ -80,11 +80,12 @@ mod streaming_metrics_iterator;
 use std::sync::Arc;
 
 pub use events::{
-    emit_json_read_completed, emit_parquet_read_completed, CrcReadStats, DomainMetadataLoadStats,
-    JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadStats, MetricEvent, MetricId,
-    ParquetReadCompleted, ProtocolMetadataLoadFailure, ProtocolMetadataLoadStats,
-    ScanMetadataCompleted, ScanType, SetTransactionLoadStats, SnapshotBuildFailure,
-    SnapshotBuildStats, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
+    emit_json_read_completed, emit_parquet_read_completed, CrcReadSuccess,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
+    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
+    ProtocolMetadataLoadSuccess, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
+    SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted,
+    StorageReadCompleted,
 };
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_storage::MeteredStorageHandler;

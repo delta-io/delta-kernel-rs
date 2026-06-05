@@ -136,7 +136,7 @@ events from the same snapshot load together.
 | `LogSegmentLoadFailure` | `operation_id` | Log segment load failed. |
 | `ProtocolMetadataLoadSuccess` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
 | `ProtocolMetadataLoadFailure` | `operation_id` | Protocol/metadata load failed. |
-| `SnapshotBuildSuccess` | `operation_id`, `version`, `total_duration` | End-to-end snapshot creation, including the table version that was loaded. |
+| `SnapshotBuildSuccess` | `operation_id`, `version`, `duration` | End-to-end snapshot creation, including the table version that was loaded. |
 | `SnapshotBuildFailure` | `operation_id` | Snapshot creation failed. Use this to track error rates. |
 
 ### Scan metadata events
@@ -148,7 +148,7 @@ consumed. It provides detailed statistics about the log replay process:
 |-------|---------|
 | `operation_id` | Unique ID for this scan, useful for correlation. |
 | `scan_type` | Which scan path produced the event (see below). |
-| `total_duration` | Wall-clock time from scan start to iterator exhaustion. |
+| `duration` | Wall-clock time from scan start to iterator exhaustion. |
 | `num_add_files_seen` | Add actions that entered deduplication. Excludes files already eliminated by data skipping. |
 | `num_active_add_files` | Add files that survived log replay. These are the files your connector reads. |
 | `num_remove_files_seen` | Remove actions encountered in commit files. |
@@ -235,17 +235,16 @@ impl CorrelatingReporter {
 
 impl MetricsReporter for CorrelatingReporter {
     fn report(&self, event: MetricEvent) {
-        // Pull the operation_id out first so intermediate events can be buffered by group.
-        let operation_id = match &event {
-            MetricEvent::LogSegmentLoadSuccess(e) => Some(e.operation_id),
-            MetricEvent::ProtocolMetadataLoadSuccess(e) => Some(e.operation_id),
-            _ => None,
-        };
         match event {
-            // 1. Buffer intermediate events, grouped by their shared operation_id.
-            MetricEvent::LogSegmentLoadSuccess(_) | MetricEvent::ProtocolMetadataLoadSuccess(_) => {
-                let mut map = self.pending.lock().unwrap();
-                map.entry(operation_id.unwrap()).or_default().push(event);
+            // 1. Buffer intermediate events, grouped by their shared operation_id. Bind with
+            //    `ref` so the event can still be moved into the buffer.
+            MetricEvent::LogSegmentLoadSuccess(ref e) => {
+                let id = e.operation_id;
+                self.pending.lock().unwrap().entry(id).or_default().push(event);
+            }
+            MetricEvent::ProtocolMetadataLoadSuccess(ref e) => {
+                let id = e.operation_id;
+                self.pending.lock().unwrap().entry(id).or_default().push(event);
             }
             // 2. When the terminal event arrives, drain the group and
             //    compute aggregates (here, a count of sub-events).
