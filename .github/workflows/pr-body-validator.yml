@@ -8,8 +8,6 @@ on:
 jobs:
   validate-body:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Validate PR Body
         shell: bash
