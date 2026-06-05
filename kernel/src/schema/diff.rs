@@ -743,7 +743,7 @@ mod tests {
 
     fn create_field_with_id(
         name: &str,
-        data_type: DataType,
+        data_type: impl Into<DataType>,
         nullable: bool,
         id: i64,
     ) -> StructField {

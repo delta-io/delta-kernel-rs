@@ -1607,10 +1607,10 @@ pub struct ArrayType {
 }
 
 impl ArrayType {
-    pub fn new(element_type: DataType, contains_null: bool) -> Self {
+    pub fn new(element_type: impl Into<DataType>, contains_null: bool) -> Self {
         Self {
             type_name: "array".into(),
-            element_type,
+            element_type: element_type.into(),
             contains_null,
         }
     }
