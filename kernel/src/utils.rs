@@ -25,6 +25,7 @@ pub(crate) use require;
 /// simplify type bounds. For example, `CollectInto` allows to write this:
 ///
 /// ```
+/// # use delta_kernel::utils::CollectInto;
 /// # struct Foo;
 /// fn foo(arg: impl CollectInto<Foo>) -> Foo {
 ///     arg.collect_into()
@@ -43,8 +44,7 @@ pub(crate) use require;
 /// }
 /// ```
 pub trait CollectInto<T>: IntoIterator + Sized {
-    /// Collects this iterable into a `T`; the dual of [`FromIterator`] just as [`Into`] is the dual
-    /// of [`From`].
+    /// Collects this iterable into a `T`
     fn collect_into(self) -> T;
 }
 
