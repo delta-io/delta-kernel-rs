@@ -18,9 +18,10 @@ The easiest way to write a checkpoint is the convenience method on `Snapshot`:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::snapshot::CheckpointWriteResult;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn main() -> DeltaResult<()> {

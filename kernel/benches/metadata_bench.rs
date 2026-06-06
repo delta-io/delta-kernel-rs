@@ -20,11 +20,11 @@
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
 use tempfile::TempDir;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::load_test_data;
 use url::Url;
 
@@ -38,7 +38,7 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let table_path = tempdir.path().join(table);
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
     // TODO: use multi-threaded executor
-    use delta_kernel::engine::default::storage::store_from_url;
+    use test_utils::delta_kernel_default_engine::storage::store_from_url;
     let store = store_from_url(&url).expect("Failed to create store");
     let engine = DefaultEngineBuilder::new(store).build();
 

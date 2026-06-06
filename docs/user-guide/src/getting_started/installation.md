@@ -1,7 +1,12 @@
 # Installation
 
-`delta_kernel` is available on [crates.io](https://crates.io/crates/delta_kernel) and uses
-Cargo feature flags to keep the core dependency-light.
+The Delta Kernel ships as two crates on crates.io:
+
+- [`delta_kernel`](https://crates.io/crates/delta_kernel): the core library. No I/O, no Arrow.
+- [`delta_kernel_default_engine`](https://crates.io/crates/delta_kernel_default_engine): the default
+  Arrow + Tokio implementation of the `Engine` trait.
+
+Cargo feature flags keep both crates dependency-light.
 
 ## Requirements
 
@@ -10,67 +15,69 @@ Cargo feature flags to keep the core dependency-light.
 
 ## Adding the dependency
 
-Add `delta_kernel` to your `Cargo.toml`:
+For the common case (use the default engine), add both crates:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "0.21", features = ["default-engine-rustls", "arrow"] }
+delta_kernel = "0.23"
+delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
 ```
 
-This gives you the default engine (which handles all I/O and expression evaluation for you) backed
-by Arrow, with `rustls` for TLS. This is the recommended starting point for most users.
+That gives you Kernel plus a default engine that handles I/O and expression evaluation for you,
+backed by Arrow with `rustls` for TLS.
+
+If you're building a custom engine and don't need the default, depend on just `delta_kernel`
+and enable whatever Arrow interop flags you want:
+
+```toml
+[dependencies]
+delta_kernel = { version = "0.23", features = ["arrow-conversion", "arrow-expression"] }
+```
 
 ## Feature flags
 
 You only pay for what you enable.
 
-### Engine features
-
-These enable the built-in `DefaultEngine`, which provides out-of-the-box support for reading and
-writing Delta tables using Arrow and the `object_store` crate.
+### `delta_kernel_default_engine` features
 
 | Feature | Description |
 |---------|-------------|
-| `default-engine-rustls` | Default engine with `rustls` for TLS. **Recommended for most users.** |
-| `default-engine-native-tls` | Default engine using your platform's native TLS (OpenSSL on Linux, Schannel on Windows, Secure Transport on macOS). Use this if `rustls` doesn't work in your environment. |
-| `arrow` | Re-exports Arrow types at the version the kernel was built against. Enables `arrow-conversion` and `arrow-expression` implicitly via the default engine features. Currently maps to Arrow 58. |
+| `rustls` | Default engine with `rustls` for TLS. **Recommended for most users.** |
+| `native-tls` | Default engine using your platform's native TLS (OpenSSL on Linux, Schannel on Windows, Secure Transport on macOS). Use this if `rustls` doesn't work in your environment. |
+| `arrow` | Use the latest Arrow version Kernel supports. Currently maps to Arrow 58. |
 
-You need exactly one of `default-engine-rustls` or `default-engine-native-tls` to use the default
-engine. If you're building a custom engine, you may not need either. See
-[Building a Connector](../connector/overview.md) for details.
+You need exactly one of `rustls` or `native-tls`. See
+[Building a Connector](../connector/overview.md) for when a custom engine makes sense instead.
 
 ### Arrow version pinning
 
-If you need a specific Arrow version (e.g. to match your existing Arrow dependency), you can pin it
-explicitly:
+If you need a specific Arrow version (e.g. to match your existing Arrow dependency), pin it
+explicitly on both crates:
 
 | Feature | Arrow version |
 |---------|---------------|
 | `arrow-58` | Arrow 58 (current default) |
 | `arrow-57` | Arrow 57 |
 
-For more details on managing Arrow version compatibility, see [Feature Flags](../concepts/feature_flags.md).
+For more details on managing Arrow version compatibility, see
+[Feature Flags](../concepts/feature_flags.md).
 
-### Data features
-
-| Feature | Description |
-|---------|-------------|
-| `arrow-conversion` | Enables converting between kernel types and Arrow types |
-| `arrow-expression` | Enables evaluating kernel expressions over Arrow data |
-
-These are pulled in automatically by the default engine features. You typically only need to specify
-them directly if you're building a custom engine that still uses Arrow.
-
-### Advanced features
+### `delta_kernel` features
 
 | Feature | Description |
 |---------|-------------|
-| `internal-api` | Exposes additional APIs that are not yet fully stabilized. Some examples in this guide require this feature. |
-| `schema-diff` | Enables experimental schema diffing functionality. |
+| `arrow-conversion` | Convert between kernel types and Arrow types |
+| `arrow-expression` | Evaluate kernel expressions over Arrow data |
+| `internal-api` | Expose additional APIs that aren't yet stabilized. Some examples in this guide need this. |
+| `schema-diff` | Experimental schema diffing |
+
+The `arrow-conversion` and `arrow-expression` flags are pulled in automatically by
+`delta_kernel_default_engine`, so you typically only set them when building a custom Arrow-based
+engine yourself.
 
 ## Example `Cargo.toml`
 
-A typical project using delta kernel:
+A typical project using Kernel:
 
 ```toml
 [package]
@@ -79,13 +86,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-delta_kernel = { version = "0.21", features = ["default-engine-rustls", "arrow"] }
+delta_kernel = "0.23"
+delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
 
-# The kernel re-exports arrow, but you can also depend on it directly
+# Kernel re-exports arrow, but you can also depend on it directly:
 # arrow = "58"
 ```
 
 ## What's next
 
-With the dependency added, head to [Quick Start: Reading a Table](./quick_start_read.md) to read
-your first Delta table.
+With the dependencies added, head to [Quick Start: Reading a Table](./quick_start_read.md) to
+read your first Delta table.

@@ -145,9 +145,10 @@ Pass the predicate to `ScanBuilder::with_predicate`:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{column_expr, Predicate, Scalar};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
@@ -224,8 +225,9 @@ statistics altogether. This avoids the cost of parsing statistics from checkpoin
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
@@ -259,8 +261,9 @@ in your scan metadata, pass `StatsOptions::all_struct()` (struct stats only) or
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
@@ -294,8 +297,9 @@ To receive statistics for only a subset of columns, pass `StatsOptions::struct_c
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::ColumnName;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};

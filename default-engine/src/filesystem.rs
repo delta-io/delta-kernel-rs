@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use delta_kernel_derive::internal_api;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
+use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
-use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::executor::TaskExecutor;
+use crate::UrlExt;
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -20,7 +19,6 @@ pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    #[internal_api]
     pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             inner: store,
@@ -42,7 +40,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// handler (e.g. inside `DefaultEngine`'s `storage_handler()`), so this function just
 /// returns the raw stream.
 ///
-/// [`MeteredStorageHandler`]: crate::metrics::MeteredStorageHandler
+/// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
@@ -84,7 +82,7 @@ async fn list_from_impl(
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
         Ok(Box::pin(stream::iter(
-            items.into_iter().map(Ok::<FileMeta, crate::Error>),
+            items.into_iter().map(Ok::<FileMeta, delta_kernel::Error>),
         )))
     } else {
         Ok(Box::pin(stream))
@@ -258,16 +256,16 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::Engine as _;
+    use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
     use test_utils::delta_path_for_version;
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::utils::current_time_duration;
-    use crate::Engine as _;
+    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::DefaultEngineBuilder;
 
     fn setup_test() -> (
         tempfile::TempDir,

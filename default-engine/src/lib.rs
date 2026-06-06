@@ -9,6 +9,16 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
+use delta_kernel::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::schema::Schema;
+use delta_kernel::transaction::WriteContext;
+use delta_kernel::{
+    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+};
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
 
@@ -16,16 +26,6 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
-use super::arrow_conversion::TryFromArrow as _;
-use super::arrow_data::ArrowEngineData;
-use super::arrow_expression::ArrowEvaluationHandler;
-use crate::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
-use crate::object_store::DynObjectStore;
-use crate::schema::Schema;
-use crate::transaction::WriteContext;
-use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-};
 
 pub mod executor;
 pub mod file_stream;
@@ -232,8 +232,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
     /// serialization, and logical-to-physical key translation.
     ///
-    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
-    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
+    /// [`Transaction::partitioned_write_context`]: delta_kernel::transaction::Transaction::partitioned_write_context
+    /// [`Transaction::unpartitioned_write_context`]: delta_kernel::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
@@ -265,7 +265,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// [`Transaction::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
-/// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+/// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
@@ -324,9 +324,10 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use test_utils::engine_contract::test_arrow_engine;
+
     use super::*;
-    use crate::engine::tests::test_arrow_engine;
-    use crate::object_store::local::LocalFileSystem;
 
     #[test]
     fn test_default_engine() {
