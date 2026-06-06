@@ -664,7 +664,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 }
 
                 // Widen tightBounds to false (unless already false) instead of recomputing the
-                // stats. Matches delta-spark.
+                // stats.
                 let already_wide = stats_obj
                     .get(TIGHT_BOUNDS)
                     .and_then(serde_json::Value::as_bool)
