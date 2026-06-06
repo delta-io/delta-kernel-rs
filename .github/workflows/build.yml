@@ -346,7 +346,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest

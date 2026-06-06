@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
@@ -96,7 +96,6 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
-            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }
@@ -421,7 +420,7 @@ fn nullable_add_log_schema() -> &'static SchemaRef {
 /// Used when appending DV columns to scan file data.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 static STRUCT_DELETION_VECTOR_SCHEMA: LazyLock<ArrayType> =
-    LazyLock::new(|| ArrayType::new(DeletionVectorDescriptor::to_schema().into(), true));
+    LazyLock::new(|| ArrayType::new(DeletionVectorDescriptor::to_schema(), true));
 
 /// Returns the schema for an array of deletion vector descriptors.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]

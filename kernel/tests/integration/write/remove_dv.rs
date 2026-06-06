@@ -12,6 +12,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{column_expr, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
@@ -1042,7 +1043,10 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         // Always request all stats columns so stats_parsed is present in scan metadata
         // regardless of whether a predicate is used. This ensures remove_files can always
         // reconstruct stats (including the coalesce path when writeStatsAsJson=false).
-        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        let mut scan_builder = snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(StatsOptions::all());
         if use_predicate {
             scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
                 column_expr!("number"),
@@ -1070,7 +1074,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         );
 
         // stats must be populated in every remove action: stats_parsed is always present
-        // (via include_all_stats_columns), so the coalesce path handles even checkpoints
+        // (via `StatsOptions::all()`), so the coalesce path handles even checkpoints
         // that omit the raw JSON stats string (writeStatsAsJson=false).
         for remove in &remove_actions {
             let stats_str = remove["stats"]
@@ -1094,7 +1098,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
 ///   scans whose predicate misses the partition columns).
 /// - partition predicate: `partitionValues_parsed` present.
 ///
-/// Every case calls `.include_all_stats_columns()`, which forces `stats_parsed`
+/// Every case sets `.with_stats(StatsOptions::all())`, which forces `stats_parsed`
 /// into the scan output regardless of the predicate shape, so the partition-
 /// predicate case exercises both parsed-column drop paths together while the
 /// other two exercise only the `stats_parsed` drop path. The coalesce
@@ -1169,7 +1173,10 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         txn.commit(engine.as_ref())?.unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        let mut scan_builder = snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(StatsOptions::all());
         if let Some(pred) = predicate.clone() {
             scan_builder = scan_builder.with_predicate(Arc::new(pred));
         }

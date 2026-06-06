@@ -500,6 +500,12 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
+                // Void has no dedicated FFI tag. The current predicate-construction path is
+                // not expected to produce a void-typed literal null; if one ever reaches this
+                // code we want it represented as a non-primitive null rather than a missing
+                // case, so this arm is a defensive fallback rather than part of the normal
+                // void-column path.
+                PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
             },
             _ => (Self::NonPrimitive, 0, 0),
         }
@@ -738,25 +744,21 @@ mod tests {
 
     #[test]
     fn from_data_type_non_primitive_produces_sentinel() {
-        let struct_type = DataType::Struct(Box::new(
+        let struct_type = DataType::from(
             StructType::try_new(vec![StructField::not_null("a", DataType::INTEGER)]).unwrap(),
-        ));
+        );
         assert_eq!(
             NullTypeTag::from_data_type(&struct_type),
             (NullTypeTag::NonPrimitive, 0, 0)
         );
 
-        let array_type = DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false)));
+        let array_type = DataType::from(ArrayType::new(DataType::INTEGER, false));
         assert_eq!(
             NullTypeTag::from_data_type(&array_type),
             (NullTypeTag::NonPrimitive, 0, 0)
         );
 
-        let map_type = DataType::Map(Box::new(MapType::new(
-            DataType::STRING,
-            DataType::INTEGER,
-            false,
-        )));
+        let map_type = DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, false));
         assert_eq!(
             NullTypeTag::from_data_type(&map_type),
             (NullTypeTag::NonPrimitive, 0, 0)

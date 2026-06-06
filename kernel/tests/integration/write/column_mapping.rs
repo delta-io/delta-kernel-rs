@@ -17,6 +17,7 @@ use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table;
@@ -135,7 +136,7 @@ async fn test_column_mapping_write(
     {
         let scan = ckpt_snapshot
             .scan_builder()
-            .include_all_stats_columns()
+            .with_stats(StatsOptions::all())
             .build()?;
         let scan_metadata_results: Vec<_> = scan
             .scan_metadata(engine.as_ref())?

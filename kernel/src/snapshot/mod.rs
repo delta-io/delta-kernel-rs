@@ -284,6 +284,35 @@ impl Snapshot {
         self.table_configuration.logical_schema()
     }
 
+    /// Estimated owned heap size in bytes for this snapshot. Best-effort estimate
+    /// for capacity tracking, not authoritative.
+    ///
+    /// Counts only the dominant per-snapshot heap contributors, normally > 70% of the snapshot's
+    /// owned heap size:
+    /// - For every listed log path (commit, compaction, checkpoint, latest CRC, latest commit): the
+    ///   filename / extension / Url string heap.
+    /// - Vec buffer capacity (`capacity * size_of::<ParsedLogPath>()`) for the three Vec fields on
+    ///   `LogSegmentFiles`.
+    /// - The log root Url string.
+    /// - The raw `schemaString` JSON on table metadata.
+    ///
+    /// The Arc-shared variables (e.g. logical/physical schemas, `crc`) are not counted,
+    /// as they can be shared between multiple snapshots and are not owned by a single snapshot.
+    ///
+    /// Other variables' contributions to heap size are relatively small, so they are not counted
+    /// here.
+    ///
+    /// Runs in O(n) over listed log files.
+    pub fn estimated_owned_heap_size_bytes(&self) -> usize {
+        self.log_segment.listed.estimated_heap_size_bytes()
+            + self.log_segment.log_root.as_str().len()
+            + self
+                .table_configuration()
+                .metadata()
+                .schema_string()
+                .capacity()
+    }
+
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
@@ -1089,7 +1118,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::{
-        checkpoint_json_stats, unpartitioned, FeatureSet, LogState, VersionTarget,
+        checkpoint_json_stats, unpartitioned, FeatureSet, LogState, TestTableBuilder, VersionTarget,
     };
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -2098,5 +2127,159 @@ mod tests {
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
         let result = snapshot.get_logical_clustering_columns(&engine).unwrap();
         assert_eq!(result, expected);
+    }
+
+    // === estimated_owned_heap_size ===
+    /// Test that the estimated_owned_heap_size is correctly considering normal commit jsons,
+    /// checkpoint parts, and log compaction files.
+    #[test]
+    fn estimated_owned_heap_size_on_table_with_many_log_files() {
+        // Baseline: 101 commits (v0..=v100), no checkpoint, no compactions.
+        let (_engine, baseline_snap, _table) = test_utils::test_context!(
+            LogState::with_latest_version(100),
+            FeatureSet::empty(),
+            unpartitioned(),
+            checkpoint_json_stats(),
+            VersionTarget::Latest,
+            SyncEngine::new_with_store
+        );
+
+        let baseline_heap = baseline_snap.estimated_owned_heap_size_bytes();
+        let struct_size = size_of::<Snapshot>();
+        // Heap size should be at least 5 times the stack size, to account for
+        // the 100 commits file metadata.
+        assert!(
+            baseline_heap > 5 * struct_size,
+            "baseline heap {baseline_heap} should exceed 5 * sizeof(Snapshot)={}",
+            5 * struct_size
+        );
+
+        // 100 extra checkpoint parts: each contributes to heap.
+        // Kernel doesn't yet support writing multi-part checkpoints, so we manually add them here.
+        let snap_extra_checkpoints =
+            snapshot_with_extra_files(&baseline_snap, |listed, log_root| {
+                for i in 1..=100u32 {
+                    let filename =
+                        format!("00000000000000000099.checkpoint.{i:010}.0000000100.parquet");
+                    let location = log_root.join(&filename).unwrap();
+                    let part = ParsedLogPath::try_from(crate::FileMeta {
+                        location,
+                        last_modified: 0,
+                        size: 100,
+                    })
+                    .unwrap()
+                    .unwrap();
+                    listed.checkpoint_parts.push(part);
+                }
+            });
+        let delta_checkpoints =
+            snap_extra_checkpoints.estimated_owned_heap_size_bytes() - baseline_heap;
+        assert!(
+            delta_checkpoints >= 15_000,
+            "delta_checkpoints {delta_checkpoints} should be >= 15_000 for 100 checkpoint parts"
+        );
+
+        // 100 extra log compaction files: each contributes to heap.
+        // Kernel disables writing log compaction files currently, so we manually add them here.
+        let snap_extra_compactions =
+            snapshot_with_extra_files(&baseline_snap, |listed, log_root| {
+                for i in 0..100u64 {
+                    let start = i * 10;
+                    let end = start + 5;
+                    let filename = format!("{start:020}.{end:020}.compacted.json");
+                    let location = log_root.join(&filename).unwrap();
+                    let comp = ParsedLogPath::try_from(crate::FileMeta {
+                        location,
+                        last_modified: 0,
+                        size: 100,
+                    })
+                    .unwrap()
+                    .unwrap();
+                    listed.ascending_compaction_files.push(comp);
+                }
+            });
+        let delta_compactions =
+            snap_extra_compactions.estimated_owned_heap_size_bytes() - baseline_heap;
+        assert!(
+            delta_compactions >= 15_000,
+            "delta_compactions {delta_compactions} should be >= 15_000 for 100 compaction files"
+        );
+    }
+
+    /// Two tables that differ only in schema width: the wider schema should bump
+    /// estimated_owned_heap_size by approximately the schemaString delta.
+    #[test]
+    fn estimated_owned_heap_size_reflects_schema_string() {
+        fn snap_with_schema(schema: SchemaRef) -> SnapshotRef {
+            let store = Arc::new(InMemory::new());
+            let engine = SyncEngine::new_with_store(store);
+            create_table("memory:///", schema, "test")
+                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .unwrap()
+                .commit(&engine)
+                .unwrap()
+                .unwrap_committed();
+            Snapshot::builder_for("memory:///").build(&engine).unwrap()
+        }
+
+        let small_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)]).unwrap(),
+        );
+        let wide_schema = Arc::new(
+            StructType::try_new(
+                (0..50)
+                    .map(|i| StructField::nullable(format!("field_{i:03}"), DataType::STRING))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+
+        let snap_small = snap_with_schema(small_schema);
+        let snap_wide = snap_with_schema(wide_schema);
+
+        let schema_str_delta = snap_wide
+            .table_configuration()
+            .metadata()
+            .schema_string()
+            .capacity()
+            - snap_small
+                .table_configuration()
+                .metadata()
+                .schema_string()
+                .capacity();
+        let heap_delta = snap_wide.estimated_owned_heap_size_bytes()
+            - snap_small.estimated_owned_heap_size_bytes();
+        // Tables differ only in schemaString, so heap_delta should be approximately the
+        // schema_str_delta.
+        let ratio = heap_delta as f64 / schema_str_delta as f64;
+        assert!(
+            (0.8..=1.2).contains(&ratio),
+            "heap_delta {heap_delta} should be within 20% of schema_str_delta {schema_str_delta} (ratio = {ratio:.3})"
+        );
+    }
+
+    #[test]
+    fn estimated_owned_heap_size_for_version_zero() {
+        let table = TestTableBuilder::new().build().unwrap();
+        let engine = SyncEngine::new_with_store(table.store().clone());
+        let snapshot = Snapshot::builder_for(table.table_root())
+            .build(&engine)
+            .unwrap();
+
+        let heap = snapshot.estimated_owned_heap_size_bytes();
+        assert!(heap > 0, "heap size should be nonzero");
+        assert!(
+            heap < 10000,
+            "heap size {heap} unexpectedly large for v0 snapshot"
+        );
+    }
+
+    fn snapshot_with_extra_files<F>(baseline: &SnapshotRef, mutate: F) -> Snapshot
+    where
+        F: FnOnce(&mut LogSegmentFiles, &Url),
+    {
+        let mut new_log_segment = baseline.log_segment().clone();
+        mutate(&mut new_log_segment.listed, &new_log_segment.log_root);
+        Snapshot::new(new_log_segment, baseline.table_configuration().clone()).unwrap()
     }
 }

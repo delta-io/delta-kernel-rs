@@ -918,17 +918,11 @@ impl LogSegment {
                 let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
 
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable(
-                        "stats_parsed",
-                        DataType::Struct(Box::new(ss.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
                 }
 
                 if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable(
-                        "partitionValues_parsed",
-                        DataType::Struct(Box::new(ps.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
                 }
 
                 // Rebuild schema with modified add field

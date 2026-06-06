@@ -56,18 +56,30 @@
 //! }
 //! ```
 //!
-//! # Storage Metrics
+//! # Handler Metrics
 //!
-//! Storage operations (list, read, copy) are automatically instrumented when using
-//! `DefaultEngine` with a metrics reporter. The default storage handler implementation
-//! emits `StorageListCompleted`, `StorageReadCompleted`, and `StorageCopyCompleted`
-//! events that track latencies at the storage layer.
+//! Storage, JSON, and Parquet handler operations emit one event per read or copy
+//! operation, fired when the returned iterator is exhausted or dropped:
+//! `StorageListCompleted` / `StorageReadCompleted` / `StorageCopyCompleted` for storage,
+//! `JsonReadCompleted` for `JsonHandler::read_json_files`, and `ParquetReadCompleted`
+//! for `ParquetHandler::read_parquet_files`. `DefaultEngine` wraps its three handlers
+//! in [`MeteredStorageHandler`], [`MeteredJsonHandler`], and [`MeteredParquetHandler`]
+//! at construction; any other engine gets the same coverage by wrapping its [`Engine`]
+//! in [`MeteredDeltaEngine`].
 //!
-//! These metrics are standalone and track aggregate storage performance without
+//! These metrics are standalone and track aggregate handler performance without
 //! correlating to specific Snapshot/Transaction operations.
+//!
+//! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
+mod metered_engine;
+mod metered_json;
+mod metered_parquet;
+mod metered_storage;
+mod precounted_metrics_iterator;
 pub(crate) mod reporter;
+mod streaming_metrics_iterator;
 
 use std::sync::Arc;
 
@@ -78,7 +90,13 @@ pub use events::{
     SnapshotCompleted, SnapshotFailed, StorageCopyCompleted, StorageListCompleted,
     StorageReadCompleted,
 };
+pub use metered_engine::MeteredDeltaEngine;
+pub use metered_json::MeteredJsonHandler;
+pub use metered_parquet::MeteredParquetHandler;
+pub use metered_storage::MeteredStorageHandler;
+pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
+pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;

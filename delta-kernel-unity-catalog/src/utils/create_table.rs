@@ -234,7 +234,7 @@ mod tests {
             StructType::try_new(vec![
                 StructField::new("id", DataType::INTEGER, true),
                 StructField::new("region", DataType::STRING, true),
-                StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
+                StructField::new("address", address_struct, true),
             ])
             .unwrap(),
         );

@@ -18,6 +18,7 @@ release = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+bytes = "1.10"
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
@@ -25,7 +26,7 @@ url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.23.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.24.0" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
 
@@ -58,6 +59,11 @@ arrow-57 = ["delta_kernel/arrow-57"]
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
 # default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
 default-engine-base = ["delta_kernel/default-engine-base"]
+
+# Declarative plan execution via PlanExecutor trait (experimental).
+#
+# Requires `arrow` because iterators returned from plan execution use Arrow to pass along data batches.
+declarative-plans = ["delta_kernel/declarative-plans", "arrow"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []

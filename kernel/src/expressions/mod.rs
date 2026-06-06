@@ -8,8 +8,8 @@ use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::column_names::{
-    column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
+    joined_column_name, ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -18,6 +18,7 @@ use crate::kernel_predicates::{
 };
 use crate::schema::SchemaRef;
 use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::utils::CollectInto;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
@@ -27,6 +28,19 @@ mod scalars;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
+
+/// Build an [`Expression::Literal`] from anything that converts into a [`Scalar`].
+///
+/// Concise alternative to [`Expression::literal`] for plan builders. Accepts the same value
+/// types [`Scalar`] does (`i32`, `i64`, `&str`, `bool`, ...).
+///
+/// ```
+/// use delta_kernel::expressions::lit;
+/// let _zero = lit(0i64);
+/// ```
+pub fn lit(value: impl Into<Scalar>) -> Expression {
+    Expression::literal(value)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -386,10 +400,7 @@ impl ExpressionStructPatch {
 
     /// Creates a new empty patch that operates on fields of a nested struct identified by
     /// `path`. The various `with_xxx` helper methods can be used to add specific field patches.
-    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn new_nested(path: impl CollectInto<ColumnName>) -> Self {
         Self {
             input_path: Some(ColumnName::new(path)),
             ..Default::default()
@@ -658,10 +669,7 @@ impl Expression {
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Expression
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Expression {
         ColumnName::new(field_names).into()
     }
 
@@ -828,10 +836,7 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Predicate
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Predicate {
         Self::from_expr(ColumnName::new(field_names))
     }
 
@@ -1395,7 +1400,7 @@ mod tests {
             let cases: Vec<ColumnName> = vec![
                 column_name!("simple"),
                 ColumnName::new(["a", "b", "c"]),
-                ColumnName::new::<&str>([]),
+                ColumnName::default(),
             ];
 
             for col in &cases {
