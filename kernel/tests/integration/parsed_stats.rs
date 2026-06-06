@@ -1,7 +1,4 @@
-//! Integration test for `StatsOptions::all` parsed-stats output.
-//!
-//! Builds a table with `delta.checkpoint.writeStatsAsStruct=true` and a nested schema,
-//! then verifies the parsed-stats struct column matches the JSON `stats` string.
+//! Integration tests for parsed-stats output.
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
 use delta_kernel::arrow::array::{
@@ -103,6 +100,8 @@ fn validate_struct_stats(
     }
 }
 
+/// Builds a table with `delta.checkpoint.writeStatsAsStruct=true` and a nested schema,
+/// then verifies the parsed-stats struct column matches the JSON `stats` string.
 #[rstest]
 fn scan_metadata_with_stats_columns_kernel_written(
     #[values(
