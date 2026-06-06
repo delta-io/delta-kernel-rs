@@ -1744,31 +1744,6 @@ mod tests {
         (engine, Url::parse("memory:///_delta_log/").unwrap())
     }
 
-    #[test]
-    fn __probe_shapes() {
-        for (name, paths) in [
-            ("cp5+commits6-8", {
-                let mut p = vec![single_part_checkpoint_path(5)];
-                p.extend(commit_path(6..=8));
-                p
-            }),
-            ("cp5+commits7-8(gap6)", {
-                let mut p = vec![single_part_checkpoint_path(5)];
-                p.extend(commit_path(7..=8));
-                p
-            }),
-            ("cp5+commits5-9", {
-                let mut p = vec![single_part_checkpoint_path(5)];
-                p.extend(commit_path(5..=9));
-                p
-            }),
-        ] {
-            let (engine, log_root) = engine_with_log_files(&paths);
-            let r = get_earliest_recreatable_commit(&engine, &log_root, None);
-            eprintln!("PROBE {name} => {r:?}");
-        }
-    }
-
     fn commit_path(version_range: RangeInclusive<Version>) -> Vec<String> {
         version_range
             .map(|v| delta_path_for_version(v, "json").to_string())
