@@ -14,6 +14,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
@@ -540,7 +541,7 @@ async fn test_dv_update_stats_tight_bound(
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let scan = ckpt_snapshot
         .scan_builder()
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
         .build()?;
     let mut checked_stats_parsed = false;
     for scan_metadata in scan.scan_metadata(engine.as_ref())? {
