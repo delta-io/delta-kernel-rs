@@ -769,6 +769,40 @@ fn get_earliest_recreatable_commit(
     }
 }
 
+/// Returns the earliest table version available on the file system at `log_root`. The returned
+/// version is not guaranteed to exist by the time the caller acts on it: a concurrent log-cleanup
+/// operation may delete the underlying file.
+///
+/// # Parameters
+/// - `engine`: kernel engine used to list `log_root`.
+/// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
+/// - `earliest_ratified_commit_version`: For catalog-managed tables, the earliest version the
+///   catalog has ratified a commit at. Pass `None` for filesystem-only tables.
+/// - `must_be_recreatable`: When `true`, return the earliest version whose state can be fully
+///   reconstructed (commit 0 or the earliest complete checkpoint). When `false`, return the
+///   lowest-numbered published commit.
+///
+/// # Errors
+/// - Propagates any error from listing the log directory.
+/// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits.
+/// - [`LogHistoryError::NoRecreatableCommit`] when `must_be_recreatable` is `true`, commits exist,
+///   but neither `00...00.json` nor a checkpoint anchoring the smallest commit is present.
+/// - [`DeltaError::Generic`] when there is no published filesystem commit and
+///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
+///   (ratified commit 0 with no published filesystem commit).
+pub fn get_earliest_commit(
+    engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+    must_be_recreatable: bool,
+) -> DeltaResult<Version> {
+    if must_be_recreatable {
+        get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
+    } else {
+        get_earliest_published_commit_version(engine, log_root, earliest_ratified_commit_version)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
