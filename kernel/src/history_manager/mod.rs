@@ -770,6 +770,17 @@ fn get_earliest_recreatable_commit(
     }))
 }
 
+/// Select which commit type to return in the get_earliest_commit query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitType {
+    /// A file-system commit or a catalog commit present in the table's _delta_log/ .
+    /// The commit does not gurantee that the table can be reconstructed from the commit's version.
+    Published,
+    /// A commit that table can be reconstructed from that version and replay forward to the latest
+    /// version.
+    Recreatable,
+}
+
 /// Returns the earliest table version available on the file system at `log_root`. The returned
 /// version is not guaranteed to exist by the time the caller acts on it: a concurrent log-cleanup
 /// operation may delete the underlying file.
@@ -796,12 +807,18 @@ pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-    must_be_recreatable: bool,
+    commit_type: CommitType,
 ) -> DeltaResult<Version> {
-    if must_be_recreatable {
-        get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
-    } else {
-        get_earliest_published_commit_version(engine, log_root, earliest_ratified_commit_version)
+    match commit_type {
+        CommitType::Published => get_earliest_published_commit_version(
+            engine,
+            log_root,
+            earliest_ratified_commit_version,
+        ),
+
+        CommitType::Recreatable => {
+            get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
+        }
     }
 }
 
