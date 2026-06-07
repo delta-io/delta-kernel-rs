@@ -25,7 +25,7 @@ pub mod opaque_eval;
 mod arrow_eval;
 
 #[cfg(feature = "default-engine-base")]
-use opaque_eval::{EvalMode, OpaqueEvalCallbacks};
+use opaque_eval::{COpaqueEvalCallbacks, EvalMode};
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
 pub struct SharedExpression;
@@ -105,10 +105,10 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
     visit(data, kernel_string_slice!(name));
 }
 
-// === NamedOpaquePredicateOp ===================================================
+// === FfiOpaquePredicateOp ===================================================
 
 /// Engine-defined opaque predicate identified by a name (e.g. `STARTS_WITH`, `LIKE`). Optionally
-/// carries an [`OpaqueEvalCallbacks`] reference; when attached, kernel routes row-time evaluation
+/// carries an [`COpaqueEvalCallbacks`] reference; when attached, kernel routes row-time evaluation
 /// through the engine's `eval_pred` callback (engine receives pre-evaluated args as Arrow arrays).
 ///
 /// # Data skipping
@@ -119,7 +119,7 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 /// evaluates per data row and never drops files. See [`EngineEvalPredFn`] for the per-mode arg
 /// shapes the engine callback must handle.
 ///
-/// Bare ops (`Predicate::opaque(NamedOpaquePredicateOp::new(...))`) have no callback attached
+/// Bare ops (`Predicate::opaque(FfiOpaquePredicateOp::new(...))`) have no callback attached
 /// and so abstain from file pruning. Scalar / partition-pruning paths always abstain.
 ///
 /// Inverted predicates (`NOT op`) are rewritten too: the inversion is recorded on the op and
@@ -128,13 +128,13 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 /// no sibling literal to infer its type from, or an arg is some kind other than `Column`,
 /// `Literal`, or `Predicate`.
 ///
-/// [`OpaqueEvalCallbacks`]: opaque_eval::OpaqueEvalCallbacks
+/// [`COpaqueEvalCallbacks`]: opaque_eval::COpaqueEvalCallbacks
 /// [`EngineEvalPredFn`]: opaque_eval::EngineEvalPredFn
 #[derive(Debug, Clone)]
-pub(crate) struct NamedOpaquePredicateOp {
+pub(crate) struct FfiOpaquePredicateOp {
     name: String,
     #[cfg(feature = "default-engine-base")]
-    callbacks: Option<Arc<OpaqueEvalCallbacks>>,
+    callbacks: Option<Arc<COpaqueEvalCallbacks>>,
     /// Mode forwarded to the engine callback during eval. Defaults to `RowMode`.
     #[cfg(feature = "default-engine-base")]
     mode: EvalMode,
@@ -144,7 +144,7 @@ pub(crate) struct NamedOpaquePredicateOp {
     inverted: bool,
 }
 
-impl NamedOpaquePredicateOp {
+impl FfiOpaquePredicateOp {
     /// Build an op identified by `name`, without any engine integrations.
     /// Kernel keeps every file and row.
     pub(crate) fn new(name: impl Into<String>) -> Self {
@@ -159,18 +159,11 @@ impl NamedOpaquePredicateOp {
         }
     }
 
-    /// Build an op that consults `callbacks` during eval. Defaults to `RowMode`.
+    /// Consume `self` and return it with `callbacks` attached.
     #[cfg(feature = "default-engine-base")]
-    pub(crate) fn with_callbacks(
-        name: impl Into<String>,
-        callbacks: Arc<OpaqueEvalCallbacks>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            callbacks: Some(callbacks),
-            mode: EvalMode::RowMode,
-            inverted: false,
-        }
+    pub(crate) fn with_callbacks(mut self, callbacks: Arc<COpaqueEvalCallbacks>) -> Self {
+        self.callbacks = Some(callbacks);
+        self
     }
 
     /// Consume `self` and return it with `mode` overridden.
@@ -193,7 +186,7 @@ impl NamedOpaquePredicateOp {
     }
 
     #[cfg(feature = "default-engine-base")]
-    pub(crate) fn callbacks_clone(&self) -> Option<Arc<OpaqueEvalCallbacks>> {
+    pub(crate) fn callbacks_clone(&self) -> Option<Arc<COpaqueEvalCallbacks>> {
         self.callbacks.clone()
     }
 
@@ -208,7 +201,7 @@ impl NamedOpaquePredicateOp {
     }
 }
 
-impl PartialEq for NamedOpaquePredicateOp {
+impl PartialEq for FfiOpaquePredicateOp {
     fn eq(&self, other: &Self) -> bool {
         // The name identifies the op. Under `default-engine-base` the op also carries an eval mode,
         // an inversion flag, and a callback bundle, all of which change how it evaluates, so
@@ -229,9 +222,9 @@ impl PartialEq for NamedOpaquePredicateOp {
     }
 }
 
-impl Eq for NamedOpaquePredicateOp {}
+impl Eq for FfiOpaquePredicateOp {}
 
-impl OpaquePredicateOp for NamedOpaquePredicateOp {
+impl OpaquePredicateOp for FfiOpaquePredicateOp {
     fn name(&self) -> &str {
         &self.name
     }
@@ -263,7 +256,7 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
     ) -> Option<Predicate> {
         // The real rewrite lives on the `ArrowOpaquePredicateOp` impl in `arrow_eval.rs` -- it
         // wraps the output via `Predicate::arrow_opaque` so runtime dispatch can reach the
-        // engine callback. Ops built via `Predicate::opaque(NamedOpaquePredicateOp::new(...))`
+        // engine callback. Ops built via `Predicate::opaque(FfiOpaquePredicateOp::new(...))`
         // have no callback to dispatch to, so file pruning is impossible regardless: abstain.
         None
     }
@@ -276,13 +269,20 @@ impl OpaquePredicateOp for NamedOpaquePredicateOp {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
-    use delta_kernel::expressions::OpaquePredicateOp as _;
+    use std::cmp::Ordering;
+
+    use delta_kernel::expressions::{
+        BinaryPredicateOp, ColumnName, JunctionPredicateOp, OpaquePredicateOp as _,
+        OpaquePredicateOpRef, Scalar,
+    };
+    use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
+    use delta_kernel::schema::DataType as SchemaDataType;
 
     use super::*;
 
     #[test]
     fn named_opaque_predicate_op_carries_name() {
-        let op = NamedOpaquePredicateOp::new("STARTS_WITH");
+        let op = FfiOpaquePredicateOp::new("STARTS_WITH");
         assert_eq!(op.name(), "STARTS_WITH");
     }
 
@@ -290,12 +290,12 @@ mod tests {
     fn named_opaque_predicate_op_equality() {
         // Name is the baseline identity.
         assert_eq!(
-            NamedOpaquePredicateOp::new("LIKE"),
-            NamedOpaquePredicateOp::new("LIKE")
+            FfiOpaquePredicateOp::new("LIKE"),
+            FfiOpaquePredicateOp::new("LIKE")
         );
         assert_ne!(
-            NamedOpaquePredicateOp::new("LIKE"),
-            NamedOpaquePredicateOp::new("OTHER")
+            FfiOpaquePredicateOp::new("LIKE"),
+            FfiOpaquePredicateOp::new("OTHER")
         );
 
         // Under default-engine-base, equality also distinguishes eval mode and callback identity,
@@ -305,7 +305,7 @@ mod tests {
             use std::ffi::c_void;
             use std::sync::Arc;
 
-            use super::opaque_eval::{EvalMode, OpaqueEvalCallbacks};
+            use super::opaque_eval::{COpaqueEvalCallbacks, EvalMode};
             use crate::engine_data::ArrowFFIData;
             use crate::{KernelStringSlice, OptionalValue};
 
@@ -320,7 +320,7 @@ mod tests {
             }
             unsafe extern "C" fn stub_free(_: *mut c_void) {}
             let make_cb = || {
-                Arc::new(OpaqueEvalCallbacks {
+                Arc::new(COpaqueEvalCallbacks {
                     engine_state: std::ptr::null_mut(),
                     eval_pred: stub_eval,
                     free_state: stub_free,
@@ -329,27 +329,27 @@ mod tests {
 
             // Same name, different mode -> not equal.
             assert_ne!(
-                NamedOpaquePredicateOp::new("OP"),
-                NamedOpaquePredicateOp::new("OP").with_mode(EvalMode::StatsMode)
+                FfiOpaquePredicateOp::new("OP"),
+                FfiOpaquePredicateOp::new("OP").with_mode(EvalMode::StatsMode)
             );
 
             // Same name, different inversion -> not equal.
             assert_ne!(
-                NamedOpaquePredicateOp::new("OP"),
-                NamedOpaquePredicateOp::new("OP").with_inverted(true)
+                FfiOpaquePredicateOp::new("OP"),
+                FfiOpaquePredicateOp::new("OP").with_inverted(true)
             );
 
             // Same callbacks Arc (cloned) -> equal; distinct Arcs -> not equal (pointer identity).
             let cb = make_cb();
-            let shared = NamedOpaquePredicateOp::with_callbacks("OP", cb.clone());
-            assert_eq!(shared, NamedOpaquePredicateOp::with_callbacks("OP", cb));
+            let shared = FfiOpaquePredicateOp::new("OP").with_callbacks(cb.clone());
+            assert_eq!(shared, FfiOpaquePredicateOp::new("OP").with_callbacks(cb));
             assert_ne!(
                 shared,
-                NamedOpaquePredicateOp::with_callbacks("OP", make_cb())
+                FfiOpaquePredicateOp::new("OP").with_callbacks(make_cb())
             );
 
             // Callbacks present vs absent -> not equal.
-            assert_ne!(shared, NamedOpaquePredicateOp::new("OP"));
+            assert_ne!(shared, FfiOpaquePredicateOp::new("OP"));
         }
     }
 
@@ -357,14 +357,6 @@ mod tests {
     /// `ArrowOpaquePredicateOp` impl in `arrow_eval.rs`.
     #[test]
     fn kernel_trait_as_data_skipping_predicate_always_returns_none() {
-        use std::cmp::Ordering;
-
-        use delta_kernel::expressions::{
-            BinaryPredicateOp, ColumnName, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
-        };
-        use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
-        use delta_kernel::schema::DataType as SchemaDataType;
-
         // Minimal evaluator stub -- the trait impl ignores its evaluator argument, so the body
         // is never exercised.
         struct NeverCalled;
@@ -428,7 +420,7 @@ mod tests {
             }
         }
 
-        let op = NamedOpaquePredicateOp::new("ANY");
+        let op = FfiOpaquePredicateOp::new("ANY");
         let evaluator = NeverCalled;
         let result = op.as_data_skipping_predicate(
             &evaluator

@@ -144,6 +144,15 @@ pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
     let _ = unsafe { Box::from_raw(result) };
 }
 
+/// Allocate an empty [`ArrowFFIData`] for the engine to populate and return to kernel. Engines MUST
+/// use this (not their own allocator) so kernel can reclaim it; free with [`free_arrow_ffi_data`]
+/// if not returned.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub extern "C" fn arrow_ffi_data_new() -> *mut ArrowFFIData {
+    Box::into_raw(Box::new(ArrowFFIData::empty()))
+}
+
 /// Creates engine data from Arrow C Data Interface array and schema.
 ///
 /// Converts the provided Arrow C Data Interface array and schema into delta-kernel's internal

@@ -1,4 +1,4 @@
-//! `ArrowOpaquePredicateOp` impl for `NamedOpaquePredicateOp`.
+//! `ArrowOpaquePredicateOp` impl for `FfiOpaquePredicateOp`.
 //!
 //! Kernel's `evaluate_predicate` recurses through compound expressions (Binary, Junction, etc.)
 //! natively. This module is the leaf: when kernel hits an opaque predicate, we evaluate each arg
@@ -25,11 +25,12 @@ use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
+use delta_kernel::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
-use super::opaque_eval::{EvalMode, OpaqueEvalCallbacks};
-use super::NamedOpaquePredicateOp;
+use super::opaque_eval::{COpaqueEvalCallbacks, EvalMode};
+use super::FfiOpaquePredicateOp;
 use crate::engine_data::ArrowFFIData;
 use crate::{kernel_string_slice, OptionalValue};
 
@@ -38,17 +39,9 @@ use crate::{kernel_string_slice, OptionalValue};
 /// `Expression::Struct` args (produced by the stats-mode rewrite) get a dedicated path because
 /// kernel's evaluator needs a `DataType::Struct` result type to name fields, which we don't have.
 fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<RecordBatch> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            Expression::Struct(fields, _nullability) => evaluate_struct_arg(fields, batch),
-            _ => evaluate_expression(arg, batch, None),
-        })
-        .collect::<DeltaResult<_>>()?;
-
     // Zero-arg ops (e.g. NOW(), RAND()): empty-schema batch with explicit row count so the
     // engine knows how many rows to emit.
-    if arrays.is_empty() {
+    if args.is_empty() {
         let n_rows = batch.num_rows();
         return RecordBatch::try_new_with_options(
             Arc::new(Schema::empty()),
@@ -57,6 +50,14 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
         )
         .map_err(|e| Error::Generic(format!("zero-arg opaque eval batch construction: {e}")));
     }
+
+    let arrays: Vec<ArrayRef> = args
+        .iter()
+        .map(|arg| match arg {
+            Expression::Struct(fields, _nullability) => evaluate_struct_arg(fields, batch),
+            _ => evaluate_expression(arg, batch, None),
+        })
+        .collect::<DeltaResult<_>>()?;
 
     let fields: Vec<Field> = arrays
         .iter()
@@ -74,7 +75,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
 fn is_partition_column_ref(expr: &Expression) -> bool {
     matches!(
         expr,
-        Expression::Column(name) if name.path().first().is_some_and(|p| p == "partitionValues_parsed")
+        Expression::Column(name) if name.path().first().is_some_and(|p| p == PARTITION_VALUES_PARSED_NAME)
     )
 }
 
@@ -91,12 +92,8 @@ fn pick_column_type_hint(exprs: &[Expression]) -> Option<DataType> {
 /// `Struct[min, max, nullcount, rowcount]`; `Literal` passes through unchanged; `Predicate`
 /// recurses through kernel's standard data-skipping evaluator.
 ///
-/// Returns `None` (which makes the whole predicate abstain) when the arg can't be expressed
-/// against stats: an unsupported expression kind, or a non-partition `Column` with no
-/// `type_hint`. Reading min/max stats requires the column's type, which we only learn from a
-/// sibling literal (see [`pick_column_type_hint`]); with no literal to borrow we abstain rather
-/// than guess. A column whose type is known but whose stats weren't collected still produces a
-/// wrapper with null min/max, so the engine can prune on nullcount/rowcount alone.
+/// Returns `None` (abstaining the whole predicate) when the arg can't be expressed against stats:
+/// an unsupported expression kind, or a data `Column` with no sibling literal to infer its type.
 fn rewrite_stat_arg(
     evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
     arg: &Expression,
@@ -162,18 +159,13 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
 
 /// Import an `ArrowFFIData` produced by the engine back into an `ArrayRef`.
 fn import_ffi_array(ffi: &mut ArrowFFIData) -> DeltaResult<ArrayRef> {
-    // Engine signalled success but handed back an unpopulated result: an empty
-    // FFI_ArrowArray has no `release` callback (per Arrow C Data Interface,
-    // every populated array carries a release fn). Detect this before
-    // handing the empties to `from_ffi`, which would otherwise be UB-adjacent.
+    // A released array means an unpopulated result (empty arrays carry no release callback).
     if ffi.array.is_released() {
         return Err(Error::Generic(
             "engine callback returned success but no result array".into(),
         ));
     }
 
-    // Take ownership of the FFI structs out of the result buffer so the
-    // engine's release callbacks fire exactly once.
     let array = std::mem::replace(&mut ffi.array, FFI_ArrowArray::empty());
     let schema = std::mem::replace(&mut ffi.schema, FFI_ArrowSchema::empty());
 
@@ -184,8 +176,6 @@ fn import_ffi_array(ffi: &mut ArrowFFIData) -> DeltaResult<ArrayRef> {
     Ok(make_array(array_data))
 }
 
-/// Engine returned an `ArrayRef` of the wrong top-level shape -- raise an
-/// error rather than silently coercing.
 fn require_boolean_array(arr: ArrayRef) -> DeltaResult<BooleanArray> {
     arr.as_any()
         .downcast_ref::<BooleanArray>()
@@ -199,7 +189,7 @@ fn require_boolean_array(arr: ArrayRef) -> DeltaResult<BooleanArray> {
 }
 
 fn call_eval_pred(
-    cb: &OpaqueEvalCallbacks,
+    cb: &COpaqueEvalCallbacks,
     op_name: &str,
     args_batch: &RecordBatch,
     mode: EvalMode,
@@ -229,9 +219,8 @@ fn call_eval_pred(
         )));
     }
 
-    // SAFETY: on success the engine transfers ownership of a `Box`-allocated `ArrowFFIData`
-    // (see `EngineEvalPredFn`); reclaim it so its memory is freed when `result_ffi` drops. The
-    // inner Arrow structs are moved out by `import_ffi_array`, leaving an empty (no-op Drop) box.
+    // SAFETY: per `EngineEvalPredFn`, the engine allocates this via `arrow_ffi_data_new`, so
+    // `Box::from_raw` reclaims it correctly. `import_ffi_array` moves the inner structs out first.
     let mut result_ffi = unsafe { Box::from_raw(ptr) };
     let arr = import_ffi_array(&mut result_ffi)?;
     require_boolean_array(arr)
@@ -239,7 +228,7 @@ fn call_eval_pred(
 
 // === ArrowOpaquePredicateOp ====================================================
 
-impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
+impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
     fn name(&self) -> &str {
         self.op_name()
     }
@@ -287,6 +276,8 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         _exprs: &[Expression],
         _inverted: bool,
     ) -> DeltaResult<Option<bool>> {
+        // Abstains from scalar evaluation (e.g. partition pruning).
+        // TODO: support it by invoking the engine callback with a one-row stats batch.
         Ok(None)
     }
 
@@ -296,8 +287,10 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         _exprs: &[Expression],
         _inverted: bool,
     ) -> Option<bool> {
-        // The scalar-bool skipping path can't drive engine callbacks, so we always abstain;
-        // file pruning happens via `as_data_skipping_predicate` instead.
+        // Row-group skipping: abstain. Opaque predicates prune at the file level instead -- via the
+        // `as_data_skipping_predicate` rewrite, then `evaluate_predicate` -> `eval_pred`.
+        // TODO: support row-group skipping by invoking the engine callback with a one-row stats
+        // batch.
         None
     }
 
@@ -307,9 +300,7 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
-        // Without callbacks the rewritten predicate would error at evaluation time (the
-        // arrow eval_pred above requires callbacks). Abstain so the surrounding junction
-        // logic correctly drops this branch from the stats predicate.
+        // Abstain without callbacks: the rewritten predicate's eval would otherwise error.
         self.callbacks_clone()?;
 
         // Each `Column` arg becomes a `Struct[min, max, nullcount, rowcount]`; literals pass
@@ -321,12 +312,8 @@ impl ArrowOpaquePredicateOp for NamedOpaquePredicateOp {
             .map(|arg| rewrite_stat_arg(evaluator, arg, type_hint.as_ref()))
             .collect::<Option<Vec<_>>>()?;
 
-        // Record the inversion on the op (kernel evaluates the stats predicate non-inverted, so the
-        // flag rides on the op rather than a surrounding NOT -- a `Predicate::not` here would make
-        // kernel flip the boolean verdict, which is unsound for stats). The engine callback must
-        // reason about the negated op, NOT flip its non-inverted verdict; see `EngineEvalPredFn`.
-        // arrow_opaque (not bare opaque) so runtime dispatch reaches our callback via the
-        // ArrowOpaquePredicateOpAdaptor.
+        // Record inversion on the op, not as a surrounding `Predicate::not` (kernel would flip the
+        // verdict, unsound for stats). Use arrow_opaque so dispatch reaches our callback.
         let stats_op = self
             .clone()
             .with_mode(EvalMode::StatsMode)
@@ -353,7 +340,7 @@ mod tests {
     use delta_kernel::expressions::{column_expr, Expression, Predicate};
 
     use super::*;
-    use crate::expressions::opaque_eval::OpaqueEvalCallbacks;
+    use crate::expressions::opaque_eval::COpaqueEvalCallbacks;
     use crate::KernelStringSlice;
 
     // === Engine-side test stubs ===================================================
@@ -376,9 +363,12 @@ mod tests {
     /// real engine returns its result from `eval_pred`.
     fn make_result(arr: ArrayRef) -> OptionalValue<*mut ArrowFFIData> {
         let array_data = arr.to_data();
-        let array = FFI_ArrowArray::new(&array_data);
-        let schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
-        OptionalValue::Some(Box::into_raw(Box::new(ArrowFFIData { array, schema })))
+        let ptr = crate::engine_data::arrow_ffi_data_new();
+        unsafe {
+            (*ptr).array = FFI_ArrowArray::new(&array_data);
+            (*ptr).schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
+        }
+        OptionalValue::Some(ptr)
     }
 
     /// Composite opaque predicate: `STARTS_WITH(LOWER(args[0]), args[1])`. Both
@@ -459,8 +449,8 @@ mod tests {
             EvalMode,
             bool,
         ) -> OptionalValue<*mut ArrowFFIData>,
-    ) -> Arc<OpaqueEvalCallbacks> {
-        Arc::new(OpaqueEvalCallbacks {
+    ) -> Arc<COpaqueEvalCallbacks> {
+        Arc::new(COpaqueEvalCallbacks {
             engine_state: ptr::null_mut(),
             eval_pred,
             free_state: noop_free,
@@ -482,10 +472,8 @@ mod tests {
     #[test]
     fn composite_starts_with_lower_predicate_round_trips() {
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks(
-                "STARTS_WITH_LOWER",
-                callbacks_for(engine_starts_with_lower),
-            ),
+            FfiOpaquePredicateOp::new("STARTS_WITH_LOWER")
+                .with_callbacks(callbacks_for(engine_starts_with_lower)),
             [column_expr!("col"), Expression::literal("foo")],
         );
 
@@ -502,10 +490,8 @@ mod tests {
     #[test]
     fn inversion_flips_verdicts() {
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks(
-                "STARTS_WITH_LOWER",
-                callbacks_for(engine_starts_with_lower),
-            ),
+            FfiOpaquePredicateOp::new("STARTS_WITH_LOWER")
+                .with_callbacks(callbacks_for(engine_starts_with_lower)),
             [column_expr!("col"), Expression::literal("foo")],
         );
         let batch = batch_with_col(vec![Some("FOOBAR"), Some("Apple")]);
@@ -520,11 +506,11 @@ mod tests {
     fn composition_and_of_two_opaque_predicates() {
         let cb = callbacks_for(engine_starts_with);
         let lhs = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", cb.clone()),
+            FfiOpaquePredicateOp::new("STARTS_WITH").with_callbacks(cb.clone()),
             [column_expr!("col"), Expression::literal("F")],
         );
         let rhs = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("STARTS_WITH", cb),
+            FfiOpaquePredicateOp::new("STARTS_WITH").with_callbacks(cb),
             [column_expr!("col"), Expression::literal("FO")],
         );
         let and_pred = Predicate::and_from([lhs, rhs]);
@@ -550,7 +536,7 @@ mod tests {
             OptionalValue::None
         }
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("ALWAYS_FAIL", callbacks_for(engine_fail)),
+            FfiOpaquePredicateOp::new("ALWAYS_FAIL").with_callbacks(callbacks_for(engine_fail)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
@@ -571,7 +557,7 @@ mod tests {
             OptionalValue::Some(ptr::null_mut())
         }
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("RETURNS_NULL", callbacks_for(engine_null)),
+            FfiOpaquePredicateOp::new("RETURNS_NULL").with_callbacks(callbacks_for(engine_null)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
@@ -593,7 +579,7 @@ mod tests {
             make_result(arr)
         }
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("RETURNS_INT", callbacks_for(engine_int)),
+            FfiOpaquePredicateOp::new("RETURNS_INT").with_callbacks(callbacks_for(engine_int)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x"), Some("y"), Some("z")]);
@@ -612,10 +598,10 @@ mod tests {
         ) -> OptionalValue<*mut ArrowFFIData> {
             // Consume args but hand back an empty (unpopulated) result.
             let _ = unsafe { take_ffi_record_batch(args_in) };
-            OptionalValue::Some(Box::into_raw(Box::new(ArrowFFIData::empty())))
+            OptionalValue::Some(crate::engine_data::arrow_ffi_data_new())
         }
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("EMPTY", callbacks_for(engine_empty)),
+            FfiOpaquePredicateOp::new("EMPTY").with_callbacks(callbacks_for(engine_empty)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
@@ -641,7 +627,7 @@ mod tests {
             make_result(arr)
         }
         let pred = Predicate::arrow_opaque(
-            NamedOpaquePredicateOp::with_callbacks("ZERO_ARG", callbacks_for(engine_always_true)),
+            FfiOpaquePredicateOp::new("ZERO_ARG").with_callbacks(callbacks_for(engine_always_true)),
             [] as [Expression; 0],
         );
         let batch = batch_with_col(vec![Some("a"); 5]);
@@ -654,13 +640,14 @@ mod tests {
 
     mod rewrite {
         use std::cmp::Ordering;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         use delta_kernel::arrow::array::Int64Array;
         use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
         use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp as _;
         use delta_kernel::expressions::{
-            column_expr, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
-            OpaquePredicateOpRef, Scalar,
+            column_expr, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+            JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
         use delta_kernel::schema::DataType;
@@ -835,12 +822,12 @@ mod tests {
             }
         }
 
-        fn op_with_callbacks(name: &str) -> NamedOpaquePredicateOp {
-            NamedOpaquePredicateOp::with_callbacks(name, callbacks_for(engine_starts_with))
+        fn op_with_callbacks(name: &str) -> FfiOpaquePredicateOp {
+            FfiOpaquePredicateOp::new(name).with_callbacks(callbacks_for(engine_starts_with))
         }
 
         fn rewrite(
-            op: &NamedOpaquePredicateOp,
+            op: &FfiOpaquePredicateOp,
             args: &[Expression],
             rewriter: &StatsRewriter,
             inverted: bool,
@@ -858,10 +845,6 @@ mod tests {
 
         #[test]
         fn inverted_range_op_prunes_complement() {
-            use std::ffi::c_void;
-
-            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-
             // Range op `GE(col, t)`: non-inverted keeps a file iff some value could be `>= t`
             // (max >= t); inverted (`col < t`) keeps iff some value could be `< t` (min < t).
             // Same stats, different computation -- not a verdict flip.
@@ -908,7 +891,7 @@ mod tests {
             }
 
             // Stats batch: a single file with id in [1, 10]. Target 11 is above the whole range.
-            let op = NamedOpaquePredicateOp::with_callbacks("GE", callbacks_for(engine_ge));
+            let op = FfiOpaquePredicateOp::new("GE").with_callbacks(callbacks_for(engine_ge));
             let args = [column_expr!("col"), Expression::literal(11i64)];
             let stats_batch = single_col_int64_stats_batch();
 
@@ -931,7 +914,7 @@ mod tests {
 
         #[test]
         fn abstains_when_no_callbacks() {
-            let op = NamedOpaquePredicateOp::new("STARTS_WITH");
+            let op = FfiOpaquePredicateOp::new("STARTS_WITH");
             let args = [column_expr!("col")];
             assert!(rewrite(&op, &args, &rewriter(), false).is_none());
         }
@@ -1010,7 +993,6 @@ mod tests {
 
         #[test]
         fn abstains_on_unsupported_expr_kinds() {
-            use delta_kernel::expressions::BinaryExpressionOp;
             let op = op_with_callbacks("OP");
             let args = [Expression::binary(
                 BinaryExpressionOp::Plus,
@@ -1077,11 +1059,6 @@ mod tests {
         /// Bare `Predicate::opaque` would fail the adapter downcast and silently skip the callback.
         #[test]
         fn rewritten_predicate_dispatches_to_engine_callback() {
-            use std::ffi::c_void;
-            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-
             static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
             unsafe extern "C" fn engine_count(
@@ -1098,7 +1075,7 @@ mod tests {
                 make_result(arr)
             }
 
-            let op = NamedOpaquePredicateOp::with_callbacks("OP", callbacks_for(engine_count));
+            let op = FfiOpaquePredicateOp::new("OP").with_callbacks(callbacks_for(engine_count));
             let args = [column_expr!("col"), Expression::literal(5i64)];
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
@@ -1120,11 +1097,6 @@ mod tests {
         /// and falls back to keep-the-file.
         #[test]
         fn engine_handles_missing_nullcount_via_null_placeholder() {
-            use std::ffi::c_void;
-            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-
             static SAW_NULLCOUNT: AtomicUsize = AtomicUsize::new(0);
 
             unsafe extern "C" fn engine_check_nullcount(
@@ -1156,10 +1128,8 @@ mod tests {
                 make_result(arr)
             }
 
-            let op = NamedOpaquePredicateOp::with_callbacks(
-                "NEEDS_NULLCOUNT",
-                callbacks_for(engine_check_nullcount),
-            );
+            let op = FfiOpaquePredicateOp::new("NEEDS_NULLCOUNT")
+                .with_callbacks(callbacks_for(engine_check_nullcount));
             let args = [column_expr!("col"), Expression::literal(5i64)];
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
@@ -1221,11 +1191,6 @@ mod tests {
         /// never fires.
         #[test]
         fn stats_eval_abstains_when_min_max_ref_is_unbacked() {
-            use std::ffi::c_void;
-            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-            use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-
             static CALLS: AtomicUsize = AtomicUsize::new(0);
 
             unsafe extern "C" fn engine_count(
@@ -1240,7 +1205,7 @@ mod tests {
                 make_result(Arc::new(BooleanArray::from(vec![true; batch.num_rows()])))
             }
 
-            let op = NamedOpaquePredicateOp::with_callbacks("OP", callbacks_for(engine_count));
+            let op = FfiOpaquePredicateOp::new("OP").with_callbacks(callbacks_for(engine_count));
             let args = [column_expr!("col"), Expression::literal(5i64)];
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");

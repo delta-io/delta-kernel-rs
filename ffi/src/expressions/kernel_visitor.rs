@@ -5,15 +5,15 @@ use std::sync::Arc;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
-    UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
+    Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::opaque_eval::SharedOpaqueEvalContext;
-use crate::expressions::{NamedOpaquePredicateOp, SharedExpression, SharedPredicate};
+use crate::expressions::{FfiOpaquePredicateOp, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -608,7 +608,6 @@ pub extern "C" fn visit_predicate_or(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
 ) -> usize {
-    use delta_kernel::expressions::JunctionPredicateOp;
     let result = Predicate::junction(
         JunctionPredicateOp::Or,
         children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
@@ -716,7 +715,7 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
     resolved.into_iter().collect()
 }
 
-/// Build `Predicate::Opaque(NamedOpaquePredicateOp(name), children)` without
+/// Build `Predicate::Opaque(FfiOpaquePredicateOp(name), children)` without
 /// an engine eval context. The resulting predicate abstains during scalar /
 /// data-skipping evaluation and errors if it ever reaches the Arrow batch
 /// evaluator (kernel never wires the op to a callback).
@@ -750,11 +749,11 @@ fn visit_predicate_opaque_impl(
     };
     Ok(wrap_predicate(
         state,
-        Predicate::opaque(NamedOpaquePredicateOp::new(name), exprs),
+        Predicate::opaque(FfiOpaquePredicateOp::new(name), exprs),
     ))
 }
 
-/// Build `Predicate::Opaque(NamedOpaquePredicateOp(name, callbacks), children)`
+/// Build `Predicate::Opaque(FfiOpaquePredicateOp(name, callbacks), children)`
 /// and route it through the default engine's Arrow batch evaluator. Kernel
 /// pre-evaluates each child arg recursively via its standard
 /// `evaluate_expression`, exports the resulting columns as a single
@@ -788,13 +787,13 @@ fn visit_predicate_opaque_with_eval_impl(
     state: &mut KernelExpressionVisitorState,
     name: DeltaResult<String>,
     children: &mut EngineIterator,
-    callbacks: Arc<crate::expressions::opaque_eval::OpaqueEvalCallbacks>,
+    callbacks: Arc<crate::expressions::opaque_eval::COpaqueEvalCallbacks>,
 ) -> DeltaResult<usize> {
     let name = name?;
     let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
         return Ok(0);
     };
-    let op = NamedOpaquePredicateOp::with_callbacks(name, callbacks);
+    let op = FfiOpaquePredicateOp::new(name).with_callbacks(callbacks);
     Ok(wrap_predicate(state, Predicate::arrow_opaque(op, exprs)))
 }
 
@@ -1027,12 +1026,9 @@ mod tests {
     use std::os::raw::c_void;
     use std::ptr::NonNull;
 
-    /// Backing buffer for a test `EngineIterator`: yields each id by casting
-    /// it directly to a pointer; the consumer casts back via `c as usize`.
-    ///
-    /// Caveat: an id of 0 is indistinguishable from "end of iteration" (the
-    /// `EngineIterator::next` contract treats null as exhausted). That's fine
-    /// here because 0 is already the kernel's sentinel for "invalid id".
+    /// Backing buffer for a test `EngineIterator`: yields each id as a pointer (consumer casts back
+    /// via `c as usize`). An id of 0 reads as end-of-iteration, fine since 0 is kernel's "invalid
+    /// id".
     struct IterState {
         ids: Vec<usize>,
         idx: usize,
@@ -1050,13 +1046,9 @@ mod tests {
         id as *const c_void
     }
 
-    /// RAII wrapper that owns the heap-allocated `IterState` referenced by an
-    /// `EngineIterator::data` pointer. Using `Box::into_raw` here (rather than
-    /// returning the `Box<IterState>` directly) avoids a stacked-borrows
-    /// violation: returning `(boxed, it)` would move `boxed`, which retags its
-    /// contents and invalidates the `*mut IterState` we stored inside `it`.
-    /// `Box::into_raw` decouples ownership from the borrow tag so the pointer
-    /// stays valid for the lifetime of the iterator.
+    /// RAII wrapper that frees the heap-allocated `IterState` backing an `EngineIterator`. Held as
+    /// a raw pointer via `Box::into_raw` so stacked borrows don't retag it while `it` holds the
+    /// pointer.
     struct IterStateBox(*mut IterState);
 
     impl Drop for IterStateBox {
@@ -1100,11 +1092,7 @@ mod tests {
 
     #[test]
     fn visit_predicate_opaque_returns_zero_on_invalid_child() {
-        // 9999 is a never-issued ReferenceSet ID, so `unwrap_kernel_expression`
-        // returns None and the builder must bail out without wrapping.
-        // (Id=0 is conflated with null/end-of-iteration by the FFI
-        // EngineIterator contract, so it manifests as "no children" rather
-        // than "invalid child" -- not a useful test for this code path.)
+        // 9999 is a never-issued id, so the builder bails without wrapping.
         let mut state = KernelExpressionVisitorState::default();
         let (_keep, mut it) = make_iter(vec![9999usize]);
         let id = visit_predicate_opaque_impl(&mut state, Ok("OP".to_string()), &mut it).unwrap();
@@ -1155,7 +1143,7 @@ mod tests {
 
         use crate::engine_data::ArrowFFIData;
         use crate::expressions::opaque_eval::{
-            create_opaque_eval_context, free_opaque_eval_context, EvalMode, OpaqueEvalCallbacks,
+            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks, EvalMode,
         };
         use crate::OptionalValue;
 
@@ -1176,7 +1164,7 @@ mod tests {
 
         FREED.store(0, Ordering::SeqCst);
         let ctx = unsafe {
-            create_opaque_eval_context(OpaqueEvalCallbacks {
+            create_opaque_eval_context(COpaqueEvalCallbacks {
                 engine_state: std::ptr::null_mut(),
                 eval_pred: stub_eval,
                 free_state: counting_free,
@@ -1239,7 +1227,7 @@ mod tests {
 
         use crate::engine_data::ArrowFFIData;
         use crate::expressions::opaque_eval::{
-            create_opaque_eval_context, free_opaque_eval_context, EvalMode, OpaqueEvalCallbacks,
+            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks, EvalMode,
         };
         use crate::OptionalValue;
 
@@ -1297,12 +1285,12 @@ mod tests {
 
             let arr: ArrayRef = Arc::new(keep);
             let array_data = arr.to_data();
-            let out_array = FFI_ArrowArray::new(&array_data);
-            let out_schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
-            OptionalValue::Some(Box::into_raw(Box::new(ArrowFFIData {
-                array: out_array,
-                schema: out_schema,
-            })))
+            let ptr = crate::engine_data::arrow_ffi_data_new();
+            unsafe {
+                (*ptr).array = FFI_ArrowArray::new(&array_data);
+                (*ptr).schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
+            }
+            OptionalValue::Some(ptr)
         }
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 
@@ -1312,7 +1300,7 @@ mod tests {
         let target = wrap_expression(&mut state, Expression::literal(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let ctx = unsafe {
-            create_opaque_eval_context(OpaqueEvalCallbacks {
+            create_opaque_eval_context(COpaqueEvalCallbacks {
                 engine_state: std::ptr::null_mut(),
                 eval_pred: engine_in_range,
                 free_state: noop_free,
