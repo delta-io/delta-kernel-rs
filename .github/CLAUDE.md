@@ -33,6 +33,13 @@ on:
   merge_group:
 ```
 
+## Never `paths`/`paths-ignore` a workflow whose jobs are required checks
+
+Do NOT add `paths` or `paths-ignore` filters to a workflow whose jobs are required
+status checks (most of `build.yml`). When a path filter skips the whole workflow,
+the required checks never report, and the PR stays blocked on "Expected, waiting
+for status" indefinitely. A skipped workflow is not the same as a passing one.
+
 ## Supply chain security: `--locked`
 
 Every `cargo` command in CI that resolves dependencies MUST use `--locked` to
