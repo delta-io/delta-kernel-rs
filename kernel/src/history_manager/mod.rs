@@ -645,10 +645,7 @@ pub fn timestamp_range_to_versions(
 ///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
 ///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
 ///   indicates a broken invariant rather than a normal missing version.
-// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
-// this helper lands.
-#[allow(unused)]
-#[tracing::instrument(skip(engine), ret)]
+#[tracing::instrument(skip(engine), ret, err)]
 fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
@@ -692,9 +689,6 @@ fn get_earliest_published_commit_version(
 /// broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
 /// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
 /// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
-// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
-// this helper lands.
-#[allow(unused)]
 #[tracing::instrument(skip(engine), err, ret)]
 fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
@@ -790,6 +784,7 @@ fn get_earliest_recreatable_commit(
 /// - [`DeltaError::Generic`] when there is no published filesystem commit and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
+#[tracing::instrument(skip(engine), err, ret)]
 pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,
