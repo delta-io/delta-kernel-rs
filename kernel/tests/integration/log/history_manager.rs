@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::history_manager::get_earliest_commit;
+use delta_kernel::history_manager::{get_earliest_commit, CommitType};
 use delta_kernel::Version;
 use rstest::rstest;
 use test_utils::{create_table_and_load_snapshot, test_table_setup_mt, write_batch_to_table};
@@ -70,19 +70,19 @@ fn remove_commits(table_url: &Url, versions: RangeInclusive<Version>) {
 //   - cleanup v0..=v4 (commit at checkpoint version survives): both report 5
 //   - earliest_ratified_commit_version is plumbed through but irrelevant while commits exist
 #[rstest]
-#[case::recreatable_v0_present(None, None, true, 0)]
-#[case::published_v0_present(None, None, false, 0)]
-#[case::recreatable_checkpoint_anchors(Some(0..=5), None, true, 5)]
-#[case::published_lowest_surviving_json(Some(0..=5), None, false, 6)]
-#[case::recreatable_commit_at_checkpoint_survives(Some(0..=4), None, true, 5)]
-#[case::published_commit_at_checkpoint_survives(Some(0..=4), None, false, 5)]
-#[case::recreatable_ratified_zero_passthrough(None, Some(0), true, 0)]
-#[case::published_ratified_zero_passthrough(None, Some(0), false, 0)]
+#[case::recreatable_v0_present(None, None, CommitType::Recreatable, 0)]
+#[case::published_v0_present(None, None, CommitType::Published, 0)]
+#[case::recreatable_checkpoint_anchors(Some(0..=5), None, CommitType::Recreatable, 5)]
+#[case::published_lowest_surviving_json(Some(0..=5), None, CommitType::Published, 6)]
+#[case::recreatable_commit_at_checkpoint_survives(Some(0..=4), None, CommitType::Recreatable, 5)]
+#[case::published_commit_at_checkpoint_survives(Some(0..=4), None, CommitType::Published, 5)]
+#[case::recreatable_ratified_zero_passthrough(None, Some(0), CommitType::Recreatable, 0)]
+#[case::published_ratified_zero_passthrough(None, Some(0), CommitType::Published, 0)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_earliest_commit(
     #[case] cleanup: Option<RangeInclusive<Version>>,
     #[case] earliest_ratified_commit_version: Option<Version>,
-    #[case] must_be_recreatable: bool,
+    #[case] commit_type: CommitType,
     #[case] expected_version: Version,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_url, engine) = build_table().await?;
@@ -95,7 +95,7 @@ async fn test_get_earliest_commit(
         engine.as_ref(),
         &log_root,
         earliest_ratified_commit_version,
-        must_be_recreatable,
+        commit_type,
     )?;
     assert_eq!(earliest, expected_version);
     Ok(())
