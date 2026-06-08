@@ -56,7 +56,7 @@ for (partition_values, batch) in partitions {
     // 1. Create a WriteContext for this partition
     let wc = txn.partitioned_write_context(partition_values)?;
 
-    // 2. Write the data (physical schema excludes partition columns)
+    // 2. Write the data (partition columns must be excluded from the batch)
     let data = ArrowEngineData::new(batch);
     let file_metadata = engine.write_parquet(&data, &wc).await?;
 
@@ -88,8 +88,11 @@ Key points:
   Kernel rejects type mismatches.
 - **Case-insensitive keys**: `"YEAR"` matches schema column `"year"`. Kernel normalizes
   to the schema case.
-- **Physical schema**: `wc.physical_schema()` excludes partition columns. Data files
-  contain only the non-partition columns.
+- **Physical schema**: `wc.physical_schema()` excludes partition columns, unless the table
+  materializes them (e.g. the `materializePartitionColumns` writer feature or `icebergCompatV3`),
+  in which case the partition columns appear in the physical schema and the data files. Either
+  way, the batch you pass to `write_parquet` must not contain partition columns: Kernel
+  handles the materialization automatically.
 
 > [!TIP]
 > To get the partition column names at runtime, call `txn.logical_partition_columns()`.

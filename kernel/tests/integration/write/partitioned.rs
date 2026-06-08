@@ -666,7 +666,15 @@ async fn setup_and_write(
     Box<dyn std::error::Error>,
 > {
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+    // Data fields must not contain partition columns.
+    let (data_fields, data_columns): (Vec<_>, Vec<ArrayRef>) = schema
+        .fields()
+        .cloned()
+        .zip(arrow_columns)
+        .filter(|(f, _)| !partition_cols.contains(&f.name().as_str()))
+        .unzip();
+    let kernel_data_schema = StructType::try_new(data_fields)?;
+    let arrow_data_schema: Arc<ArrowSchema> = Arc::new((&kernel_data_schema).try_into_arrow()?);
     let snapshot = create_partitioned_table(
         &table_path,
         engine.as_ref(),
@@ -676,7 +684,7 @@ async fn setup_and_write(
         write_partition_values_parsed,
     )?;
 
-    let batch = RecordBatch::try_new(arrow_schema, arrow_columns)?;
+    let batch = RecordBatch::try_new(arrow_data_schema, data_columns)?;
     let snapshot =
         write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
 
@@ -781,17 +789,15 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     let mut txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
         .with_engine_info("default engine");
 
-    // Build the input logical batch with all schema columns, including the partition column.
-    // What ends up in the parquet file is determined by `materializePartitionColumns` later
-    // in the pipeline (`Transaction::generate_logical_to_physical` skips the partition-column
-    // drop when the feature is on); the input batch shape itself is unaffected.
-    let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
+    // Data batch must not contain the partition column.
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+    let arrow_schema = Arc::new(data_schema.as_ref().try_into_arrow()?);
     let batch = RecordBatch::try_new(
         arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["a", "a", "a"])),
-        ],
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )?;
     let data = Box::new(ArrowEngineData::new(batch));
 
@@ -831,6 +837,81 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     Ok(())
 }
 
+/// Including a partition column in the input data violates the write contract and errors, whether
+/// or not the table materializes partition columns.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_input_data_with_partition_column_errors(
+    #[values(true, false)] materialized: bool,
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cm = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Name => "name",
+        ColumnMappingMode::Id => "id",
+    };
+    let partition_col = "partition";
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("number", DataType::INTEGER),
+        StructField::nullable(partition_col, DataType::STRING),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let mut properties = vec![("delta.columnMapping.mode", cm)];
+    if materialized {
+        properties.push(("delta.feature.materializePartitionColumns", "supported"));
+    }
+    let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
+        .with_data_layout(DataLayout::partitioned([partition_col]))
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
+        .with_engine_info("default engine");
+
+    // Contract violation: the batch includes the `partition` column.
+    let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "a", "a"])),
+        ],
+    )?;
+    let data = Box::new(ArrowEngineData::new(batch));
+
+    let write_context = txn.partitioned_write_context(HashMap::from([(
+        partition_col.to_string(),
+        Scalar::String("a".into()),
+    )]))?;
+    let err = engine
+        .write_parquet(&data, &write_context)
+        .await
+        .err()
+        .expect("writing data that includes the partition column must fail")
+        .to_string();
+    // The two cases fail at different layers. When materialized, the non-empty transform injects
+    // the partition literal and overflows the output schema. When not, the transform is empty,
+    // error comes when applying the physical schema to the transformed data.
+    let needle = if materialized {
+        "Too few fields in output schema"
+    } else {
+        "Passed struct had 2 columns, but transformed column has 1"
+    };
+    assert!(
+        err.contains(needle),
+        "expected error containing {needle:?} (materialized={materialized}), got: {err}"
+    );
+
+    Ok(())
+}
+
 // ==============================================================================
 // NOT NULL partition column tests
 // ==============================================================================
@@ -838,14 +919,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
 // See [#2465](https://github.com/delta-io/delta-kernel-rs/issues/2465). These tests pin the
 // kernel contract that mirrors Delta-Spark's `DELTA_NOT_NULL_CONSTRAINT_VIOLATED` (SQLSTATE
 // 23502): a NULL written into a `NOT NULL` partition column must be rejected on the default
-// engine. The two arms exercise the two enforcement seams:
-//
-// 1. Non-materialized (default): partition columns are stripped from the batch before the Parquet
-//    write, so the partition-value map is the authority. Kernel validation rejects null-equivalent
-//    values for `nullable: false` partition columns up front.
-// 2. Materialized (`materializePartitionColumns` writer feature): partition columns stay in the
-//    batch on the way to the engine, so a null in the NOT NULL column is rejected by the engine
-//    (arrow-rs) at batch construction, matching the data-column NOT NULL contract.
+// engine.
 
 /// Validates the e2e NOT NULL contract on partition values for the non-materialized path: a
 /// null-equivalent value into a `nullable: false` partition column is rejected before
@@ -977,13 +1051,9 @@ async fn test_partition_null_validation_mixed_nullability(
     Ok(())
 }
 
-/// Materialized arm: with the `materializePartitionColumns` writer feature enabled, partition
-/// columns stay in the engine-bound Arrow batch, so the NOT NULL enforcement seam is the same
-/// as for data columns where the engine rejects a null in a `nullable: false` field at batch
-/// construction.
+/// Materialized arm: enforcement is identical to the non-materialized path.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_partition_null_validation_in_batch_materialized(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_partition_null_validation_materialized() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = Arc::new(StructType::try_new(vec![
@@ -1006,35 +1076,26 @@ async fn test_partition_null_validation_in_batch_materialized(
         "test setup must enable materializePartitionColumns"
     );
 
-    // The partition-value map below is a benign mock: it satisfies the kernel write API
-    // but is decoupled from this test's assertion. With the materialize feature enabled,
-    // the partition column stays in the Arrow batch on the way to the engine (rather than
-    // being filtered out), so the NOT NULL enforcement seam moves into the engine: a null
-    // in a `nullable: false` field is rejected at batch construction below, independent of
-    // whatever value the mock map carries here.
-    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
-    let _write_context = txn.partitioned_write_context(HashMap::from([(
-        "p".to_string(),
-        Scalar::String("a".into()),
-    )]))?;
+    // A valid non-null value is accepted.
+    begin_transaction(snapshot.clone(), engine.as_ref())?
+        .with_engine_info("default engine")
+        .partitioned_write_context(HashMap::from([(
+            "p".to_string(),
+            Scalar::String("a".into()),
+        )]))?;
 
-    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
-    assert!(
-        !arrow_schema.field_with_name("p")?.is_nullable(),
-        "kernel `not_null` partition field must produce Arrow `nullable: false`",
-    );
-
-    let result = RecordBatch::try_new(
-        Arc::new(arrow_schema),
-        vec![
-            Arc::new(Int32Array::from(vec![Some(1)])),
-            Arc::new(StringArray::from(vec![None as Option<&str>])),
-        ],
-    );
-    assert!(
-        result.is_err(),
-        "RecordBatch::try_new should reject null in NOT NULL materialized partition column; got: {result:?}",
-    );
+    // A null into the NOT NULL partition column is rejected up front, identically to the
+    // non-materialized path.
+    let err = begin_transaction(snapshot, engine.as_ref())?
+        .with_engine_info("default engine")
+        .partitioned_write_context(HashMap::from([(
+            "p".to_string(),
+            Scalar::Null(DataType::STRING),
+        )]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not nullable"), "{err}");
+    assert!(err.contains("'p'"), "{err}");
 
     Ok(())
 }

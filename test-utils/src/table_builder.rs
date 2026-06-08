@@ -1329,19 +1329,23 @@ async fn write_data_commit<E: TaskExecutor>(
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
         let partition_seed = (version as usize) * 1000 + file_idx * 100;
-        let columns: Vec<ArrayRef> = arrow_schema
-            .fields()
-            .iter()
-            .zip(logical_schema.fields())
-            .map(|(arrow_field, kernel_field)| {
-                if partition_columns.contains(&kernel_field.name().to_string()) {
-                    generate_constant_column(arrow_field.data_type(), rows_per_file, partition_seed)
-                } else {
-                    generate_column(arrow_field.data_type(), rows_per_file, base)
-                }
-            })
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
+        // Data batches must not contain any partition columns.
+        let mut data_fields = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for (arrow_field, kernel_field) in arrow_schema.fields().iter().zip(logical_schema.fields())
+        {
+            if partition_columns.contains(&kernel_field.name().to_string()) {
+                continue;
+            }
+            columns.push(generate_column(
+                arrow_field.data_type(),
+                rows_per_file,
+                base,
+            ));
+            data_fields.push(arrow_field.clone());
+        }
+        let data_arrow_schema = ArrowSchema::new(data_fields);
+        let batch = RecordBatch::try_new(Arc::new(data_arrow_schema), columns)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
@@ -1362,71 +1366,6 @@ async fn write_data_commit<E: TaskExecutor>(
     }
 
     txn.commit(engine)
-}
-
-/// Generate a constant column where all rows have the same value derived from `seed`.
-/// Used for partition columns so the data matches the declared partition values.
-fn generate_constant_column(arrow_type: &ArrowDataType, rows: usize, seed: usize) -> ArrayRef {
-    match arrow_type {
-        ArrowDataType::Boolean => {
-            let v = seed.is_multiple_of(2);
-            Arc::new(BooleanArray::from(vec![v; rows]))
-        }
-        ArrowDataType::Int8 => {
-            let v = (seed % 100) as i8;
-            Arc::new(Int8Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int16 => {
-            let v = (seed % 100) as i16;
-            Arc::new(Int16Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int32 => {
-            let v = (seed % 100) as i32;
-            Arc::new(Int32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int64 => {
-            let v = (seed * 1000) as i64;
-            Arc::new(Int64Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Float32 => {
-            let v = seed as f32 * 0.5;
-            Arc::new(Float32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Float64 => {
-            let v = seed as f64 * 0.25;
-            Arc::new(Float64Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Utf8 => {
-            let v = format!("part_{seed}");
-            Arc::new(StringArray::from(vec![v.as_str(); rows]))
-        }
-        ArrowDataType::Binary => {
-            let v = format!("bin_{seed}").into_bytes();
-            Arc::new(BinaryArray::from(vec![v.as_slice(); rows]))
-        }
-        ArrowDataType::Date32 => {
-            let v = 18000 + seed as i32;
-            Arc::new(Date32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let v = (18000 + seed as i64) * 86_400_000_000;
-            let array = TimestampMicrosecondArray::from(vec![v; rows]);
-            match tz {
-                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
-                None => Arc::new(array),
-            }
-        }
-        ArrowDataType::Decimal128(precision, scale) => {
-            let scale_factor = 10i128.pow(*scale as u32);
-            let v = seed as i128 * scale_factor;
-            Arc::new(
-                Decimal128Array::from(vec![v; rows])
-                    .with_precision_and_scale(*precision, *scale)
-                    .expect("valid decimal"),
-            )
-        }
-        other => panic!("unsupported Arrow type for partition column: {other:?}"),
-    }
 }
 
 /// Generate a single column of data based on its Arrow type.

@@ -104,9 +104,9 @@ pub unsafe extern "C" fn get_physical_write_schema(
 
 /// Returns the logical-to-physical transform from a [`WriteContext`] handle. Engines apply
 /// it via an [`ExpressionEvaluator`] to each batch of logical data before writing parquet.
-/// It drops partition columns when partition columns are not materialized. The column
-/// rename itself is encoded in the physical schema (the evaluator matches input columns to
-/// output fields by position), not in this expression.
+/// The logical data batches must not contain partition columns. The column rename itself is encoded
+/// in the physical schema (the evaluator matches input columns to output fields by position), not
+/// in this expression.
 ///
 /// To build the evaluator, pass [`get_write_schema`] as the input, this expression as the
 /// transform, and [`get_physical_write_schema`] as the output. See
