@@ -23,7 +23,7 @@ SIGNIFICANCE_THRESHOLD = 2.0
 
 # Emoji markers for the Change cell, by side and severity.
 SIGNIFICANT_SLOWDOWN = '🐌'  # ratio >= SIGNIFICANCE_THRESHOLD
-SLIGHT_SLOWDOWN = '⚠️'      # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
+SLIGHT_SLOWDOWN = '⚠️&nbsp;'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD; nbsp pads U+FE0F variation selector
 SLIGHT_SPEEDUP = '✅'        # 1.0 / SIGNIFICANCE_THRESHOLD < ratio < 1.0
 SIGNIFICANT_SPEEDUP = '🚀'   # ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
 
@@ -139,22 +139,24 @@ def change_emoji(ratio, significant):
     return SIGNIFICANT_SPEEDUP if significant else SLIGHT_SPEEDUP
 
 def render_summary(rows):
-    """Render the summary block. Counts and extrema use only statistically significant rows.
+    """Render the summary block. Counts and extrema include every slowdown and speedup
+    regardless of the 2x significance threshold; the per-row emoji marker is the place
+    that distinguishes significant from slight changes.
 
-    Rows with ratio == 1.00 (or near-1) are excluded from both counts and extrema
-    regardless of significance, since they are not slowdowns or speedups.
+    Rows with ratio == 1.00 (or near-1) are excluded since they are neither slowdowns nor
+    speedups. N/A rows (ratio is None) are excluded for the same reason.
     """
-    significant_slow = [r for r in rows if r['significant'] and r['ratio'] is not None and r['ratio'] > 1.0]
-    significant_fast = [r for r in rows if r['significant'] and r['ratio'] is not None and r['ratio'] < 1.0]
+    slow = [r for r in rows if r['ratio'] is not None and r['ratio'] > 1.0]
+    fast = [r for r in rows if r['ratio'] is not None and r['ratio'] < 1.0]
 
-    if significant_slow:
-        worst = max(significant_slow, key=lambda r: r['ratio'])
+    if slow:
+        worst = max(slow, key=lambda r: r['ratio'])
         largest_slowdown = f"`{worst['name']}` ({format_difference(worst['ratio'])})"
     else:
         largest_slowdown = "no benchmarks slowed down"
 
-    if significant_fast:
-        best = min(significant_fast, key=lambda r: r['ratio'])
+    if fast:
+        best = min(fast, key=lambda r: r['ratio'])
         fastest_speedup = f"`{best['name']}` ({format_difference(best['ratio'])})"
     else:
         fastest_speedup = "no benchmarks sped up"
@@ -164,8 +166,8 @@ def render_summary(rows):
         "",
         f"- Largest slowdown: {largest_slowdown}",
         f"- Fastest speedup: {fastest_speedup}",
-        f"- Benchmarks slowed down: {len(significant_slow)}",
-        f"- Benchmarks sped up: {len(significant_fast)}",
+        f"- Benchmarks slowed down: {len(slow)}",
+        f"- Benchmarks sped up: {len(fast)}",
     ]
     return "\n".join(lines)
 
