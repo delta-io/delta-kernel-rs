@@ -271,7 +271,7 @@ impl ReadMetadataRunner {
             .clone()
             .scan_builder()
             .with_predicate(self.predicate.clone())
-            .with_stats(StatsOptions::all())
+            .with_stats(StatsOptions::all_struct())
             .build()?;
         let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
         for result in metadata_iter {
@@ -291,7 +291,7 @@ impl ReadMetadataRunner {
             .clone()
             .scan_builder()
             .with_predicate(self.predicate.clone())
-            .with_stats(StatsOptions::all())
+            .with_stats(StatsOptions::all_struct())
             .build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;

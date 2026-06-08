@@ -8,37 +8,36 @@ Reads the output of `critcmp base changes` from stdin and writes:
   2. A `<details>` block (closed by default) containing the full
      per-benchmark table with columns: Test | Base | PR | Change.
 
-The Change cell is bolded when the difference is statistically significant
-(i.e. the error bounds do not overlap). The summary counts only significant
-changes -- non-significant deltas are noise.
+A change is "significant" when it is at least 2x in either direction
+(ratio >= 2.0 for slowdown, ratio <= 0.5 for speedup). The summary counts
+only significant changes and the Change cell gets a 🐌/🚀 marker for them.
 
 Usage:
     critcmp base changes | python3 benchmarks/ci/parse_critcmp.py
 """
-import sys, re
+import re
+import sys
+
+# Significance threshold for slowdowns/speedups (2x in either direction).
+SIGNIFICANCE_THRESHOLD = 2.0
+
+# Emoji markers for the Change cell, by side and severity.
+SIGNIFICANT_SLOWDOWN = '🐌'  # ratio >= SIGNIFICANCE_THRESHOLD
+SLIGHT_SLOWDOWN = '⚠️'      # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
+SLIGHT_SPEEDUP = '✅'        # 1.0 / SIGNIFICANCE_THRESHOLD < ratio < 1.0
+SIGNIFICANT_SPEEDUP = '🚀'   # ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
 
 def to_ms(value, units):
     u = units.strip()
-    if u == 's':   return value * 1e3
-    if u == 'ms':  return value
-    if u in ('µs', 'us', 'μs'): return value / 1e3
-    if u == 'ns':  return value / 1e6
+    if u == 's':
+        return value * 1e3
+    if u == 'ms':
+        return value
+    if u in ('µs', 'us', 'μs'):
+        return value / 1e3
+    if u == 'ns':
+        return value / 1e6
     return value
-
-def is_significant(chg_dur, chg_err, base_dur, base_err):
-    """Return True if the difference between two measurements is statistically significant.
-
-    Significance is determined by whether either center value (the `X` in `X±err`) lies outside the other's error bar.
-    Concretely, if chg is faster than base, the change is significant if:
-      - base's center value is above chg's entire error bar range (chg + chg_err < base), OR
-      - chg's center value is below base's entire error bar range (base - base_err > chg).
-    The symmetric conditions apply when chg is slower. This is an OR test: only one side
-    needs to show clear separation for the difference to be considered significant.
-    """
-    if chg_dur < base_dur:
-        return chg_dur + chg_err < base_dur or base_dur - base_err > chg_dur
-    else:
-        return chg_dur - chg_err > base_dur or base_dur + base_err < chg_dur
 
 def parse_duration(s):
     m = re.match(r'([0-9.]+)±([0-9.]+)(.+)', s.strip())
@@ -49,8 +48,8 @@ def parse_duration(s):
 def sanitize_name(raw):
     """Sanitize an attacker-controllable benchmark name for safe markdown embedding.
 
-    Strips backticks (so the name can't break out of the code span) then escapes pipes
-    (which would otherwise terminate a table cell). Returns the bare string -- the
+    Strips backticks (so the name can't break out of the code span), then escapes pipes
+    (which would otherwise terminate a table cell). Returns the bare string. The
     caller wraps in backticks where appropriate.
     """
     return raw.replace('`', '').replace('|', r'\|')
@@ -94,10 +93,8 @@ def parse_rows(lines):
             base_p = parse_duration(base_dur_str)
             chg_p  = parse_duration(chg_dur_str)
             if base_p and chg_p:
-                base_ms     = to_ms(base_p[0], base_p[2])
-                base_err_ms = to_ms(base_p[1], base_p[2])
-                chg_ms      = to_ms(chg_p[0],  chg_p[2])
-                chg_err_ms  = to_ms(chg_p[1],  chg_p[2])
+                base_ms = to_ms(base_p[0], base_p[2])
+                chg_ms  = to_ms(chg_p[0],  chg_p[2])
 
                 # Float-equality on zero is safe here: to_ms only multiplies/divides
                 # by powers of ten, so a zero output strictly implies a zero input.
@@ -105,7 +102,10 @@ def parse_rows(lines):
                 # benches (sub-nanosecond rounding) as N/A.
                 if base_ms != 0 and chg_ms != 0:
                     ratio = chg_ms / base_ms
-                    significant = is_significant(chg_ms, chg_err_ms, base_ms, base_err_ms)
+                    significant = (
+                        ratio >= SIGNIFICANCE_THRESHOLD
+                        or ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
+                    )
 
         rows.append({
             'name': name,
@@ -125,6 +125,18 @@ def format_difference(ratio):
     if ratio > 1:
         return f'{ratio:.2f}x slower'
     return f'{1.0 / ratio:.2f}x faster'
+
+def change_emoji(ratio, significant):
+    """Pick an emoji indicator for the Change cell.
+
+    See the module-level emoji constants for the marker assignments. Returns
+    an empty string for ratios near 1.0 or N/A rows.
+    """
+    if ratio is None or abs(ratio - 1.0) < 1e-9:
+        return ''
+    if ratio > 1.0:
+        return SIGNIFICANT_SLOWDOWN if significant else SLIGHT_SLOWDOWN
+    return SIGNIFICANT_SPEEDUP if significant else SLIGHT_SPEEDUP
 
 def render_summary(rows):
     """Render the summary block. Counts and extrema use only statistically significant rows.
@@ -160,17 +172,24 @@ def render_summary(rows):
 def render_table(rows):
     """Render the per-benchmark table wrapped in a closed-by-default <details> block."""
     out = []
-    out.append(f"<details>")
+    out.append("<details>")
     out.append(f"<summary>Per-benchmark results ({len(rows)} rows)</summary>")
+    out.append("")
+    out.append(
+        f"**Legend:** {SIGNIFICANT_SLOWDOWN} ≥ 2x slower &nbsp;·&nbsp; "
+        f"{SLIGHT_SLOWDOWN} < 2x slower &nbsp;·&nbsp; "
+        f"{SLIGHT_SPEEDUP} < 2x faster &nbsp;·&nbsp; "
+        f"{SIGNIFICANT_SPEEDUP} ≥ 2x faster"
+    )
     out.append("")
     out.append("| Test | Base         | PR               | Change |")
     out.append("|------|--------------|------------------|--------|")
     for r in rows:
         name_cell = f"`{r['name']}`" if r['name'] else ''
         difference = format_difference(r['ratio'])
-        if r['significant'] and r['ratio'] is not None and abs(r['ratio'] - 1.0) >= 1e-9:
-            difference = f"**{difference}**"
-        out.append(f"| {name_cell} | {r['base_display']} | {r['chg_display']} | {difference} |")
+        emoji = change_emoji(r['ratio'], r['significant'])
+        change_cell = f"{emoji} {difference}".lstrip()
+        out.append(f"| {name_cell} | {r['base_display']} | {r['chg_display']} | {change_cell} |")
     out.append("")
     out.append("</details>")
     return "\n".join(out)
