@@ -1233,6 +1233,7 @@ mod tests {
                     .get("row_id_col")
                     .expect("Should have row_id_col patch");
                 assert!(!row_id_patch.keep_input);
+                assert_eq!(row_id_patch.exprs.len(), 1);
                 let expr = &row_id_patch.insertions[0];
                 let expected_expr = Arc::new(Expr::coalesce([
                     Expr::column(["row_id_col"]),
