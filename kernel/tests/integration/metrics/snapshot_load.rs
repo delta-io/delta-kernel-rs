@@ -288,7 +288,7 @@ async fn crc_at_prior_version_advances_via_reverse_replay() -> DeltaResult<()> {
     // Measurement: build snapshot at latest (v2); CRC is at v0 (two versions behind)
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let snap = Snapshot::builder_for(table_url)
-        .with_incremental_state_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
         .build(&measure_engine)?;
     assert_eq!(snap.crc().expect("stale CRC advanced to v2").version, 2);
 

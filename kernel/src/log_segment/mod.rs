@@ -1066,6 +1066,14 @@ impl LogSegment {
     /// `(start_v_exclusive, end_version]`, dropping checkpoint files, CRC files, and
     /// last-checkpoint metadata.
     pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> Self {
+        // A checkpoint above start_v_exclusive would drop the commits between them, since the
+        // returned segment keeps only (start_v_exclusive, end] and no checkpoint.
+        debug_assert!(
+            self.checkpoint_version
+                .is_none_or(|ckpt| start_v_exclusive >= ckpt),
+            "segment_after_version: start_v_exclusive ({start_v_exclusive}) is below checkpoint {:?}",
+            self.checkpoint_version,
+        );
         let (commits, compactions) =
             self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
         LogSegment {

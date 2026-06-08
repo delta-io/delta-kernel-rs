@@ -1151,7 +1151,7 @@ mod tests {
 
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
-            .with_incremental_state_replay(IncrementalReplay::Unlimited)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
             .build(ctx.engine.as_ref())?;
         // A fresh build advances the stale CRC via reverse-replay to a CRC at v3 (file stats
         // Indeterminate, since these synthetic commits carry no commitInfo). The segment's

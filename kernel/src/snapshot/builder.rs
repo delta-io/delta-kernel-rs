@@ -64,16 +64,25 @@ pub enum IncrementalReplay {
 
 impl IncrementalReplay {
     /// Whether the configured budget permits advancing a CRC at `crc_version` to `target_version`.
+    /// Errors if `crc_version` is ahead of `target_version`, which violates a caller invariant.
     ///
     /// Example: 95.crc with commits 96.json through 100.json is 5 commits, so `UpToCommits(5)`
     /// advances and `UpToCommits(4)` does not; `Unlimited` always advances.
-    pub(crate) fn should_advance(self, crc_version: Version, target_version: Version) -> bool {
-        let distance = target_version.saturating_sub(crc_version);
-        match self {
+    pub(crate) fn should_advance(
+        self,
+        crc_version: Version,
+        target_version: Version,
+    ) -> DeltaResult<bool> {
+        let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
+            Error::internal_error(format!(
+                "CRC version {crc_version} is ahead of target version {target_version}"
+            ))
+        })?;
+        Ok(match self {
             IncrementalReplay::Disabled => false,
             IncrementalReplay::UpToCommits(n) => distance <= n,
             IncrementalReplay::Unlimited => true,
-        }
+        })
     }
 }
 
@@ -157,11 +166,12 @@ impl SnapshotBuilder {
     /// Writers should set this to [`IncrementalReplay::Unlimited`] for faster writes, as should
     /// readers that always want table-level file statistics for query optimization.
     ///
-    /// Only affects builds from a table root. Incremental updates from an existing snapshot
-    /// (via [`Snapshot::builder_from`]) do not yet advance stale CRCs (see #2674).
+    /// This setting applies only to builds from a table root; it does not carry into incremental
+    /// updates derived from the resulting snapshot. [`Snapshot::builder_from`] does not yet advance
+    /// stale CRCs regardless of this value (see #2674).
     ///
     /// [`Snapshot::builder_from`]: crate::Snapshot::builder_from
-    pub fn with_incremental_state_replay(mut self, mode: IncrementalReplay) -> Self {
+    pub fn with_incremental_crc_replay(mut self, mode: IncrementalReplay) -> Self {
         self.incremental_replay = mode;
         self
     }

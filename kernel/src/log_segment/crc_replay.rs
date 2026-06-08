@@ -92,7 +92,7 @@ impl LogSegment {
             return Ok(Some(base_crc)); // Case 2
         }
         // Case 3: advance only within the caller's commit budget.
-        if !incremental_replay.should_advance(base_crc.version, self.end_version) {
+        if !incremental_replay.should_advance(base_crc.version, self.end_version)? {
             return Ok(None);
         }
         let advanced = self.build_incremental_crc_from_base(engine, &base_crc)?;

@@ -97,7 +97,7 @@ async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -
     // The fresh v1 build advances the stale v0 CRC; the safe commit added no files, so file
     // stats stay Complete and are served at v1 unchanged.
     let snapshot = Snapshot::builder_for(table_path)
-        .with_incremental_state_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
     assert_eq!(snapshot.crc().unwrap().version, 1);
@@ -1593,7 +1593,7 @@ async fn commit_with_dm_and_txn<E: TaskExecutor>(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrcStaleness {
-    Middle,
+    MidSegment,
     AtCheckpoint,
     Absent,
 }
@@ -1602,7 +1602,7 @@ enum CrcStaleness {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stale_crc_fresh_build_advance_matrix(
     #[values(
-        CrcStaleness::Middle,
+        CrcStaleness::MidSegment,
         CrcStaleness::AtCheckpoint,
         CrcStaleness::Absent
     )]
@@ -1612,7 +1612,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     const CHECKPOINT_VERSION: i64 = 10;
     const LATEST_VERSION: i64 = 20;
     let crc_version = match crc_staleness {
-        CrcStaleness::Middle => Some((CHECKPOINT_VERSION + LATEST_VERSION) / 2),
+        CrcStaleness::MidSegment => Some((CHECKPOINT_VERSION + LATEST_VERSION) / 2),
         CrcStaleness::AtCheckpoint => Some(CHECKPOINT_VERSION),
         CrcStaleness::Absent => None,
     };
@@ -1665,7 +1665,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 
     // === Step 4: A fresh Snapshot at the latest version. ===
     let fresh = Snapshot::builder_for(&table_path)
-        .with_incremental_state_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
         .build(engine.as_ref())?;
     assert_eq!(fresh.version() as i64, LATEST_VERSION);
 
@@ -1793,7 +1793,7 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
     // ===== THEN: advancing the stale CRC trips file stats to Indeterminate, so they are not
     // served and write_checksum is rejected =====
     let fresh = Snapshot::builder_for(&table_path)
-        .with_incremental_state_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
         .build(engine.as_ref())?;
     assert_eq!(fresh.version(), 2);
     assert!(fresh.crc().unwrap().file_stats_state().is_indeterminate());
@@ -1829,7 +1829,7 @@ async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() 
     std::fs::write(&commit_v1, b"}}} not valid commit json").unwrap();
 
     assert!(Snapshot::builder_for(&table_path)
-        .with_incremental_state_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
         .build(engine.as_ref())
         .is_err());
 
