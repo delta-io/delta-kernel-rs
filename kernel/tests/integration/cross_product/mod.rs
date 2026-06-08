@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
     all_features_cm_id, all_features_cm_name, checkpoint_at_end, checkpoint_at_end_crc_at_end,
     checkpoint_at_end_no_hint, checkpoint_at_end_no_hint_post_cleanup,

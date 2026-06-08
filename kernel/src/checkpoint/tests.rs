@@ -20,11 +20,8 @@ use crate::checkpoint::{
 };
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
-use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
@@ -878,13 +875,10 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
     .unwrap();
 
     // ===== Create Engine =====
-    let store = Arc::new(LocalFileSystem::new());
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
+    // Use SyncEngine::new() (not new_with_store(LocalFileSystem::new())) so the engine builds
+    // per-URL LocalFileSystem instances rooted at the URL's drive. The bare
+    // LocalFileSystem::new() rejects absolute Windows paths via file:// URLs.
+    let engine = SyncEngine::new();
 
     // ===== Commit domain metadata for "foo" =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;

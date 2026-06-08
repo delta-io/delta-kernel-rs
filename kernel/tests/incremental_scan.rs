@@ -7,9 +7,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::json::DefaultJsonHandler;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
     IncrementalScanSummary,
@@ -22,6 +19,9 @@ use delta_kernel::{
     Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
     compacted_log_path_for_versions, create_log_path, delta_path_for_version, TestAction,

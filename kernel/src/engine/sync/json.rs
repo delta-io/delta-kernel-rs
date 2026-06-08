@@ -160,8 +160,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn json_handler_file_path_contract() {
-        crate::engine::tests::test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
-    }
+    // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
+    // call them without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn json_handler_file_path_contract() {
+    //     test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
+    // }
 }

@@ -1,10 +1,25 @@
 name: build
 
-on: [push, pull_request, merge_group]
+# Restrict push to long-lived branches to avoid duplicate CI runs. See .github/CLAUDE.md.
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  merge_group:
+
+concurrency:
+  # A new push to a PR cancels that PR's in-flight run. On push to main/release, head_ref
+  # is empty, so run_id (always unique) is used and those runs never cancel each other.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Strip debuginfo (debugger source-line/variable maps, type layouts) in CI: no debugger
+  # attaches here, so it is pure compile overhead. Test output, logs, and panics are unaffected.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 # Supply chain security: all cargo commands that resolve dependencies use --locked to
 # enforce the committed Cargo.lock. This prevents CI from silently resolving a newer
@@ -24,8 +39,8 @@ env:
 #
 # Without this, GHA's ref-scoped caching works against us: each PR writes ~6.3GB of
 # cache entries (14 jobs x ~450MB) that only that PR can read. A handful of active PRs
-# fills the 10GB cache budget, LRU evicts main's shared entries, and every subsequent
-# PR compiles from scratch.
+# fills the 50GB cache budget (as of 2026-06), LRU evicts main's shared entries, and
+# every subsequent PR compiles from scratch.
 #
 # The save-if condition checks both event_name == 'push' and ref == main because
 # pull_request_target events set github.ref to the base branch (main), not the PR
@@ -244,6 +259,8 @@ jobs:
               sudo apt install -y -V libarrow-glib-dev # For GLib (C)
               sudo apt install -y -V valgrind # For memory leak test
            fi
+      # TODO (#2707): This step's cache misses 100% of runs, wasting ~4.5 min per macOS run on a
+      #               fresh `brew install`. See the issue for root cause and fix options.
       - name: Install arrow-glib-macOS
         if: runner.os == 'macOS'
         uses: ./.github/actions/use-homebrew-tools

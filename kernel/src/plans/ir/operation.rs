@@ -6,8 +6,8 @@
 use bytes::Bytes;
 use url::Url;
 
-use crate::schema::SchemaRef;
-use crate::{FileMeta, FileSlice, PredicateRef};
+use super::plan::Plan;
+use crate::{FileMeta, FileSlice};
 
 /// Represents a set of instructions that the
 /// [`PlanExecutor`](crate::plans::PlanExecutor) should perform.
@@ -17,8 +17,10 @@ use crate::{FileMeta, FileSlice, PredicateRef};
 pub enum Operation {
     /// A singular I/O operation that returns concretely typed data such as bytes or file metadata.
     IoOperation(IoOperation),
-    /// A query on relational-like data, expressed through a plan algebra.
-    QueryPlan(QueryPlan),
+    /// A query on relational-like data, expressed as a [`Plan`]: a DAG of
+    /// [`PlanNode`](super::plan::PlanNode)s whose terminal (last) node produces the rows the
+    /// engine streams to the caller.
+    QueryPlan(Plan),
 }
 
 /// A singular I/O operation that returns typed data such as raw bytes or file metadata.
@@ -108,39 +110,4 @@ impl IoOperation {
     pub fn parquet_footer(file: FileMeta) -> Self {
         Self::ParquetFooter { file }
     }
-}
-
-/// Representation of a query on relational data.
-///
-/// TODO: We expect this to evolve as we flesh out the plan algebra (e.g. towards SSA form
-/// with multiple linked nodes), but for now a [`QueryPlan`] holds a single [`QueryPlanNode`].
-pub type QueryPlan = QueryPlanNode;
-
-/// A single node in a [`QueryPlan`]. Each variant describes a relational operation.
-#[derive(Debug)]
-pub enum QueryPlanNode {
-    /// Read and parse newline-delimited JSON files, returning columnar data.
-    ///
-    /// Returns [`PlanResult::Data`](crate::plans::PlanResult::Data) with columns matching the
-    /// provided `physical_schema`. See [`JsonHandler::read_json_files`] for more details on column
-    /// resolution rules and ordering contracts.
-    ///
-    /// [`JsonHandler::read_json_files`]: crate::JsonHandler::read_json_files
-    ScanJson {
-        files: Vec<FileMeta>,
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    },
-    /// Read and parse Apache Parquet files, returning columnar data.
-    ///
-    /// Returns [`PlanResult::Data`](crate::plans::PlanResult::Data) with columns matching the
-    /// provided `physical_schema`. See [`ParquetHandler::read_parquet_files`] for more details on
-    /// column resolution rules and ordering contracts.
-    ///
-    /// [`ParquetHandler::read_parquet_files`]: crate::ParquetHandler::read_parquet_files
-    ScanParquet {
-        files: Vec<FileMeta>,
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    },
 }

@@ -6,13 +6,13 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Snapshot, Version};
 use tempfile::{tempdir, TempDir};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, create_table, engine_store_setup,
     load_and_begin_transaction,
