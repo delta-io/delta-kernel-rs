@@ -62,6 +62,9 @@ pub use alter_table::AlterTableTransaction;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
+#[cfg(feature = "internal-api")]
+pub mod stats_verifier;
+#[cfg(not(feature = "internal-api"))]
 mod stats_verifier;
 mod update;
 mod write_context;
@@ -100,7 +103,7 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 /// The base schema for add file metadata, referenced by [`Transaction::add_files_schema`].
 ///
 /// The `stats` field represents the minimum structure. The actual stats written by
-/// [`DefaultEngine::write_parquet`] include additional fields computed from the data:
+/// `DefaultEngine::write_parquet` include additional fields computed from the data:
 /// - `nullCount`: nested struct mirroring the data schema (all fields LONG)
 /// - `minValues`: nested struct with min/max eligible column types
 /// - `maxValues`: nested struct with min/max eligible column types
@@ -108,8 +111,6 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 /// The nested structures within nullCount/minValues/maxValues depend on the table's data schema
 /// and which columns have statistics enabled. Use [`Transaction::stats_schema`] to get the
 /// expected stats schema for a specific table.
-///
-/// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
 pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
@@ -810,7 +811,7 @@ impl<S> Transaction<S> {
     /// add_file action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
     /// The `stats` field contains file-level statistics. The schema returned here shows the base
-    /// structure; the actual stats written by [`DefaultEngine::write_parquet`] include dynamically
+    /// structure; the actual stats written by `DefaultEngine::write_parquet` include dynamically
     /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
     /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
     /// stats schema.
@@ -820,7 +821,6 @@ impl<S> Transaction<S> {
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
-    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
@@ -1380,8 +1380,8 @@ impl<S> Transaction<S> {
         // Build two evaluators: one for the common case where scan files do not include a
         // stats_parsed column, and one for predicate-based scans that include stats_parsed.
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
-        // case where stats is null (e.g., when skip_stats=true was used) and then drops the
-        // stats_parsed column.
+        // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
+        // then drops the stats_parsed column.
         let base_eval = Arc::new(make_eval(false)?);
         let stats_parsed_eval = Arc::new(make_eval(true)?);
         let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
@@ -1408,8 +1408,8 @@ impl<S> Transaction<S> {
 ///
 /// - `stats_parsed`: when `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
 ///   `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. The coalesce handles
-///   cases where `stats` is null (e.g., `skip_stats=true` or V2 checkpoints with
-///   `writeStatsAsJson=false`) by reconstructing the JSON from the parsed representation.
+///   cases where `stats` is null (e.g., V2 checkpoints with `writeStatsAsJson=false`) by
+///   reconstructing the JSON from the parsed representation.
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.
@@ -1729,8 +1729,7 @@ mod tests {
     fn setup_dv_supported_but_disabled_table() -> DeltaResult<(Arc<dyn Engine>, Arc<Snapshot>)> {
         let storage = Arc::new(InMemory::new());
         let table_root = url::Url::parse("memory:///").unwrap();
-        let engine =
-            Arc::new(crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build());
+        let engine = Arc::new(SyncEngine::new_with_store(storage.clone()));
         let schema_json = serde_json::json!({
             "type": "struct",
             "fields": [{

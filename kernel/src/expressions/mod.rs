@@ -18,6 +18,7 @@ use crate::kernel_predicates::{
 };
 use crate::schema::SchemaRef;
 use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::utils::CollectInto;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
@@ -399,10 +400,7 @@ impl ExpressionStructPatch {
 
     /// Creates a new empty patch that operates on fields of a nested struct identified by
     /// `path`. The various `with_xxx` helper methods can be used to add specific field patches.
-    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn new_nested(path: impl CollectInto<ColumnName>) -> Self {
         Self {
             input_path: Some(ColumnName::new(path)),
             ..Default::default()
@@ -671,10 +669,7 @@ impl Expression {
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Expression
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Expression {
         ColumnName::new(field_names).into()
     }
 
@@ -841,10 +836,7 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Predicate
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Predicate {
         Self::from_expr(ColumnName::new(field_names))
     }
 
@@ -1408,7 +1400,7 @@ mod tests {
             let cases: Vec<ColumnName> = vec![
                 column_name!("simple"),
                 ColumnName::new(["a", "b", "c"]),
-                ColumnName::new::<&str>([]),
+                ColumnName::default(),
             ];
 
             for col in &cases {

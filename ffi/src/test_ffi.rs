@@ -103,10 +103,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     let nested_struct_type = StructType::try_new(nested_fields).unwrap();
 
     let top_level_struct = StructData::try_new(
-        vec![StructField::nullable(
-            "top",
-            DataType::Struct(Box::new(nested_struct_type)),
-        )],
+        vec![StructField::nullable("top", nested_struct_type)],
         vec![Scalar::Struct(nested_struct)],
     )
     .unwrap();

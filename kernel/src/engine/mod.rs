@@ -1,6 +1,10 @@
-//! Provides an engine implementation that implements the required traits. The engine can optionally
-//! be built into the kernel by setting the `default-engine-rustls` or `default-engine-native-tls`
-//! feature flag. See the related module for more information.
+//! Engine infrastructure shared by `Engine` implementations.
+//!
+//! The default Arrow/Tokio engine lives in the separate `delta_kernel_default_engine` crate.
+//! `SyncEngine` is included only in test builds.
+
+#[cfg(feature = "arrow-expression")]
+use delta_kernel_derive::internal_api;
 
 #[cfg(feature = "arrow-expression")]
 use crate::parquet::arrow::arrow_reader::ArrowReaderOptions;
@@ -12,6 +16,7 @@ use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
 /// Skipping the embedded Arrow IPC schema avoids dependence on Arrow-specific metadata and
 /// ensures that type resolution is driven by the kernel schema rather than the file's schema.
 #[cfg(feature = "arrow-expression")]
+#[internal_api]
 pub(crate) fn reader_options() -> ArrowReaderOptions {
     ArrowReaderOptions::new().with_skip_arrow_metadata(true)
 }
@@ -21,6 +26,7 @@ pub(crate) fn reader_options() -> ArrowReaderOptions {
 /// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
 /// non-Arrow readers and avoids encoding Arrow-specific type information.
 #[cfg(feature = "arrow-expression")]
+#[internal_api]
 pub(crate) fn writer_options() -> ArrowWriterOptions {
     ArrowWriterOptions::new().with_skip_arrow_metadata(true)
 }
@@ -34,11 +40,8 @@ pub mod arrow_expression;
 pub mod arrow_utils;
 #[cfg(all(feature = "arrow-expression", not(feature = "internal-api")))]
 pub(crate) mod arrow_utils;
-#[cfg(feature = "internal-api")]
+#[cfg(all(feature = "internal-api", feature = "arrow-expression"))]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
-
-#[cfg(feature = "default-engine-base")]
-pub mod default;
 
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
@@ -57,6 +60,3 @@ pub(crate) mod ensure_data_types;
 #[cfg(feature = "default-engine-base")]
 // module is always pub; trait inside is gated by #[internal_api]
 pub mod parquet_row_group_skipping;
-
-#[cfg(test)]
-pub(crate) mod tests;

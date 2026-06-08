@@ -744,25 +744,21 @@ mod tests {
 
     #[test]
     fn from_data_type_non_primitive_produces_sentinel() {
-        let struct_type = DataType::Struct(Box::new(
+        let struct_type = DataType::from(
             StructType::try_new(vec![StructField::not_null("a", DataType::INTEGER)]).unwrap(),
-        ));
+        );
         assert_eq!(
             NullTypeTag::from_data_type(&struct_type),
             (NullTypeTag::NonPrimitive, 0, 0)
         );
 
-        let array_type = DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false)));
+        let array_type = DataType::from(ArrayType::new(DataType::INTEGER, false));
         assert_eq!(
             NullTypeTag::from_data_type(&array_type),
             (NullTypeTag::NonPrimitive, 0, 0)
         );
 
-        let map_type = DataType::Map(Box::new(MapType::new(
-            DataType::STRING,
-            DataType::INTEGER,
-            false,
-        )));
+        let map_type = DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, false));
         assert_eq!(
             NullTypeTag::from_data_type(&map_type),
             (NullTypeTag::NonPrimitive, 0, 0)

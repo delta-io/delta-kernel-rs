@@ -78,6 +78,10 @@ pub(crate) const MAX_VALUES: &str = "maxValues";
 #[internal_api]
 pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
 
+/// Struct-encoded per-file statistics column (checkpoints with `writeStatsAsStruct=true`).
+#[internal_api]
+pub(crate) const STATS_PARSED: &str = "stats_parsed";
+
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),

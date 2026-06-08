@@ -1,11 +1,11 @@
 //! This module defines the concept of a PlanExecutor and its associated input + output types.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
-mod ir;
+pub mod ir;
 mod query_builder;
 
 use bytes::Bytes;
-pub use ir::{IoOperation, Operation, QueryPlan, QueryPlanNode};
+pub use ir::{IoOperation, Operation};
 pub use query_builder::QueryPlanBuilder;
 
 use crate::{

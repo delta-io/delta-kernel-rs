@@ -2950,8 +2950,7 @@ mod tests {
                                 .with_metadata(column_mapping_metadata(3, mode)),
                             StructField::not_null(logical_name(4), DataType::STRING)
                                 .with_metadata(column_mapping_metadata(4, mode)),
-                        ])
-                        .into(),
+                        ]),
                         false,
                     ),
                 )
@@ -3060,8 +3059,7 @@ mod tests {
                             logical_name(4),
                             DataType::INTEGER,
                         )
-                        .with_metadata(column_mapping_metadata(4, mode))])
-                        .into(),
+                        .with_metadata(column_mapping_metadata(4, mode))]),
                         false,
                     ),
                 )
@@ -3123,8 +3121,7 @@ mod tests {
                                 .with_metadata(column_mapping_metadata(6, mode)),
                             StructField::not_null(logical_name(5), DataType::INTEGER)
                                 .with_metadata(column_mapping_metadata(5, mode)),
-                        ])
-                        .into(),
+                        ]),
                         false,
                     ),
                 )
@@ -4156,13 +4153,13 @@ mod tests {
         let target_schema: SchemaRef =
             Arc::new(StructType::new_unchecked([StructField::nullable(
                 "outer",
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("lst", ArrayType::new(DataType::INTEGER, true)),
                     StructField::nullable(
                         "mp",
                         MapType::new(DataType::STRING, DataType::INTEGER, true),
                     ),
-                ]))),
+                ]),
             )]));
 
         let ordering = [ReorderIndex::identity(0)];
@@ -4249,15 +4246,16 @@ mod tests {
         let target_schema: SchemaRef =
             Arc::new(StructType::new_unchecked([StructField::not_null(
                 "outer",
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::not_null("tgt_x", DataType::INTEGER),
                     StructField::not_null(
                         "tgt_y",
-                        DataType::Struct(Box::new(StructType::new_unchecked([
-                            StructField::not_null("tgt_z", DataType::INTEGER),
-                        ]))),
+                        StructType::new_unchecked([StructField::not_null(
+                            "tgt_z",
+                            DataType::INTEGER,
+                        )]),
                     ),
-                ]))),
+                ]),
             )]));
 
         let ordering = [ReorderIndex::identity(0)];

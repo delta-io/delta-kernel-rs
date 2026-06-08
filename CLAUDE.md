@@ -267,6 +267,18 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer `StructField::nullable` / `StructField::not_null` over
   `StructField::new(name, type, bool)` when nullability is known at compile time.
   Reserve `StructField::new` for cases where nullability is a runtime value.
+- Leverage `impl Into<DataType>` to avoid `DataType::Struct/Array/Map(Box::new(...))`
+  boilerplate. `StructType`, `ArrayType`, and `MapType` all implement `Into<DataType>`,
+  and constructors like `StructField::new`/`nullable`/`not_null`, `ArrayType::new`, and
+  `MapType::new` accept `impl Into<DataType>`. So:
+  - When passing to a parameter that accepts `impl Into<DataType>`, pass the container
+    type directly: `StructField::nullable("a", ArrayType::new(DataType::INTEGER, true))`
+    -- do NOT wrap in `DataType::from(...)` or `.into()` (redundant at best, and an
+    ambiguous-type compile error at worst).
+  - When a concrete `DataType` value is actually required (e.g. a `DataType`-typed
+    binding/field, a `[DataType]`/`Vec<DataType>` element, or a `&DataType` argument),
+    prefer `DataType::from(ArrayType::new(...))` over
+    `DataType::Array(Box::new(ArrayType::new(...)))`.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
 - Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
@@ -318,32 +330,6 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
 
-### CI Jobs and Github Actions
-
-**Supply chain security:** every `cargo` command in CI that resolves dependencies MUST use
-`--locked` to enforce the committed `Cargo.lock`. This prevents CI from silently picking up
-a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
-`Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
-reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
-`--locked`: `cargo +nightly fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
-`cargo miri setup` (tooling setup).
-
-Ensure that when writing any github action you are considering safety including thinking of
-and mitigating common attack vectors such expression injection and pull request target attacks.
-
-Example:
-```yaml
-# The code below is vulnerable to expression injection
-run: |
-    echo "Comment: ${{ github.event.comment.body }}"
-
-# To mitigate instead use environment variables
-env:
-    COMMENT_BODY: ${{ github.event.comment.body }}
-run: |
-    echo "Comment: $COMMENT_BODY"
-```
-
 ## Deep Context
 
 Read these when relevant to the task at hand:
@@ -356,4 +342,5 @@ Read these when relevant to the task at hand:
 **Keeping docs current:** If you notice anything inaccurate in these docs -- renamed
 structs, traits, functions, modules, crates, APIs, stale data flows, wrong file paths --
 inform the user so they can be updated. After major changes, update this file,
-`CLAUDE/architecture.md`, `ffi/CLAUDE.md`, and any relevant `<crate>/CLAUDE.md` files.
+`CLAUDE/architecture.md`, `ffi/CLAUDE.md`, `.github/CLAUDE.md`, and any relevant
+`<crate>/CLAUDE.md` files.

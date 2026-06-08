@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tracing::instrument;
 
-use super::Snapshot;
+use super::{IncrementalReplay, Snapshot};
 use crate::crc::{read_crc_file_or_none, Crc};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -181,6 +181,7 @@ impl Snapshot {
                     new_log_segment,
                     engine,
                     operation_id,
+                    IncrementalReplay::Disabled,
                 );
                 return Ok(Arc::new(snapshot?));
             }
@@ -242,16 +243,10 @@ impl Snapshot {
         );
 
         // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
-        // checkpoint. Only pass a CRC newer than the existing snapshot: an older CRC's P&M
-        // could predate changes already in the existing snapshot.
+        // checkpoint. The existing snapshot supplies the P&M baseline.
         let (new_metadata, new_protocol) = new_log_segment
-            .segment_after_crc(existing_snapshot_version)
-            .read_protocol_metadata_opt(
-                engine,
-                resolved_crc
-                    .as_ref()
-                    .filter(|c| c.version > existing_snapshot_version),
-            )?;
+            .segment_after_version(existing_snapshot_version)
+            .read_protocol_metadata_opt(engine)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -319,6 +314,8 @@ impl Snapshot {
             combined_log_segment,
             table_configuration,
             // The snapshot holds a CRC only when it is at the new end version.
+            // TODO(#2674): advance the existing snapshot's CRC over the new tail commits instead
+            //              of dropping a stale one and falling back to full log replay.
             resolved_crc.filter(|c| c.version == new_end_version),
         )?))
     }
@@ -334,11 +331,11 @@ impl Snapshot {
     /// if and only if its version is >= the new segment's checkpoint version. This preserves
     /// the [`LogSegmentFiles`] invariant `crc.version >= checkpoint.version`.
     ///
-    /// The returned `Crc` is read only when the resolved CRC file is newer than
-    /// `existing_snapshot_version` (so it can contribute P&M for the new commits) or at the new
-    /// end version (so it can back the new snapshot). An older CRC can do neither, so it is left
-    /// unread and only contributes its path to the combined segment. When the resolved CRC is
-    /// the one `existing_crc` already holds, it is reused instead of re-read.
+    /// The returned `Crc` is read when the resolved CRC file is newer than
+    /// `existing_snapshot_version` (currently unused; see #2674) or at the new end version (which
+    /// backs the new snapshot). An older CRC can do neither, so it is left unread and only
+    /// contributes its path to the combined segment. When the resolved CRC is the one
+    /// `existing_crc` already holds, it is reused instead of re-read.
     fn resolve_crc(
         new_log_segment: &LogSegment,
         existing_log_segment: &LogSegment,
@@ -1154,10 +1151,12 @@ mod tests {
 
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
             .build(ctx.engine.as_ref())?;
-        // The existing CRC at v2 is stale for the v3 snapshot, so it is not stored on the
-        // snapshot, though it still appears as the segment's latest CRC file.
-        assert!(snapshot_v3.crc().is_none());
+        // A fresh build advances the stale CRC via reverse-replay to a CRC at v3 (file stats
+        // Indeterminate, since these synthetic commits carry no commitInfo). The segment's
+        // latest CRC file still points at the on-disk CRC version.
+        assert_eq!(snapshot_v3.crc().map(|c| c.version), Some(3));
         assert_eq!(
             snapshot_v3
                 .log_segment

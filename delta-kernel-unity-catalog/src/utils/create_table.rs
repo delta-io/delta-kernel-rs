@@ -120,13 +120,13 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
     use delta_kernel::{DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData};
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     use super::*;
 
@@ -234,7 +234,7 @@ mod tests {
             StructType::try_new(vec![
                 StructField::new("id", DataType::INTEGER, true),
                 StructField::new("region", DataType::STRING, true),
-                StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
+                StructField::new("address", address_struct, true),
             ])
             .unwrap(),
         );

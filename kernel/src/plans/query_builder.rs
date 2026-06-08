@@ -1,56 +1,61 @@
-//! Builder API for constructing a [`QueryPlan`].
+//! Builder API for constructing a [`Plan`] over a single relational node.
+//!
+//! The builder produces single-node [`Plan`]s today (one scan source, no transforms);
+//! it will grow to support multi-node plans. Until then, multi-node [`Plan`]s are
+//! constructed directly via [`Plan`] / [`PlanNode`].
 
-use super::ir::QueryPlanNode;
+use super::ir::nodes::{NodeKind, ScanFile, ScanJson, ScanParquet};
+use super::ir::plan::{Plan, PlanNode, RefId};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, FileMeta, PredicateRef, QueryPlan};
+use crate::{DeltaResult, FileMeta};
 
-/// Builder for constructing a [`QueryPlan`].
-///
-/// TODO: We expect this to evolve to support multi-node plans. For now it just supports a
-/// single node.
+/// Builder for constructing a single-node [`Plan`].
 #[derive(Debug)]
 pub struct QueryPlanBuilder {
-    node: QueryPlanNode,
+    kind: NodeKind,
 }
 
 impl QueryPlanBuilder {
-    /// Construct a [`QueryPlanNode::ScanJson`] over the given files.
+    /// Construct a [`ScanJson`] over the given files.
     ///
-    /// See [`QueryPlanNode::ScanJson`] for the parameter semantics.
-    pub fn scan_json(
-        files: Vec<FileMeta>,
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> Self {
+    /// See [`ScanJson`] for parameter semantics.
+    pub fn scan_json(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
         Self {
-            node: QueryPlanNode::ScanJson {
-                files,
-                physical_schema,
-                predicate,
-            },
+            kind: NodeKind::ScanJson(ScanJson {
+                files: files.into_iter().map(ScanFile::from).collect(),
+                file_constant_columns: vec![],
+                schema,
+            }),
         }
     }
 
-    /// Construct a [`QueryPlanNode::ScanParquet`] over the given files.
+    /// Construct a [`ScanParquet`] over the given files.
     ///
-    /// See [`QueryPlanNode::ScanParquet`] for the parameter semantics.
-    pub fn scan_parquet(
-        files: Vec<FileMeta>,
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> Self {
+    /// See [`ScanParquet`] for parameter semantics.
+    pub fn scan_parquet(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
         Self {
-            node: QueryPlanNode::ScanParquet {
-                files,
-                physical_schema,
-                predicate,
-            },
+            kind: NodeKind::ScanParquet(ScanParquet {
+                files: files.into_iter().map(ScanFile::from).collect(),
+                file_constant_columns: vec![],
+                schema,
+            }),
         }
     }
 
-    /// Consume the builder and produce a [`QueryPlan`].
-    pub fn build(self) -> DeltaResult<QueryPlan> {
-        Ok(self.node)
+    /// Consume the builder and produce a [`Plan`] with a single node whose output is `RefId(0)`.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; returns `DeltaResult` for a stable signature as the builder
+    /// grows multi-node validation in follow-up work.
+    pub fn build(self) -> DeltaResult<Plan> {
+        Ok(Plan {
+            nodes: vec![PlanNode {
+                kind: self.kind,
+                inputs: vec![],
+                output: RefId(0),
+            }],
+        })
     }
 }
 
@@ -58,6 +63,7 @@ impl QueryPlanBuilder {
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
     use url::Url;
 
     use super::*;
@@ -79,50 +85,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scan_parquet_constructs_scan_parquet_node() {
-        let schema = test_schema();
-        let files = vec![
-            test_file("file:///a.parquet"),
-            test_file("file:///b.parquet"),
-        ];
-
-        let node = QueryPlanBuilder::scan_parquet(files.clone(), schema.clone(), None)
-            .build()
-            .unwrap();
-
-        let QueryPlanNode::ScanParquet {
-            files: scan_files,
-            physical_schema,
-            predicate,
-        } = node
-        else {
-            panic!("expected ScanParquet, got {node:?}");
-        };
-        assert_eq!(scan_files, files);
-        assert!(Arc::ptr_eq(&physical_schema, &schema));
-        assert!(predicate.is_none());
+    enum Format {
+        Json,
+        Parquet,
     }
 
-    #[test]
-    fn scan_json_constructs_scan_json_node() {
+    #[rstest]
+    #[case::json(Format::Json, &["file:///a.json", "file:///b.json"])]
+    #[case::parquet(Format::Parquet, &["file:///a.parquet", "file:///b.parquet"])]
+    fn build_constructs_scan_node(#[case] format: Format, #[case] urls: &[&str]) {
         let schema = test_schema();
-        let files = vec![test_file("file:///a.json"), test_file("file:///b.json")];
+        let files: Vec<FileMeta> = urls.iter().map(|u| test_file(u)).collect();
 
-        let node = QueryPlanBuilder::scan_json(files.clone(), schema.clone(), None)
-            .build()
-            .unwrap();
+        let plan = match format {
+            Format::Json => QueryPlanBuilder::scan_json(files.clone(), schema.clone()),
+            Format::Parquet => QueryPlanBuilder::scan_parquet(files.clone(), schema.clone()),
+        }
+        .build()
+        .unwrap();
 
-        let QueryPlanNode::ScanJson {
+        let result = plan.result();
+        let [node] = <[_; 1]>::try_from(plan.nodes).expect("single-node plan");
+        assert_eq!(Some(node.output), result);
+        let (NodeKind::ScanJson(ScanJson {
             files: scan_files,
-            physical_schema,
-            predicate,
-        } = node
+            schema: node_schema,
+            ..
+        })
+        | NodeKind::ScanParquet(ScanParquet {
+            files: scan_files,
+            schema: node_schema,
+            ..
+        })) = node.kind
         else {
-            panic!("expected ScanJson, got {node:?}");
+            panic!("expected ScanJson / ScanParquet, got {:?}", node.kind);
         };
-        assert_eq!(scan_files, files);
-        assert!(Arc::ptr_eq(&physical_schema, &schema));
-        assert!(predicate.is_none());
+        let scan_metas: Vec<FileMeta> = scan_files.into_iter().map(|f| f.meta).collect();
+        assert_eq!(scan_metas, files);
+        assert!(Arc::ptr_eq(&node_schema, &schema));
     }
 }

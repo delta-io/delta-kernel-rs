@@ -10,9 +10,9 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{
-    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred, Scalar,
+    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred, PredicateRef,
+    Scalar,
 };
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::object_store::memory::InMemory;
@@ -21,10 +21,11 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
-use delta_kernel::scan::Scan;
+use delta_kernel::scan::{Scan, StatsOptions};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
@@ -2172,14 +2173,106 @@ fn checkpoint_stats_skipping(
     Ok(())
 }
 
-// Verifies ScanFile.stats is populated from struct stats in checkpoints.
-// Tables have writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
+// Verifies ScanFile.stats handling for parsed-stats checkpoints. Tables have
+// writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
-// include_all_stats_columns() forces stats_parsed into the scan output so the COALESCE
-// fallback (ToJson(stats_parsed)) produces a JSON stats string for ScanFile.stats.
+// Cross-product covers all five checkpoint variants against four stats option
+// shapes: ScanFile.stats should be populated via the COALESCE/ToJson fallback
+// when both `json=true` and `struct_stats=All` are set; otherwise null on these
+// struct-stats-only checkpoints.
 #[rstest::rstest]
-#[test]
+#[case::default_json_only(StatsOptions::default(), false)]
+#[case::all_both(StatsOptions::all(), true)]
+#[case::all_struct_only(StatsOptions::all_struct(), false)]
+#[case::none(StatsOptions::none(), false)]
 fn struct_stats_surfaced_in_scan_file(
+    #[values(
+        "v1-single-part",
+        "v1-multi-part",
+        "v2-parquet-sidecars",
+        "v2-json-sidecars",
+        "v2-classic-parquet"
+    )]
+    checkpoint_type: &str,
+    #[case] stats: StatsOptions,
+    #[case] expect_json_stats: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_path = format!("./tests/data/{checkpoint_type}-struct-stats-only/");
+    let path = std::fs::canonicalize(PathBuf::from(table_path))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().with_stats(stats).build()?;
+
+    let mut scan_files = vec![];
+    for res in scan.scan_metadata(engine.as_ref())? {
+        let scan_metadata = res?;
+        scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
+    }
+
+    assert_eq!(scan_files.len(), 5, "expected 5 files in checkpoint");
+    for scan_file in &scan_files {
+        if expect_json_stats {
+            assert!(
+                scan_file.stats.is_some(),
+                "ScanFile.stats should be populated, path: {}",
+                scan_file.path
+            );
+            assert_eq!(
+                scan_file.stats.as_ref().unwrap().num_records,
+                1,
+                "each file has exactly 1 row, path: {}",
+                scan_file.path
+            );
+        } else {
+            assert!(
+                scan_file.stats.is_none(),
+                "ScanFile.stats should be None, path: {}",
+                scan_file.path
+            );
+        }
+    }
+    Ok(())
+}
+
+// On a JSON-only table (no parsed-stats checkpoint), `has_stats_parsed` is
+// false and the COALESCE branch is never selected, so `StatsOptions::all_struct`
+// vs `StatsOptions::default` is a no-op for the `stats` JSON column: `add.stats`
+// is read directly from the commit JSON either way.
+#[rstest::rstest]
+fn struct_stats_only_no_op_on_json_only_table(
+    #[values(StatsOptions::default(), StatsOptions::all_struct())] stats: StatsOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().with_stats(stats).build()?;
+
+    let mut scan_files = vec![];
+    for res in scan.scan_metadata(engine.as_ref())? {
+        let scan_metadata = res?;
+        scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
+    }
+
+    assert!(!scan_files.is_empty());
+    for scan_file in &scan_files {
+        assert!(
+            scan_file.stats.is_some(),
+            "JSON commits populate stats from add.stats"
+        );
+    }
+    Ok(())
+}
+
+// Confirms `stats_parsed` is still consumed by data skipping when only struct
+// stats are requested (no JSON synthesis). Predicate `id > 3` should skip files
+// where `max(id) <= 3`, returning rows 4 and 5 only. If `all_struct` accidentally
+// disabled the stats_parsed read path, all 5 rows would come back.
+#[rstest::rstest]
+fn struct_stats_only_preserves_data_skipping(
     #[values(
         "v1-single-part",
         "v1-multi-part",
@@ -2193,11 +2286,13 @@ fn struct_stats_surfaced_in_scan_file(
     let path = std::fs::canonicalize(PathBuf::from(table_path))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = test_utils::create_default_engine(&url)?;
-
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(3i64)));
     let scan = snapshot
         .scan_builder()
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all_struct())
+        .with_predicate(predicate)
         .build()?;
 
     let mut scan_files = vec![];
@@ -2206,17 +2301,15 @@ fn struct_stats_surfaced_in_scan_file(
         scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
     }
 
-    assert_eq!(scan_files.len(), 5, "expected 5 files in checkpoint");
+    assert_eq!(
+        scan_files.len(),
+        2,
+        "data skipping via stats_parsed should leave only 2 files (id=4, id=5)"
+    );
     for scan_file in &scan_files {
         assert!(
-            scan_file.stats.is_some(),
-            "ScanFile.stats should be populated from struct stats, path: {}",
-            scan_file.path
-        );
-        assert_eq!(
-            scan_file.stats.as_ref().unwrap().num_records,
-            1,
-            "each file has exactly 1 row, path: {}",
+            scan_file.stats.is_none(),
+            "ScanFile.stats must remain null when synthesis is skipped, path: {}",
             scan_file.path
         );
     }

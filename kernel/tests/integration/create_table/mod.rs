@@ -277,11 +277,8 @@ fn nested_non_null_schema() -> Arc<StructType> {
     let nested = StructType::try_new(vec![StructField::not_null("child", DataType::INTEGER)])
         .expect("nested non-null schema should be valid");
     Arc::new(
-        StructType::try_new(vec![StructField::nullable(
-            "nested",
-            DataType::Struct(Box::new(nested)),
-        )])
-        .expect("top-level nested schema should be valid"),
+        StructType::try_new(vec![StructField::nullable("nested", nested)])
+            .expect("top-level nested schema should be valid"),
     )
 }
 

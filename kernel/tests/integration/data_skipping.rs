@@ -17,8 +17,6 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Int64Array, RecordBatch};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
 };
@@ -27,6 +25,8 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::{Snapshot, SnapshotRef};
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     add_commit, create_table_and_load_snapshot, test_table_setup_mt, write_batch_to_table,
 };

@@ -254,10 +254,7 @@ mod tests {
         StructField::nullable(
             "outer",
             StructType::new_unchecked([
-                StructField::nullable(
-                    "inner",
-                    DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
-                ),
+                StructField::nullable("inner", ArrayType::new(DataType::VOID, true)),
             ])
         ),
         "array element type"
@@ -266,10 +263,7 @@ mod tests {
         "void in map inside array",
         StructField::nullable(
             "col",
-            ArrayType::new(
-                DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::VOID, true,))),
-                true,
-            ),
+            ArrayType::new(MapType::new(DataType::STRING, DataType::VOID, true), true,),
         ),
         "map value type"
     )]
@@ -278,10 +272,10 @@ mod tests {
         StructField::nullable(
             "arr",
             ArrayType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::VOID),
-                ]))),
+                ]),
                 true,
             ),
         ),
@@ -322,13 +316,13 @@ mod tests {
         StructField::nullable(
             "outer",
             ArrayType::new(
-                DataType::Array(Box::new(ArrayType::new(
-                    DataType::Struct(Box::new(StructType::new_unchecked([
+                ArrayType::new(
+                    StructType::new_unchecked([
                         StructField::nullable("a", DataType::INTEGER),
                         StructField::nullable("b", DataType::VOID),
-                    ]))),
+                    ]),
                     true,
-                ))),
+                ),
                 true,
             ),
         ),
@@ -339,16 +333,16 @@ mod tests {
         StructField::nullable(
             "arr",
             ArrayType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable(
                         "b",
-                        DataType::Struct(Box::new(StructType::new_unchecked([
+                        StructType::new_unchecked([
                             StructField::nullable("x", DataType::INTEGER),
                             StructField::nullable("y", DataType::VOID),
-                        ]))),
+                        ]),
                     ),
-                ]))),
+                ]),
                 true,
             ),
         ),
@@ -359,15 +353,16 @@ mod tests {
         StructField::nullable(
             "outer",
             ArrayType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
+                StructType::new_unchecked([StructField::nullable(
                     "inner",
-                    DataType::Array(Box::new(ArrayType::new(
-                        DataType::Struct(Box::new(StructType::new_unchecked([
-                            StructField::nullable("v", DataType::VOID),
-                        ]))),
+                    ArrayType::new(
+                        StructType::new_unchecked([StructField::nullable(
+                            "v",
+                            DataType::VOID,
+                        )]),
                         true,
-                    ))),
-                )]))),
+                    ),
+                )]),
                 true,
             ),
         ),
@@ -378,9 +373,7 @@ mod tests {
         StructField::nullable(
             "arr",
             ArrayType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked(
-                    Vec::<StructField>::new(),
-                ))),
+                StructType::new_unchecked(Vec::<StructField>::new()),
                 true,
             ),
         ),
@@ -444,10 +437,10 @@ mod tests {
         StructType::new_unchecked([StructField::nullable(
             "arr",
             ArrayType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::STRING),
-                ]))),
+                ]),
                 true,
             ),
         )])
@@ -555,9 +548,7 @@ mod tests {
                 StructType::new_unchecked([
                     StructField::nullable(
                         "inner",
-                        DataType::Struct(Box::new(StructType::new_unchecked([
-                            StructField::nullable("x", DataType::VOID),
-                        ]))),
+                        StructType::new_unchecked([StructField::nullable("x", DataType::VOID)]),
                     ),
                 ]),
             ),
@@ -644,20 +635,17 @@ mod tests {
             "outer",
             StructType::new_unchecked([StructField::nullable(
                 "inner",
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("v", DataType::VOID),
-                ]))),
+                ]),
             )]),
         )]),
         StructType::new_unchecked([StructField::nullable(
             "outer",
             StructType::new_unchecked([StructField::nullable(
                 "inner",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
-                    "a",
-                    DataType::INTEGER,
-                )]))),
+                StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]),
             )]),
         )])
     )]
@@ -674,17 +662,17 @@ mod tests {
     // primitive is filtered: ArrayType / MapType cannot be reconstructed without their
     // element / key / value, so the containing field disappears.
     #[rstest::rstest]
-    #[case::array_of_void(DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))))]
-    #[case::map_with_void_value(DataType::Map(Box::new(MapType::new(
+    #[case::array_of_void(DataType::from(ArrayType::new(DataType::VOID, true)))]
+    #[case::map_with_void_value(DataType::from(MapType::new(
         DataType::STRING,
         DataType::VOID,
         true
-    ))))]
-    #[case::map_with_void_key(DataType::Map(Box::new(MapType::new(
+    )))]
+    #[case::map_with_void_key(DataType::from(MapType::new(
         DataType::VOID,
         DataType::STRING,
         true
-    ))))]
+    )))]
     fn test_strip_drops_container_with_void(#[case] field_type: DataType) {
         let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),

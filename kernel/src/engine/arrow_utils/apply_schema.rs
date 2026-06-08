@@ -471,10 +471,10 @@ mod apply_schema_validation_tests {
         .unwrap();
 
         // Target schema with nullable fields
-        let target_schema = DataType::Struct(Box::new(StructType::new_unchecked([
+        let target_schema = DataType::from(StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, true),
             StructField::new("b", DataType::INTEGER, true),
-        ])));
+        ]));
 
         // Apply schema - should successfully convert to RecordBatch
         let result = apply_schema(&struct_array, &target_schema).unwrap();
@@ -602,7 +602,7 @@ mod apply_schema_validation_tests {
     fn test_apply_schema_threads_nested_ids_onto_arrow_schema() {
         let meta_key = ColumnMetadataKey::ColumnMappingNestedIds.as_ref();
         let fixture = complex_nested_with_field_ids(meta_key);
-        let kernel_type = DataType::Struct(Box::new(fixture.kernel_schema));
+        let kernel_type = DataType::from(fixture.kernel_schema);
         let result = apply_schema(&fixture.input_arrow_data, &kernel_type).unwrap();
 
         assert_eq!(
@@ -624,7 +624,7 @@ mod apply_schema_validation_tests {
         );
         let kernel_schema =
             array_in_map_with_field_ids(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
-        let result = apply_schema(&input, &DataType::Struct(Box::new(kernel_schema))).unwrap();
+        let result = apply_schema(&input, &DataType::from(kernel_schema)).unwrap();
 
         let result_schema = result.schema();
         let ArrowDataType::Map(entries_field, _) = result_schema.field(0).data_type() else {
@@ -673,7 +673,7 @@ mod apply_schema_validation_tests {
         #[case] schema: StructType,
         #[case] expected_field_ids: &[(&str, &str)],
     ) {
-        let kernel_type = DataType::Struct(Box::new(schema));
+        let kernel_type = DataType::from(schema);
         let result =
             apply_schema(&array_in_map_arrow_data_without_field_ids(), &kernel_type).unwrap();
         let field_ids: HashMap<String, String> =
@@ -709,7 +709,7 @@ mod apply_schema_validation_tests {
                 .to_string(),
             value,
         )]);
-        let kernel_type = DataType::Struct(Box::new(schema));
+        let kernel_type = DataType::from(schema);
 
         assert_result_error_with_message(
             apply_schema(&array_in_map_arrow_data_without_field_ids(), &kernel_type),

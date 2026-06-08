@@ -13,7 +13,7 @@ use super::TableChanges;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
-use crate::scan::{PhysicalPredicate, StatsOutputMode};
+use crate::scan::{PhysicalPredicate, StatsOptions};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
@@ -48,7 +48,7 @@ pub struct TableChangesScan {
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
-/// # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngineBuilder};
+/// # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
 /// # let engine = DefaultEngineBuilder::new(store_from_url(&url).unwrap()).build();
 /// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes
@@ -122,7 +122,7 @@ impl TableChangesScanBuilder {
             table_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
-            StatsOutputMode::default(),
+            &StatsOptions::default(),
             CdfTransformFieldClassifier,
         )?;
 

@@ -606,24 +606,24 @@ fn flat_cm_info_for_nested_data_type(
             let new_inner = assign_column_mapping_metadata(
                 inner, max_id, /* assign_nested_field_ids */ false,
             )?;
-            Ok(DataType::Struct(Box::new(new_inner)))
+            Ok(DataType::from(new_inner))
         }
         DataType::Array(array_type) => {
             let new_element_type =
                 flat_cm_info_for_nested_data_type(array_type.element_type(), max_id)?;
-            Ok(DataType::Array(Box::new(ArrayType::new(
+            Ok(DataType::from(ArrayType::new(
                 new_element_type,
                 array_type.contains_null(),
-            ))))
+            )))
         }
         DataType::Map(map_type) => {
             let new_key_type = flat_cm_info_for_nested_data_type(map_type.key_type(), max_id)?;
             let new_value_type = flat_cm_info_for_nested_data_type(map_type.value_type(), max_id)?;
-            Ok(DataType::Map(Box::new(MapType::new(
+            Ok(DataType::from(MapType::new(
                 new_key_type,
                 new_value_type,
                 map_type.value_contains_null(),
-            ))))
+            )))
         }
         // Primitive and Variant types don't contain nested struct fields - return as-is
         DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
@@ -655,19 +655,17 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
         nested_ids: &mut NestedFieldIds,
     ) -> DeltaResult<DataType> {
         match data_type {
-            DataType::Struct(inner) => Ok(DataType::Struct(Box::new(assign_nested_cm_ids(
-                inner, max_id,
-            )?))),
+            DataType::Struct(inner) => Ok(DataType::from(assign_nested_cm_ids(inner, max_id)?)),
             DataType::Array(array_type) => {
                 let element_path = format!("{path}.element");
                 *max_id += 1;
                 nested_ids.insert(element_path.clone(), serde_json::Value::from(*max_id));
                 let new_element =
                     walk(array_type.element_type(), max_id, &element_path, nested_ids)?;
-                Ok(DataType::Array(Box::new(ArrayType::new(
+                Ok(DataType::from(ArrayType::new(
                     new_element,
                     array_type.contains_null(),
-                ))))
+                )))
             }
             DataType::Map(map_type) => {
                 let key_path = format!("{path}.key");
@@ -678,11 +676,11 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
                 *max_id += 1;
                 nested_ids.insert(value_path.clone(), serde_json::Value::from(*max_id));
                 let new_value = walk(map_type.value_type(), max_id, &value_path, nested_ids)?;
-                Ok(DataType::Map(Box::new(MapType::new(
+                Ok(DataType::from(MapType::new(
                     new_key,
                     new_value,
                     map_type.value_contains_null(),
-                ))))
+                )))
             }
             DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
         }
@@ -1027,11 +1025,7 @@ mod tests {
         let schema = StructType::new_unchecked([make_cm_field(
             "b",
             1,
-            MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(unannotated)),
-                false,
-            ),
+            MapType::new(DataType::STRING, unannotated, false),
         )]);
         validate_schema_column_mapping(&schema, ColumnMappingMode::Id)
             .expect_err("missing annotation on struct field inside map value");
@@ -1062,18 +1056,14 @@ mod tests {
             make_cm_field("x", 5, DataType::INTEGER),
             make_cm_field("y", 5, DataType::INTEGER),
         ]);
-        StructType::new_unchecked([make_cm_field(
-            "outer",
-            10,
-            DataType::Struct(Box::new(nested)),
-        )])
+        StructType::new_unchecked([make_cm_field("outer", 10, nested)])
     }
 
     fn cm_schema_cross_level_duplicates() -> StructType {
         let nested = StructType::new_unchecked([make_cm_field("inner", 1, DataType::INTEGER)]);
         StructType::new_unchecked([
             make_cm_field("a", 1, DataType::INTEGER),
-            make_cm_field("b", 2, DataType::Struct(Box::new(nested))),
+            make_cm_field("b", 2, nested),
         ])
     }
 
@@ -1081,11 +1071,7 @@ mod tests {
         let element = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
         StructType::new_unchecked([
             make_cm_field("a", 1, DataType::INTEGER),
-            make_cm_field(
-                "b",
-                2,
-                ArrayType::new(DataType::Struct(Box::new(element)), false),
-            ),
+            make_cm_field("b", 2, ArrayType::new(element, false)),
         ])
     }
 
@@ -1093,11 +1079,7 @@ mod tests {
         let value = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
         StructType::new_unchecked([
             make_cm_field("a", 1, DataType::INTEGER),
-            make_cm_field(
-                "b",
-                2,
-                MapType::new(DataType::STRING, DataType::Struct(Box::new(value)), false),
-            ),
+            make_cm_field("b", 2, MapType::new(DataType::STRING, value, false)),
         ])
     }
 
@@ -1249,19 +1231,17 @@ mod tests {
                 let inner = StructType::new_unchecked([field_under_test]);
                 let schema = StructType::new_unchecked([
                     StructField::nullable("unannotated_sibling", DataType::STRING),
-                    StructField::nullable("outer", DataType::Struct(Box::new(inner))),
+                    StructField::nullable("outer", inner),
                 ]);
                 (schema, path(&["outer", FIELD_UNDER_TEST]))
             }
             SchemaShape::DeeplyNestedStruct => {
                 let innermost = StructType::new_unchecked([field_under_test]);
-                let middle = StructType::new_unchecked([StructField::nullable(
-                    "middle",
-                    DataType::Struct(Box::new(innermost)),
-                )]);
+                let middle =
+                    StructType::new_unchecked([StructField::nullable("middle", innermost)]);
                 let schema = StructType::new_unchecked([
                     StructField::nullable("unannotated_sibling", DataType::STRING),
-                    StructField::nullable("outer", DataType::Struct(Box::new(middle))),
+                    StructField::nullable("outer", middle),
                 ]);
                 (schema, path(&["outer", "middle", FIELD_UNDER_TEST]))
             }
@@ -1587,7 +1567,7 @@ mod tests {
 
         let schema = StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false),
-            StructField::new("nested", DataType::Struct(Box::new(inner)), true),
+            StructField::new("nested", inner, true),
         ]);
 
         let mut max_id = 0;
@@ -1670,17 +1650,9 @@ mod tests {
         let value_struct =
             StructType::new_unchecked([StructField::new("v", DataType::INTEGER, false)]);
 
-        let map_type = MapType::new(
-            DataType::Struct(Box::new(key_struct)),
-            DataType::Struct(Box::new(value_struct)),
-            true,
-        );
+        let map_type = MapType::new(key_struct, value_struct, true);
 
-        let schema = StructType::new_unchecked([StructField::new(
-            "my_map",
-            DataType::Map(Box::new(map_type)),
-            true,
-        )]);
+        let schema = StructType::new_unchecked([StructField::new("my_map", map_type, true)]);
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -1720,13 +1692,9 @@ mod tests {
         let elem_struct =
             StructType::new_unchecked([StructField::new("elem", DataType::INTEGER, false)]);
 
-        let array_type = ArrayType::new(DataType::Struct(Box::new(elem_struct)), true);
+        let array_type = ArrayType::new(elem_struct, true);
 
-        let schema = StructType::new_unchecked([StructField::new(
-            "my_array",
-            DataType::Array(Box::new(array_type)),
-            true,
-        )]);
+        let schema = StructType::new_unchecked([StructField::new("my_array", array_type, true)]);
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -1761,14 +1729,11 @@ mod tests {
         let deep_struct =
             StructType::new_unchecked([StructField::new("deep", DataType::INTEGER, false)]);
 
-        let inner_array = ArrayType::new(DataType::Struct(Box::new(deep_struct)), true);
-        let outer_array = ArrayType::new(DataType::Array(Box::new(inner_array)), true);
+        let inner_array = ArrayType::new(deep_struct, true);
+        let outer_array = ArrayType::new(inner_array, true);
 
-        let schema = StructType::new_unchecked([StructField::new(
-            "nested_arrays",
-            DataType::Array(Box::new(outer_array)),
-            true,
-        )]);
+        let schema =
+            StructType::new_unchecked([StructField::new("nested_arrays", outer_array, true)]);
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -1808,22 +1773,14 @@ mod tests {
         let value_struct =
             StructType::new_unchecked([StructField::new("v", DataType::INTEGER, false)]);
 
-        let key_array = ArrayType::new(DataType::Struct(Box::new(key_struct)), true);
-        let value_array = ArrayType::new(DataType::Struct(Box::new(value_struct)), true);
+        let key_array = ArrayType::new(key_struct, true);
+        let value_array = ArrayType::new(value_struct, true);
 
-        let inner_map = MapType::new(
-            DataType::Array(Box::new(key_array)),
-            DataType::Array(Box::new(value_array)),
-            true,
-        );
+        let inner_map = MapType::new(key_array, value_array, true);
 
-        let outer_array = ArrayType::new(DataType::Map(Box::new(inner_map)), true);
+        let outer_array = ArrayType::new(inner_map, true);
 
-        let schema = StructType::new_unchecked([StructField::new(
-            "cursed",
-            DataType::Array(Box::new(outer_array)),
-            true,
-        )]);
+        let schema = StructType::new_unchecked([StructField::new("cursed", outer_array, true)]);
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
@@ -1881,21 +1838,17 @@ mod tests {
                 ),
             ])]);
 
-        let schema = StructType::new_unchecked([StructField::new(
-            "a",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )
-        .add_metadata([
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-outer-a".to_string()),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::Number(1),
-            ),
-        ])]);
+        let schema =
+            StructType::new_unchecked([StructField::new("a", inner, true).add_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-outer-a".to_string()),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+            ])]);
 
         // Top-level column
         let result = get_any_level_column_physical_name(
@@ -1976,21 +1929,17 @@ mod tests {
         }
 
         let inner = StructType::new_unchecked([inner_field]);
-        let schema = StructType::new_unchecked([StructField::new(
-            "a",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )
-        .add_metadata([
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-outer-a".to_string()),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::Number(1),
-            ),
-        ])]);
+        let schema =
+            StructType::new_unchecked([StructField::new("a", inner, true).add_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-outer-a".to_string()),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(1),
+                ),
+            ])]);
 
         let err = get_any_level_column_physical_name(
             &schema,
@@ -2094,12 +2043,10 @@ mod tests {
             MetadataValue::String("col-inner-456".to_string()),
         )]);
         let inner_struct = StructType::new_unchecked(vec![inner_field]);
-        let outer_field =
-            StructField::new("address", DataType::Struct(Box::new(inner_struct)), true)
-                .with_metadata([(
-                    "delta.columnMapping.physicalName".to_string(),
-                    MetadataValue::String("col-outer-123".to_string()),
-                )]);
+        let outer_field = StructField::new("address", inner_struct, true).with_metadata([(
+            "delta.columnMapping.physicalName".to_string(),
+            MetadataValue::String("col-outer-123".to_string()),
+        )]);
         let schema = StructType::new_unchecked(vec![outer_field]);
 
         let physical_col = ColumnName::new(["col-outer-123", "col-inner-456"]);
@@ -2125,7 +2072,7 @@ mod tests {
 
     // === find_max_column_id_in_schema tests ===
 
-    fn field_with_id(name: &str, ty: DataType, id: i64) -> StructField {
+    fn field_with_id(name: &str, ty: impl Into<DataType>, id: i64) -> StructField {
         let mut f = StructField::nullable(name, ty);
         f.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
@@ -2154,13 +2101,13 @@ mod tests {
 
     #[test]
     fn find_max_column_id_nested_struct() {
-        let inner = DataType::Struct(Box::new(
+        let inner = DataType::from(
             StructType::try_new(vec![
                 field_with_id("x", DataType::STRING, 7),
                 field_with_id("y", DataType::STRING, 5),
             ])
             .unwrap(),
-        ));
+        );
         let schema = StructType::try_new(vec![
             field_with_id("outer", inner, 2),
             field_with_id("sibling", DataType::STRING, 3),
@@ -2171,19 +2118,15 @@ mod tests {
 
     #[test]
     fn find_max_column_id_array_and_map_recurse_into_element_types() {
-        let array_elem_struct = DataType::Array(Box::new(ArrayType::new(
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![field_with_id("deep", DataType::STRING, 42)]).unwrap(),
-            )),
+        let array_elem_struct = DataType::from(ArrayType::new(
+            StructType::try_new(vec![field_with_id("deep", DataType::STRING, 42)]).unwrap(),
             true,
-        )));
-        let map_ty = DataType::Map(Box::new(MapType::new(
+        ));
+        let map_ty = DataType::from(MapType::new(
             DataType::STRING,
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![field_with_id("inside", DataType::STRING, 9)]).unwrap(),
-            )),
+            StructType::try_new(vec![field_with_id("inside", DataType::STRING, 9)]).unwrap(),
             false,
-        )));
+        ));
         let schema = StructType::try_new(vec![
             field_with_id("arr", array_elem_struct, 1),
             field_with_id("m", map_ty, 2),
@@ -2194,13 +2137,13 @@ mod tests {
 
     #[test]
     fn find_max_column_id_map_with_struct_key_recurses() {
-        let key_struct = DataType::Struct(Box::new(
+        let key_struct = DataType::from(
             StructType::try_new(vec![field_with_id("key_id", DataType::INTEGER, 17)]).unwrap(),
-        ));
-        let value_struct = DataType::Struct(Box::new(
+        );
+        let value_struct = DataType::from(
             StructType::try_new(vec![field_with_id("val_id", DataType::INTEGER, 11)]).unwrap(),
-        ));
-        let map_ty = DataType::Map(Box::new(MapType::new(key_struct, value_struct, false)));
+        );
+        let map_ty = DataType::from(MapType::new(key_struct, value_struct, false));
         let schema = StructType::try_new(vec![field_with_id("m", map_ty, 1)]).unwrap();
         // Max should come from the key struct's `key_id = 17`, beating value's 11 and
         // top-level's 1.
@@ -2230,11 +2173,7 @@ mod tests {
     fn find_max_column_id_picks_up_nested_ids_metadata() {
         let mut field = field_with_id(
             "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::INTEGER,
-                DataType::INTEGER,
-                false,
-            ))),
+            MapType::new(DataType::INTEGER, DataType::INTEGER, false),
             1,
         );
         field.metadata.insert(
