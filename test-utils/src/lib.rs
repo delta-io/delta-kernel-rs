@@ -5,6 +5,19 @@ pub mod counting_reporter;
 pub mod engine_contract;
 pub mod table_builder;
 
+/// Helper macro to extract a typed column from a RecordBatch or StructArray.
+#[macro_export]
+macro_rules! get_column {
+    ($source:expr, $name:expr, $ty:ty) => {
+        $source
+            .column_by_name($name)
+            .unwrap_or_else(|| panic!("should have column '{}'", $name))
+            .as_any()
+            .downcast_ref::<$ty>()
+            .unwrap_or_else(|| panic!("column '{}' should be {}", $name, stringify!($ty)))
+    };
+}
+
 // `rstest` and the `table_builder` factories appear inside the `define_sweeps!`
 // invocation below. Macro bodies are token streams that are only resolved when
 // consumer crates apply the emitted templates, so rustc doesn't see these uses.

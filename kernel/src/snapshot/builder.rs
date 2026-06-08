@@ -40,6 +40,50 @@ pub struct SnapshotBuilder {
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
+    incremental_replay: IncrementalReplay,
+}
+
+/// Controls whether kernel replays commits to advance a stale on-disk CRC to the target snapshot
+/// version on load. A CRC already at the target version is always used regardless of this
+/// setting; this only bounds the cost of advancing a *stale* CRC.
+///
+/// A resolved CRC gives the snapshot precomputed file statistics (file count and sizes, useful
+/// for query optimization and for writers producing a post-commit CRC) along with domain metadata
+/// and set transactions (useful for writers), all without extra log replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IncrementalReplay {
+    /// Never advance a stale CRC; fall back to normal log replay. `UpToCommits(0)` is equivalent.
+    #[default]
+    Disabled,
+    /// Advance only when the CRC is within `n` commits of the target version, i.e.
+    /// `target_version - crc_version <= n`.
+    UpToCommits(u64),
+    /// Advance regardless of how stale the CRC is.
+    Unlimited,
+}
+
+impl IncrementalReplay {
+    /// Whether the configured budget permits advancing a CRC at `crc_version` to `target_version`.
+    /// Errors if `crc_version` is ahead of `target_version`, which violates a caller invariant.
+    ///
+    /// Example: 95.crc with commits 96.json through 100.json is 5 commits, so `UpToCommits(5)`
+    /// advances and `UpToCommits(4)` does not; `Unlimited` always advances.
+    pub(crate) fn should_advance(
+        self,
+        crc_version: Version,
+        target_version: Version,
+    ) -> DeltaResult<bool> {
+        let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
+            Error::internal_error(format!(
+                "CRC version {crc_version} is ahead of target version {target_version}"
+            ))
+        })?;
+        Ok(match self {
+            IncrementalReplay::Disabled => false,
+            IncrementalReplay::UpToCommits(n) => distance <= n,
+            IncrementalReplay::Unlimited => true,
+        })
+    }
 }
 
 impl SnapshotBuilder {
@@ -54,6 +98,7 @@ impl SnapshotBuilder {
             version: None,
             log_tail: Vec::new(),
             max_catalog_version: None,
+            incremental_replay: IncrementalReplay::default(),
         }
     }
 
@@ -64,6 +109,7 @@ impl SnapshotBuilder {
             version: None,
             log_tail: Vec::new(),
             max_catalog_version: None,
+            incremental_replay: IncrementalReplay::default(),
         }
     }
 
@@ -114,6 +160,22 @@ impl SnapshotBuilder {
         self
     }
 
+    /// Bound how many commits kernel will replay to advance a stale on-disk CRC to the target
+    /// version. See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
+    ///
+    /// Writers should set this to [`IncrementalReplay::Unlimited`] for faster writes, as should
+    /// readers that always want table-level file statistics for query optimization.
+    ///
+    /// This setting applies only to builds from a table root; it does not carry into incremental
+    /// updates derived from the resulting snapshot. [`Snapshot::builder_from`] does not yet advance
+    /// stale CRCs regardless of this value (see #2674).
+    ///
+    /// [`Snapshot::builder_from`]: crate::Snapshot::builder_from
+    pub fn with_incremental_crc_replay(mut self, mode: IncrementalReplay) -> Self {
+        self.incremental_replay = mode;
+        self
+    }
+
     // ============================================================================
     // Terminal: build the Snapshot
     // ============================================================================
@@ -152,6 +214,7 @@ impl SnapshotBuilder {
             version,
             log_tail,
             max_catalog_version,
+            incremental_replay,
         } = self;
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
@@ -178,8 +241,14 @@ impl SnapshotBuilder {
                     effective_version,
                     operation_id,
                 )?;
-                Snapshot::try_new_from_log_segment(table_url, log_segment, engine, operation_id)
-                    .map(Into::into)
+                Snapshot::try_new_from_log_segment(
+                    table_url,
+                    log_segment,
+                    engine,
+                    operation_id,
+                    incremental_replay,
+                )
+                .map(Into::into)
             })
         } else {
             existing_snapshot

@@ -29,6 +29,11 @@ pub struct CParquetFooter {
 }
 
 /// C-compatible equivalent of the kernel's `PlanResult` enum.
+///
+/// We instruct cbindgen to prefix enum variants with enum name (e.g. `CPlanResult_Unit`)
+/// so they don't collide with other identifiers (e.g. with the `FileMeta` struct)
+///
+/// cbindgen:prefix-with-name=true
 #[repr(C)]
 pub enum CPlanResult {
     Unit,

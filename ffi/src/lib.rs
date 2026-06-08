@@ -146,6 +146,30 @@ impl KernelStringSlice {
     }
 }
 
+/// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.
+///
+/// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
+/// must not be retained beyond the foreign function call it was passed into.
+#[repr(C)]
+pub struct KernelBytesSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl KernelBytesSlice {
+    /// Creates a new bytes slice from a source byte slice.
+    ///
+    /// # Safety
+    /// Caller must guarantee that the source will outlive the created KernelBytesSlice.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
+            len: source.len(),
+        }
+    }
+}
+
 /// FFI-safe implementation for Rust's `Option<T>`
 #[derive(PartialEq, Debug)]
 #[repr(C)]
@@ -184,6 +208,23 @@ macro_rules! kernel_string_slice {
     }};
 }
 pub(crate) use kernel_string_slice;
+
+/// Similar to [`kernel_string_slice!`](kernel_string_slice), this macro provides a safer way to
+/// construct a KernelBytesSlice.
+///
+/// Refer to [`kernel_string_slice!`](kernel_string_slice) for safety and implementation
+/// notes.
+#[cfg(feature = "declarative-plans")]
+macro_rules! kernel_bytes_slice {
+    ( $source:ident ) => {{
+        fn do_it(b: &[u8]) -> $crate::KernelBytesSlice {
+            unsafe { $crate::KernelBytesSlice::new_unsafe(b) }
+        }
+        do_it(&$source)
+    }};
+}
+#[cfg(feature = "declarative-plans")]
+pub(crate) use kernel_bytes_slice;
 
 trait TryFromStringSlice<'a>: Sized {
     unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;

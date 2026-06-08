@@ -15,5 +15,6 @@ mod golden_tables;
 mod hdfs;
 mod log;
 mod metrics;
+mod parsed_stats;
 mod read;
 mod write;
