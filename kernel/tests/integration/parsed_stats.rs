@@ -6,11 +6,11 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::Snapshot;
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{unpartitioned, version_latest, FeatureSet, LogState, TableConfig};
 use test_utils::{get_column, test_context};
 
