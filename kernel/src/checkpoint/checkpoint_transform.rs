@@ -90,11 +90,10 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_json {
         // Populate stats from stats_parsed if needed (for old checkpoints that only had
         // stats_parsed)
-        patch_builder =
-            patch_builder.with_replaced_field_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
+        patch_builder = patch_builder.replace_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
     } else {
         // Drop stats field when not writing as JSON
-        patch_builder = patch_builder.with_dropped_field_at([ADD_NAME], STATS_FIELD);
+        patch_builder = patch_builder.drop_at([ADD_NAME], STATS_FIELD);
     }
 
     // Handle stats_parsed field
@@ -103,26 +102,21 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_struct {
         // Populate stats_parsed from JSON stats (for commits that only have JSON stats)
         let stats_parsed_expr = build_stats_parsed_expr(stats_schema);
-        patch_builder =
-            patch_builder.with_replaced_field_at([ADD_NAME], STATS_PARSED_FIELD, stats_parsed_expr);
+        patch_builder = patch_builder.replace_at([ADD_NAME], STATS_PARSED_FIELD, stats_parsed_expr);
     } else {
         // Drop stats_parsed field when not writing as struct
-        patch_builder = patch_builder.with_dropped_field_at([ADD_NAME], STATS_PARSED_FIELD);
+        patch_builder = patch_builder.drop_at([ADD_NAME], STATS_PARSED_FIELD);
     }
 
     // Handle partitionValues_parsed field (only for partitioned tables)
     if partition_schema.is_some() {
         if config.write_stats_as_struct {
             let pv_parsed_expr = build_partition_values_parsed_expr();
-            patch_builder = patch_builder.with_replaced_field_at(
-                [ADD_NAME],
-                PARTITION_VALUES_PARSED_FIELD,
-                pv_parsed_expr,
-            );
+            patch_builder =
+                patch_builder.replace_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
         } else {
             // Drop partitionValues_parsed since it was added to read schema
-            patch_builder =
-                patch_builder.with_dropped_field_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD);
+            patch_builder = patch_builder.drop_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD);
         }
     }
 
@@ -160,12 +154,12 @@ pub(crate) fn build_checkpoint_read_schema(
                 "partitionValues_parsed field already exists in Add schema",
             ));
         }
-        let mut patch = SchemaStructPatchBuilder::new().with_inserted_field_after(
+        let mut patch = SchemaStructPatchBuilder::new().insert_after(
             STATS_FIELD,
             StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
         );
         if let Some(pv_schema) = partition_schema {
-            patch = patch.with_inserted_field_after(
+            patch = patch.insert_after(
                 PARTITION_VALUES_FIELD,
                 StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
             );
@@ -279,7 +273,7 @@ fn transform_add_schema(
     let new_add_field = StructField::new(ADD_NAME, modified_add, add_field.nullable)
         .with_metadata(add_field.metadata.clone());
     let new_schema = SchemaStructPatchBuilder::new()
-        .with_replaced_field(ADD_NAME, new_add_field)
+        .replace(ADD_NAME, new_add_field)
         .build(base_schema)?;
 
     Ok(Arc::new(new_schema))
@@ -293,12 +287,12 @@ fn build_add_output_schema(
 ) -> DeltaResult<StructType> {
     let mut patch = SchemaStructPatchBuilder::new();
     if config.write_stats_as_struct {
-        patch = patch.with_inserted_field_after(
+        patch = patch.insert_after(
             STATS_FIELD,
             StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
         );
         if let Some(pv_schema) = partition_schema {
-            patch = patch.with_inserted_field_after(
+            patch = patch.insert_after(
                 PARTITION_VALUES_FIELD,
                 StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
             );
@@ -306,7 +300,7 @@ fn build_add_output_schema(
     }
 
     if !config.write_stats_as_json {
-        patch = patch.with_dropped_field(STATS_FIELD);
+        patch = patch.drop(STATS_FIELD);
     }
     patch.build(add_schema)
 }

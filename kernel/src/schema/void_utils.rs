@@ -178,7 +178,7 @@ fn add_void_stripping_inner<'a>(
 ) -> ExpressionStructPatchBuilder {
     for field in st.fields() {
         if *field.data_type() == DataType::VOID {
-            patch = patch.with_dropped_field_at(path.iter().copied(), field.name());
+            patch = patch.drop_at(path.iter().copied(), field.name());
         } else if let DataType::Struct(inner) = field.data_type() {
             path.push(field.name());
             patch = add_void_stripping_inner(patch, inner, path);

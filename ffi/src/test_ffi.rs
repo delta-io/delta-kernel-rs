@@ -113,20 +113,20 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     // struct becomes a child of `foo.bar.baz`, inserted after `a`. Which means a hypothetical child
     // `t` of `foo.bar.baz` will appear twice in the output (as `foo.bar.baz.t` and also as `t`).
     let nested_patch = ExpressionStructPatchBuilder::new()
-        .with_dropped_field("gone")
-        .with_replaced_field("stub", Expr::literal("replaced").into())
-        .with_inserted_field_after("x", Expr::literal(true).into())
-        .with_inserted_field_after("y", Expr::literal(false).into())
+        .drop("gone")
+        .replace("stub", Expr::literal("replaced").into())
+        .insert_after("x", Expr::literal(true).into())
+        .insert_after("y", Expr::literal(false).into())
         .build()
         .unwrap();
     let top_level_patch = ExpressionStructPatchBuilder::new_nested(column_name!("foo.bar.baz"))
-        .with_dropped_field("dropme")
-        .with_replaced_field("replaceme", Expr::literal(42).into())
-        .with_prepended_field(Expr::literal("prepended").into())
-        .with_inserted_field_after("a", Expr::literal("first").into())
-        .with_inserted_field_after("a", Expr::struct_patch(nested_patch).unwrap().into())
-        .with_inserted_field_after("a", Expr::literal("third").into())
-        .with_appended_field(Expr::literal("appended").into())
+        .drop("dropme")
+        .replace("replaceme", Expr::literal(42).into())
+        .prepend(Expr::literal("prepended").into())
+        .insert_after("a", Expr::literal("first").into())
+        .insert_after("a", Expr::struct_patch(nested_patch).unwrap().into())
+        .insert_after("a", Expr::literal("third").into())
+        .append(Expr::literal("appended").into())
         .build()
         .unwrap();
     let empty_top_level_patch = ExpressionStructPatchBuilder::new().build().unwrap();

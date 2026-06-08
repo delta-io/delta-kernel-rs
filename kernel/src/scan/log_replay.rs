@@ -645,13 +645,13 @@ fn scan_row_schema_with_parsed_columns(
     }
     let mut patch = SchemaStructPatchBuilder::new();
     if let Some(schema) = stats_schema {
-        patch = patch.with_appended_field(StructField::nullable(
+        patch = patch.append(StructField::nullable(
             STATS_PARSED_NAME,
             schema.as_ref().clone(),
         ));
     }
     if let Some(schema) = partition_schema {
-        patch = patch.with_appended_field(StructField::nullable(
+        patch = patch.append(StructField::nullable(
             PARTITION_VALUES_PARSED_NAME,
             schema.as_ref().clone(),
         ));

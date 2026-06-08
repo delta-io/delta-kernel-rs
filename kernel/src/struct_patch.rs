@@ -233,12 +233,12 @@ impl<Item> StructPatchBuilder<Item> {
     }
 
     /// Records a field drop.
-    pub fn with_dropped_field(self, field_name: impl Into<String>) -> Self {
-        self.with_dropped_field_at(TOP_LEVEL, field_name)
+    pub fn drop(self, field_name: impl Into<String>) -> Self {
+        self.drop_at(TOP_LEVEL, field_name)
     }
 
     /// Records a field drop in a nested struct.
-    pub fn with_dropped_field_at(
+    pub fn drop_at(
         self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
@@ -247,12 +247,12 @@ impl<Item> StructPatchBuilder<Item> {
     }
 
     /// Records an optional field drop.
-    pub fn with_dropped_field_if_exists(self, field_name: impl Into<String>) -> Self {
-        self.with_dropped_field_if_exists_at(TOP_LEVEL, field_name)
+    pub fn drop_if_exists(self, field_name: impl Into<String>) -> Self {
+        self.drop_if_exists_at(TOP_LEVEL, field_name)
     }
 
     /// Records an optional field drop in a nested struct.
-    pub fn with_dropped_field_if_exists_at(
+    pub fn drop_if_exists_at(
         self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
@@ -261,12 +261,12 @@ impl<Item> StructPatchBuilder<Item> {
     }
 
     /// Records a field replacement.
-    pub fn with_replaced_field(self, field_name: impl Into<String>, item: Item) -> Self {
-        self.with_replaced_field_at(TOP_LEVEL, field_name, item)
+    pub fn replace(self, field_name: impl Into<String>, item: Item) -> Self {
+        self.replace_at(TOP_LEVEL, field_name, item)
     }
 
     /// Records a field replacement in a nested struct.
-    pub fn with_replaced_field_at(
+    pub fn replace_at(
         self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
@@ -278,16 +278,12 @@ impl<Item> StructPatchBuilder<Item> {
     }
 
     /// Records an item to emit before processing the first input field.
-    pub fn with_prepended_field(self, item: Item) -> Self {
-        self.with_prepended_field_at(TOP_LEVEL, item)
+    pub fn prepend(self, item: Item) -> Self {
+        self.prepend_at(TOP_LEVEL, item)
     }
 
     /// Records an item to emit before processing the first input field of a nested struct.
-    pub fn with_prepended_field_at(
-        self,
-        struct_path: impl CollectInto<ColumnName>,
-        item: Item,
-    ) -> Self {
+    pub fn prepend_at(self, struct_path: impl CollectInto<ColumnName>, item: Item) -> Self {
         self.apply_at(struct_path, |node| {
             node.prepended_fields.push(item);
             Ok(())
@@ -295,12 +291,12 @@ impl<Item> StructPatchBuilder<Item> {
     }
 
     /// Records an item to insert after the named field.
-    pub fn with_inserted_field_after(self, field_name: impl Into<String>, item: Item) -> Self {
-        self.with_inserted_field_after_at(TOP_LEVEL, field_name, item)
+    pub fn insert_after(self, field_name: impl Into<String>, item: Item) -> Self {
+        self.insert_after_at(TOP_LEVEL, field_name, item)
     }
 
     /// Records an item to insert after the named field in a nested struct.
-    pub fn with_inserted_field_after_at(
+    pub fn insert_after_at(
         self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
@@ -310,16 +306,12 @@ impl<Item> StructPatchBuilder<Item> {
     }
 
     /// Records an item to append after all input fields and field-specific insertions.
-    pub fn with_appended_field(self, item: Item) -> Self {
-        self.with_appended_field_at(TOP_LEVEL, item)
+    pub fn append(self, item: Item) -> Self {
+        self.append_at(TOP_LEVEL, item)
     }
 
     /// Records an item to append after all fields of a nested struct.
-    pub fn with_appended_field_at(
-        self,
-        struct_path: impl CollectInto<ColumnName>,
-        item: Item,
-    ) -> Self {
+    pub fn append_at(self, struct_path: impl CollectInto<ColumnName>, item: Item) -> Self {
         self.apply_at(struct_path, |node| {
             node.appended_fields.push(item);
             Ok(())
@@ -633,10 +625,10 @@ mod tests {
     #[test]
     fn struct_patch_builder_lowers_nested_paths_to_raw_patches() {
         let patch = ExpressionStructPatchBuilder::new()
-            .with_dropped_field_at(["add"], "gone")
-            .with_replaced_field_at(["add"], "stub", Arc::new(Expr::literal("replaced")))
-            .with_inserted_field_after_at(["add"], "x", Arc::new(Expr::literal(true)))
-            .with_inserted_field_after("add", Arc::new(Expr::literal("after_add")))
+            .drop_at(["add"], "gone")
+            .replace_at(["add"], "stub", Arc::new(Expr::literal("replaced")))
+            .insert_after_at(["add"], "x", Arc::new(Expr::literal(true)))
+            .insert_after("add", Arc::new(Expr::literal("after_add")))
             .build()
             .unwrap();
 
@@ -706,8 +698,8 @@ mod tests {
     #[test]
     fn struct_patch_builder_rejects_destructive_overlaps() {
         let result = ExpressionStructPatchBuilder::new()
-            .with_dropped_field("a")
-            .with_replaced_field("a", Arc::new(Expr::literal(1)))
+            .drop("a")
+            .replace("a", Arc::new(Expr::literal(1)))
             .build();
         assert!(result
             .unwrap_err()
@@ -715,8 +707,8 @@ mod tests {
             .contains("multiple input field actions"));
 
         let result = ExpressionStructPatchBuilder::new()
-            .with_replaced_field("a", Arc::new(Expr::literal(1)))
-            .with_dropped_field("a")
+            .replace("a", Arc::new(Expr::literal(1)))
+            .drop("a")
             .build();
         assert!(result
             .unwrap_err()
@@ -724,14 +716,14 @@ mod tests {
             .contains("multiple input field actions"));
 
         let result = ExpressionStructPatchBuilder::new()
-            .with_dropped_field("add")
-            .with_inserted_field_after_at(["add"], "x", Arc::new(Expr::literal(true)))
+            .drop("add")
+            .insert_after_at(["add"], "x", Arc::new(Expr::literal(true)))
             .build();
         assert!(result.unwrap_err().to_string().contains("nested fields"));
 
         let result = ExpressionStructPatchBuilder::new()
-            .with_replaced_field_at(["add"], "x", Arc::new(Expr::literal("one")))
-            .with_dropped_field_at(["add"], "x")
+            .replace_at(["add"], "x", Arc::new(Expr::literal("one")))
+            .drop_at(["add"], "x")
             .build();
         assert!(result
             .unwrap_err()
@@ -769,7 +761,7 @@ mod tests {
     fn schema_build_empty_nested_path_patches_top_level_schema() {
         let input_schema = schema(&["a", "b"]);
         let output_schema = SchemaStructPatchBuilder::new_nested(Vec::<String>::new())
-            .with_inserted_field_after("a", field("after_a"))
+            .insert_after("a", field("after_a"))
             .build(&input_schema)
             .unwrap();
 
@@ -780,8 +772,8 @@ mod tests {
     fn schema_build_inserts_fields_before_and_after_input_fields() {
         let input_schema = schema(&["a", "b"]);
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_prepended_field(field("prepended"))
-            .with_inserted_field_after("a", field("after_a"))
+            .prepend(field("prepended"))
+            .insert_after("a", field("after_a"))
             .build(&input_schema)
             .unwrap();
 
@@ -795,8 +787,8 @@ mod tests {
     fn schema_build_appends_fields_after_all_input_fields() {
         let input_schema = schema(&["a", "b"]);
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_appended_field(field("appended_1"))
-            .with_appended_field(field("appended_2"))
+            .append(field("appended_1"))
+            .append(field("appended_2"))
             .build(&input_schema)
             .unwrap();
 
@@ -810,7 +802,7 @@ mod tests {
     fn schema_build_appends_to_empty_input_schema() {
         let input_schema = StructType::new_unchecked(Vec::<StructField>::new());
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_appended_field(field("only"))
+            .append(field("only"))
             .build(&input_schema)
             .unwrap();
 
@@ -821,7 +813,7 @@ mod tests {
     fn schema_build_replaces_field_at_input_position() {
         let input_schema = schema(&["a", "b", "c"]);
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_replaced_field("b", field("bb"))
+            .replace("b", field("bb"))
             .build(&input_schema)
             .unwrap();
 
@@ -832,7 +824,7 @@ mod tests {
     fn schema_build_drops_field() {
         let input_schema = schema(&["a", "b", "c"]);
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_dropped_field("b")
+            .drop("b")
             .build(&input_schema)
             .unwrap();
 
@@ -847,7 +839,7 @@ mod tests {
             field("top"),
         ]);
         let output_schema = SchemaStructPatchBuilder::new_nested(["nested"])
-            .with_inserted_field_after("nested_a", field("nested_inserted"))
+            .insert_after("nested_a", field("nested_inserted"))
             .build(&input_schema)
             .unwrap();
 
@@ -865,7 +857,7 @@ mod tests {
             field("top"),
         ]);
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_inserted_field_after_at(["nested"], "nested_a", field("nested_inserted"))
+            .insert_after_at(["nested"], "nested_a", field("nested_inserted"))
             .build(&input_schema)
             .unwrap();
 
@@ -883,7 +875,7 @@ mod tests {
     fn schema_build_optional_missing_drop_is_ignored() {
         let input_schema = schema(&["a", "b"]);
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_dropped_field_if_exists("missing")
+            .drop_if_exists("missing")
             .build(&input_schema)
             .unwrap();
 
@@ -894,7 +886,7 @@ mod tests {
     fn schema_build_required_missing_field_returns_error() {
         let input_schema = schema(&["a", "b"]);
         let result = SchemaStructPatchBuilder::new()
-            .with_dropped_field("missing")
+            .drop("missing")
             .build(&input_schema);
 
         assert_result_error_with_message(result, "Field to patch does not exist: missing");
@@ -904,8 +896,8 @@ mod tests {
     fn schema_build_required_missing_field_errors_even_when_optional_patch_matches() {
         let input_schema = schema(&["a", "b"]);
         let result = SchemaStructPatchBuilder::new()
-            .with_dropped_field_if_exists("a")
-            .with_dropped_field("missing")
+            .drop_if_exists("a")
+            .drop("missing")
             .build(&input_schema);
 
         assert_result_error_with_message(result, "Field to patch does not exist: missing");
@@ -915,11 +907,11 @@ mod tests {
     fn schema_build_preserves_patch_ordering() {
         let input_schema = schema(&["a", "b", "c"]);
         let output_schema = SchemaStructPatchBuilder::new()
-            .with_prepended_field(field("prepended"))
-            .with_inserted_field_after("a", field("after_a"))
-            .with_replaced_field("b", field("bb"))
-            .with_dropped_field("c")
-            .with_appended_field(field("appended"))
+            .prepend(field("prepended"))
+            .insert_after("a", field("after_a"))
+            .replace("b", field("bb"))
+            .drop("c")
+            .append(field("appended"))
             .build(&input_schema)
             .unwrap();
 

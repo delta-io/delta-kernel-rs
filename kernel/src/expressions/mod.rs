@@ -1404,28 +1404,25 @@ mod tests {
                 // Identity transform
                 Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
                 // Drop field
-                Expression::struct_patch(
-                    ExpressionStructPatchBuilder::new().with_dropped_field("old_column"),
-                )
-                .unwrap(),
+                Expression::struct_patch(ExpressionStructPatchBuilder::new().drop("old_column"))
+                    .unwrap(),
                 // Replace field
                 Expression::struct_patch(
                     ExpressionStructPatchBuilder::new()
-                        .with_replaced_field("original", Arc::new(Expression::literal(0))),
+                        .replace("original", Arc::new(Expression::literal(0))),
                 )
                 .unwrap(),
                 // Insert fields
                 Expression::struct_patch(
                     ExpressionStructPatchBuilder::new()
-                        .with_inserted_field_after("after_col", Arc::new(column_expr!("new_col")))
-                        .with_prepended_field(Arc::new(Expression::literal("prepended")))
-                        .with_appended_field(Arc::new(Expression::literal("appended"))),
+                        .insert_after("after_col", Arc::new(column_expr!("new_col")))
+                        .prepend(Arc::new(Expression::literal("prepended")))
+                        .append(Arc::new(Expression::literal("appended"))),
                 )
                 .unwrap(),
                 // Nested transform
                 Expression::struct_patch(
-                    ExpressionStructPatchBuilder::new_nested(["parent", "child"])
-                        .with_dropped_field("to_drop"),
+                    ExpressionStructPatchBuilder::new_nested(["parent", "child"]).drop("to_drop"),
                 )
                 .unwrap(),
             ];

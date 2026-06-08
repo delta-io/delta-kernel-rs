@@ -497,13 +497,13 @@ impl<S> Transaction<S> {
         // schema fields.
         let with_new_dv_expr = Expression::struct_patch(
             ExpressionStructPatchBuilder::new()
-                .with_replaced_field(
+                .replace(
                     "deletionVector",
                     Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
                 )
-                .with_replaced_field("stats", Expression::column([NEW_STATS_NAME]).into())
-                .with_dropped_field(NEW_DELETION_VECTOR_NAME)
-                .with_dropped_field(NEW_STATS_NAME),
+                .replace("stats", Expression::column([NEW_STATS_NAME]).into())
+                .drop(NEW_DELETION_VECTOR_NAME)
+                .drop(NEW_STATS_NAME),
         )?;
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
@@ -516,7 +516,7 @@ impl<S> Transaction<S> {
             nullable_restored_add_schema().clone().into(),
         )?;
         let with_data_change_patch = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new_nested(["add"]).with_inserted_field_after(
+            ExpressionStructPatchBuilder::new_nested(["add"]).insert_after(
                 "modificationTime",
                 Expression::literal(self.data_change).into(),
             ),

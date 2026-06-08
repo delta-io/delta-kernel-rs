@@ -135,7 +135,7 @@ pub(crate) fn get_transform_expr(
             StaticInsert { insert_after, expr } => {
                 apply_insert_after(patch, insert_after, expr.clone())
             }
-            StaticDrop { field_name } => patch.with_dropped_field(field_name.clone()),
+            StaticDrop { field_name } => patch.drop(field_name.clone()),
             GenerateRowId {
                 field_name,
                 row_index_field_name,
@@ -147,7 +147,7 @@ pub(crate) fn get_transform_expr(
                     col!(field_name),
                     lit(base_row_id) + col!(row_index_field_name),
                 ]));
-                patch.with_replaced_field(field_name.clone(), expr)
+                patch.replace(field_name.clone(), expr)
             }
             MetadataDerivedColumn {
                 field_index,
@@ -174,7 +174,7 @@ pub(crate) fn get_transform_expr(
                     // Column exists physically - reorder it via drop+insert
                     // This ensures consistent column ordering across file types
                     apply_insert_after(
-                        patch.with_dropped_field(physical_name),
+                        patch.drop(physical_name),
                         insert_after,
                         Arc::new(col!(physical_name)),
                     )
@@ -203,8 +203,8 @@ fn apply_insert_after(
     expr: ExpressionRef,
 ) -> ExpressionStructPatchBuilder {
     match insert_after {
-        Some(predecessor) => patch.with_inserted_field_after(predecessor, expr),
-        None => patch.with_prepended_field(expr),
+        Some(predecessor) => patch.insert_after(predecessor, expr),
+        None => patch.prepend(expr),
     }
 }
 

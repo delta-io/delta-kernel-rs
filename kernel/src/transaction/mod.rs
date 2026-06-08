@@ -170,8 +170,8 @@ fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
 /// Note that this method is only useful to extend an Add action schema.
 fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
     let patch = SchemaStructPatchBuilder::new()
-        .with_appended_field(StructField::nullable("baseRowId", DataType::LONG))
-        .with_appended_field(StructField::nullable(
+        .append(StructField::nullable("baseRowId", DataType::LONG))
+        .append(StructField::nullable(
             "defaultRowCommitVersion",
             DataType::LONG,
         ));
@@ -314,11 +314,8 @@ where
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
             ExpressionStructPatchBuilder::new()
-                .with_inserted_field_after(
-                    "modificationTime",
-                    Expression::literal(data_change).into(),
-                )
-                .with_replaced_field(
+                .insert_after("modificationTime", Expression::literal(data_change).into())
+                .replace(
                     "stats",
                     Expression::unary(ToJson, Expression::column(["stats"])).into(),
                 ),
@@ -957,7 +954,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let mut patch = ExpressionStructPatchBuilder::new();
         if !should_materialize_partition_columns {
             for col in self.effective_table_config.partition_columns() {
-                patch = patch.with_dropped_field_if_exists(col);
+                patch = patch.drop_if_exists(col);
             }
         }
         let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema());
@@ -1484,12 +1481,12 @@ fn build_remove_struct_patch(
 ) -> DeltaResult<ExpressionStructPatch> {
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
-        .with_inserted_field_after("path", Expression::literal(commit_timestamp).into())
+        .insert_after("path", Expression::literal(commit_timestamp).into())
         // dataChange
-        .with_inserted_field_after("path", Expression::literal(data_change).into())
+        .insert_after("path", Expression::literal(data_change).into())
         // extended_file_metadata
-        .with_inserted_field_after("path", Expression::literal(true).into())
-        .with_inserted_field_after(
+        .insert_after("path", Expression::literal(true).into())
+        .insert_after(
             "path",
             Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
         );
@@ -1501,30 +1498,30 @@ fn build_remove_struct_patch(
             Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
         ]);
         patch = patch
-            .with_replaced_field("stats", coalesce_stats.into())
-            .with_dropped_field(STATS_PARSED_NAME);
+            .replace("stats", coalesce_stats.into())
+            .drop(STATS_PARSED_NAME);
     }
 
     patch = patch
-        .with_inserted_field_after(
+        .insert_after(
             "stats",
             Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
         )
-        .with_inserted_field_after(
+        .insert_after(
             "deletionVector",
             Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
         )
-        .with_inserted_field_after(
+        .insert_after(
             "deletionVector",
             Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
         )
-        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-        .with_dropped_field("modificationTime")
+        .drop(FILE_CONSTANT_VALUES_NAME)
+        .drop("modificationTime")
         // Added to scan output when the predicate touches a partition column.
-        .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
+        .drop_if_exists(PARTITION_VALUES_PARSED_NAME);
 
     for column_to_drop in columns_to_drop {
-        patch = patch.with_dropped_field(*column_to_drop);
+        patch = patch.drop(*column_to_drop);
     }
 
     patch.build()

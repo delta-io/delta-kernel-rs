@@ -742,7 +742,7 @@ impl CheckpointWriter {
         )?);
 
         // Use a struct patch to set just the checkpointMetadata field, keeping others null
-        let patch = ExpressionStructPatchBuilder::new().with_replaced_field(
+        let patch = ExpressionStructPatchBuilder::new().replace(
             CHECKPOINT_METADATA_NAME,
             Arc::new(Expression::literal(checkpoint_metadata_value)),
         );
