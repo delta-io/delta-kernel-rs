@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use super::Crc;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
@@ -17,8 +17,8 @@ use crate::{DeltaResult, Engine, Error};
 /// missing required fields). The caller should handle errors gracefully by falling back to log
 /// replay.
 ///
-/// Reports metrics: `CrcReadCompleted`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, skip_all, fields(report, bytes_read))]
+/// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
+#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, bytes_read, path = ?crc_path.location.location))]
 pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
@@ -30,24 +30,15 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
     Crc::try_from_json_bytes(&data, crc_path.version)
 }
 
-/// Read a CRC file, returning `None` and logging a `warn` if it cannot be read.
+/// Read a CRC file, returning `None` if it cannot be read.
 ///
 /// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
-/// it.
+/// it. The failure is logged and metered by [`try_read_crc_file`]'s instrumentation.
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
 ) -> Option<Arc<Crc>> {
-    match try_read_crc_file(engine, crc_file) {
-        Ok(crc) => Some(Arc::new(crc)),
-        Err(e) => {
-            warn!(
-                "Failed to read CRC file {:?}: {e}.",
-                crc_file.location.location
-            );
-            None
-        }
-    }
+    try_read_crc_file(engine, crc_file).ok().map(Arc::new)
 }
 
 #[cfg(test)]
@@ -174,18 +165,17 @@ mod tests {
         assert!(crc.num_deletion_vectors_opt.is_none());
         assert!(crc.deleted_record_counts_histogram_opt.is_none());
 
-        // Verify CrcReadCompleted metric was emitted
         let crc_events: Vec<_> = reporter
             .events()
             .into_iter()
-            .filter(|e| matches!(e, MetricEvent::CrcReadCompleted(_)))
+            .filter(|e| matches!(e, MetricEvent::CrcReadSuccess(_)))
             .collect();
         assert_eq!(crc_events.len(), 1);
-        assert!(matches!(&crc_events[0], MetricEvent::CrcReadCompleted(e) if e.bytes_read > 0));
+        assert!(matches!(&crc_events[0], MetricEvent::CrcReadSuccess(e) if e.bytes_read > 0));
     }
 
     #[test]
-    fn test_read_malformed_crc_file_emits_metric_then_fails() {
+    fn test_read_malformed_crc_file_emits_failure_metric() {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
@@ -195,13 +185,18 @@ mod tests {
 
         assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "expected value");
 
-        // CrcReadCompleted is emitted after storage read, even when JSON parse fails
-        let crc_events: Vec<_> = reporter
-            .events()
-            .into_iter()
-            .filter(|e| matches!(e, MetricEvent::CrcReadCompleted(_)))
-            .collect();
-        assert_eq!(crc_events.len(), 1);
-        assert!(matches!(&crc_events[0], MetricEvent::CrcReadCompleted(e) if e.bytes_read > 0));
+        let events = reporter.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::CrcReadFailure)),
+            "expected CrcReadFailure when JSON parse fails"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::CrcReadSuccess(_))),
+            "should not emit CrcReadSuccess when JSON parse fails"
+        );
     }
 }
