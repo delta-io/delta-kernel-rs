@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ::test_utils::get_column;
 use bytes::Bytes;
 use rstest::rstest;
 
@@ -30,18 +31,6 @@ use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
     FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
 };
-
-/// Helper macro to extract a typed column from a RecordBatch or StructArray.
-macro_rules! get_column {
-    ($source:expr, $name:expr, $ty:ty) => {
-        $source
-            .column_by_name($name)
-            .unwrap_or_else(|| panic!("should have column '{}'", $name))
-            .as_any()
-            .downcast_ref::<$ty>()
-            .unwrap_or_else(|| panic!("column '{}' should be {}", $name, stringify!($ty)))
-    };
-}
 
 fn field_names(s: &StructArray) -> Vec<String> {
     s.fields().iter().map(|f| f.name().clone()).collect()
