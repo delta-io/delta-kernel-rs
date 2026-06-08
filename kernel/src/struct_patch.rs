@@ -261,7 +261,7 @@ impl<Item> StructPatchBuilder<Item> {
     }
 
     /// Records a field replacement.
-    pub fn replace(self, field_name: impl Into<String>, item: Item) -> Self {
+    pub fn replace(self, field_name: impl Into<String>, item: impl Into<Item>) -> Self {
         self.replace_at(TOP_LEVEL, field_name, item)
     }
 
@@ -270,28 +270,32 @@ impl<Item> StructPatchBuilder<Item> {
         self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
-        item: Item,
+        item: impl Into<Item>,
     ) -> Self {
         self.apply_at(struct_path, |node| {
-            node.set_action(field_name, FieldPatchOp::Replace(item))
+            node.set_action(field_name, FieldPatchOp::Replace(item.into()))
         })
     }
 
     /// Records an item to emit before processing the first input field.
-    pub fn prepend(self, item: Item) -> Self {
+    pub fn prepend(self, item: impl Into<Item>) -> Self {
         self.prepend_at(TOP_LEVEL, item)
     }
 
     /// Records an item to emit before processing the first input field of a nested struct.
-    pub fn prepend_at(self, struct_path: impl CollectInto<ColumnName>, item: Item) -> Self {
+    pub fn prepend_at(
+        self,
+        struct_path: impl CollectInto<ColumnName>,
+        item: impl Into<Item>,
+    ) -> Self {
         self.apply_at(struct_path, |node| {
-            node.prepended_fields.push(item);
+            node.prepended_fields.push(item.into());
             Ok(())
         })
     }
 
     /// Records an item to insert after the named field.
-    pub fn insert_after(self, field_name: impl Into<String>, item: Item) -> Self {
+    pub fn insert_after(self, field_name: impl Into<String>, item: impl Into<Item>) -> Self {
         self.insert_after_at(TOP_LEVEL, field_name, item)
     }
 
@@ -300,20 +304,26 @@ impl<Item> StructPatchBuilder<Item> {
         self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
-        item: Item,
+        item: impl Into<Item>,
     ) -> Self {
-        self.apply_at(struct_path, |node| node.insert_after(field_name, item))
+        self.apply_at(struct_path, |node| {
+            node.insert_after(field_name, item.into())
+        })
     }
 
     /// Records an item to append after all input fields and field-specific insertions.
-    pub fn append(self, item: Item) -> Self {
+    pub fn append(self, item: impl Into<Item>) -> Self {
         self.append_at(TOP_LEVEL, item)
     }
 
     /// Records an item to append after all fields of a nested struct.
-    pub fn append_at(self, struct_path: impl CollectInto<ColumnName>, item: Item) -> Self {
+    pub fn append_at(
+        self,
+        struct_path: impl CollectInto<ColumnName>,
+        item: impl Into<Item>,
+    ) -> Self {
         self.apply_at(struct_path, |node| {
-            node.appended_fields.push(item);
+            node.appended_fields.push(item.into());
             Ok(())
         })
     }
@@ -337,7 +347,11 @@ impl<Item> StructPatchBuilder<Item> {
 
 impl<Item> StructPatchNode<Item> {
     /// Records an item to insert immediately after the named input field.
-    fn insert_after(&mut self, field_name: impl Into<String>, item: Item) -> DeltaResult<()> {
+    fn insert_after(
+        &mut self,
+        field_name: impl Into<String>,
+        item: impl Into<Item>,
+    ) -> DeltaResult<()> {
         let entry = self.field_state_mut(field_name.into(), |field_name, entry| {
             if entry.action.is_optional_drop() {
                 return Err(Error::generic(format!(
@@ -346,7 +360,7 @@ impl<Item> StructPatchNode<Item> {
             }
             Ok(())
         })?;
-        entry.insert_after.push(item);
+        entry.insert_after.push(item.into());
         Ok(())
     }
 
@@ -618,7 +632,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{FieldPatchNode, FieldPatchOp, StructPatchNode};
-    use crate::expressions::{Expression as Expr, ExpressionStructPatchBuilder};
+    use crate::expressions::{lit, Expression as Expr, ExpressionStructPatchBuilder};
     use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
@@ -626,9 +640,9 @@ mod tests {
     fn struct_patch_builder_lowers_nested_paths_to_raw_patches() {
         let patch = ExpressionStructPatchBuilder::new()
             .drop_at(["add"], "gone")
-            .replace_at(["add"], "stub", Arc::new(Expr::literal("replaced")))
-            .insert_after_at(["add"], "x", Arc::new(Expr::literal(true)))
-            .insert_after("add", Arc::new(Expr::literal("after_add")))
+            .replace_at(["add"], "stub", lit("replaced"))
+            .insert_after_at(["add"], "x", lit(true))
+            .insert_after("add", lit("after_add"))
             .build()
             .unwrap();
 
@@ -650,16 +664,13 @@ mod tests {
 
         let stub = inner.field_patches.get("stub").unwrap();
         assert!(!stub.keep_input);
-        assert_eq!(stub.insertions, vec![Arc::new(Expr::literal("replaced"))]);
+        assert_eq!(stub.insertions, vec![Arc::new(lit("replaced"))]);
 
         let x = inner.field_patches.get("x").unwrap();
         assert!(x.keep_input);
-        assert_eq!(x.insertions, vec![Arc::new(Expr::literal(true))]);
+        assert_eq!(x.insertions, vec![Arc::new(lit(true))]);
 
-        assert_eq!(
-            add_patch.insertions[1],
-            Arc::new(Expr::literal("after_add"))
-        );
+        assert_eq!(add_patch.insertions[1], Arc::new(lit("after_add")));
     }
 
     #[test]
@@ -699,7 +710,7 @@ mod tests {
     fn struct_patch_builder_rejects_destructive_overlaps() {
         let result = ExpressionStructPatchBuilder::new()
             .drop("a")
-            .replace("a", Arc::new(Expr::literal(1)))
+            .replace("a", lit(1))
             .build();
         assert!(result
             .unwrap_err()
@@ -707,7 +718,7 @@ mod tests {
             .contains("multiple input field actions"));
 
         let result = ExpressionStructPatchBuilder::new()
-            .replace("a", Arc::new(Expr::literal(1)))
+            .replace("a", lit(1))
             .drop("a")
             .build();
         assert!(result
@@ -717,12 +728,12 @@ mod tests {
 
         let result = ExpressionStructPatchBuilder::new()
             .drop("add")
-            .insert_after_at(["add"], "x", Arc::new(Expr::literal(true)))
+            .insert_after_at(["add"], "x", lit(true))
             .build();
         assert!(result.unwrap_err().to_string().contains("nested fields"));
 
         let result = ExpressionStructPatchBuilder::new()
-            .replace_at(["add"], "x", Arc::new(Expr::literal("one")))
+            .replace_at(["add"], "x", lit("one"))
             .drop_at(["add"], "x")
             .build();
         assert!(result

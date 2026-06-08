@@ -1038,7 +1038,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr,
+        col, column_expr, column_expr_ref, lit, BinaryExpressionOp, Expression as Expr,
         ExpressionStructPatchBuilder,
     };
     use crate::schema::{DataType, StructField, StructType};
@@ -1171,15 +1171,15 @@ mod tests {
         let batch = create_test_batch();
 
         let patch = ExpressionStructPatchBuilder::new()
-            .replace("a", column_expr_ref!("b"))
+            .replace("a", col!("b"))
             .drop("b")
-            .prepend(Expr::literal(1).into())
-            .prepend(Expr::literal(2).into())
-            .prepend(column_expr_ref!("c"))
-            .insert_after("c", Expr::literal(42).into())
-            .insert_after("c", column_expr_ref!("a"))
-            .insert_after("c", Expr::literal(99).into())
-            .append(Expr::literal(7).into())
+            .prepend(lit(1))
+            .prepend(lit(2))
+            .prepend(col!("c"))
+            .insert_after("c", lit(42))
+            .insert_after("c", col!("a"))
+            .insert_after("c", lit(99))
+            .append(lit(7))
             .build()
             .unwrap();
 
@@ -1228,8 +1228,8 @@ mod tests {
         let batch = create_test_batch();
 
         let patch = ExpressionStructPatchBuilder::new()
-            .insert_after("a", Expr::literal(42).into())
-            .replace("a", column_expr_ref!("b"))
+            .insert_after("a", lit(42))
+            .replace("a", col!("b"))
             .build()
             .unwrap();
 
@@ -1295,8 +1295,8 @@ mod tests {
 
         // Test 2: Modify nested struct and relocate it
         let modify_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
-            .replace("x".to_string(), Expr::literal(777).into())
-            .insert_after("y", Expr::literal(555).into())
+            .replace("x", lit(777))
+            .insert_after("y", lit(555))
             .build()
             .unwrap();
 
@@ -1337,7 +1337,7 @@ mod tests {
 
         // Test unused replacement keys
         let patch = ExpressionStructPatchBuilder::new()
-            .replace("missing", Expr::literal(1).into())
+            .replace("missing", lit(1))
             .build()
             .unwrap();
         let output_schema = StructType::new_unchecked(vec![
@@ -1356,7 +1356,7 @@ mod tests {
 
         // Test unused insertion keys
         let insertion_patch = ExpressionStructPatchBuilder::new()
-            .insert_after("nonexistent", Expr::literal(1).into())
+            .insert_after("nonexistent", lit(1))
             .build()
             .unwrap();
 
@@ -1429,7 +1429,7 @@ mod tests {
         ]);
 
         let patch = ExpressionStructPatchBuilder::new()
-            .replace("a", Expr::literal(1).into())
+            .replace("a", lit(1))
             .build()
             .unwrap();
         let expr = Expr::StructPatch(patch);
@@ -1765,12 +1765,12 @@ mod tests {
 
         // Simple nested patch - replace a field in the nested struct
         let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
-            .replace("x", Expr::literal(999).into())
+            .replace("x", lit(999))
             .build()
             .unwrap();
 
         let outer_patch = ExpressionStructPatchBuilder::new()
-            .insert_after("a", Expr::StructPatch(nested_patch).into())
+            .insert_after("a", Expr::StructPatch(nested_patch))
             .build()
             .unwrap();
 

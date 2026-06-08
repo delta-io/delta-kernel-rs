@@ -21,7 +21,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
+    col, lit, ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
 };
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
@@ -314,11 +314,8 @@ where
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
             ExpressionStructPatchBuilder::new()
-                .insert_after("modificationTime", Expression::literal(data_change).into())
-                .replace(
-                    "stats",
-                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                ),
+                .insert_after("modificationTime", lit(data_change))
+                .replace("stats", Expression::unary(ToJson, col!("stats"))),
         )?;
         let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
@@ -1481,39 +1478,33 @@ fn build_remove_struct_patch(
 ) -> DeltaResult<ExpressionStructPatch> {
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
-        .insert_after("path", Expression::literal(commit_timestamp).into())
+        .insert_after("path", lit(commit_timestamp))
         // dataChange
-        .insert_after("path", Expression::literal(data_change).into())
+        .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .insert_after("path", Expression::literal(true).into())
-        .insert_after(
-            "path",
-            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
-        );
+        .insert_after("path", lit(true))
+        .insert_after("path", col!(FILE_CONSTANT_VALUES_NAME, "partitionValues"));
 
     if coalesce_stats_with_parsed {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             Expression::column(["stats"]),
-            Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
+            Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch
-            .replace("stats", coalesce_stats.into())
+            .replace("stats", coalesce_stats)
             .drop(STATS_PARSED_NAME);
     }
 
     patch = patch
+        .insert_after("stats", col!(FILE_CONSTANT_VALUES_NAME, TAGS_NAME))
         .insert_after(
-            "stats",
-            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+            "deletionVector",
+            col!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME),
         )
         .insert_after(
             "deletionVector",
-            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
-        )
-        .insert_after(
-            "deletionVector",
-            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
+            col!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME),
         )
         .drop(FILE_CONSTANT_VALUES_NAME)
         .drop("modificationTime")

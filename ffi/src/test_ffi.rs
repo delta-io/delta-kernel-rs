@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use delta_kernel::expressions::{
-    column_expr, column_name, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
+    column_expr, column_name, column_pred, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
     Expression as Expr, ExpressionStructPatchBuilder, MapData, OpaqueExpressionOp,
     OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData,
 };
@@ -114,19 +114,19 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     // `t` of `foo.bar.baz` will appear twice in the output (as `foo.bar.baz.t` and also as `t`).
     let nested_patch = ExpressionStructPatchBuilder::new()
         .drop("gone")
-        .replace("stub", Expr::literal("replaced").into())
-        .insert_after("x", Expr::literal(true).into())
-        .insert_after("y", Expr::literal(false).into())
+        .replace("stub", lit("replaced"))
+        .insert_after("x", lit(true))
+        .insert_after("y", lit(false))
         .build()
         .unwrap();
     let top_level_patch = ExpressionStructPatchBuilder::new_nested(column_name!("foo.bar.baz"))
         .drop("dropme")
-        .replace("replaceme", Expr::literal(42).into())
-        .prepend(Expr::literal("prepended").into())
-        .insert_after("a", Expr::literal("first").into())
-        .insert_after("a", Expr::struct_patch(nested_patch).unwrap().into())
-        .insert_after("a", Expr::literal("third").into())
-        .append(Expr::literal("appended").into())
+        .replace("replaceme", lit(42))
+        .prepend(lit("prepended"))
+        .insert_after("a", lit("first"))
+        .insert_after("a", Expr::struct_patch(nested_patch).unwrap())
+        .insert_after("a", lit("third"))
+        .append(lit("appended"))
         .build()
         .unwrap();
     let empty_top_level_patch = ExpressionStructPatchBuilder::new().build().unwrap();

@@ -1211,7 +1211,7 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+            col, column_expr, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
             Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
@@ -1408,16 +1408,15 @@ mod tests {
                     .unwrap(),
                 // Replace field
                 Expression::struct_patch(
-                    ExpressionStructPatchBuilder::new()
-                        .replace("original", Arc::new(Expression::literal(0))),
+                    ExpressionStructPatchBuilder::new().replace("original", lit(0)),
                 )
                 .unwrap(),
                 // Insert fields
                 Expression::struct_patch(
                     ExpressionStructPatchBuilder::new()
-                        .insert_after("after_col", Arc::new(column_expr!("new_col")))
-                        .prepend(Arc::new(Expression::literal("prepended")))
-                        .append(Arc::new(Expression::literal("appended"))),
+                        .insert_after("after_col", col!("new_col"))
+                        .prepend(lit("prepended"))
+                        .append(lit("appended")),
                 )
                 .unwrap(),
                 // Nested transform
