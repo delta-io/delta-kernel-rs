@@ -11,7 +11,7 @@ use crate::plans::result::{
     engine_error_to_kernel, CParquetFooter, CPlanResult, CPlanResultWrapper, PlanResultCleanup,
 };
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
-use crate::{KernelBytesSlice, NullableCvoid};
+use crate::{kernel_bytes_slice, KernelBytesSlice, NullableCvoid};
 
 /// A shared (`Arc`-like) handle to an [`PlanExecutor`].
 #[handle_descriptor(target=dyn PlanExecutor, mutable=false)]
@@ -55,7 +55,7 @@ impl PlanExecutor for FfiPlanExecutor {
     fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
         // TODO: serialize `_op` to bytes once proto schema is checked in.
         let plan_proto_bytes: &[u8] = &[];
-        let plan_proto_slice = unsafe { KernelBytesSlice::new_unsafe(plan_proto_bytes) };
+        let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
         let result_wrapper = (self.callback)(self.context, plan_proto_slice);
 

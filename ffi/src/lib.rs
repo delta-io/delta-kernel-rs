@@ -209,6 +209,23 @@ macro_rules! kernel_string_slice {
 }
 pub(crate) use kernel_string_slice;
 
+/// Similar to [`kernel_string_slice!`](kernel_string_slice), this macro provides a safer way to
+/// construct a KernelBytesSlice.
+///
+/// Refer to [`kernel_string_slice!`](kernel_string_slice) for safety and implementation
+/// notes.
+#[cfg(feature = "declarative-plans")]
+macro_rules! kernel_bytes_slice {
+    ( $source:ident ) => {{
+        fn do_it(b: &[u8]) -> $crate::KernelBytesSlice {
+            unsafe { $crate::KernelBytesSlice::new_unsafe(b) }
+        }
+        do_it(&$source)
+    }};
+}
+#[cfg(feature = "declarative-plans")]
+pub(crate) use kernel_bytes_slice;
+
 trait TryFromStringSlice<'a>: Sized {
     unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;
 }
