@@ -21,6 +21,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
 use itertools::Itertools;
@@ -379,6 +380,7 @@ pub(crate) fn timestamp_to_version(
     engine: &dyn Engine,
     timestamp: Timestamp,
     bound: Bound,
+    return_commit_type: HistoryCommitType,
 ) -> Result<CommitAt, LogHistoryError> {
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
@@ -420,6 +422,19 @@ pub(crate) fn timestamp_to_version(
         ));
     }
 
+    let start_version: Option<Version> = match return_commit_type {
+        HistoryCommitType::Published => None,
+        HistoryCommitType::Recreatable => Some(
+            get_earliest_commit(
+                engine,
+                &snapshot.log_segment().log_root,
+                None,
+                HistoryCommitType::Recreatable,
+            )
+            .map_err(|e| LogHistoryError::internal("failed to get earliest commit", e))?,
+        ),
+    };
+
     // Build a dedicated log segment for timestamp conversion. We cannot reuse
     // snapshot.log_segment() because it may include a checkpoint prefix with gaps in
     // the commit sequence. for_timestamp_conversion returns only contiguous commits,
@@ -428,7 +443,10 @@ pub(crate) fn timestamp_to_version(
         engine.storage_handler().as_ref(),
         snapshot.log_segment().log_root.clone(),
         snapshot.version(),
-        None,
+        start_version
+            .map(|v| snapshot.version() - v + 1)
+            .and_then(|count| usize::try_from(count).ok())
+            .and_then(NonZero::new),
     )
     .map_err(|e| {
         LogHistoryError::internal("failed to build log segment for timestamp conversion", e)
@@ -473,6 +491,16 @@ pub(crate) fn timestamp_to_version(
 
 /// Gets the latest [`CommitAt`] (version and timestamp) with a timestamp at or before `timestamp`.
 ///
+/// # Parameters
+/// - `snapshot`: defines the searchable version range (typically the latest snapshot).
+/// - `engine`: used to access version history.
+/// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
+/// - `result_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
+///   searches all published commits, while [`CommitType::Recreatable`] restricts the result to
+///   versions the table can be reconstructed from (commit 0 or the earliest complete checkpoint),
+///   guaranteeing the returned version is loadable via time travel.
+///
+/// # Errors
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or before
 /// the given timestamp.
 ///
@@ -480,26 +508,44 @@ pub(crate) fn timestamp_to_version(
 /// ```ignore
 /// use delta_kernel::snapshot::Snapshot;
 /// use test_utils::delta_kernel_default_engine::DefaultEngine;
-/// use delta_kernel::history_manager::latest_version_as_of;
+/// use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
 ///
 /// let engine = DefaultEngine::try_new(...)?;
 /// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
 ///
 /// // Get the latest commit as of January 1, 2023
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
-/// let commit = latest_version_as_of(&snapshot, &engine, timestamp)?;
+/// let commit = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
 #[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
+    result_commit_type: HistoryCommitType,
 ) -> DeltaResult<CommitAt> {
-    timestamp_to_version(snapshot, engine, timestamp, Bound::GreatestLower).map_err(Into::into)
+    timestamp_to_version(
+        snapshot,
+        engine,
+        timestamp,
+        Bound::GreatestLower,
+        result_commit_type,
+    )
+    .map_err(Into::into)
 }
 
 /// Gets the first [`CommitAt`] (version and timestamp) with a timestamp at or after `timestamp`.
 ///
+/// # Parameters
+/// - `snapshot`: defines the searchable version range (typically the latest snapshot).
+/// - `engine`: used to access version history.
+/// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
+/// - `result_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
+///   searches all published commits, while [`CommitType::Recreatable`] restricts the result to
+///   versions the table can be reconstructed from (commit 0 or the earliest complete checkpoint),
+///   guaranteeing the returned version is loadable via time travel.
+///
+/// # Errors
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or after
 /// the given timestamp.
 ///
@@ -507,22 +553,30 @@ pub fn latest_version_as_of(
 /// ```ignore
 /// use delta_kernel::snapshot::Snapshot;
 /// use test_utils::delta_kernel_default_engine::DefaultEngine;
-/// use delta_kernel::history_manager::first_version_after;
+/// use delta_kernel::history_manager::{first_version_after, HistoryCommitType};
 ///
 /// let engine = DefaultEngine::try_new(...)?;
 /// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
 ///
 /// // Find the first commit that occurred at or after January 1, 2023
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
-/// let commit = first_version_after(&snapshot, &engine, timestamp)?;
+/// let commit = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
 #[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
 pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
+    result_commit_type: HistoryCommitType,
 ) -> DeltaResult<CommitAt> {
-    timestamp_to_version(snapshot, engine, timestamp, Bound::LeastUpper).map_err(Into::into)
+    timestamp_to_version(
+        snapshot,
+        engine,
+        timestamp,
+        Bound::LeastUpper,
+        result_commit_type,
+    )
+    .map_err(Into::into)
 }
 
 /// Converts a timestamp range to a corresponding version range.
@@ -593,12 +647,19 @@ pub fn timestamp_range_to_versions(
     // helper (e.g., timestamp_to_version_in_segment) to cut listing time in half.
 
     // Convert the start timestamp to version
-    let start_version = first_version_after(snapshot, engine, start_timestamp)?.version;
+    let start_version = first_version_after(
+        snapshot,
+        engine,
+        start_timestamp,
+        HistoryCommitType::Published,
+    )?
+    .version;
 
     // If the end timestamp is present, convert it to an end version
     let end_version = end_timestamp
         .map(|end| {
-            let end_version = latest_version_as_of(snapshot, engine, end)?.version;
+            let end_version =
+                latest_version_as_of(snapshot, engine, end, HistoryCommitType::Published)?.version;
 
             // Verify that the start version is no greater than the end version. This can
             // happen in the case that the entire timestamp range falls between two commits.
@@ -1177,7 +1238,13 @@ mod tests {
         let (_table, engine, snapshot, _log_segment) =
             build_test_snapshot(&timestamps, Some(3), None).await;
 
-        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        let res = timestamp_to_version(
+            &snapshot,
+            &engine,
+            timestamp,
+            bound,
+            HistoryCommitType::Published,
+        );
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
@@ -1210,7 +1277,13 @@ mod tests {
         let path = Url::from_directory_path(mock_table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        let res = timestamp_to_version(
+            &snapshot,
+            &engine,
+            timestamp,
+            bound,
+            HistoryCommitType::Published,
+        );
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
@@ -1239,7 +1312,13 @@ mod tests {
         let path = Url::from_directory_path(mock_table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        let res = timestamp_to_version(
+            &snapshot,
+            &engine,
+            timestamp,
+            bound,
+            HistoryCommitType::Published,
+        );
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
@@ -1283,7 +1362,13 @@ mod tests {
         let path = Url::from_directory_path(mock_table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        let res = timestamp_to_version(
+            &snapshot,
+            &engine,
+            timestamp,
+            bound,
+            HistoryCommitType::Published,
+        );
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(
@@ -1334,7 +1419,14 @@ mod tests {
         let (_table, engine, snapshot, _log_segment) =
             build_test_snapshot(timestamps, ict_enablement, None).await;
 
-        let err = timestamp_to_version(&snapshot, &engine, timestamp, bound).unwrap_err();
+        let err = timestamp_to_version(
+            &snapshot,
+            &engine,
+            timestamp,
+            bound,
+            HistoryCommitType::Published,
+        )
+        .unwrap_err();
         let LogHistoryError::TimestampOutOfRange {
             nearest_timestamp, ..
         } = err
@@ -1363,7 +1455,13 @@ mod tests {
 
         // Search for timestamp 350 which would need to search in ICT range (v3+)
         // The search will try to read ICT from v4 which is missing
-        let res = timestamp_to_version(&snapshot, &engine, 350, Bound::LeastUpper);
+        let res = timestamp_to_version(
+            &snapshot,
+            &engine,
+            350,
+            Bound::LeastUpper,
+            HistoryCommitType::Published,
+        );
         assert!(
             matches!(res, Err(LogHistoryError::Internal { .. })),
             "Expected internal error for missing ICT: {res:?}"
@@ -1405,7 +1503,7 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        let res = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
@@ -1442,7 +1540,7 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = first_version_after(&snapshot, &engine, timestamp);
+        let res = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
@@ -1566,7 +1664,7 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        let res = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
@@ -1590,7 +1688,7 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = first_version_after(&snapshot, &engine, timestamp);
+        let res = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
@@ -1615,7 +1713,7 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        let res = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
@@ -1640,7 +1738,7 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = first_version_after(&snapshot, &engine, timestamp);
+        let res = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
@@ -1676,7 +1774,7 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        let res = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
@@ -1712,11 +1810,131 @@ mod tests {
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        let res = first_version_after(&snapshot, &engine, timestamp);
+        let res = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Published);
         match expected {
             Some(commit) => assert_eq!(res.unwrap(), commit),
             None => assert!(res.is_err(), "{res:?}"),
         }
+    }
+
+    /// Builds a table from `timestamps` (file-modification times, one per version starting at
+    /// v0, no ICT), then simulates log cleanup: writes an empty placeholder checkpoint at
+    /// `checkpoint_version` and deletes commit files for versions
+    /// `0..=log_cleanup_until_version`.
+    async fn build_mock_table_with_log_cleanup(
+        timestamps: &[Timestamp],
+        checkpoint_version: Version,
+        log_cleanup_until_version: Version,
+    ) -> (LocalMockTable, SyncEngine, Arc<Snapshot>) {
+        let timestamps: Vec<_> = timestamps.iter().map(|&ts| (ts, None)).collect();
+        let table = mock_table_with_timestamps(&timestamps, None).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let log_dir = table.table_root().join("_delta_log");
+        std::fs::write(
+            log_dir.join(format!("{checkpoint_version:020}.checkpoint.parquet")),
+            b"x",
+        )
+        .unwrap();
+        for version in 0..=log_cleanup_until_version {
+            remove_file(log_dir.join(format!("{version:020}.json"))).unwrap();
+        }
+
+        (table, engine, snapshot)
+    }
+
+    #[rstest::rstest]
+    #[case::published_glb_orphan_v1(
+        HistoryCommitType::Published,
+        15,
+        Bound::GreatestLower,
+        Some(CommitAt::new(1, 10))
+    )]
+    #[case::recreatable_glb_orphan_v1(
+        HistoryCommitType::Recreatable,
+        15,
+        Bound::GreatestLower,
+        None
+    )]
+    #[case::published_glb_orphan_v2(
+        HistoryCommitType::Published,
+        25,
+        Bound::GreatestLower,
+        Some(CommitAt::new(2, 20))
+    )]
+    #[case::recreatable_glb_orphan_v2(
+        HistoryCommitType::Recreatable,
+        25,
+        Bound::GreatestLower,
+        None
+    )]
+    #[case::published_lub_orphan(
+        HistoryCommitType::Published,
+        15,
+        Bound::LeastUpper,
+        Some(CommitAt::new(2, 20))
+    )]
+    #[case::recreatable_lub_anchor(
+        HistoryCommitType::Recreatable,
+        15,
+        Bound::LeastUpper,
+        Some(CommitAt::new(3, 30))
+    )]
+    #[tokio::test]
+    async fn timestamp_to_version_with_commit_type(
+        #[case] commit_type: HistoryCommitType,
+        #[case] timestamp: Timestamp,
+        #[case] bound: Bound,
+        #[case] expected: Option<CommitAt>,
+    ) {
+        let (_table, engine, snapshot) =
+            build_mock_table_with_log_cleanup(&[5, 10, 20, 30, 40, 50], 3, 0).await;
+
+        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound, commit_type);
+        match expected {
+            Some(commit) => assert_eq!(res.unwrap(), commit),
+            None => assert!(
+                matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
+                "{res:?}"
+            ),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::published_sees_orphan(HistoryCommitType::Published, 25, Some(CommitAt::new(2, 20)))]
+    #[case::recreatable_excludes_orphan(HistoryCommitType::Recreatable, 25, None)]
+    #[tokio::test]
+    async fn latest_version_as_of_with_commit_type(
+        #[case] commit_type: HistoryCommitType,
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<CommitAt>,
+    ) {
+        let (_table, engine, snapshot) =
+            build_mock_table_with_log_cleanup(&[5, 10, 20, 30, 40, 50], 3, 0).await;
+
+        let res = latest_version_as_of(&snapshot, &engine, timestamp, commit_type);
+        match expected {
+            Some(commit) => assert_eq!(res.unwrap(), commit),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::published_sees_orphan(HistoryCommitType::Published, 15, CommitAt::new(2, 20))]
+    #[case::recreatable_skips_to_anchor(HistoryCommitType::Recreatable, 15, CommitAt::new(3, 30))]
+    #[tokio::test]
+    async fn first_version_after_with_commit_type(
+        #[case] commit_type: HistoryCommitType,
+        #[case] timestamp: Timestamp,
+        #[case] expected: CommitAt,
+    ) {
+        let (_table, engine, snapshot) =
+            build_mock_table_with_log_cleanup(&[5, 10, 20, 30, 40, 50], 3, 0).await;
+
+        let res = first_version_after(&snapshot, &engine, timestamp, commit_type).unwrap();
+        assert_eq!(res, expected);
     }
 
     /// timestamp_range_to_versions with file-mod-only table (v0=100, v1=200, v2=300)
