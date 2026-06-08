@@ -89,22 +89,67 @@ pub struct StructPatchBuilder<Item> {
     /// None for a top-level patch; otherwise the path of the nested struct this patch targets.
     input_path: Option<ColumnName>,
     /// The patch tree assembled so far, with each `with_*` call applied eagerly.
-    root: PatchNode<Item>,
+    root: StructPatchNode<Item>,
     /// The first error produced by a `with_*` call, surfaced by `build`. Once set, later `with_*`
     /// calls are skipped so the original (most relevant) error is preserved.
     error: DeltaResult<()>,
 }
 
+/// The patch builder internally represents the in-progress patch specification as a tree of struct
+/// and field patches, incrementally built up by validated calls to `with_*`. For example, the
+/// following sequence of calls (in any order):
+///
+/// ```ignore
+/// let builder = StructPatchBuilder::new()
+///     .with_prepended_field(item1)
+///     .with_appended_field(item2)
+///     .with_dropped_field("a")
+///     .with_replaced_field("b", item3)
+///     .with_inserted_field_after("b", item4)
+///     .with_inserted_field_after("b", item5)
+///     .with_inserted_field_after_at(["c"], "x", item6);
+/// ```
+///
+/// ... produces the following tree structure:
+///
+/// ```text
+/// root: StructPatchNode               (patches applied to the top-level struct)
+/// ├── prepended_fields: [item1]
+/// ├── appended_fields: [item2]
+/// └── fields:
+///     ├── "a" → FieldPatchNode
+///     │         ├── op: Drop
+///     │         └── insert_after: []
+///     │
+///     ├── "b" → FieldPatchNode
+///     │         ├── op: Replace(item3)
+///     │         └── insert_after: [item4, item5]
+///     │
+///     └── "c" → FieldPatchNode
+///               ├── op: Nested(StructPatchNode)    (recurse into nested struct)
+///               │   ├── prepended_fields: []
+///               │   ├── appended_fields: []
+///               │   └── fields:
+///               │       └── "x" → FieldPatchNode
+///               │                 ├── op: Keep
+///               │                 └── insert_after: [item6]
+///               └── insert_after: []
+/// ```
+///
+/// Conflicting operations ({Replace, Drop, Nested} x {Replace, Drop}) are detected and rejected
+/// along the way, so the tree is always valid. If no conflicts were detected, the final patch is
+/// produced by recursively lowering the internal tree into the output patch type, at which point it
+/// is no longer possible to distinguish e.g. Drop+Insert from Replace.
 #[derive(Debug)]
-struct PatchNode<Item> {
+struct StructPatchNode<Item> {
     prepended_fields: Vec<Item>,
     appended_fields: Vec<Item>,
-    fields: HashMap<String, PatchNodeField<Item>>,
+    fields: HashMap<String, FieldPatchNode<Item>>,
 }
 
 // Do not derive `Default` -- it emits `impl<Item: Default> Default`, even though none of the
 // fields' defaults actually requires `Item: Default`.
-impl<Item> Default for PatchNode<Item> {
+impl<Item> Default for StructPatchNode<Item> {
     fn default() -> Self {
         Self {
             prepended_fields: Vec::new(),
@@ -115,47 +160,52 @@ impl<Item> Default for PatchNode<Item> {
 }
 
 #[derive(Debug)]
-struct PatchNodeField<Item> {
-    action: InputFieldAction<Item>,
+struct FieldPatchNode<Item> {
+    action: FieldPatchOp<Item>,
     insert_after: Vec<Item>,
 }
 
 // Do not derive `Default` -- it emits `impl<Item: Default> Default`, even though none of the
 // fields' defaults actually requires `Item: Default`.
-impl<Item> Default for PatchNodeField<Item> {
+impl<Item> Default for FieldPatchNode<Item> {
     fn default() -> Self {
         Self {
-            action: InputFieldAction::default(),
+            action: FieldPatchOp::default(),
             insert_after: Vec::new(),
         }
     }
 }
 
+/// Describes what happens to the input field itself; any insertions after the input are field
+/// tracked separately. A node with `Keep` is either freshly-inserted into the patch tree (with the
+/// true op to be applied immediately after), or is the otherwise unmodified named anchor of 1+
+/// insert-after operations. A `Nested` operation is like special `Replace`, where the replacement
+/// is the computed result of applying patches to one or more of the field's children.
 #[derive(Debug)]
-enum InputFieldAction<Item> {
+enum FieldPatchOp<Item> {
     Keep,
     Drop { optional: bool },
     Replace(Item),
-    Patch(Box<PatchNode<Item>>),
+    Nested(Box<StructPatchNode<Item>>),
 }
 
 // Do not derive `Default` -- it emits `impl<Item: Default> Default`, even though the default enum
 // variant does not contain any `Item`. Also suppress the clippy suggestion to define a `#[default]`
 // enum variant, since that's unrelated to the problematic `Item: Default` bound.
 #[allow(clippy::derivable_impls)]
-impl<Item> Default for InputFieldAction<Item> {
+impl<Item> Default for FieldPatchOp<Item> {
     fn default() -> Self {
-        InputFieldAction::Keep
+        FieldPatchOp::Keep
     }
 }
 
-impl<Item> InputFieldAction<Item> {
+impl<Item> FieldPatchOp<Item> {
     fn is_keep(&self) -> bool {
-        matches!(self, InputFieldAction::Keep)
+        matches!(self, FieldPatchOp::Keep)
     }
 
     fn is_optional_drop(&self) -> bool {
-        matches!(self, InputFieldAction::Drop { optional: true })
+        matches!(self, FieldPatchOp::Drop { optional: true })
     }
 }
 
@@ -168,7 +218,7 @@ impl<Item> StructPatchBuilder<Item> {
     pub fn new() -> Self {
         Self {
             input_path: None,
-            root: PatchNode::default(),
+            root: StructPatchNode::default(),
             error: Ok(()),
         }
     }
@@ -177,7 +227,7 @@ impl<Item> StructPatchBuilder<Item> {
     pub fn new_nested(path: impl CollectInto<ColumnName>) -> Self {
         Self {
             input_path: Some(path.collect_into()),
-            root: PatchNode::default(),
+            root: StructPatchNode::default(),
             error: Ok(()),
         }
     }
@@ -223,7 +273,7 @@ impl<Item> StructPatchBuilder<Item> {
         item: Item,
     ) -> Self {
         self.apply_at(struct_path, |node| {
-            node.set_action(field_name, InputFieldAction::Replace(item))
+            node.set_action(field_name, FieldPatchOp::Replace(item))
         })
     }
 
@@ -283,7 +333,7 @@ impl<Item> StructPatchBuilder<Item> {
     fn apply_at(
         mut self,
         struct_path: impl CollectInto<ColumnName>,
-        op: impl FnOnce(&mut PatchNode<Item>) -> DeltaResult<()>,
+        op: impl FnOnce(&mut StructPatchNode<Item>) -> DeltaResult<()>,
     ) -> Self {
         if self.error.is_ok() {
             let path = struct_path.collect_into();
@@ -293,7 +343,7 @@ impl<Item> StructPatchBuilder<Item> {
     }
 }
 
-impl<Item> PatchNode<Item> {
+impl<Item> StructPatchNode<Item> {
     /// Records an item to insert immediately after the named input field.
     fn insert_after(&mut self, field_name: impl Into<String>, item: Item) -> DeltaResult<()> {
         let entry = self.field_state_mut(field_name.into(), |field_name, entry| {
@@ -311,7 +361,7 @@ impl<Item> PatchNode<Item> {
     /// Records a drop of the named input field. `optional` tolerates an absent field at evaluation
     /// time, but cannot combine with insertions after that field.
     fn drop(&mut self, field_name: impl Into<String>, optional: bool) -> DeltaResult<()> {
-        self.set_action(field_name, InputFieldAction::Drop { optional })
+        self.set_action(field_name, FieldPatchOp::Drop { optional })
     }
 
     /// Records the input field action (drop/replace/patch) for the named input field. Only one such
@@ -319,7 +369,7 @@ impl<Item> PatchNode<Item> {
     fn set_action(
         &mut self,
         field_name: impl Into<String>,
-        action: InputFieldAction<Item>,
+        action: FieldPatchOp<Item>,
     ) -> DeltaResult<()> {
         let entry = self.field_state_mut(field_name.into(), |field_name, entry| {
             if !entry.action.is_keep() {
@@ -346,9 +396,9 @@ impl<Item> PatchNode<Item> {
         // Keep (a newly-created no-op or existing insert-after) to Patch, but not Drop or Replace.
         let state = self.fields.entry(field_name.to_string()).or_default();
         if state.action.is_keep() {
-            state.action = InputFieldAction::Patch(Box::default());
+            state.action = FieldPatchOp::Nested(Box::default());
         }
-        let InputFieldAction::Patch(node) = &mut state.action else {
+        let FieldPatchOp::Nested(node) = &mut state.action else {
             return Err(Error::generic(format!(
                 "Cannot patch nested fields under dropped/replaced field '{field_name}'"
             )));
@@ -362,10 +412,10 @@ impl<Item> PatchNode<Item> {
     fn field_state_mut(
         &mut self,
         field_name: String,
-        validate_existing: impl FnOnce(&str, &PatchNodeField<Item>) -> DeltaResult<()>,
-    ) -> DeltaResult<&mut PatchNodeField<Item>> {
+        validate_existing: impl FnOnce(&str, &FieldPatchNode<Item>) -> DeltaResult<()>,
+    ) -> DeltaResult<&mut FieldPatchNode<Item>> {
         match self.fields.entry(field_name) {
-            hash_map::Entry::Vacant(entry) => Ok(entry.insert(PatchNodeField::default())),
+            hash_map::Entry::Vacant(entry) => Ok(entry.insert(FieldPatchNode::default())),
             hash_map::Entry::Occupied(entry) => {
                 validate_existing(entry.key(), entry.get())?;
                 Ok(entry.into_mut())
@@ -377,7 +427,7 @@ impl<Item> PatchNode<Item> {
 // === Expression lowering ===
 
 impl StructPatchBuilder<ExpressionRef> {
-    /// Builds the raw expression patch.
+    /// Builds the final expression patch.
     ///
     /// # Errors
     ///
@@ -386,7 +436,7 @@ impl StructPatchBuilder<ExpressionRef> {
     /// nested child field.
     pub fn build(self) -> DeltaResult<ExpressionStructPatch> {
         self.error?;
-        self.root.into_raw_patch(self.input_path)
+        self.root.into_struct_patch(self.input_path)
     }
 }
 
@@ -398,11 +448,14 @@ impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
     }
 }
 
-impl PatchNode<ExpressionRef> {
-    fn into_raw_patch(self, input_path: Option<ColumnName>) -> DeltaResult<ExpressionStructPatch> {
+impl StructPatchNode<ExpressionRef> {
+    fn into_struct_patch(
+        self,
+        input_path: Option<ColumnName>,
+    ) -> DeltaResult<ExpressionStructPatch> {
         let mut field_patches = HashMap::with_capacity(self.fields.len());
         for (field_name, state) in self.fields {
-            let patch = state.into_raw_field_patch(input_path.as_ref(), &field_name)?;
+            let patch = state.into_field_patch(input_path.as_ref(), &field_name)?;
             field_patches.insert(field_name, patch);
         }
 
@@ -415,15 +468,15 @@ impl PatchNode<ExpressionRef> {
     }
 }
 
-impl PatchNodeField<ExpressionRef> {
-    fn into_raw_field_patch(
+impl FieldPatchNode<ExpressionRef> {
+    fn into_field_patch(
         self,
         parent_input_path: Option<&ColumnName>,
         field_name: &str,
     ) -> DeltaResult<ExpressionFieldPatch> {
         let mut insertions = self.insert_after;
         let (keep_input, optional) = match self.action {
-            InputFieldAction::Keep => {
+            FieldPatchOp::Keep => {
                 if insertions.is_empty() {
                     return Err(Error::generic(format!(
                         "Internal error: builder produced a no-op patch for field '{field_name}'"
@@ -431,12 +484,12 @@ impl PatchNodeField<ExpressionRef> {
                 }
                 (true, false)
             }
-            InputFieldAction::Drop { optional } => (false, optional),
-            InputFieldAction::Replace(expr) => {
+            FieldPatchOp::Drop { optional } => (false, optional),
+            FieldPatchOp::Replace(expr) => {
                 insertions.insert(0, expr);
                 (false, false)
             }
-            InputFieldAction::Patch(node) => {
+            FieldPatchOp::Nested(node) => {
                 if node.prepended_fields.is_empty()
                     && node.appended_fields.is_empty()
                     && node.fields.is_empty()
@@ -451,7 +504,7 @@ impl PatchNodeField<ExpressionRef> {
                     Some(parent) => parent.join(&field_name),
                     None => field_name,
                 };
-                let child_patch = node.into_raw_patch(Some(child_input_path))?;
+                let child_patch = node.into_struct_patch(Some(child_input_path))?;
                 insertions.insert(0, Arc::new(Expression::StructPatch(child_patch)));
                 (false, false)
             }
@@ -486,9 +539,9 @@ impl StructPatchBuilder<StructField> {
     }
 }
 
-impl PatchNode<StructField> {
+impl StructPatchNode<StructField> {
     fn build_schema(self, input_schema: &StructType) -> DeltaResult<StructType> {
-        let PatchNode {
+        let StructPatchNode {
             prepended_fields,
             appended_fields,
             mut fields,
@@ -498,7 +551,7 @@ impl PatchNode<StructField> {
         output_fields.reserve(input_schema.num_fields() + fields.len());
 
         for input_field in input_schema.fields() {
-            let Some(PatchNodeField {
+            let Some(FieldPatchNode {
                 action,
                 insert_after,
             }) = fields.remove(input_field.name())
@@ -507,10 +560,10 @@ impl PatchNode<StructField> {
                 continue;
             };
             match action {
-                InputFieldAction::Keep => output_fields.push(input_field.clone()),
-                InputFieldAction::Drop { .. } => {}
-                InputFieldAction::Replace(field) => output_fields.push(field),
-                InputFieldAction::Patch(node) => {
+                FieldPatchOp::Keep => output_fields.push(input_field.clone()),
+                FieldPatchOp::Drop { .. } => {}
+                FieldPatchOp::Replace(field) => output_fields.push(field),
+                FieldPatchOp::Nested(node) => {
                     let DataType::Struct(nested_schema) = input_field.data_type() else {
                         return Err(Error::generic(format!(
                             "Cannot patch nested fields under non-struct field '{}'",
@@ -572,7 +625,7 @@ fn resolve_input_schema<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use super::{InputFieldAction, PatchNode, PatchNodeField};
+    use super::{FieldPatchNode, FieldPatchOp, StructPatchNode};
     use crate::expressions::{Expression as Expr, ExpressionStructPatchBuilder};
     use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -638,11 +691,11 @@ mod tests {
 
     #[test]
     fn struct_patch_builder_rejects_impossible_empty_nested_patch() {
-        let result = PatchNodeField {
-            action: InputFieldAction::Patch(Box::<PatchNode<_>>::default()),
+        let result = FieldPatchNode {
+            action: FieldPatchOp::Nested(Box::<StructPatchNode<_>>::default()),
             insert_after: vec![],
         }
-        .into_raw_field_patch(None, "add");
+        .into_field_patch(None, "add");
 
         assert!(result
             .unwrap_err()
