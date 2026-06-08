@@ -166,8 +166,8 @@ to `at_version`.
 
 | Function | Returns |
 |----------|---------|
-| `latest_version_as_of(snapshot, engine, timestamp, commit_type)` | The `CommitAt` for the latest version with a timestamp at or before `timestamp`. |
-| `first_version_after(snapshot, engine, timestamp, commit_type)` | The `CommitAt` for the first version with a timestamp at or after `timestamp`. |
+| `latest_version_as_of(snapshot, engine, timestamp, resolved_commit_type)` | The `CommitAt` for the latest version with a timestamp at or before `timestamp`. |
+| `first_version_after(snapshot, engine, timestamp, resolved_commit_type)` | The `CommitAt` for the first version with a timestamp at or after `timestamp`. |
 | `timestamp_range_to_versions(snapshot, engine, start, end)` | A `(start_version, end_version)` pair covering the timestamp range. |
 
 Each helper takes a `Snapshot` reference, which defines the searchable

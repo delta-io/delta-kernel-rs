@@ -380,7 +380,7 @@ pub(crate) fn timestamp_to_version(
     engine: &dyn Engine,
     timestamp: Timestamp,
     bound: Bound,
-    return_commit_type: HistoryCommitType,
+    resolved_commit_type: HistoryCommitType,
 ) -> Result<CommitAt, LogHistoryError> {
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
@@ -422,7 +422,7 @@ pub(crate) fn timestamp_to_version(
         ));
     }
 
-    let start_version: Option<Version> = match return_commit_type {
+    let start_version: Option<Version> = match resolved_commit_type {
         HistoryCommitType::Published => None,
         HistoryCommitType::Recreatable => Some(
             get_earliest_commit(
@@ -444,7 +444,8 @@ pub(crate) fn timestamp_to_version(
         snapshot.log_segment().log_root.clone(),
         snapshot.version(),
         start_version
-            .map(|v| snapshot.version() - v + 1)
+            .and_then(|v| snapshot.version().checked_sub(v))
+            .map(|diff| diff + 1)
             .and_then(|count| usize::try_from(count).ok())
             .and_then(NonZero::new),
     )
@@ -495,7 +496,7 @@ pub(crate) fn timestamp_to_version(
 /// - `snapshot`: defines the searchable version range (typically the latest snapshot).
 /// - `engine`: used to access version history.
 /// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
-/// - `result_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
+/// - `resolved_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
 ///   searches all published commits, while [`CommitType::Recreatable`] restricts the result to
 ///   versions the table can be reconstructed from (commit 0 or the earliest complete checkpoint),
 ///   guaranteeing the returned version is loadable via time travel.
@@ -522,14 +523,14 @@ pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
-    result_commit_type: HistoryCommitType,
+    resolved_commit_type: HistoryCommitType,
 ) -> DeltaResult<CommitAt> {
     timestamp_to_version(
         snapshot,
         engine,
         timestamp,
         Bound::GreatestLower,
-        result_commit_type,
+        resolved_commit_type,
     )
     .map_err(Into::into)
 }
@@ -540,7 +541,7 @@ pub fn latest_version_as_of(
 /// - `snapshot`: defines the searchable version range (typically the latest snapshot).
 /// - `engine`: used to access version history.
 /// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
-/// - `result_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
+/// - `resolved_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
 ///   searches all published commits, while [`CommitType::Recreatable`] restricts the result to
 ///   versions the table can be reconstructed from (commit 0 or the earliest complete checkpoint),
 ///   guaranteeing the returned version is loadable via time travel.
@@ -567,14 +568,14 @@ pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
-    result_commit_type: HistoryCommitType,
+    resolved_commit_type: HistoryCommitType,
 ) -> DeltaResult<CommitAt> {
     timestamp_to_version(
         snapshot,
         engine,
         timestamp,
         Bound::LeastUpper,
-        result_commit_type,
+        resolved_commit_type,
     )
     .map_err(Into::into)
 }
@@ -1899,6 +1900,45 @@ mod tests {
                 matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
                 "{res:?}"
             ),
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn timestamp_to_version_recreatable_matches_published_when_v0_present(
+        #[values(0, 50, 100, 250, 300, 350, 1000)] timestamp: Timestamp,
+        #[values(Bound::GreatestLower, Bound::LeastUpper)] bound: Bound,
+    ) {
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let (_table, engine, snapshot, _log_segment) =
+            build_test_snapshot(&timestamps, Some(3), None).await;
+
+        let published = timestamp_to_version(
+            &snapshot,
+            &engine,
+            timestamp,
+            bound,
+            HistoryCommitType::Published,
+        );
+        let recreatable = timestamp_to_version(
+            &snapshot,
+            &engine,
+            timestamp,
+            bound,
+            HistoryCommitType::Recreatable,
+        );
+        match (published, recreatable) {
+            (Ok(p), Ok(r)) => assert_eq!(p, r, "diverged at ts={timestamp} bound={bound:?}"),
+            (Err(_), Err(_)) => {}
+            (p, r) => {
+                panic!("Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}")
+            }
         }
     }
 
