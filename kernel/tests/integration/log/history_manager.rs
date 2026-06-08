@@ -2,7 +2,6 @@
 
 use std::ops::RangeInclusive;
 
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::history_manager::{get_earliest_commit, HistoryCommitType};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
@@ -13,6 +12,7 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::Version;
 use rstest::rstest;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use url::Url;
 
