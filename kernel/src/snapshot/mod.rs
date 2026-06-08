@@ -37,7 +37,7 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
 mod incremental;
-pub use builder::SnapshotBuilder;
+pub use builder::{IncrementalReplay, SnapshotBuilder};
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -178,8 +178,9 @@ impl Snapshot {
         log_segment: LogSegment,
         engine: &dyn Engine,
         operation_id: MetricId,
+        incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Self> {
-        let crc = log_segment.try_build_incremental_crc(engine)?;
+        let crc = log_segment.try_build_incremental_crc(engine, incremental_replay)?;
 
         // TODO(#2677): emit an `IncrementalCrcLoad` metric on the CRC branch; the
         //              `ProtocolMetadataLoaded` span only fires on the replay branch below.

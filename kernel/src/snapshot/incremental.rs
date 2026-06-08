@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tracing::instrument;
 
-use super::Snapshot;
+use super::{IncrementalReplay, Snapshot};
 use crate::crc::{read_crc_file_or_none, Crc};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -181,6 +181,7 @@ impl Snapshot {
                     new_log_segment,
                     engine,
                     operation_id,
+                    IncrementalReplay::Disabled,
                 );
                 return Ok(Arc::new(snapshot?));
             }
@@ -1150,6 +1151,7 @@ mod tests {
 
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
+            .with_incremental_state_replay(IncrementalReplay::Unlimited)
             .build(ctx.engine.as_ref())?;
         // A fresh build advances the stale CRC via reverse-replay to a CRC at v3 (file stats
         // Indeterminate, since these synthetic commits carry no commitInfo). The segment's

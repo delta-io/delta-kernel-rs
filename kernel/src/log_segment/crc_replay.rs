@@ -28,6 +28,7 @@ use crate::schema::{
     column_name, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
     StructField, StructType, ToSchema as _,
 };
+use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, RowVisitor, Version};
 
@@ -74,10 +75,12 @@ impl LogSegment {
     /// Try to build the CRC at this segment's `end_version`. Handles three cases:
     /// - Case 1: CRC absent (1A) or read fails (1B) -> return None
     /// - Case 2: CRC at `end_version` -> return it as-is
-    /// - Case 3: Stale CRC older than `end_version` -> advance it to `end_version`
+    /// - Case 3: Stale CRC older than `end_version` -> advance it to `end_version` when
+    ///   `incremental_replay` permits, else fall back to normal log replay (return None)
     pub(crate) fn try_build_incremental_crc(
         &self,
         engine: &dyn Engine,
+        incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Option<Arc<Crc>>> {
         let Some(crc_file) = self.listed.latest_crc_file.as_ref() else {
             return Ok(None); // Case 1A
@@ -88,8 +91,12 @@ impl LogSegment {
         if base_crc.version == self.end_version {
             return Ok(Some(base_crc)); // Case 2
         }
+        // Case 3: advance only within the caller's commit budget.
+        if !incremental_replay.should_advance(base_crc.version, self.end_version) {
+            return Ok(None);
+        }
         let advanced = self.build_incremental_crc_from_base(engine, &base_crc)?;
-        Ok(Some(Arc::new(advanced))) // Case 3
+        Ok(Some(Arc::new(advanced)))
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in

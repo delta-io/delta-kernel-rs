@@ -13,6 +13,7 @@ use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -286,7 +287,9 @@ async fn crc_at_prior_version_advances_via_reverse_replay() -> DeltaResult<()> {
 
     // Measurement: build snapshot at latest (v2); CRC is at v0 (two versions behind)
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
+    let snap = Snapshot::builder_for(table_url)
+        .with_incremental_state_replay(IncrementalReplay::Unlimited)
+        .build(&measure_engine)?;
     assert_eq!(snap.crc().expect("stale CRC advanced to v2").version, 2);
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
