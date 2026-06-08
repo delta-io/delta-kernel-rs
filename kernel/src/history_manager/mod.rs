@@ -763,14 +763,14 @@ fn get_earliest_recreatable_commit(
     }
 }
 
-/// Select which commit type to return in the get_earliest_commit query.
+/// Selects which commit the [`get_earliest_commit`] query returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitType {
-    /// A file-system commit or a catalog commit present in the table's _delta_log/ .
-    /// The commit does not gurantee that the table can be reconstructed from the commit's version.
+pub enum HistoryCommitType {
+    /// A filesystem or catalog commit present in the table's `_delta_log/`. Its presence does not
+    /// guarantee that the table can be reconstructed at that commit's version.
     Published,
-    /// A commit that table can be reconstructed from that version and replay forward to the latest
-    /// version.
+    /// A commit whose version the table state can be fully reconstructed at and replayed forward
+    /// from to the latest version.
     Recreatable,
 }
 
@@ -783,16 +783,18 @@ pub enum CommitType {
 /// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
 /// - `earliest_ratified_commit_version`: For catalog-managed tables, the earliest version the
 ///   catalog has ratified a commit at. Pass `None` for filesystem-only tables.
-/// - `must_be_recreatable`: When `true`, return the earliest version whose state can be fully
-///   reconstructed (commit 0 or the earliest complete checkpoint). When `false`, return the
-///   lowest-numbered published commit.
+/// - `commit_type`: selects the query. [`HistoryCommitType::Published`] returns the lowest-numbered
+///   published commit; [`HistoryCommitType::Recreatable`] returns the earliest version whose state
+///   can be fully reconstructed (commit 0 or the earliest complete checkpoint).
 ///
 /// # Errors
 /// - Propagates any error from listing the log directory.
-/// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits.
-/// - [`LogHistoryError::NoRecreatableCommit`] when `must_be_recreatable` is `true`, commits exist,
-///   but neither `00...00.json` nor a checkpoint anchoring the smallest commit is present.
-/// - [`DeltaError::Generic`] when there is no published filesystem commit and
+/// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits and
+///   `earliest_ratified_commit_version` is not `Some(0)`.
+/// - [`LogHistoryError::NoRecreatableCommit`] when `commit_type` is
+///   [`HistoryCommitType::Recreatable`], commits exist, but neither `00...00.json` nor a checkpoint
+///   anchoring the smallest commit is present.
+/// - [`DeltaError::Generic`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
 #[tracing::instrument(skip(engine), err, ret)]
@@ -800,16 +802,16 @@ pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-    commit_type: CommitType,
+    commit_type: HistoryCommitType,
 ) -> DeltaResult<Version> {
     match commit_type {
-        CommitType::Published => get_earliest_published_commit_version(
+        HistoryCommitType::Published => get_earliest_published_commit_version(
             engine,
             log_root,
             earliest_ratified_commit_version,
         ),
 
-        CommitType::Recreatable => {
+        HistoryCommitType::Recreatable => {
             get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
         }
     }
