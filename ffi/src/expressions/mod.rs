@@ -108,28 +108,29 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
 // === FfiOpaquePredicateOp ===================================================
 
 /// Engine-defined opaque predicate identified by a name (e.g. `STARTS_WITH`, `LIKE`). Optionally
-/// carries an [`COpaqueEvalCallbacks`] reference; when attached, kernel routes row-time evaluation
-/// through the engine's `eval_pred` callback (engine receives pre-evaluated args as Arrow arrays).
+/// carries a [`COpaqueEvalCallbacks`] reference; when attached, kernel routes evaluation through
+/// the engine's callbacks (engine receives pre-evaluated args as Arrow arrays).
 ///
 /// # Data skipping
 ///
 /// `as_data_skipping_predicate` (StatsMode) rewrites each `Column` arg into a
 /// `Struct[min, max, nullcount, rowcount]` and tags the op with `EvalMode::StatsMode`. Literals
 /// pass through; `Predicate` children recurse. This is the only mode that prunes files -- RowMode
-/// evaluates per data row and never drops files. See [`EngineEvalPredFn`] for the per-mode arg
-/// shapes the engine callback must handle.
+/// evaluates per data row and never drops files. See [`EngineEvalRowsFn`] / [`EngineEvalStatsFn`]
+/// for the per-callback arg shapes.
 ///
 /// Bare ops (`Predicate::opaque(FfiOpaquePredicateOp::new(...))`) have no callback attached
 /// and so abstain from file pruning. Scalar / partition-pruning paths always abstain.
 ///
 /// Inverted predicates (`NOT op`) are rewritten too: the inversion is recorded on the op and
 /// forwarded to the engine callback's `inverted` flag, which must reason about the negated op (see
-/// [`EngineEvalPredFn`]). The StatsMode rewrite abstains (keeps all files) when a `Column` arg has
+/// [`EngineEvalStatsFn`]). The StatsMode rewrite abstains (keeps all files) when a `Column` arg has
 /// no sibling literal to infer its type from, or an arg is some kind other than `Column`,
 /// `Literal`, or `Predicate`.
 ///
 /// [`COpaqueEvalCallbacks`]: opaque_eval::COpaqueEvalCallbacks
-/// [`EngineEvalPredFn`]: opaque_eval::EngineEvalPredFn
+/// [`EngineEvalRowsFn`]: opaque_eval::EngineEvalRowsFn
+/// [`EngineEvalStatsFn`]: opaque_eval::EngineEvalStatsFn
 #[derive(Debug, Clone)]
 pub(crate) struct FfiOpaquePredicateOp {
     name: String,
@@ -139,7 +140,7 @@ pub(crate) struct FfiOpaquePredicateOp {
     #[cfg(feature = "default-engine-base")]
     mode: EvalMode,
     /// Whether the op is negated. Set by the StatsMode rewrite so the eval callback can reason
-    /// about the negated op (see [`EngineEvalPredFn`]); XORed with the eval-time `inverted`.
+    /// about the negated op (see [`EngineEvalStatsFn`]); XORed with the eval-time `inverted`.
     #[cfg(feature = "default-engine-base")]
     inverted: bool,
 }
@@ -313,7 +314,6 @@ mod tests {
                 _: *mut c_void,
                 _: KernelStringSlice,
                 _: *mut ArrowFFIData,
-                _: EvalMode,
                 _: bool,
             ) -> OptionalValue<*mut ArrowFFIData> {
                 OptionalValue::None
@@ -322,7 +322,8 @@ mod tests {
             let make_cb = || {
                 Arc::new(COpaqueEvalCallbacks {
                     engine_state: std::ptr::null_mut(),
-                    eval_pred: stub_eval,
+                    eval_pred_rows: stub_eval,
+                    eval_pred_stats: stub_eval,
                     free_state: stub_free,
                 })
             };

@@ -200,26 +200,28 @@ fn call_eval_pred(
     // SAFETY: callback was supplied by the engine. We pass a writable args slot; the engine takes
     // ownership of the Arrow FFI handles by moving them out of it.
     let result = unsafe {
-        (cb.eval_pred)(
-            cb.engine_state,
-            kernel_string_slice!(op_name),
-            &mut args_ffi,
-            mode,
-            inverted,
-        )
+        let name = kernel_string_slice!(op_name);
+        match mode {
+            EvalMode::RowMode => {
+                (cb.eval_pred_rows)(cb.engine_state, name, &mut args_ffi, inverted)
+            }
+            EvalMode::StatsMode => {
+                (cb.eval_pred_stats)(cb.engine_state, name, &mut args_ffi, inverted)
+            }
+        }
     };
     let OptionalValue::Some(ptr) = result else {
         return Err(Error::Generic(format!(
-            "engine eval_pred reported failure for `{op_name}`"
+            "engine opaque-eval callback reported failure for `{op_name}`"
         )));
     };
     if ptr.is_null() {
         return Err(Error::Generic(format!(
-            "engine eval_pred returned a null result for `{op_name}`"
+            "engine opaque-eval callback returned a null result for `{op_name}`"
         )));
     }
 
-    // SAFETY: per `EngineEvalPredFn`, the engine allocates this via `arrow_ffi_data_new`, so
+    // SAFETY: per the eval-callback contract the engine allocates this via `arrow_ffi_data_new`, so
     // `Box::from_raw` reclaims it correctly. `import_ffi_array` moves the inner structs out first.
     let mut result_ffi = unsafe { Box::from_raw(ptr) };
     let arr = import_ffi_array(&mut result_ffi)?;
@@ -328,6 +330,7 @@ mod tests {
 
     use std::ffi::c_void;
     use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
 
     use delta_kernel::arrow::array::ffi::from_ffi;
@@ -378,10 +381,8 @@ mod tests {
         _state: *mut c_void,
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
-        mode: EvalMode,
         inverted: bool,
     ) -> OptionalValue<*mut ArrowFFIData> {
-        assert_eq!(mode, EvalMode::RowMode);
         let batch = unsafe { take_ffi_record_batch(args_in) };
         assert_eq!(batch.num_columns(), 2);
         let col = batch
@@ -413,7 +414,6 @@ mod tests {
         _state: *mut c_void,
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
-        _mode: EvalMode,
         inverted: bool,
     ) -> OptionalValue<*mut ArrowFFIData> {
         let batch = unsafe { take_ffi_record_batch(args_in) };
@@ -446,13 +446,15 @@ mod tests {
             *mut c_void,
             KernelStringSlice,
             *mut ArrowFFIData,
-            EvalMode,
             bool,
         ) -> OptionalValue<*mut ArrowFFIData>,
     ) -> Arc<COpaqueEvalCallbacks> {
+        // Each test exercises one mode; the unused slot is never invoked, so wire the same stub to
+        // both row and stats callbacks.
         Arc::new(COpaqueEvalCallbacks {
             engine_state: ptr::null_mut(),
-            eval_pred,
+            eval_pred_rows: eval_pred,
+            eval_pred_stats: eval_pred,
             free_state: noop_free,
         })
     }
@@ -530,7 +532,6 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             _args_in: *mut ArrowFFIData,
-            _mode: EvalMode,
             _inverted: bool,
         ) -> OptionalValue<*mut ArrowFFIData> {
             OptionalValue::None
@@ -541,7 +542,7 @@ mod tests {
         );
         let batch = batch_with_col(vec![Some("x")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
-        assert!(format!("{err}").contains("engine eval_pred reported failure"));
+        assert!(format!("{err}").contains("engine opaque-eval callback reported failure"));
     }
 
     #[test]
@@ -550,7 +551,6 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
-            _mode: EvalMode,
             _inverted: bool,
         ) -> OptionalValue<*mut ArrowFFIData> {
             let _ = unsafe { take_ffi_record_batch(args_in) };
@@ -571,7 +571,6 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
-            _mode: EvalMode,
             _inverted: bool,
         ) -> OptionalValue<*mut ArrowFFIData> {
             let _ = unsafe { take_ffi_record_batch(args_in) };
@@ -593,7 +592,6 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
-            _mode: EvalMode,
             _inverted: bool,
         ) -> OptionalValue<*mut ArrowFFIData> {
             // Consume args but hand back an empty (unpopulated) result.
@@ -617,7 +615,6 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
-            _mode: EvalMode,
             _inverted: bool,
         ) -> OptionalValue<*mut ArrowFFIData> {
             let batch = unsafe { take_ffi_record_batch(args_in) };
@@ -634,6 +631,73 @@ mod tests {
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result.len(), 5);
         assert!((0..5).all(|i| result.value(i)));
+    }
+
+    /// `call_eval_pred` must route by mode: a RowMode op hits `eval_pred_rows`, a StatsMode op hits
+    /// `eval_pred_stats`. Every other test wires the same stub into both slots, so a swapped match
+    /// arm would pass them -- this pins the routing with two distinct stubs.
+    #[test]
+    fn dispatch_routes_each_mode_to_its_callback() {
+        static ROWS: AtomicUsize = AtomicUsize::new(0);
+        static STATS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn rows(
+            _: *mut c_void,
+            _: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _: bool,
+        ) -> OptionalValue<*mut ArrowFFIData> {
+            ROWS.fetch_add(1, AtomicOrdering::SeqCst);
+            let batch = unsafe { take_ffi_record_batch(args_in) };
+            make_result(Arc::new(BooleanArray::from(vec![true; batch.num_rows()])))
+        }
+        unsafe extern "C" fn stats(
+            _: *mut c_void,
+            _: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _: bool,
+        ) -> OptionalValue<*mut ArrowFFIData> {
+            STATS.fetch_add(1, AtomicOrdering::SeqCst);
+            let batch = unsafe { take_ffi_record_batch(args_in) };
+            make_result(Arc::new(BooleanArray::from(vec![true; batch.num_rows()])))
+        }
+        let callbacks = || {
+            Arc::new(COpaqueEvalCallbacks {
+                engine_state: ptr::null_mut(),
+                eval_pred_rows: rows,
+                eval_pred_stats: stats,
+                free_state: noop_free,
+            })
+        };
+        let batch = batch_with_col(vec![Some("x")]);
+
+        // RowMode (default) routes to eval_pred_rows only.
+        let row_pred = Predicate::arrow_opaque(
+            FfiOpaquePredicateOp::new("OP").with_callbacks(callbacks()),
+            [column_expr!("col")],
+        );
+        evaluate_predicate(&row_pred, &batch, false).unwrap();
+        assert_eq!(ROWS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            STATS.load(AtomicOrdering::SeqCst),
+            0,
+            "row mode must not hit the stats slot"
+        );
+
+        // StatsMode routes to eval_pred_stats only.
+        let stats_pred = Predicate::arrow_opaque(
+            FfiOpaquePredicateOp::new("OP")
+                .with_mode(EvalMode::StatsMode)
+                .with_callbacks(callbacks()),
+            [column_expr!("col")],
+        );
+        evaluate_predicate(&stats_pred, &batch, false).unwrap();
+        assert_eq!(
+            ROWS.load(AtomicOrdering::SeqCst),
+            1,
+            "stats mode must not hit the rows slot"
+        );
+        assert_eq!(STATS.load(AtomicOrdering::SeqCst), 1);
     }
 
     // === Data-skipping rewrite ==================================================
@@ -852,10 +916,8 @@ mod tests {
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
-                mode: EvalMode,
                 inverted: bool,
             ) -> OptionalValue<*mut ArrowFFIData> {
-                assert_eq!(mode, EvalMode::StatsMode);
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let stats = batch
                     .column(0)
@@ -1065,10 +1127,8 @@ mod tests {
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
-                mode: EvalMode,
                 _inverted: bool,
             ) -> OptionalValue<*mut ArrowFFIData> {
-                assert_eq!(mode, EvalMode::StatsMode);
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 CALL_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
                 let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; batch.num_rows()]));
@@ -1103,10 +1163,8 @@ mod tests {
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
-                mode: EvalMode,
                 _inverted: bool,
             ) -> OptionalValue<*mut ArrowFFIData> {
-                assert_eq!(mode, EvalMode::StatsMode);
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let col = batch
                     .column(0)
@@ -1145,6 +1203,46 @@ mod tests {
                 SAW_NULLCOUNT.load(AtomicOrdering::SeqCst),
                 1,
                 "engine should observe nullcount as all-null and fall back to keep"
+            );
+        }
+
+        /// Add/Remove reconciliation safety: a row with no collected stats (as a checkpoint Remove
+        /// row presents) rewrites to null min/max, and a conservative engine must keep it --
+        /// dropping it would resurrect a deleted file. Pins the contract the soundness relies on.
+        #[test]
+        fn null_bounds_keep_file_for_remove_row_safety() {
+            unsafe extern "C" fn engine_keep_on_null_bounds(
+                _state: *mut c_void,
+                _op_name: KernelStringSlice,
+                args_in: *mut ArrowFFIData,
+                _inverted: bool,
+            ) -> OptionalValue<*mut ArrowFFIData> {
+                let batch = unsafe { take_ffi_record_batch(args_in) };
+                let stats = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("arg0 should be StructArray");
+                let (min, max) = (stats.column(0), stats.column(1));
+                let keep: BooleanArray = (0..batch.num_rows())
+                    // Null bounds can't prove the predicate impossible, so keep the file (true).
+                    .map(|i| Some(min.is_null(i) || max.is_null(i)))
+                    .collect();
+                make_result(Arc::new(keep))
+            }
+
+            let op = FfiOpaquePredicateOp::new("OP")
+                .with_callbacks(callbacks_for(engine_keep_on_null_bounds));
+            let args = [column_expr!("col"), Expression::literal(5i64)];
+            // `no_stats_rewriter` models a row with no collected stats (e.g. a Remove): null
+            // min/max.
+            let rewritten = rewrite(&op, &args, &no_stats_rewriter(), false)
+                .expect("rewrite should succeed with a type hint");
+            let stats_batch = single_col_int64_stats_batch();
+            let result = evaluate_predicate(&rewritten, &stats_batch, false).unwrap();
+            assert!(
+                result.value(0),
+                "row with null bounds must be kept, not pruned"
             );
         }
 
@@ -1197,7 +1295,6 @@ mod tests {
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
-                _mode: EvalMode,
                 _inverted: bool,
             ) -> OptionalValue<*mut ArrowFFIData> {
                 let batch = unsafe { take_ffi_record_batch(args_in) };

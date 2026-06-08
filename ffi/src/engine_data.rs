@@ -214,6 +214,16 @@ mod tests {
     }
 
     #[test]
+    fn arrow_ffi_data_new_allocates_empty_and_frees() {
+        let ptr = arrow_ffi_data_new();
+        assert!(!ptr.is_null());
+        // Empty arrays carry no release callback -- the invariant `import_ffi_array` relies on.
+        assert!(unsafe { (*ptr).array.is_released() });
+        // The "free if not handed back to kernel" path must not leak or double-free.
+        unsafe { free_arrow_ffi_data(ptr) };
+    }
+
+    #[test]
     fn free_drops_box_and_invokes_release_callbacks() {
         // Verifies the common path: kernel allocates, engine immediately frees. The Drop
         // impls on FFI_ArrowArray / FFI_ArrowSchema invoke their release callbacks; this

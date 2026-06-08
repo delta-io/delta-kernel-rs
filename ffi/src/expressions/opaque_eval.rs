@@ -1,6 +1,6 @@
 //! Engine callback framework for opaque-predicate evaluation.
 //!
-//! Engines register an [`COpaqueEvalCallbacks`] struct, then attach it to an opaque predicate via
+//! Engines register a [`COpaqueEvalCallbacks`] struct, then attach it to an opaque predicate via
 //! [`crate::expressions::kernel_visitor::visit_predicate_opaque_with_eval`]. Kernel does all
 //! recursive evaluation natively through its standard `evaluate_expression` / `evaluate_predicate`
 //! paths; the engine is called only for the opaque-predicate node itself, and receives args as
@@ -24,95 +24,57 @@ use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
 use crate::{KernelStringSlice, OptionalValue};
 
-/// Tells the engine callback how to interpret each arg slot (see [`EngineEvalPredFn`]).
-///
-/// ABI: `#[repr(u8)]`. New variants must append, never reorder.
-#[repr(u8)]
+/// Which engine callback an opaque op dispatches to (set by the stats rewrite; internal to the FFI
+/// layer, not part of the ABI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvalMode {
-    /// Per-row evaluation against a data batch. Each arg slot carries one value per row.
-    RowMode = 0,
-    /// Per-file evaluation against a stats batch. `Column` args arrive as
-    /// `Struct[min, max, nullcount, rowcount]`; literals pass through.
-    StatsMode = 1,
+pub(crate) enum EvalMode {
+    /// Row-time evaluation -> `eval_pred_rows`.
+    RowMode,
+    /// Stats-based evaluation (file data skipping) -> `eval_pred_stats`.
+    StatsMode,
 }
 
-/// Engine callback for evaluating an opaque predicate.
+/// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
-/// # Arguments (`args_in`)
+/// Kernel pre-evaluates the predicate's args into a `RecordBatch` (one field per arg) and exports
+/// it across the Arrow C Data Interface; ownership of the inner `FFI_ArrowArray`/`FFI_ArrowSchema`
+/// transfers to the engine, which imports them and invokes their release callbacks. By position: a
+/// `Column` arg holds its values, a `Literal` the constant repeated per row, a `Predicate` a
+/// `BooleanArray`. The engine returns one bool per row.
 ///
-/// Args are pre-evaluated by kernel and handed over as a single `RecordBatch` (a struct array with
-/// one field per argument) exported across the Arrow C Data Interface. Ownership of the inner
-/// `FFI_ArrowArray` / `FFI_ArrowSchema` transfers to the engine, which imports them and invokes
-/// their release callbacks when done.
+/// On success return `OptionalValue::Some(ptr)` holding the result `BooleanArray`;
+/// `OptionalValue::None` signals a (non-fatal) failure. When `inverted`, evaluate `NOT op`.
 ///
-/// # Result
-///
-/// On success, return `OptionalValue::Some(ptr)` where `ptr` owns an [`ArrowFFIData`] holding the
-/// result `BooleanArray`. `ptr` MUST be obtained from
-/// [`arrow_ffi_data_new`](crate::engine_data::arrow_ffi_data_new).
-///
-/// Returns `OptionalValue::None` to signal a (non-fatal) evaluation failure; kernel surfaces an
-/// `Err` upstream.
-///
-/// # Inversion (`inverted`)
-///
-/// When `inverted` is true, evaluate the *negated* op (`NOT op`). In StatsMode this is not
-/// `!verdict`; if you can't reason soundly about the negated op, keep every file.
-///
-/// # Panics
-///
-/// The callback must not panic or otherwise unwind across the FFI boundary. Engines must trap their
-/// own errors and report them via `OptionalValue::None`.
-///
-/// # Arg shapes per [`EvalMode`]
-///
-/// Each arg slot maps by position to one argument of the predicate; what a slot *holds* depends
-/// on the mode. Running example: `STARTS_WITH(col, "foo")` -- arg 0 is the column `col`, arg 1 is
-/// the literal `"foo"`.
-///
-/// ## RowMode (one entry per data row)
-///
-/// Each slot holds one Arrow value per row: a `Column` -> its values, a `Literal` -> the constant
-/// repeated for every row, a `Predicate` -> a `BooleanArray` of per-row results. For the example,
-/// slot 0 is `col`'s values and slot 1 is `"foo"` repeated; the engine returns one bool per row.
-///
-/// ## StatsMode (one entry per file, used for data skipping)
-///
-/// Each slot holds per-file statistics so the engine can decide whether a file *might* contain a
-/// match. A `Column` arrives as a 4-field struct, indexed by position (inner field names are not
-/// part of the contract):
-///
-/// - 0 = `min` (column type; null if not collected)
-/// - 1 = `max` (column type; null if not collected)
-/// - 2 = `nullcount` (`Int64`; null if not collected)
-/// - 3 = `rowcount` (`Int64`; null if the batch has no rowcount stat)
-///
-/// `Literal` and `Predicate` slots are the same as RowMode. The engine returns one bool per file:
-/// `false` = skip the file, `true`/`null` = keep it. For the example, slot 0 is `col`'s
-/// `{min, max, nullcount, rowcount}` and slot 1 is `"foo"`; keep the file if any value in
-/// `[min, max]` could start with `"foo"`.
-///
-/// The stats are *conservative*, never exact: `min`/`max` only bound the values, and
-/// `nullcount`/`rowcount` may overcount. So skip a file only when the predicate *cannot* hold for
-/// any value in `[min, max]`. The per-file `tightBounds` flag is not forwarded -- always treat
-/// stats as wide, matching kernel-native skipping.
-///
-/// ## Notes
-///
-/// - Some types have no min/max (map, array, boolean, binary). Without a sibling literal the
-///   predicate abstains before the engine sees it; with one, min/max are null and the op keeps
-///   every file rather than erroring.
-/// - Partition columns: `min` and `max` are both the exact partition value; `nullcount`/`rowcount`
-///   are null (Delta doesn't track them per partition).
-/// - Struct columns use the same 4-field shape, with min/max following the nested schema.
-/// - Kernel reads a column's stats at the type of a sibling literal (like `col < val` reads stats
-///   at `val`'s type), so keep column and literal types compatible.
-pub type EngineEvalPredFn = unsafe extern "C" fn(
+/// # Safety
+/// `ptr` MUST be allocated via [`arrow_ffi_data_new`](crate::engine_data::arrow_ffi_data_new):
+/// kernel reclaims it with `Box::from_raw`, so a pointer from any other allocator is undefined
+/// behavior. The callback must not panic or unwind across the FFI boundary.
+pub type EngineEvalRowsFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
-    mode: EvalMode,
+    inverted: bool,
+) -> OptionalValue<*mut ArrowFFIData>;
+
+/// Engine callback for **stats-based** evaluation of an opaque predicate, for file data skipping.
+///
+/// Like [`EngineEvalRowsFn`], but each `Column` arg arrives as a per-file 4-field struct indexed by
+/// position: `0`=min, `1`=max (column type; null if not collected), `2`=nullcount, `3`=rowcount
+/// (`Int64`; null if not collected). `Literal`/`Predicate` args are unchanged. The engine returns
+/// one bool per file: `false` = skip, `true`/`null` = keep.
+///
+/// Stats are *conservative*: `min`/`max` only bound the values and `nullcount`/`rowcount` may
+/// overcount, so skip a file only when the predicate *cannot* hold for any value in `[min, max]`.
+/// Returning `false` (skip) on null/absent bounds is unsound: during checkpoint replay the skipping
+/// batch also carries Remove rows (which have null stats), and dropping one resurrects a deleted
+/// file -- corrupting Add/Remove reconciliation, not just pruning accuracy. Keep (`true`/`null`)
+/// whenever the stats can't prove the predicate impossible.
+/// When `inverted`, evaluate `NOT op` -- not `!verdict`; if you can't reason soundly about the
+/// negated op, keep every file. Result/allocation/panic contract matches [`EngineEvalRowsFn`].
+pub type EngineEvalStatsFn = unsafe extern "C" fn(
+    engine_state: *mut c_void,
+    op_name: KernelStringSlice,
+    args_in: *mut ArrowFFIData,
     inverted: bool,
 ) -> OptionalValue<*mut ArrowFFIData>;
 
@@ -127,8 +89,10 @@ pub struct COpaqueEvalCallbacks {
     /// Opaque engine state; passed back as the first argument to each
     /// callback.
     pub engine_state: *mut c_void,
-    /// Predicate-evaluation callback.
-    pub eval_pred: EngineEvalPredFn,
+    /// Row-time evaluation: one verdict per data row.
+    pub eval_pred_rows: EngineEvalRowsFn,
+    /// Stats-based evaluation for file data skipping: one verdict per file.
+    pub eval_pred_stats: EngineEvalStatsFn,
     /// Destructor for `engine_state`. Called once when the last reference
     /// to the eval context is dropped; may run on any kernel thread.
     pub free_state: EngineFreeStateFn,
@@ -196,7 +160,6 @@ pub(crate) mod tests {
         _state: *mut c_void,
         _op_name: KernelStringSlice,
         _args_in: *mut ArrowFFIData,
-        _mode: EvalMode,
         _inverted: bool,
     ) -> OptionalValue<*mut ArrowFFIData> {
         OptionalValue::None
@@ -211,7 +174,8 @@ pub(crate) mod tests {
         TEST_FREES.store(0, Ordering::SeqCst);
         let cb = COpaqueEvalCallbacks {
             engine_state: ptr::null_mut(),
-            eval_pred: noop_eval_pred,
+            eval_pred_rows: noop_eval_pred,
+            eval_pred_stats: noop_eval_pred,
             free_state: counting_free_state,
         };
         let ctx = unsafe { create_opaque_eval_context(cb) };
@@ -225,7 +189,8 @@ pub(crate) mod tests {
         TEST_FREES.store(0, Ordering::SeqCst);
         let cb = COpaqueEvalCallbacks {
             engine_state: ptr::null_mut(),
-            eval_pred: noop_eval_pred,
+            eval_pred_rows: noop_eval_pred,
+            eval_pred_stats: noop_eval_pred,
             free_state: counting_free_state,
         };
         let arc1 = Arc::new(cb);

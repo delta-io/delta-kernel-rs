@@ -757,8 +757,8 @@ fn visit_predicate_opaque_impl(
 /// and route it through the default engine's Arrow batch evaluator. Kernel
 /// pre-evaluates each child arg recursively via its standard
 /// `evaluate_expression`, exports the resulting columns as a single
-/// `RecordBatch` over Arrow C Data Interface, and invokes the engine's
-/// `eval_pred` callback. Engine never walks the AST.
+/// `RecordBatch` over Arrow C Data Interface, and invokes the engine's eval
+/// callback. Engine never walks the AST.
 ///
 /// Returns 0 if any child ID is invalid.
 ///
@@ -1143,7 +1143,7 @@ mod tests {
 
         use crate::engine_data::ArrowFFIData;
         use crate::expressions::opaque_eval::{
-            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks, EvalMode,
+            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks,
         };
         use crate::OptionalValue;
 
@@ -1153,7 +1153,6 @@ mod tests {
             _: *mut c_void,
             _: KernelStringSlice,
             _: *mut ArrowFFIData,
-            _: EvalMode,
             _: bool,
         ) -> OptionalValue<*mut ArrowFFIData> {
             OptionalValue::None
@@ -1166,7 +1165,8 @@ mod tests {
         let ctx = unsafe {
             create_opaque_eval_context(COpaqueEvalCallbacks {
                 engine_state: std::ptr::null_mut(),
-                eval_pred: stub_eval,
+                eval_pred_rows: stub_eval,
+                eval_pred_stats: stub_eval,
                 free_state: counting_free,
             })
         };
@@ -1208,7 +1208,12 @@ mod tests {
     /// 3-file in-memory table with disjoint `id` ranges. The engine callback prunes files whose
     /// [min, max] excludes 25, so only the file covering [20, 30] survives -- proving the symbol ->
     /// rewrite -> StatsMode dispatch -> file pruning chain works against a real log.
-    #[cfg(feature = "default-engine-base")]
+    // Gated on a TLS backend (not bare `default-engine-base`): this test builds a real
+    // `DefaultEngineBuilder`, and kernel cannot compile with `default-engine-base` alone.
+    #[cfg(any(
+        feature = "default-engine-rustls",
+        feature = "default-engine-native-tls"
+    ))]
     #[tokio::test(flavor = "multi_thread")]
     async fn opaque_predicate_prunes_files_end_to_end() {
         use std::ffi::c_void;
@@ -1219,15 +1224,15 @@ mod tests {
         use delta_kernel::arrow::array::{
             Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StructArray,
         };
-        use delta_kernel::engine::default::DefaultEngineBuilder;
         use delta_kernel::object_store::memory::InMemory;
         use delta_kernel::scan::state::ScanFile;
         use delta_kernel::Snapshot;
+        use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 
         use crate::engine_data::ArrowFFIData;
         use crate::expressions::opaque_eval::{
-            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks, EvalMode,
+            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks,
         };
         use crate::OptionalValue;
 
@@ -1239,10 +1244,8 @@ mod tests {
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
-            mode: EvalMode,
             _inverted: bool,
         ) -> OptionalValue<*mut ArrowFFIData> {
-            assert_eq!(mode, EvalMode::StatsMode);
             CALLS.fetch_add(1, Ordering::SeqCst);
 
             let array =
@@ -1302,7 +1305,8 @@ mod tests {
         let ctx = unsafe {
             create_opaque_eval_context(COpaqueEvalCallbacks {
                 engine_state: std::ptr::null_mut(),
-                eval_pred: engine_in_range,
+                eval_pred_rows: engine_in_range,
+                eval_pred_stats: engine_in_range,
                 free_state: noop_free,
             })
         };
