@@ -548,13 +548,9 @@ impl StructPatchNode<StructField> {
                             input_field.name()
                         )));
                     };
-                    let patched = node.build_schema(nested_schema)?;
-                    output_fields.push(StructField {
-                        name: input_field.name().clone(),
-                        data_type: DataType::Struct(Box::new(patched)),
-                        nullable: input_field.nullable,
-                        metadata: input_field.metadata.clone(),
-                    });
+                    let field = node.build_schema(nested_schema)?;
+                    let field = StructField::new(input_field.name(), field, input_field.nullable);
+                    output_fields.push(field.with_metadata(input_field.metadata.clone()));
                 }
             }
             output_fields.extend(field_patch.insert_after);
