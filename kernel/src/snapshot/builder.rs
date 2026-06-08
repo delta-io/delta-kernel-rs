@@ -160,17 +160,13 @@ impl SnapshotBuilder {
         self
     }
 
-    /// Bound how many commits kernel will replay to advance a stale on-disk CRC to the target
-    /// version. See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
+    /// Bound how many commits kernel will replay to advance a stale CRC to the target version.
+    /// See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
     ///
     /// Writers should set this to [`IncrementalReplay::Unlimited`] for faster writes, as should
     /// readers that always want table-level file statistics for query optimization.
     ///
-    /// This setting applies only to builds from a table root; it does not carry into incremental
-    /// updates derived from the resulting snapshot. [`Snapshot::builder_from`] does not yet advance
-    /// stale CRCs regardless of this value (see #2674).
-    ///
-    /// [`Snapshot::builder_from`]: crate::Snapshot::builder_from
+    /// Applies to both fresh and incremental builds.
     pub fn with_incremental_crc_replay(mut self, mode: IncrementalReplay) -> Self {
         self.incremental_replay = mode;
         self
@@ -264,6 +260,7 @@ impl SnapshotBuilder {
                         engine,
                         effective_version,
                         operation_id,
+                        incremental_replay,
                     )
                 })
         };

@@ -219,6 +219,19 @@ impl LogSegment {
                 None
             };
 
+        // A CRC describes the table state at its version, so it can never predate the checkpoint.
+        if let (Some(crc), Some(checkpoint_version)) =
+            (&listed_files.latest_crc_file, checkpoint_version)
+        {
+            require!(
+                crc.version >= checkpoint_version,
+                Error::internal_error(format!(
+                    "CRC file version {} is older than checkpoint version {checkpoint_version}",
+                    crc.version
+                ))
+            );
+        }
+
         validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,

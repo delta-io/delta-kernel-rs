@@ -72,21 +72,31 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 impl LogSegment {
-    /// Try to build the CRC at this segment's `end_version`. Handles three cases:
-    /// - Case 1: CRC absent (1A) or read fails (1B) -> return None
-    /// - Case 2: CRC at `end_version` -> return it as-is
-    /// - Case 3: Stale CRC older than `end_version` -> advance it to `end_version` when
-    ///   `incremental_replay` permits, else fall back to normal log replay (return None)
+    /// Try to build the CRC at this segment's `end_version` from this segment's on-disk
+    /// `latest_crc_file`. See [`Self::try_build_incremental_crc_with_base`].
     pub(crate) fn try_build_incremental_crc(
         &self,
         engine: &dyn Engine,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Option<Arc<Crc>>> {
-        let Some(crc_file) = self.listed.latest_crc_file.as_ref() else {
-            return Ok(None); // Case 1A
-        };
-        let Some(base_crc) = read_crc_file_or_none(engine, crc_file) else {
-            return Ok(None); // Case 1B
+        self.try_build_incremental_crc_with_base(engine, None, incremental_replay)
+    }
+
+    /// Try to build the CRC at this segment's `end_version` from the best available base: the
+    /// in-memory base (e.g. the CRC the updating snapshot holds) or this segment's on-disk CRC.
+    /// Handles three cases:
+    /// - Case 1: no base CRC available -> return None
+    /// - Case 2: base CRC at `end_version` -> return it as-is
+    /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
+    ///   `incremental_replay` permits, else fall back to normal log replay (return None)
+    pub(crate) fn try_build_incremental_crc_with_base(
+        &self,
+        engine: &dyn Engine,
+        in_memory_base: Option<&Arc<Crc>>,
+        incremental_replay: IncrementalReplay,
+    ) -> DeltaResult<Option<Arc<Crc>>> {
+        let Some(base_crc) = self.pick_best_base_crc(engine, in_memory_base) else {
+            return Ok(None); // Case 1 (1A: absent, 1B: read failed)
         };
         if base_crc.version == self.end_version {
             return Ok(Some(base_crc)); // Case 2
@@ -97,6 +107,26 @@ impl LogSegment {
         }
         let advanced = self.build_incremental_crc_from_base(engine, &base_crc)?;
         Ok(Some(Arc::new(advanced)))
+    }
+
+    /// Pick the higher-version of the in-memory base and this segment's on-disk CRC.
+    fn pick_best_base_crc(
+        &self,
+        engine: &dyn Engine,
+        in_memory_base: Option<&Arc<Crc>>,
+    ) -> Option<Arc<Crc>> {
+        // The on-disk CRC is read only when strictly newer than the in-memory base, falling back
+        // to the in-memory base if that read fails.
+        let disk_crc = self.listed.latest_crc_file.as_ref();
+        let disk_is_newer =
+            disk_crc.is_some_and(|f| in_memory_base.is_none_or(|m| f.version > m.version));
+        if disk_is_newer {
+            disk_crc
+                .and_then(|f| read_crc_file_or_none(engine, f))
+                .or_else(|| in_memory_base.cloned())
+        } else {
+            in_memory_base.cloned()
+        }
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
