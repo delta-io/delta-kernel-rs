@@ -194,10 +194,21 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure,
-            // Non-lifecycle events have no failure form and never fire an `error` field. A new
-            // event that adds `err` instrumentation without a failure mapping would silently
-            // pass through here as a success.
-            other => other,
+            // Events with no failure form pass through unchanged.
+            // Note: here we list explicitly so adding a lifecycle event without a failure mapping
+            //       fails to compile.
+            e @ (Self::LogSegmentLoadFailure(_)
+            | Self::ProtocolMetadataLoadFailure(_)
+            | Self::SnapshotBuildFailure(_)
+            | Self::DomainMetadataLoadFailure
+            | Self::SetTransactionLoadFailure
+            | Self::CrcReadFailure
+            | Self::JsonReadCompleted(_)
+            | Self::ParquetReadCompleted(_)
+            | Self::ScanMetadataCompleted(_)
+            | Self::StorageListCompleted(_)
+            | Self::StorageReadCompleted(_)
+            | Self::StorageCopyCompleted(_)) => e,
         }
     }
 }
@@ -238,6 +249,7 @@ impl fmt::Display for MetricEvent {
 // not a multi-segment path like `Type::SPAN_NAME`.
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
+/// A log segment was listed and assembled for a snapshot.
 #[derive(Debug, Clone)]
 pub struct LogSegmentLoadSuccess {
     // === Set on span creation ===
@@ -313,6 +325,7 @@ impl fmt::Display for LogSegmentLoadSuccess {
     }
 }
 
+/// Listing the log segment for a snapshot failed.
 #[derive(Debug, Clone)]
 pub struct LogSegmentLoadFailure {
     pub operation_id: MetricId,
@@ -330,6 +343,7 @@ impl fmt::Display for LogSegmentLoadFailure {
 
 pub(crate) const PROTOCOL_METADATA_LOADED_SPAN: &str = "segment.read_metadata";
 
+/// Protocol and metadata actions were read from the log.
 #[derive(Debug, Clone)]
 pub struct ProtocolMetadataLoadSuccess {
     // === Set on span creation ===
@@ -367,6 +381,7 @@ impl fmt::Display for ProtocolMetadataLoadSuccess {
     }
 }
 
+/// Reading protocol and metadata from the log failed.
 #[derive(Debug, Clone)]
 pub struct ProtocolMetadataLoadFailure {
     pub operation_id: MetricId,
@@ -384,6 +399,7 @@ impl fmt::Display for ProtocolMetadataLoadFailure {
 
 pub(crate) const SNAPSHOT_COMPLETED_SPAN: &str = "snap.build";
 
+/// A snapshot was built successfully.
 #[derive(Debug, Clone)]
 pub struct SnapshotBuildSuccess {
     // === Set on span creation ===
@@ -438,6 +454,7 @@ impl fmt::Display for SnapshotBuildSuccess {
 // SnapshotBuildFailure
 // ====================================================================
 
+/// Building a snapshot failed.
 #[derive(Debug, Clone)]
 pub struct SnapshotBuildFailure {
     pub operation_id: MetricId,
@@ -971,6 +988,7 @@ impl Visit for StorageAttrs {
 // StorageListCompleted
 // ============================
 
+/// A storage list operation completed.
 #[derive(Debug, Clone)]
 pub struct StorageListCompleted {
     // === Set on span creation ===
@@ -999,6 +1017,7 @@ impl fmt::Display for StorageListCompleted {
 // StorageReadCompleted
 // ============================
 
+/// A storage read operation completed.
 #[derive(Debug, Clone)]
 pub struct StorageReadCompleted {
     // === Set on span creation ===
@@ -1029,6 +1048,7 @@ impl fmt::Display for StorageReadCompleted {
 // StorageCopyCompleted
 // ============================
 
+/// A storage copy or rename operation completed.
 #[derive(Debug, Clone)]
 pub struct StorageCopyCompleted {
     // === Set on span creation ===
