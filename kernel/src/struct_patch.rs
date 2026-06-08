@@ -442,7 +442,7 @@ impl StructPatchBuilder<ExpressionRef> {
     /// nested child field.
     pub fn build(self) -> DeltaResult<ExpressionStructPatch> {
         self.error?;
-        self.root.into_struct_patch(self.input_path)
+        Ok(self.root.into_struct_patch(self.input_path))
     }
 }
 
@@ -455,22 +455,19 @@ impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
 }
 
 impl StructPatchNode<ExpressionRef> {
-    fn into_struct_patch(
-        self,
-        input_path: Option<ColumnName>,
-    ) -> DeltaResult<ExpressionStructPatch> {
+    fn into_struct_patch(self, input_path: Option<ColumnName>) -> ExpressionStructPatch {
         let mut field_patches = HashMap::with_capacity(self.fields.len());
         for (field_name, state) in self.fields {
-            let patch = state.into_field_patch(input_path.as_ref(), &field_name)?;
+            let patch = state.into_field_patch(input_path.as_ref(), &field_name);
             field_patches.insert(field_name, patch);
         }
 
-        Ok(ExpressionStructPatch {
+        ExpressionStructPatch {
             field_patches,
             prepended_fields: self.prepended_fields,
             appended_fields: self.appended_fields,
             input_path,
-        })
+        }
     }
 }
 
@@ -479,15 +476,10 @@ impl FieldPatchNode<ExpressionRef> {
         self,
         parent_input_path: Option<&ColumnName>,
         field_name: &str,
-    ) -> DeltaResult<ExpressionFieldPatch> {
+    ) -> ExpressionFieldPatch {
         let mut field_patch = ExpressionFieldPatch::default();
         match self.action {
             FieldPatchOp::Keep => {
-                if self.insert_after.is_empty() {
-                    return Err(Error::generic(format!(
-                        "Internal error: builder produced a no-op patch for field '{field_name}'"
-                    )));
-                }
                 field_patch.keep_input = true;
             }
             FieldPatchOp::Drop { optional } => {
@@ -497,28 +489,19 @@ impl FieldPatchNode<ExpressionRef> {
                 field_patch.insertions.push(expr);
             }
             FieldPatchOp::Nested(node) => {
-                if node.prepended_fields.is_empty()
-                    && node.appended_fields.is_empty()
-                    && node.fields.is_empty()
-                {
-                    return Err(Error::generic(format!(
-                        "Internal error: builder produced an empty nested patch for field \
-                         '{field_name}'"
-                    )));
-                }
                 let field_name = ColumnName::new([field_name]);
                 let child_input_path = match parent_input_path {
                     Some(parent) => parent.join(&field_name),
                     None => field_name,
                 };
-                let child_patch = node.into_struct_patch(Some(child_input_path))?;
+                let child_patch = node.into_struct_patch(Some(child_input_path));
                 let child_patch = Arc::new(Expression::StructPatch(child_patch));
                 field_patch.insertions.push(child_patch);
             }
         }
 
         field_patch.insertions.extend(self.insert_after);
-        Ok(field_patch)
+        field_patch
     }
 }
 
@@ -622,7 +605,6 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{FieldPatchNode, FieldPatchOp, StructPatchNode};
     use crate::expressions::{lit, Expression as Expr, ExpressionStructPatchBuilder};
     use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -681,17 +663,6 @@ mod tests {
                 .as_deref(),
             Some("nested")
         );
-    }
-
-    #[test]
-    fn struct_patch_builder_rejects_impossible_empty_nested_patch() {
-        let result = FieldPatchNode {
-            action: FieldPatchOp::Nested(Box::<StructPatchNode<_>>::default()),
-            insert_after: vec![],
-        }
-        .into_field_patch(None, "add");
-
-        assert_result_error_with_message(result, "empty nested patch");
     }
 
     #[rstest]
