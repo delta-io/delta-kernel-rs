@@ -4,19 +4,24 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
+use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine, FileStats, Version};
 use rstest::rstest;
-use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::{add_commit, begin_transaction, insert_data, test_table_setup};
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use test_utils::{
+    add_commit, begin_transaction, insert_data, test_table_setup, test_table_setup_mt,
+};
 use url::Url;
 
 // ============================================================================
@@ -66,7 +71,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
+async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -> DeltaResult<()> {
     use test_utils::copy_directory;
 
     // ===== GIVEN =====
@@ -82,17 +87,23 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
     assert!(snapshot.get_file_stats_if_present().is_some());
 
     // ===== WHEN =====
-    // Empty commit to advance to version 1 (no new CRC file written)
-    let _ = begin_transaction(snapshot, engine.as_ref())?.commit(engine.as_ref())?;
+    // Safe (WRITE) commit with no file actions advances to version 1 (no new CRC written).
+    begin_transaction(snapshot, engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
 
     // ===== THEN =====
-    // Load a fresh snapshot at version 1
-    let snapshot = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    // The fresh v1 build advances the stale v0 CRC; the safe commit added no files, so file
+    // stats stay Complete and are served at v1 unchanged.
+    let snapshot = Snapshot::builder_for(table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
-
-    // No CRC at version 1, so file stats should be None
-    let file_stats = snapshot.get_file_stats_if_present();
-    assert_eq!(file_stats, None);
+    assert_eq!(snapshot.crc().unwrap().version, 1);
+    let stats = snapshot.get_file_stats_if_present().unwrap();
+    assert_eq!(stats.num_files(), 10);
+    assert_eq!(stats.table_size_bytes(), 5259);
 
     Ok(())
 }
@@ -1545,6 +1556,282 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         assert_eq!(counts.len(), 95, "default bins should have 95 bins");
         assert_histogram_totals(stats_v2, 2, total_disk_bytes);
     }
+
+    Ok(())
+}
+
+// ============================================================================
+// Stale-CRC advance on fresh build (reverse-replay)
+// ============================================================================
+
+// Commit one data file plus DomainMetadata "domain"->"value_{v}" and SetTxn "app"->{v} where `v` is
+// the commit version.
+async fn commit_with_dm_and_txn<E: TaskExecutor>(
+    snapshot: SnapshotRef,
+    engine: &Arc<DefaultEngine<E>>,
+    v: i64,
+) -> DeltaResult<SnapshotRef> {
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+    let batch = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![v as i32]))],
+    )
+    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_data_change(true)
+        .with_domain_metadata("domain".to_string(), format!("value_{v}"))
+        .with_transaction_id("app".to_string(), v);
+    let write_context = txn.unpartitioned_write_context()?;
+    let adds = engine
+        .write_parquet(&ArrowEngineData::new(batch), &write_context)
+        .await?;
+    txn.add_files(adds);
+    Ok(txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrcStaleness {
+    MidSegment,
+    AtCheckpoint,
+    Absent,
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stale_crc_fresh_build_advance_matrix(
+    #[values(
+        CrcStaleness::MidSegment,
+        CrcStaleness::AtCheckpoint,
+        CrcStaleness::Absent
+    )]
+    crc_staleness: CrcStaleness,
+    #[values(false, true)] crc_missing_opt_fields: bool,
+) -> DeltaResult<()> {
+    const CHECKPOINT_VERSION: i64 = 10;
+    const LATEST_VERSION: i64 = 20;
+    let crc_version = match crc_staleness {
+        CrcStaleness::MidSegment => Some((CHECKPOINT_VERSION + LATEST_VERSION) / 2),
+        CrcStaleness::AtCheckpoint => Some(CHECKPOINT_VERSION),
+        CrcStaleness::Absent => None,
+    };
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    // === Step 1: Create table with clustering, rowTracking, ICT ===
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let mut snap = create_table(&table_path, schema, "test_engine")
+        .with_data_layout(DataLayout::clustered(["id"]))
+        .with_table_properties([
+            ("delta.enableRowTracking", "true"),
+            ("delta.enableInCommitTimestamps", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .with_domain_metadata("domain_at_create".to_string(), "value_0".to_string())
+        .with_transaction_id("app_at_create".to_string(), 0)
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    // === Step 2: Commits up to CHECKPOINT_VERSION, followed by a checkpoint. ===
+    for v in 1..=CHECKPOINT_VERSION {
+        snap = commit_with_dm_and_txn(snap, &engine, v).await?;
+    }
+    snap = snap.checkpoint(engine.as_ref(), None)?.1;
+
+    // === Step 3: Commit up to LATEST_VERSION, writing the CRC at its target version. ===
+    //
+    // Each commit will write:
+    // - DomainMetadata: "domain"->"value_{v}"
+    // - SetTxn: "app"->{v}
+    if crc_version == Some(CHECKPOINT_VERSION) {
+        snap.write_checksum(engine.as_ref())?;
+    }
+    for v in (CHECKPOINT_VERSION + 1)..=LATEST_VERSION {
+        snap = commit_with_dm_and_txn(snap, &engine, v).await?;
+        if crc_version == Some(v) {
+            snap.write_checksum(engine.as_ref())?;
+        }
+    }
+
+    // If test setup required missing CRC fields, then remove all optional ones.
+    if let Some(v) = crc_version.filter(|_| crc_missing_opt_fields) {
+        for field in ["fileSizeHistogram", "domainMetadata", "setTransactions"] {
+            strip_field_from_crc(&table_path, v as u64, field);
+        }
+    }
+
+    // === Step 4: A fresh Snapshot at the latest version. ===
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.version() as i64, LATEST_VERSION);
+
+    let expect_crc_present = crc_staleness != CrcStaleness::Absent;
+
+    // Define our engines that will be used below.
+    let real_engine_iff_crc_missing: &dyn Engine = if expect_crc_present {
+        &FailingEngine
+    } else {
+        engine.as_ref()
+    };
+    let real_engine_iff_crc_missing_or_crc_missing_opt_fields: &dyn Engine =
+        if expect_crc_present && !crc_missing_opt_fields {
+            &FailingEngine
+        } else {
+            engine.as_ref()
+        };
+
+    // === Check: CRC presence ===
+    assert_eq!(
+        fresh.crc().map(|c| c.version as i64),
+        expect_crc_present.then_some(LATEST_VERSION)
+    );
+
+    // === Check: file stats ===
+    let stats = fresh.get_file_stats_if_present();
+    assert_eq!(stats.is_some(), expect_crc_present);
+    if let Some(stats) = stats {
+        let disk = parquet_file_sizes_on_disk(&table_path);
+        assert_eq!(stats.num_files() as usize, disk.len());
+        assert_eq!(stats.table_size_bytes(), disk.iter().sum::<i64>());
+        assert_eq!(
+            stats.file_size_histogram().is_some(),
+            !crc_missing_opt_fields
+        );
+    }
+
+    // === Check: ICT ===
+    // - If no CRC, then we must re-read the latest commit -> need real engine.
+    // - Else, we did CRC replay and cached the result -> use fake engine.
+    assert!(fresh
+        .get_in_commit_timestamp(real_engine_iff_crc_missing)?
+        .is_some());
+
+    // For both domain metadata and set transaction checks below:
+    // - If no CRC, then we must read non-zero commits -> need real engine.
+    // - Else, there is a CRC:
+    //   - If we want a value set *before* the CRC was written (e.g. in create), then we need a real
+    //     engine only if the CRC is missing optional fields.
+    //   - If we want a value set *after* the CRC was written (e.g. in an insert), then we can use a
+    //     fake engine.
+
+    // === Check: domain metadata written *before* the CRC ===
+    for domain in ["domain_at_create", "delta.clustering"] {
+        assert!(fresh
+            .get_domain_metadata_internal(
+                domain,
+                real_engine_iff_crc_missing_or_crc_missing_opt_fields
+            )?
+            .is_some());
+    }
+
+    // === Check: domain metadata written *after* the CRC ===
+    for domain in ["domain", "delta.rowTracking"] {
+        assert!(fresh
+            .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
+            .is_some());
+    }
+
+    // === Check: set transactions written *before* the CRC ===
+    assert_eq!(
+        fresh.get_app_id_version(
+            "app_at_create",
+            real_engine_iff_crc_missing_or_crc_missing_opt_fields
+        )?,
+        Some(0)
+    );
+
+    // === Check: set transactions written *after* the CRC ===
+    assert_eq!(
+        fresh.get_app_id_version("app", real_engine_iff_crc_missing)?,
+        Some(LATEST_VERSION)
+    );
+
+    // === Check: write_checksum ===
+    if expect_crc_present {
+        assert_eq!(
+            fresh.write_checksum(engine.as_ref())?.0,
+            ChecksumWriteResult::Written
+        );
+    } else {
+        assert!(matches!(
+            fresh.write_checksum(engine.as_ref()),
+            Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+        ));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // ===== GIVEN: a CRC at v0 (made stale by an insert at v1) =====
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    snap.write_checksum(engine.as_ref())?;
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+
+    // ===== WHEN: a non-incremental operation (ANALYZE STATS) commits at v2 =====
+    begin_transaction(snap, engine.as_ref())?
+        .with_operation("ANALYZE STATS".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // ===== THEN: advancing the stale CRC trips file stats to Indeterminate, so they are not
+    // served and write_checksum is rejected =====
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 2);
+    assert!(fresh.crc().unwrap().file_stats_state().is_indeterminate());
+    assert_eq!(fresh.get_file_stats_if_present(), None);
+    assert!(matches!(
+        fresh.write_checksum(engine.as_ref()),
+        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    snap.write_checksum(engine.as_ref())?;
+    insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_committed();
+
+    let commit_v1 = _temp_dir
+        .path()
+        .join("_delta_log/00000000000000000001.json");
+    std::fs::write(&commit_v1, b"}}} not valid commit json").unwrap();
+
+    assert!(Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())
+        .is_err());
 
     Ok(())
 }

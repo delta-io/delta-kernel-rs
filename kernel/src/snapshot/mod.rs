@@ -17,8 +17,7 @@ use crate::checkpoint::{
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
-    read_crc_file_or_none, try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileStats,
-    SetTransactionState,
+    try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileStats, SetTransactionState,
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
@@ -38,7 +37,7 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
 mod incremental;
-pub use builder::SnapshotBuilder;
+pub use builder::{IncrementalReplay, SnapshotBuilder};
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -171,30 +170,30 @@ impl Snapshot {
         })
     }
 
-    /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`], eagerly resolving the
-    /// CRC at the segment's end version when one is present on disk.
+    /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`], taking Protocol and
+    /// Metadata from the resolved CRC when one is present.
     #[instrument(err, fields(version, operation_id = %operation_id), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
         operation_id: MetricId,
+        incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Self> {
-        let read_crc = log_segment
-            .listed
-            .latest_crc_file
-            .as_ref()
-            .and_then(|crc_file| read_crc_file_or_none(engine, crc_file));
+        let crc = log_segment.try_build_incremental_crc(engine, incremental_replay)?;
 
-        let (metadata, protocol) =
-            log_segment.read_protocol_metadata(engine, read_crc.as_ref(), operation_id)?;
+        // TODO(#2677): emit an `IncrementalCrcLoad` metric on the CRC branch; the
+        //              `ProtocolMetadataLoaded` span only fires on the replay branch below.
+        let (metadata, protocol) = match crc.as_deref() {
+            Some(c) => (c.metadata.clone(), c.protocol.clone()),
+            None => log_segment.read_protocol_metadata(engine, operation_id)?,
+        };
 
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
         tracing::Span::current().record("version", table_configuration.version());
 
-        let crc = read_crc.filter(|c| c.version == log_segment.end_version);
         Self::new_with_crc(log_segment, table_configuration, crc)
     }
 

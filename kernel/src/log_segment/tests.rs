@@ -4179,7 +4179,7 @@ async fn test_get_unpublished_catalog_commits() {
 }
 
 // ============================================================================
-// Tests: segment_after_crc
+// Tests: segment_after_version
 // ============================================================================
 
 fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
@@ -4286,7 +4286,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     })
     .await;
 
-    let after = seg.segment_after_crc(case.crc_version);
+    let after = seg.segment_after_version(case.crc_version);
     assert_eq!(extract_commit_versions(&after), case.after_commits);
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
     assert!(after.checkpoint_version.is_none());

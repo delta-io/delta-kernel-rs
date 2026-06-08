@@ -20,6 +20,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
+use crate::snapshot::IncrementalReplay;
 use crate::{DeltaResult, Engine, Snapshot};
 
 // ============================================================================
@@ -408,13 +409,21 @@ impl BuiltCrcTest {
     /// Build a snapshot at `version` (or latest if `None`) and return it
     /// alongside a human-readable label like `"v2"` or `"latest"`.
     fn snapshot_at(&self, version: Option<u64>) -> (crate::snapshot::SnapshotRef, String) {
-        let mut builder = Snapshot::builder_for(self.url.clone());
+        let mut builder = Snapshot::builder_for(self.url.clone())
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited);
         if let Some(v) = version {
             builder = builder.at_version(v);
         }
         let snapshot = builder.build(&self.engine).unwrap();
         let label = version.map_or("latest".to_string(), |v| format!("v{v}"));
         (snapshot, label)
+    }
+
+    fn snapshot_latest_with_replay(&self, mode: IncrementalReplay) -> crate::snapshot::SnapshotRef {
+        Snapshot::builder_for(self.url.clone())
+            .with_incremental_crc_replay(mode)
+            .build(&self.engine)
+            .unwrap()
     }
 
     fn assert_p_m(
@@ -1150,4 +1159,38 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
     let txn = crc.set_transaction_state.expect_complete();
     assert_eq!(txn["app_a"].version, 1);
     assert_eq!(txn["app_b"].version, 5);
+}
+
+// ============================================================================
+// Tests: incremental-replay budget gate
+// ============================================================================
+
+// Commits 0-3 (target v3) with a CRC at `crc_version`, so distance = 3 - crc_version.
+#[rstest]
+// CRC already at the target (distance 0): used regardless of mode, even Disabled.
+#[case::at_target_disabled(3, IncrementalReplay::Disabled, Some(3))]
+// Stale CRC (distance >= 1): advancement depends on the budget.
+#[case::disabled_stale(1, IncrementalReplay::Disabled, None)]
+#[case::up_to_zero(1, IncrementalReplay::UpToCommits(0), None)]
+#[case::interior(2, IncrementalReplay::UpToCommits(5), Some(3))] // distance 1 < 5
+#[case::at_budget(1, IncrementalReplay::UpToCommits(2), Some(3))] // distance 2 == 2
+#[case::over_budget(1, IncrementalReplay::UpToCommits(1), None)] // distance 2 > 1
+#[case::unlimited(0, IncrementalReplay::Unlimited, Some(3))] // distance 3
+#[tokio::test]
+async fn test_stale_crc_advanced_only_within_replay_budget(
+    #[case] crc_version: u64,
+    #[case] mode: IncrementalReplay,
+    #[case] expected_crc_version: Option<u64>,
+) {
+    let built = CrcReadTest::new()
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .commit(1, [commit_info(DEFAULT_OPERATION, None)])
+        .commit(2, [commit_info(DEFAULT_OPERATION, None)])
+        .commit(3, [commit_info(DEFAULT_OPERATION, None)])
+        .crc(crc_version, protocol_v2(), metadata_a(), None)
+        .build()
+        .await;
+    let snapshot = built.snapshot_latest_with_replay(mode);
+    assert_eq!(snapshot.version(), 3);
+    assert_eq!(snapshot.crc().map(|c| c.version), expected_crc_version);
 }
