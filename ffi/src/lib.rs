@@ -2101,7 +2101,8 @@ mod tests {
         let returned_version = unsafe { version(written_snap.shallow_copy()) };
         assert_eq!(returned_version, input_version);
 
-        // (b) chain a second checkpoint_builder_for(returned_snap, engine) + build => AlreadyExists.
+        // (b) chain a second checkpoint_builder_for(returned_snap, engine) + build =>
+        // AlreadyExists.
         let builder2 =
             unsafe { checkpoint_builder_for(written_snap.shallow_copy(), engine.shallow_copy()) };
         let chained = unsafe { ok_or_panic(checkpoint_builder_build(builder2)) };

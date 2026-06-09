@@ -98,6 +98,14 @@ int main(int argc, char* argv[]) {
     free_error((Error*)engine_builder_res.err);
     return 1;
   }
+  // Snapshot::checkpoint performs async I/O (read commit JSONs + write parquet checkpoint /
+  // sidecars). Calling it from sync C without an explicit executor would hang waiting for one,
+  // because DefaultEngineBuilder's lazy-executor path needs an outer tokio runtime to capture
+  // and there isn't one here. Set a small multithreaded executor (2 workers, default blocking
+  // threads) to drive the engine's async work.
+  set_builder_with_multithreaded_executor(engine_builder_res.ok,
+                                          /*worker_threads*/ 2,
+                                          /*max_blocking_threads*/ 0);
   ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder_res.ok);
   if (engine_res.tag != OkHandleSharedExternEngine) {
     print_error("Failed to build engine.", (Error*)engine_res.err);
