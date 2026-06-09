@@ -14,7 +14,7 @@ use std::sync::Arc;
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -733,43 +733,6 @@ pub struct FfiCheckpointBuilder {
 #[handle_descriptor(target=FfiCheckpointBuilder, mutable=true, sized=true)]
 pub struct MutableFfiCheckpointBuilder;
 
-/// Outcome of a checksum (CRC file) write performed via [`checksum_builder_build`].
-///
-/// `Written` indicates the kernel wrote a new CRC file at this version and returns an
-/// updated snapshot whose log segment reflects it. `AlreadyExists` indicates a CRC file
-/// at this version was already present (either pre-existed or was written by a concurrent
-/// writer) and returns the original snapshot unchanged.
-///
-/// Both variants carry an owned `Handle<SharedSnapshot>` that the caller must release via
-/// [`free_snapshot`].
-///
-/// cbindgen:prefix-with-name=true
-#[repr(C)]
-pub enum FfiChecksumWriteResult {
-    Written(Handle<SharedSnapshot>),
-    AlreadyExists(Handle<SharedSnapshot>),
-}
-
-impl FfiChecksumWriteResult {
-    fn from_kernel(result: ChecksumWriteResult, snapshot: SnapshotRef) -> Self {
-        match result {
-            ChecksumWriteResult::Written => Self::Written(snapshot.into()),
-            ChecksumWriteResult::AlreadyExists => Self::AlreadyExists(snapshot.into()),
-        }
-    }
-}
-
-/// Opaque builder for a checksum (CRC file) write. There are no setters — checksum writes
-/// take no configuration; call [`checksum_builder_build`] to perform the write or
-/// [`free_checksum_builder`] to discard without writing.
-pub struct FfiChecksumBuilder {
-    engine: Arc<dyn ExternEngine>,
-    snapshot: SnapshotRef,
-}
-
-#[handle_descriptor(target=FfiChecksumBuilder, mutable=true, sized=true)]
-pub struct MutableFfiChecksumBuilder;
-
 #[handle_descriptor(target=Protocol, mutable=false, sized=true)]
 pub struct SharedProtocol;
 
@@ -1074,63 +1037,6 @@ pub unsafe extern "C" fn checkpoint_builder_build(
 /// Caller must pass a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn free_checkpoint_builder(builder: Handle<MutableFfiCheckpointBuilder>) {
-    builder.drop_handle();
-}
-
-/// Create a checksum (CRC file) builder for the given snapshot. Infallible.
-///
-/// The returned builder holds owned Arc clones of both the snapshot and the engine; the
-/// caller may release the input handles immediately if desired.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles.
-#[no_mangle]
-pub unsafe extern "C" fn checksum_builder_for(
-    snapshot: Handle<SharedSnapshot>,
-    engine: Handle<SharedExternEngine>,
-) -> Handle<MutableFfiChecksumBuilder> {
-    let engine = unsafe { engine.clone_as_arc() };
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    Box::new(FfiChecksumBuilder { engine, snapshot }).into()
-}
-
-/// Perform the checksum (CRC) write. Consumes the builder; the pointer is no longer valid
-/// after this call regardless of outcome.
-///
-/// Returns [`FfiChecksumWriteResult::Written`] with the post-checksum snapshot (whose log
-/// segment records the new CRC file), or [`FfiChecksumWriteResult::AlreadyExists`] with the
-/// original snapshot when a CRC file at this version was already present. In both branches
-/// the caller owns the returned snapshot handle and must release it via [`free_snapshot`].
-///
-/// Note: per the Delta protocol, writers must not overwrite existing version checksum
-/// files. The kernel detects this case both eagerly (via `_last_checkpoint` listing) and
-/// reactively (via `FileAlreadyExists` from a concurrent writer); either path maps to
-/// `AlreadyExists` here.
-///
-/// # Safety
-///
-/// Caller must pass a valid builder pointer and must not use it again afterwards.
-#[no_mangle]
-pub unsafe extern "C" fn checksum_builder_build(
-    builder: Handle<MutableFfiChecksumBuilder>,
-) -> ExternResult<FfiChecksumWriteResult> {
-    let builder_box = unsafe { builder.into_inner() };
-    let FfiChecksumBuilder { engine, snapshot } = *builder_box;
-    let engine_ref: &dyn ExternEngine = engine.as_ref();
-    snapshot
-        .write_checksum(engine.engine().as_ref())
-        .map(|(result, updated)| FfiChecksumWriteResult::from_kernel(result, updated))
-        .into_extern_result(&engine_ref)
-}
-
-/// Discard a checksum builder without writing.
-///
-/// # Safety
-///
-/// Caller must pass a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn free_checksum_builder(builder: Handle<MutableFfiChecksumBuilder>) {
     builder.drop_handle();
 }
 
@@ -2205,63 +2111,6 @@ mod tests {
         }
 
         unsafe { free_snapshot(written_snap) }
-        unsafe { free_snapshot(snapshot) }
-        unsafe { free_engine(engine) }
-        Ok(())
-    }
-
-    // -- FfiChecksumBuilder tests -------------------------------------------------------------
-    //
-    // NOTE: `Snapshot::write_checksum` requires an in-memory CRC available at the snapshot's
-    // version. The kernel populates this via `CommittedTransaction::post_commit_snapshot()` after
-    // a successful commit (see `kernel/tests/integration/log/crc.rs` test_write_checksum_success_simple
-    // for the canonical setup). `Snapshot::checkpoint` does NOT populate `lazy_crc` from scratch;
-    // it just clones whatever was already present.
-    //
-    // A full success-path test for the checksum builder requires a committed-transaction setup
-    // that this PR's FFI surface does not yet expose to C/C++ callers. This single test exercises
-    // the FFI error-plumbing path ("no in-memory CRC available") on a freshly-built snapshot,
-    // proving the builder's `into_inner` + `write_checksum` + `into_extern_result` chain works.
-
-    // Test 8: builder build on a snapshot without in-memory CRC propagates the kernel's
-    // `Error::ChecksumWriteUnsupported` through the FFI as a `KernelError` with the documented
-    // message. Validates FFI error plumbing for the checksum builder.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checksum_builder_propagates_no_in_memory_crc_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        seed_classic_table(storage.as_ref(), table_root, 2).await?;
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
-        );
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
-
-        let builder =
-            unsafe { checksum_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
-        let extern_result = unsafe { checksum_builder_build(builder) };
-
-        // Note: kernel maps `Error::ChecksumWriteUnsupported` to `KernelError::UnknownError`
-        // (no dedicated variant). The exact mapping is a kernel-internal concern; the FFI just
-        // needs to thread the error through cleanly with a recognizable message.
-        assert_extern_result_error_with_message(
-            extern_result,
-            KernelError::UnknownError,
-            Some(
-                "Checksum write unsupported: No in-memory CRC available at this snapshot version.",
-            ),
-        );
-
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
