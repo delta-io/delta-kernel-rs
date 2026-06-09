@@ -76,7 +76,9 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   cargo feature off, writes to tables listing this feature are blocked.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only
+- `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
+  proto wire format mirroring it (`kernel/proto/`). Auto-enables `internal-api` and `arrow`.
+- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
 
 ## Architecture at a Glance
 

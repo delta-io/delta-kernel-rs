@@ -102,6 +102,7 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+/// Declarative plan IR and proto wire format. Opt-in behind `declarative-plans`.
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
 pub mod scan;
