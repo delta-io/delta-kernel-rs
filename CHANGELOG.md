@@ -1,49 +1,5 @@
 # Changelog
 
-## [Unreleased]
-
-### 🏗️ Breaking changes
-
-1. Refactor FFI `checkpoint_snapshot` into an opaque `FfiCheckpointBuilder` family ([#TBD-checkpoint])
-   - Removes the legacy `checkpoint_snapshot` FFI function (which returned `ExternResult<bool>`
-     and discarded both `CheckpointWriteResult` and the updated `SnapshotRef`).
-   - Replaces it with five new functions: `checkpoint_builder_for`,
-     `checkpoint_builder_set_v2_no_sidecar`, `checkpoint_builder_set_v2_with_sidecars`,
-     `checkpoint_builder_build`, and `free_checkpoint_builder`.
-   - Adds a `#[repr(C)] enum FfiCheckpointWriteResult { Written(Handle<SharedSnapshot>),
-     AlreadyExists(Handle<SharedSnapshot>) }` discriminated union returned by
-     `checkpoint_builder_build`, closing the long-standing FFI debt of discarding the kernel's
-     `(CheckpointWriteResult, SnapshotRef)` tuple.
-   - Migration: callers of `checkpoint_snapshot(snapshot, engine)` now call
-     `let builder = checkpoint_builder_for(snapshot, engine);
-      let result = checkpoint_builder_build(builder);` and inspect `result.tag` for `Written` vs
-     `AlreadyExists`; both variants carry an owned `Handle<SharedSnapshot>` that must be released
-     via `free_snapshot`. Adds the C example `ffi/examples/checkpoint-table/` exercising all
-     three sub-flows (inline / V2-no-sidecar / V2-with-sidecars).
-
-### 🚀 Features / new APIs
-
-1. Add symmetric `FfiChecksumBuilder` family wrapping `Snapshot::write_checksum` ([#TBD-checksum])
-   - Adds three new FFI functions: `checksum_builder_for`, `checksum_builder_build`, and
-     `free_checksum_builder`.
-   - Adds `#[repr(C)] enum FfiChecksumWriteResult { Written(Handle<SharedSnapshot>),
-     AlreadyExists(Handle<SharedSnapshot>) }` paralleling the checkpoint builder's return type.
-   - Mirrors the opaque-builder pattern established by `FfiSnapshotBuilder` (PR #2255) and
-     `FfiCheckpointBuilder` (above); no C ctest in this PR per PR #2255 precedent.
-
-### 🐛 Bug Fixes
-
-1. Fix stale `V2Checkpoint` reader-feature doc-comment in `TableFeature` enum ([#TBD-docfix])
-   - Corrects the comment on `pub enum TableFeature` from "The kernel currently supports all
-     reader features except `V2Checkpoint`." to "The kernel currently supports all reader
-     features." The kernel has supported `V2Checkpoint` since v0.5.0 per the `FEATURES`
-     declaration table; the comment had been stale for approximately eighteen months.
-
-[#TBD-checkpoint]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-checkpoint
-[#TBD-checksum]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-checksum
-[#TBD-docfix]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-docfix
-
-
 ## [v0.23.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.23.0/) (2026-05-15)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.22.1...v0.23.0)
