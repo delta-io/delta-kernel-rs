@@ -235,10 +235,9 @@ impl ReadMetadataRunner {
             .map(Arc::new);
 
         let name = format!(
-            "{}/{}/{}/{}",
+            "{}/{}/{}",
             table_info.name,
             case_name,
-            ReadOperation::ReadMetadata.as_str(),
             config.name,
         );
 
@@ -383,10 +382,9 @@ impl SnapshotConstructionRunner {
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let name = format!(
-            "{}/{}/{}",
+            "{}/{}",
             table_info.name,
             case_name,
-            snapshot_spec.as_str()
         );
 
         let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
