@@ -120,6 +120,10 @@ impl CommitRange {
     /// Actions are returned raw, exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
     ///
+    /// This is operation-agnostic: requesting [`DeltaAction::Cdc`] returns the raw `cdc` action
+    /// records and does NOT impose change-data-feed support (`Operation::Cdf`) or require CDF to be
+    /// enabled on the table. It does not materialize a change data feed.
+    ///
     /// Returns `Err` if `actions` is empty or contains duplicate kinds, or if `start_snapshot`
     /// belongs to a different table, its version does not match the range anchor, or its table
     /// does not support scanning.
@@ -191,32 +195,24 @@ pub(crate) struct CommitActionsIterator {
 }
 
 impl CommitActionsIterator {
-    /// Build a `CommitAction` for `log_path`, extract and validate its `(Protocol, Metadata)`,
-    /// and (under ascending ordering) advance the iterator's accumulated state.
+    /// Build and validate a `CommitAction` for `log_path` (seeded with the iterator's accumulated
+    /// state), and (under ascending ordering) advance the accumulated `(Protocol, Metadata)` to
+    /// this commit's effective values.
     fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
         let version = log_path.version;
-        let mut commit_action = CommitAction::new(
+        let commit_action = CommitAction::try_new(
             self.engine.clone(),
             self.table_root.clone(),
             log_path,
             self.read_schema.clone(),
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
-        );
-        let (extracted_protocol, extracted_metadata) = commit_action
-            .get_protocol_and_metadata()
-            .map_err(|e| with_version_context(version, e))?;
-        commit_action
-            .protocol_validation()
-            .map_err(|e| with_version_context(version, e))?;
+        )
+        .map_err(|e| with_version_context(version, e))?;
 
         if self.commit_ordering == CommitOrdering::AscendingOrder {
-            if let Some(p) = extracted_protocol {
-                self.latest_protocol = Some(p);
-            }
-            if let Some(m) = extracted_metadata {
-                self.latest_metadata = Some(m);
-            }
+            self.latest_protocol = commit_action.protocol().cloned();
+            self.latest_metadata = commit_action.metadata().cloned();
         }
         Ok(commit_action)
     }
@@ -266,6 +262,7 @@ fn action_to_field(action: &DeltaAction) -> StructField {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, LazyLock};
 
@@ -743,5 +740,148 @@ mod tests {
             }
             Err(other) => panic!("expected Error::Unsupported, got: {other:?}"),
         }
+    }
+
+    const ICT_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#;
+    const ICT_METADATA_ENABLED: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1000}}"#;
+    const COMMIT_INFO_NO_ICT: &str = r#"{"commitInfo":{"timestamp":0,"operation":"WRITE"}}"#;
+
+    fn ict_metadata_enabled_at(enablement_version: Version, enablement_ts: i64) -> String {
+        format!(
+            r#"{{"metaData":{{"id":"00000000-0000-0000-0000-000000000000","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[]}}","partitionColumns":[],"configuration":{{"delta.enableInCommitTimestamps":"true","delta.inCommitTimestampEnablementVersion":"{enablement_version}","delta.inCommitTimestampEnablementTimestamp":"{enablement_ts}"}},"createdTime":2000}}}}"#
+        )
+    }
+
+    fn commit_info_with_ict(ts: i64) -> String {
+        format!(
+            r#"{{"commitInfo":{{"inCommitTimestamp":{ts},"timestamp":0,"operation":"WRITE"}}}}"#
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedTs {
+        /// Expect exactly this in-commit timestamp.
+        Ict(i64),
+        /// Expect the commit file's `last_modified`.
+        FileModified,
+    }
+
+    #[rstest::rstest]
+    #[case::ict_never_enabled(
+        vec![
+            (0u64, format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE)),
+            (1, COMMIT_INFO_NO_ICT.to_string()),
+        ],
+        Some(0),
+        CommitOrdering::AscendingOrder,
+        vec![(0, ExpectedTs::FileModified), (1, ExpectedTs::FileModified)],
+    )]
+    #[case::ict_enabled_from_creation(
+        vec![(0u64, format!("{}\n{}\n{}", commit_info_with_ict(555_000), ICT_PROTOCOL_LINE, ICT_METADATA_ENABLED))],
+        Some(0),
+        CommitOrdering::AscendingOrder,
+        vec![(0, ExpectedTs::Ict(555_000))],
+    )]
+    #[case::ict_enabled_mid_range(
+        vec![
+            (0u64, format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE)),
+            (1, format!("{}\n{}\n{}", commit_info_with_ict(700_000), ICT_PROTOCOL_LINE, ict_metadata_enabled_at(1, 700_000))),
+            (2, commit_info_with_ict(800_000)),
+        ],
+        Some(0),
+        CommitOrdering::AscendingOrder,
+        vec![(0, ExpectedTs::FileModified), (1, ExpectedTs::Ict(700_000)), (2, ExpectedTs::Ict(800_000))],
+    )]
+    #[case::ict_enablement_check(
+        vec![
+            (0u64, format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE)),
+            (1, COMMIT_INFO_NO_ICT.to_string()),
+            (2, format!("{}\n{}\n{}", commit_info_with_ict(800_000), ICT_PROTOCOL_LINE, ict_metadata_enabled_at(2, 800_000))),
+        ],
+        Some(2),
+        CommitOrdering::DescendingOrder,
+        vec![(0, ExpectedTs::FileModified), (1, ExpectedTs::FileModified), (2, ExpectedTs::Ict(800_000))],
+    )]
+    #[case::best_effort_present_ict(
+        vec![
+            (0u64, commit_info_with_ict(111_000)),
+            (1, commit_info_with_ict(222_000)),
+        ],
+        None,
+        CommitOrdering::AscendingOrder,
+        vec![(0, ExpectedTs::Ict(111_000)), (1, ExpectedTs::Ict(222_000))],
+    )]
+    #[case::best_effort_absent_ict(
+        vec![(0u64, COMMIT_INFO_NO_ICT.to_string())],
+        None,
+        CommitOrdering::AscendingOrder,
+        vec![(0, ExpectedTs::FileModified)],
+    )]
+    #[tokio::test]
+    async fn test_timestamp_resolution(
+        #[case] commits: Vec<(u64, String)>,
+        #[case] snapshot_version: Option<Version>,
+        #[case] ordering: CommitOrdering,
+        #[case] expected: Vec<(Version, ExpectedTs)>,
+    ) {
+        let commit_refs: Vec<(u64, &str)> = commits
+            .iter()
+            .map(|(v, body)| (*v, body.as_str()))
+            .collect();
+        let end_version = commit_refs.iter().map(|(v, _)| *v).max().unwrap();
+        let (engine, table_root) = engine_with_commits(&commit_refs).await;
+
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_end_version(end_version)
+            .with_ordering(ordering)
+            .build(engine.as_ref())
+            .unwrap();
+
+        let mtimes: HashMap<Version, i64> = range
+            .commit_files
+            .iter()
+            .map(|f| (f.version, f.location.last_modified))
+            .collect();
+
+        let snapshot = snapshot_version.map(|v| {
+            Snapshot::builder_for(table_root)
+                .at_version(v)
+                .build(engine.as_ref())
+                .unwrap()
+        });
+
+        let expected: HashMap<Version, ExpectedTs> = expected.into_iter().collect();
+        let actions = [DeltaAction::Add, DeltaAction::Remove];
+        for commit in range.commits(engine, snapshot, &actions).unwrap() {
+            let commit = commit.unwrap();
+            let version = commit.version();
+            let want = match expected[&version] {
+                ExpectedTs::Ict(ts) => ts,
+                ExpectedTs::FileModified => mtimes[&version],
+            };
+            assert_eq!(commit.timestamp(), want, "timestamp for v={version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_errors_when_enabled_but_ict_missing() {
+        // ICT enabled from creation, but the commit omits the mandatory inCommitTimestamp.
+        let v0 = format!("{}\n{}", ICT_PROTOCOL_LINE, ICT_METADATA_ENABLED);
+        let (engine, table_root) = engine_with_commits(&[(0, &v0)]).await;
+
+        let range = CommitRange::builder_for(table_root, 0)
+            .with_end_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+        let snapshot = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
+        let actions = [DeltaAction::Add, DeltaAction::Remove];
+        let err = drain_commits(&range, engine, Some(snapshot), &actions)
+            .expect_err("missing in-commit timestamp must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("in-commit timestamp"), "got: {msg}");
     }
 }
