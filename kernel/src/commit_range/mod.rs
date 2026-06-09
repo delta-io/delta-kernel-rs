@@ -270,7 +270,6 @@ mod tests {
 
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
     use crate::object_store::memory::InMemory;
@@ -396,7 +395,7 @@ mod tests {
     async fn engine_with_commits(commits: &[(u64, &str)]) -> (Arc<dyn Engine>, &'static str) {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store.clone()));
         for (version, body) in commits {
             add_commit(table_root, store.as_ref(), *version, body.to_string())
                 .await
