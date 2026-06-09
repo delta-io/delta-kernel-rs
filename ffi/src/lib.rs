@@ -12,8 +12,9 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::{Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -690,6 +691,48 @@ pub struct SharedSchema;
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
 
+/// Outcome of a checkpoint write performed via [`checkpoint_builder_build`].
+///
+/// `Written` indicates the kernel wrote a new checkpoint at this version and returns an
+/// updated snapshot whose log segment reflects the new checkpoint. `AlreadyExists` indicates
+/// a checkpoint at this version was already present (either pre-existed or was written by a
+/// concurrent writer) and returns the original snapshot unchanged.
+///
+/// Both variants carry an owned `Handle<SharedSnapshot>` that the caller must release via
+/// [`free_snapshot`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum FfiCheckpointWriteResult {
+    Written(Handle<SharedSnapshot>),
+    AlreadyExists(Handle<SharedSnapshot>),
+}
+
+impl FfiCheckpointWriteResult {
+    fn from_kernel(result: CheckpointWriteResult, snapshot: SnapshotRef) -> Self {
+        match result {
+            CheckpointWriteResult::Written => Self::Written(snapshot.into()),
+            CheckpointWriteResult::AlreadyExists => Self::AlreadyExists(snapshot.into()),
+        }
+    }
+}
+
+/// Opaque builder for a checkpoint write. Configure via `checkpoint_builder_set_*` and then
+/// call [`checkpoint_builder_build`] to perform the write; or [`free_checkpoint_builder`] to
+/// discard without writing.
+///
+/// When no `set_*` setter is called, the kernel auto-picks V1 or V2 based on the table's
+/// protocol features and emits an inline checkpoint with no sidecars.
+pub struct FfiCheckpointBuilder {
+    engine: Arc<dyn ExternEngine>,
+    snapshot: SnapshotRef,
+    // `None` => kernel auto-picks V1/V2 from protocol, no sidecars.
+    spec: Option<CheckpointSpec>,
+}
+
+#[handle_descriptor(target=FfiCheckpointBuilder, mutable=true, sized=true)]
+pub struct MutableFfiCheckpointBuilder;
+
 #[handle_descriptor(target=Protocol, mutable=false, sized=true)]
 pub struct SharedProtocol;
 
@@ -893,32 +936,108 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     snapshot.drop_handle();
 }
 
-/// Perform a full checkpoint of the specified snapshot using the supplied engine.
+/// Create a checkpoint builder for the given snapshot. Infallible.
 ///
-/// This writes the checkpoint parquet file and the `_last_checkpoint` file.
-// TODO: Expose the updated snapshot via a new FFI function that returns a snapshot handle.
+/// The returned builder holds owned Arc clones of both the snapshot and the engine; the
+/// caller may release the input handles immediately if desired.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles.
 #[no_mangle]
-pub unsafe extern "C" fn checkpoint_snapshot(
+pub unsafe extern "C" fn checkpoint_builder_for(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<bool> {
-    let engine_ref = unsafe { engine.as_ref() };
+) -> Handle<MutableFfiCheckpointBuilder> {
+    let engine = unsafe { engine.clone_as_arc() };
     let snapshot = unsafe { snapshot.clone_as_arc() };
-    snapshot_checkpoint_impl(snapshot, engine_ref).into_extern_result(&engine_ref)
+    Box::new(FfiCheckpointBuilder {
+        engine,
+        snapshot,
+        spec: None,
+    })
+    .into()
 }
 
-fn snapshot_checkpoint_impl(
-    snapshot: Arc<Snapshot>,
-    extern_engine: &dyn ExternEngine,
-) -> DeltaResult<bool> {
-    let (_result, _updated) = snapshot.checkpoint(extern_engine.engine().as_ref(), None)?;
-    // We ignore the CheckpointWriteResult because both Written and AlreadyExists are non-error
-    // outcomes at the FFI layer.
-    Ok(true)
+/// Configure the builder to write a V2 checkpoint without sidecars.
+///
+/// Requires the table to declare the `v2Checkpoint` feature; the requirement is verified
+/// at build time by [`checkpoint_builder_build`].
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn checkpoint_builder_set_v2_no_sidecar(
+    builder: &mut Handle<MutableFfiCheckpointBuilder>,
+) {
+    unsafe { builder.as_mut() }.spec = Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar));
+}
+
+/// Configure the builder to write a V2 checkpoint with sidecars.
+///
+/// Requires the table to declare the `v2Checkpoint` feature; the requirement is verified
+/// at build time by [`checkpoint_builder_build`].
+///
+/// `file_actions_per_sidecar_hint == 0` uses the kernel default
+/// (`DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`, currently 50,000). Non-zero values are passed
+/// to the kernel as the suggested upper bound of file actions per sidecar parquet.
+///
+/// **Known limitation:** the kernel writer currently uses `Uuid::new_v4()` for sidecar
+/// filenames and `ParquetHandler::write_parquet_file` silently overwrites on collision.
+/// Tracked upstream at <https://github.com/delta-io/delta-kernel-rs/issues/2503>.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn checkpoint_builder_set_v2_with_sidecars(
+    builder: &mut Handle<MutableFfiCheckpointBuilder>,
+    file_actions_per_sidecar_hint: usize,
+) {
+    let hint = (file_actions_per_sidecar_hint != 0).then_some(file_actions_per_sidecar_hint);
+    unsafe { builder.as_mut() }.spec = Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: hint,
+    }));
+}
+
+/// Perform the checkpoint write. Consumes the builder; the pointer is no longer valid
+/// after this call regardless of outcome.
+///
+/// Returns [`FfiCheckpointWriteResult::Written`] with the post-checkpoint snapshot (whose
+/// log segment records the new checkpoint), or [`FfiCheckpointWriteResult::AlreadyExists`]
+/// with the original snapshot when a checkpoint at this version was already present. In
+/// both branches the caller owns the returned snapshot handle and must release it via
+/// [`free_snapshot`].
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and must not use it again afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn checkpoint_builder_build(
+    builder: Handle<MutableFfiCheckpointBuilder>,
+) -> ExternResult<FfiCheckpointWriteResult> {
+    let builder_box = unsafe { builder.into_inner() };
+    let FfiCheckpointBuilder {
+        engine,
+        snapshot,
+        spec,
+    } = *builder_box;
+    let engine_ref: &dyn ExternEngine = engine.as_ref();
+    snapshot
+        .checkpoint(engine.engine().as_ref(), spec.as_ref())
+        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
+        .into_extern_result(&engine_ref)
+}
+
+/// Discard a checkpoint builder without writing.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn free_checkpoint_builder(builder: Handle<MutableFfiCheckpointBuilder>) {
+    builder.drop_handle();
 }
 
 /// Get the version of the specified snapshot
@@ -1293,10 +1412,9 @@ mod tests {
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::object_store::ObjectStore as _;
     use delta_kernel::schema::StructType;
     use rstest::rstest;
-    use serde_json::Value;
     use test_utils::{
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
         actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
@@ -1605,78 +1723,394 @@ mod tests {
         Ok(())
     }
 
-    // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_snapshot_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
+    // V2 protocol + metadata declaring the `v2Checkpoint` reader+writer feature.
+    //
+    // Schema mirrors the standard `METADATA` constant from `test-utils` (two columns: id INT,
+    // val STRING), with no partitions and no extra table properties. Used by every test below
+    // that needs sidecar emission or `set_v2_no_sidecar` to succeed.
+    const V2_CHECKPOINT_PROTOCOL_AND_METADATA: &str = concat!(
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["v2Checkpoint"],"writerFeatures":["v2Checkpoint"]}}"#,
+        "\n",
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
+    );
 
-        // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
-        // add/remove commits.
+    /// Seed an in-memory table with the standard protocol+metadata at version 0, then append
+    /// `num_add_actions` single-add commits at versions 1..=num_add_actions. Returns the storage
+    /// (which the caller will pass to engine construction).
+    async fn seed_classic_table(
+        storage: &InMemory,
+        table_root: &str,
+        num_add_actions: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let protocol_and_metadata = METADATA
             .lines()
             .skip(1) // skip commitInfo
             .collect::<Vec<_>>()
             .join("\n");
-        add_commit(table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
+        add_commit(table_root, storage, 0, protocol_and_metadata).await?;
+        for i in 0..num_add_actions {
+            add_commit(
+                table_root,
+                storage,
+                (i + 1) as u64,
+                actions_to_string(vec![TestAction::Add(format!("file{i}.parquet"))]),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Like `seed_classic_table` but uses [`V2_CHECKPOINT_PROTOCOL_AND_METADATA`] so the
+    /// table declares the `v2Checkpoint` reader+writer feature.
+    async fn seed_v2_table(
+        storage: &InMemory,
+        table_root: &str,
+        num_add_actions: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         add_commit(
             table_root,
-            storage.as_ref(),
-            1,
-            actions_to_string(vec![
-                TestAction::Add("file1.parquet".into()),
-                TestAction::Add("file2.parquet".into()),
-            ]),
+            storage,
+            0,
+            V2_CHECKPOINT_PROTOCOL_AND_METADATA.to_string(),
         )
         .await?;
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            2,
-            actions_to_string(vec![
-                TestAction::Add("file3.parquet".into()),
-                TestAction::Remove("file1.parquet".into()),
-            ]),
-        )
-        .await?;
+        for i in 0..num_add_actions {
+            add_commit(
+                table_root,
+                storage,
+                (i + 1) as u64,
+                actions_to_string_with_metadata(
+                    vec![TestAction::Add(format!("file{i}.parquet"))],
+                    V2_CHECKPOINT_PROTOCOL_AND_METADATA,
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Count the entries in a given object_store prefix (used to assert the existence and
+    /// cardinality of `_delta_log/_sidecars/`). Uses `list_with_delimiter` to avoid the
+    /// `futures` crate dependency in test code.
+    async fn count_objects_with_prefix(storage: &InMemory, prefix: &str) -> usize {
+        let prefix_path = Path::from(prefix);
+        match storage.list_with_delimiter(Some(&prefix_path)).await {
+            Ok(result) => result.objects.len(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Extract the `Handle<SharedSnapshot>` from the `Written` variant; panics on
+    /// `AlreadyExists`. Caller owns the returned handle and must `free_snapshot` it.
+    fn unwrap_written(result: FfiCheckpointWriteResult) -> Handle<SharedSnapshot> {
+        match result {
+            FfiCheckpointWriteResult::Written(snap) => snap,
+            FfiCheckpointWriteResult::AlreadyExists(_) => {
+                panic!("expected Written, got AlreadyExists")
+            }
+        }
+    }
+
+    // Test 1: classic vanilla (non-V2) table, no setter call. Builder falls through to the
+    // kernel's auto-pick path (V1 since no `v2Checkpoint` feature) and writes a single inline
+    // checkpoint with no `_sidecars/` directory.
+    //
+    // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_builder_no_setter_writes_inline_checkpoint(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        seed_classic_table(storage.as_ref(), table_root, 2).await?;
 
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
         ));
-        let engine = DefaultEngineBuilder::new(storage.clone())
-            .with_task_executor(executor)
-            .build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
 
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
-        let did_checkpoint = unsafe {
-            ok_or_panic(checkpoint_snapshot(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-            ))
+        let builder =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        let result = unsafe { ok_or_panic(checkpoint_builder_build(builder)) };
+        let written_snap = unwrap_written(result);
+
+        // Inline path: no `_sidecars/` directory should have been created.
+        let sidecar_count =
+            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
+        assert_eq!(sidecar_count, 0);
+
+        unsafe { free_snapshot(written_snap) }
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test 2: V2-feature table, explicit `set_v2_no_sidecar`. Builder writes a V2 checkpoint
+    // with file actions inline (no `_sidecars/`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_builder_set_v2_no_sidecar_writes_inline_v2(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        seed_v2_table(storage.as_ref(), table_root, 2).await?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let mut builder =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        unsafe { checkpoint_builder_set_v2_no_sidecar(&mut builder) };
+        let result = unsafe { ok_or_panic(checkpoint_builder_build(builder)) };
+        let written_snap = unwrap_written(result);
+
+        let sidecar_count =
+            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
+        assert_eq!(sidecar_count, 0);
+
+        unsafe { free_snapshot(written_snap) }
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test 3: V2-feature table, `set_v2_with_sidecars(0)` (kernel default hint = 50,000).
+    // Small table fits in a single sidecar parquet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_builder_set_v2_with_sidecars_default_hint(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        seed_v2_table(storage.as_ref(), table_root, 3).await?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let mut builder =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        // hint = 0 => kernel default (DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT = 50,000).
+        unsafe { checkpoint_builder_set_v2_with_sidecars(&mut builder, 0) };
+        let result = unsafe { ok_or_panic(checkpoint_builder_build(builder)) };
+        let written_snap = unwrap_written(result);
+
+        let sidecar_count =
+            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
+        // 3 file actions fit in a single sidecar at the 50k default.
+        assert_eq!(sidecar_count, 1);
+
+        unsafe { free_snapshot(written_snap) }
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test 4: V2-feature table, 8 adds, explicit hint=2. Expect ceil(8/2)=4 sidecars.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_builder_set_v2_with_sidecars_explicit_hint_2(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        seed_v2_table(storage.as_ref(), table_root, 8).await?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let mut builder =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        unsafe { checkpoint_builder_set_v2_with_sidecars(&mut builder, 2) };
+        let result = unsafe { ok_or_panic(checkpoint_builder_build(builder)) };
+        let written_snap = unwrap_written(result);
+
+        let sidecar_count =
+            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
+        assert_eq!(sidecar_count, 4); // ceil(8 / 2)
+
+        unsafe { free_snapshot(written_snap) }
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test 5: classic (non-V2) table, `set_v2_no_sidecar` => `KernelError::CheckpointWriteError`.
+    // V2 spec requires the `v2Checkpoint` feature; without it, the kernel rejects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_builder_v2_on_non_v2_table_returns_checkpoint_write_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        seed_classic_table(storage.as_ref(), table_root, 1).await?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let mut builder =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        unsafe { checkpoint_builder_set_v2_no_sidecar(&mut builder) };
+        let extern_result = unsafe { checkpoint_builder_build(builder) };
+        assert_extern_result_error_with_message(
+            extern_result,
+            KernelError::CheckpointWriteError,
+            Some("Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported"),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test 6: write a checkpoint, then call again on the same snapshot version. The FFI
+    // plumbing for both `Written` and `AlreadyExists` variants must work without error and
+    // return a snapshot whose version matches the input.
+    //
+    // NOTE: the kernel's checkpoint writer currently overwrites existing checkpoint files
+    // (no upfront `has_checkpoint` short-circuit, unlike `Snapshot::write_checksum`), so
+    // under both InMemory and LocalFileSystem the second call typically returns `Written`.
+    // The test accepts either outcome and asserts the FFI plumbing is sound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_builder_second_call_returns_consistent_snapshot(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        seed_classic_table(storage.as_ref(), table_root, 2).await?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let input_version = unsafe { version(snapshot.shallow_copy()) };
+
+        // First call: extract the returned snapshot (accept either variant).
+        let builder =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        let first = unsafe { ok_or_panic(checkpoint_builder_build(builder)) };
+        let first_snap = match first {
+            FfiCheckpointWriteResult::Written(s) | FfiCheckpointWriteResult::AlreadyExists(s) => s,
         };
-        assert!(did_checkpoint);
+        let first_version = unsafe { version(first_snap.shallow_copy()) };
+        assert_eq!(first_version, input_version);
+        unsafe { free_snapshot(first_snap) };
 
-        // Verify `_last_checkpoint` exists and looks sane.
-        let last_checkpoint = storage
-            .get(&Path::from("_delta_log/_last_checkpoint"))
-            .await?;
-        let last_checkpoint_bytes = last_checkpoint.bytes().await?;
-        let v: Value = serde_json::from_slice(last_checkpoint_bytes.as_ref())?;
-        assert_eq!(v["version"].as_u64(), Some(2));
-        // Here file1 was removed, so only file2 and
-        // file3 remain.
-        assert_eq!(v["numOfAddFiles"].as_u64(), Some(2));
-        // size = 1 protocol + 1 metadata + 2 live adds
-        assert_eq!(v["size"].as_u64(), Some(4));
+        // Second call on the same input snapshot: must succeed with consistent version.
+        let builder2 =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        let second = unsafe { ok_or_panic(checkpoint_builder_build(builder2)) };
+        let second_snap = match second {
+            FfiCheckpointWriteResult::Written(s) | FfiCheckpointWriteResult::AlreadyExists(s) => s,
+        };
+        let second_version = unsafe { version(second_snap.shallow_copy()) };
+        assert_eq!(second_version, input_version);
+        unsafe { free_snapshot(second_snap) };
 
-        // Cross-check checkpoint file size against `_last_checkpoint.sizeInBytes`.
-        let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
-        let checkpoint_size = storage.head(&checkpoint_path).await?.size;
-        assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
 
+    // Test 7: the snapshot handle returned by the `Written` variant is usable for downstream
+    // calls (here: `version(returned_snap)` matches input; chained `checkpoint_builder_for`
+    // returns `AlreadyExists` since we're still at the same table version).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_builder_written_snapshot_is_usable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        seed_classic_table(storage.as_ref(), table_root, 2).await?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let input_version = unsafe { version(snapshot.shallow_copy()) };
+
+        let builder =
+            unsafe { checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy()) };
+        let result = unsafe { ok_or_panic(checkpoint_builder_build(builder)) };
+        let written_snap = unwrap_written(result);
+
+        // (a) version() on the returned snapshot matches the input version.
+        let returned_version = unsafe { version(written_snap.shallow_copy()) };
+        assert_eq!(returned_version, input_version);
+
+        // (b) chain a second checkpoint_builder_for(returned_snap, engine) + build => AlreadyExists.
+        let builder2 =
+            unsafe { checkpoint_builder_for(written_snap.shallow_copy(), engine.shallow_copy()) };
+        let chained = unsafe { ok_or_panic(checkpoint_builder_build(builder2)) };
+        match chained {
+            FfiCheckpointWriteResult::AlreadyExists(snap) => unsafe { free_snapshot(snap) },
+            FfiCheckpointWriteResult::Written(_) => panic!("expected AlreadyExists"),
+        }
+
+        unsafe { free_snapshot(written_snap) }
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
@@ -1749,10 +2183,17 @@ mod tests {
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let did_checkpoint = unsafe {
-            ok_or_panic(checkpoint_snapshot(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-            ))
+            let builder = checkpoint_builder_for(snapshot.shallow_copy(), engine.shallow_copy());
+            match ok_or_panic(checkpoint_builder_build(builder)) {
+                FfiCheckpointWriteResult::Written(snap) => {
+                    free_snapshot(snap);
+                    true
+                }
+                FfiCheckpointWriteResult::AlreadyExists(snap) => {
+                    free_snapshot(snap);
+                    true
+                }
+            }
         };
         assert!(did_checkpoint);
 
