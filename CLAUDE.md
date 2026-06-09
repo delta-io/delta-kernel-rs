@@ -165,7 +165,9 @@ This list is non-exhaustive -- when in doubt, browse the source files directly
 **Engine + table setup (from `test_utils`)**
 
 - `test_table_setup()` / `test_table_setup_mt()` -- engine + temp table path. Use the `_mt`
-  variant under `#[tokio::test(flavor = "multi_thread")]`.
+  variant under `#[tokio::test(flavor = "multi_thread")]`. Required whenever a test calls
+  `snapshot.checkpoint()`: it issues nested `block_on` calls that deadlock on a single-threaded
+  runtime / `TokioBackgroundExecutor`.
 - `engine_store_setup(name, opts)` -- returns `(store, engine, table_location)` when a test
   needs direct object-store access.
 - `setup_test_tables(...)` -- multiple pre-built tables for read/scan tests.
