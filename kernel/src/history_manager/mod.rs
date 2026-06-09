@@ -496,10 +496,11 @@ pub(crate) fn timestamp_to_version(
 /// - `snapshot`: defines the searchable version range (typically the latest snapshot).
 /// - `engine`: used to access version history.
 /// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
-/// - `resolved_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
-///   searches all published commits, while [`CommitType::Recreatable`] restricts the result to
-///   versions the table can be reconstructed from (commit 0 or the earliest complete checkpoint),
-///   guaranteeing the returned version is loadable via time travel.
+/// - `resolved_commit_type`: which commits the search may resolve to.
+///   [`HistoryCommitType::Published`] searches all published commits, while
+///   [`HistoryCommitType::Recreatable`] restricts the result to versions the table can be
+///   reconstructed from (commit 0 or the earliest complete checkpoint), guaranteeing the returned
+///   version is loadable via time travel.
 ///
 /// # Errors
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or before
@@ -541,10 +542,11 @@ pub fn latest_version_as_of(
 /// - `snapshot`: defines the searchable version range (typically the latest snapshot).
 /// - `engine`: used to access version history.
 /// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
-/// - `resolved_commit_type`: which commits the search may resolve to. [`CommitType::Published`]
-///   searches all published commits, while [`CommitType::Recreatable`] restricts the result to
-///   versions the table can be reconstructed from (commit 0 or the earliest complete checkpoint),
-///   guaranteeing the returned version is loadable via time travel.
+/// - `resolved_commit_type`: which commits the search may resolve to.
+///   [`HistoryCommitType::Published`] searches all published commits, while
+///   [`HistoryCommitType::Recreatable`] restricts the result to versions the table can be
+///   reconstructed from (commit 0 or the earliest complete checkpoint), guaranteeing the returned
+///   version is loadable via time travel.
 ///
 /// # Errors
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or after
