@@ -18,6 +18,7 @@ use url::Url;
 
 use super::{measuring_engine, simple_schema};
 
+/// Reporter that keeps the last `TransactionCommitSuccess` for field-level assertions.
 #[derive(Debug, Default)]
 struct LastCommitSuccess(Mutex<Option<TransactionCommitSuccess>>);
 
@@ -42,63 +43,11 @@ fn setup_empty_table() -> DeltaResult<(tempfile::TempDir, Url)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_append_emits_success_metrics() -> DeltaResult<()> {
     let (_temp_dir, table_url) = setup_empty_table()?;
-    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let engine = Arc::new(engine);
-    let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-
-    reporter.reset();
-    let committed = insert_data(
-        snap,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_committed();
-
-    assert_eq!(committed.commit_version(), 1);
-    assert_eq!(reporter.transaction_commits.get(), 1);
-    assert_eq!(reporter.commit_add_files.get(), 1);
-    assert!(reporter.commit_add_bytes.get() > 0);
-    assert_eq!(reporter.commit_remove_files.get(), 0);
-    assert_eq!(reporter.commit_remove_bytes.get(), 0);
-    assert_eq!(reporter.commit_conflicts.get(), 0);
-    assert_eq!(reporter.commit_errors.get(), 0);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
-    let (_temp_dir, table_url) = setup_empty_table()?;
-    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let engine = Arc::new(engine);
-    let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-
-    reporter.reset();
-    insert_data(
-        snap.clone(),
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1]))],
-    )
-    .await?
-    .unwrap_committed();
-    // Both transactions are built from the same base snapshot, so the second targets a version
-    // the first already wrote, forcing a conflict.
-    let result = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))]).await?;
-
-    assert!(matches!(result, CommitResult::ConflictedTransaction(_)));
-    assert_eq!(reporter.transaction_commits.get(), 1);
-    assert_eq!(reporter.commit_conflicts.get(), 1);
-    assert_eq!(reporter.commit_errors.get(), 0);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_success_event_carries_operation_and_flags() -> DeltaResult<()> {
-    let (_temp_dir, table_url) = setup_empty_table()?;
     let reporter = Arc::new(LastCommitSuccess::default());
     let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
     insert_data(
         snap,
         &engine,
@@ -113,9 +62,42 @@ async fn commit_success_event_carries_operation_and_flags() -> DeltaResult<()> {
         .unwrap()
         .clone()
         .expect("commit success event");
+    assert_eq!(success.commit_version, 1);
+    assert_eq!(success.num_add_files, 1);
+    assert!(success.add_files_bytes > 0);
+    assert_eq!(success.num_remove_files, 0);
+    assert_eq!(success.remove_files_bytes, 0);
     assert_eq!(success.operation.as_deref(), Some("WRITE"));
     assert!(success.data_change);
     assert!(!success.is_blind_append);
-    assert_eq!(success.num_add_files, 1);
+    assert!(success.total_duration >= success.prepare_duration + success.committer_duration);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
+    // GIVEN a table at v0 (00.json) and a snapshot pinned to it.
+    let (_temp_dir, table_url) = setup_empty_table()?;
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let engine = Arc::new(engine);
+    let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    reporter.reset();
+    // WHEN a first append commits against that snapshot, advancing the table to v1 (01.json).
+    insert_data(
+        snap.clone(),
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )
+    .await?
+    .unwrap_committed();
+    // AND a second append reuses the SAME v0 snapshot, so it also targets v1 (already written).
+    let result = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))]).await?;
+
+    // THEN the second commit conflicts and emits exactly one conflict metric.
+    assert!(matches!(result, CommitResult::ConflictedTransaction(_)));
+    assert_eq!(reporter.transaction_commits.get(), 1);
+    assert_eq!(reporter.commit_conflicts.get(), 1);
+    assert_eq!(reporter.commit_errors.get(), 0);
     Ok(())
 }

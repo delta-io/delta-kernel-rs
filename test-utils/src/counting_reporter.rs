@@ -545,7 +545,7 @@ mod tests {
                 operation: Some("WRITE".to_string()),
                 prepare_duration: dur(),
                 committer_duration: dur(),
-                duration: dur(),
+                total_duration: dur(),
             },
         ));
         assert_eq!(reporter.transaction_commits.get(), 1);

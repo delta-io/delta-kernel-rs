@@ -529,7 +529,7 @@ pub struct TransactionCommitSuccess {
     pub committer_duration: Duration,
 
     // === Set on span close ===
-    pub duration: Duration,
+    pub total_duration: Duration,
 }
 
 impl TransactionCommitSuccess {
@@ -550,7 +550,7 @@ impl TransactionCommitSuccess {
             operation: None,
             prepare_duration: Duration::default(),
             committer_duration: Duration::default(),
-            duration: Duration::default(),
+            total_duration: Duration::default(),
         }
     }
 
@@ -585,7 +585,7 @@ impl TransactionCommitSuccess {
     }
 
     pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
+        self.total_duration = d;
     }
 }
 
@@ -603,12 +603,12 @@ impl fmt::Display for TransactionCommitSuccess {
             operation,
             prepare_duration,
             committer_duration,
-            duration,
+            total_duration,
         } = self;
         write!(
             f,
             "TransactionCommitSuccess(id={operation_id}, version={commit_version}, \
-             duration={duration:?}, prepare={prepare_duration:?}, committer={committer_duration:?}, \
+             total_duration={total_duration:?}, prepare={prepare_duration:?}, committer={committer_duration:?}, \
              add_files={num_add_files}, remove_files={num_remove_files}, \
              add_bytes={add_files_bytes}, remove_bytes={remove_files_bytes}, \
              is_blind_append={is_blind_append}, data_change={data_change}, operation={operation:?})"
@@ -1364,7 +1364,7 @@ mod tests {
             operation: None,
             prepare_duration: Duration::default(),
             committer_duration: Duration::default(),
-            duration: Duration::default(),
+            total_duration: Duration::default(),
         }
     }
 
