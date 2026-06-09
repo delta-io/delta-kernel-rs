@@ -281,14 +281,14 @@ impl CrcReplayAccumulator {
     fn on_add(&mut self, size: i64) -> DeltaResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
-        // file-stats state to `Indeterminate` and discard `net_files`/`net_bytes`/histogram.
-        // Stop accumulating; further math is wasted work.
+        // file-stats state to `Indeterminate` and discard the accumulated file stats and
+        // histogram. Stop accumulating; further math is wasted work.
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
         let fs = &mut self.delta.file_stats;
-        fs.net_files += 1;
-        fs.net_bytes += size;
+        fs.gross_add_files += 1;
+        fs.gross_add_bytes += size.max(0) as u64;
         if let Some(hist) = fs.net_histogram.as_mut() {
             // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
             //              Indeterminate instead, like a missing remove size.
@@ -302,16 +302,16 @@ impl CrcReplayAccumulator {
     fn on_remove(&mut self, path: &str, size: Option<i64>) -> DeltaResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
-        // file-stats state to `Indeterminate` and discard `net_files`/`net_bytes`/histogram.
-        // Stop accumulating; further math is wasted work.
+        // file-stats state to `Indeterminate` and discard the accumulated file stats and
+        // histogram. Stop accumulating; further math is wasted work.
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
         match size {
             Some(s) => {
                 let fs = &mut self.delta.file_stats;
-                fs.net_files -= 1;
-                fs.net_bytes -= s;
+                fs.gross_remove_files += 1;
+                fs.gross_remove_bytes += s.max(0) as u64;
                 if let Some(hist) = fs.net_histogram.as_mut() {
                     hist.remove(s)?;
                 }
@@ -540,8 +540,8 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_add(100).unwrap();
         acc.on_add(200).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files, 2);
-        assert_eq!(acc.delta.file_stats.net_bytes, 300);
+        assert_eq!(acc.delta.file_stats.net_files(), 2);
+        assert_eq!(acc.delta.file_stats.net_bytes(), 300);
         assert!(acc.delta.is_incremental_safe);
     }
 
@@ -551,8 +551,8 @@ mod tests {
     fn on_remove_with_size_decrements_files_and_bytes() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_remove("p", Some(50)).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files, -1);
-        assert_eq!(acc.delta.file_stats.net_bytes, -50);
+        assert_eq!(acc.delta.file_stats.net_files(), -1);
+        assert_eq!(acc.delta.file_stats.net_bytes(), -50);
         assert!(acc.delta.is_incremental_safe);
     }
 
@@ -617,8 +617,8 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_add(42).unwrap();
         let delta = acc.into_crc_delta();
-        assert_eq!(delta.file_stats.net_files, 1);
-        assert_eq!(delta.file_stats.net_bytes, 42);
+        assert_eq!(delta.file_stats.net_files(), 1);
+        assert_eq!(delta.file_stats.net_bytes(), 42);
     }
 
     #[test]

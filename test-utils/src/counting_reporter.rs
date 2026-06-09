@@ -7,7 +7,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use delta_kernel::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
+use delta_kernel::metrics::{
+    CommitFailureReason, MetricEvent, MetricsReporter, WithMetricsReporterLayer as _,
+};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -188,6 +190,16 @@ pub struct CountingReporter {
     pub set_transaction_load_failures: RelaxedCounter,
     pub set_transaction_cache_hits: RelaxedCounter,
     pub set_transaction_found: RelaxedCounter,
+
+    // Transaction commit counters (Transaction::commit)
+    pub transaction_commits: RelaxedCounter,
+    pub commit_conflicts: RelaxedCounter,
+    pub commit_retryable_failures: RelaxedCounter,
+    pub commit_errors: RelaxedCounter,
+    pub commit_add_files: RelaxedCounter,
+    pub commit_remove_files: RelaxedCounter,
+    pub commit_add_bytes: RelaxedCounter,
+    pub commit_remove_bytes: RelaxedCounter,
 }
 
 impl CountingReporter {
@@ -228,6 +240,14 @@ impl CountingReporter {
         self.set_transaction_load_failures.reset();
         self.set_transaction_cache_hits.reset();
         self.set_transaction_found.reset();
+        self.transaction_commits.reset();
+        self.commit_conflicts.reset();
+        self.commit_retryable_failures.reset();
+        self.commit_errors.reset();
+        self.commit_add_files.reset();
+        self.commit_remove_files.reset();
+        self.commit_add_bytes.reset();
+        self.commit_remove_bytes.reset();
     }
 
     /// Print a human-readable IO and operation summary.
@@ -328,6 +348,18 @@ impl MetricsReporter for CountingReporter {
             MetricEvent::SetTransactionLoadFailure => {
                 self.set_transaction_load_failures.inc();
             }
+            MetricEvent::TransactionCommitSuccess(e) => {
+                self.transaction_commits.inc();
+                self.commit_add_files.add(e.num_add_files);
+                self.commit_remove_files.add(e.num_remove_files);
+                self.commit_add_bytes.add(e.add_files_bytes);
+                self.commit_remove_bytes.add(e.remove_files_bytes);
+            }
+            MetricEvent::TransactionCommitFailure(e) => match e.reason {
+                CommitFailureReason::Conflict => self.commit_conflicts.inc(),
+                CommitFailureReason::RetryableIo => self.commit_retryable_failures.inc(),
+                CommitFailureReason::Error => self.commit_errors.inc(),
+            },
             // Intentionally not tracked. Add counters if needed.
             MetricEvent::ProtocolMetadataLoadSuccess(_)
             | MetricEvent::ProtocolMetadataLoadFailure(_)
@@ -348,6 +380,7 @@ mod tests {
         CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
         ProtocolMetadataLoadSuccess, SetTransactionLoadSuccess, SnapshotBuildFailure,
         SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
+        TransactionCommitFailure, TransactionCommitSuccess,
     };
 
     use super::*;
@@ -494,6 +527,53 @@ mod tests {
         assert_eq!(reporter.set_transaction_loads.get(), 2);
         assert_eq!(reporter.set_transaction_cache_hits.get(), 1);
         assert_eq!(reporter.set_transaction_found.get(), 1);
+    }
+
+    #[test]
+    fn report_transaction_commit_success_accumulates_files_and_bytes() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::TransactionCommitSuccess(
+            TransactionCommitSuccess {
+                operation_id: MetricId::new(),
+                commit_version: 1,
+                num_add_files: 3,
+                num_remove_files: 2,
+                add_files_bytes: 600,
+                remove_files_bytes: 150,
+                is_blind_append: false,
+                data_change: true,
+                operation: Some("WRITE".to_string()),
+                prepare_duration: dur(),
+                committer_duration: dur(),
+                duration: dur(),
+            },
+        ));
+        assert_eq!(reporter.transaction_commits.get(), 1);
+        assert_eq!(reporter.commit_add_files.get(), 3);
+        assert_eq!(reporter.commit_remove_files.get(), 2);
+        assert_eq!(reporter.commit_add_bytes.get(), 600);
+        assert_eq!(reporter.commit_remove_bytes.get(), 150);
+    }
+
+    #[test]
+    fn report_transaction_commit_failure_increments_matching_reason_counter() {
+        let reporter = CountingReporter::new();
+        for reason in [
+            CommitFailureReason::Conflict,
+            CommitFailureReason::RetryableIo,
+            CommitFailureReason::Error,
+        ] {
+            reporter.report(MetricEvent::TransactionCommitFailure(
+                TransactionCommitFailure {
+                    operation_id: MetricId::new(),
+                    reason,
+                },
+            ));
+        }
+        assert_eq!(reporter.commit_conflicts.get(), 1);
+        assert_eq!(reporter.commit_retryable_failures.get(), 1);
+        assert_eq!(reporter.commit_errors.get(), 1);
+        assert_eq!(reporter.transaction_commits.get(), 0);
     }
 
     #[test]

@@ -57,23 +57,22 @@ impl CrcDelta {
         );
         // CREATE TABLE starts with a known-complete set of transactions (possibly empty).
         let set_transaction_state = SetTransactionState::Complete(self.set_transactions);
-        // For version zero the delta IS the full table histogram. Validate that all bins
-        // are non-negative (a real table can't have negative file counts). If validation
-        // fails, drop the histogram.
-        let initial_histogram = self.file_stats.net_histogram.and_then(|delta| {
-            delta
-                .check_non_negative()
-                .inspect_err(|e| {
-                    warn!("Non-negative file count check failed, dropping file size histogram for version zero: {e}");
-                })
-                .ok()
-        });
         Some(Crc {
             version: 0,
             file_stats_state: FileStatsState::Complete(FileStats {
-                num_files: self.file_stats.net_files,
-                table_size_bytes: self.file_stats.net_bytes,
-                file_size_histogram: initial_histogram,
+                num_files: self.file_stats.net_files(),
+                table_size_bytes: self.file_stats.net_bytes(),
+                // For version zero the delta IS the full table histogram. Validate that all bins
+                // are non-negative (a real table can't have negative file counts). If validation
+                // fails, drop the histogram.
+                file_size_histogram: self.file_stats.net_histogram.and_then(|delta| {
+                    delta
+                        .check_non_negative()
+                        .inspect_err(|e| {
+                            warn!("Non-negative file count check failed, dropping file size histogram for version zero: {e}");
+                        })
+                        .ok()
+                }),
             }),
             protocol,
             metadata,
@@ -164,8 +163,8 @@ fn transition_file_stats(
         _ if !is_incremental_safe => FileStatsState::Indeterminate,
         FileStatsState::Complete(stats) => FileStatsState::Complete(FileStats {
             // Counts and bytes have no non-negative check.
-            num_files: stats.num_files + delta.net_files,
-            table_size_bytes: stats.table_size_bytes + delta.net_bytes,
+            num_files: stats.num_files + delta.net_files(),
+            table_size_bytes: stats.table_size_bytes + delta.net_bytes(),
             // Histogram: per-bin merge; drop on failure. See `merge_histogram`.
             file_size_histogram: merge_histogram(
                 stats.file_size_histogram.as_ref(),
@@ -247,8 +246,10 @@ mod tests {
     fn write_delta(net_files: i64, net_bytes: i64) -> CrcDelta {
         CrcDelta {
             file_stats: FileStatsDelta {
-                net_files,
-                net_bytes,
+                gross_add_files: net_files.max(0) as u64,
+                gross_remove_files: (-net_files).max(0) as u64,
+                gross_add_bytes: net_bytes.max(0) as u64,
+                gross_remove_bytes: (-net_bytes).max(0) as u64,
                 ..Default::default()
             },
             is_incremental_safe: true,
@@ -598,12 +599,12 @@ mod tests {
         for &s in remove_sizes {
             hist.remove(s).unwrap();
         }
-        let net_files = add_sizes.len() as i64 - remove_sizes.len() as i64;
-        let net_bytes: i64 = add_sizes.iter().sum::<i64>() - remove_sizes.iter().sum::<i64>();
         CrcDelta {
             file_stats: FileStatsDelta {
-                net_files,
-                net_bytes,
+                gross_add_files: add_sizes.len() as u64,
+                gross_remove_files: remove_sizes.len() as u64,
+                gross_add_bytes: add_sizes.iter().sum::<i64>() as u64,
+                gross_remove_bytes: remove_sizes.iter().sum::<i64>() as u64,
                 net_histogram: Some(hist),
             },
             is_incremental_safe: true,
@@ -660,9 +661,10 @@ mod tests {
         };
         let delta = CrcDelta {
             file_stats: FileStatsDelta {
-                net_files: 1,
-                net_bytes: 100,
+                gross_add_files: 1,
+                gross_add_bytes: 100,
                 net_histogram: None,
+                ..Default::default()
             },
             is_incremental_safe: true,
             ..Default::default()
@@ -694,9 +696,10 @@ mod tests {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             file_stats: FileStatsDelta {
-                net_files: 2,
-                net_bytes: 1500,
+                gross_add_files: 2,
+                gross_add_bytes: 1500,
                 net_histogram: Some(delta_hist),
+                ..Default::default()
             },
             is_incremental_safe: true,
             ..Default::default()
@@ -749,8 +752,10 @@ mod tests {
 
         let delta = CrcDelta {
             file_stats: FileStatsDelta {
-                net_files: 1,    // +2 - 1
-                net_bytes: 1450, // (100 + 1500) - 150
+                gross_add_files: 2,
+                gross_remove_files: 1,
+                gross_add_bytes: 1600,
+                gross_remove_bytes: 150,
                 net_histogram: Some(delta_hist),
             },
             is_incremental_safe: true,

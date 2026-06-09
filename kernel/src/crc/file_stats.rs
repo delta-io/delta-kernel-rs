@@ -54,13 +54,13 @@ impl FileStats {
     }
 }
 
-/// Net file count and size changes from a single commit, with an optional net histogram.
+/// Gross file-change totals from a single commit, plus an optional net file-size histogram.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileStatsDelta {
-    /// Net change in file count (files added minus files removed).
-    pub(crate) net_files: i64,
-    /// Net change in total bytes (bytes added minus bytes removed).
-    pub(crate) net_bytes: i64,
+    pub(crate) gross_add_files: u64,
+    pub(crate) gross_remove_files: u64,
+    pub(crate) gross_add_bytes: u64,
+    pub(crate) gross_remove_bytes: u64,
     /// Net change in file size histogram (adds minus removes per bin). May contain negative
     /// values in bins where more files were removed than added. `None` when the delta source
     /// does not provide histogram data.
@@ -91,6 +91,16 @@ pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
 }
 
 impl FileStatsDelta {
+    /// Net change in file count (added minus removed).
+    pub(crate) fn net_files(&self) -> i64 {
+        self.gross_add_files as i64 - self.gross_remove_files as i64
+    }
+
+    /// Net change in total bytes (added minus removed).
+    pub(crate) fn net_bytes(&self) -> i64 {
+        self.gross_add_bytes as i64 - self.gross_remove_bytes as i64
+    }
+
     /// Compute file stats and a delta histogram from a transaction's staged add and remove
     /// metadata.
     ///
@@ -116,15 +126,17 @@ impl FileStatsDelta {
             Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec())?,
             None => FileSizeHistogram::create_default(),
         };
-        let mut net_files = 0i64;
-        let mut net_bytes = 0i64;
+        let mut gross_add_files = 0u64;
+        let mut gross_remove_files = 0u64;
+        let mut gross_add_bytes = 0u64;
+        let mut gross_remove_bytes = 0u64;
 
         // Visit add files (insert into histogram). Every row is a file being added.
         for batch in add_files_metadata {
             let mut visitor = FileStatsVisitor::new(None, false, &mut histogram);
             visitor.visit_rows_of(batch.as_ref())?;
-            net_files += visitor.count;
-            net_bytes += visitor.total_size;
+            gross_add_files += visitor.count.unsigned_abs();
+            gross_add_bytes += visitor.total_size.unsigned_abs();
         }
 
         // Visit remove files (remove from histogram). Each FilteredEngineData has its own
@@ -134,13 +146,15 @@ impl FileStatsDelta {
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
             let mut visitor = FileStatsVisitor::new(sv_opt, true, &mut histogram);
             visitor.visit_rows_of(filtered_batch.data())?;
-            net_files += visitor.count;
-            net_bytes += visitor.total_size;
+            gross_remove_files += visitor.count.unsigned_abs();
+            gross_remove_bytes += visitor.total_size.unsigned_abs();
         }
 
         Ok(FileStatsDelta {
-            net_files,
-            net_bytes,
+            gross_add_files,
+            gross_remove_files,
+            gross_add_bytes,
+            gross_remove_bytes,
             net_histogram: Some(histogram),
         })
     }
@@ -285,8 +299,8 @@ mod tests {
             .map(|sizes| FilteredEngineData::with_all_rows_selected(size_batch(sizes)))
             .collect();
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
-        assert_eq!(stats.net_files, case.expected_net_files);
-        assert_eq!(stats.net_bytes, case.expected_net_bytes);
+        assert_eq!(stats.net_files(), case.expected_net_files);
+        assert_eq!(stats.net_bytes(), case.expected_net_bytes);
     }
 
     #[test]
@@ -303,8 +317,12 @@ mod tests {
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
         // adds: 3 files, 600 bytes (100 + 200 + 300)
         // removes: 4 files, 2400 bytes (400 + 500 + 700 + 800)
-        assert_eq!(stats.net_files, -1); // 3 - 4
-        assert_eq!(stats.net_bytes, -1800); // 600 - 2400
+        assert_eq!(stats.net_files(), -1); // 3 - 4
+        assert_eq!(stats.net_bytes(), -1800); // 600 - 2400
+        assert_eq!(stats.gross_add_files, 3);
+        assert_eq!(stats.gross_remove_files, 4);
+        assert_eq!(stats.gross_add_bytes, 600);
+        assert_eq!(stats.gross_remove_bytes, 2400);
     }
 
     #[test]

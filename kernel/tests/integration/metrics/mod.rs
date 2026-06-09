@@ -29,6 +29,7 @@ use test_utils::{
 };
 use url::Url;
 
+mod commit;
 mod scan;
 mod snapshot_load;
 
