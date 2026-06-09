@@ -229,8 +229,8 @@ jobs:
         shell: bash
         run: |
           output=$(cargo run --profile test --example metrics-tester)
-          echo "$output" | grep -q 'invalid_field'
-          echo "$output" | grep -q 'Invalid uuid'
+          grep -q 'invalid_field' <<< "$output"
+          grep -q 'Invalid uuid' <<< "$output"
 
   ffi_test:
     runs-on: ${{ matrix.os }}
