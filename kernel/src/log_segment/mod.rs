@@ -10,8 +10,8 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME,
-    PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, MAX_VALUES,
+    METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -20,6 +20,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::events::LOG_SEGMENT_LOADED_SPAN;
 use crate::metrics::MetricId;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -31,6 +32,7 @@ use crate::{
     StorageHandler, Version,
 };
 
+mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
@@ -217,6 +219,19 @@ impl LogSegment {
                 None
             };
 
+        // A CRC describes the table state at its version, so it can never predate the checkpoint.
+        if let (Some(crc), Some(checkpoint_version)) =
+            (&listed_files.latest_crc_file, checkpoint_version)
+        {
+            require!(
+                crc.version >= checkpoint_version,
+                Error::internal_error(format!(
+                    "CRC file version {} is older than checkpoint version {checkpoint_version}",
+                    crc.version
+                ))
+            );
+        }
+
         validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
@@ -298,13 +313,12 @@ impl LogSegment {
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
-    /// Reports metrics: `LogSegmentLoaded`.
-    // Span name must match `SEGMENT_FOR_SNAPSHOT_SPAN` in `metrics::reporter`.
+    /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[instrument(
-        name = "segment.for_snapshot",
+        name = LOG_SEGMENT_LOADED_SPAN,
         err,
         skip(storage, time_travel_version),
-        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
+        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(
@@ -337,6 +351,10 @@ impl LogSegment {
                 tracing::Span::current().record(
                     "num_compaction_files",
                     log_segment.listed.ascending_compaction_files.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "has_latest_crc_file",
+                    log_segment.listed.latest_crc_file.is_some(),
                 );
                 Ok(log_segment)
             }
@@ -913,17 +931,11 @@ impl LogSegment {
                 let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
 
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable(
-                        "stats_parsed",
-                        DataType::Struct(Box::new(ss.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
                 }
 
                 if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable(
-                        "partitionValues_parsed",
-                        DataType::Struct(Box::new(ps.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
                 }
 
                 // Rebuild schema with modified add field
@@ -1063,12 +1075,18 @@ impl LogSegment {
             .try_collect()
     }
 
-    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
-    ///
-    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
-    /// checkpoint files, CRC files, and last checkpoint metadata. Only commits and compactions
-    /// in `(start_v_exclusive, end_version]` are retained.
-    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+    /// Creates a pruned LogSegment of only the commits and compactions in
+    /// `(start_v_exclusive, end_version]`, dropping checkpoint files, CRC files, and
+    /// last-checkpoint metadata.
+    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> Self {
+        // A checkpoint above start_v_exclusive would drop the commits between them, since the
+        // returned segment keeps only (start_v_exclusive, end] and no checkpoint.
+        debug_assert!(
+            self.checkpoint_version
+                .is_none_or(|ckpt| start_v_exclusive >= ckpt),
+            "segment_after_version: start_v_exclusive ({start_v_exclusive}) is below checkpoint {:?}",
+            self.checkpoint_version,
+        );
         let (commits, compactions) =
             self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
         LogSegment {
@@ -1080,31 +1098,6 @@ impl LogSegment {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
                 checkpoint_parts: vec![],
-                latest_crc_file: None,
-                latest_commit_file: None,
-                max_published_version: None,
-            },
-        }
-    }
-
-    /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
-    ///
-    /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
-    /// checkpoint-based replay, so checkpoint files and metadata are preserved. Only commits
-    /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
-    /// needed for this replay path (CRC file, latest commit file) are dropped.
-    pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
-        let (commits, compactions) =
-            self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
-        LogSegment {
-            end_version: self.end_version,
-            checkpoint_version: self.checkpoint_version,
-            log_root: self.log_root.clone(),
-            last_checkpoint_metadata: self.last_checkpoint_metadata.clone(),
-            listed: LogSegmentFiles {
-                ascending_commit_files: commits,
-                ascending_compaction_files: compactions,
-                checkpoint_parts: self.listed.checkpoint_parts.clone(),
                 latest_crc_file: None,
                 latest_commit_file: None,
                 max_published_version: None,
@@ -1241,7 +1234,7 @@ impl LogSegment {
         // Check type compatibility for both minValues and maxValues structs.
         // While these typically have the same schema, the protocol doesn't guarantee it,
         // so we check both to be safe.
-        for field_name in ["minValues", "maxValues"] {
+        for field_name in [MIN_VALUES, MAX_VALUES] {
             let Some(checkpoint_values_field) = stats_struct.field(field_name) else {
                 // stats_parsed exists but no minValues/maxValues - unusual but valid
                 continue;

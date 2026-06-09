@@ -602,13 +602,13 @@ mod tests {
     }
 
     fn struct_of_two_primitives() -> DataType {
-        DataType::Struct(Box::new(
+        DataType::from(
             StructType::try_new(vec![
                 StructField::nullable("a", DataType::STRING),
                 StructField::nullable("b", DataType::STRING),
             ])
             .unwrap(),
-        ))
+        )
     }
 
     /// Adding a complex column on a CM table: every inner struct field reachable through
@@ -616,32 +616,18 @@ mod tests {
     /// and `new_max_column_id` must advance to the largest assigned ID.
     #[rstest]
     #[case::nested_struct(struct_of_two_primitives(), 3)]
-    #[case::array_of_primitive(
-        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-        1
-    )]
+    #[case::array_of_primitive(DataType::from(ArrayType::new(DataType::STRING, true)), 1)]
     #[case::map_of_primitives(
-        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, true))),
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
         1
     )]
-    #[case::array_of_struct(
-        DataType::Array(Box::new(ArrayType::new(struct_of_two_primitives(), true))),
-        3
-    )]
+    #[case::array_of_struct(DataType::from(ArrayType::new(struct_of_two_primitives(), true)), 3)]
     #[case::map_value_is_struct(
-        DataType::Map(Box::new(MapType::new(
-            DataType::STRING,
-            struct_of_two_primitives(),
-            true,
-        ))),
+        DataType::from(MapType::new(DataType::STRING, struct_of_two_primitives(), true,)),
         3
     )]
     #[case::map_key_is_struct(
-        DataType::Map(Box::new(MapType::new(
-            struct_of_two_primitives(),
-            DataType::INTEGER,
-            true,
-        ))),
+        DataType::from(MapType::new(struct_of_two_primitives(), DataType::INTEGER, true,)),
         3
     )]
     fn add_complex_column_with_column_mapping_assigns_ids_to_all_inner_fields(
@@ -688,9 +674,7 @@ mod tests {
     #[case::top_level(field_with_id_only("tainted", DataType::STRING, 99))]
     #[case::nested_in_struct(StructField::nullable(
         "outer",
-        DataType::Struct(Box::new(
-            StructType::try_new(vec![field_with_id_only("inner", DataType::STRING, 99)]).unwrap(),
-        )),
+        StructType::try_new(vec![field_with_id_only("inner", DataType::STRING, 99)]).unwrap(),
     ))]
     fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn { field }];

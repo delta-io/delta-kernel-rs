@@ -3,10 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
@@ -16,6 +15,8 @@ use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use tempfile::TempDir;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     create_default_engine_mt_executor, nested_batches, nested_schema, read_actions_from_commit,
     test_table_setup, write_batch_to_table,
@@ -41,12 +42,12 @@ async fn test_checkpoint_non_kernel_written_table() {
     let url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(
-        delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
+        test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
         ),
     );
-    let engine: Arc<delta_kernel::engine::default::DefaultEngine<_>> = Arc::new(
-        delta_kernel::engine::default::DefaultEngineBuilder::new(store)
+    let engine: Arc<test_utils::delta_kernel_default_engine::DefaultEngine<_>> = Arc::new(
+        test_utils::delta_kernel_default_engine::DefaultEngineBuilder::new(store)
             .with_task_executor(executor)
             .build(),
     );
@@ -220,7 +221,7 @@ async fn test_clustered_table_write_has_stats(
             assert_min_max_stats(&stats, &physical_paths[1], *min_st, *max_st);
 
             // Non-clustering column "name" should NOT have stats
-            let non_cluster_min = resolve_json_path(&stats["minValues"], &non_clustering_physical);
+            let non_cluster_min = resolve_json_path(&stats[MIN_VALUES], &non_clustering_physical);
             assert!(
                 non_cluster_min.is_null(),
                 "v{version}: non-clustering column 'name' should not have stats"
@@ -291,7 +292,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
-    // ScanBuilder::include_all_stats_columns() doesn't support stats_parsed when
+    // `ScanBuilder::with_stats(StatsOptions::all())` doesn't support stats_parsed when
     // dataSkippingNumIndexedCols=0. Read directly from the checkpoint parquet file instead.
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let delta_log = std::path::Path::new(&setup.table_path).join("_delta_log");
@@ -307,8 +308,8 @@ async fn test_clustered_table_write_has_stats_parsed(
     let file = std::fs::File::open(&ckpt_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
 
-    let min_path = |field: &[String]| -> Vec<String> { [&["minValues".into()], field].concat() };
-    let max_path = |field: &[String]| -> Vec<String> { [&["maxValues".into()], field].concat() };
+    let min_path = |field: &[String]| -> Vec<String> { [&[MIN_VALUES.into()], field].concat() };
+    let max_path = |field: &[String]| -> Vec<String> { [&[MAX_VALUES.into()], field].concat() };
 
     let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
     for batch in reader {
@@ -318,7 +319,7 @@ async fn test_clustered_table_write_has_stats_parsed(
         let stats_parsed: &StructArray = resolve_struct_field(add, &["stats_parsed".into()]);
 
         // Non-clustering column should not appear in stats_parsed
-        let min_values: &StructArray = resolve_struct_field(stats_parsed, &["minValues".into()]);
+        let min_values: &StructArray = resolve_struct_field(stats_parsed, &[MIN_VALUES.into()]);
         assert!(
             min_values
                 .column_by_name(&non_clustering_physical[0])

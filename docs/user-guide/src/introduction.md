@@ -114,7 +114,8 @@ without writing any Rust. See the [FFI overview](./ffi/overview.md) for details.
 For Rust projects, add to `Cargo.toml`:
 
 ```toml
-delta_kernel = { version = "0.21", features = ["default-engine-rustls", "arrow"] }
+delta_kernel = "0.23"
+delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
 ```
 
 For C/C++ projects, build the FFI crate and link against it. See the

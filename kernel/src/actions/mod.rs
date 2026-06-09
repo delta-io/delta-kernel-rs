@@ -59,6 +59,29 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
+// === Sub-fields of an AddFile's `stats` struct ===
+// See the Delta protocol spec, "Per-file Statistics", and `expected_stats_schema` in
+// `scan/data_skipping/stats_schema/mod.rs` for the full semantics.
+/// Logical (post-DV) row count, stored as a `long`.
+#[internal_api]
+pub(crate) const NUM_RECORDS: &str = "numRecords";
+/// Per-column null counts, as a nested struct mirroring the table schema.
+#[internal_api]
+pub(crate) const NULL_COUNT: &str = "nullCount";
+/// Per-column lower bounds, as a nested struct mirroring the table schema.
+#[internal_api]
+pub(crate) const MIN_VALUES: &str = "minValues";
+/// Per-column upper bounds, as a nested struct mirroring the table schema.
+#[internal_api]
+pub(crate) const MAX_VALUES: &str = "maxValues";
+/// Whether the min/max/nullCount stats are tight or wide. Defaults to `true` when absent.
+#[internal_api]
+pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
+
+/// Struct-encoded per-file statistics column (checkpoints with `writeStatsAsStruct=true`).
+#[internal_api]
+pub(crate) const STATS_PARSED: &str = "stats_parsed";
+
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),

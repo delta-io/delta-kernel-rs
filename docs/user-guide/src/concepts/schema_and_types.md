@@ -210,8 +210,9 @@ Every `Snapshot` exposes the table's schema:
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn main() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;

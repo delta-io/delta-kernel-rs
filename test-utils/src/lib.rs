@@ -1,7 +1,146 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod column_mapping_fixtures;
 pub mod counting_reporter;
+pub mod engine_contract;
 pub mod table_builder;
+
+/// Helper macro to extract a typed column from a RecordBatch or StructArray.
+#[macro_export]
+macro_rules! get_column {
+    ($source:expr, $name:expr, $ty:ty) => {
+        $source
+            .column_by_name($name)
+            .unwrap_or_else(|| panic!("should have column '{}'", $name))
+            .as_any()
+            .downcast_ref::<$ty>()
+            .unwrap_or_else(|| panic!("column '{}' should be {}", $name, stringify!($ty)))
+    };
+}
+
+// `rstest` and the `table_builder` factories appear inside the `define_sweeps!`
+// invocation below. Macro bodies are token streams that are only resolved when
+// consumer crates apply the emitted templates, so rustc doesn't see these uses.
+#[allow(unused_imports)]
+use rstest::rstest;
+pub use rstest_reuse;
+use rstest_reuse::template;
+#[allow(unused_imports)]
+use table_builder::*;
+
+/// Emits canonical sweep templates from a single source of truth.
+///
+/// Generates one `default_sweep` template (full Cartesian product of all five axes)
+/// plus one per-axis template (`log_state_sweep`, `feature_set_sweep`,
+/// `data_layout_sweep`, `table_config_sweep`, `version_target_sweep`). Each per-axis
+/// template only supplies its own axis; the consumer test fills in the others with
+/// inline `#[values(...)]` to control combination count.
+///
+/// Templates are emitted at crate root so the generated `#[macro_export]` macros
+/// are reachable cross-crate as `test_utils::<name>` via `#[rstest_reuse::apply]`.
+///
+/// ```ignore
+/// // Iterate only the LogState axis; fix everything else.
+/// #[apply(log_state_sweep)]
+/// fn my_test(
+///     log_state: LogState,
+///     #[values(no_features())] feature_set: FeatureSet,
+///     #[values(unpartitioned())] data_layout: DataLayoutConfig,
+///     #[values(checkpoint_json_stats())] table_config: TableConfig,
+///     #[values(version_latest())] version_target: VersionTarget,
+/// ) { /* ... */ }
+/// ```
+macro_rules! define_sweeps {
+    (
+        log_state_values = $ls:tt,
+        feature_set_values = $fs:tt,
+        data_layout_values = $dl:tt,
+        table_config_values = $tc:tt,
+        version_target_values = $vt:tt $(,)?
+    ) => {
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn default_sweep(
+            #[values $ls] log_state: LogState,
+            #[values $fs] feature_set: FeatureSet,
+            #[values $dl] data_layout: DataLayoutConfig,
+            #[values $tc] table_config: TableConfig,
+            #[values $vt] version_target: VersionTarget,
+        ) {
+        }
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn log_state_sweep(#[values $ls] log_state: LogState) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn feature_set_sweep(#[values $fs] feature_set: FeatureSet) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn data_layout_sweep(#[values $dl] data_layout: DataLayoutConfig) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn table_config_sweep(#[values $tc] table_config: TableConfig) {}
+
+        #[template]
+        #[export]
+        #[rstest]
+        pub fn version_target_sweep(#[values $vt] version_target: VersionTarget) {}
+    };
+}
+
+define_sweeps! {
+    // TODO: Log compaction (needs LogState::with_compaction_at, #2337).
+    // TODO: Schema history (add/drop/rename) (needs schema-evolution support).
+    log_state_values = (
+        commits_only(),
+        checkpoint_at_end(),
+        checkpoint_at_end_no_hint(),
+        checkpoint_mid(),
+        checkpoint_mid_no_hint(),
+        two_checkpoints_stale_hint(),
+        crc_at_end(),
+        crc_at_mid(),
+        checkpoint_at_end_crc_at_end(),
+        checkpoint_at_end_post_cleanup(),
+        checkpoint_at_end_no_hint_post_cleanup(),
+        checkpoint_mid_post_cleanup(),
+        checkpoint_mid_no_hint_post_cleanup(),
+        two_checkpoints_stale_hint_post_cleanup(),
+        checkpoint_mid_crc_at_mid_post_cleanup(),
+        checkpoint_mid_crc_above_mid_post_cleanup(),
+        checkpoint_mid_crc_at_end_post_cleanup()
+    ),
+    // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
+    //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
+    //       allowColumnDefaults, identityColumns, NTZ/variant (schema-driven),
+    //       catalogManaged, collations for CM=name, typeWidening write support).
+    // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
+    // TODO: iceV3 (needs icebergCompatV3).
+    feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
+    // TODO: null-distribution and partition-by-timestamp-with-CM rows.
+    data_layout_values = (unpartitioned(), partitioned(), clustered()),
+    table_config_values = (
+        checkpoint_json_stats(),
+        checkpoint_struct_stats(),
+        no_checkpoint_stats()
+    ),
+    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
+    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
+    version_target_values = (
+        version_latest(),
+        version_at_mid(),
+        version_incremental_to_latest()
+    ),
+}
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +148,9 @@ pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CountingReporter, RelaxedCounter,
 };
-use delta_kernel::actions::get_log_add_schema;
+use delta_kernel::actions::{
+    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
     StringArray, StructArray,
@@ -21,12 +162,6 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
@@ -38,6 +173,15 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
+// Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
+// taking a direct dev-dep on the new crate (which would create a cycle via this crate).
+pub use delta_kernel_default_engine;
+use delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel_default_engine::executor::TaskExecutor;
+use delta_kernel_default_engine::storage::store_from_url;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
 use tracing::subscriber::DefaultGuard;
@@ -442,6 +586,8 @@ pub fn engine_store_setup(
 
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
+// For property-gated writer features, this helper also writes the corresponding enablement
+// property when the writer feature is requested.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
     store: Arc<DynObjectStore>,
@@ -503,6 +649,9 @@ pub async fn create_table(
         }
         if writer_features.contains(&"changeDataFeed") {
             config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+        if writer_features.contains(&"deletionVectors") {
+            config.insert("delta.enableDeletionVectors".to_string(), json!("true"));
         }
         if reader_features.contains(&"catalogManaged") {
             config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
@@ -821,9 +970,7 @@ pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
         StructField::new("id", DataType::INTEGER, true),
         StructField::new(
             "nested",
-            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                "inner", dtype, true,
-            )]))),
+            StructType::new_unchecked(vec![StructField::new("inner", dtype, true)]),
             true,
         ),
     ]))
@@ -980,12 +1127,12 @@ pub fn create_add_files_metadata(
 
     let stats_struct = StructArray::from(vec![
         (
-            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
             Arc::new(num_records_array) as ArrayRef,
         ),
         (
             Arc::new(Field::new(
-                "nullCount",
+                NULL_COUNT,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -993,7 +1140,7 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "minValues",
+                MIN_VALUES,
                 ArrowDataType::Struct(empty_struct_fields.clone()),
                 true,
             )),
@@ -1001,14 +1148,14 @@ pub fn create_add_files_metadata(
         ),
         (
             Arc::new(Field::new(
-                "maxValues",
+                MAX_VALUES,
                 ArrowDataType::Struct(empty_struct_fields),
                 true,
             )),
             Arc::new(empty_struct) as ArrayRef,
         ),
         (
-            Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+            Arc::new(Field::new(TIGHT_BOUNDS, ArrowDataType::Boolean, true)),
             Arc::new(tight_bounds_array) as ArrayRef,
         ),
     ]);
@@ -1031,7 +1178,7 @@ pub fn create_add_files_metadata(
 /// snapshot.
 pub async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
-    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
+    engine: &DefaultEngine<impl delta_kernel_default_engine::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {

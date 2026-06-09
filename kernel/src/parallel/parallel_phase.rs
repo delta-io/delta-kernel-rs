@@ -143,9 +143,10 @@ mod tests {
         AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
     };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::scan::log_replay::ScanLogReplayProcessor;
+    use crate::scan::log_replay::{ScanLogReplayProcessor, ScanStatsOptions};
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
+    use crate::scan::StatsOptions;
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
@@ -208,7 +209,7 @@ mod tests {
             state_info,
             checkpoint_info,
             seen_file_keys,
-            false,
+            ScanStatsOptions::default(),
         )
     }
 
@@ -889,7 +890,7 @@ mod tests {
         let scan = snapshot
             .clone()
             .scan_builder()
-            .with_skip_stats(true)
+            .with_stats(StatsOptions::none())
             .build()?;
         let mut single_node_iter = scan.scan_metadata(engine.as_ref())?;
         let mut expected_paths = single_node_iter.try_fold(Vec::new(), |acc, metadata_res| {
@@ -904,7 +905,10 @@ mod tests {
         expected_paths.sort();
 
         // Run parallel workflow with skip_stats=true
-        let scan = snapshot.scan_builder().with_skip_stats(true).build()?;
+        let scan = snapshot
+            .scan_builder()
+            .with_stats(StatsOptions::none())
+            .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
         // Verify stats is None in sequential results and collect paths
@@ -971,7 +975,7 @@ mod tests {
         let scan_events: Vec<&ScanType> = events
             .iter()
             .filter_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted { scan_type, .. } => Some(scan_type),
+                MetricEvent::ScanMetadataCompleted(s) => Some(&s.scan_type),
                 _ => None,
             })
             .collect();
@@ -1008,11 +1012,11 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::SequentialPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s)
+                    if s.scan_type == ScanType::SequentialPhase =>
+                {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected SequentialPhase ScanMetadataCompleted event after finish()");
@@ -1028,11 +1032,9 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::ParallelPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s) if s.scan_type == ScanType::ParallelPhase => {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected ParallelPhase ScanMetadataCompleted event after log_metrics()");

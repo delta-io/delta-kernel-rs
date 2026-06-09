@@ -46,6 +46,7 @@ jobs:
         with:
           comment-id: ${{ steps.find.outputs.comment-id }}
           issue-number: ${{ steps.pr-context.outputs.number }}
+          edit-mode: replace
           body: |
             PR title does not match the required pattern. Please ensure you follow the [conventional commits](https://www.conventionalcommits.org/) spec.
 

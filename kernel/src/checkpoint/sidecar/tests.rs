@@ -7,7 +7,7 @@ use url::Url;
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
-use crate::actions::{Add, ADD_NAME};
+use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
@@ -19,8 +19,7 @@ use crate::checkpoint::tests::{
 use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
-use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use crate::engine::default::DefaultEngineBuilder;
+use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
@@ -92,14 +91,9 @@ fn generate_checkpoint_parts(
     })
 }
 
-/// Helper to build a DefaultEngine with multi-thread executor.
-fn new_multi_thread_engine(store: Arc<InMemory>) -> impl Engine {
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    DefaultEngineBuilder::new(store)
-        .with_task_executor(executor)
-        .build()
+/// Helper to build a SyncEngine backed by an in-memory store.
+fn new_sync_engine(store: Arc<InMemory>) -> impl Engine {
+    SyncEngine::new_with_store(store)
 }
 
 struct ExpectedNonFileContent<'a> {
@@ -290,7 +284,7 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,
@@ -353,7 +347,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     // Commit 0: v2 protocol + metadata + 3 adds (mixed batch of file and non-file actions)
     write_commit_to_store(
@@ -463,7 +457,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,
@@ -533,7 +527,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,
@@ -626,17 +620,14 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
                 .column_by_name("stats_parsed")
                 .unwrap()
                 .as_struct();
-            assert_eq!(
-                struct_field_value::<Int64Type>(stats, "numRecords", row),
-                42
-            );
-            let min_vals = stats.column_by_name("minValues").unwrap().as_struct();
+            assert_eq!(struct_field_value::<Int64Type>(stats, NUM_RECORDS, row), 42);
+            let min_vals = stats.column_by_name(MIN_VALUES).unwrap().as_struct();
             assert_eq!(struct_field_value::<Int64Type>(min_vals, "id", row), 1);
             assert_eq!(struct_field_string(min_vals, "name", row), "alice");
-            let max_vals = stats.column_by_name("maxValues").unwrap().as_struct();
+            let max_vals = stats.column_by_name(MAX_VALUES).unwrap().as_struct();
             assert_eq!(struct_field_value::<Int64Type>(max_vals, "id", row), 100);
             assert_eq!(struct_field_string(max_vals, "name", row), "zoe");
-            let null_count = stats.column_by_name("nullCount").unwrap().as_struct();
+            let null_count = stats.column_by_name(NULL_COUNT).unwrap().as_struct();
             assert_eq!(struct_field_value::<Int64Type>(null_count, "id", row), 0);
             assert_eq!(struct_field_value::<Int64Type>(null_count, "name", row), 5);
         }
@@ -651,7 +642,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,

@@ -23,7 +23,8 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "...", features = ["default-engine-rustls"] }
+delta_kernel = "..."
+delta_kernel_default_engine = { version = "...", features = ["rustls"] }
 delta-kernel-unity-catalog = "..."
 unity-catalog-delta-rest-client = "..."
 unity-catalog-delta-client-api = "..."
@@ -31,7 +32,7 @@ url = "2"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Use `default-engine-rustls` for a pure-Rust TLS stack or `default-engine-native-tls`
+Use `rustls` on `delta_kernel_default_engine` for a pure-Rust TLS stack or `native-tls`
 to link against the system's TLS implementation. You need
 `unity-catalog-delta-client-api` directly to import types like `Operation`, since
 the REST client crate does not re-export them.
@@ -111,7 +112,7 @@ store, then wrap it in a `DefaultEngineBuilder`:
 
 ```rust,ignore
 use std::sync::Arc;
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel::object_store;
 
 let table_url = url::Url::parse(table_uri)?;
@@ -179,7 +180,7 @@ resolves a table, fetches credentials, loads a Snapshot, and reads the data.
 ```rust,ignore
 use std::sync::Arc;
 
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel::object_store;
 use delta_kernel_unity_catalog::UCKernelClient;
 use unity_catalog_delta_client_api::Operation;

@@ -21,7 +21,7 @@ use tracing::debug;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
-    delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
+    delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
     std::collections::HashMap,
 };
 
@@ -54,6 +54,8 @@ pub mod expressions;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
 pub mod log_path;
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
@@ -145,6 +147,30 @@ impl KernelStringSlice {
     }
 }
 
+/// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.
+///
+/// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
+/// must not be retained beyond the foreign function call it was passed into.
+#[repr(C)]
+pub struct KernelBytesSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl KernelBytesSlice {
+    /// Creates a new bytes slice from a source byte slice.
+    ///
+    /// # Safety
+    /// Caller must guarantee that the source will outlive the created KernelBytesSlice.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
+            len: source.len(),
+        }
+    }
+}
+
 /// FFI-safe implementation for Rust's `Option<T>`
 #[derive(PartialEq, Debug)]
 #[repr(C)]
@@ -183,6 +209,23 @@ macro_rules! kernel_string_slice {
     }};
 }
 pub(crate) use kernel_string_slice;
+
+/// Similar to [`kernel_string_slice!`](kernel_string_slice), this macro provides a safer way to
+/// construct a KernelBytesSlice.
+///
+/// Refer to [`kernel_string_slice!`](kernel_string_slice) for safety and implementation
+/// notes.
+#[cfg(feature = "declarative-plans")]
+macro_rules! kernel_bytes_slice {
+    ( $source:ident ) => {{
+        fn do_it(b: &[u8]) -> $crate::KernelBytesSlice {
+            unsafe { $crate::KernelBytesSlice::new_unsafe(b) }
+        }
+        do_it(&$source)
+    }};
+}
+#[cfg(feature = "declarative-plans")]
+pub(crate) use kernel_bytes_slice;
 
 trait TryFromStringSlice<'a>: Sized {
     unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;
@@ -654,8 +697,8 @@ fn get_default_engine_impl(
     executor_config: Option<MultithreadedExecutorConfig>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel::engine::default::storage::store_from_url_opts;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel_default_engine::storage::store_from_url_opts;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     let store = store_from_url_opts(&url, options)?;
 
@@ -1408,12 +1451,12 @@ impl<T> Default for ReferenceSet<T> {
 mod tests {
     use std::collections::HashMap;
 
-    use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore as _;
     use delta_kernel::schema::StructType;
+    use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::{
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,

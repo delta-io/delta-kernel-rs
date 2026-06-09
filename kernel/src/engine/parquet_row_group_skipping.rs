@@ -6,6 +6,7 @@ use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
 use tracing::debug;
 
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
@@ -199,6 +200,8 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
             decimal_from_bytes(b.min_bytes_opt(), *d)?
         }
         (Decimal(..), _) => return None,
+        // Void columns have no Parquet representation, so no stats exist
+        (Void, _) => return None,
     };
     Some(value)
 }
@@ -243,6 +246,8 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
             decimal_from_bytes(b.max_bytes_opt(), *d)?
         }
         (Decimal(..), _) => return None,
+        // Void columns have no Parquet representation, so no stats exist
+        (Void, _) => return None,
     };
     Some(value)
 }
@@ -548,9 +553,9 @@ fn compute_checkpoint_field_indices(
             }
             let entry = stats_indices.entry(col_name).or_default();
             match stat_type {
-                "minValues" => entry.min_index = Some(i),
-                "maxValues" => entry.max_index = Some(i),
-                "nullCount" => entry.nullcount_index = Some(i),
+                MIN_VALUES => entry.min_index = Some(i),
+                MAX_VALUES => entry.max_index = Some(i),
+                NULL_COUNT => entry.nullcount_index = Some(i),
                 _ => {}
             }
         }

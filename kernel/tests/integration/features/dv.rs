@@ -8,17 +8,25 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
 };
+use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
+use delta_kernel::arrow::array::{BooleanArray, Int64Array, StructArray};
+use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
-    create_add_files_metadata, create_table, engine_store_setup, generate_batch, into_record_batch,
-    load_and_begin_transaction, record_batch_to_bytes, IntoArray,
+    add_commit, create_add_files_metadata, create_default_engine_mt_executor, create_table,
+    engine_store_setup, generate_batch, into_record_batch, load_and_begin_transaction,
+    read_actions_from_commit, record_batch_to_bytes, IntoArray,
 };
+
+use crate::common::write_utils::resolve_struct_field;
 
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.
@@ -383,6 +391,187 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     // Verify the correct rows remain using helper
     verify_sorted_scan_results(batches, expected_ids, &expected_values)?;
+
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::tight_bounds_true(Some(true))]
+#[case::tight_bounds_false(Some(false))]
+#[case::tight_bounds_absent(None)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dv_update_stats_tight_bound(
+    #[case] initial_tight_bounds: Option<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Nested schema: a `point` struct with two leaf columns.
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "point",
+        StructType::try_new(vec![
+            StructField::nullable("x", DataType::INTEGER),
+            StructField::nullable("y", DataType::INTEGER),
+        ])?,
+    )])?);
+
+    let temp_dir = tempdir()?;
+    let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
+    let (store, engine, table_url) = engine_store_setup("test_table", Some(&base_url));
+    let engine = Arc::new(engine);
+
+    // Hand-write v0 as create table doesn't support `delta.checkpoint.writeStatsAsStruct`.
+    std::fs::create_dir_all(table_url.to_file_path().unwrap())?;
+    let protocol = serde_json::json!({
+        "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["deletionVectors"],
+            "writerFeatures": ["deletionVectors"],
+        }
+    });
+    let metadata = serde_json::json!({
+        "metaData": {
+            "id": "test_id",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&schema)?,
+            "partitionColumns": [],
+            "configuration": {
+                "delta.enableDeletionVectors": "true",
+                "delta.checkpoint.writeStatsAsStruct": "true",
+            },
+            "createdTime": 1677811175819u64,
+        }
+    });
+    let v0 = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&protocol)?,
+        serde_json::to_string(&metadata)?
+    );
+    add_commit(table_url.as_str(), store.as_ref(), 0, v0).await?;
+
+    // Commit an Add at v1 with hand-crafted nested stats and the parameterized `tightBounds`.
+    // Kernel inserts always set tightBounds: true, so we handcraft the commit here.
+    let data_file_path = "data_file_1.parquet";
+    let mut stats = serde_json::json!({
+        "numRecords": 10,
+        "nullCount": {"point": {"x": 0, "y": 2}},
+        "minValues": {"point": {"x": 1, "y": 5}},
+        "maxValues": {"point": {"x": 100, "y": 50}},
+    });
+    if let Some(tb) = initial_tight_bounds {
+        stats["tightBounds"] = serde_json::Value::Bool(tb);
+    }
+    let stats_str = serde_json::to_string(&stats)?;
+    let add = serde_json::json!({
+        "add": {
+            "path": data_file_path,
+            "partitionValues": {},
+            "size": 1000,
+            "modificationTime": 1,
+            "dataChange": true,
+            "stats": stats_str,
+        }
+    });
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        serde_json::to_string(&add)?,
+    )
+    .await?;
+
+    // Apply a DV to the file and commit.
+    let mut dv = KernelDeletionVector::new();
+    dv.add_deleted_row_indexes([3u64]);
+    let write_context = get_write_context(&table_url, engine.as_ref())?;
+    let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let scan_files = get_scan_files(snapshot, engine.as_ref())?;
+    let mut dv_map = HashMap::new();
+    dv_map.insert(data_file_path.to_string(), dv_descriptor);
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    // The new AddFile must report tightBounds: false while preserving every other stats field.
+    let v2_adds = read_actions_from_commit(&table_url, 2, "add")?;
+    assert_eq!(v2_adds.len(), 1, "expected exactly one add at v2");
+    let add_stats: serde_json::Value = serde_json::from_str(
+        v2_adds[0]["stats"]
+            .as_str()
+            .expect("add stats should be a JSON string"),
+    )?;
+    assert_eq!(
+        add_stats["tightBounds"].as_bool(),
+        Some(false),
+        "DV-update add must report tightBounds: false regardless of the original value"
+    );
+    assert_eq!(add_stats["numRecords"], stats["numRecords"]);
+    assert_eq!(
+        add_stats["nullCount"], stats["nullCount"],
+        "nested nullCount must survive verbatim"
+    );
+    assert_eq!(
+        add_stats["minValues"], stats["minValues"],
+        "nested minValues must survive verbatim"
+    );
+    assert_eq!(
+        add_stats["maxValues"], stats["maxValues"],
+        "nested maxValues must survive verbatim"
+    );
+
+    // The paired RemoveFile must preserve the original stats unchanged.
+    let v2_removes = read_actions_from_commit(&table_url, 2, "remove")?;
+    assert_eq!(v2_removes.len(), 1, "expected exactly one remove at v2");
+    let remove_stats: serde_json::Value = serde_json::from_str(
+        v2_removes[0]["stats"]
+            .as_str()
+            .expect("remove stats should be a JSON string"),
+    )?;
+    assert_eq!(
+        remove_stats["tightBounds"].as_bool(),
+        initial_tight_bounds,
+        "remove action must preserve the original tightBounds unchanged"
+    );
+
+    // Checkpoint and validate the tightBounds of stats_parsed.
+    let snapshot_v2 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mt_engine = create_default_engine_mt_executor(&table_url)?;
+    snapshot_v2.checkpoint(mt_engine.as_ref(), None)?;
+
+    let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan = ckpt_snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .build()?;
+    let mut checked_stats_parsed = false;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        let (data, selection_vector) = scan_metadata?.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
+        let batch_struct = StructArray::from(batch.clone());
+        let tight_bounds: &BooleanArray =
+            resolve_struct_field(&batch_struct, &["stats_parsed".into(), TIGHT_BOUNDS.into()]);
+        let num_records: &Int64Array =
+            resolve_struct_field(&batch_struct, &["stats_parsed".into(), NUM_RECORDS.into()]);
+        for (i, &selected) in selection_vector.iter().enumerate().take(batch.num_rows()) {
+            if !selected {
+                continue;
+            }
+            assert!(
+                !tight_bounds.value(i),
+                "checkpoint stats_parsed.tightBounds must be false after a DV update"
+            );
+            assert_eq!(
+                num_records.value(i),
+                10,
+                "checkpoint stats_parsed.numRecords must be preserved"
+            );
+            checked_stats_parsed = true;
+        }
+    }
+    assert!(
+        checked_stats_parsed,
+        "expected at least one selected file with stats_parsed in the checkpoint"
+    );
 
     Ok(())
 }

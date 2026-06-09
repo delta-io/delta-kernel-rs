@@ -81,14 +81,18 @@ impl EnsureDataTypes {
             (&DataType::Variant(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
-            // strings, bools, and binary  aren't primitive in arrow
+            // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
+            // excludes Boolean, the string and binary variants, and Null -- even though
+            // kernel models all of these as `PrimitiveType` variants. Match them
+            // explicitly here so they are still recognized as compatible.
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
             | (&DataType::STRING, ArrowDataType::LargeUtf8)
             | (&DataType::STRING, ArrowDataType::Utf8)
             | (&DataType::STRING, ArrowDataType::Utf8View)
             | (&DataType::BINARY, ArrowDataType::LargeBinary)
             | (&DataType::BINARY, ArrowDataType::BinaryView)
-            | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
+            | (&DataType::BINARY, ArrowDataType::Binary)
+            | (&DataType::VOID, ArrowDataType::Null) => Ok(DataTypeCompat::Identical),
             (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::LargeList(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::ListView(arrow_list_field))
@@ -433,11 +437,7 @@ mod tests {
             false,
         );
         assert!(ensure_data_types(
-            &DataType::Map(Box::new(MapType::new(
-                DataType::LONG,
-                DataType::STRING,
-                true
-            ))),
+            &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
             arrow_field.data_type(),
             ValidationMode::TypesAndNames
         )
@@ -445,11 +445,7 @@ mod tests {
 
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Map(Box::new(MapType::new(
-                    DataType::LONG,
-                    DataType::STRING,
-                    false,
-                ))),
+                &DataType::from(MapType::new(DataType::LONG, DataType::STRING, false)),
                 arrow_field.data_type(),
                 ValidationMode::Full,
             ),
@@ -457,7 +453,7 @@ mod tests {
         );
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Map(Box::new(MapType::new(DataType::LONG, DataType::LONG, true))),
+                &DataType::from(MapType::new(DataType::LONG, DataType::LONG, true)),
                 arrow_field.data_type(),
                 ValidationMode::TypesAndNames,
             ),
@@ -468,20 +464,20 @@ mod tests {
     #[test]
     fn ensure_list() {
         assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+            &DataType::from(ArrayType::new(DataType::LONG, true)),
             &ArrowDataType::new_list(ArrowDataType::Int64, true),
             ValidationMode::TypesAndNames
         )
         .is_ok());
         assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+            &DataType::from(ArrayType::new(DataType::LONG, true)),
             &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
             ValidationMode::TypesAndNames
         )
         .is_ok());
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+                &DataType::from(ArrayType::new(DataType::STRING, true)),
                 &ArrowDataType::new_list(ArrowDataType::Int64, true),
                 ValidationMode::TypesAndNames,
             ),
@@ -489,7 +485,7 @@ mod tests {
         );
         assert_result_error_with_message(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
                 &ArrowDataType::new_list(ArrowDataType::Int64, false),
                 ValidationMode::Full,
             ),
@@ -597,7 +593,7 @@ mod tests {
         );
         assert_eq!(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
                 &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(
                     ArrowDataType::Int64,
                     true
@@ -609,7 +605,7 @@ mod tests {
         );
         assert_eq!(
             ensure_data_types(
-                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
                 &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(
                     ArrowDataType::Int64,
                     true

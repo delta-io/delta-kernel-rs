@@ -5,8 +5,6 @@ use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
@@ -16,6 +14,8 @@ use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     begin_transaction, create_default_engine_mt_executor, create_table, engine_store_setup,
     load_and_begin_transaction, read_scan, test_read,

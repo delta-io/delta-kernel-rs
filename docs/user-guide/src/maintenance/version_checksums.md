@@ -96,19 +96,19 @@ configured interval.
 
 When Kernel loads a snapshot whose version has a CRC file, it parses the
 checksum's table-level statistics and caches them on the snapshot. Call
-`Snapshot::get_file_stats_if_loaded()` to read them back:
+`Snapshot::get_file_stats_if_present()` to read them back:
 
 ```rust,ignore
-if let Some(stats) = snapshot.get_file_stats_if_loaded() {
+if let Some(stats) = snapshot.get_file_stats_if_present() {
     println!("num files:        {}", stats.num_files);
     println!("table size bytes: {}", stats.table_size_bytes);
 }
 ```
 
-`get_file_stats_if_loaded()` returns `None` when no CRC file was loaded for
-this snapshot's version. It never triggers a CRC read. It only returns stats
-that were already materialized during snapshot construction, so the call is
-cheap and always synchronous.
+`get_file_stats_if_present()` returns `None` when this snapshot has no CRC at
+its version. It never triggers a CRC read. It only returns stats that were
+already materialized during snapshot construction, so the call is cheap and
+always synchronous.
 
 ### File size histogram
 
@@ -117,7 +117,7 @@ Kernel exposes it alongside the scalar totals. The histogram groups the
 snapshot's live files into size bins:
 
 ```rust,ignore
-if let Some(stats) = snapshot.get_file_stats_if_loaded() {
+if let Some(stats) = snapshot.get_file_stats_if_present() {
     if let Some(histogram) = &stats.file_size_histogram {
         for ((bin_start, count), bytes) in histogram
             .sorted_bin_boundaries
@@ -138,7 +138,7 @@ did not populate it.
 
 Use these stats for lightweight planning (cost estimation, compaction
 heuristics, monitoring) without replaying the log. When
-`get_file_stats_if_loaded()` returns `None`, either fall back to aggregating
+`get_file_stats_if_present()` returns `None`, either fall back to aggregating
 `ScanFile.size` and `ScanFile.stats` via `visit_scan_files`, or write a CRC
 file on the next commit so subsequent snapshots have stats available.
 

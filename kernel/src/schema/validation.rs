@@ -4,9 +4,8 @@
 
 use std::collections::HashSet;
 
-use crate::schema::{ColumnMetadataKey, StructField, StructType};
-use crate::table_configuration::TableConfiguration;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::schema::{StructField, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::transforms::SchemaTransform;
 use crate::{transform_output_type, DeltaResult, Error};
 
@@ -17,18 +16,14 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// Validates a schema for CREATE TABLE or ALTER TABLE.
 ///
 /// Performs the following checks:
-/// 1. Schema is non-empty
-/// 2. No duplicate column names (case-insensitive, including nested fields)
-/// 3. Column names contain only valid characters
-/// 4. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
-///    by kernel; see `TableConfiguration::ensure_write_supported`)
+/// 1. No duplicate column names (case-insensitive, including nested fields)
+/// 2. Column names contain only valid characters
+/// 3. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
+///    by kernel)
 pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<()> {
-    if schema.num_fields() == 0 {
-        return Err(Error::generic("Schema cannot be empty"));
-    }
     let mut validator = SchemaValidator::new(column_mapping_mode);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
@@ -91,9 +86,7 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         self.current_path.push(field.name().to_ascii_lowercase());
 
         // Reject `delta.invariants` metadata on any field. Kernel cannot evaluate SQL
-        // expression invariants, so writing to any table with invariants metadata is
-        // blocked by `TableConfiguration::ensure_write_supported`. Reject at create
-        // time with a clearer, path-aware error.
+        // expression invariants, so reject at create time with a clear, path-aware error.
         //
         // Note: unlike `NonNullFieldChecker`, this validator intentionally does NOT
         // skip recursion into variant internals. Variants are not expected to carry
@@ -121,56 +114,6 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
 
         self.recurse_into_struct_field(field);
         self.current_path.pop();
-    }
-}
-
-/// `parquet.field.nested.ids` is to be deprecated in favor of `delta.columnMapping.nested.ids`.
-/// Validates that no fields in the schema have `parquet.field.nested.ids` metadata.
-///
-/// Tracking issue: <https://github.com/delta-io/delta/issues/6688>
-pub(crate) fn validate_iceberg_compat_v3_no_legacy_nested_id(
-    tc: &TableConfiguration,
-) -> DeltaResult<()> {
-    if !tc.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-        return Ok(());
-    }
-    let mut v = LegacyNestedIdsVisitor {
-        path: vec![],
-        offender: None,
-    };
-    v.transform_struct(&tc.logical_schema());
-    let Some(offender) = v.offender else {
-        return Ok(());
-    };
-    Err(Error::generic(format!(
-        "field `{offender}` carries deprecated `{}` metadata; use `{}` instead. \
-         See https://github.com/delta-io/delta/issues/6688",
-        ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
-    )))
-}
-
-struct LegacyNestedIdsVisitor {
-    path: Vec<String>,
-    offender: Option<String>,
-}
-
-impl<'a> SchemaTransform<'a> for LegacyNestedIdsVisitor {
-    transform_output_type!(|'a, T| ());
-
-    fn transform_struct_field(&mut self, f: &'a StructField) {
-        if self.offender.is_some() {
-            return;
-        }
-        self.path.push(f.name().to_string());
-        if f.metadata()
-            .contains_key(ColumnMetadataKey::ParquetFieldNestedIds.as_ref())
-        {
-            self.offender = Some(self.path.join("."));
-            return;
-        }
-        self.recurse_into_struct_field(f);
-        self.path.pop();
     }
 }
 
@@ -251,8 +194,8 @@ mod tests {
         let inner_b =
             StructType::new_unchecked(vec![StructField::new("CHILD", DataType::STRING, true)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", DataType::Struct(Box::new(inner_a)), false),
-            StructField::new("b", DataType::Struct(Box::new(inner_b)), false),
+            StructField::new("a", inner_a, false),
+            StructField::new("b", inner_b, false),
         ])
     }
 
@@ -286,11 +229,7 @@ mod tests {
             DataType::INTEGER,
             false,
         )]);
-        StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-            false,
-        )])
+        StructType::new_unchecked(vec![StructField::new("parent", inner, false)])
     }
 
     fn schema_array_bad_char() -> StructType {
@@ -298,10 +237,7 @@ mod tests {
             StructType::new_unchecked(vec![StructField::new("bad col", DataType::INTEGER, false)]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             false,
         )])
     }
@@ -311,11 +247,7 @@ mod tests {
             StructType::new_unchecked(vec![StructField::new("bad;val", DataType::INTEGER, false)]);
         StructType::new_unchecked(vec![StructField::new(
             "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            MapType::new(DataType::STRING, inner, true),
             false,
         )])
     }
@@ -324,7 +256,7 @@ mod tests {
         let inner =
             StructType::new_unchecked(vec![StructField::new("x", DataType::INTEGER, false)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", DataType::Struct(Box::new(inner)), false),
+            StructField::new("a", inner, false),
             StructField::new("A", DataType::STRING, true),
         ])
     }
@@ -336,10 +268,7 @@ mod tests {
         ]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             false,
         )])
     }
@@ -379,11 +308,7 @@ mod tests {
     fn schema_nested_invariant() -> StructType {
         let inner =
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )])
+        StructType::new_unchecked(vec![StructField::new("parent", inner, true)])
     }
 
     fn schema_array_nested_invariant() -> StructType {
@@ -391,10 +316,7 @@ mod tests {
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             true,
         )])
     }
@@ -404,11 +326,7 @@ mod tests {
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            MapType::new(DataType::STRING, inner, true),
             true,
         )])
     }
@@ -421,6 +339,9 @@ mod tests {
     #[case::special_chars_with_cm(schema_with_special_chars(), ColumnMappingMode::Name)]
     #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
     #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
+    #[case::empty_no_cm(StructType::new_unchecked(vec![]), ColumnMappingMode::None)]
+    #[case::empty_cm_name(StructType::new_unchecked(vec![]), ColumnMappingMode::Name)]
+    #[case::empty_cm_id(StructType::new_unchecked(vec![]), ColumnMappingMode::Id)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
         assert!(validate_schema(&schema, cm).is_ok());
     }
@@ -428,7 +349,6 @@ mod tests {
     // === Invalid schemas ===
 
     #[rstest]
-    #[case::empty_schema(StructType::new_unchecked(vec![]), ColumnMappingMode::None, &["cannot be empty"])]
     #[case::space_without_cm(schema_with_space(), ColumnMappingMode::None, &["invalid character"])]
     #[case::semicolon_without_cm(schema_with_semicolon(), ColumnMappingMode::None, &["invalid character"])]
     #[case::newline_with_cm(schema_with_newline(), ColumnMappingMode::Name, &["newline"])]
@@ -474,110 +394,5 @@ mod tests {
             msg.contains(expected_path),
             "Expected path '{expected_path}' in error, got: {msg}"
         );
-    }
-
-    // === LegacyNestedIdsVisitor: parquet.field.nested.ids detection ===
-
-    #[rstest]
-    #[case::clean_schema(simple_schema(), None)]
-    #[case::column_mapping_nested_id_key_only(schema_with_good_nested_ids(), None)]
-    #[case::top_level_legacy(schema_with_legacy_at("top"), Some("top".to_string()))]
-    #[case::nested_struct_legacy(schema_struct_with_legacy_at_inner(), Some("parent.inner".to_string()))]
-    #[case::array_struct_legacy(schema_array_struct_with_legacy_at_inner(), Some("arr.inner".to_string()))]
-    #[case::map_value_struct_legacy(schema_map_value_struct_with_legacy_at_inner(), Some("m.inner".to_string()))]
-    #[case::first_offender_wins(schema_two_legacy_fields(), Some("a".to_string()))]
-    fn legacy_nested_ids_visitor_finds_first_offender(
-        #[case] schema: StructType,
-        #[case] expected: Option<String>,
-    ) {
-        let mut v = LegacyNestedIdsVisitor {
-            path: vec![],
-            offender: None,
-        };
-        v.transform_struct(&schema);
-        assert_eq!(v.offender, expected);
-    }
-
-    fn field_with_metadata(name: &str, dtype: DataType, key: &str) -> StructField {
-        let mut f = StructField::nullable(name, dtype);
-        f.metadata.insert(
-            key.to_string(),
-            MetadataValue::Other(serde_json::json!({ "x.element": 1 })),
-        );
-        f
-    }
-
-    fn schema_with_good_nested_ids() -> StructType {
-        StructType::new_unchecked(vec![field_with_metadata(
-            "x",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-            ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
-        )])
-    }
-
-    fn schema_with_legacy_at(name: &str) -> StructType {
-        StructType::new_unchecked(vec![field_with_metadata(
-            name,
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )])
-    }
-
-    fn schema_struct_with_legacy_at_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![field_with_metadata(
-            "inner",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )]);
-        StructType::new_unchecked(vec![StructField::nullable(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-        )])
-    }
-
-    fn schema_array_struct_with_legacy_at_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![field_with_metadata(
-            "inner",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )]);
-        StructType::new_unchecked(vec![StructField::nullable(
-            "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
-        )])
-    }
-
-    fn schema_map_value_struct_with_legacy_at_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![field_with_metadata(
-            "inner",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )]);
-        StructType::new_unchecked(vec![StructField::nullable(
-            "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
-        )])
-    }
-
-    fn schema_two_legacy_fields() -> StructType {
-        StructType::new_unchecked(vec![
-            field_with_metadata(
-                "a",
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-                ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-            ),
-            field_with_metadata(
-                "b",
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-                ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-            ),
-        ])
     }
 }

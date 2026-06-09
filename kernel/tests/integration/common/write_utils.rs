@@ -10,12 +10,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
@@ -27,6 +26,8 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{begin_transaction, create_add_files_metadata, create_table, engine_store_setup};
 use url::Url;
 use uuid::Uuid;
@@ -345,11 +346,11 @@ pub fn assert_min_max_stats(
     expected_max: impl Into<serde_json::Value>,
 ) {
     assert_eq!(
-        *resolve_json_path(&stats["minValues"], physical_path),
+        *resolve_json_path(&stats[MIN_VALUES], physical_path),
         expected_min.into()
     );
     assert_eq!(
-        *resolve_json_path(&stats["maxValues"], physical_path),
+        *resolve_json_path(&stats[MAX_VALUES], physical_path),
         expected_max.into()
     );
 }

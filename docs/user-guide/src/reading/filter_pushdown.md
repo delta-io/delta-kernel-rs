@@ -145,9 +145,10 @@ Pass the predicate to `ScanBuilder::with_predicate`:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{column_expr, Predicate, Scalar};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
@@ -213,7 +214,9 @@ This happens for several reasons:
 
 By default, Kernel reads file-level statistics from the transaction log
 and uses them internally for data skipping, but does not expose those statistics to your
-connector. `ScanBuilder` provides three methods that change this behavior.
+connector. To override the default, call `ScanBuilder::with_stats` with a
+`StatsOptions` value. The named constructors cover the common shapes; you can also
+build the struct directly for any combination.
 
 ### Disabling data skipping entirely
 
@@ -222,8 +225,10 @@ statistics altogether. This avoids the cost of parsing statistics from checkpoin
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -232,13 +237,13 @@ statistics altogether. This avoids the cost of parsing statistics from checkpoin
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot
     .scan_builder()
-    .with_skip_stats(true)
+    .with_stats(StatsOptions::none())
     .build()?;
 # Ok(())
 # }
 ```
 
-When `with_skip_stats(true)` is set:
+With `StatsOptions::none()`:
 
 - Kernel skips the stats column entirely during checkpoint reads.
 - No statistics-based or partition-value-based file pruning occurs (row-level
@@ -251,12 +256,15 @@ avoid the overhead of parsing statistics you won't use.
 ### Including all statistics in scan metadata
 
 To receive pre-parsed statistics (min/max values, null counts, row counts) for every file
-in your scan metadata, call `include_all_stats_columns()`:
+in your scan metadata, pass `StatsOptions::all_struct()` (struct stats only) or
+`StatsOptions::all()` (both struct stats and the legacy JSON `stats` column):
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -265,7 +273,7 @@ in your scan metadata, call `include_all_stats_columns()`:
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot
     .scan_builder()
-    .include_all_stats_columns()
+    .with_stats(StatsOptions::all_struct())
     .build()?;
 # Ok(())
 # }
@@ -275,19 +283,25 @@ The statistics appear in a `stats_parsed` column in the scan metadata. Which col
 statistics depends on the table's configuration (`delta.dataSkippingStatsColumns` or
 `delta.dataSkippingNumIndexedCols`).
 
+`all_struct` is the cheap path: it omits the synthesized JSON `stats` column entirely.
+If your connector consumes `stats_parsed` directly, this avoids a per-batch `ToJson`
+serialization that scales with the table's stats schema width.
+
 You can combine this with `with_predicate`. When both are set, Kernel performs its own data
-skipping internally _and_ exposes the parsed statistics so your connector can apply
+skipping internally and exposes the parsed statistics so your connector can apply
 additional pruning logic.
 
 ### Including statistics for specific columns
 
-To receive statistics for only a subset of columns, call `with_stats_columns`:
+To receive statistics for only a subset of columns, pass `StatsOptions::struct_columns`:
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::ColumnName;
+# use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -296,31 +310,29 @@ To receive statistics for only a subset of columns, call `with_stats_columns`:
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot
     .scan_builder()
-    .with_stats_columns(vec![
+    .with_stats(StatsOptions::struct_columns(vec![
         ColumnName::new(["age"]),
         ColumnName::new(["city"]),
-    ])
+    ]))
     .build()?;
 # Ok(())
 # }
 ```
 
-Only the named columns appear in `stats_parsed`. Passing an empty list is equivalent to the
-default behavior (no stats output, but internal data skipping still works if a predicate is
-set).
+Only the named columns appear in `stats_parsed`.
 
 ### Choosing the right mode
 
-| Goal | Method |
-|------|--------|
-| Default behavior (Kernel skips files internally, no stats exposed) | No call needed |
-| Disable all stats reading for performance | `with_skip_stats(true)` |
-| Expose all stats to your connector for custom pruning | `include_all_stats_columns()` |
-| Expose stats for specific columns only | `with_stats_columns(columns)` |
+| Goal | Constructor |
+|------|-------------|
+| Default behavior (Kernel skips files internally, no stats exposed) | No call needed (or `StatsOptions::json_only()`) |
+| Disable all stats reading for performance | `StatsOptions::none()` |
+| Expose all struct stats to your connector for custom pruning (cheap path) | `StatsOptions::all_struct()` |
+| Expose both struct stats and the JSON `stats` column | `StatsOptions::all()` |
+| Expose stats for specific columns only | `StatsOptions::struct_columns(cols)` |
 
-> [!NOTE]
-> These methods follow "last call wins" semantics. If you call `include_all_stats_columns()`
-> and then `with_skip_stats(true)`, stats are skipped entirely.
+`with_stats` takes a single `StatsOptions` value, so each call fully replaces any prior
+configuration. There is no "last call wins" composition to track.
 
 ## What's next
 

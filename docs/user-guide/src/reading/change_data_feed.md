@@ -23,8 +23,9 @@ across the requested range.
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
@@ -42,8 +43,9 @@ table at the time of the call.
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
@@ -86,9 +88,10 @@ project columns with `with_schema` and filter rows with `with_predicate`.
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{column_expr, Scalar};
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::{DeltaResult, Predicate};
@@ -125,9 +128,10 @@ If you skip `with_predicate`, no filtering is applied.
 
 > [!NOTE]
 > Predicates on the CDF metadata columns (`_change_type`, `_commit_version`,
-> `_commit_timestamp`) are not currently supported. Apply predicates only to regular table
-> columns. Filtering on CDF columns after the scan returns is still possible in your
-> connector code.
+> `_commit_timestamp`) are accepted but have no effect. Kernel doesn't apply them during
+> file pruning because CDF metadata is synthesized during scan execution, not read from
+> data files. Apply such filters in your connector code after the scan returns. See
+> [issue #525](https://github.com/delta-io/delta-kernel-rs/issues/525).
 
 > [!NOTE]
 > Like regular scans, CDF filtering is best-effort. The scan may return rows that do not
@@ -142,9 +146,10 @@ after building the scan), use `scan_builder` on an `Arc<TableChanges>` instead o
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {

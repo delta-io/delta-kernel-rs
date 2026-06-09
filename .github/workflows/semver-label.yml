@@ -75,3 +75,20 @@ jobs:
             echo "ERROR: unexpected semver outcome '${STEP_OUTCOME}' in semver-outcome.txt"
             exit 1
           fi
+
+      # Create an artifact for pr-title-validator, which is triggered by this workflow via
+      # workflow_run. Due to how it's triggered, that run will have no idea what PR it's running
+      # against, so we output it here so it can do its job
+      - name: Record PR number
+        if: steps.pr-context.outputs.number != ''
+        env:
+          PR_NUMBER: ${{ steps.pr-context.outputs.number }}
+        run: echo "$PR_NUMBER" > pr-number.txt
+
+      - name: Upload PR number for title validator
+        if: steps.pr-context.outputs.number != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr-number
+          path: pr-number.txt
+          if-no-files-found: error

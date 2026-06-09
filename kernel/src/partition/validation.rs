@@ -452,17 +452,15 @@ mod tests {
     /// Complex types (struct, array, map) are rejected as partition column types.
     #[rstest]
     #[case(
-        DataType::Struct(Box::new(StructType::new_unchecked(vec![
-            StructField::not_null("x", DataType::INTEGER),
-        ]))),
+        DataType::from(StructType::new_unchecked(vec![StructField::not_null("x", DataType::INTEGER)])),
         Scalar::Null(DataType::STRING)
     )]
     #[case(
-        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+        DataType::from(ArrayType::new(DataType::INTEGER, false)),
         Scalar::Null(DataType::STRING)
     )]
     #[case(
-        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, false))),
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, false)),
         Scalar::Null(DataType::STRING)
     )]
     fn test_validate_types_complex_type_returns_error(
