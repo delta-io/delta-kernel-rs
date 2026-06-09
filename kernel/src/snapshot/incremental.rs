@@ -236,18 +236,6 @@ impl Snapshot {
         // The CRC file the combined segment carries on disk.
         let crc_file = Self::resolve_crc_file(&new_log_segment, existing_log_segment);
 
-        // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
-        // checkpoint. The existing snapshot supplies the P&M baseline.
-        let (new_metadata, new_protocol) = new_log_segment
-            .segment_after_version(existing_snapshot_version)
-            .read_protocol_metadata_opt(engine)?;
-        let table_configuration = TableConfiguration::try_new_from(
-            existing_snapshot.table_configuration(),
-            new_metadata,
-            new_protocol,
-            new_log_segment.end_version,
-        )?;
-
         // Combine existing and new log segments. When the new listing found a checkpoint at or
         // below the existing snapshot version, trim existing commits and compaction files
         // already covered by it; otherwise keep all existing files.
@@ -303,13 +291,39 @@ impl Snapshot {
             new_checkpoint_schema,
         )?;
 
-        // Advance the best available base (the existing snapshot's in-memory CRC, or a newer
+        // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
         // `incremental_replay`.
         let crc = combined_log_segment.try_build_incremental_crc_with_base(
             engine,
             existing_snapshot.crc(),
             incremental_replay,
+        )?;
+
+        let existing_table_config = existing_snapshot.table_configuration();
+        let (new_metadata, new_protocol) = match &crc {
+            Some(crc) => {
+                // If we were able to build a new CRC, then re-use it for TableConfiguration
+                // creation.
+                let new_metadata = (crc.metadata != *existing_table_config.metadata())
+                    .then(|| crc.metadata.clone());
+                let new_protocol = (crc.protocol != *existing_table_config.protocol())
+                    .then(|| crc.protocol.clone());
+                (new_metadata, new_protocol)
+            }
+            None => {
+                // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
+                // scanned any log files) Perform normal P & M replay.
+                combined_log_segment
+                    .segment_after_version(existing_snapshot_version)
+                    .read_protocol_metadata_opt(engine)?
+            }
+        };
+        let table_configuration = TableConfiguration::try_new_from(
+            existing_table_config,
+            new_metadata,
+            new_protocol,
+            new_end_version,
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());

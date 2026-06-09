@@ -79,10 +79,14 @@ impl LogSegment {
         engine: &dyn Engine,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Option<Arc<Crc>>> {
-        self.try_build_incremental_crc_with_base(engine, None, incremental_replay)
+        self.try_build_incremental_crc_with_base(
+            engine,
+            None, /* in_memory_base */
+            incremental_replay,
+        )
     }
 
-    /// Try to build the CRC at this segment's `end_version` from the best available base: the
+    /// Try to build the CRC at this segment's `end_version` from the latest available base: the
     /// in-memory base (e.g. the CRC the updating snapshot holds) or this segment's on-disk CRC.
     /// Handles three cases:
     /// - Case 1: no base CRC available -> return None
@@ -95,7 +99,7 @@ impl LogSegment {
         in_memory_base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Option<Arc<Crc>>> {
-        let Some(base_crc) = self.pick_best_base_crc(engine, in_memory_base) else {
+        let Some(base_crc) = self.pick_latest_base_crc(engine, in_memory_base) else {
             return Ok(None); // Case 1 (1A: absent, 1B: read failed)
         };
         if base_crc.version == self.end_version {
@@ -109,8 +113,7 @@ impl LogSegment {
         Ok(Some(Arc::new(advanced)))
     }
 
-    /// Pick the higher-version of the in-memory base and this segment's on-disk CRC.
-    fn pick_best_base_crc(
+    fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
