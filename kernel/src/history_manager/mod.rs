@@ -1832,14 +1832,14 @@ mod tests {
         None,
         Expected::Version(0),
     )]
-    #[case::checkpoint_at_smallest_commit_anchors(
+    #[case::checkpoint_before_smallest_commit_anchors(
         {
             let mut p = vec![single_part_checkpoint_path(5)];
-            p.extend(commit_path(5..=8));
+            p.extend(commit_path(6..=8));
             p
         },
         None,
-        Expected::Version(5),
+        Expected::NoRecreatableCommit,
     )]
     #[case::empty_log(vec![], None, Expected::NoCommitsFound)]
     #[case::crc_only(vec![format!("_delta_log/{:020}.crc", 5)], None, Expected::NoCommitsFound)]
