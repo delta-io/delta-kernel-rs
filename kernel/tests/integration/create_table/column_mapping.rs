@@ -16,7 +16,9 @@ use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use test_utils::{create_table_and_load_snapshot, test_table_setup};
+use test_utils::{
+    column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
+};
 
 use super::simple_schema;
 
@@ -39,7 +41,7 @@ pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
         match dt {
             DataType::Struct(s) => {
                 let fields: Vec<_> = s.fields().map(|f| strip_field(f, cm_id, cm_name)).collect();
-                DataType::Struct(Box::new(StructType::new_unchecked(fields)))
+                DataType::from(StructType::new_unchecked(fields))
             }
             DataType::Array(a) => DataType::from(ArrayType::new(
                 strip_data_type(a.element_type(), cm_id, cm_name),
@@ -342,7 +344,7 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
 
     let schema = Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, true),
-        StructField::new("address", DataType::Struct(Box::new(address_type)), true),
+        StructField::new("address", address_type, true),
     ])?);
 
     // Create table and load snapshot (validates column mapping for nested schema on read)
@@ -426,7 +428,7 @@ fn test_column_mapping_schema_with_maps_and_arrays() -> DeltaResult<()> {
             DataType::from(ArrayType::new(DataType::INTEGER, true)),
             true,
         ),
-        StructField::new("metadata", DataType::Struct(Box::new(metadata_type)), true),
+        StructField::new("metadata", metadata_type, true),
     ])?);
 
     // Create table with column mapping and read back the snapshot.
@@ -459,26 +461,14 @@ fn clustering_cm_test_schema() -> DeltaResult<Arc<StructType>> {
         StructField::new("zip", DataType::STRING, true),
     ])?;
     let l4 = StructType::try_new(vec![StructField::new("value", DataType::DOUBLE, true)])?;
-    let l3 = StructType::try_new(vec![StructField::new(
-        "l4",
-        DataType::Struct(Box::new(l4)),
-        true,
-    )])?;
-    let l2 = StructType::try_new(vec![StructField::new(
-        "l3",
-        DataType::Struct(Box::new(l3)),
-        true,
-    )])?;
-    let l1 = StructType::try_new(vec![StructField::new(
-        "l2",
-        DataType::Struct(Box::new(l2)),
-        true,
-    )])?;
+    let l3 = StructType::try_new(vec![StructField::new("l4", l4, true)])?;
+    let l2 = StructType::try_new(vec![StructField::new("l3", l3, true)])?;
+    let l1 = StructType::try_new(vec![StructField::new("l2", l2, true)])?;
     Ok(Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
-        StructField::new("address", DataType::Struct(Box::new(address)), true),
-        StructField::new("l1", DataType::Struct(Box::new(l1)), true),
+        StructField::new("address", address, true),
+        StructField::new("l1", l1, true),
     ])?))
 }
 
@@ -614,5 +604,43 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
         "Partitioned table should not have clustering columns"
     );
 
+    Ok(())
+}
+
+/// Create table with pre-existing `delta.columnMapping.physicalName` annotations,
+/// verify the physical name duplicate validation logic.
+///
+/// - **accept**: same leaf physical name under two different parent structs.
+/// - **reject**: two siblings inside `struct -> map -> array -> struct` share same physical name.
+#[rstest::rstest]
+#[case::accept(fixtures::same_leaf_phy_name_under_different_parents(), None)]
+#[case::reject(
+    fixtures::nested_field_with_same_phy_path(),
+    Some("Duplicate `delta.columnMapping.physicalName`")
+)]
+fn test_create_table_dup_physical_name(
+    #[case] schema: StructType,
+    #[case] expected_error_substring: Option<&str>,
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let result = create_table(&table_path, Arc::new(schema), "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    match expected_error_substring {
+        None => {
+            let _commit = result?.commit(engine.as_ref())?;
+        }
+        Some(substr) => {
+            let msg = result
+                .expect_err("dup physicalName must be rejected at create-table build")
+                .to_string();
+            assert!(
+                msg.contains(substr) && msg.contains(".a'") && msg.contains(".b'"),
+                "expected path-aware dedup error naming colliding leaves under {cm_mode}, got: {msg}"
+            );
+        }
+    }
     Ok(())
 }

@@ -1,11 +1,50 @@
 //! Error types for the history manager module.
 
+use url::Url;
+
+use super::search::Bound;
 use super::Timestamp;
 use crate::Version;
+
+/// The nearest retained timestamp on the side of the search bound that an
+/// out-of-range search failed against. Engines surface this to users so the
+/// error message can point at a valid timestamp.
+///
+/// `Earliest` and `Latest` carry the boundary commit's timestamp. `Unknown`
+/// means no boundary timestamp was available, e.g. empty log or a failure
+/// reading the boundary commit's In-Commit Timestamp at the error site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NearestTimestamp {
+    /// The earliest retained commit's timestamp. Returned for a
+    /// `GreatestLower` search whose input fell below the retained range.
+    Earliest(Timestamp),
+    /// The latest retained commit's timestamp. Returned for a `LeastUpper`
+    /// search whose input fell above the retained range.
+    Latest(Timestamp),
+    /// No boundary timestamp could be determined.
+    Unknown,
+}
+
+impl NearestTimestamp {
+    /// Tags `ts` with the variant matching `bound`.
+    pub(crate) fn from_boundary(bound: Bound, ts: Timestamp) -> Self {
+        match bound {
+            Bound::GreatestLower => Self::Earliest(ts),
+            Bound::LeastUpper => Self::Latest(ts),
+        }
+    }
+}
 
 /// Represents errors that can occur when converting commit timestamps to versions.
 #[derive(Debug, thiserror::Error)]
 pub enum LogHistoryError {
+    /// No commit files were found in the log directory.
+    #[error("No commits found in log directory {log_root}")]
+    NoCommitsFound {
+        /// The log directory URL that was searched.
+        log_root: Url,
+    },
     /// The provided timestamp range is invalid (start > end).
     #[error("Invalid timestamp range: ({start_timestamp}, {end_timestamp})")]
     InvalidTimestampRange {
@@ -37,6 +76,11 @@ pub enum LogHistoryError {
         timestamp: Timestamp,
         /// Description of why the timestamp is out of range.
         reason: &'static str,
+        /// The nearest retained commit's timestamp on the side of the search
+        /// bound. For example, given a retained range `[100, 500]` and a
+        /// `GreatestLower` search at timestamp `50`, this is
+        /// `NearestTimestamp::Earliest(100)`.
+        nearest_timestamp: NearestTimestamp,
     },
     /// An internal error occurred during timestamp conversion.
     #[error("{context}{}", source.as_ref().map(|e| format!(": {e}")).unwrap_or_default())]
@@ -63,6 +107,19 @@ impl LogHistoryError {
         Self::Internal {
             context,
             source: None,
+        }
+    }
+
+    /// Creates a `TimestampOutOfRange` error. The reason is derived from `bound`.
+    pub(crate) fn out_of_range(
+        timestamp: Timestamp,
+        bound: Bound,
+        nearest_timestamp: NearestTimestamp,
+    ) -> Self {
+        Self::TimestampOutOfRange {
+            timestamp,
+            reason: bound.out_of_range_reason(),
+            nearest_timestamp,
         }
     }
 }

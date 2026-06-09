@@ -7,7 +7,6 @@
 #![allow(unreachable_pub)]
 
 use std::marker::PhantomData;
-use std::sync::OnceLock;
 
 use crate::committer::Committer;
 use crate::snapshot::SnapshotRef;
@@ -63,7 +62,6 @@ impl AlterTableTransaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: false,
-            shared_write_state: OnceLock::new(),
             engine_commit_info: None,
             // TODO(#2446): match delta-spark's per-op isBlindAppend policy
             // (ADD/DROP/DROP NOT NULL -> true, SET NOT NULL -> false). Hardcoded false for

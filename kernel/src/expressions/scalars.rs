@@ -285,6 +285,17 @@ impl Scalar {
         matches!(self, Self::Null(_))
     }
 
+    /// Constructs a null `Scalar` of the given type. Accepts anything convertible into a
+    /// [`DataType`], so container types like [`StructType`], [`ArrayType`], and [`MapType`]
+    /// can be passed directly without an explicit `DataType::from(...)` wrapper.
+    ///
+    /// [`StructType`]: crate::schema::StructType
+    /// [`ArrayType`]: crate::schema::ArrayType
+    /// [`MapType`]: crate::schema::MapType
+    pub fn null(data_type: impl Into<DataType>) -> Self {
+        Self::Null(data_type.into())
+    }
+
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
@@ -711,6 +722,7 @@ impl PrimitiveType {
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
             Float => self.parse_str_as_scalar(raw, Scalar::Float),
             Double => self.parse_str_as_scalar(raw, Scalar::Double),
+            Void => Err(self.parse_error(raw)),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
                     Ok(Scalar::Boolean(true))
@@ -828,6 +840,16 @@ mod tests {
     use crate::expressions::{column_expr, BinaryPredicateOp};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
+
+    #[test]
+    fn test_void_parse_scalar() {
+        // Empty string should produce Null (like all primitive types)
+        let scalar = PrimitiveType::Void.parse_scalar("").unwrap();
+        assert_eq!(scalar, Scalar::Null(DataType::VOID));
+
+        // Non-empty string should fail
+        PrimitiveType::Void.parse_scalar("anything").unwrap_err();
+    }
 
     #[test]
     fn test_bad_decimal() {

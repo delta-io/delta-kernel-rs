@@ -7,11 +7,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
@@ -26,6 +25,8 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     assert_schema_has_field, nested_batches, nested_schema, read_add_infos, test_table_setup,
     write_batch_to_table,
@@ -70,10 +71,10 @@ fn verify_column_names_in_stats(
     let stats = add_actions
         .iter()
         .filter_map(|a| a.stats.as_ref())
-        .find(|s| s.get("minValues").is_some());
+        .find(|s| s.get(MIN_VALUES).is_some());
 
     if let Some(stats) = stats {
-        let min_values = &stats["minValues"];
+        let min_values = &stats[MIN_VALUES];
         for logical_path in VERIFIED_PATHS {
             let col = ColumnName::new(logical_path.iter().copied());
             let expected =

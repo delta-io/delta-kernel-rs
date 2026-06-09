@@ -867,13 +867,15 @@ impl CreateTableTransactionBuilder {
     /// This method performs validation:
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
-    /// - Validates the schema is non-empty
     /// - Rejects schemas with `delta.invariants` metadata annotations (unsupported by kernel)
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
     /// Non-null columns (`nullable: false`) are allowed. The `invariants` writer feature is
     /// auto-added to the protocol when the schema has any non-null column.
+    ///
+    /// Empty schemas are accepted. The resulting table cannot be read or blind-appended to
+    /// until columns are added via `ALTER TABLE ADD COLUMN`.
     ///
     /// # Arguments
     ///
@@ -885,7 +887,6 @@ impl CreateTableTransactionBuilder {
     /// Returns an error if:
     /// - The table path is invalid
     /// - A table already exists at the given path
-    /// - The schema is empty
     /// - The schema has `delta.invariants` metadata on any column
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
@@ -917,7 +918,8 @@ impl CreateTableTransactionBuilder {
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
 
-        // Validate schema (non-empty, column names, duplicates, no `delta.invariants` metadata)
+        // Validate schema (column names, duplicates, no `delta.invariants` metadata).
+        // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
@@ -1238,7 +1240,7 @@ mod tests {
         ]);
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
-            StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
+            StructField::new("address", address_struct, true),
         ]));
 
         let mut reader_features = vec![];
@@ -1288,9 +1290,11 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
-                    StructField::new("inner_v", DataType::unshredded_variant(), true),
-                ]))),
+                StructType::new_unchecked(vec![StructField::new(
+                    "inner_v",
+                    DataType::unshredded_variant(),
+                    true,
+                )]),
                 true,
             ),
         ])),
@@ -1308,9 +1312,11 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
-                    StructField::new("inner_ts", DataType::TIMESTAMP_NTZ, true),
-                ]))),
+                StructType::new_unchecked(vec![StructField::new(
+                    "inner_ts",
+                    DataType::TIMESTAMP_NTZ,
+                    true,
+                )]),
                 true,
             ),
         ])),
@@ -1383,11 +1389,7 @@ mod tests {
     #[case::nested_non_null(
         Arc::new(StructType::new_unchecked(vec![StructField::new(
             "parent",
-            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                "child",
-                DataType::INTEGER,
-                false,
-            )]))),
+            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]),
             true,
         )])),
         true,
@@ -1607,7 +1609,7 @@ mod tests {
             StructType::new_unchecked(vec![StructField::new("city", DataType::STRING, true)]);
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
-            StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
+            StructField::new("address", address_struct, true),
         ]);
 
         let columns = vec![ColumnName::new(["address", "city"])];
@@ -1622,21 +1624,15 @@ mod tests {
     #[rstest::rstest]
     #[case::struct_type(
         "struct_col",
-        DataType::Struct(Box::new(StructType::new_unchecked(vec![
-            StructField::new("inner", DataType::STRING, false),
-        ]))),
+        DataType::from(StructType::new_unchecked(vec![StructField::new("inner", DataType::STRING, false)])),
     )]
     #[case::array_type(
         "array_col",
-        DataType::Array(Box::new(crate::schema::ArrayType::new(DataType::INTEGER, false)))
+        DataType::from(crate::schema::ArrayType::new(DataType::INTEGER, false))
     )]
     #[case::map_type(
         "map_col",
-        DataType::Map(Box::new(crate::schema::MapType::new(
-            DataType::STRING,
-            DataType::INTEGER,
-            false
-        )))
+        DataType::from(crate::schema::MapType::new(DataType::STRING, DataType::INTEGER, false))
     )]
     fn test_validate_partition_columns_complex_types_rejected(
         #[case] col_name: &str,

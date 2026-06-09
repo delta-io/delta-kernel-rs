@@ -1,6 +1,17 @@
 name: run-examples
 
-on: [push, pull_request, merge_group]
+# Restrict push to long-lived branches to avoid duplicate CI runs. See .github/CLAUDE.md.
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  merge_group:
+
+concurrency:
+  # A new push to a PR cancels that PR's in-flight run. Non-PR events (push, merge_group) have
+  # no head_ref, so run_id (always unique) is used and those runs never cancel each other.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

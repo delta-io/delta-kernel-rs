@@ -1,13 +1,19 @@
 use std::error;
+use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 use itertools::Itertools;
-use test_utils::load_test_data;
+use test_utils::{
+    add_commit, create_default_engine, create_table, engine_store_setup, load_test_data,
+};
+use url::Url;
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,
@@ -577,6 +583,71 @@ fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
 
+    Ok(())
+}
+
+/// CDF over a commit whose Add carries an extended-year ISO 8601 timestamp in `stats`.
+/// The bad `EventTime` cell becomes a per-cell NULL while sibling `UserId` stats survive;
+/// the `UserId > 1000` predicate then prunes the file inside the `DataSkippingFilter` in
+/// `table_changes` log-replay, so `execute()` never tries to read the phantom parquet
+/// file and returns zero rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Error>> {
+    let schema = Arc::new(
+        StructType::try_new(vec![
+            StructField::nullable("EventTime", DataType::TIMESTAMP),
+            StructField::nullable("UserId", DataType::LONG),
+        ])
+        .unwrap(),
+    );
+
+    let tmp_dir = tempfile::tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let (store, _engine, table_url) = engine_store_setup("cdf_per_cell_null", Some(&tmp_url));
+
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true,
+        vec![],
+        vec!["changeDataFeed"],
+    )
+    .await?;
+
+    let stats = r#"{"numRecords":20,"minValues":{"EventTime":"+48690-07-02T22:50:38.211Z","UserId":5},"maxValues":{"EventTime":"+48690-07-02T22:50:38.211Z","UserId":200},"nullCount":{"EventTime":0,"UserId":0},"tightBounds":true}"#;
+    let stats_escaped = serde_json::Value::String(stats.to_string()).to_string();
+    let commit_info =
+        r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE","version":1}}"#;
+    let add = format!(
+        r#"{{"add":{{"path":"phantom_file.parquet","size":1024,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{{}},"stats":{stats_escaped}}}}}"#
+    );
+    let commit_body = format!("{commit_info}\n{add}");
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit_body).await?;
+
+    let engine = create_default_engine(&table_url)?;
+    let table_changes = TableChanges::try_new(table_url.clone(), engine.as_ref(), 1, Some(1))?;
+
+    let predicate: PredicateRef =
+        Arc::new(Pred::gt(column_expr!("UserId"), Expr::literal(1000i64)));
+    let scan = table_changes
+        .into_scan_builder()
+        .with_predicate(predicate)
+        .build()?;
+
+    // execute() must succeed and yield zero rows. The phantom file would crash an actual
+    // parquet read; the test passing means the per-cell NULL kept UserId stats valid and
+    // the predicate pruned the file before reading.
+    let batches: Vec<RecordBatch> = scan
+        .execute(engine)?
+        .map(|data| -> DeltaResult<_> { data?.try_into_record_batch() })
+        .try_collect()?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 0,
+        "predicate should have pruned the phantom file"
+    );
     Ok(())
 }
 
