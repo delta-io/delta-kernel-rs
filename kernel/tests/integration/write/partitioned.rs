@@ -21,7 +21,12 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
-use test_utils::{begin_transaction, read_scan, test_table_setup_mt, write_batch_to_table};
+use test_utils::{
+    begin_transaction, get_column, read_scan, test_table_setup_mt, write_batch_to_table,
+};
+use url::Url;
+
+use crate::common::read_utils::read_parquet_file;
 
 // ==============================================================================
 // Tests
@@ -833,6 +838,94 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         stats[NULL_COUNT].get(partition_col).is_none(),
         "partition column should not have nullCount even when materialized"
     );
+
+    Ok(())
+}
+
+/// End-to-end happy path for `materializePartitionColumns`: Writes a batch
+/// and read & verify both the raw parquet and the scanned result.
+#[rstest]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_materialize_partition_columns_e2e(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cm = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Name => "name",
+        ColumnMappingMode::Id => "id",
+    };
+    // Partition columns p1, p2 sit in the middle of the data columns.
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("d1", DataType::INTEGER),
+        StructField::nullable("p1", DataType::STRING),
+        StructField::nullable("p2", DataType::INTEGER),
+        StructField::nullable("d2", DataType::INTEGER),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let _ = create_table(&table_path, table_schema, "test/1.0")
+        .with_data_layout(DataLayout::partitioned(["p1", "p2"]))
+        .with_table_properties([
+            ("delta.feature.materializePartitionColumns", "supported"),
+            ("delta.columnMapping.mode", cm),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+
+    // Data schema excludes the partition columns.
+    let data_schema = StructType::try_new(vec![
+        StructField::nullable("d1", DataType::INTEGER),
+        StructField::nullable("d2", DataType::INTEGER),
+    ])?;
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )?;
+    let partition_values = HashMap::from([
+        ("p1".to_string(), Scalar::String("x".into())),
+        ("p2".to_string(), Scalar::Integer(5)),
+    ]);
+    let snapshot =
+        write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // ===== Read the written parquet file directly: partition columns are materialized. =====
+    let logical_schema = snapshot.schema();
+    let p1_phys = logical_schema.field("p1").unwrap().physical_name(cm_mode);
+    let p2_phys = logical_schema.field("p2").unwrap().physical_name(cm_mode);
+    let (_add, rel_path) = read_single_add(&table_path, 1)?;
+    let parquet_path = Url::from_directory_path(&table_path)
+        .unwrap()
+        .join(&rel_path)?
+        .to_file_path()
+        .unwrap();
+    let file_batch = read_parquet_file(&parquet_path);
+    assert_eq!(file_batch.num_rows(), 3);
+    let p1_in_file = get_column!(file_batch, p1_phys, StringArray);
+    assert!(
+        p1_in_file.iter().all(|v| v == Some("x")),
+        "materialized p1 should be 'x' in every row, got {p1_in_file:?}"
+    );
+    let p2_in_file = get_column!(file_batch, p2_phys, Int32Array);
+    assert!(
+        p2_in_file.iter().all(|v| v == Some(5)),
+        "materialized p2 should be 5 in every row, got {p2_in_file:?}"
+    );
+
+    // ===== Scan round-trip: partition values come back correctly. =====
+    let sorted = read_sorted(&snapshot, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
+    let int_col = |name: &str| get_column!(sorted, name, Int32Array).values().to_vec();
+    let p1_scan = get_column!(sorted, "p1", StringArray);
+    assert_eq!(int_col("d1"), vec![1, 2, 3]);
+    assert_eq!(int_col("d2"), vec![10, 20, 30]);
+    assert!(p1_scan.iter().all(|v| v == Some("x")));
+    assert_eq!(int_col("p2"), vec![5, 5, 5]);
 
     Ok(())
 }
