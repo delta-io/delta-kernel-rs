@@ -234,12 +234,7 @@ impl ReadMetadataRunner {
             .transpose()?
             .map(Arc::new);
 
-        let name = format!(
-            "{}/{}/{}",
-            table_info.name,
-            case_name,
-            config.name,
-        );
+        let name = format!("{}/{}/{}", table_info.name, case_name, config.name,);
 
         let thread_pool = match &config.parallel_scan {
             ParallelScan::Enabled { num_threads } => {
@@ -381,11 +376,7 @@ impl SnapshotConstructionRunner {
         snapshot_spec: &SnapshotConstructionSpec,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let name = format!(
-            "{}/{}",
-            table_info.name,
-            case_name,
-        );
+        let name = format!("{}/{}", table_info.name, case_name,);
 
         let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
 
@@ -497,10 +488,7 @@ mod tests {
             test_runtime(),
         )
         .expect("setup should succeed");
-        assert_eq!(
-            runner.name(),
-            "basic_partitioned/testCase/readMetadata/serial"
-        );
+        assert_eq!(runner.name(), "basic_partitioned/testCase/serial");
         assert!(runner.execute().is_ok());
     }
 
@@ -514,10 +502,7 @@ mod tests {
             test_runtime(),
         )
         .expect("setup should succeed");
-        assert_eq!(
-            runner.name(),
-            "basic_partitioned/testCase/readMetadata/parallel2"
-        );
+        assert_eq!(runner.name(), "basic_partitioned/testCase/parallel2");
         assert!(runner.execute().is_ok());
     }
 
@@ -548,10 +533,7 @@ mod tests {
             test_runtime(),
         )
         .expect("setup should succeed");
-        assert_eq!(
-            runner.name(),
-            "basic_partitioned/testCase/snapshotConstruction"
-        );
+        assert_eq!(runner.name(), "basic_partitioned/testCase");
     }
 
     #[test]
