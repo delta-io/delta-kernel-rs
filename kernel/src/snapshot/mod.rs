@@ -36,6 +36,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
+#[cfg(feature = "declarative-plans")]
+mod full_state;
 mod incremental;
 pub use builder::{IncrementalReplay, SnapshotBuilder};
 
