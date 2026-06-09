@@ -1943,8 +1943,9 @@ fn test_float_not_distinct_from(
     );
 }
 
-/// Column-vs-column comparisons exercise `NullBuffer::union` with disjoint null positions
-/// and the `(false, false) => Equal` arm of `sql_float_cmp` for both-NaN rows.
+/// Column-vs-column comparisons exercise `NullBuffer::union` with disjoint null positions,
+/// the `(false, false) => Equal` arm of `sql_float_cmp` for both-NaN rows, and the
+/// both-null row where DISTINCT is false and `<=>` is true.
 #[test]
 fn test_float_column_vs_column() {
     let left = Arc::new(Float64Array::from(vec![
@@ -1954,6 +1955,7 @@ fn test_float_column_vs_column() {
         None,
         Some(1.0),
         Some(2.0),
+        None,
     ])) as ArrayRef;
     let right = Arc::new(Float64Array::from(vec![
         Some(0.0),
@@ -1962,6 +1964,7 @@ fn test_float_column_vs_column() {
         Some(1.0),
         None,
         Some(2.0),
+        None,
     ])) as ArrayRef;
     let schema = Schema::new(vec![
         Field::new("a", DataType::Float64, true),
@@ -1981,7 +1984,8 @@ fn test_float_column_vs_column() {
             Some(false),
             None,
             None,
-            Some(true)
+            Some(true),
+            None
         ]),
         "a eq b: -0.0/0.0 equal, NaN/NaN equal, NULLs propagate"
     );
@@ -1990,8 +1994,16 @@ fn test_float_column_vs_column() {
     let result = evaluate_predicate(&pred, &batch, false).unwrap();
     assert_eq!(
         result,
-        BooleanArray::from(vec![false, false, true, true, true, false]),
-        "a distinct b: NULLs treated as values"
+        BooleanArray::from(vec![false, false, true, true, true, false, false]),
+        "a distinct b: NULL is distinct from a value but not from NULL"
+    );
+
+    let pred = a.clone().distinct(b.clone());
+    let result = evaluate_predicate(&pred, &batch, true).unwrap();
+    assert_eq!(
+        result,
+        BooleanArray::from(vec![true, true, false, false, false, true, true]),
+        "a not_distinct b: NULL <=> NULL is true, NULL <=> value is false"
     );
 
     let pred = a.gt(b);
@@ -2004,7 +2016,8 @@ fn test_float_column_vs_column() {
             Some(true),
             None,
             None,
-            Some(false)
+            Some(false),
+            None
         ]),
         "a gt b: NaN > 1.0"
     );
