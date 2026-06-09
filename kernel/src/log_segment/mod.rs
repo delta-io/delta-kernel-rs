@@ -300,7 +300,7 @@ impl LogSegment {
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
-    /// Reports metrics: `LogSegmentLoaded`.
+    /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[instrument(
         name = LOG_SEGMENT_LOADED_SPAN,
         err,
@@ -918,17 +918,11 @@ impl LogSegment {
                 let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
 
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable(
-                        "stats_parsed",
-                        DataType::Struct(Box::new(ss.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
                 }
 
                 if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable(
-                        "partitionValues_parsed",
-                        DataType::Struct(Box::new(ps.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
                 }
 
                 // Rebuild schema with modified add field
@@ -1068,12 +1062,18 @@ impl LogSegment {
             .try_collect()
     }
 
-    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
-    ///
-    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
-    /// checkpoint files, CRC files, and last checkpoint metadata. Only commits and compactions
-    /// in `(start_v_exclusive, end_version]` are retained.
-    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+    /// Creates a pruned LogSegment of only the commits and compactions in
+    /// `(start_v_exclusive, end_version]`, dropping checkpoint files, CRC files, and
+    /// last-checkpoint metadata.
+    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> Self {
+        // A checkpoint above start_v_exclusive would drop the commits between them, since the
+        // returned segment keeps only (start_v_exclusive, end] and no checkpoint.
+        debug_assert!(
+            self.checkpoint_version
+                .is_none_or(|ckpt| start_v_exclusive >= ckpt),
+            "segment_after_version: start_v_exclusive ({start_v_exclusive}) is below checkpoint {:?}",
+            self.checkpoint_version,
+        );
         let (commits, compactions) =
             self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
         LogSegment {
@@ -1085,31 +1085,6 @@ impl LogSegment {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
                 checkpoint_parts: vec![],
-                latest_crc_file: None,
-                latest_commit_file: None,
-                max_published_version: None,
-            },
-        }
-    }
-
-    /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
-    ///
-    /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
-    /// checkpoint-based replay, so checkpoint files and metadata are preserved. Only commits
-    /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
-    /// needed for this replay path (CRC file, latest commit file) are dropped.
-    pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
-        let (commits, compactions) =
-            self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
-        LogSegment {
-            end_version: self.end_version,
-            checkpoint_version: self.checkpoint_version,
-            log_root: self.log_root.clone(),
-            last_checkpoint_metadata: self.last_checkpoint_metadata.clone(),
-            listed: LogSegmentFiles {
-                ascending_commit_files: commits,
-                ascending_compaction_files: compactions,
-                checkpoint_parts: self.listed.checkpoint_parts.clone(),
                 latest_crc_file: None,
                 latest_commit_file: None,
                 max_published_version: None,

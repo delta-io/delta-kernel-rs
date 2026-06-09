@@ -15,14 +15,13 @@
 
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::ADD_NAME;
+use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatch, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 pub(crate) const STATS_FIELD: &str = "stats";
-pub(crate) const STATS_PARSED_FIELD: &str = "stats_parsed";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
 pub(crate) const PARTITION_VALUES_PARSED_FIELD: &str = "partitionValues_parsed";
 
@@ -160,18 +159,12 @@ pub(crate) fn build_checkpoint_read_schema(
         }
         let mut result = add_struct.clone().with_field_inserted_after(
             Some(STATS_FIELD),
-            StructField::nullable(
-                STATS_PARSED_FIELD,
-                DataType::Struct(Box::new(stats_schema.clone())),
-            ),
+            StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
         )?;
         if let Some(pv_schema) = partition_schema {
             result = result.with_field_inserted_after(
                 Some(PARTITION_VALUES_FIELD),
-                StructField::nullable(
-                    PARTITION_VALUES_PARSED_FIELD,
-                    DataType::Struct(Box::new(pv_schema.clone())),
-                ),
+                StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
             )?;
         }
         Ok(result)
@@ -286,7 +279,7 @@ fn transform_add_schema(
         ADD_NAME,
         StructField {
             name: ADD_NAME.to_string(),
-            data_type: DataType::Struct(Box::new(modified_add)),
+            data_type: DataType::from(modified_add),
             nullable: add_field.nullable,
             metadata: add_field.metadata.clone(),
         },
@@ -305,18 +298,12 @@ fn build_add_output_schema(
     if config.write_stats_as_struct {
         new_schema = new_schema.with_field_inserted_after(
             Some(STATS_FIELD),
-            StructField::nullable(
-                STATS_PARSED_FIELD,
-                DataType::Struct(Box::new(stats_schema.clone())),
-            ),
+            StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
         )?;
         if let Some(pv_schema) = partition_schema {
             new_schema = new_schema.with_field_inserted_after(
                 Some(PARTITION_VALUES_FIELD),
-                StructField::nullable(
-                    PARTITION_VALUES_PARSED_FIELD,
-                    DataType::Struct(Box::new(pv_schema.clone())),
-                ),
+                StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
             )?;
         }
     }
@@ -586,10 +573,7 @@ mod tests {
         let result = add_schema
             .with_field_inserted_after(
                 Some(STATS_FIELD),
-                StructField::nullable(
-                    STATS_PARSED_FIELD,
-                    DataType::Struct(Box::new(injected_schema)),
-                ),
+                StructField::nullable(STATS_PARSED_FIELD, injected_schema),
             )
             .expect("inserting stats_parsed should succeed");
 
@@ -679,11 +663,7 @@ mod tests {
             StructField::not_null("path", DataType::STRING),
             StructField::nullable(
                 "partitionValues",
-                DataType::Map(Box::new(crate::schema::MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
+                crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
             ),
             StructField::nullable("stats", DataType::STRING),
         ]);
@@ -722,11 +702,7 @@ mod tests {
             StructField::not_null("path", DataType::STRING),
             StructField::nullable(
                 "partitionValues",
-                DataType::Map(Box::new(crate::schema::MapType::new(
-                    DataType::STRING,
-                    DataType::STRING,
-                    true,
-                ))),
+                crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
             ),
             StructField::nullable("stats", DataType::STRING),
         ]);

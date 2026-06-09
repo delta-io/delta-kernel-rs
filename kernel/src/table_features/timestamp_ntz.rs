@@ -62,11 +62,11 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
+                StructType::new_unchecked([StructField::new(
                     "inner_ts",
                     DataType::Primitive(PrimitiveType::TimestampNtz),
                     true,
-                )]))),
+                )]),
                 true,
             ),
         ]);

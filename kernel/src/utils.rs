@@ -20,6 +20,41 @@ macro_rules! require {
 
 pub(crate) use require;
 
+/// Dual of the `FromIterator` trait, similar to how `Into` is the dual of `From`. It is
+/// automatically implemented for any iterable whose items collect into `T`, and can drastically
+/// simplify type bounds. For example, `CollectInto` allows to write this:
+///
+/// ```
+/// # use delta_kernel::CollectInto;
+/// # struct Foo;
+/// fn foo(arg: impl CollectInto<Foo>) -> Foo {
+///     arg.collect_into()
+/// }
+/// ```
+///
+/// instead of the much more verbose:
+///
+/// ```
+/// # struct Foo;
+/// fn foo<T>(arg: impl IntoIterator<Item = T>) -> Foo
+/// where
+///     Foo: FromIterator<T>,
+/// {
+///     Foo::from_iter(arg)
+/// }
+/// ```
+pub trait CollectInto<T>: IntoIterator + Sized {
+    /// Collects this iterable into a `T`
+    fn collect_into(self) -> T;
+}
+
+// blanket impl
+impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
+    fn collect_into(self) -> T {
+        T::from_iter(self)
+    }
+}
+
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.
 #[allow(unused)]
@@ -251,7 +286,7 @@ pub(crate) mod test_utils {
 
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue,
-        PrimitiveType, SchemaRef, StructField, StructType,
+        SchemaRef, StructField, StructType,
     };
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
@@ -408,82 +443,6 @@ pub(crate) mod test_utils {
         crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
     }
 
-    /// Helper to get a field from a StructType by name, panicking if not found.
-    pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
-        struct_type
-            .fields()
-            .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{name}' not found"))
-            .clone()
-    }
-
-    /// Validates that a schema has the expected checkpoint structure with top-level action fields
-    /// and proper nested types for add, metaData, and protocol actions.
-    pub(crate) fn validate_checkpoint_schema(schema: &SchemaRef) {
-        // Verify top-level action fields exist and are structs
-        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
-        for field_name in top_level_fields {
-            let field = get_schema_field(schema, field_name);
-            assert!(
-                matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{field_name}' should be a struct type"
-            );
-        }
-
-        // Verify 'add' struct has expected fields with correct types
-        let add_field = get_schema_field(schema, "add");
-        let add_struct = match add_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'add' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(add_struct, "path").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-        assert_eq!(
-            get_schema_field(add_struct, "size").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Long)
-        );
-        assert!(
-            matches!(
-                get_schema_field(add_struct, "partitionValues").data_type(),
-                KernelDataType::Map(_)
-            ),
-            "'partitionValues' should be a map type"
-        );
-
-        // Verify 'metaData' struct has nested 'format' struct
-        let metadata_field = get_schema_field(schema, "metaData");
-        let metadata_struct = match metadata_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'metaData' should be a struct"),
-        };
-        let format_field = get_schema_field(metadata_struct, "format");
-        let format_struct = match format_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'format' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(format_struct, "provider").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-
-        // Verify 'protocol' struct has version fields
-        let protocol_field = get_schema_field(schema, "protocol");
-        let protocol_struct = match protocol_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'protocol' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(protocol_struct, "minReaderVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
-        assert_eq!(
-            get_schema_field(protocol_struct, "minWriterVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
-    }
-
     // ==================== Test schema helpers ====================
     //
     // Reusable test schemas
@@ -552,11 +511,11 @@ pub(crate) mod test_utils {
     ) -> StructType {
         let array_in_map = StructField::nullable(
             "array_in_map",
-            KernelDataType::Map(Box::new(MapType::new(
+            MapType::new(
                 KernelDataType::INTEGER,
-                KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
+                ArrayType::new(KernelDataType::INTEGER, true),
                 true,
-            ))),
+            ),
         )
         .with_metadata(metadata);
         StructType::try_new(vec![array_in_map]).unwrap()
@@ -750,19 +709,19 @@ pub(crate) mod test_utils {
     }
 
     fn complex_nested_inner_map_type() -> KernelDataType {
-        KernelDataType::Map(Box::new(MapType::new(
+        KernelDataType::from(MapType::new(
             KernelDataType::INTEGER,
-            KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
+            ArrayType::new(KernelDataType::INTEGER, true),
             true,
-        )))
+        ))
     }
 
     fn complex_nested_outer_map_type(struct_value: StructType) -> KernelDataType {
-        KernelDataType::Map(Box::new(MapType::new(
-            KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
-            KernelDataType::Struct(Box::new(struct_value)),
+        KernelDataType::from(MapType::new(
+            ArrayType::new(KernelDataType::INTEGER, true),
+            struct_value,
             true,
-        )))
+        ))
     }
 
     /// Build the kernel schema described by [`complex_nested_with_field_ids`].
@@ -947,11 +906,7 @@ pub(crate) mod test_utils {
             StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "entries",
-                MapType::new(
-                    KernelDataType::STRING,
-                    KernelDataType::Struct(Box::new(value_struct)),
-                    true,
-                ),
+                MapType::new(KernelDataType::STRING, value_struct, true),
             ),
             StructField::nullable("name", KernelDataType::STRING),
         ]))
@@ -980,11 +935,7 @@ pub(crate) mod test_utils {
             with_column_mapping(
                 StructField::nullable(
                     "entries",
-                    MapType::new(
-                        KernelDataType::STRING,
-                        KernelDataType::Struct(Box::new(value_struct)),
-                        true,
-                    ),
+                    MapType::new(KernelDataType::STRING, value_struct, true),
                 ),
                 2,
                 "phys_entries",
@@ -1007,7 +958,7 @@ pub(crate) mod test_utils {
             StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "items",
-                ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+                ArrayType::new(KernelDataType::from(item_struct), true),
             ),
             StructField::nullable("name", KernelDataType::STRING),
         ]))
@@ -1036,7 +987,7 @@ pub(crate) mod test_utils {
             with_column_mapping(
                 StructField::nullable(
                     "items",
-                    ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+                    ArrayType::new(KernelDataType::from(item_struct), true),
                 ),
                 2,
                 "phys_items",
@@ -1056,17 +1007,13 @@ pub(crate) mod test_utils {
     pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
         let leaf_struct =
             StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
-        let map_type = MapType::new(
-            KernelDataType::STRING,
-            KernelDataType::Struct(Box::new(leaf_struct)),
-            true,
-        );
+        let map_type = MapType::new(KernelDataType::STRING, leaf_struct, true);
         let mid_struct = StructType::new_unchecked([with_column_mapping(
             StructField::nullable("mid_field", map_type),
             2,
             "phys_mid_field",
         )]);
-        let array_type = ArrayType::new(KernelDataType::Struct(Box::new(mid_struct)), true);
+        let array_type = ArrayType::new(KernelDataType::from(mid_struct), true);
         StructType::new_unchecked([with_column_mapping(
             StructField::nullable("top", array_type),
             1,
@@ -1210,7 +1157,7 @@ pub(crate) mod test_utils {
             let nested = StructType::new_unchecked([cm_field("id", 3, "id", DataType::INTEGER)]);
             StructType::new_unchecked([
                 cm_field("id", 1, "id", DataType::INTEGER),
-                cm_field("nested", 2, "nested", DataType::Struct(Box::new(nested))),
+                cm_field("nested", 2, "nested", nested),
             ])
         }
 
@@ -1220,7 +1167,7 @@ pub(crate) mod test_utils {
                 cm_field("a", 2, "x", DataType::INTEGER),
                 cm_field("b", 3, "x", DataType::INTEGER),
             ]);
-            let arr_of_struct = ArrayType::new(DataType::Struct(Box::new(inner)), true);
+            let arr_of_struct = ArrayType::new(inner, true);
             let map_to_arr = MapType::new(DataType::STRING, arr_of_struct, true);
             StructType::new_unchecked([cm_field("outer", 1, "outer", map_to_arr)])
         }
@@ -1249,9 +1196,9 @@ pub(crate) mod test_utils {
                 cm_field("y", 5, "q", DataType::INTEGER),
             ]);
             StructType::new_unchecked([
-                cm_field("a", 1, "p", DataType::Struct(Box::new(a_struct))),
-                cm_field("b", 2, "p", DataType::Struct(Box::new(b_struct))),
-                cm_field("nested", 3, "nested", DataType::Struct(Box::new(nested))),
+                cm_field("a", 1, "p", a_struct),
+                cm_field("b", 2, "p", b_struct),
+                cm_field("nested", 3, "nested", nested),
             ])
         }
 

@@ -28,13 +28,14 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # extern crate tokio;
 # use std::collections::HashMap;
 # use delta_kernel::arrow::array::RecordBatch;
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::Scalar;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]

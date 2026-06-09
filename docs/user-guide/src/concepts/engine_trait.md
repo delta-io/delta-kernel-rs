@@ -99,9 +99,10 @@ To construct one, create an object store and pass it to the builder:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # extern crate url;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::DeltaResult;
 # fn example() -> DeltaResult<()> {
 let url = url::Url::parse("file:///path/to/table")?;
@@ -162,7 +163,7 @@ running a single-threaded Tokio runtime. All async work is dispatched to that th
 channel.
 
 ```rust,ignore
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 
 let executor = TokioBackgroundExecutor::new();
 ```
@@ -185,7 +186,7 @@ flavors.
 a web server or a query engine), pass its handle so Kernel's I/O shares the same thread pool:
 
 ```rust,ignore
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 
 let handle = tokio::runtime::Handle::current();
 let executor = TokioMultiThreadExecutor::new(handle);

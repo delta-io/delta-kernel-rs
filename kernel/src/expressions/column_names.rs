@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
 use std::ops::Deref;
 
+use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
 
 /// A (possibly nested) column name.
@@ -15,11 +16,8 @@ pub struct ColumnName {
 impl ColumnName {
     /// Creates a new column name from input satisfying `FromIterator for ColumnName`. The provided
     /// field names are concatenated into a single path.
-    pub fn new<A>(iter: impl IntoIterator<Item = A>) -> Self
-    where
-        Self: FromIterator<A>,
-    {
-        iter.into_iter().collect()
+    pub fn new(iter: impl CollectInto<Self>) -> Self {
+        iter.collect_into()
     }
 
     /// Naively splits a string at dots to create a column name.
@@ -439,6 +437,49 @@ macro_rules! __column_expr {
 }
 #[doc(inline)]
 pub use __column_expr as column_expr;
+
+/// Builds an [`Expression`] column reference. Accepts two forms:
+///
+/// - A single **string literal** is split on `.` at compile time into a (possibly nested) column
+///   reference: `col!("a.b.c")` is equivalent to `col!("a", "b", "c")`. This is the same
+///   compile-time splitting [`column_expr!`] performs.
+/// - One or more comma-separated arguments build a column whose segments are taken **verbatim**
+///   (never split on `.`). A single non-literal argument is one segment, so `col!(name)` for a
+///   runtime `&str`/`String` is a single-segment column; `col!("a.b", "c")` is two segments.
+///
+/// ```
+/// # use delta_kernel::expressions::{col, column_expr, ColumnName, Expression};
+/// // A string literal splits on dots at compile time (same as `column_expr!`).
+/// assert_eq!(col!("a.b.c"), Expression::Column(ColumnName::new(["a", "b", "c"])));
+/// assert_eq!(col!("a.b.c"), column_expr!("a.b.c"));
+///
+/// // A single dotless literal is one segment.
+/// assert_eq!(col!("x"), Expression::Column(ColumnName::new(["x"])));
+///
+/// // Multiple args build a multi-segment column, each segment verbatim (not split).
+/// assert_eq!(col!("a.b", "c"), Expression::Column(ColumnName::new(["a.b", "c"])));
+///
+/// // A single runtime value is one verbatim segment.
+/// let name = "runtime";
+/// assert_eq!(col!(name), Expression::Column(ColumnName::new(["runtime"])));
+/// ```
+///
+/// [`Expression`]: crate::expressions::Expression
+/// [`column_expr!`]: crate::expressions::column_expr
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __col {
+    // A single string literal: split on `.` at compile time (same as `column_expr!`).
+    ( $name:literal ) => {
+        $crate::expressions::column_expr!($name)
+    };
+    // One or more comma-separated segments, each taken verbatim (never split on `.`).
+    ( $($segments:expr),+ $(,)? ) => {
+        $crate::expressions::Expression::column([$($segments),+])
+    };
+}
+#[doc(inline)]
+pub use __col as col;
 
 #[macro_export]
 #[doc(hidden)]

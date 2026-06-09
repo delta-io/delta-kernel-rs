@@ -63,20 +63,21 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel_default_engine::executor::TaskExecutor;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
 // ===========================================================================
 // Sweep constants
@@ -177,7 +178,8 @@ impl fmt::Display for LastCheckpointHintState {
     }
 }
 
-/// Shape of a Delta table's `_delta_log/` directory.
+/// Shape of a Delta table's `_delta_log/` directory: commits, checkpoints, CRC
+/// files, the `_last_checkpoint` hint, and log cleanup.
 #[derive(Clone, Debug)]
 pub struct LogState {
     /// Latest version on the table. Versions `0..=latest_version` exist as
@@ -188,6 +190,9 @@ pub struct LogState {
     checkpoints_at: Vec<u64>,
     /// Format applied to every checkpoint in `checkpoints_at`.
     checkpoint_format: CheckpointFormat,
+    /// Sorted ascending, distinct, all `<= latest_version`. A `.crc` file is
+    /// written at each listed version.
+    crcs_at: Vec<u64>,
     /// If `Some(n)`, log files at versions `< n` are deleted after the table is built.
     cleanup_before: Option<u64>,
     /// State of the `_last_checkpoint` hint file. Defaults to `Present`.
@@ -202,6 +207,7 @@ impl LogState {
             latest_version: n,
             checkpoints_at: Vec::new(),
             checkpoint_format: CheckpointFormat::Default,
+            crcs_at: Vec::new(),
             cleanup_before: None,
             last_checkpoint_hint: LastCheckpointHintState::Present,
         }
@@ -210,6 +216,10 @@ impl LogState {
     /// Add checkpoints at the given versions. Pass `[v]` for a single
     /// checkpoint or `[v1, v2, ...]` for multiple. Each `v` must be
     /// `<= latest_version` and not already present.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any `v > latest_version` or is already present.
     pub fn with_checkpoint_at(mut self, vs: impl IntoIterator<Item = u64>) -> Self {
         for v in vs {
             assert!(
@@ -236,6 +246,31 @@ impl LogState {
             Some(v) => self.with_checkpoint_at([v]),
             None => self,
         }
+    }
+
+    /// Add CRC files at the given versions. Pass `[v]` for a single CRC or
+    /// `[v1, v2, ...]` for multiple. Each `v` must be `<= latest_version` and
+    /// not already present.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any `v > latest_version` or is already present.
+    pub fn with_crc_at(mut self, vs: impl IntoIterator<Item = u64>) -> Self {
+        for v in vs {
+            assert!(
+                v <= self.latest_version,
+                "crc_at ({v}) must be <= latest_version ({})",
+                self.latest_version,
+            );
+            assert!(
+                !self.crcs_at.contains(&v),
+                "crc_at ({v}) already present in {:?}",
+                self.crcs_at,
+            );
+            self.crcs_at.push(v);
+        }
+        self.crcs_at.sort_unstable();
+        self
     }
 
     /// Switch every checkpoint to V2 with sidecars. Pass `None` for the kernel
@@ -288,6 +323,11 @@ impl LogState {
         &self.checkpoint_format
     }
 
+    /// Versions at which CRC files are written, in ascending order.
+    pub(crate) fn crcs_at(&self) -> &[u64] {
+        &self.crcs_at
+    }
+
     /// Version below which commits and checkpoints have been cleaned up, if any.
     pub(crate) fn cleanup_before(&self) -> Option<u64> {
         self.cleanup_before
@@ -330,6 +370,22 @@ pub fn two_checkpoints_stale_hint() -> LogState {
         .with_last_checkpoint_hint(LastCheckpointHintState::Stale)
 }
 
+pub fn crc_at_end() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
+}
+
+pub fn crc_at_mid() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_crc_at([DEFAULT_SWEEP_MID_VERSION])
+}
+
+pub fn checkpoint_at_end_crc_at_end() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_LATEST_VERSION])
+        .with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
+}
+
 // Post-cleanup variants: same shapes as above but with log cleanup applied at MID.
 // Cleanup at MID (not at LATEST) keeps commits MID..=LATEST reachable, so the canonical
 // `at_version(MID)` and `incremental_to_latest { from: MID }` targets still resolve.
@@ -354,6 +410,19 @@ pub fn checkpoint_mid_no_hint_post_cleanup() -> LogState {
 
 pub fn two_checkpoints_stale_hint_post_cleanup() -> LogState {
     two_checkpoints_stale_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_mid_crc_at_mid_post_cleanup() -> LogState {
+    checkpoint_mid_post_cleanup().with_crc_at([DEFAULT_SWEEP_MID_VERSION])
+}
+
+pub fn checkpoint_mid_crc_above_mid_post_cleanup() -> LogState {
+    // Version 8 lies strictly between MID=5 and LATEST=10.
+    checkpoint_mid_post_cleanup().with_crc_at([8])
+}
+
+pub fn checkpoint_mid_crc_at_end_post_cleanup() -> LogState {
+    checkpoint_mid_post_cleanup().with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
 }
 
 /// Extract the version from a versioned log file. Returns `None` for unversioned
@@ -403,6 +472,9 @@ impl fmt::Display for LogState {
         write!(f, "v={}", self.latest_version)?;
         for v in &self.checkpoints_at {
             write!(f, "+checkpoint_at({v})")?;
+        }
+        for v in &self.crcs_at {
+            write!(f, "+crc_at({v})")?;
         }
         if let Some(n) = self.cleanup_before {
             write!(f, "+cleanup_before({n})")?;
@@ -1128,6 +1200,11 @@ impl TestTableBuilder {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
+
+        let crcs_at = self.log_state.crcs_at();
+        if crcs_at.contains(&0) {
+            write_crc(&snapshot, engine.as_ref())?;
+        }
         if checkpoints_at.contains(&0) {
             snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
             if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
@@ -1148,6 +1225,9 @@ impl TestTableBuilder {
             )
             .await?
             .unwrap_post_commit_snapshot();
+            if crcs_at.contains(&v) {
+                write_crc(&snapshot, engine.as_ref())?;
+            }
             if checkpoints_at.contains(&v) {
                 snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
                 if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
@@ -1210,6 +1290,19 @@ impl TestTableBuilder {
 // ===========================================================================
 // Data commit via kernel write path
 // ===========================================================================
+
+/// Write a CRC file via kernel's checksum writer. Builder invariant: the snapshot
+/// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
+/// that version cannot already exist on disk.
+fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
+    let (result, _) = snapshot.write_checksum(engine)?;
+    assert_eq!(
+        result,
+        ChecksumWriteResult::Written,
+        "fresh in-memory table should never have a CRC on disk at this version",
+    );
+    Ok(())
+}
 
 /// Write a data commit using kernel's transaction + write_parquet path.
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
@@ -1623,6 +1716,7 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 Scalar::decimal(bits, dt.precision(), dt.scale())
                     .expect("test seed produced invalid decimal")
             }
+            PrimitiveType::Void => panic!("void type is not a valid partition column"),
         },
         other => panic!("partition columns must be primitive types, got: {other:?}"),
     }
@@ -1864,6 +1958,24 @@ mod tests {
             .with_cleanup_commits_before(8)
             .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
     )]
+    #[case::crc_at_v0(LogState::with_latest_version(2).with_crc_at([0]))]
+    #[case::crc_at_v1(LogState::with_latest_version(2).with_crc_at([1]))]
+    #[case::crc_at_latest(LogState::with_latest_version(2).with_crc_at([2]))]
+    #[case::checkpoint_with_later_crc(
+        LogState::with_latest_version(2).with_checkpoint_at([1]).with_crc_at([2]),
+    )]
+    #[case::crc_below_cleanup_is_deleted(
+        LogState::with_latest_version(3)
+            .with_checkpoint_at([2])
+            .with_crc_at([1])
+            .with_cleanup_commits_before(2),
+    )]
+    #[case::crc_at_cleanup_boundary_survives(
+        LogState::with_latest_version(3)
+            .with_checkpoint_at([2])
+            .with_crc_at([2])
+            .with_cleanup_commits_before(2),
+    )]
     fn test_log_state_checkpoint_shapes_land_on_disk(
         #[case] log_state: LogState,
     ) -> DeltaResult<()> {
@@ -2041,6 +2153,53 @@ mod tests {
         LogState::with_latest_version(2).with_checkpoint_at([3]);
     }
 
+    #[rstest::rstest]
+    #[case::no_features(FeatureSet::empty(), false)]
+    #[case::v2_checkpoint_feature(FeatureSet::new().v2_checkpoint(), false)]
+    #[case::ict(FeatureSet::new().ict(), true)]
+    fn test_builder_writes_crc_with_correct_content(
+        #[case] features: FeatureSet,
+        #[case] expect_ict: bool,
+    ) -> DeltaResult<()> {
+        let log_state = LogState::with_latest_version(2)
+            .with_checkpoint_at([2])
+            .with_crc_at([2]);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state.clone())
+            .with_features(features)
+            .build()?;
+        assert_log_state_files_on_disk(&table, &log_state)?;
+
+        let crc = read_crc_json(table.store(), 2)?;
+        assert_eq!(
+            crc["numFiles"].as_u64().unwrap(),
+            2,
+            "numFiles should match the 2 data adds emitted at v=1 and v=2",
+        );
+        assert!(
+            crc["tableSizeBytes"].as_u64().unwrap() > 0,
+            "tableSizeBytes should be positive for a table with 2 data files",
+        );
+        assert_eq!(
+            crc["inCommitTimestampOpt"].is_i64(),
+            expect_ict,
+            "inCommitTimestampOpt presence must match the ICT feature flag",
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "must be <= latest_version")]
+    fn test_with_crc_at_rejects_above_latest_version() {
+        LogState::with_latest_version(2).with_crc_at([3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "already present")]
+    fn test_with_crc_at_rejects_duplicate_version() {
+        LogState::with_latest_version(2).with_crc_at([1, 1]);
+    }
+
     #[test]
     fn test_cleanup_commits_before_deletes_old_files_and_rebuilds() -> DeltaResult<()> {
         // Checkpoints at v=1 (below cutoff), v=3 (at cutoff), v=5 (above cutoff)
@@ -2145,6 +2304,38 @@ mod tests {
             }
         }
 
+        for &v in log_state.crcs_at() {
+            let crc_name = format!("{v:020}.crc");
+            let surviving = v >= cleanup;
+            let found = entries.iter().any(|name| name == &crc_name);
+            assert_eq!(
+                found,
+                surviving,
+                "CRC at v={v} should be {} for {log_state}: {entries:?}",
+                if surviving { "present" } else { "cleaned up" },
+            );
+            if surviving {
+                let crc = read_crc_json(table.store(), v)?;
+                assert!(
+                    crc["tableSizeBytes"].is_u64(),
+                    "CRC at v={v} missing tableSizeBytes",
+                );
+                assert!(crc["numFiles"].is_u64(), "CRC at v={v} missing numFiles");
+                assert_eq!(
+                    crc["numMetadata"].as_u64(),
+                    Some(1),
+                    "CRC at v={v} must have numMetadata == 1 per spec",
+                );
+                assert_eq!(
+                    crc["numProtocol"].as_u64(),
+                    Some(1),
+                    "CRC at v={v} must have numProtocol == 1 per spec",
+                );
+                assert!(crc["protocol"].is_object(), "CRC at v={v} missing protocol");
+                assert!(crc["metadata"].is_object(), "CRC at v={v} missing metadata");
+            }
+        }
+
         let hint = read_last_checkpoint_hint(table.store())?;
         match log_state.last_checkpoint_hint() {
             LastCheckpointHintState::Present => {
@@ -2178,27 +2369,46 @@ mod tests {
         version: u64,
     }
 
+    /// Read and JSON-parse a file from `store`. Returns `Ok(None)` if absent.
+    async fn try_read_json(
+        store: &DynObjectStore,
+        path: &Path,
+    ) -> DeltaResult<Option<serde_json::Value>> {
+        let bytes = match store.get(path).await {
+            Ok(r) => r.bytes().await.map_err(delta_kernel::Error::from)?,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(delta_kernel::Error::from(e)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| delta_kernel::Error::generic(e.to_string()))
+    }
+
     /// Read and parse the `_last_checkpoint` hint, if present.
     fn read_last_checkpoint_hint(store: &Arc<DynObjectStore>) -> DeltaResult<Option<HintFile>> {
         let store = store.clone();
         block_on_sync(move || async move {
             let path = Path::from("_delta_log/_last_checkpoint");
-            match store.get(&path).await {
-                Ok(get_result) => {
-                    let bytes = get_result
-                        .bytes()
-                        .await
-                        .map_err(delta_kernel::Error::from)?;
-                    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-                        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+            match try_read_json(&store, &path).await? {
+                Some(parsed) => {
                     let version = parsed["version"].as_u64().ok_or_else(|| {
                         delta_kernel::Error::generic("hint missing `version` field")
                     })?;
                     Ok(Some(HintFile { version }))
                 }
-                Err(ObjectStoreError::NotFound { .. }) => Ok(None),
-                Err(e) => Err(delta_kernel::Error::from(e)),
+                None => Ok(None),
             }
+        })
+    }
+
+    /// Read and parse a CRC file at `version`. Errors if the file is absent.
+    fn read_crc_json(store: &Arc<DynObjectStore>, version: u64) -> DeltaResult<serde_json::Value> {
+        let store = store.clone();
+        block_on_sync(move || async move {
+            let path = Path::from(format!("_delta_log/{version:020}.crc"));
+            try_read_json(&store, &path)
+                .await?
+                .ok_or_else(|| delta_kernel::Error::generic(format!("CRC at v={version} missing")))
         })
     }
 

@@ -11,10 +11,11 @@ The `create_table` function returns a builder that you configure and then commit
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::DeltaResult;
@@ -93,10 +94,11 @@ You can set custom application properties on the table:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::DeltaResult;
@@ -128,10 +130,11 @@ layout for queries that filter on the clustering columns:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
@@ -183,10 +186,11 @@ entire directories when filtering on those columns.
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;

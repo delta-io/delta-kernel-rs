@@ -393,7 +393,7 @@ fn create_struct_data_type(
         .collect::<DeltaResult<Vec<_>>>()?;
 
     let struct_type = StructType::try_new(field_vec)?;
-    Ok(DataType::Struct(Box::new(struct_type)))
+    Ok(DataType::from(struct_type))
 }
 
 fn visit_field_struct_impl(

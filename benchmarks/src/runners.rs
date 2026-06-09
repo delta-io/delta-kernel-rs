@@ -13,12 +13,12 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::{Engine, Snapshot};
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::UCKernelClient;
 use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
 use unity_catalog_delta_rest_client::{

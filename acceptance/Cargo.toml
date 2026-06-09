@@ -22,10 +22,11 @@ arrow-57 = ["delta_kernel/arrow-57", "test_utils/arrow-57"]
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = [
-  "default-engine-rustls",
+  "default-engine-base",
   "internal-api",
   "prettyprint",
 ] }
+delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"] }
 delta_kernel_benchmarks = { path = "../benchmarks" }
 futures = "0.3"
 itertools = "0.14"

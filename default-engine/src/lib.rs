@@ -9,6 +9,16 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
+use delta_kernel::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::schema::Schema;
+use delta_kernel::transaction::WriteContext;
+use delta_kernel::{
+    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+};
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
 
@@ -16,15 +26,6 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
-use super::arrow_conversion::TryFromArrow as _;
-use super::arrow_data::ArrowEngineData;
-use super::arrow_expression::ArrowEvaluationHandler;
-use crate::object_store::DynObjectStore;
-use crate::schema::Schema;
-use crate::transaction::WriteContext;
-use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-};
 
 pub mod executor;
 pub mod file_stream;
@@ -83,70 +84,17 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
-/// Wraps a [`crate::FileDataReadResultIterator`] to emit a metrics event exactly once when the
-/// iterator is either exhausted or dropped.
-///
-/// Used by the JSON and Parquet handlers to report the number of files and bytes requested per
-/// `read_*_files` call. The `emit_fn` is called with `(num_files, bytes_read)` and is expected
-/// to create and immediately drop a tracing span, which triggers the `ReportGeneratorLayer` to
-/// fire the appropriate [`crate::metrics::MetricEvent`] to any registered reporter.
-pub(super) struct ReadMetricsIterator {
-    inner: crate::FileDataReadResultIterator,
-    num_files: u64,
-    bytes_read: u64,
-    emitted: bool,
-    emit_fn: fn(u64, u64),
-}
-
-impl ReadMetricsIterator {
-    pub(super) fn new(
-        inner: crate::FileDataReadResultIterator,
-        num_files: u64,
-        bytes_read: u64,
-        emit_fn: fn(u64, u64),
-    ) -> Self {
-        Self {
-            inner,
-            num_files,
-            bytes_read,
-            emitted: false,
-            emit_fn,
-        }
-    }
-
-    fn emit_once(&mut self) {
-        if !self.emitted {
-            self.emitted = true;
-            (self.emit_fn)(self.num_files, self.bytes_read);
-        }
-    }
-}
-
-impl Iterator for ReadMetricsIterator {
-    type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let item = self.inner.next();
-        if item.is_none() {
-            self.emit_once();
-        }
-        item
-    }
-}
-
-impl Drop for ReadMetricsIterator {
-    fn drop(&mut self) {
-        self.emit_once();
-    }
-}
-
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    storage: Arc<ObjectStoreStorageHandler<E>>,
-    json: Arc<DefaultJsonHandler<E>>,
-    parquet: Arc<DefaultParquetHandler<E>>,
+    storage: Arc<MeteredStorageHandler>,
+    json: Arc<MeteredJsonHandler>,
+    parquet: Arc<MeteredParquetHandler>,
+    /// Concrete parquet handler retained so [`Self::write_parquet`] and
+    /// [`Self::default_parquet_handler`] can reach the inherent `write_parquet_file`
+    /// helper, which the [`ParquetHandler`] trait surface doesn't expose.
+    raw_parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
@@ -230,19 +178,23 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 
 impl<E: TaskExecutor> DefaultEngine<E> {
     fn new_with_opts(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+        let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
+            object_store.clone(),
+            task_executor.clone(),
+        ));
+        let raw_json: Arc<dyn JsonHandler> = Arc::new(DefaultJsonHandler::new(
+            object_store.clone(),
+            task_executor.clone(),
+        ));
+        let raw_parquet = Arc::new(DefaultParquetHandler::new(
+            object_store.clone(),
+            task_executor.clone(),
+        ));
         Self {
-            storage: Arc::new(ObjectStoreStorageHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
-            json: Arc::new(DefaultJsonHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
-            parquet: Arc::new(DefaultParquetHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
+            storage: Arc::new(MeteredStorageHandler::new(raw_storage)),
+            json: Arc::new(MeteredJsonHandler::new(raw_json)),
+            parquet: Arc::new(MeteredParquetHandler::new(raw_parquet.clone())),
+            raw_parquet,
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
@@ -264,14 +216,24 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         Some(self.object_store.clone())
     }
 
+    /// Returns the concrete [`DefaultParquetHandler`] for callers that need the inherent
+    /// async `write_parquet_file` helper not exposed by the [`ParquetHandler`] trait.
+    /// For the metered trait surface used by reads, use [`Self::parquet_handler`].
+    ///
+    /// TODO(#2701): lift the inherent helper onto [`DefaultEngine`] so this accessor
+    /// (and the `raw_parquet` field) can be removed.
+    pub fn default_parquet_handler(&self) -> Arc<DefaultParquetHandler<E>> {
+        self.raw_parquet.clone()
+    }
+
     /// Write `data` as a parquet file using the provided `write_context`.
     ///
     /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
     /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
     /// serialization, and logical-to-physical key translation.
     ///
-    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
-    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
+    /// [`Transaction::partitioned_write_context`]: delta_kernel::transaction::Transaction::partitioned_write_context
+    /// [`Transaction::unpartitioned_write_context`]: delta_kernel::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
@@ -286,7 +248,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        self.parquet
+        self.raw_parquet
             .write_parquet_file(physical_data, write_context)
             .await
     }
@@ -303,7 +265,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// [`Transaction::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
-/// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+/// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
@@ -362,9 +324,10 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use test_utils::engine_contract::test_arrow_engine;
+
     use super::*;
-    use crate::engine::tests::test_arrow_engine;
-    use crate::object_store::local::LocalFileSystem;
 
     #[test]
     fn test_default_engine() {

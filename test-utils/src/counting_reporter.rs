@@ -172,10 +172,22 @@ pub struct CountingReporter {
     pub latest_crc_files_found: RelaxedCounter,
 
     // CRC reader IO counters
-    /// Number of CRC read calls (one per [`MetricEvent::CrcReadCompleted`]).
+    /// Number of CRC read calls (one per [`MetricEvent::CrcReadSuccess`]).
     pub crc_read_calls: RelaxedCounter,
     /// Total number of bytes read from CRC files, across all CRC read calls.
     pub crc_bytes_read: RelaxedCounter,
+
+    // Domain metadata load counters (Snapshot::get_domain_metadatas_internal)
+    pub domain_metadata_loads: RelaxedCounter,
+    pub domain_metadata_load_failures: RelaxedCounter,
+    pub domain_metadata_cache_hits: RelaxedCounter,
+    pub domain_metadata_domains_returned: RelaxedCounter,
+
+    // SetTransaction load counters (Snapshot::get_app_id_version)
+    pub set_transaction_loads: RelaxedCounter,
+    pub set_transaction_load_failures: RelaxedCounter,
+    pub set_transaction_cache_hits: RelaxedCounter,
+    pub set_transaction_found: RelaxedCounter,
 }
 
 impl CountingReporter {
@@ -208,6 +220,14 @@ impl CountingReporter {
         self.latest_crc_files_found.reset();
         self.crc_read_calls.reset();
         self.crc_bytes_read.reset();
+        self.domain_metadata_loads.reset();
+        self.domain_metadata_load_failures.reset();
+        self.domain_metadata_cache_hits.reset();
+        self.domain_metadata_domains_returned.reset();
+        self.set_transaction_loads.reset();
+        self.set_transaction_load_failures.reset();
+        self.set_transaction_cache_hits.reset();
+        self.set_transaction_found.reset();
     }
 
     /// Print a human-readable IO and operation summary.
@@ -270,10 +290,10 @@ impl MetricsReporter for CountingReporter {
                 self.parquet_files_read.add(e.num_files);
                 self.parquet_bytes_read.add(e.bytes_read);
             }
-            MetricEvent::SnapshotCompleted(_) => {
+            MetricEvent::SnapshotBuildSuccess(_) => {
                 self.snapshot_completions.inc();
             }
-            MetricEvent::LogSegmentLoaded(e) => {
+            MetricEvent::LogSegmentLoadSuccess(e) => {
                 self.log_segment_loads.inc();
                 self.commit_files.add(e.num_commit_files);
                 self.checkpoint_files.add(e.num_checkpoint_files);
@@ -281,13 +301,39 @@ impl MetricsReporter for CountingReporter {
                 self.latest_crc_files_found
                     .add(e.has_latest_crc_file as u64);
             }
-            MetricEvent::CrcReadCompleted(e) => {
+            MetricEvent::CrcReadSuccess(e) => {
                 self.crc_read_calls.inc();
                 self.crc_bytes_read.add(e.bytes_read);
             }
+            MetricEvent::DomainMetadataLoadSuccess(e) => {
+                self.domain_metadata_loads.inc();
+                if e.from_cache {
+                    self.domain_metadata_cache_hits.inc();
+                }
+                self.domain_metadata_domains_returned
+                    .add(e.num_domains_returned);
+            }
+            MetricEvent::DomainMetadataLoadFailure => {
+                self.domain_metadata_load_failures.inc();
+            }
+            MetricEvent::SetTransactionLoadSuccess(e) => {
+                self.set_transaction_loads.inc();
+                if e.from_cache {
+                    self.set_transaction_cache_hits.inc();
+                }
+                if e.found {
+                    self.set_transaction_found.inc();
+                }
+            }
+            MetricEvent::SetTransactionLoadFailure => {
+                self.set_transaction_load_failures.inc();
+            }
             // Intentionally not tracked. Add counters if needed.
-            MetricEvent::ProtocolMetadataLoaded(_)
-            | MetricEvent::SnapshotFailed(_)
+            MetricEvent::ProtocolMetadataLoadSuccess(_)
+            | MetricEvent::ProtocolMetadataLoadFailure(_)
+            | MetricEvent::LogSegmentLoadFailure(_)
+            | MetricEvent::SnapshotBuildFailure(_)
+            | MetricEvent::CrcReadFailure
             | MetricEvent::ScanMetadataCompleted(_) => {}
         }
     }
@@ -299,8 +345,9 @@ mod tests {
     use std::time::Duration;
 
     use delta_kernel::metrics::{
-        CrcReadCompleted, LogSegmentLoaded, MetricId, ProtocolMetadataLoaded, SnapshotCompleted,
-        SnapshotFailed, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
+        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
+        ProtocolMetadataLoadSuccess, SetTransactionLoadSuccess, SnapshotBuildFailure,
+        SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
     };
 
     use super::*;
@@ -349,7 +396,7 @@ mod tests {
     #[test]
     fn report_snapshot_completed_increments_snapshot_counter() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::SnapshotCompleted(SnapshotCompleted {
+        reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
             operation_id: MetricId::new(),
             version: 0,
             duration: dur(),
@@ -360,7 +407,7 @@ mod tests {
     #[test]
     fn report_log_segment_loaded_increments_log_replay_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::LogSegmentLoaded(LogSegmentLoaded {
+        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 7,
@@ -378,7 +425,7 @@ mod tests {
     #[test]
     fn report_log_segment_loaded_without_crc_does_not_increment_crc_counter() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::LogSegmentLoaded(LogSegmentLoaded {
+        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 3,
@@ -393,11 +440,11 @@ mod tests {
     #[test]
     fn report_crc_read_completed_increments_crc_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::CrcReadCompleted(CrcReadCompleted {
+        reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
             bytes_read: 512,
         }));
-        reporter.report(MetricEvent::CrcReadCompleted(CrcReadCompleted {
+        reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
             bytes_read: 256,
         }));
@@ -406,17 +453,60 @@ mod tests {
     }
 
     #[test]
+    fn report_domain_metadata_loaded_increments_domain_metadata_counters() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::DomainMetadataLoadSuccess(
+            DomainMetadataLoadSuccess {
+                from_cache: true,
+                num_domains_returned: 3,
+                duration: dur(),
+            },
+        ));
+        reporter.report(MetricEvent::DomainMetadataLoadSuccess(
+            DomainMetadataLoadSuccess {
+                from_cache: false,
+                num_domains_returned: 1,
+                duration: dur(),
+            },
+        ));
+        assert_eq!(reporter.domain_metadata_loads.get(), 2);
+        assert_eq!(reporter.domain_metadata_cache_hits.get(), 1);
+        assert_eq!(reporter.domain_metadata_domains_returned.get(), 4);
+    }
+
+    #[test]
+    fn report_set_transaction_loaded_increments_set_transaction_counters() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::SetTransactionLoadSuccess(
+            SetTransactionLoadSuccess {
+                from_cache: true,
+                found: true,
+                duration: dur(),
+            },
+        ));
+        reporter.report(MetricEvent::SetTransactionLoadSuccess(
+            SetTransactionLoadSuccess {
+                from_cache: false,
+                found: false,
+                duration: dur(),
+            },
+        ));
+        assert_eq!(reporter.set_transaction_loads.get(), 2);
+        assert_eq!(reporter.set_transaction_cache_hits.get(), 1);
+        assert_eq!(reporter.set_transaction_found.get(), 1);
+    }
+
+    #[test]
     fn report_untracked_events_does_not_panic() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::ProtocolMetadataLoaded(
-            ProtocolMetadataLoaded {
+        reporter.report(MetricEvent::ProtocolMetadataLoadSuccess(
+            ProtocolMetadataLoadSuccess {
                 operation_id: MetricId::new(),
                 duration: dur(),
             },
         ));
-        reporter.report(MetricEvent::SnapshotFailed(SnapshotFailed {
+        reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
             operation_id: MetricId::new(),
-            duration: dur(),
         }));
         assert_eq!(reporter.snapshot_completions.get(), 0);
     }
@@ -436,7 +526,7 @@ mod tests {
         reporter.report(MetricEvent::StorageCopyCompleted(StorageCopyCompleted {
             duration: dur(),
         }));
-        reporter.report(MetricEvent::LogSegmentLoaded(LogSegmentLoaded {
+        reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             duration: dur(),
             num_commit_files: 7,
@@ -444,10 +534,24 @@ mod tests {
             num_compaction_files: 1,
             has_latest_crc_file: true,
         }));
-        reporter.report(MetricEvent::CrcReadCompleted(CrcReadCompleted {
+        reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
             bytes_read: 512,
         }));
+        reporter.report(MetricEvent::DomainMetadataLoadSuccess(
+            DomainMetadataLoadSuccess {
+                from_cache: true,
+                num_domains_returned: 2,
+                duration: dur(),
+            },
+        ));
+        reporter.report(MetricEvent::SetTransactionLoadSuccess(
+            SetTransactionLoadSuccess {
+                from_cache: true,
+                found: true,
+                duration: dur(),
+            },
+        ));
 
         reporter.reset();
 
@@ -471,5 +575,24 @@ mod tests {
         assert_eq!(reporter.latest_crc_files_found.get(), 0);
         assert_eq!(reporter.crc_read_calls.get(), 0);
         assert_eq!(reporter.crc_bytes_read.get(), 0);
+        assert_eq!(reporter.domain_metadata_loads.get(), 0);
+        assert_eq!(reporter.domain_metadata_load_failures.get(), 0);
+        assert_eq!(reporter.domain_metadata_cache_hits.get(), 0);
+        assert_eq!(reporter.domain_metadata_domains_returned.get(), 0);
+        assert_eq!(reporter.set_transaction_loads.get(), 0);
+        assert_eq!(reporter.set_transaction_load_failures.get(), 0);
+        assert_eq!(reporter.set_transaction_cache_hits.get(), 0);
+        assert_eq!(reporter.set_transaction_found.get(), 0);
+    }
+
+    #[test]
+    fn report_load_failures_increment_failure_counters() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::DomainMetadataLoadFailure);
+        reporter.report(MetricEvent::SetTransactionLoadFailure);
+        assert_eq!(reporter.domain_metadata_load_failures.get(), 1);
+        assert_eq!(reporter.set_transaction_load_failures.get(), 1);
+        assert_eq!(reporter.domain_metadata_loads.get(), 0);
+        assert_eq!(reporter.set_transaction_loads.get(), 0);
     }
 }

@@ -1,107 +1,15 @@
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Instant;
 
 use bytes::Bytes;
-use delta_kernel_derive::internal_api;
-use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
+use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
-use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::events::{
-    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, STORAGE_SPAN,
-};
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
-
-/// Stream wrapper that emits a storage metric span when dropped. Drop fires regardless of
-/// whether the iterator was fully consumed or dropped early.
-///
-/// The span is always emitted on the thread that drops this iterator, which is the caller's
-/// thread.
-///
-/// Generic over the inner stream type and item type.
-struct MetricsIterator<I, T> {
-    inner: I,
-    name: &'static str,
-    start: Instant,
-    num_files: u64,
-    bytes_read: u64,
-    _phantom: std::marker::PhantomData<T>,
-}
-
-impl<I, T> MetricsIterator<I, T> {
-    fn new(inner: I, name: &'static str, start: Instant) -> Self {
-        Self {
-            inner,
-            name,
-            start,
-            num_files: 0,
-            bytes_read: 0,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<I, T> Drop for MetricsIterator<I, T> {
-    fn drop(&mut self) {
-        let duration = self.start.elapsed();
-        let _span = tracing::span!(
-            tracing::Level::INFO,
-            STORAGE_SPAN,
-            report = tracing::field::Empty,
-            name = self.name,
-            num_files = self.num_files,
-            bytes_read = self.bytes_read,
-            duration_ns = duration.as_nanos() as u64,
-        );
-    }
-}
-
-// Iterator over file metadata (e.g. for `list_from`). Counts num_files only.
-impl<I> Stream for MetricsIterator<I, FileMeta>
-where
-    I: Stream<Item = DeltaResult<FileMeta>> + Unpin,
-{
-    type Item = I::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-            Some(item) => {
-                if item.is_ok() {
-                    self.num_files += 1;
-                }
-                Poll::Ready(Some(item))
-            }
-            None => Poll::Ready(None),
-        }
-    }
-}
-
-// Iterator over byte buffers (e.g. for `read_files`). Counts num_files and total bytes_read.
-impl<I> Stream for MetricsIterator<I, Bytes>
-where
-    I: Stream<Item = DeltaResult<Bytes>> + Unpin,
-{
-    type Item = I::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-            Some(item) => {
-                if let Ok(ref bytes) = item {
-                    self.num_files += 1;
-                    self.bytes_read += bytes.len() as u64;
-                }
-                Poll::Ready(Some(item))
-            }
-            None => Poll::Ready(None),
-        }
-    }
-}
+use crate::executor::TaskExecutor;
+use crate::UrlExt;
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -111,7 +19,6 @@ pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    #[internal_api]
     pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             inner: store,
@@ -127,13 +34,17 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     }
 }
 
-/// Native async implementation for list_from
+/// Native async implementation for list_from.
+///
+/// Storage metrics are emitted by the outer [`MeteredStorageHandler`] wrapping this
+/// handler (e.g. inside `DefaultEngine`'s `storage_handler()`), so this function just
+/// returns the raw stream.
+///
+/// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
-    let start = Instant::now();
-
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
     // directory-like, because it strips trailing /, so we're reduced to manually checking the
@@ -170,16 +81,10 @@ async fn list_from_impl(
         // Local filesystem doesn't return sorted list - need to collect and sort
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
-        // Wrap in MetricsIterator so the metric fires in Drop on the caller's thread
-        // (not here on the background thread where no tracing subscriber is installed).
-        let stream = MetricsIterator::new(
-            stream::iter(items.into_iter().map(Ok::<FileMeta, crate::Error>)),
-            StorageListCompleted::NAME,
-            start,
-        );
-        Ok(Box::pin(stream))
+        Ok(Box::pin(stream::iter(
+            items.into_iter().map(Ok::<FileMeta, delta_kernel::Error>),
+        )))
     } else {
-        let stream = MetricsIterator::new(stream, StorageListCompleted::NAME, start);
         Ok(Box::pin(stream))
     }
 }
@@ -190,7 +95,6 @@ async fn read_files_impl(
     files: Vec<FileSlice>,
     readahead: usize,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
-    let start = Instant::now();
     let files = stream::iter(files).map(move |(url, range)| {
         let store = store.clone();
         async move {
@@ -221,11 +125,7 @@ async fn read_files_impl(
 
     // We allow executing up to `readahead` futures concurrently and
     // buffer the results. This allows us to achieve async concurrency.
-    Ok(Box::pin(MetricsIterator::new(
-        files.buffered(readahead),
-        StorageReadCompleted::NAME,
-        start,
-    )))
+    Ok(Box::pin(files.buffered(readahead)))
 }
 
 /// Native async implementation for copy_atomic
@@ -234,28 +134,17 @@ async fn copy_atomic_impl(
     src_path: Path,
     dest_path: Path,
 ) -> DeltaResult<()> {
-    let start = Instant::now();
-
     // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
     // necessarily atomic, but since the source file is immutable, we aren't exposed to the
     // possibility of source file changing while we do the PUT.
     let data = store.get(&src_path).await?.bytes().await?;
-    let result = store
+    store
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
-        .await;
-    let duration = start.elapsed();
-    let _span = tracing::span!(
-        tracing::Level::INFO,
-        STORAGE_SPAN,
-        report = tracing::field::Empty,
-        name = StorageCopyCompleted::NAME,
-        duration_ns = duration.as_nanos() as u64,
-    );
-
-    result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
-        e => e.into(),
-    })?;
+        .await
+        .map_err(|e| match e {
+            object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
+            e => e.into(),
+        })?;
     Ok(())
 }
 
@@ -367,16 +256,16 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::Engine as _;
+    use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
     use test_utils::delta_path_for_version;
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::utils::current_time_duration;
-    use crate::Engine as _;
+    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::DefaultEngineBuilder;
 
     fn setup_test() -> (
         tempfile::TempDir,

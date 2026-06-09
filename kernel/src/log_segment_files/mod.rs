@@ -64,7 +64,7 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
-fn list_from_storage(
+pub(crate) fn list_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
@@ -425,6 +425,29 @@ impl LogSegmentFiles {
 
     pub(crate) fn latest_commit_file(&self) -> &Option<ParsedLogPath> {
         &self.latest_commit_file
+    }
+
+    /// Iterator over every listed log path across all fields.
+    pub(crate) fn iter_all_paths(&self) -> impl Iterator<Item = &ParsedLogPath> {
+        self.ascending_commit_files
+            .iter()
+            .chain(&self.ascending_compaction_files)
+            .chain(&self.checkpoint_parts)
+            .chain(&self.latest_crc_file)
+            .chain(&self.latest_commit_file)
+    }
+
+    /// Estimated heap size in bytes, best-effort estimate.
+    pub(crate) fn estimated_heap_size_bytes(&self) -> usize {
+        let vec_buffer_bytes = (self.ascending_commit_files.capacity()
+            + self.ascending_compaction_files.capacity()
+            + self.checkpoint_parts.capacity())
+            * size_of::<ParsedLogPath>();
+        let path_bytes: usize = self
+            .iter_all_paths()
+            .map(ParsedLogPath::estimated_heap_size_bytes)
+            .sum();
+        vec_buffer_bytes + path_bytes
     }
 
     /// List all commits between the provided `start_version` (inclusive) and `end_version`

@@ -8,8 +8,8 @@ use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::column_names::{
-    column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
+    joined_column_name, ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -18,6 +18,7 @@ use crate::kernel_predicates::{
 };
 use crate::schema::SchemaRef;
 use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::utils::CollectInto;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
@@ -27,6 +28,19 @@ mod scalars;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
+
+/// Build an [`Expression::Literal`] from anything that converts into a [`Scalar`].
+///
+/// Concise alternative to [`Expression::literal`] for plan builders. Accepts the same value
+/// types [`Scalar`] does (`i32`, `i64`, `&str`, `bool`, ...).
+///
+/// ```
+/// use delta_kernel::expressions::lit;
+/// let _zero = lit(0i64);
+/// ```
+pub fn lit(value: impl Into<Scalar>) -> Expression {
+    Expression::literal(value)
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -79,6 +93,15 @@ pub enum BinaryExpressionOp {
 pub enum VariadicExpressionOp {
     /// Collapse multiple values into one by taking the first non-null value
     Coalesce,
+    /// Construct an Array by evaluating each input expression. For example, the expression
+    /// `Array(1, (1 + 2), col("my_int_col"))` evaluates to the array
+    /// `[1, 3, <my_int_col value>]` per row. All inputs must share the same element type.
+    /// Requires at least one element; the element type is inferred from the inputs.
+    ///
+    /// For static array literals whose elements are all compile-time constants, use
+    /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
+    /// `Scalar::Array` is evaluated at compile time.
+    Array,
 }
 
 /// A junction (AND/OR) predicate operator.
@@ -377,10 +400,7 @@ impl ExpressionStructPatch {
 
     /// Creates a new empty patch that operates on fields of a nested struct identified by
     /// `path`. The various `with_xxx` helper methods can be used to add specific field patches.
-    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn new_nested(path: impl CollectInto<ColumnName>) -> Self {
         Self {
             input_path: Some(ColumnName::new(path)),
             ..Default::default()
@@ -649,10 +669,7 @@ impl Expression {
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Expression
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Expression {
         ColumnName::new(field_names).into()
     }
 
@@ -778,6 +795,11 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Coalesce, exprs)
     }
 
+    /// Creates a new Array constructor expression. See [`VariadicExpressionOp::Array`].
+    pub fn array(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
+        Self::variadic(VariadicExpressionOp::Array, exprs)
+    }
+
     /// Creates a new opaque expression
     pub fn opaque(
         op: impl OpaqueExpressionOp,
@@ -814,10 +836,7 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Predicate
-    where
-        ColumnName: FromIterator<A>,
-    {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Predicate {
         Self::from_expr(ColumnName::new(field_names))
     }
 
@@ -1003,6 +1022,7 @@ impl Display for VariadicExpressionOp {
         use VariadicExpressionOp::*;
         match self {
             Coalesce => write!(f, "COALESCE"),
+            Array => write!(f, "ARRAY"),
         }
     }
 }
@@ -1212,6 +1232,10 @@ mod tests {
                 Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
                 "Struct(Column(x), 2, 10)",
             ),
+            (
+                Expr::array([column_expr!("x"), column_expr!("y"), Expr::literal(0)]),
+                "ARRAY(Column(x), Column(y), 0)",
+            ),
         ];
 
         for (expr, expected) in cases {
@@ -1376,7 +1400,7 @@ mod tests {
             let cases: Vec<ColumnName> = vec![
                 column_name!("simple"),
                 ColumnName::new(["a", "b", "c"]),
-                ColumnName::new::<&str>([]),
+                ColumnName::default(),
             ];
 
             for col in &cases {
@@ -1414,6 +1438,17 @@ mod tests {
                 column_expr!("b"),
                 Expression::literal("default"),
             ]);
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        #[case::array_single(Expression::array([Expression::literal(7i32)]))]
+        #[case::array_mixed(Expression::array([
+            column_expr!("a"),
+            column_expr!("b"),
+            Expression::literal(42i64),
+        ]))]
+        fn test_array_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
         }
 

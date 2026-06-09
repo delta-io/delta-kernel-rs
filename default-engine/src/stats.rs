@@ -6,24 +6,22 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
-use crate::arrow::array::{
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
+use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
     LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
-use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
-use crate::arrow::datatypes::{
+use delta_kernel::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
+use delta_kernel::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
     Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, TimeUnit, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
-use crate::column_trie::ColumnTrie;
-use crate::engine::arrow_utils::fix_nested_null_masks;
-use crate::expressions::ColumnName;
-use crate::{DeltaResult, Error};
+use delta_kernel::column_trie::ColumnTrie;
+use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::{DeltaResult, Error};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
 const STRING_PREFIX_LENGTH: usize = 32;
@@ -165,7 +163,7 @@ fn agg_timestamp<T>(
     agg: Agg,
 ) -> DeltaResult<Option<ArrayRef>>
 where
-    T: crate::arrow::datatypes::ArrowTimestampType,
+    T: delta_kernel::arrow::datatypes::ArrowTimestampType,
     PrimitiveArray<T>: From<Vec<Option<i64>>>,
 {
     let array = column.as_primitive_opt::<T>().ok_or_else(|| {
@@ -432,6 +430,21 @@ fn compute_column_stats(
                 max_value: None,
             })
         }
+        // Void columns (Arrow `Null` / kernel `VOID`): every value is null by definition,
+        // and the column has no parquet representation. We still need to publish nullCount
+        // for IS NULL / IS NOT NULL data skipping, so synthesize it from the array length.
+        // Use `column.len()` rather than `column.null_count()` because `NullArray` has no
+        // null buffer and the inherited `Array::null_count` default returns 0.
+        DataType::Null => {
+            if !filter.contains_prefix_of(path) {
+                return Ok(ColumnStats::default());
+            }
+            Ok(ColumnStats {
+                null_count: Some(Arc::new(Int64Array::from(vec![column.len() as i64]))),
+                min_value: None,
+                max_value: None,
+            })
+        }
         _ => {
             // Leaf: check filter, compute all stats together
             if !filter.contains_prefix_of(path) {
@@ -503,7 +516,6 @@ impl StatsAccumulator {
 /// * `batch` - The RecordBatch to collect statistics from
 /// * `stats_columns` - Column names that should have statistics collected (allowlist). Only these
 ///   columns will appear in nullCount/minValues/maxValues.
-#[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
@@ -556,16 +568,18 @@ pub(crate) fn collect_stats(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::arrow::array::{
-        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+    use delta_kernel::arrow::array::{
+        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, NullArray,
+        StringArray,
     };
-    use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-    use crate::arrow::compute::concat_batches;
-    use crate::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
-    use crate::engine::arrow_expression::evaluate_expression::to_json;
-    use crate::expressions::column_name;
-    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
+    use delta_kernel::arrow::compute::concat_batches;
+    use delta_kernel::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
+    use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
+    use delta_kernel::expressions::column_name;
+    use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    use super::*;
 
     #[test]
     fn test_collect_stats_single_batch() {
@@ -799,6 +813,103 @@ mod tests {
             .unwrap();
         let max_col = max_values.column_by_name("value").unwrap();
         assert!(max_col.is_null(0));
+    }
+
+    // A void column reaches stats only if a connector or direct caller bypasses the
+    // kernel-side physical write schema, which strips void columns. Even so, we must
+    // publish nullCount = numRecords rather than 0, because `NullArray` has no null
+    // buffer and the inherited `Array::null_count` default returns 0. Min/max are not
+    // meaningful for void.
+    #[rstest::rstest]
+    #[case::non_empty(5)]
+    #[case::empty(0)]
+    fn test_collect_stats_void_column_synthesizes_full_null_count(#[case] length: usize) {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(length))]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("v")]).unwrap();
+
+        let null_count = stats
+            .column_by_name("nullCount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let v_null_count = null_count
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v_null_count.value(0), length as i64);
+
+        // Void columns do not participate in min/max stats. With void as the only stats
+        // column, both struct accumulators stay empty and the fields are omitted entirely.
+        assert!(stats.column_by_name("minValues").is_none());
+        assert!(stats.column_by_name("maxValues").is_none());
+    }
+
+    #[test]
+    fn test_collect_stats_void_column_nested_in_struct() {
+        // Worst realistic shape for the latent bug: void buried inside a struct alongside
+        // a non-void sibling. The recursion must reach the `DataType::Null` arm so that
+        // `s.v` records `nullCount = numRecords`, while `s.a` still gets full min/max.
+        let inner_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("v", DataType::Null, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(inner_fields.clone()),
+            false,
+        )]));
+        let inner = StructArray::try_new(
+            inner_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                Arc::new(NullArray::new(4)) as ArrayRef,
+            ],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(inner) as ArrayRef]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("s.a"), column_name!("s.v")]).unwrap();
+
+        let s_null_count = stats
+            .column_by_name("nullCount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let v_null_count = s_null_count
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v_null_count.value(0), 4);
+
+        // `s.a` keeps its min/max; `s.v` does not appear under min/max because void has no
+        // ordering.
+        let s_min = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(s_min.column_by_name("a").is_some());
+        assert!(s_min.column_by_name("v").is_none());
     }
 
     #[test]
@@ -1439,7 +1550,7 @@ mod tests {
         field_name: &str,
     ) -> T::Native
     where
-        T: crate::arrow::datatypes::ArrowPrimitiveType,
+        T: delta_kernel::arrow::datatypes::ArrowPrimitiveType,
     {
         stats
             .column_by_name(stat_name)
@@ -1610,7 +1721,7 @@ mod tests {
         // Load a PySpark-generated Delta table containing all supported stat types
         // and extract Spark's reference stats from the commit log.
         let test_path =
-            std::fs::canonicalize("./tests/data/stats-writing-all-types/delta").unwrap();
+            std::fs::canonicalize("../kernel/tests/data/stats-writing-all-types/delta").unwrap();
 
         let commit_path = test_path
             .join("_delta_log")

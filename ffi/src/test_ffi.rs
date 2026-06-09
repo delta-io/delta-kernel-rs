@@ -103,10 +103,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     let nested_struct_type = StructType::try_new(nested_fields).unwrap();
 
     let top_level_struct = StructData::try_new(
-        vec![StructField::nullable(
-            "top",
-            DataType::Struct(Box::new(nested_struct_type)),
-        )],
+        vec![StructField::nullable("top", nested_struct_type)],
         vec![Scalar::Struct(nested_struct)],
     )
     .unwrap();
@@ -160,6 +157,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         ),
         Expr::unknown("mystery"),
         Expr::map_to_struct(column_expr!("pv")),
+        Expr::coalesce([column_expr!("col"), Expr::literal(0_i32)]),
+        Expr::array([Expr::literal(1_i32), Expr::literal(2_i32)]),
     ];
     sub_exprs.extend(
         [

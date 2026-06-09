@@ -1,22 +1,25 @@
-//! Snapshot-loading and on-demand API metrics tests.
+//! Metrics tests for snapshot loading and on-demand snapshot APIs.
 //!
-//! Covers all major log-segment shapes (delta-only, V1 checkpoint, log compaction, CRC
-//! fast-path, CRC at prior version, checkpoint with tail commits) plus on-demand API calls
-//! (`get_domain_metadata`) that incur additional I/O after a snapshot is already built.
+//! Each test builds a table in a known state, attaches a `CountingReporter`, and asserts the
+//! exact metric counters a real connector would observe.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
-use test_utils::{insert_data, test_table_setup_mt};
+use rstest::rstest;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::{insert_data, test_table_setup, test_table_setup_mt};
 use url::Url;
 
 use super::{
@@ -235,10 +238,10 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
 // ============================================================================
 // TODO: migrate to TestTableBuilder when CRC LogState variants land (#2284)
 
-/// When a CRC file exists at an older version than the snapshot, the kernel takes the
-/// partial-replay path: it replays only the tail commits (those after the CRC version)
-/// looking for Protocol/Metadata changes, then falls back to the CRC when none are
-/// found. This produces JSON reads for the tail commits AND a storage read for the CRC.
+/// When a CRC file exists at an older version than the snapshot, the kernel advances it to the
+/// target version via reverse-replay: it reads the tail commits (those after the CRC version)
+/// once and reads the base CRC from storage. P&M come from the advanced CRC, so there is no
+/// separate P&M scan.
 ///
 /// This is a normal, expected table state -- having a CRC from a previous version is
 /// not an error or degraded condition.
@@ -247,7 +250,7 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
 /// one), so this test uses `create_table` commit -> `post_commit_snapshot` ->
 /// `write_checksum` to write the CRC at v0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> DeltaResult<()> {
+async fn crc_at_prior_version_advances_via_reverse_replay() -> DeltaResult<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -284,16 +287,19 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
 
     // Measurement: build snapshot at latest (v2); CRC is at v0 (two versions behind)
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
-    let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
+    let snap = Snapshot::builder_for(table_url)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(&measure_engine)?;
+    assert_eq!(snap.crc().expect("stale CRC advanced to v2").version, 2);
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 3); // v0, v1, v2
 
-    // Tail replay: commits v1 and v2 (after the CRC at v0) are replayed via JSON
+    // Reverse-replay reads the tail commits v1 and v2 (after the CRC at v0) in one JSON call.
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 2);
-    // CRC is loaded from storage as a fallback (P+M not found in the tail commits)
+    // The base CRC at v0 is read from storage.
     assert!(reporter.storage_read_calls.get() >= 1);
 
     Ok(())
@@ -383,6 +389,151 @@ fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> Delt
         "get_domain_metadata replays the log, incurring one additional JSON read call"
     );
     assert!(reporter.json_files_read.get() > 0);
+
+    Ok(())
+}
+
+// ============================================================================
+// Scenario 9: domain metadata and set-transaction loads
+// ============================================================================
+
+// Creates a table with clustering and rowTracking enabled (two system domain metadatas), plus a
+// user domain metadata and a SetTransaction.
+async fn setup_table_with_dms_and_set_txns(
+    write_crc: bool,
+) -> DeltaResult<(Url, tempfile::TempDir)> {
+    let (temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let committer = || Box::new(FileSystemCommitter::new());
+
+    let properties = HashMap::from([("delta.enableRowTracking".to_string(), "true".to_string())]);
+    let snap_v0 = create_table(&table_path, simple_schema(), "Test/1.0")
+        .with_table_properties(properties)
+        .with_data_layout(DataLayout::clustered(["id"]))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    let snap_v1 = snap_v0
+        .transaction(committer(), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
+        .with_transaction_id("my-app".to_string(), 1)
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    if write_crc {
+        snap_v1.write_checksum(engine.as_ref())?;
+    }
+    Ok((table_url, temp_dir))
+}
+
+#[rstest]
+#[case::log_replay(false)]
+#[case::crc_cache(true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_transaction_loads_domain_metadata_internally(
+    #[case] with_crc: bool,
+) -> DeltaResult<()> {
+    let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(with_crc).await?;
+
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let engine = Arc::new(engine);
+    let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    // Isolate the transaction's internal loads from the snapshot build.
+    reporter.reset();
+    insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+
+    // Clustering domain (creating the transaction) + row-tracking domain (committing the append).
+    assert_eq!(reporter.domain_metadata_loads.get(), 2);
+    assert_eq!(
+        reporter.domain_metadata_cache_hits.get(),
+        2 * with_crc as u64
+    );
+    assert_eq!(reporter.domain_metadata_domains_returned.get(), 2);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::log_replay(false)]
+#[case::crc_cache(true)]
+#[tokio::test]
+async fn get_app_id_version_load_emits_loaded_metric(#[case] with_crc: bool) -> DeltaResult<()> {
+    let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(with_crc).await?;
+
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let snap = Snapshot::builder_for(table_url).build(&engine)?;
+
+    // Hit on an app id with a committed transaction.
+    reporter.reset();
+    assert_eq!(snap.get_app_id_version("my-app", &engine)?, Some(1));
+    assert_eq!(reporter.set_transaction_loads.get(), 1);
+    assert_eq!(reporter.set_transaction_cache_hits.get(), with_crc as u64);
+    assert_eq!(reporter.set_transaction_found.get(), 1);
+
+    // Miss on an unknown app id. A Complete CRC answers the miss from cache; without a CRC it
+    // falls back to log replay.
+    reporter.reset();
+    assert_eq!(snap.get_app_id_version("no-such-app", &engine)?, None);
+    assert_eq!(reporter.set_transaction_loads.get(), 1);
+    assert_eq!(reporter.set_transaction_cache_hits.get(), with_crc as u64);
+    assert_eq!(reporter.set_transaction_found.get(), 0);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::log_replay(false)]
+#[case::crc_cache(true)]
+#[tokio::test]
+async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) -> DeltaResult<()> {
+    let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(with_crc).await?;
+
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let snap = Snapshot::builder_for(table_url).build(&engine)?;
+
+    // Hit on the user domain.
+    reporter.reset();
+    assert!(snap.get_domain_metadata("myapp.config", &engine)?.is_some());
+    assert_eq!(reporter.domain_metadata_loads.get(), 1);
+    assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
+    assert_eq!(reporter.domain_metadata_domains_returned.get(), 1);
+
+    // Miss on a nonexistent domain. A Complete CRC answers the miss from cache; without a CRC it
+    // falls back to log replay.
+    reporter.reset();
+    assert!(snap
+        .get_domain_metadata("does.not.exist", &engine)?
+        .is_none());
+    assert_eq!(reporter.domain_metadata_loads.get(), 1);
+    assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
+    assert_eq!(reporter.domain_metadata_domains_returned.get(), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_loads_emit_failure_metric() -> DeltaResult<()> {
+    let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(false).await?;
+
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let snap = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+    // Remove a commit so the log has a gap and the replay-based load fails.
+    let log_dir = table_url.to_file_path().unwrap().join("_delta_log");
+    std::fs::remove_file(log_dir.join("00000000000000000001.json")).unwrap();
+
+    reporter.reset();
+    assert!(snap.get_domain_metadata("myapp.config", &engine).is_err());
+    assert!(snap.get_app_id_version("my-app", &engine).is_err());
+    assert_eq!(reporter.domain_metadata_loads.get(), 0);
+    assert_eq!(reporter.set_transaction_loads.get(), 0);
+    assert_eq!(reporter.domain_metadata_load_failures.get(), 1);
+    assert_eq!(reporter.set_transaction_load_failures.get(), 1);
 
     Ok(())
 }

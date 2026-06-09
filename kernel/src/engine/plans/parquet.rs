@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{IoOperation, Operation, PlanExecutor, QueryPlanBuilder};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
@@ -29,10 +29,11 @@ impl ParquetHandler for PlanBasedParquetHandler {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
+        _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let query =
-            QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema, predicate).build()?;
+        // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
+        // single-node executor can then match the filter -> scan shape.
+        let query = QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema).build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -48,10 +49,11 @@ impl ParquetHandler for PlanBasedParquetHandler {
         ))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
-        Err(Error::unsupported(
-            "PlanBasedParquetHandler does not support read_parquet_footer yet",
-        ))
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        let op = IoOperation::parquet_footer(file.clone());
+        self.executor
+            .execute_op(Operation::IoOperation(op))?
+            .into_parquet_footer()
     }
 }
 
@@ -63,19 +65,29 @@ mod tests {
     use std::sync::Arc;
 
     use tempfile::tempdir;
+    use url::Url;
 
     use super::PlanBasedParquetHandler;
     use crate::arrow::array::{Array, Int64Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::engine::tests::{file_meta_for, test_parquet_handler_reads_file_with_arrow_schema};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::schema::SchemaRef;
     use crate::{FileMeta, ParquetHandler as _};
 
     fn make_handler() -> PlanBasedParquetHandler {
         PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::new()))
+    }
+
+    fn file_meta_for(path: &Path) -> FileMeta {
+        let url = Url::from_file_path(path).unwrap();
+        let size = std::fs::metadata(path).unwrap().len();
+        FileMeta {
+            location: url,
+            last_modified: 0,
+            size,
+        }
     }
 
     fn make_test_parquet_file(path: &Path, batch: &RecordBatch) -> (FileMeta, SchemaRef) {
@@ -124,8 +136,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parquet_handler_reads_contract() {
-        test_parquet_handler_reads_file_with_arrow_schema(&make_handler());
-    }
+    // TODO(#2618): Restore once `PlanBasedParquetHandler` moves to delta_kernel_default_engine
+    // and can use the test_utils::engine_contract helpers without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn test_parquet_handler_reads_contract() {
+    //     test_parquet_handler_reads_file_with_arrow_schema(&make_handler());
+    // }
+    //
+    // #[test]
+    // fn test_read_parquet_footer_contract() {
+    //     test_parquet_handler_reads_footer(&make_handler());
+    // }
+    //
+    // #[test]
+    // fn test_read_parquet_footer_missing_file_contract() {
+    //     test_parquet_handler_footer_errors_on_missing_file(&make_handler());
+    // }
+    //
+    // #[test]
+    // fn test_read_parquet_footer_preserves_field_ids_contract() {
+    //     test_parquet_handler_footer_preserves_field_ids(&make_handler());
+    // }
 }

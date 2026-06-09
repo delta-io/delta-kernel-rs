@@ -62,6 +62,8 @@ cargo +nightly fmt \
 
 ### Feature Flags
 
+Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list):
+
 - `default-engine-rustls` / `default-engine-native-tls` -- async Arrow/Tokio engine (pick a TLS backend)
 - `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
@@ -69,9 +71,12 @@ cargo +nightly fmt \
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
+- `column-defaults-in-dev` -- column defaults write support (experimental, in development).
+  Gates `KernelSupport::Supported` for the `allowColumnDefaults` writer feature; with the
+  cargo feature off, writes to tables listing this feature are blocked.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
+- `test-utils`, `integration-test` -- development only
 
 ## Architecture at a Glance
 
@@ -90,8 +95,8 @@ actions, enforces protocol compliance, delegates atomic commit to a `Committer`.
 `EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
 `kernel/src/engine/default/`.
 
-**EngineData:** opaque columnar data interface. IMPORTANT: never access `EngineData` columns
-directly -- always use the visitor pattern (`visit_rows` with typed `GetData` accessors).
+**EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
+directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
 
 ## Testing
 
@@ -138,9 +143,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
   `LocalFileSystem::new_with_prefix()` with `add_commit` -- the prefix causes double-nesting
   because `add_commit` already resolves the full path from the URL. For in-memory tests, use
-  `InMemory::new()` with `"memory:///"`. Always use the same `table_root` URL string for
+  `InMemory::new()` with `"memory:///"`. ALWAYS use the same `table_root` URL string for
   both `add_commit` (writing log files) and `snapshot`/`Snapshot::try_new` (reading the
-  table). Always include a trailing slash in directory URLs to ensure correct path joining.
+  table). ALWAYS include a trailing slash in directory URLs to ensure correct path joining.
 
 ### Common test helpers
 
@@ -235,9 +240,9 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Common Gotchas
 
-- **EngineData is opaque:** Never downcast to `ArrowEngineData` or any concrete type
-  in production code (ok in tests). Never assume one batch per file -- always iterate.
-- **Column mapping:** Physical column names can differ from logical names. Always use
+- **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
+  in production code (ok in tests). NEVER assume one batch per file -- ALWAYS iterate.
+- **Column mapping:** Physical column names can differ from logical names. ALWAYS use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
 - **Transforms:** Generic recursive schema and expression transform traits and helpers
@@ -251,23 +256,9 @@ Keep this list updated when new protocol features are added to kernel.
   the extensions block closes, and emit via `warn!()` only then. See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
 
-## Code Style / Documentation
+## Code Style
 
 - Line width is 100 characters. Wrap comments and string literals at 100, not 80.
-- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
-  `// ============`).
-- MUST include doc comments for all public functions, structs, enums, and methods.
-- MUST document function parameters, return values, and errors.
-- Keep comments up-to-date with code changes.
-- Include examples in doc comments for complex functions only.
-- NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
-  checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
-- Comments should be concise and non-repetitive -- find the right place to say it once.
-- Comments should never include temporal references -- only refer to current code and
-  design, not past iterations.
-- Doc comments focus on "what" (contract with caller) more than "how" (implementation),
-  unless the "how" meaningfully impacts the "what".
-- Code comments state intent and explain "why" -- don't restate what the code self-documents.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code) -- never inside function bodies.
 - Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
@@ -276,10 +267,54 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer `StructField::nullable` / `StructField::not_null` over
   `StructField::new(name, type, bool)` when nullability is known at compile time.
   Reserve `StructField::new` for cases where nullability is a runtime value.
+- Leverage `impl Into<DataType>` to avoid `DataType::Struct/Array/Map(Box::new(...))`
+  boilerplate. `StructType`, `ArrayType`, and `MapType` all implement `Into<DataType>`,
+  and constructors like `StructField::new`/`nullable`/`not_null`, `ArrayType::new`, and
+  `MapType::new` accept `impl Into<DataType>`. So:
+  - When passing to a parameter that accepts `impl Into<DataType>`, pass the container
+    type directly: `StructField::nullable("a", ArrayType::new(DataType::INTEGER, true))`
+    -- do NOT wrap in `DataType::from(...)` or `.into()` (redundant at best, and an
+    ambiguous-type compile error at worst).
+  - When a concrete `DataType` value is actually required (e.g. a `DataType`-typed
+    binding/field, a `[DataType]`/`Vec<DataType>` element, or a `&DataType` argument),
+    prefer `DataType::from(ArrayType::new(...))` over
+    `DataType::Array(Box::new(ArrayType::new(...)))`.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
+- Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
+  `Expression::literal(...)` when building expressions inline. `col!` has two forms: a single
+  string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
+  same as `column_expr!`); one or more comma-separated args build a column with each segment taken
+  verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
+
+## Comment & Doc Style
+
+- MUST include doc comments for all public functions, structs, enums, and methods.
+- MUST document function parameters, return values, and errors.
+- Doc comments focus on "what" (contract with caller) more than "how" (implementation),
+  unless the "how" meaningfully impacts the "what".
+- Code comments state intent and explain "why" -- don't restate what the code self-documents.
+- Be succinct. No verbose AI-slop comments. With well-written and well-named code,
+  verbose comments are worse than none.
+- Say each thing once, in the right place -- don't repeat the same idea across
+  doc comment and inline comment.
+- Comments earn their place only for hidden invariants, real-bug workarounds, or
+  constraints the reader can't see from the code itself.
+- Don't enumerate what grep can answer. Lists like `// Used by a, b, c` rot the
+  moment `d` lands. Describe the shape; let the reader grep.
+- No stale-prone anchors in durable docs or source comments: counts ("the 10
+  variants", "5-arm match"), line numbers, or enumeration lists. Describe the
+  shape; let the reader grep.
+- Comments MUST NOT include temporal references -- only refer to current code and
+  design, not past iterations.
+- Keep comments up-to-date with code changes.
+- Include examples in doc comments for complex functions only.
+- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`).
+- NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
+  checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
 
 ## Pull Requests
 
@@ -295,32 +330,6 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
 
-### CI Jobs and Github Actions
-
-**Supply chain security:** every `cargo` command in CI that resolves dependencies MUST use
-`--locked` to enforce the committed `Cargo.lock`. This prevents CI from silently picking up
-a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
-`Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
-reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
-`--locked`: `cargo +nightly fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
-`cargo miri setup` (tooling setup).
-
-Ensure that when writing any github action you are considering safety including thinking of
-and mitigating common attack vectors such expression injection and pull request target attacks.
-
-Example:
-```yaml
-# The code below is vulnerable to expression injection
-run: |
-    echo "Comment: ${{ github.event.comment.body }}"
-
-# To mitigate instead use environment variables
-env:
-    COMMENT_BODY: ${{ github.event.comment.body }}
-run: |
-    echo "Comment: $COMMENT_BODY"
-```
-
 ## Deep Context
 
 Read these when relevant to the task at hand:
@@ -333,4 +342,5 @@ Read these when relevant to the task at hand:
 **Keeping docs current:** If you notice anything inaccurate in these docs -- renamed
 structs, traits, functions, modules, crates, APIs, stale data flows, wrong file paths --
 inform the user so they can be updated. After major changes, update this file,
-`CLAUDE/architecture.md`, `ffi/CLAUDE.md`, and any relevant `<crate>/CLAUDE.md` files.
+`CLAUDE/architecture.md`, `ffi/CLAUDE.md`, `.github/CLAUDE.md`, and any relevant
+`<crate>/CLAUDE.md` files.

@@ -90,11 +90,9 @@ pub mod actions;
 pub mod checkpoint;
 pub mod commit_range;
 pub mod committer;
-// Public under test-utils so integration tests can inspect CRC state via
-// Snapshot::get_current_crc_if_loaded_for_testing.
-#[cfg(feature = "test-utils")]
+#[cfg(feature = "internal-api")]
 pub mod crc;
-#[cfg(not(feature = "test-utils"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -137,10 +135,13 @@ pub mod column_trie;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
+#[cfg(feature = "internal-api")]
+pub mod utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::try_parse_uri;
+pub use utils::{try_parse_uri, CollectInto};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -186,15 +187,12 @@ use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
-pub use plans::{
-    IoOperation, Operation, PlanExecutor, PlanResult, QueryPlan, QueryPlanBuilder, QueryPlanNode,
-};
+pub use plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanBuilder};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
+    feature = "default-engine-base",
     feature = "arrow-conversion",
     feature = "declarative-plans"
 ))]
@@ -973,21 +971,6 @@ pub trait Engine: AsAny {
         unimplemented!("this engine does not provide a PlanExecutor")
     }
 }
-
-// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with
-// _only_ default-engine-base, so we give a friendly error here.
-#[cfg(all(
-    feature = "default-engine-base",
-    not(any(
-        feature = "default-engine-native-tls",
-        feature = "default-engine-rustls",
-    ))
-))]
-compile_error!(
-    "The default-engine-base feature flag is not meant to be used directly. \
-    Please use either default-engine-native-tls or default-engine-rustls."
-);
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
 // using doctests to test macros. Specifically, we are testing for failed macro invocations due
