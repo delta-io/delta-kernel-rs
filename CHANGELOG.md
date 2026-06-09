@@ -31,8 +31,17 @@
    - Mirrors the opaque-builder pattern established by `FfiSnapshotBuilder` (PR #2255) and
      `FfiCheckpointBuilder` (above); no C ctest in this PR per PR #2255 precedent.
 
+### 🐛 Bug Fixes
+
+1. Fix stale `V2Checkpoint` reader-feature doc-comment in `TableFeature` enum ([#TBD-docfix])
+   - Corrects the comment on `pub enum TableFeature` from "The kernel currently supports all
+     reader features except `V2Checkpoint`." to "The kernel currently supports all reader
+     features." The kernel has supported `V2Checkpoint` since v0.5.0 per the `FEATURES`
+     declaration table; the comment had been stale for approximately eighteen months.
+
 [#TBD-checkpoint]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-checkpoint
 [#TBD-checksum]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-checksum
+[#TBD-docfix]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-docfix
 
 
 ## [v0.23.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.23.0/) (2026-05-15)
