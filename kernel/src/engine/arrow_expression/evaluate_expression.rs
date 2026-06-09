@@ -672,15 +672,12 @@ where
     let right_vals = right.values();
     let mut builder = BooleanBufferBuilder::new(len);
     for i in 0..len {
-        // SQL: NULL is not distinct from NULL; NULL is distinct from any value.
-        let result = match (left.is_null(i), right.is_null(i)) {
-            (false, false) => {
-                (sql_float_cmp(left_vals[i], right_vals[i]) != Ordering::Equal) != inverted
-            }
-            (true, true) => inverted,
-            _ => !inverted,
+        let is_distinct = match (left.is_null(i), right.is_null(i)) {
+            (false, false) => sql_float_cmp(left_vals[i], right_vals[i]) != Ordering::Equal,
+            // NULL is not distinct from NULL, but is distinct from any non-null value.
+            (l_null, r_null) => l_null != r_null,
         };
-        builder.append(result);
+        builder.append(is_distinct != inverted);
     }
     BooleanArray::new(builder.finish(), None)
 }
@@ -845,22 +842,18 @@ pub fn evaluate_predicate(
             // `float_dispatch` for SQL semantics (-0.0 == 0.0, NaN == NaN, NaN > all). See
             // the section comment above `sql_float_cmp` for paths still on Arrow's kernels.
             match (left.data_type(), right.data_type()) {
-                (ArrowDataType::Float32, ArrowDataType::Float32) => {
-                    let l = left.as_primitive_opt::<Float32Type>();
-                    let r = right.as_primitive_opt::<Float32Type>();
-                    if let (Some(l), Some(r)) = (l, r) {
-                        return float_dispatch(l, r, *op, inverted);
-                    }
-                    Ok(eval_fn(&left, &right)?)
-                }
-                (ArrowDataType::Float64, ArrowDataType::Float64) => {
-                    let l = left.as_primitive_opt::<Float64Type>();
-                    let r = right.as_primitive_opt::<Float64Type>();
-                    if let (Some(l), Some(r)) = (l, r) {
-                        return float_dispatch(l, r, *op, inverted);
-                    }
-                    Ok(eval_fn(&left, &right)?)
-                }
+                (ArrowDataType::Float32, ArrowDataType::Float32) => float_dispatch(
+                    left.as_primitive::<Float32Type>(),
+                    right.as_primitive::<Float32Type>(),
+                    *op,
+                    inverted,
+                ),
+                (ArrowDataType::Float64, ArrowDataType::Float64) => float_dispatch(
+                    left.as_primitive::<Float64Type>(),
+                    right.as_primitive::<Float64Type>(),
+                    *op,
+                    inverted,
+                ),
                 _ => Ok(eval_fn(&left, &right)?),
             }
         }
