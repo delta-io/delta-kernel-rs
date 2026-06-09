@@ -112,7 +112,15 @@ authoritative list and signatures, consult the generated
 | `get_default_engine` | Create an engine from a table path with default options |
 | `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
 | `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
+| `make_custom_io_engine` | Create an engine whose storage, JSON, and parquet I/O are all connector callbacks |
 | `free_engine` | Release the engine handle |
+
+To replace the built-in object store, call `make_custom_io_engine` with a
+`CustomIOCallbacks` bundle. You must supply all three IO vtables (storage, JSON,
+parquet); partial override is not supported. Evaluation always uses the kernel's
+default Arrow handler. See `ffi/examples/custom-io-engine/` for a minimal smoke
+test and [Implementing the Engine trait](../connector/implementing_engine.md) for
+handler contracts.
 
 **Snapshots**
 

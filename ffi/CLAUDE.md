@@ -26,9 +26,24 @@ the caller's memory space.
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
+- `src/custom_io_engine/` -- all-or-nothing custom I/O engine (`make_custom_io_engine`)
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
+
+## Custom I/O engine
+
+When the default object store is insufficient, connectors supply **all** storage, JSON, and
+parquet I/O together via `make_custom_io_engine`. There is no partial override: either implement
+every IO vtable in `CustomIOCallbacks`, or use `get_default_engine`.
+
+Evaluation always uses the kernel's default Arrow handler. JSON read batches use the
+column-materialization protocol and are converted to Arrow inside the kernel; parquet read batches
+must cross the boundary as Arrow C Data Interface structs.
+
+Storage status codes: `0` = success, `2` = file not found, `3` = file already exists.
+
+Example: `examples/custom-io-engine/`.
 
 ## Read Flow
 

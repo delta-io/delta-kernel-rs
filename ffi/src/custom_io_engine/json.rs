@@ -33,6 +33,7 @@ use url::Url;
 
 use crate::custom_io_engine::{to_ffi_file_metas, CustomReadResult};
 use crate::engine_data::ArrowFFIData;
+use crate::expressions::SharedPredicate;
 use crate::handle::Handle;
 use crate::{KernelStringSlice, SharedSchema};
 
@@ -210,13 +211,16 @@ pub struct CustomJsonCallbacks {
     pub engine_state: *mut c_void,
     /// Begin reading the given JSON files. The engine **consumes** the
     /// `physical_schema` handle exactly once (via `free_schema` on the FFI
-    /// side, or [`Handle::into_inner`] when implemented in Rust). On success
-    /// the engine writes a non-null iterator state.
+    /// side, or [`Handle::into_inner`] when implemented in Rust). When
+    /// `predicate` is non-null it points to a [`SharedPredicate`] handle the
+    /// engine also consumes exactly once; null means no predicate hint. On
+    /// success the engine writes a non-null iterator state.
     pub read_json_files: extern "C" fn(
         engine_state: *mut c_void,
         files: *const crate::engine_funcs::FileMeta,
         files_len: usize,
         physical_schema: Handle<SharedSchema>,
+        predicate: *mut crate::expressions::SharedPredicate,
         out: *mut CustomReadResult,
     ),
     /// Pump the next batch from a file-read iterator.
@@ -306,12 +310,17 @@ impl JsonHandler for CustomJsonHandler {
         &self,
         files: &[KernelFileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         let ffi_files = to_ffi_file_metas(files)?;
         // Hand the engine its own clone of the schema; keep the original for
         // the per-batch Arrow conversion. The engine consumes the handle.
         let schema_handle: Handle<SharedSchema> = physical_schema.clone().into();
+        let mut predicate_handle = predicate.map(Handle::<SharedPredicate>::from);
+        // `Handle<SharedPredicate>` is `repr(transparent)` over `NonNull<SharedPredicate>`.
+        let predicate_ptr = predicate_handle
+            .as_mut()
+            .map_or(std::ptr::null_mut(), |h| std::ptr::from_mut(h).cast());
         let mut result = CustomReadResult {
             iter_state: std::ptr::null_mut(),
             error: 0,
@@ -321,6 +330,7 @@ impl JsonHandler for CustomJsonHandler {
             ffi_files.as_ptr(),
             ffi_files.len(),
             schema_handle,
+            predicate_ptr,
             &mut result,
         );
         if result.error != 0 {
@@ -450,5 +460,108 @@ impl Iterator for CustomJsonIter {
                 &self.physical_schema,
             ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    use delta_kernel::arrow::array::{ArrayRef, Int32Array, StructArray};
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::{DeltaResult, EngineData, FilteredEngineData};
+
+    use super::*;
+    use crate::engine_data::ArrowFFIData;
+
+    struct WriteShim {
+        batch_count: Arc<Mutex<usize>>,
+    }
+
+    extern "C" fn noop_materialize(
+        _: *mut c_void,
+        _: *const VisitRowsRequest,
+        _: *mut VisitRowsResult,
+    ) {
+    }
+
+    extern "C" fn noop_free_columns(_: *mut c_void, _: *const ColumnBuffers, _: usize) {}
+    extern "C" fn noop_free_batch(_: *mut c_void, _: *mut c_void) {}
+    extern "C" fn noop_iter_next(_: *mut c_void, _: *mut c_void, _: *mut CustomEngineDataResult) {}
+    extern "C" fn noop_iter_free(_: *mut c_void, _: *mut c_void) {}
+
+    extern "C" fn read_empty(
+        _: *mut c_void,
+        _: *const crate::engine_funcs::FileMeta,
+        _: usize,
+        schema: Handle<SharedSchema>,
+        _: *mut crate::expressions::SharedPredicate,
+        out: *mut CustomReadResult,
+    ) {
+        let _ = unsafe { schema.into_inner() };
+        unsafe {
+            *out = CustomReadResult {
+                iter_state: std::ptr::null_mut(),
+                error: 1,
+            };
+        }
+    }
+
+    extern "C" fn write_count(
+        engine_state: *mut c_void,
+        _: KernelStringSlice,
+        _batches: *mut ArrowFFIData,
+        batches_len: usize,
+        _: bool,
+        out_error: *mut u32,
+    ) {
+        let shim = unsafe { &*(engine_state as *const WriteShim) };
+        *shim.batch_count.lock().unwrap() += batches_len;
+        unsafe { *out_error = 0 };
+    }
+
+    extern "C" fn free_shim(engine_state: *mut c_void) {
+        if !engine_state.is_null() {
+            unsafe { drop(Box::from_raw(engine_state as *mut WriteShim)) };
+        }
+    }
+
+    fn make_write_handler(batch_count: Arc<Mutex<usize>>) -> CustomJsonHandler {
+        let shim = Box::new(WriteShim { batch_count });
+        let callbacks = CustomJsonCallbacks {
+            engine_state: Box::into_raw(shim) as *mut c_void,
+            read_json_files: read_empty,
+            iter_next: noop_iter_next,
+            iter_free: noop_iter_free,
+            write_json_file: write_count,
+            engine_data_callbacks: CustomEngineDataCallbacks {
+                materialize_columns: noop_materialize,
+                free_columns: noop_free_columns,
+                free_batch: noop_free_batch,
+            },
+            free_engine_state: free_shim,
+        };
+        CustomJsonHandler::new(callbacks)
+    }
+
+    #[test]
+    fn write_json_file_exports_arrow_batches_to_connector() {
+        let batch_count = Arc::new(Mutex::new(0));
+        let handler = make_write_handler(batch_count.clone());
+        let col = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let field = Arc::new(ArrowField::new("id", ArrowDataType::Int32, true));
+        let sa = StructArray::from(vec![(field, col)]);
+        let batch: ArrowEngineData = sa.into();
+        let rows: Vec<DeltaResult<FilteredEngineData>> = vec![Ok(
+            FilteredEngineData::with_all_rows_selected(Box::new(batch) as Box<dyn EngineData>),
+        )];
+        let iter = rows.into_iter();
+        let path = Url::parse("memory:///t/_delta_log/00000000000000000000.json").unwrap();
+        handler
+            .write_json_file(&path, Box::new(iter), true)
+            .expect("write should succeed");
+        assert_eq!(*batch_count.lock().unwrap(), 1);
     }
 }

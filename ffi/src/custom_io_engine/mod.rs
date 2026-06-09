@@ -181,9 +181,30 @@ unsafe fn make_custom_io_engine_impl(
     Ok(engine_to_handle(engine, allocate_error))
 }
 
+/// Test driver for C/C++ integrators: builds a [`CustomIOEngine`] from the
+/// supplied callbacks and immediately frees it. Returns `0` on success.
+///
+/// # Safety
+/// Same requirements as [`make_custom_io_engine`], including a valid `allocate_error`.
+#[no_mangle]
+pub unsafe extern "C" fn test_drive_custom_io_engine(
+    callbacks: CustomIOCallbacks,
+    allocate_error: AllocateErrorFn,
+) -> u32 {
+    match unsafe { make_custom_io_engine_impl(callbacks, allocate_error) } {
+        Ok(handle) => {
+            unsafe { crate::free_engine(handle) };
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
+
+    use delta_kernel::{JsonHandler, ParquetHandler, StorageHandler};
 
     use super::*;
     use crate::ffi_test_utils::allocate_err;
@@ -249,10 +270,17 @@ mod tests {
             _: *const FileMeta,
             _: usize,
             schema: Handle<crate::SharedSchema>,
+            predicate: *mut crate::expressions::SharedPredicate,
             _: *mut CustomReadResult,
         ) {
-            // Consume the handle so it is not leaked if ever called.
+            // Consume the handles so they are not leaked if ever called.
             let _ = unsafe { schema.into_inner() };
+            if !predicate.is_null() {
+                unsafe {
+                    std::ptr::read(predicate as *mut Handle<crate::expressions::SharedPredicate>)
+                        .drop_handle()
+                };
+            }
         }
         extern "C" fn iter_next(_: *mut c_void, _: *mut c_void, _: *mut CustomEngineDataResult) {}
         extern "C" fn iter_free(_: *mut c_void, _: *mut c_void) {}
@@ -294,9 +322,16 @@ mod tests {
             _: *const FileMeta,
             _: usize,
             schema: Handle<crate::SharedSchema>,
+            predicate: *mut crate::expressions::SharedPredicate,
             _: *mut CustomReadResult,
         ) {
             let _ = unsafe { schema.into_inner() };
+            if !predicate.is_null() {
+                unsafe {
+                    std::ptr::read(predicate as *mut Handle<crate::expressions::SharedPredicate>)
+                        .drop_handle()
+                };
+            }
         }
         extern "C" fn iter_next(_: *mut c_void, _: *mut c_void, _: *mut CustomArrowDataResult) {}
         extern "C" fn iter_free(_: *mut c_void, _: *mut c_void) {}
@@ -367,6 +402,16 @@ mod tests {
         // The factory read each vtable by value; dropping the handle runs each
         // `free_engine_state` exactly once.
         unsafe { crate::free_engine(engine) };
+    }
+
+    #[test]
+    fn custom_io_engine_wires_all_three_io_handlers() {
+        let engine = CustomIOEngine::new(noop_storage(), noop_json(), noop_parquet());
+        // Each accessor returns a distinct handler; evaluation is always Arrow.
+        let _storage: Arc<dyn StorageHandler> = engine.storage_handler();
+        let _json: Arc<dyn JsonHandler> = engine.json_handler();
+        let _parquet: Arc<dyn ParquetHandler> = engine.parquet_handler();
+        let _eval: Arc<dyn EvaluationHandler> = engine.evaluation_handler();
     }
 
     #[test]

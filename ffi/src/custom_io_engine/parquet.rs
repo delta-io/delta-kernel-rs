@@ -25,6 +25,7 @@ use delta_kernel::{
 use crate::custom_io_engine::{to_ffi_file_metas, CustomReadResult};
 use crate::engine_data::ArrowFFIData;
 use crate::engine_funcs::FileMeta;
+use crate::expressions::SharedPredicate;
 use crate::handle::Handle;
 use crate::{KernelStringSlice, SharedSchema};
 
@@ -60,13 +61,16 @@ pub struct CustomParquetCallbacks {
     /// Engine-managed opaque pointer threaded through every callback.
     pub engine_state: *mut c_void,
     /// Begin reading the given parquet files into the `physical_schema`. The
-    /// engine **consumes** the schema handle exactly once. On success the
+    /// engine **consumes** the schema handle exactly once. When `predicate` is
+    /// non-null it points to a [`SharedPredicate`] handle the engine also
+    /// consumes exactly once; null means no predicate hint. On success the
     /// engine writes a non-null iterator state.
     pub read_parquet_files: extern "C" fn(
         engine_state: *mut c_void,
         files: *const FileMeta,
         files_len: usize,
         physical_schema: Handle<SharedSchema>,
+        predicate: *mut crate::expressions::SharedPredicate,
         out: *mut CustomReadResult,
     ),
     /// Pump the next batch from an iterator, exporting it via the Arrow C Data
@@ -138,10 +142,15 @@ impl ParquetHandler for CustomParquetHandler {
         &self,
         files: &[KernelFileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         let ffi_files = to_ffi_file_metas(files)?;
         let schema_handle: Handle<SharedSchema> = physical_schema.into();
+        let mut predicate_handle = predicate.map(Handle::<SharedPredicate>::from);
+        // `Handle<SharedPredicate>` is `repr(transparent)` over `NonNull<SharedPredicate>`.
+        let predicate_ptr = predicate_handle
+            .as_mut()
+            .map_or(std::ptr::null_mut(), |h| std::ptr::from_mut(h).cast());
         let mut result = CustomReadResult {
             iter_state: std::ptr::null_mut(),
             error: 0,
@@ -151,6 +160,7 @@ impl ParquetHandler for CustomParquetHandler {
             ffi_files.as_ptr(),
             ffi_files.len(),
             schema_handle,
+            predicate_ptr,
             &mut result,
         );
         if result.error != 0 {
@@ -318,10 +328,14 @@ mod tests {
         _files: *const FileMeta,
         _files_len: usize,
         physical_schema: Handle<SharedSchema>,
+        predicate: *mut SharedPredicate,
         out: *mut CustomReadResult,
     ) {
         // Consume the schema handle, mirroring a real engine.
         let _schema = unsafe { physical_schema.into_inner() };
+        if !predicate.is_null() {
+            unsafe { std::ptr::read(predicate as *mut Handle<SharedPredicate>).drop_handle() };
+        }
         // The iterator state owns its own queue, cloned from the engine state.
         let state = unsafe { &*(_engine_state as *const ParquetShim) };
         let remaining: Vec<usize> = state.remaining.lock().unwrap().clone();
@@ -461,9 +475,13 @@ mod tests {
             _files: *const FileMeta,
             _files_len: usize,
             physical_schema: Handle<SharedSchema>,
+            predicate: *mut SharedPredicate,
             out: *mut CustomReadResult,
         ) {
             let _schema = unsafe { physical_schema.into_inner() };
+            if !predicate.is_null() {
+                unsafe { std::ptr::read(predicate as *mut Handle<SharedPredicate>).drop_handle() };
+            }
             unsafe {
                 *out = CustomReadResult {
                     iter_state: std::ptr::null_mut(),
