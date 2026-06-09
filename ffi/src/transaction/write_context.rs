@@ -108,8 +108,8 @@ pub unsafe extern "C" fn get_physical_write_schema(
 /// in the physical schema (the evaluator matches input columns to output fields by position), not
 /// in this expression.
 ///
-/// To build the evaluator, pass [`get_write_schema`] as the input, this expression as the
-/// transform, and [`get_physical_write_schema`] as the output. See
+/// To build the evaluator, pass the schema of the partition-free input data as the input, this
+/// expression as the transform, and [`get_physical_write_schema`] as the output. See
 /// [`crate::engine_funcs::new_expression_evaluator`].
 ///
 /// The returned expression must be freed via [`crate::expressions::free_kernel_expression`].

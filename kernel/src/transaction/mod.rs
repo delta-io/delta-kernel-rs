@@ -19,7 +19,7 @@ use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
+use crate::expressions::{lit, ArrayData, ColumnName, ExpressionStructPatch, Scalar};
 use crate::log_segment::LogSegment;
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
@@ -913,7 +913,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                              transform"
                         ))
                     })?;
-                    let literal = Arc::new(Expression::literal(value.clone()));
+                    let literal = Arc::new(lit(value.clone()));
                     patch = patch.with_inserted_field(predecessor, literal);
                 } else if *field.data_type() != DataType::VOID {
                     predecessor = Some(name);
@@ -998,6 +998,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
     ///
     /// [`write_dir`]: WriteContext::write_dir
+    /// [`logical_to_physical`]: WriteContext::logical_to_physical
     pub fn partitioned_write_context(
         &self,
         partition_values: HashMap<String, Scalar>,
@@ -1652,6 +1653,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    use ::test_utils::get_column;
     use rstest::rstest;
     use url::Url;
 
@@ -1992,17 +1994,30 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
-    /// For partitioned tables, creates a partitioned write context with null values.
-    /// Returns a snapshot and a partitioned write context (with null partition values) for the
-    /// given test table. The table must be partitioned.
+    /// Loads a snapshot from `table_path` and builds a partitioned write context for the given
+    /// partition values. The table must be partitioned.
+    fn snapshot_and_partitioned_write_context(
+        table_path: &str,
+        partition_values: HashMap<String, Scalar>,
+    ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let wc = txn.partitioned_write_context(partition_values)?;
+        Ok((snapshot, wc))
+    }
+
     /// Helper: evaluates the logical-to-physical transform on the given batch and returns the
     /// output RecordBatch.
     fn eval_logical_to_physical(
         wc: &WriteContext,
         batch: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-        let input_schema = crate::schema::StructType::try_from_arrow(batch.schema())?;
+        let input_schema = StructType::try_from_arrow(batch.schema())?;
         let physical_schema = wc.physical_schema();
         let l2p = wc.logical_to_physical();
 
@@ -2025,10 +2040,10 @@ mod tests {
         #[case] table_path: &str,
         #[case] materialized: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let (snapshot, wc) = snapshot_and_partitioned_write_context(
+            table_path,
+            HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
+        )?;
         assert_eq!(
             snapshot
                 .table_configuration()
@@ -2036,12 +2051,6 @@ mod tests {
                 .has_table_feature(&TableFeature::MaterializePartitionColumns),
             materialized
         );
-
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let wc = txn.partitioned_write_context(HashMap::from([(
-            "letter".to_string(),
-            Scalar::String("a".into()),
-        )]))?;
 
         // The input data must exclude the partition column "letter".
         let input_schema = Arc::new(ArrowSchema::new(vec![
@@ -2065,12 +2074,7 @@ mod tests {
             .collect();
         if materialized {
             assert_eq!(names, vec!["letter", "number", "a_float"]);
-            let letter = rb
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("letter column should be Utf8");
-            assert_eq!(letter.value(0), "a");
+            assert_eq!(get_column!(rb, "letter", StringArray).value(0), "a");
         } else {
             assert_eq!(names, vec!["number", "a_float"]);
         }
@@ -2116,7 +2120,7 @@ mod tests {
             ("p4".to_string(), Scalar::Integer(9)),
         ]))?;
 
-        // Input excludes partition columns but keeps the void column, in logical (non-partition)
+        // Input excludes partition columns but keeps the void column, in logical schema
         // order: [d1, v, d2].
         let input_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("d1", ArrowDataType::Int32, true),
@@ -2148,27 +2152,13 @@ mod tests {
             .collect();
         assert_eq!(names, expected_names);
 
-        let string_col = |i: usize| {
-            rb.column(i)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("string column")
-                .value(0)
-                .to_string()
-        };
-        let int_col = |i: usize| {
-            rb.column(i)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("int column")
-                .value(0)
-        };
-        assert_eq!(string_col(0), "aa"); // p1
-        assert_eq!(int_col(1), 7); // p2
-        assert_eq!(int_col(2), 10); // d1
-        assert_eq!(string_col(3), "cc"); // p3
-        assert_eq!(int_col(4), 9); // p4
-        assert_eq!(int_col(5), 20); // d2
+        // Look up by the physical column names (CM-dependent) collected above, in schema order.
+        assert_eq!(get_column!(rb, names[0], StringArray).value(0), "aa"); // p1 (prepended)
+        assert_eq!(get_column!(rb, names[1], Int32Array).value(0), 7); // p2 (prepended)
+        assert_eq!(get_column!(rb, names[2], Int32Array).value(0), 10); // d1
+        assert_eq!(get_column!(rb, names[3], StringArray).value(0), "cc"); // p3 (after d1, void skipped)
+        assert_eq!(get_column!(rb, names[4], Int32Array).value(0), 9); // p4 (after d1)
+        assert_eq!(get_column!(rb, names[5], Int32Array).value(0), 20); // d2
         Ok(())
     }
 
@@ -2176,19 +2166,10 @@ mod tests {
     #[test]
     fn test_physical_schema_includes_partition_columns_when_materialized(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from(
+        let (_snapshot, write_context) = snapshot_and_partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
-        ))
-        .unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
-
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let write_context = txn.partitioned_write_context(HashMap::from([(
-            "letter".to_string(),
-            Scalar::String("a".into()),
-        )]))?;
+            HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
+        )?;
         let physical_schema = write_context.physical_schema();
 
         assert!(

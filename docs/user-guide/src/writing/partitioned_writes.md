@@ -89,10 +89,9 @@ Key points:
 - **Case-insensitive keys**: `"YEAR"` matches schema column `"year"`. Kernel normalizes
   to the schema case.
 - **Physical schema**: `wc.physical_schema()` excludes partition columns, unless the table
-  materializes them (e.g. the `materializePartitionColumns` writer feature or `icebergCompatV3`),
-  in which case the partition columns appear in the physical schema and the data files. Either
-  way, the batch you pass to `write_parquet` must not contain partition columns: Kernel
-  handles the materialization automatically.
+  materializes them (e.g. `materializePartitionColumns` or `icebergCompatV3`). Either way, the
+  batch you transform with `WriteContext::logical_to_physical` must not contain partition columns.
+  The `logical_to_physical` transform handles the materialization automatically.
 
 > [!TIP]
 > To get the partition column names at runtime, call `txn.logical_partition_columns()`.

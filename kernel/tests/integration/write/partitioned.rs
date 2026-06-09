@@ -842,7 +842,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     Ok(())
 }
 
-/// End-to-end happy path for `materializePartitionColumns`: Writes a batch
+/// End-to-end happy path for `materializePartitionColumns`: Writes two batches
 /// and read & verify both the raw parquet and the scanned result.
 #[rstest]
 #[case::cm_none(ColumnMappingMode::None)]
@@ -876,56 +876,141 @@ async fn test_materialize_partition_columns_e2e(
         .commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
-    // Data schema excludes the partition columns.
-    let data_schema = StructType::try_new(vec![
+    // Data schema excludes partition columns.
+    let kernel_data_schema = StructType::try_new(vec![
         StructField::nullable("d1", DataType::INTEGER),
         StructField::nullable("d2", DataType::INTEGER),
     ])?;
-    let batch = RecordBatch::try_new(
-        Arc::new((&data_schema).try_into_arrow()?),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(Int32Array::from(vec![10, 20, 30])),
-        ],
-    )?;
-    let partition_values = HashMap::from([
-        ("p1".to_string(), Scalar::String("x".into())),
-        ("p2".to_string(), Scalar::Integer(5)),
-    ]);
-    let snapshot =
-        write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+    let arrow_data_schema: Arc<ArrowSchema> = Arc::new((&kernel_data_schema).try_into_arrow()?);
+    let make_batch = |d1: Vec<i32>, d2: Vec<i32>| {
+        RecordBatch::try_new(
+            arrow_data_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(d1)) as ArrayRef,
+                Arc::new(Int32Array::from(d2)),
+            ],
+        )
+        .unwrap()
+    };
 
-    // ===== Read the written parquet file directly: partition columns are materialized. =====
+    let partition_values = |p1: &str, p2: i32| {
+        HashMap::from([
+            ("p1".to_string(), Scalar::String(p1.into())),
+            ("p2".to_string(), Scalar::Integer(p2)),
+        ])
+    };
+
+    // A single commit writing two distinct partitions.
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine")
+        .with_data_change(true);
+    for (d1, d2, p1, p2) in [
+        (vec![1, 2, 3], vec![10, 20, 30], "x", 5),
+        (vec![4, 5], vec![40, 50], "y", 6),
+    ] {
+        let wc = txn.partitioned_write_context(partition_values(p1, p2))?;
+        let add = engine
+            .write_parquet(&ArrowEngineData::new(make_batch(d1, d2)), &wc)
+            .await?;
+        txn.add_files(add);
+    }
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+    // ===== Verify the materialized partition columns from parquet =====
     let logical_schema = snapshot.schema();
     let p1_phys = logical_schema.field("p1").unwrap().physical_name(cm_mode);
     let p2_phys = logical_schema.field("p2").unwrap().physical_name(cm_mode);
+    let adds = read_add_actions_json(&table_path, 1)?;
+    assert_eq!(adds.len(), 2, "one commit should write two partition files");
+    let mut found: Vec<(String, i32, usize)> = Vec::new();
+    for add in &adds {
+        let rel_path = add["path"].as_str().unwrap();
+        let parquet_path = Url::from_directory_path(&table_path)
+            .unwrap()
+            .join(rel_path)?
+            .to_file_path()
+            .unwrap();
+        let file_batch = read_parquet_file(&parquet_path);
+
+        let pv = add["partitionValues"].as_object().unwrap();
+        let p1_from_delta_log = pv.get(p1_phys).and_then(|v| v.as_str()).unwrap();
+        let p2_from_delta_log: i32 = pv.get(p2_phys).and_then(|v| v.as_str()).unwrap().parse()?;
+
+        let p1 = get_column!(file_batch, p1_phys, StringArray);
+        let p2 = get_column!(file_batch, p2_phys, Int32Array);
+        assert!(
+            p1.iter().all(|v| v == Some(p1_from_delta_log)),
+            "materialized p1 should equal declared '{p1_from_delta_log}' in every row, got {p1:?}"
+        );
+        assert!(
+            p2.iter().all(|v| v == Some(p2_from_delta_log)),
+            "materialized p2 should equal declared {p2_from_delta_log} in every row, got {p2:?}"
+        );
+        found.push((
+            p1_from_delta_log.to_string(),
+            p2_from_delta_log,
+            file_batch.num_rows(),
+        ));
+    }
+    found.sort();
+    assert_eq!(
+        found,
+        vec![("x".to_string(), 5, 3), ("y".to_string(), 6, 2)]
+    );
+
+    // ===== Scan round-trip across both partitions. =====
+    let sorted = read_sorted(&snapshot, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
+    let int_col = |name: &str| get_column!(sorted, name, Int32Array).values().to_vec();
+    let p1_scan: Vec<Option<&str>> = get_column!(sorted, "p1", StringArray).iter().collect();
+    assert_eq!(int_col("d1"), vec![1, 2, 3, 4, 5]);
+    assert_eq!(int_col("d2"), vec![10, 20, 30, 40, 50]);
+    assert_eq!(
+        p1_scan,
+        vec![Some("x"), Some("x"), Some("x"), Some("y"), Some("y")]
+    );
+    assert_eq!(int_col("p2"), vec![5, 5, 5, 6, 6]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_materialize_all_primitive_partition_types() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let _ = create_table(&table_path, all_types_schema(), "test/1.0")
+        .with_data_layout(DataLayout::partitioned(PARTITION_COLS.iter().copied()))
+        .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+
+    // Data schema excludes partition columns.
+    let data_schema = StructType::try_new(vec![StructField::nullable("value", DataType::INTEGER)])?;
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![normal_arrow_columns()[0].clone()],
+    )?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        normal_partition_values()?,
+    )
+    .await?;
+
+    // Read raw parquet and verify the materialized partition columns.
     let (_add, rel_path) = read_single_add(&table_path, 1)?;
     let parquet_path = Url::from_directory_path(&table_path)
         .unwrap()
         .join(&rel_path)?
         .to_file_path()
         .unwrap();
-    let file_batch = read_parquet_file(&parquet_path);
-    assert_eq!(file_batch.num_rows(), 3);
-    let p1_in_file = get_column!(file_batch, p1_phys, StringArray);
-    assert!(
-        p1_in_file.iter().all(|v| v == Some("x")),
-        "materialized p1 should be 'x' in every row, got {p1_in_file:?}"
-    );
-    let p2_in_file = get_column!(file_batch, p2_phys, Int32Array);
-    assert!(
-        p2_in_file.iter().all(|v| v == Some(5)),
-        "materialized p2 should be 5 in every row, got {p2_in_file:?}"
-    );
+    assert_normal_values(&read_parquet_file(&parquet_path));
 
-    // ===== Scan round-trip: partition values come back correctly. =====
+    // Validate the scan result for partition columns.
     let sorted = read_sorted(&snapshot, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
-    let int_col = |name: &str| get_column!(sorted, name, Int32Array).values().to_vec();
-    let p1_scan = get_column!(sorted, "p1", StringArray);
-    assert_eq!(int_col("d1"), vec![1, 2, 3]);
-    assert_eq!(int_col("d2"), vec![10, 20, 30]);
-    assert!(p1_scan.iter().all(|v| v == Some("x")));
-    assert_eq!(int_col("p2"), vec![5, 5, 5]);
+    assert_normal_values(&sorted);
 
     Ok(())
 }
@@ -1014,13 +1099,11 @@ async fn test_input_data_with_partition_column_errors(
 // 23502): a NULL written into a `NOT NULL` partition column must be rejected on the default
 // engine.
 
-/// Validates the e2e NOT NULL contract on partition values for the non-materialized path: a
-/// null-equivalent value into a `nullable: false` partition column is rejected before
-/// serialization, and ordinary non-null values pass through unchanged. The column-mapping
-/// axis is orthogonal. Validation runs against logical names and field nullability before
-/// any column-mapping renaming, so the same outcome is expected under all three CM modes.
+/// Validates the e2e NOT NULL contract on partition values: a null-equivalent value into a
+/// `nullable: false` partition column is rejected before serialization, , and ordinary
+/// non-null values pass through unchanged.
 ///
-/// Three value cases cross-multiplied against three column-mapping modes:
+/// Three value cases, cross-multiplied against column-mapping modes and materialization:
 ///
 /// - `Scalar::Null(STRING)` -- explicit null, must be rejected.
 /// - `Scalar::String("a")`  -- ordinary non-null value, must be accepted.
@@ -1029,7 +1112,8 @@ async fn test_input_data_with_partition_column_errors(
 ///   would slip past the nullability check and land a null value in a NOT NULL column.
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_partition_null_validation_non_materialized(
+async fn test_partition_null_validation(
+    #[values(false, true)] materialized: bool,
     #[values(
         ColumnMappingMode::None,
         ColumnMappingMode::Name,
@@ -1053,14 +1137,16 @@ async fn test_partition_null_validation_non_materialized(
     ])?);
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let snapshot = create_partitioned_table(
-        &table_path,
-        engine.as_ref(),
-        schema,
-        &["p"],
-        cm_mode,
-        false, // write_partition_values_parsed; unused, no checkpoint in this test
-    )?;
+    let mut properties = vec![("delta.columnMapping.mode", cm_mode_str(cm_mode))];
+    if materialized {
+        properties.push(("delta.feature.materializePartitionColumns", "supported"));
+    }
+    let _ = create_table(&table_path, schema, "test/1.0")
+        .with_data_layout(DataLayout::partitioned(["p"]))
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
     let result = begin_transaction(snapshot, engine.as_ref())?
         .with_engine_info("default engine")
@@ -1140,55 +1226,6 @@ async fn test_partition_null_validation_mixed_nullability(
         .to_string();
     assert!(err.contains("not nullable"), "{err}");
     assert!(err.contains("'p_required'"), "{err}");
-
-    Ok(())
-}
-
-/// Materialized arm: enforcement is identical to the non-materialized path.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_partition_null_validation_materialized() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("value", DataType::INTEGER),
-        StructField::not_null("p", DataType::STRING),
-    ])?);
-
-    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let _ = create_table(&table_path, schema.clone(), "test/1.0")
-        .with_data_layout(DataLayout::partitioned(["p"]))
-        .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert!(
-        snapshot.table_configuration().is_feature_enabled(
-            &delta_kernel::table_features::TableFeature::MaterializePartitionColumns
-        ),
-        "test setup must enable materializePartitionColumns"
-    );
-
-    // A valid non-null value is accepted.
-    begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([(
-            "p".to_string(),
-            Scalar::String("a".into()),
-        )]))?;
-
-    // A null into the NOT NULL partition column is rejected up front, identically to the
-    // non-materialized path.
-    let err = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine")
-        .partitioned_write_context(HashMap::from([(
-            "p".to_string(),
-            Scalar::Null(DataType::STRING),
-        )]))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("not nullable"), "{err}");
-    assert!(err.contains("'p'"), "{err}");
 
     Ok(())
 }
