@@ -39,21 +39,11 @@ pub enum CheckpointShape {
     None,
     /// The checkpoint files ARE the leaves -- `add` / `remove` rows are stored inline. Covers
     /// classic V1 checkpoints and V2 checkpoints that inline their actions (no sidecars).
-    Leaf {
-        /// The checkpoint files.
-        files: Vec<FileMeta>,
-        /// How the checkpoint files are encoded.
-        file_format: FileType,
-    },
+    Leaf,
     /// V2 multipart manifest -- `files` are the manifest parts; the leaf rows live in sidecar
     /// parquet files the manifest references (resolved lazily by the reconciliation plan, not
     /// stored here).
-    Manifest {
-        /// The manifest (top-level checkpoint) files.
-        files: Vec<FileMeta>,
-        /// How the manifest files are encoded.
-        file_format: FileType,
-    },
+    Manifest,
 }
 
 /// Stats wiring resolved for a scan that requested stats: the projected stats schema plus
@@ -125,40 +115,32 @@ impl ScanShape {
         // footer IS the leaf schema we probe for parsed stats. JSON has no footer, so we always
         // drain. Either way: >=1 sidecar => manifest, 0 => leaf.
         let mut leaf_parsed_stats = None;
-        let (is_manifest, sidecars) = match file_format {
+        let sidecar = match file_format {
             FileType::Parquet => {
                 let cp_schema = read_footer_schema(exec, first.location.clone())?;
-                let sidecars = if cp_schema.contains(SIDECAR_NAME) {
-                    Some(collect_sidecars(
-                        exec,
-                        files.clone(),
-                        file_format,
-                        &seg.log_root,
-                    )?)
+                let sidecar = if cp_schema.contains(SIDECAR_NAME) {
+                    collect_sidecar(exec, files, file_format, &seg.log_root)?
                 } else {
                     None
                 };
-                match sidecars {
-                    Some(sidecars) if !sidecars.is_empty() => (true, Some(sidecars)),
+                match sidecar {
+                    Some(sidecar) => Some(sidecar),
                     // No `sidecar` column (V1 leaf) or column present but unreferenced (V2 inline
                     // leaf): either way the footer we read is the leaf schema, so probe it here.
                     _ => {
                         leaf_parsed_stats = stats_probe(Some(&cp_schema), stats_schema);
-                        (false, None)
+                        None
                     }
                 }
             }
-            FileType::Json => {
-                let sidecars = collect_sidecars(exec, files.clone(), file_format, &seg.log_root)?;
-                (!sidecars.is_empty(), Some(sidecars))
-            }
+            FileType::Json => collect_sidecar(exec, files, file_format, &seg.log_root)?,
         };
 
-        if !is_manifest {
+        if sidecar.is_none() {
             // A JSON leaf has no footer to probe and surfaces stats only as JSON strings, so its
             // parsed answer falls through to `false`.
             return Ok(make_info(
-                CheckpointShape::Leaf { files, file_format },
+                CheckpointShape::Leaf,
                 leaf_parsed_stats.unwrap_or(false),
             ));
         }
@@ -169,8 +151,7 @@ impl ScanShape {
         // only when stats were requested.
         // Classification drained these sidecars; the leaf path returned above, so a manifest
         // always carries at least one. An empty list would simply leave parsed stats `false`.
-        let sidecars = sidecars.unwrap_or_default();
-        let has_parsed_stats = match (stats_schema, sidecars.first()) {
+        let has_parsed_stats = match (stats_schema, sidecar) {
             (Some(reqd), Some(sidecar)) => {
                 let side_schema = read_footer_schema(exec, sidecar.clone())?;
                 LogSegment::schema_has_compatible_stats_parsed(side_schema.as_ref(), reqd.as_ref())
@@ -178,10 +159,7 @@ impl ScanShape {
             _ => false,
         };
 
-        Ok(make_info(
-            CheckpointShape::Manifest { files, file_format },
-            has_parsed_stats,
-        ))
+        Ok(make_info(CheckpointShape::Manifest, has_parsed_stats))
     }
 }
 
@@ -211,12 +189,12 @@ fn read_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<Sc
 /// stream and visits its rows, rather than crossing the engine boundary with a reducer sink.
 /// The scan projects only the `sidecar` column, so manifest action rows (`add` / `remove`) read
 /// as null and are skipped by the visitor.
-fn collect_sidecars(
+fn collect_sidecar(
     exec: &dyn PlanExecutor,
     files: Vec<FileMeta>,
     file_format: FileType,
     log_root: &Url,
-) -> DeltaResult<Vec<FileMeta>> {
+) -> DeltaResult<Option<FileMeta>> {
     let plan = match file_format {
         FileType::Parquet => QueryPlanBuilder::scan_parquet(files, sidecar_scan_schema()),
         FileType::Json => QueryPlanBuilder::scan_json(files, sidecar_scan_schema()),
@@ -226,13 +204,15 @@ fn collect_sidecars(
 
     let mut visitor = SidecarVisitor::default();
     for batch in data {
+        if !visitor.sidecars.is_empty() {
+            break;
+        }
         visitor.visit_rows_of(batch?.as_ref())?;
     }
-    visitor
-        .sidecars
-        .into_iter()
-        .map(|sidecar| sidecar.to_filemeta(log_root))
-        .collect()
+    match visitor.sidecars.pop() {
+        Some(sidecar) => Ok(Some(sidecar.to_filemeta(log_root)?)),
+        None => Ok(None),
+    }
 }
 
 /// Manifest scan schema: just the `sidecar` column. Narrowing to that one column avoids paying
