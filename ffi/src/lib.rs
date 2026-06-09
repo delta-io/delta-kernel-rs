@@ -42,9 +42,9 @@ extern crate self as delta_kernel_ffi;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
 #[cfg(feature = "default-engine-base")]
-pub mod callback_engine;
+mod arrow_bridge;
 #[cfg(feature = "default-engine-base")]
-pub mod callback_handlers;
+pub mod custom_io_engine;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
