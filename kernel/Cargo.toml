@@ -52,6 +52,17 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
+prost = { version = "0.13", optional = true }
+# Object-safe `Clone` for the `KernelReducer` trait. Gated by `declarative-plans`.
+dyn-clone = { version = "1.0", optional = true }
+# Stackless coroutines for the SM driver. Gated by `declarative-plans`.
+# default-features can't be disabled in 0.100.1 -- an unconditional
+# `pub use genawaiter2_proc_macro::stack_producer;` in genawaiter2's lib.rs
+# leaks the proc-macro crate as a hard dependency even when the `proc_macro`
+# feature is off (upstream bug). This drags in `proc-macro-error 0.4.12`
+# (unmaintained). Track for replacement when genawaiter2 patches the gate or
+# we switch to a different stackless-coroutine crate.
+genawaiter2 = { version = "0.100", optional = true }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = "0.3"
 url = "2"
@@ -114,9 +125,8 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# Declarative plan IR (experimental). The IR uses kernel-internal types hidden 
-# under `#[internal_api]` 
-declarative-plans = ["internal-api"]
+# Declarative plan IR + proto wire format (experimental).
+declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored", "dep:dyn-clone", "dep:genawaiter2"]
 
 # Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
 # work. TODO(#2630): remove once full column-defaults support ships.
@@ -134,6 +144,9 @@ default-engine-base = [
 
 [build-dependencies]
 rustc_version = "0.4.1"
+# Proto codegen, only pulled in / run under the `declarative-plans` feature.
+prost-build = { version = "0.13", optional = true }
+protoc-bin-vendored = { version = "3.2", optional = true }
 
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["test-utils"] }
