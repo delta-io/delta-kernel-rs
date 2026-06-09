@@ -20,8 +20,8 @@
 //! use std::sync::Arc;
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
 //! use delta_kernel::{Engine, Error, Snapshot};
-//! use delta_kernel::engine::default::DefaultEngineBuilder;
 //! use delta_kernel::object_store::local::LocalFileSystem;
+//! use delta_kernel_default_engine::DefaultEngineBuilder;
 //!
 //! let engine: Arc<dyn Engine> =
 //!     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
