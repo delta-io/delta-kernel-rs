@@ -22,6 +22,10 @@ import sys
 # Significance threshold for slowdowns/speedups (2x in either direction).
 SIGNIFICANCE_THRESHOLD = 2.0
 
+# Ratios within this of 1.0 count as no change: rendered "1.00x" with no marker
+# and excluded from the summary's slowdown/speedup counts.
+NEUTRAL_THRESHOLD = 1e-3
+
 # Emoji markers for the Change cell, by side and severity.
 SIGNIFICANT_SLOWDOWN = '🐌'  # ratio >= SIGNIFICANCE_THRESHOLD
 SLIGHT_SLOWDOWN = '🚧'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
@@ -118,7 +122,7 @@ def format_difference(ratio):
     """Render a ratio as e.g. '1.00x', '1.50x slower', or '2.00x faster'."""
     if ratio is None:
         return 'N/A'
-    if abs(ratio - 1.0) < 1e-9:
+    if abs(ratio - 1.0) < NEUTRAL_THRESHOLD:
         return '1.00x'
     if ratio > 1:
         return f'{ratio:.2f}x slower'
@@ -130,7 +134,7 @@ def change_emoji(ratio, significant):
     See the module-level emoji constants for the marker assignments. Returns
     an empty string for ratios near 1.0 or N/A rows.
     """
-    if ratio is None or abs(ratio - 1.0) < 1e-9:
+    if ratio is None or abs(ratio - 1.0) < NEUTRAL_THRESHOLD:
         return ''
     if ratio > 1.0:
         return SIGNIFICANT_SLOWDOWN if significant else SLIGHT_SLOWDOWN
@@ -142,11 +146,11 @@ def render_summary(rows):
     threshold; the per-row emoji marker is what distinguishes significant from
     slight changes.
 
-    Rows with ratio == 1.00 (or near-1) are excluded since they are neither slowdowns nor
-    speedups. N/A rows (ratio is None) are excluded for the same reason.
+    Rows within NEUTRAL_THRESHOLD of 1.0 are excluded since they are neither slowdowns
+    nor speedups. N/A rows (ratio is None) are excluded for the same reason.
     """
-    slow = [r for r in rows if r['ratio'] is not None and r['ratio'] > 1.0]
-    fast = [r for r in rows if r['ratio'] is not None and r['ratio'] < 1.0]
+    slow = [r for r in rows if r['ratio'] is not None and r['ratio'] - 1.0 >= NEUTRAL_THRESHOLD]
+    fast = [r for r in rows if r['ratio'] is not None and 1.0 - r['ratio'] >= NEUTRAL_THRESHOLD]
 
     if slow:
         worst = max(slow, key=lambda r: r['ratio'])
