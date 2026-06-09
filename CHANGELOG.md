@@ -21,7 +21,18 @@
      via `free_snapshot`. Adds the C example `ffi/examples/checkpoint-table/` exercising all
      three sub-flows (inline / V2-no-sidecar / V2-with-sidecars).
 
+### 🚀 Features / new APIs
+
+1. Add symmetric `FfiChecksumBuilder` family wrapping `Snapshot::write_checksum` ([#TBD-checksum])
+   - Adds three new FFI functions: `checksum_builder_for`, `checksum_builder_build`, and
+     `free_checksum_builder`.
+   - Adds `#[repr(C)] enum FfiChecksumWriteResult { Written(Handle<SharedSnapshot>),
+     AlreadyExists(Handle<SharedSnapshot>) }` paralleling the checkpoint builder's return type.
+   - Mirrors the opaque-builder pattern established by `FfiSnapshotBuilder` (PR #2255) and
+     `FfiCheckpointBuilder` (above); no C ctest in this PR per PR #2255 precedent.
+
 [#TBD-checkpoint]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-checkpoint
+[#TBD-checksum]: https://github.com/delta-io/delta-kernel-rs/pull/TBD-checksum
 
 
 ## [v0.23.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.23.0/) (2026-05-15)
