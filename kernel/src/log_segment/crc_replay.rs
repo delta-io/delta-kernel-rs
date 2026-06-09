@@ -118,18 +118,15 @@ impl LogSegment {
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
     ) -> Option<Arc<Crc>> {
-        // The on-disk CRC is read only when strictly newer than the in-memory base, falling back
-        // to the in-memory base if that read fails.
-        let disk_crc = self.listed.latest_crc_file.as_ref();
-        let disk_is_newer =
-            disk_crc.is_some_and(|f| in_memory_base.is_none_or(|m| f.version > m.version));
-        if disk_is_newer {
-            disk_crc
-                .and_then(|f| read_crc_file_or_none(engine, f))
-                .or_else(|| in_memory_base.cloned())
-        } else {
-            in_memory_base.cloned()
-        }
+        // A failed on-disk read falls back to the in-memory base.
+        let preferred_disk_crc = self
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
+        preferred_disk_crc
+            .and_then(|f| read_crc_file_or_none(engine, f))
+            .or_else(|| in_memory_base.cloned())
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in

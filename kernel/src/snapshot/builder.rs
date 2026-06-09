@@ -43,9 +43,10 @@ pub struct SnapshotBuilder {
     incremental_replay: IncrementalReplay,
 }
 
-/// Controls whether kernel replays commits to advance a stale on-disk CRC to the target snapshot
-/// version on load. A CRC already at the target version is always used regardless of this
-/// setting; this only bounds the cost of advancing a *stale* CRC.
+/// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
+/// in-memory CRC, or an on-disk CRC) to the target snapshot version on load. A CRC already at the
+/// target version is always used regardless of this setting; this only bounds the cost of
+/// advancing a *stale* CRC.
 ///
 /// A resolved CRC gives the snapshot precomputed file statistics (file count and sizes, useful
 /// for query optimization and for writers producing a post-commit CRC) along with domain metadata

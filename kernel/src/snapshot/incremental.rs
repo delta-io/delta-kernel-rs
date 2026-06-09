@@ -313,7 +313,7 @@ impl Snapshot {
             }
             None => {
                 // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
-                // scanned any log files) Perform normal P & M replay.
+                // scanned any log files). Perform normal P & M replay.
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine)?
@@ -341,8 +341,9 @@ impl Snapshot {
     /// Determine the on-disk CRC file the combined segment should carry.
     ///
     /// Prefers the new segment's CRC; falls back to the existing segment's CRC if and only if
-    /// its version is >= the new segment's checkpoint version. This preserves the
-    /// [`LogSegmentFiles`] invariant `crc.version >= checkpoint.version`.
+    /// its version is >= the new segment's checkpoint version, so the fallback never violates the
+    /// [`LogSegmentFiles`] invariant `crc.version >= checkpoint.version` (enforced in
+    /// [`LogSegment::try_new`]).
     fn resolve_crc_file(
         new_log_segment: &LogSegment,
         existing_log_segment: &LogSegment,
@@ -1245,9 +1246,9 @@ mod tests {
     // Stronger regression for the `resolve_crc_file` invariant filter: set up a metadata change
     // at the checkpoint version so that a stale inherited CRC would produce wrong
     // Metadata, not just wrong bookkeeping. Without the filter, the incremental update
-    // would return Metadata from commit 0 (via Case 2(b) fallback on a below-checkpoint
-    // CRC); the fresh rebuild would return Metadata from commit 2. `compare_snapshots`
-    // catches that on `table_configuration`.
+    // would inherit the below-checkpoint CRC and return Metadata from commit 0; the fresh
+    // rebuild would return Metadata from commit 2. `compare_snapshots` catches that on
+    // `table_configuration`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata(
     ) -> DeltaResult<()> {
@@ -1312,9 +1313,8 @@ mod tests {
             .checkpoint(ctx.engine.as_ref(), None)?;
 
         // Incremental update. With the filter: CRC@v1 dropped, log replay via checkpoint@v2
-        // returns the correct new metadata. Without the filter: Case 2(b) fallback returns
-        // CRC@v1's stale (empty) configuration, and compare_snapshots fails on
-        // table_configuration.
+        // returns the correct new metadata. Without the filter: the inherited CRC@v1 returns
+        // its stale (empty) configuration, and compare_snapshots fails on table_configuration.
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
         compare_snapshots(&updated, &fresh);
@@ -1401,7 +1401,7 @@ mod tests {
 
         // Incremental update. The pruned replay on commits > 3 is empty. With the stale-
         // CRC skip, the replay returns (None, None) and `TableConfiguration::try_new_from`
-        // preserves existing P&M. Without the skip, Case 2(b) would load CRC@v1's stale
+        // preserves existing P&M. Without the skip, the inherited CRC@v1 would load its stale
         // metadata and overwrite the existing (correct) v2 configuration.
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
