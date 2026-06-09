@@ -9,8 +9,9 @@ Reads the output of `critcmp base changes` from stdin and writes:
      per-benchmark table with columns: Test | Base | PR | Change.
 
 A change is "significant" when it is at least 2x in either direction
-(ratio >= 2.0 for slowdown, ratio <= 0.5 for speedup). The summary counts
-only significant changes and the Change cell gets a 🐌/🚀 marker for them.
+(ratio >= 2.0 for slowdown, ratio <= 0.5 for speedup). The summary includes
+every slowdown and speedup; significant ones get a 🐌/🚀 marker in the
+Change cell.
 
 Usage:
     critcmp base changes | python3 benchmarks/ci/parse_critcmp.py
@@ -23,21 +24,28 @@ SIGNIFICANCE_THRESHOLD = 2.0
 
 # Emoji markers for the Change cell, by side and severity.
 SIGNIFICANT_SLOWDOWN = '🐌'  # ratio >= SIGNIFICANCE_THRESHOLD
-SLIGHT_SLOWDOWN = '⚠️&nbsp;'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD; nbsp pads U+FE0F variation selector
+SLIGHT_SLOWDOWN = '⚠️;'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
 SLIGHT_SPEEDUP = '✅'        # 1.0 / SIGNIFICANCE_THRESHOLD < ratio < 1.0
 SIGNIFICANT_SPEEDUP = '🚀'   # ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
 
 def to_ms(value, units):
+    """Convert a critcmp duration to milliseconds.
+
+    Matches exactly the units critcmp can emit (see `time()` in critcmp's
+    output.rs): ns, µs (U+00B5), ms, s. An unrecognized unit means the critcmp
+    output format changed; raise so the run fails loudly instead of rendering a
+    silently wrong table.
+    """
     u = units.strip()
     if u == 's':
         return value * 1e3
     if u == 'ms':
         return value
-    if u in ('µs', 'us', 'μs'):
+    if u == 'µs':
         return value / 1e3
     if u == 'ns':
         return value / 1e6
-    return value
+    raise ValueError(f'unrecognized critcmp time unit: {units!r}')
 
 def parse_duration(s):
     m = re.match(r'([0-9.]+)±([0-9.]+)(.+)', s.strip())
@@ -46,11 +54,16 @@ def parse_duration(s):
     return float(m.group(1)), float(m.group(2)), m.group(3).strip()
 
 def sanitize_name(raw):
-    """Sanitize an attacker-controllable benchmark name for safe markdown embedding.
+    """Escape a benchmark name so it renders cleanly inside a markdown table cell.
 
-    Strips backticks (so the name can't break out of the code span), then escapes pipes
-    (which would otherwise terminate a table cell). Returns the bare string. The
+    Strips backticks (which would terminate the code span), then escapes pipes
+    (which would otherwise terminate the table cell). Returns the bare string. The
     caller wraps in backticks where appropriate.
+
+    Rendering hygiene only, not a security boundary: the entire comment body is
+    produced by the untrusted bench run and posted verbatim (see
+    .github/SECURITY_MODEL.md), so escaping here cannot -- and does not need to --
+    prevent markdown injection.
     """
     return raw.replace('`', '').replace('|', r'\|')
 
@@ -132,16 +145,17 @@ def change_emoji(ratio, significant):
     See the module-level emoji constants for the marker assignments. Returns
     an empty string for ratios near 1.0 or N/A rows.
     """
-    if ratio is None or abs(ratio - 1.0) < 1e-9:
+    if ratio is None or abs(ratio - 1.0) < 1.0e-1:
         return ''
     if ratio > 1.0:
         return SIGNIFICANT_SLOWDOWN if significant else SLIGHT_SLOWDOWN
     return SIGNIFICANT_SPEEDUP if significant else SLIGHT_SPEEDUP
 
 def render_summary(rows):
-    """Render the summary block. Counts and extrema include every slowdown and speedup
-    regardless of the 2x significance threshold; the per-row emoji marker is the place
-    that distinguishes significant from slight changes.
+    """Render the summary block. The counts and the largest-slowdown/fastest-speedup
+    lines include every slowdown and speedup regardless of the 2x significance
+    threshold; the per-row emoji marker is what distinguishes significant from
+    slight changes.
 
     Rows with ratio == 1.00 (or near-1) are excluded since they are neither slowdowns nor
     speedups. N/A rows (ratio is None) are excluded for the same reason.
