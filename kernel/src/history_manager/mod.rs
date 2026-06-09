@@ -672,11 +672,11 @@ fn get_earliest_published_commit_version(
         })
 }
 
-/// Returns the earliest table version that can be fully reconstructed from the log at
-/// `log_root`. This is either commit version 0 (if `00...00.json` exists), or the version
-/// of the earliest complete checkpoint. The returned version is not guaranteed to exist by the
-/// time the caller acts on it: a concurrent log-cleanup operation may delete the file.
-/// This method assumes that the commits are contiguous.
+/// Returns the earliest table version that can be fully reconstructed, and from which we can replay
+/// forward in time to the current version `log_root`. This is either commit version 0 (if
+/// `00...00.json` exists), or the version of the earliest complete checkpoint. The returned version
+/// is not guaranteed to exist by the time the caller acts on it: a concurrent log-cleanup operation
+/// may delete the file. This method assumes that the commits are contiguous.
 ///
 /// # Parameters
 /// - `engine`: kernel engine used to list `log_root`.
@@ -705,7 +705,7 @@ fn get_earliest_recreatable_commit(
     // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
     // checkpoint completeness.
     let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
-    let mut smallest_commit_version = Version::MAX;
+    let mut earliest_commit_version = Version::MAX;
 
     let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
@@ -715,13 +715,13 @@ fn get_earliest_recreatable_commit(
                 if parsed_log_path.version == 0 {
                     return Ok(0);
                 }
-                smallest_commit_version = smallest_commit_version.min(parsed_log_path.version);
+                earliest_commit_version = earliest_commit_version.min(parsed_log_path.version);
 
                 if let Some(checkpoint_version) = last_complete_checkpoint {
-                    if checkpoint_version + 1 >= smallest_commit_version {
+                    if checkpoint_version >= earliest_commit_version {
                         // Given the contiguity assumption of delta_log commits,
                         // when a full checkpoint has contiguous commits starting before or at
-                        // (checkpoint_version + 1) that table can be
+                        // checkpoint_version that table can be
                         // recreated at checkpoint_version.
                         return Ok(checkpoint_version);
                     }
@@ -749,24 +749,26 @@ fn get_earliest_recreatable_commit(
         }
     }
 
-    let saw_any_commit = smallest_commit_version != Version::MAX;
-    match last_complete_checkpoint {
-        Some(checkpoint_version)
-            if saw_any_commit && checkpoint_version >= smallest_commit_version =>
-        {
-            Ok(checkpoint_version)
-        }
-        _ if saw_any_commit => Err(DeltaError::from(LogHistoryError::NoRecreatableCommit {
+    // Files are listed in ascending lexicography order, so any recreatable version, e.g commit 0,
+    // or a complete checkpoint immediately followed by its contiguous commit, is detected and
+    // returned inside the loop above. Reaching here therefore means no such version exists,
+    // which is always an error.
+    if earliest_commit_version != Version::MAX {
+        // Commits exist, but none is anchored by commit 0 or a complete checkpoint.
+        return Err(DeltaError::from(LogHistoryError::NoRecreatableCommit {
             log_root: log_root.clone(),
-        })),
-        _ if earliest_ratified_commit_version == Some(0) => Err(DeltaError::generic(format!(
-            "expected a published v0 commit for catalog-managed table {log_root}, \
-                                    but the log listing returned no commits"
-        ))),
-        _ => Err(DeltaError::from(LogHistoryError::NoCommitsFound {
-            log_root: log_root.clone(),
-        })),
+        }));
     }
+    if earliest_ratified_commit_version == Some(0) {
+        // Broken CCv2 invariant: the catalog ratified commit 0, but no published commit exists.
+        return Err(DeltaError::generic(format!(
+            "expected a published v0 commit for catalog-managed table {log_root}, \
+             but the log listing returned no commits"
+        )));
+    }
+    Err(DeltaError::from(LogHistoryError::NoCommitsFound {
+        log_root: log_root.clone(),
+    }))
 }
 
 #[cfg(test)]
@@ -1830,10 +1832,10 @@ mod tests {
         None,
         Expected::Version(0),
     )]
-    #[case::checkpoint_before_smallest_commit_anchors(
+    #[case::checkpoint_at_smallest_commit_anchors(
         {
             let mut p = vec![single_part_checkpoint_path(5)];
-            p.extend(commit_path(6..=8));
+            p.extend(commit_path(5..=8));
             p
         },
         None,
