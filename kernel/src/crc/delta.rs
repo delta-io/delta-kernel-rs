@@ -243,13 +243,23 @@ mod tests {
         HashMap::from([dm_entry("keep", "old"), dm_entry("drop", "x")])
     }
 
-    fn write_delta(net_files: i64, net_bytes: i64) -> CrcDelta {
+    fn add_files_delta(add_files: u64, add_bytes: u64) -> CrcDelta {
         CrcDelta {
             file_stats: FileStatsDelta {
-                gross_add_files: net_files.max(0) as u64,
-                gross_remove_files: (-net_files).max(0) as u64,
-                gross_add_bytes: net_bytes.max(0) as u64,
-                gross_remove_bytes: (-net_bytes).max(0) as u64,
+                gross_add_files: add_files,
+                gross_add_bytes: add_bytes,
+                ..Default::default()
+            },
+            is_incremental_safe: true,
+            ..Default::default()
+        }
+    }
+
+    fn remove_files_delta(remove_files: u64, remove_bytes: u64) -> CrcDelta {
+        CrcDelta {
+            file_stats: FileStatsDelta {
+                gross_remove_files: remove_files,
+                gross_remove_bytes: remove_bytes,
                 ..Default::default()
             },
             is_incremental_safe: true,
@@ -301,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_apply_updates_file_stats() {
-        let crc = base_crc().apply(write_delta(3, 600), 1);
+        let crc = base_crc().apply(add_files_delta(3, 600), 1);
         let stats = crc.file_stats().unwrap();
         assert_eq!(stats.num_files(), 13); // 10 + 3
         assert_eq!(stats.table_size_bytes(), 1600); // 1000 + 600
@@ -313,8 +323,8 @@ mod tests {
     #[test]
     fn test_apply_multiple_deltas() {
         let crc = base_crc()
-            .apply(write_delta(3, 600), 1)
-            .apply(write_delta(-2, -400), 2);
+            .apply(add_files_delta(3, 600), 1)
+            .apply(remove_files_delta(2, 400), 2);
         let stats = crc.file_stats().unwrap();
         assert_eq!(stats.num_files(), 11); // 10 + 3 - 2
         assert_eq!(stats.table_size_bytes(), 1200); // 1000 + 600 - 400
@@ -326,7 +336,7 @@ mod tests {
     fn test_apply_not_incremental_safe_transitions_to_indeterminate() {
         let unsafe_change = CrcDelta {
             is_incremental_safe: false,
-            ..write_delta(1, 100)
+            ..add_files_delta(1, 100)
         };
         let crc = base_crc().apply(unsafe_change, 1);
         assert!(crc.file_stats_state.is_indeterminate());
@@ -336,13 +346,13 @@ mod tests {
     fn test_indeterminate_stays_indeterminate() {
         let unsafe_change = CrcDelta {
             is_incremental_safe: false,
-            ..write_delta(1, 100)
+            ..add_files_delta(1, 100)
         };
         let crc = base_crc().apply(unsafe_change, 1);
         assert!(crc.file_stats_state.is_indeterminate());
 
         // Subsequent safe op doesn't recover the state. Version still advances.
-        let crc = crc.apply(write_delta(5, 500), 2);
+        let crc = crc.apply(add_files_delta(5, 500), 2);
         assert!(crc.file_stats_state.is_indeterminate());
         assert_eq!(crc.version, 2);
     }
@@ -360,7 +370,7 @@ mod tests {
         .unwrap();
         let delta = CrcDelta {
             protocol: Some(new_protocol.clone()),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = base_crc().apply(delta, 1);
         assert_eq!(crc.protocol, new_protocol);
@@ -381,7 +391,7 @@ mod tests {
                 dm_entry("add", "y"),
                 dm_remove_entry("drop", "x"),
             ]),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = Crc {
             domain_metadata_state: base,
@@ -405,7 +415,7 @@ mod tests {
     fn test_apply_replaces_in_commit_timestamp() {
         let delta = CrcDelta {
             in_commit_timestamp: Some(9999),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = base_crc().apply(delta, 1);
         assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
@@ -415,7 +425,7 @@ mod tests {
     fn test_apply_clears_in_commit_timestamp_when_delta_is_none() {
         let delta = CrcDelta {
             in_commit_timestamp: None,
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = Crc {
             in_commit_timestamp_opt: Some(1000),
@@ -444,7 +454,7 @@ mod tests {
         let delta = CrcDelta {
             protocol: Some(protocol.clone()),
             metadata: Some(metadata.clone()),
-            ..write_delta(5, 1000)
+            ..add_files_delta(5, 1000)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         let stats = crc.file_stats().unwrap();
@@ -469,7 +479,7 @@ mod tests {
     fn test_into_crc_for_version_zero_returns_none_without_protocol() {
         let delta = CrcDelta {
             metadata: Some(Metadata::default()),
-            ..write_delta(5, 1000)
+            ..add_files_delta(5, 1000)
         };
         assert!(delta.into_crc_for_version_zero().is_none());
     }
@@ -478,7 +488,7 @@ mod tests {
     fn test_into_crc_for_version_zero_returns_none_without_metadata() {
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
-            ..write_delta(5, 1000)
+            ..add_files_delta(5, 1000)
         };
         assert!(delta.into_crc_for_version_zero().is_none());
     }
@@ -490,7 +500,7 @@ mod tests {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             domain_metadata: HashMap::from([("my.domain".to_string(), dm)]),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         let map = crc.domain_metadata_state.expect_complete();
@@ -504,7 +514,7 @@ mod tests {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             in_commit_timestamp: Some(12345),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
@@ -529,7 +539,7 @@ mod tests {
                 txn_entry("existing", 2, Some(2000)),
                 txn_entry("new", 1, Some(1500)),
             ]),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = Crc {
             set_transaction_state: base,
@@ -557,7 +567,7 @@ mod tests {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             set_transactions: HashMap::from([("my-app".to_string(), txn)]),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         let map = crc.set_transaction_state.expect_complete();
@@ -681,7 +691,7 @@ mod tests {
     fn apply_drops_histogram_on_indeterminate() {
         let unsafe_delta = CrcDelta {
             is_incremental_safe: false,
-            ..write_delta(1, 100)
+            ..add_files_delta(1, 100)
         };
         let crc = base_crc_with_histogram(&[100, 200]).apply(unsafe_delta, 1);
         // Indeterminate has no histogram field; the histogram data is gone.
@@ -713,12 +723,12 @@ mod tests {
 
     #[test]
     fn into_crc_for_version_zero_without_histogram() {
-        // write_delta() produces a CrcDelta with no histogram delta, so
+        // add_files_delta() produces a CrcDelta with no histogram delta, so
         // into_crc_for_version_zero cannot construct a file size histogram.
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
-            ..write_delta(0, 0)
+            ..add_files_delta(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         let stats = crc.file_stats().unwrap();
