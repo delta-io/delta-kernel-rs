@@ -24,9 +24,9 @@ SIGNIFICANCE_THRESHOLD = 2.0
 
 # Emoji markers for the Change cell, by side and severity.
 SIGNIFICANT_SLOWDOWN = '🐌'  # ratio >= SIGNIFICANCE_THRESHOLD
-SLIGHT_SLOWDOWN = '⚠️;'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
-SLIGHT_SPEEDUP = '✅'        # 1.0 / SIGNIFICANCE_THRESHOLD < ratio < 1.0
-SIGNIFICANT_SPEEDUP = '🚀'   # ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
+SLIGHT_SLOWDOWN = '🚧'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
+SLIGHT_SPEEDUP = '✅'  # 1.0 / SIGNIFICANCE_THRESHOLD < ratio < 1.0
+SIGNIFICANT_SPEEDUP = '🚀'  # ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
 
 def to_ms(value, units):
     """Convert a critcmp duration to milliseconds.
@@ -53,20 +53,6 @@ def parse_duration(s):
         return None
     return float(m.group(1)), float(m.group(2)), m.group(3).strip()
 
-def sanitize_name(raw):
-    """Escape a benchmark name so it renders cleanly inside a markdown table cell.
-
-    Strips backticks (which would terminate the code span), then escapes pipes
-    (which would otherwise terminate the table cell). Returns the bare string. The
-    caller wraps in backticks where appropriate.
-
-    Rendering hygiene only, not a security boundary: the entire comment body is
-    produced by the untrusted bench run and posted verbatim (see
-    .github/SECURITY_MODEL.md), so escaping here cannot -- and does not need to --
-    prevent markdown injection.
-    """
-    return raw.replace('`', '').replace('|', r'\|')
-
 def parse_rows(lines):
     """Parse critcmp stdout into a list of row dicts.
 
@@ -87,8 +73,7 @@ def parse_rows(lines):
         # Locate duration fields by the presence of "±" rather than hardcoding indices,
         # so the script works correctly regardless of whether bandwidth columns are present.
         fields = re.split(r'  +', line)
-        raw_name = fields[0].strip() if fields else ''
-        name = sanitize_name(raw_name)
+        name = fields[0].strip() if fields else ''
         dur_fields = [f.strip() for f in fields[1:] if '±' in f]
         base_dur_str = dur_fields[0] if len(dur_fields) > 0 else None
         chg_dur_str  = dur_fields[1] if len(dur_fields) > 1 else None
@@ -145,7 +130,7 @@ def change_emoji(ratio, significant):
     See the module-level emoji constants for the marker assignments. Returns
     an empty string for ratios near 1.0 or N/A rows.
     """
-    if ratio is None or abs(ratio - 1.0) < 1.0e-1:
+    if ratio is None or abs(ratio - 1.0) < 1e-9:
         return ''
     if ratio > 1.0:
         return SIGNIFICANT_SLOWDOWN if significant else SLIGHT_SLOWDOWN
@@ -192,9 +177,9 @@ def render_table(rows):
     out.append(f"<summary>Per-benchmark results ({len(rows)} rows)</summary>")
     out.append("")
     out.append(
-        f"**Legend:** {SIGNIFICANT_SLOWDOWN} ≥ 2x slower &nbsp;·&nbsp; "
-        f"{SLIGHT_SLOWDOWN} < 2x slower &nbsp;·&nbsp; "
-        f"{SLIGHT_SPEEDUP} < 2x faster &nbsp;·&nbsp; "
+        f"**Legend:** {SIGNIFICANT_SLOWDOWN} ≥ 2x slower &nbsp;·&nbsp;"
+        f"{SLIGHT_SLOWDOWN} < 2x slower &nbsp;·&nbsp;"
+        f"{SLIGHT_SPEEDUP} < 2x faster &nbsp;·&nbsp;"
         f"{SIGNIFICANT_SPEEDUP} ≥ 2x faster"
     )
     out.append("")
@@ -204,7 +189,9 @@ def render_table(rows):
         name_cell = f"`{r['name']}`" if r['name'] else ''
         difference = format_difference(r['ratio'])
         emoji = change_emoji(r['ratio'], r['significant'])
-        change_cell = f"{emoji} {difference}".lstrip()
+        # Non-breaking spaces keep the marker and ratio on one line so the
+        # Change cell renders without wrapping.
+        change_cell = f"{emoji} {difference}".strip().replace(" ", "&nbsp;")
         out.append(f"| {name_cell} | {r['base_display']} | {r['chg_display']} | {change_cell} |")
     out.append("")
     out.append("</details>")
