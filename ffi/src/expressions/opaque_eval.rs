@@ -16,8 +16,8 @@
 
 use std::ffi::c_void;
 
-use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
-use crate::KernelStringSlice;
+use crate::engine_data::ArrowFFIData;
+use crate::{KernelStringSlice, OptionalValue};
 
 /// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
@@ -28,8 +28,8 @@ use crate::KernelStringSlice;
 /// `BooleanArray`. The engine returns one bool per row.
 ///
 /// The result uses the out-pointer convention: kernel pre-initializes `*out` to
-/// `OptionalArrowFFIData::None`; on success the engine overwrites it with
-/// `OptionalArrowFFIData::Some` holding the result `BooleanArray` as Arrow C Data Interface
+/// `OptionalValue::None`; on success the engine overwrites it with
+/// `OptionalValue::Some` holding the result `BooleanArray` as Arrow C Data Interface
 /// structs, transferring their ownership to kernel. Leaving `*out` untouched (`None`) signals a
 /// (non-fatal) failure; in that case the engine may also leave `args_in` unconsumed -- kernel
 /// releases whatever the engine did not import. When `inverted`, evaluate `NOT op`.
@@ -42,7 +42,7 @@ pub type EngineEvalRowsFn = unsafe extern "C" fn(
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
     inverted: bool,
-    out: *mut OptionalArrowFFIData,
+    out: *mut OptionalValue<ArrowFFIData>,
 );
 
 /// Engine callback for **stats-based** evaluation of an opaque predicate, for file data skipping.
@@ -65,7 +65,7 @@ pub type EngineEvalStatsFn = unsafe extern "C" fn(
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
     inverted: bool,
-    out: *mut OptionalArrowFFIData,
+    out: *mut OptionalValue<ArrowFFIData>,
 );
 
 /// Destructor for the engine's state pointer.
@@ -144,7 +144,7 @@ pub(crate) mod tests {
         _op_name: KernelStringSlice,
         _args_in: *mut ArrowFFIData,
         _inverted: bool,
-        _out: *mut OptionalArrowFFIData,
+        _out: *mut OptionalValue<ArrowFFIData>,
     ) {
     }
 

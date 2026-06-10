@@ -1142,7 +1142,8 @@ mod tests {
         use std::ffi::c_void;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
+        use crate::engine_data::ArrowFFIData;
+        use crate::OptionalValue;
 
         static FREED: AtomicUsize = AtomicUsize::new(0);
 
@@ -1151,7 +1152,7 @@ mod tests {
             _: KernelStringSlice,
             _: *mut ArrowFFIData,
             _: bool,
-            _: *mut OptionalArrowFFIData,
+            _: *mut OptionalValue<ArrowFFIData>,
         ) {
         }
         unsafe extern "C" fn counting_free(_: *mut c_void) {
@@ -1240,7 +1241,8 @@ mod tests {
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 
-        use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
+        use crate::engine_data::ArrowFFIData;
+        use crate::OptionalValue;
 
         static CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1251,7 +1253,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalArrowFFIData,
+            out: *mut OptionalValue<ArrowFFIData>,
         ) {
             CALLS.fetch_add(1, Ordering::SeqCst);
 
@@ -1299,7 +1301,7 @@ mod tests {
                 array: FFI_ArrowArray::new(&array_data),
                 schema: FFI_ArrowSchema::try_from(array_data.data_type()).unwrap(),
             };
-            unsafe { *out = OptionalArrowFFIData::Some(ffi) };
+            unsafe { *out = OptionalValue::Some(ffi) };
         }
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 

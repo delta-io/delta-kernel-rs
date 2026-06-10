@@ -92,23 +92,6 @@ impl ArrowFFIData {
     }
 }
 
-/// FFI-safe `Option<ArrowFFIData>`, the out-slot type for upcalls that return Arrow data (see
-/// e.g. [`EngineEvalRowsFn`]). Layout matches the generic [`OptionalValue`]: C-int tag (`0` =
-/// Some, `1` = None) followed by the payload. Declared as a standalone monomorphic type so its C
-/// declaration carries the `default-engine-base` feature guard -- cbindgen emits generic
-/// monomorphizations unguarded, which would reference the guarded [`ArrowFFIData`] by value and
-/// break header compilation without the feature define.
-///
-/// [`OptionalValue`]: crate::OptionalValue
-/// [`EngineEvalRowsFn`]: crate::expressions::opaque_eval::EngineEvalRowsFn
-/// cbindgen:prefix-with-name
-#[cfg(feature = "default-engine-base")]
-#[repr(C)]
-pub enum OptionalArrowFFIData {
-    Some(ArrowFFIData),
-    None,
-}
-
 // TODO: This should use a callback to avoid having to have the engine free the struct
 /// Get an [`ArrowFFIData`] to allow binding to the arrow [C Data
 /// Interface](https://arrow.apache.org/docs/format/CDataInterface.html). This includes the data and

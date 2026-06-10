@@ -30,8 +30,8 @@ use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
 use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
-use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
-use crate::kernel_string_slice;
+use crate::engine_data::ArrowFFIData;
+use crate::{kernel_string_slice, OptionalValue};
 
 // === FfiOpaquePredicateOp ===================================================
 
@@ -282,7 +282,7 @@ fn call_eval_pred(
     // Out-pointer convention: kernel owns the result slot on its stack, pre-initialized to None;
     // the engine overwrites it with Some(result) on success, transferring ownership of the written
     // Arrow C Data Interface structs to kernel.
-    let mut result = OptionalArrowFFIData::None;
+    let mut result = OptionalValue::None;
 
     // SAFETY: callback was supplied by the engine. We pass a writable args slot (the engine takes
     // ownership of the Arrow FFI handles by moving them out of it) and a writable result slot
@@ -295,7 +295,7 @@ fn call_eval_pred(
         };
         eval(cb.engine_state, name, &mut args_ffi, inverted, &mut result);
     }
-    let OptionalArrowFFIData::Some(mut result_ffi) = result else {
+    let OptionalValue::Some(mut result_ffi) = result else {
         return Err(Error::Generic(format!(
             "engine opaque-eval callback reported failure for `{op_name}`"
         )));
@@ -437,13 +437,13 @@ mod tests {
 
     /// Write an `ArrayRef` into kernel's result slot as Arrow C Data Interface structs, the way a
     /// real engine returns its result from `eval_pred` (out-pointer convention).
-    unsafe fn write_result(out: *mut OptionalArrowFFIData, arr: ArrayRef) {
+    unsafe fn write_result(out: *mut OptionalValue<ArrowFFIData>, arr: ArrayRef) {
         let array_data = arr.to_data();
         let ffi = ArrowFFIData {
             array: FFI_ArrowArray::new(&array_data),
             schema: FFI_ArrowSchema::try_from(array_data.data_type()).unwrap(),
         };
-        unsafe { *out = OptionalArrowFFIData::Some(ffi) };
+        unsafe { *out = OptionalValue::Some(ffi) };
     }
 
     /// Composite opaque predicate: `STARTS_WITH(LOWER(args[0]), args[1])`. Both
@@ -454,7 +454,7 @@ mod tests {
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
         inverted: bool,
-        out: *mut OptionalArrowFFIData,
+        out: *mut OptionalValue<ArrowFFIData>,
     ) {
         let batch = unsafe { take_ffi_record_batch(args_in) };
         assert_eq!(batch.num_columns(), 2);
@@ -488,7 +488,7 @@ mod tests {
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
         inverted: bool,
-        out: *mut OptionalArrowFFIData,
+        out: *mut OptionalValue<ArrowFFIData>,
     ) {
         let batch = unsafe { take_ffi_record_batch(args_in) };
         let lhs = batch
@@ -625,7 +625,7 @@ mod tests {
             _op_name: KernelStringSlice,
             _args_in: *mut ArrowFFIData,
             _inverted: bool,
-            _out: *mut OptionalArrowFFIData,
+            _out: *mut OptionalValue<ArrowFFIData>,
         ) {
             // Leave *out untouched (kernel pre-initialized it to None) to signal failure.
         }
@@ -645,7 +645,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalArrowFFIData,
+            out: *mut OptionalValue<ArrowFFIData>,
         ) {
             let _ = unsafe { take_ffi_record_batch(args_in) };
             let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
@@ -667,11 +667,11 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalArrowFFIData,
+            out: *mut OptionalValue<ArrowFFIData>,
         ) {
             // Consume args but hand back an empty (unpopulated) result.
             let _ = unsafe { take_ffi_record_batch(args_in) };
-            unsafe { *out = OptionalArrowFFIData::Some(ArrowFFIData::empty()) };
+            unsafe { *out = OptionalValue::Some(ArrowFFIData::empty()) };
         }
         let pred = Predicate::arrow_opaque(
             FfiOpaquePredicateOp::new("EMPTY", callbacks_for(engine_empty)),
@@ -691,7 +691,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalArrowFFIData,
+            out: *mut OptionalValue<ArrowFFIData>,
         ) {
             let batch = unsafe { take_ffi_record_batch(args_in) };
             assert_eq!(batch.num_columns(), 0, "zero-arg => no columns");
@@ -722,7 +722,7 @@ mod tests {
             _: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _: bool,
-            out: *mut OptionalArrowFFIData,
+            out: *mut OptionalValue<ArrowFFIData>,
         ) {
             ROWS.fetch_add(1, AtomicOrdering::SeqCst);
             let batch = unsafe { take_ffi_record_batch(args_in) };
@@ -738,7 +738,7 @@ mod tests {
             _: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _: bool,
-            out: *mut OptionalArrowFFIData,
+            out: *mut OptionalValue<ArrowFFIData>,
         ) {
             STATS.fetch_add(1, AtomicOrdering::SeqCst);
             let batch = unsafe { take_ffi_record_batch(args_in) };
@@ -1003,7 +1003,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 inverted: bool,
-                out: *mut OptionalArrowFFIData,
+                out: *mut OptionalValue<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let stats = batch
@@ -1208,7 +1208,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalArrowFFIData,
+                out: *mut OptionalValue<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 CALL_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1245,7 +1245,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalArrowFFIData,
+                out: *mut OptionalValue<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let col = batch
@@ -1298,7 +1298,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalArrowFFIData,
+                out: *mut OptionalValue<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let stats = batch
@@ -1378,7 +1378,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalArrowFFIData,
+                out: *mut OptionalValue<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 CALLS.fetch_add(1, AtomicOrdering::SeqCst);
