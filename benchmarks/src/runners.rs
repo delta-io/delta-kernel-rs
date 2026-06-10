@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, StatsOptions};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
@@ -234,13 +234,7 @@ impl ReadMetadataRunner {
             .transpose()?
             .map(Arc::new);
 
-        let name = format!(
-            "{}/{}/{}/{}",
-            table_info.name,
-            case_name,
-            ReadOperation::ReadMetadata.as_str(),
-            config.name,
-        );
+        let name = format!("{}/{}/{}", table_info.name, case_name, config.name,);
 
         let thread_pool = match &config.parallel_scan {
             ParallelScan::Enabled { num_threads } => {
@@ -271,6 +265,7 @@ impl ReadMetadataRunner {
             .clone()
             .scan_builder()
             .with_predicate(self.predicate.clone())
+            .with_stats(StatsOptions::all_struct())
             .build()?;
         let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
         for result in metadata_iter {
@@ -290,6 +285,7 @@ impl ReadMetadataRunner {
             .clone()
             .scan_builder()
             .with_predicate(self.predicate.clone())
+            .with_stats(StatsOptions::all_struct())
             .build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
@@ -380,12 +376,7 @@ impl SnapshotConstructionRunner {
         snapshot_spec: &SnapshotConstructionSpec,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let name = format!(
-            "{}/{}/{}",
-            table_info.name,
-            case_name,
-            snapshot_spec.as_str()
-        );
+        let name = format!("{}/{}", table_info.name, case_name,);
 
         let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
 
@@ -497,10 +488,7 @@ mod tests {
             test_runtime(),
         )
         .expect("setup should succeed");
-        assert_eq!(
-            runner.name(),
-            "basic_partitioned/testCase/readMetadata/serial"
-        );
+        assert_eq!(runner.name(), "basic_partitioned/testCase/serial");
         assert!(runner.execute().is_ok());
     }
 
@@ -514,10 +502,7 @@ mod tests {
             test_runtime(),
         )
         .expect("setup should succeed");
-        assert_eq!(
-            runner.name(),
-            "basic_partitioned/testCase/readMetadata/parallel2"
-        );
+        assert_eq!(runner.name(), "basic_partitioned/testCase/parallel2");
         assert!(runner.execute().is_ok());
     }
 
@@ -548,10 +533,7 @@ mod tests {
             test_runtime(),
         )
         .expect("setup should succeed");
-        assert_eq!(
-            runner.name(),
-            "basic_partitioned/testCase/snapshotConstruction"
-        );
+        assert_eq!(runner.name(), "basic_partitioned/testCase");
     }
 
     #[test]
