@@ -144,15 +144,6 @@ pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
     let _ = unsafe { Box::from_raw(result) };
 }
 
-/// Allocate an empty [`ArrowFFIData`] for the engine to populate and return to kernel. Engines MUST
-/// use this (not their own allocator) so kernel can reclaim it; free with [`free_arrow_ffi_data`]
-/// if not returned.
-#[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub extern "C" fn arrow_ffi_data_new() -> *mut ArrowFFIData {
-    Box::into_raw(Box::new(ArrowFFIData::empty()))
-}
-
 /// Creates engine data from Arrow C Data Interface array and schema.
 ///
 /// Converts the provided Arrow C Data Interface array and schema into delta-kernel's internal
@@ -214,13 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn arrow_ffi_data_new_allocates_empty_and_frees() {
-        let ptr = arrow_ffi_data_new();
-        assert!(!ptr.is_null());
-        // Empty arrays carry no release callback -- the invariant `import_ffi_array` relies on.
-        assert!(unsafe { (*ptr).array.is_released() });
-        // The "free if not handed back to kernel" path must not leak or double-free.
-        unsafe { free_arrow_ffi_data(ptr) };
+    fn empty_arrow_ffi_data_carries_no_release_callback() {
+        // The invariant `import_ffi_array` relies on to detect an unpopulated result slot.
+        assert!(ArrowFFIData::empty().array.is_released());
     }
 
     #[test]

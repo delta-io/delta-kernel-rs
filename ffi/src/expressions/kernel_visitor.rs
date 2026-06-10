@@ -12,7 +12,7 @@ use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
 
 #[cfg(feature = "default-engine-base")]
-use crate::expressions::opaque_eval::SharedOpaqueEvalContext;
+use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
 use crate::expressions::{SharedExpression, SharedPredicate};
@@ -762,24 +762,29 @@ fn visit_predicate_opaque_impl(
 /// single `RecordBatch` over Arrow C Data Interface, and invokes the engine's
 /// eval callback. Engine never walks the AST.
 ///
+/// `callbacks` is passed by value; ownership of its `engine_state` transfers to
+/// kernel, which invokes `free_state` exactly once -- even when this call fails
+/// or returns 0. Engines attaching the same logical state to multiple opaque
+/// ops must pass independently freeable state per call.
+///
 /// Returns 0 if any child ID is invalid.
 ///
 /// # Safety
-/// `name` must be valid UTF-8 for the duration of the call; `ctx` must be
-/// a valid handle from [`create_opaque_eval_context`].
-///
-/// [`create_opaque_eval_context`]: crate::expressions::opaque_eval::create_opaque_eval_context
+/// `name` must be valid UTF-8 for the duration of the call; the function
+/// pointers in `callbacks` must remain valid for the lifetime of the built
+/// predicate.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     state: &mut KernelExpressionVisitorState,
     name: KernelStringSlice,
     children: &mut EngineIterator,
-    ctx: Handle<SharedOpaqueEvalContext>,
+    callbacks: COpaqueEvalCallbacks,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name = unsafe { String::try_from_slice(&name) };
-    let callbacks = unsafe { ctx.clone_as_arc() };
+    // Wrap immediately so free_state fires exactly once on every exit path.
+    let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
     visit_predicate_opaque_with_eval_impl(state, name, children, callbacks)
         .into_extern_result(&allocate_error)
 }
@@ -789,7 +794,7 @@ fn visit_predicate_opaque_with_eval_impl(
     state: &mut KernelExpressionVisitorState,
     name: DeltaResult<String>,
     children: &mut EngineIterator,
-    callbacks: Arc<crate::expressions::opaque_eval::COpaqueEvalCallbacks>,
+    callbacks: Arc<FfiOpaqueEvalCallbacks>,
 ) -> DeltaResult<usize> {
     let name = name?;
     let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
@@ -1127,9 +1132,10 @@ mod tests {
         assert_eq!(pred, Predicate::null_literal());
     }
 
-    /// Drives `visit_predicate_opaque_with_eval` end to end: create an eval context, build the
-    /// predicate through the FFI symbol, then verify the engine's `free_state` fires exactly once
-    /// when the last reference (held by the predicate) drops.
+    /// Drives `visit_predicate_opaque_with_eval` end to end: pass the callbacks struct by value,
+    /// build the predicate through the FFI symbol, then verify the engine's `free_state` fires
+    /// exactly once when the predicate drops -- and also fires when the build bails early (invalid
+    /// child), since ownership of `engine_state` transfers with the call.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn visit_predicate_opaque_with_eval_ffi_builds_and_frees() {
@@ -1137,10 +1143,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use crate::engine_data::ArrowFFIData;
-        use crate::expressions::opaque_eval::{
-            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks,
-        };
-        use crate::OptionalValue;
+        use crate::expressions::opaque_eval::OptionalArrowFFIData;
 
         static FREED: AtomicUsize = AtomicUsize::new(0);
 
@@ -1149,53 +1152,66 @@ mod tests {
             _: KernelStringSlice,
             _: *mut ArrowFFIData,
             _: bool,
-        ) -> OptionalValue<*mut ArrowFFIData> {
-            OptionalValue::None
+            _: *mut OptionalArrowFFIData,
+        ) {
         }
         unsafe extern "C" fn counting_free(_: *mut c_void) {
             FREED.fetch_add(1, Ordering::SeqCst);
         }
-
-        FREED.store(0, Ordering::SeqCst);
-        let ctx = unsafe {
-            create_opaque_eval_context(COpaqueEvalCallbacks {
+        fn callbacks() -> COpaqueEvalCallbacks {
+            COpaqueEvalCallbacks {
                 engine_state: std::ptr::null_mut(),
                 eval_pred_rows: stub_eval,
                 eval_pred_stats: stub_eval,
                 free_state: counting_free,
-            })
-        };
+            }
+        }
 
+        FREED.store(0, Ordering::SeqCst);
         let mut state = KernelExpressionVisitorState::default();
         let (a, b) = make_two_literal_ids(&mut state);
         let (_keep, mut it) = make_iter(vec![a, b]);
         let name = "MY_EVAL_OP";
-        // shallow_copy lends the handle to the FFI call (which clones the inner Arc) while we keep
-        // ownership of the original to free below.
         let result = unsafe {
             visit_predicate_opaque_with_eval(
                 &mut state,
                 kernel_string_slice!(name),
                 &mut it,
-                ctx.shallow_copy(),
+                callbacks(),
                 allocate_err,
             )
         };
         let id = ok_or_panic(result);
         assert_ne!(id, 0);
-
-        // Releasing our handle drops one Arc ref; the predicate still holds the other.
-        unsafe { free_opaque_eval_context(ctx) };
         assert_eq!(
             FREED.load(Ordering::SeqCst),
             0,
-            "predicate still holds a ref"
+            "predicate still holds the callbacks"
         );
 
         // Dropping the predicate drops the last ref, firing the engine's free_state exactly once.
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
         drop(pred);
         assert_eq!(FREED.load(Ordering::SeqCst), 1, "free_state must fire once");
+
+        // Bail-early path: an invalid child returns id 0, but ownership already transferred, so
+        // free_state still fires.
+        let (_keep, mut bad_it) = make_iter(vec![9999usize]);
+        let id = ok_or_panic(unsafe {
+            visit_predicate_opaque_with_eval(
+                &mut state,
+                kernel_string_slice!(name),
+                &mut bad_it,
+                callbacks(),
+                allocate_err,
+            )
+        });
+        assert_eq!(id, 0);
+        assert_eq!(
+            FREED.load(Ordering::SeqCst),
+            2,
+            "free_state must fire on the bail-early path too"
+        );
     }
 
     /// End to end: build an opaque `IN_RANGE(id, 25)` predicate through the
@@ -1226,10 +1242,7 @@ mod tests {
         use test_utils::add_commit;
 
         use crate::engine_data::ArrowFFIData;
-        use crate::expressions::opaque_eval::{
-            create_opaque_eval_context, free_opaque_eval_context, COpaqueEvalCallbacks,
-        };
-        use crate::OptionalValue;
+        use crate::expressions::opaque_eval::OptionalArrowFFIData;
 
         static CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1240,7 +1253,8 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-        ) -> OptionalValue<*mut ArrowFFIData> {
+            out: *mut OptionalArrowFFIData,
+        ) {
             CALLS.fetch_add(1, Ordering::SeqCst);
 
             let array =
@@ -1283,12 +1297,11 @@ mod tests {
 
             let arr: ArrayRef = Arc::new(keep);
             let array_data = arr.to_data();
-            let ptr = crate::engine_data::arrow_ffi_data_new();
-            unsafe {
-                (*ptr).array = FFI_ArrowArray::new(&array_data);
-                (*ptr).schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
-            }
-            OptionalValue::Some(ptr)
+            let ffi = ArrowFFIData {
+                array: FFI_ArrowArray::new(&array_data),
+                schema: FFI_ArrowSchema::try_from(array_data.data_type()).unwrap(),
+            };
+            unsafe { *out = OptionalArrowFFIData::Some(ffi) };
         }
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 
@@ -1297,26 +1310,21 @@ mod tests {
         let col_id = wrap_expression(&mut state, Expression::column(["id"]));
         let target = wrap_expression(&mut state, Expression::literal(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
-        let ctx = unsafe {
-            create_opaque_eval_context(COpaqueEvalCallbacks {
-                engine_state: std::ptr::null_mut(),
-                eval_pred_rows: engine_in_range,
-                eval_pred_stats: engine_in_range,
-                free_state: noop_free,
-            })
-        };
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {
             visit_predicate_opaque_with_eval(
                 &mut state,
                 kernel_string_slice!(name),
                 &mut it,
-                ctx.shallow_copy(),
+                COpaqueEvalCallbacks {
+                    engine_state: std::ptr::null_mut(),
+                    eval_pred_rows: engine_in_range,
+                    eval_pred_stats: engine_in_range,
+                    free_state: noop_free,
+                },
                 allocate_err,
             )
         });
-        // The built predicate holds its own Arc ref, so we can release our handle now.
-        unsafe { free_opaque_eval_context(ctx) };
         let predicate = Arc::new(unwrap_kernel_predicate(&mut state, id).unwrap());
 
         // 3-file table: A=[0,10], B=[20,30], C=[100,110]. Only B covers 25.

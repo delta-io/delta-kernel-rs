@@ -1,6 +1,6 @@
 //! Engine callback framework for opaque-predicate evaluation.
 //!
-//! Engines register a [`COpaqueEvalCallbacks`] struct, then attach it to an opaque predicate via
+//! Engines pass a [`COpaqueEvalCallbacks`] struct by value to
 //! [`crate::expressions::kernel_visitor::visit_predicate_opaque_with_eval`]. Kernel does all
 //! recursive evaluation natively through its standard `evaluate_expression` / `evaluate_predicate`
 //! paths; the engine is called only for the opaque-predicate node itself, and receives args as
@@ -15,14 +15,23 @@
 //! `evaluate_expression` on each to produce ArrayRefs, then combines them with op-specific logic.
 
 use std::ffi::c_void;
-#[cfg(test)]
-use std::sync::Arc;
-
-use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::engine_data::ArrowFFIData;
-use crate::handle::Handle;
-use crate::{KernelStringSlice, OptionalValue};
+use crate::KernelStringSlice;
+
+/// FFI-safe `Option<ArrowFFIData>`, the out-slot type for opaque-eval results. Layout matches the
+/// generic [`OptionalValue`]: C-int tag (`0` = Some, `1` = None) followed by the payload. Declared
+/// as a standalone monomorphic type so its C declaration carries this module's feature guard --
+/// cbindgen emits generic monomorphizations unguarded, which would reference the guarded
+/// `ArrowFFIData` by value and break header compilation without the feature define.
+///
+/// [`OptionalValue`]: crate::OptionalValue
+/// cbindgen:prefix-with-name
+#[repr(C)]
+pub enum OptionalArrowFFIData {
+    Some(ArrowFFIData),
+    None,
+}
 
 /// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
@@ -32,19 +41,23 @@ use crate::{KernelStringSlice, OptionalValue};
 /// `Column` arg holds its values, a `Literal` the constant repeated per row, a `Predicate` a
 /// `BooleanArray`. The engine returns one bool per row.
 ///
-/// On success return `OptionalValue::Some(ptr)` holding the result `BooleanArray`;
-/// `OptionalValue::None` signals a (non-fatal) failure. When `inverted`, evaluate `NOT op`.
+/// The result uses the out-pointer convention: kernel pre-initializes `*out` to
+/// `OptionalArrowFFIData::None`; on success the engine overwrites it with
+/// `OptionalArrowFFIData::Some` holding the result `BooleanArray` as Arrow C Data Interface
+/// structs, transferring their ownership to kernel. Leaving `*out` untouched (`None`) signals a
+/// (non-fatal) failure; in that case the engine may also leave `args_in` unconsumed -- kernel
+/// releases whatever the engine did not import. When `inverted`, evaluate `NOT op`.
 ///
 /// # Safety
-/// `ptr` MUST be allocated via [`arrow_ffi_data_new`](crate::engine_data::arrow_ffi_data_new):
-/// kernel reclaims it with `Box::from_raw`, so a pointer from any other allocator is undefined
-/// behavior. The callback must not panic or unwind across the FFI boundary.
+/// `out` is valid only for the duration of the call; the engine must not retain it. The callback
+/// must not panic or unwind across the FFI boundary.
 pub type EngineEvalRowsFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
     inverted: bool,
-) -> OptionalValue<*mut ArrowFFIData>;
+    out: *mut OptionalArrowFFIData,
+);
 
 /// Engine callback for **stats-based** evaluation of an opaque predicate, for file data skipping.
 ///
@@ -60,20 +73,27 @@ pub type EngineEvalRowsFn = unsafe extern "C" fn(
 /// file -- corrupting Add/Remove reconciliation, not just pruning accuracy. Keep (`true`/`null`)
 /// whenever the stats can't prove the predicate impossible.
 /// When `inverted`, evaluate `NOT op` -- not `!verdict`; if you can't reason soundly about the
-/// negated op, keep every file. Result/allocation/panic contract matches [`EngineEvalRowsFn`].
+/// negated op, keep every file. Result/out-pointer/panic contract matches [`EngineEvalRowsFn`].
 pub type EngineEvalStatsFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
     inverted: bool,
-) -> OptionalValue<*mut ArrowFFIData>;
+    out: *mut OptionalArrowFFIData,
+);
 
 /// Destructor for the engine's state pointer.
 ///
 /// Must not panic or unwind across the FFI boundary.
 pub type EngineFreeStateFn = unsafe extern "C" fn(engine_state: *mut c_void);
 
-/// Bundle of engine callbacks for opaque-predicate evaluation.
+/// Bundle of engine callbacks for opaque-predicate evaluation, passed by value to
+/// [`visit_predicate_opaque_with_eval`]. Ownership of `engine_state` transfers to kernel with the
+/// call: `free_state` is invoked exactly once when the predicate built from it (including any
+/// data-skipping clones kernel derives) is dropped. Engines attaching the same logical state to
+/// multiple opaque ops must pass independently freeable state per call.
+///
+/// [`visit_predicate_opaque_with_eval`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_eval
 #[repr(C)]
 pub struct COpaqueEvalCallbacks {
     /// Opaque engine state; passed back as the first argument to each
@@ -83,16 +103,10 @@ pub struct COpaqueEvalCallbacks {
     pub eval_pred_rows: EngineEvalRowsFn,
     /// Stats-based evaluation for file data skipping: one verdict per file.
     pub eval_pred_stats: EngineEvalStatsFn,
-    /// Destructor for `engine_state`. Called once when the last reference
-    /// to the eval context is dropped; may run on any kernel thread.
+    /// Destructor for `engine_state`. Called exactly once; may run on any
+    /// kernel thread.
     pub free_state: EngineFreeStateFn,
 }
-
-// SAFETY: `engine_state` and the function pointers may be touched from
-// any kernel thread. The struct lives behind `Arc<...>` via
-// `SharedOpaqueEvalContext`, and `SharedHandle` requires `T: Sync`.
-unsafe impl Send for COpaqueEvalCallbacks {}
-unsafe impl Sync for COpaqueEvalCallbacks {}
 
 impl std::fmt::Debug for COpaqueEvalCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,45 +116,38 @@ impl std::fmt::Debug for COpaqueEvalCallbacks {
     }
 }
 
-impl Drop for COpaqueEvalCallbacks {
-    fn drop(&mut self) {
-        // SAFETY: engine_state was provided by the engine alongside the free_state callback; we
-        // promise to call it exactly once when the last Arc reference drops. free_state must not
-        // panic: drop can run while kernel is already unwinding, and unwinding into kernel aborts.
-        unsafe { (self.free_state)(self.engine_state) };
+/// Rust-side adapter owning a [`COpaqueEvalCallbacks`]: invokes the engine's `free_state` exactly
+/// once on drop. Shared across an op and its data-skipping clones via `Arc`.
+#[derive(Debug)]
+pub(crate) struct FfiOpaqueEvalCallbacks {
+    pub(crate) inner: COpaqueEvalCallbacks,
+}
+
+impl FfiOpaqueEvalCallbacks {
+    pub(crate) fn new(callbacks: COpaqueEvalCallbacks) -> Self {
+        Self { inner: callbacks }
     }
 }
 
-#[handle_descriptor(target=COpaqueEvalCallbacks, mutable=false, sized=true)]
-pub struct SharedOpaqueEvalContext;
+// SAFETY: `engine_state` and the function pointers may be touched from any kernel thread. The
+// adapter lives behind `Arc<...>` inside the opaque op, and predicates must be `Send + Sync`.
+unsafe impl Send for FfiOpaqueEvalCallbacks {}
+unsafe impl Sync for FfiOpaqueEvalCallbacks {}
 
-/// Create an opaque-evaluation context. Returns a [`SharedOpaqueEvalContext`] handle the engine
-/// attaches to opaque-predicate builders via `visit_predicate_opaque_with_eval`.
-///
-/// # Safety
-/// All function pointers in `callbacks` must outlive the returned context and any opaque ops built
-/// from it.
-#[no_mangle]
-pub unsafe extern "C" fn create_opaque_eval_context(
-    callbacks: COpaqueEvalCallbacks,
-) -> Handle<SharedOpaqueEvalContext> {
-    std::sync::Arc::new(callbacks).into()
-}
-
-/// Free an opaque-evaluation context obtained from [`create_opaque_eval_context`].
-///
-/// # Safety
-/// `ctx` must be a valid handle obtained from [`create_opaque_eval_context`] and not previously
-/// freed.
-#[no_mangle]
-pub unsafe extern "C" fn free_opaque_eval_context(ctx: Handle<SharedOpaqueEvalContext>) {
-    ctx.drop_handle();
+impl Drop for FfiOpaqueEvalCallbacks {
+    fn drop(&mut self) {
+        // SAFETY: engine_state was handed over by value alongside the free_state callback; we
+        // promise to call it exactly once when the last Arc reference drops. free_state must not
+        // panic: drop can run while kernel is already unwinding, and unwinding into kernel aborts.
+        unsafe { (self.inner.free_state)(self.inner.engine_state) };
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -151,39 +158,36 @@ pub(crate) mod tests {
         _op_name: KernelStringSlice,
         _args_in: *mut ArrowFFIData,
         _inverted: bool,
-    ) -> OptionalValue<*mut ArrowFFIData> {
-        OptionalValue::None
+        _out: *mut OptionalArrowFFIData,
+    ) {
     }
 
     pub(crate) unsafe extern "C" fn counting_free_state(_state: *mut c_void) {
         TEST_FREES.fetch_add(1, Ordering::SeqCst);
     }
 
-    #[test]
-    fn create_then_free_invokes_free_state_once() {
-        TEST_FREES.store(0, Ordering::SeqCst);
-        let cb = COpaqueEvalCallbacks {
+    fn counting_callbacks() -> COpaqueEvalCallbacks {
+        COpaqueEvalCallbacks {
             engine_state: ptr::null_mut(),
             eval_pred_rows: noop_eval_pred,
             eval_pred_stats: noop_eval_pred,
             free_state: counting_free_state,
-        };
-        let ctx = unsafe { create_opaque_eval_context(cb) };
+        }
+    }
+
+    #[test]
+    fn drop_invokes_free_state_once() {
+        TEST_FREES.store(0, Ordering::SeqCst);
+        let wrapper = FfiOpaqueEvalCallbacks::new(counting_callbacks());
         assert_eq!(TEST_FREES.load(Ordering::SeqCst), 0);
-        unsafe { free_opaque_eval_context(ctx) };
+        drop(wrapper);
         assert_eq!(TEST_FREES.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn drop_via_arc_clone_fires_free_only_once() {
         TEST_FREES.store(0, Ordering::SeqCst);
-        let cb = COpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
-            eval_pred_rows: noop_eval_pred,
-            eval_pred_stats: noop_eval_pred,
-            free_state: counting_free_state,
-        };
-        let arc1 = Arc::new(cb);
+        let arc1 = Arc::new(FfiOpaqueEvalCallbacks::new(counting_callbacks()));
         let arc2 = arc1.clone();
         drop(arc1);
         assert_eq!(TEST_FREES.load(Ordering::SeqCst), 0);
