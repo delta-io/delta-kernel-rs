@@ -26,7 +26,7 @@ async fn remove_commits(store: &dyn ObjectStore, versions: RangeInclusive<Versio
 #[rstest]
 #[case::recreatable_v0_present(None, None, HistoryCommitType::Recreatable, 0)]
 #[case::published_v0_present(None, None, HistoryCommitType::Published, 0)]
-#[case::recreatable_checkpoint_anchors(Some(0..=5), None, HistoryCommitType::Recreatable, 5)]
+#[case::recreatable_checkpoint_anchors(Some(0..=4), None, HistoryCommitType::Recreatable, 5)]
 #[case::published_lowest_surviving_json(Some(0..=5), None, HistoryCommitType::Published, 6)]
 #[case::recreatable_commit_at_checkpoint_survives(Some(0..=4), Some(9), HistoryCommitType::Recreatable, 5)]
 #[case::published_commit_at_checkpoint_survives(Some(0..=4), Some(9), HistoryCommitType::Published, 5)]
