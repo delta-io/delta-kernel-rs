@@ -23,9 +23,13 @@ use crate::{KernelStringSlice, OptionalValue};
 ///
 /// Kernel pre-evaluates the predicate's args into a `RecordBatch` (one field per arg) and exports
 /// it across the Arrow C Data Interface; ownership of the inner `FFI_ArrowArray`/`FFI_ArrowSchema`
-/// transfers to the engine, which imports them and invokes their release callbacks. By position: a
-/// `Column` arg holds its values, a `Literal` the constant repeated per row, a `Predicate` a
-/// `BooleanArray`. The engine returns one bool per row.
+/// transfers to the engine, which imports them and invokes their release callbacks. The batch's
+/// columns line up with the predicate's args by position:
+/// - a `Column` arg arrives as its evaluated values
+/// - a `Literal` arg as the constant repeated for every row
+/// - a `Predicate` arg as a `BooleanArray` of its verdicts
+///
+/// The engine returns one bool per row.
 ///
 /// The result uses the out-pointer convention: kernel pre-initializes `*out` to
 /// `OptionalValue::None`; on success the engine overwrites it with
