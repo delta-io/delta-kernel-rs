@@ -208,7 +208,7 @@ Key methods:
 | `with_all_rows_selected(data)` | Wrap data with an empty selection vector (all rows kept) |
 | `data()` | Access the underlying `EngineData` |
 | `selection_vector()` | Get the boolean selection vector as `&[bool]` |
-| `apply_selection_vector()` | Applies the filter, removing unselected rows and consuming self |
+| `apply_selection_vector()` | Applies the filter, keeping only selected rows and consuming self |
 | `into_parts()` | Decompose into `(Box<dyn EngineData>, Vec<bool>)`. |
 
 > [!WARNING]
