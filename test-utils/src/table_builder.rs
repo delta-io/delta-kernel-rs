@@ -1015,31 +1015,27 @@ pub fn version_latest() -> VersionTarget {
 pub fn version_at_mid() -> VersionTarget {
     VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION)
 }
-pub fn version_incremental_to_latest() -> VersionTarget {
+pub fn version_incremental_from_mid_to_latest() -> VersionTarget {
     VersionTarget::IncrementalToLatest {
         from: DEFAULT_SWEEP_MID_VERSION,
     }
 }
-/// Incremental update from `mid` to `latest - 1`. Targets a non-latest `to` to exercise
-/// the partial-replay path that `version_incremental_to_latest()` cannot cover (that one
-/// always goes to latest, which is the same as a non-incremental load).
+/// Incremental update from `mid` to `latest - 1`. The non-latest `to` exercises the
+/// partial-replay path that `version_incremental_from_mid_to_latest()` cannot reach, since
+/// updating to latest is indistinguishable from a non-incremental load.
 pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
     VersionTarget::IncrementalFrom {
         from: DEFAULT_SWEEP_MID_VERSION,
         to: DEFAULT_SWEEP_LATEST_VERSION - 1,
     }
 }
-/// Timestamp travel using `i64::MAX`. Always resolves to the latest version (every
-/// commit's timestamp is less than `i64::MAX`), so this is a smoke test that the
-/// timestamp-conversion path (log-segment build, ICT detection, comparison loop) runs
-/// without error across the sweep -- not a resolution-correctness check.
-///
-/// Non-trivial resolution to an intermediate version is covered by
-/// `test_at_timestamp_resolves_to_intermediate_version` in
-/// `kernel/tests/integration/cross_product`, which controls file modification times
-/// explicitly via local-filesystem [`std::fs::File::set_modified`]. The default sweep
-/// can't reach that case because `InMemory` collapses successive `put` timestamps to a
-/// single millisecond.
+/// Timestamp travel using `i64::MAX`, which always resolves to the latest version (every
+/// commit's timestamp is below `i64::MAX`). This is a smoke test that the timestamp
+/// conversion path runs without error across the sweep, not a resolution-correctness
+/// check: `InMemory` collapses successive `put` timestamps to a single millisecond, so the
+/// sweep can't reach an intermediate version. Resolution to an intermediate version is
+/// covered by `test_at_timestamp_resolves_to_intermediate_version`, which sets commit
+/// modification times explicitly on the local filesystem.
 pub fn version_at_timestamp_max() -> VersionTarget {
     VersionTarget::AtTimestamp(i64::MAX)
 }

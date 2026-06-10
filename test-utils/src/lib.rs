@@ -133,15 +133,12 @@ define_sweeps! {
         checkpoint_struct_stats(),
         no_checkpoint_stats()
     ),
-    // Only `AtTimestamp(i64::MAX)` is in the sweep: `InMemory` collapses successive `put`
-    // timestamps to a single millisecond, so resolving to an intermediate version is
-    // unreachable here. That case is covered by `test_at_timestamp_resolves_to_intermediate_version`
-    // (local FS, explicit `set_modified`). A commit-derived `AtTimestamp` row can be added
-    // once `get_in_commit_timestamp` is public (needed for ICT read assertions too).
+    // `version_at_timestamp_max()` is the only timestamp row; see its docs for why
+    // intermediate-version resolution lives in a dedicated test instead.
     version_target_values = (
         version_latest(),
         version_at_mid(),
-        version_incremental_to_latest(),
+        version_incremental_from_mid_to_latest(),
         version_incremental_from_mid_to_pre_latest(),
         version_at_timestamp_max()
     ),
