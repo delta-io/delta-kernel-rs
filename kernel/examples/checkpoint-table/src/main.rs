@@ -79,7 +79,7 @@ async fn try_main() -> DeltaResult<()> {
         println!("Table checkpointed");
     } else {
         // first we create a checkpoint writer
-        let writer = snapshot.create_checkpoint_writer()?;
+        let writer = snapshot.create_checkpoint_writer(&engine)?;
 
         // this tells us the path where we should write the checkpoint file
         let checkpoint_path = writer.checkpoint_path()?;

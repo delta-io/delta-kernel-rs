@@ -45,11 +45,7 @@ fn generate_checkpoint_parts(
 ) -> DeltaResult<CheckpointParts> {
     let data_iter = writer.checkpoint_data(engine)?;
     let iter_state = data_iter.state();
-    let output_schema = writer
-        .checkpoint_output_schema
-        .get()
-        .cloned()
-        .expect("checkpoint_output_schema should be set by checkpoint_data");
+    let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
@@ -311,7 +307,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     let result = generate_checkpoint_parts(&writer, &engine, usize::MAX)?;
 
@@ -389,7 +385,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // hint=3: with DefaultEngine, each commit is one batch. Reconciliation replays
     // in reverse: commit 3 (1 add), commit 2 (2 adds + 1 remove = 3 file rows),
@@ -491,7 +487,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // hint=1: each batch exceeds the hint, so each gets its own sidecar.
     let result = generate_checkpoint_parts(&writer, &engine, 1)?;
@@ -559,7 +555,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     let data_iter = writer.checkpoint_data(&engine)?;
     let mut all_batches = Vec::new();
@@ -570,10 +566,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
     }
 
     // Validate the checkpoint data schema
-    let schema = writer
-        .checkpoint_output_schema
-        .get()
-        .expect("should be cached after checkpoint_data");
+    let schema = &writer.output_schema;
     let add_field = schema.field(ADD_NAME).expect("schema should have 'add'");
     if let DataType::Struct(ref add_struct) = add_field.data_type {
         assert!(
@@ -656,14 +649,10 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     let data_iter = writer.checkpoint_data(&engine)?;
-    let output_schema = writer
-        .checkpoint_output_schema
-        .get()
-        .cloned()
-        .expect("checkpoint_output_schema should be set by checkpoint_data");
+    let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
