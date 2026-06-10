@@ -645,10 +645,7 @@ pub fn timestamp_range_to_versions(
 ///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
 ///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
 ///   indicates a broken invariant rather than a normal missing version.
-// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
-// this helper lands.
-#[allow(unused)]
-#[tracing::instrument(skip(engine), ret)]
+#[tracing::instrument(skip(engine), ret, err)]
 fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
@@ -692,9 +689,6 @@ fn get_earliest_published_commit_version(
 /// broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
 /// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
 /// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
-// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
-// this helper lands.
-#[allow(unused)]
 #[tracing::instrument(skip(engine), err, ret)]
 fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
@@ -774,6 +768,60 @@ fn get_earliest_recreatable_commit(
     Err(DeltaError::from(LogHistoryError::NoCommitsFound {
         log_root: log_root.clone(),
     }))
+}
+
+/// Selects which commit the [`get_earliest_commit`] query returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryCommitType {
+    /// A filesystem or catalog commit present in the table's `_delta_log/`. Its presence does not
+    /// guarantee that the table can be reconstructed at that commit's version.
+    Published,
+    /// A commit whose version the table state can be fully reconstructed at and replayed forward
+    /// from to the latest version.
+    Recreatable,
+}
+
+/// Returns the earliest table version available on the file system at `log_root`. The returned
+/// version is not guaranteed to exist by the time the caller acts on it: a concurrent log-cleanup
+/// operation may delete the underlying file.
+///
+/// # Parameters
+/// - `engine`: kernel engine used to list `log_root`.
+/// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
+/// - `earliest_ratified_commit_version`: For catalog-managed tables, the earliest version the
+///   catalog has ratified a commit at. Pass `None` for filesystem-only tables.
+/// - `commit_type`: selects the query. [`HistoryCommitType::Published`] returns the lowest-numbered
+///   published commit; [`HistoryCommitType::Recreatable`] returns the earliest version whose state
+///   can be fully reconstructed (commit 0 or the earliest complete checkpoint).
+///
+/// # Errors
+/// - Propagates any error from listing the log directory.
+/// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits and
+///   `earliest_ratified_commit_version` is not `Some(0)`.
+/// - [`LogHistoryError::NoRecreatableCommit`] when `commit_type` is
+///   [`HistoryCommitType::Recreatable`], commits exist, but neither `00...00.json` nor a checkpoint
+///   anchoring the smallest commit is present.
+/// - [`DeltaError::Generic`] when the listing yields no commits and
+///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
+///   (ratified commit 0 with no published filesystem commit).
+#[tracing::instrument(skip(engine), err, ret)]
+pub fn get_earliest_commit(
+    engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+    commit_type: HistoryCommitType,
+) -> DeltaResult<Version> {
+    match commit_type {
+        HistoryCommitType::Published => get_earliest_published_commit_version(
+            engine,
+            log_root,
+            earliest_ratified_commit_version,
+        ),
+
+        HistoryCommitType::Recreatable => {
+            get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
+        }
+    }
 }
 
 #[cfg(test)]
