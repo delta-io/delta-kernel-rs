@@ -121,8 +121,8 @@ impl CommitRange {
     /// translation is applied.
     ///
     /// This is operation-agnostic: requesting [`DeltaAction::Cdc`] returns the raw `cdc` action
-    /// records and does NOT impose change-data-feed support (`Operation::Cdf`) or require CDF to be
-    /// enabled on the table. It does not materialize a change data feed.
+    /// records and does NOT impose change-data-feed support (`Operation::Cdf`). It does not
+    /// materialize a change data feed.
     ///
     /// Returns `Err` if `actions` is empty or contains duplicate kinds, or if `start_snapshot`
     /// belongs to a different table, its version does not match the range anchor, or its table
@@ -181,7 +181,7 @@ impl CommitRange {
 }
 
 /// Iterator yielded by [`CommitRange::commits`]. Holds the iterator's accumulated
-/// `latest_protocol` / `latest_metadata` (only updated under ascending ordering) and
+/// `latest_protocol` / `latest_metadata` and
 /// constructs a fresh [`CommitAction`] for each commit, running per-commit protocol
 /// validation before yielding.
 pub(crate) struct CommitActionsIterator {
@@ -196,7 +196,7 @@ pub(crate) struct CommitActionsIterator {
 
 impl CommitActionsIterator {
     /// Build and validate a `CommitAction` for `log_path` (seeded with the iterator's accumulated
-    /// state), and (under ascending ordering) advance the accumulated `(Protocol, Metadata)` to
+    /// state), and advance the accumulated `(Protocol, Metadata)` to
     /// this commit's effective values.
     fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
         let version = log_path.version;
