@@ -116,9 +116,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         .drop("gone")
         .replace("stub", lit("replaced"))
         .insert_after("x", lit(true))
-        .insert_after("y", lit(false))
-        .build()
-        .unwrap();
+        .insert_after("y", lit(false));
     let top_level_patch = ExpressionStructPatchBuilder::new_nested(column_name!("foo.bar.baz"))
         .drop("dropme")
         .replace("replaceme", lit(42))
@@ -126,13 +124,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         .insert_after("a", lit("first"))
         .insert_after("a", Expr::struct_patch(nested_patch).unwrap())
         .insert_after("a", lit("third"))
-        .append(lit("appended"))
-        .build()
-        .unwrap();
-    let empty_top_level_patch = ExpressionStructPatchBuilder::new().build().unwrap();
-    let empty_nested_patch = ExpressionStructPatchBuilder::new_nested(column_name!("empty.nested"))
-        .build()
-        .unwrap();
+        .append(lit("appended"));
+    let empty_nested_patch = ExpressionStructPatchBuilder::new_nested(column_name!("empty.nested"));
 
     let mut sub_exprs = vec![
         column_expr!("col"),
@@ -157,9 +150,9 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::decimal((1i128 << 64) + 1, 20, 3).unwrap().into(),
         Expr::null_literal(DataType::SHORT),
         Scalar::Struct(top_level_struct).into(),
-        Expr::StructPatch(top_level_patch),
-        Expr::StructPatch(empty_top_level_patch),
-        Expr::StructPatch(empty_nested_patch),
+        Expr::struct_patch(top_level_patch).unwrap(),
+        Expr::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
+        Expr::struct_patch(empty_nested_patch).unwrap(),
         Scalar::Array(array_data).into(),
         Scalar::Map(map_data).into(),
         Expr::struct_from([Expr::literal(5_i32), Expr::literal(20_i64)]),
