@@ -328,7 +328,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
             Ok(args_batch) => args_batch,
             Err(e) if self.mode == EvalMode::StatsMode => {
                 tracing::warn!(
-                    "opaque predicate `{}`: failed to materialize stats args ({e}); keeping all files",
+                    "opaque predicate `{}`: cannot materialize stats args ({e}); keeping all files",
                     self.name
                 );
                 return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
@@ -357,7 +357,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         // Abstains from scalar evaluation (e.g. partition pruning).
         // TODO: support it by invoking the engine callback with a one-row stats batch.
         tracing::info!(
-            "opaque predicate `{}`: scalar eval unsupported; not pruning on it",
+            "opaque predicate `{}`: scalar eval unsupported; not partition-pruning on it",
             self.name
         );
         Ok(None)
