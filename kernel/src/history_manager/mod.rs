@@ -492,15 +492,11 @@ pub(crate) fn timestamp_to_version(
 
 /// Gets the latest [`CommitAt`] (version and timestamp) with a timestamp at or before `timestamp`.
 ///
-/// # Parameters
-/// - `snapshot`: defines the searchable version range (typically the latest snapshot).
-/// - `engine`: used to access version history.
-/// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
-/// - `resolved_commit_type`: which commits the search may resolve to.
-///   [`HistoryCommitType::Published`] searches all published commits, while
-///   [`HistoryCommitType::Recreatable`] restricts the result to versions the table can be
-///   reconstructed from (commit 0 or the earliest complete checkpoint), guaranteeing the returned
-///   version is loadable via time travel.
+/// `resolved_commit_type` constrains the returned version:
+/// - [`HistoryCommitType::Published`]: may return any version present in the log, even one whose
+///   table cannot be reconstructed.
+/// - [`HistoryCommitType::Recreatable`]: only returns a version whose table can be fully
+///   reconstructed at the query time.
 ///
 /// # Errors
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or before
@@ -538,17 +534,12 @@ pub fn latest_version_as_of(
 
 /// Gets the first [`CommitAt`] (version and timestamp) with a timestamp at or after `timestamp`.
 ///
-/// # Parameters
-/// - `snapshot`: defines the searchable version range (typically the latest snapshot).
-/// - `engine`: used to access version history.
-/// - `timestamp`: the target timestamp, in milliseconds since the Unix epoch.
-/// - `resolved_commit_type`: which commits the search may resolve to.
-///   [`HistoryCommitType::Published`] searches all published commits, while
-///   [`HistoryCommitType::Recreatable`] restricts the result to versions the table can be
-///   reconstructed from (commit 0 or the earliest complete checkpoint), guaranteeing the returned
-///   version is loadable via time travel.
+/// `resolved_commit_type` constrains the returned version:
+/// - [`HistoryCommitType::Published`]: may return any version present in the log, even one whose
+///   table cannot be reconstructed.
+/// - [`HistoryCommitType::Recreatable`]: only returns a version whose table can be fully
+///   reconstructed at the query time.
 ///
-/// # Errors
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or after
 /// the given timestamp.
 ///
