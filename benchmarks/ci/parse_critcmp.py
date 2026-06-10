@@ -1,36 +1,42 @@
 #!/usr/bin/env python3
 """
-Parse critcmp output and format it as a GitHub-flavoured Markdown comment.
+Parse per-round critcmp output and format it as a GitHub-flavoured Markdown
+comment.
 
-Reads the output of `critcmp base changes` from stdin and writes:
-  1. A summary block listing the largest slowdown, the fastest speedup,
-     and the count of significant slowdowns/speedups.
-  2. A `<details>` block (closed by default) containing the full
-     per-benchmark table with columns: Test | Base | PR | Change.
+Each input file holds the output of `critcmp base<r> changes<r>` for one
+alternating measurement round (see benchmarks/ci/run-benchmarks.sh). Writes:
+  1. A summary block: counts of changes beyond the noise band, the largest
+     such slowdown and speedup, and the measured noise floor (round-to-round
+     spread of identical code).
+  2. A `<details>` block with the per-benchmark table comparing the best
+     (lowest) time per side across rounds.
+  3. A `<details>` block with the raw per-round times.
 
-A change is "significant" when it is at least 2x in either direction
-(ratio >= 2.0 for slowdown, ratio <= 0.5 for speedup). The summary includes
-every slowdown and speedup; significant ones get a 🐌/🚀 marker in the
-Change cell.
+A change is reported only when the ratio between the best times is at least
+NOISE_BAND away from 1.0 AND the absolute difference exceeds the two sides'
+combined error bars; everything else renders unmarked, as within noise.
+Ratios of at least SIGNIFICANCE_THRESHOLD get the strong marker.
 
 Usage:
-    critcmp base changes | python3 benchmarks/ci/parse_critcmp.py
+    python3 benchmarks/ci/parse_critcmp.py round1.txt [round2.txt ...]
 """
 import re
+import statistics
 import sys
 
-# Significance threshold for slowdowns/speedups (2x in either direction).
+# Minimum relative change that counts as beyond noise; wall clock on shared CI
+# runners routinely jitters a few percent. The error bars must also separate.
+NOISE_BAND = 0.05
+
+# Ratios at least this far from 1.0 in either direction get the strong marker.
 SIGNIFICANCE_THRESHOLD = 2.0
 
-# Ratios within this of 1.0 count as no change: rendered "1.00x" with no marker
-# and excluded from the summary's slowdown/speedup counts.
-NEUTRAL_THRESHOLD = 1e-3
-
-# Emoji markers for the Change cell, by side and severity.
+# Emoji markers for the Change cell, by side and severity. Rows within the
+# noise band carry no marker.
 SIGNIFICANT_SLOWDOWN = '🐌'  # ratio >= SIGNIFICANCE_THRESHOLD
-SLIGHT_SLOWDOWN = '🚧'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
-SLIGHT_SPEEDUP = '✅'  # 1.0 / SIGNIFICANCE_THRESHOLD < ratio < 1.0
-SIGNIFICANT_SPEEDUP = '🚀'  # ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
+SLOWDOWN = '🚧'  # beyond noise, below SIGNIFICANCE_THRESHOLD
+SPEEDUP = '✅'  # beyond noise, below SIGNIFICANCE_THRESHOLD
+SIGNIFICANT_SPEEDUP = '🚀'  # ratio <= 1 / SIGNIFICANCE_THRESHOLD
 
 def to_ms(value, units):
     """Convert a critcmp duration to milliseconds.
@@ -51,23 +57,32 @@ def to_ms(value, units):
         return value / 1e6
     raise ValueError(f'unrecognized critcmp time unit: {units!r}')
 
-def parse_duration(s):
-    m = re.match(r'([0-9.]+)±([0-9.]+)(.+)', s.strip())
+def parse_measurement(dur_str):
+    """Parse a critcmp duration cell like '26.8±0.45ms'.
+
+    Returns a dict with `ms` (point estimate), `err_ms` (error bar), and
+    `display` (the original string), or None when the cell is missing or
+    unparseable.
+    """
+    if not dur_str:
+        return None
+    m = re.match(r'([0-9.]+)±([0-9.]+)(.+)', dur_str.strip())
     if not m:
         return None
-    return float(m.group(1)), float(m.group(2)), m.group(3).strip()
+    unit = m.group(3).strip()
+    return {
+        'ms': to_ms(float(m.group(1)), unit),
+        'err_ms': to_ms(float(m.group(2)), unit),
+        'display': dur_str.strip(),
+    }
 
-def parse_rows(lines):
-    """Parse critcmp stdout into a list of row dicts.
+def parse_round(lines):
+    """Parse one critcmp output into {benchmark name: {'base': m, 'changes': m}}.
 
-    Each row dict contains:
-      name:         sanitized benchmark name (no backticks/pipes), unwrapped
-      base_display: base duration string or 'N/A'
-      chg_display:  changes duration string or 'N/A'
-      ratio:        chg_ms / base_ms, or None if either side is missing/zero
-      significant:  bool, False if ratio is None
+    Measurement values are None when a benchmark only exists in one of the two
+    baselines (added or removed benchmarks).
     """
-    rows = []
+    out = {}
     for line in lines[2:]:  # skip critcmp header rows
         if not line.strip():
             continue
@@ -79,42 +94,71 @@ def parse_rows(lines):
         fields = re.split(r'  +', line)
         name = fields[0].strip() if fields else ''
         dur_fields = [f.strip() for f in fields[1:] if '±' in f]
-        base_dur_str = dur_fields[0] if len(dur_fields) > 0 else None
-        chg_dur_str  = dur_fields[1] if len(dur_fields) > 1 else None
-
-        if not name and not base_dur_str and not chg_dur_str:
+        if not name and not dur_fields:
             continue
+        out[name] = {
+            'base': parse_measurement(dur_fields[0] if len(dur_fields) > 0 else None),
+            'changes': parse_measurement(dur_fields[1] if len(dur_fields) > 1 else None),
+        }
+    return out
 
-        # N/A when a benchmark only exists in one of the two runs (added or removed).
-        base_display = base_dur_str or 'N/A'
-        chg_display  = chg_dur_str  or 'N/A'
+def best(measurements):
+    """Lowest-time measurement, or None when the list is empty.
+
+    The minimum is the standard combiner for wall-clock rounds: scheduler and
+    neighbor interference only ever add time, so the lowest observation is the
+    closest to the machine's true speed.
+    """
+    return min(measurements, key=lambda m: m['ms']) if measurements else None
+
+def spread(measurements):
+    """Round-to-round relative spread (max/min - 1) for one side of one
+    benchmark, or None with fewer than two rounds."""
+    if len(measurements) < 2:
+        return None
+    lo = min(m['ms'] for m in measurements)
+    hi = max(m['ms'] for m in measurements)
+    return hi / lo - 1.0 if lo > 0 else None
+
+def combine_rounds(rounds):
+    """Combine per-round parses into one row per benchmark.
+
+    Each row carries the best measurement per side, the ratio between them,
+    whether the change clears the noise band and the combined error bars, the
+    per-side round-to-round spreads, and the raw per-round measurements.
+    """
+    names = {}
+    for rnd in rounds:
+        for name in rnd:
+            names.setdefault(name, None)
+
+    rows = []
+    for name in names:
+        base_all = [r[name]['base'] for r in rounds if name in r and r[name]['base']]
+        chg_all = [r[name]['changes'] for r in rounds if name in r and r[name]['changes']]
+        b = best(base_all)
+        c = best(chg_all)
+
         ratio = None
-        significant = False
+        beyond_noise = False
+        if b and c and b['ms'] > 0 and c['ms'] > 0:
+            ratio = c['ms'] / b['ms']
+            in_band = 1.0 / (1.0 + NOISE_BAND) < ratio < 1.0 + NOISE_BAND
+            separated = abs(c['ms'] - b['ms']) > (b['err_ms'] + c['err_ms'])
+            beyond_noise = not in_band and separated
 
-        if base_dur_str and chg_dur_str:
-            base_p = parse_duration(base_dur_str)
-            chg_p  = parse_duration(chg_dur_str)
-            if base_p and chg_p:
-                base_ms = to_ms(base_p[0], base_p[2])
-                chg_ms  = to_ms(chg_p[0],  chg_p[2])
-
-                # Float-equality on zero is safe here: to_ms only multiplies/divides
-                # by powers of ten, so a zero output strictly implies a zero input.
-                # Do NOT replace with an epsilon -- that would tag legitimately fast
-                # benches (sub-nanosecond rounding) as N/A.
-                if base_ms != 0 and chg_ms != 0:
-                    ratio = chg_ms / base_ms
-                    significant = (
-                        ratio >= SIGNIFICANCE_THRESHOLD
-                        or ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
-                    )
-
+        spreads = [s for s in (spread(base_all), spread(chg_all)) if s is not None]
         rows.append({
             'name': name,
-            'base_display': base_display,
-            'chg_display': chg_display,
+            'base': b,
+            'chg': c,
             'ratio': ratio,
-            'significant': significant,
+            'beyond_noise': beyond_noise,
+            'spreads': spreads,
+            'per_round': [
+                (r.get(name, {}).get('base'), r.get(name, {}).get('changes'))
+                for r in rounds
+            ],
         })
     return rows
 
@@ -122,91 +166,127 @@ def format_difference(ratio):
     """Render a ratio as e.g. '1.00x', '1.50x slower', or '2.00x faster'."""
     if ratio is None:
         return 'N/A'
-    if abs(ratio - 1.0) < NEUTRAL_THRESHOLD:
+    shown = ratio if ratio >= 1.0 else 1.0 / ratio
+    if f'{shown:.2f}' == '1.00':
         return '1.00x'
-    if ratio > 1:
-        return f'{ratio:.2f}x slower'
-    return f'{1.0 / ratio:.2f}x faster'
+    side = 'slower' if ratio > 1.0 else 'faster'
+    return f'{shown:.2f}x {side}'
 
-def change_emoji(ratio, significant):
-    """Pick an emoji indicator for the Change cell.
-
-    See the module-level emoji constants for the marker assignments. Returns
-    an empty string for ratios near 1.0 or N/A rows.
-    """
-    if ratio is None or abs(ratio - 1.0) < NEUTRAL_THRESHOLD:
+def change_emoji(row):
+    """Pick the Change-cell marker; rows within the noise band get none."""
+    if not row['beyond_noise']:
         return ''
-    if ratio > 1.0:
-        return SIGNIFICANT_SLOWDOWN if significant else SLIGHT_SLOWDOWN
-    return SIGNIFICANT_SPEEDUP if significant else SLIGHT_SPEEDUP
+    if row['ratio'] > 1.0:
+        return SIGNIFICANT_SLOWDOWN if row['ratio'] >= SIGNIFICANCE_THRESHOLD else SLOWDOWN
+    return SIGNIFICANT_SPEEDUP if row['ratio'] <= 1.0 / SIGNIFICANCE_THRESHOLD else SPEEDUP
 
 def render_summary(rows):
-    """Render the summary block. The counts and the largest-slowdown/fastest-speedup
-    lines include every slowdown and speedup regardless of the 2x significance
-    threshold; the per-row emoji marker is what distinguishes significant from
-    slight changes.
+    """Render the summary block: beyond-noise counts with the largest change on
+    each side, the within-noise count, and the measured noise floor."""
+    slow = [r for r in rows if r['beyond_noise'] and r['ratio'] > 1.0]
+    fast = [r for r in rows if r['beyond_noise'] and r['ratio'] < 1.0]
+    measured = [r for r in rows if r['ratio'] is not None]
+    within = len(measured) - len(slow) - len(fast)
 
-    Rows within NEUTRAL_THRESHOLD of 1.0 are excluded since they are neither slowdowns
-    nor speedups. N/A rows (ratio is None) are excluded for the same reason.
-    """
-    slow = [r for r in rows if r['ratio'] is not None and r['ratio'] - 1.0 >= NEUTRAL_THRESHOLD]
-    fast = [r for r in rows if r['ratio'] is not None and 1.0 - r['ratio'] >= NEUTRAL_THRESHOLD]
-
+    slow_line = f'- Slowdowns beyond noise: {len(slow)}'
     if slow:
         worst = max(slow, key=lambda r: r['ratio'])
-        largest_slowdown = f"`{worst['name']}` ({format_difference(worst['ratio'])})"
-    else:
-        largest_slowdown = "no benchmarks slowed down"
-
+        slow_line += f" (largest: `{worst['name']}`, {format_difference(worst['ratio'])})"
+    fast_line = f'- Speedups beyond noise: {len(fast)}'
     if fast:
-        best = min(fast, key=lambda r: r['ratio'])
-        fastest_speedup = f"`{best['name']}` ({format_difference(best['ratio'])})"
-    else:
-        fastest_speedup = "no benchmarks sped up"
+        best_row = min(fast, key=lambda r: r['ratio'])
+        fast_line += f" (largest: `{best_row['name']}`, {format_difference(best_row['ratio'])})"
 
-    lines = [
-        "**Summary**",
-        "",
-        f"- Largest slowdown: {largest_slowdown}",
-        f"- Fastest speedup: {fastest_speedup}",
-        f"- Benchmarks slowed down: {len(slow)}",
-        f"- Benchmarks sped up: {len(fast)}",
-    ]
-    return "\n".join(lines)
+    all_spreads = [s for r in rows for s in r['spreads']]
+    if all_spreads:
+        floor_line = (
+            f'- Measured noise floor (identical code, round-to-round): '
+            f'median {statistics.median(all_spreads):.1%}, max {max(all_spreads):.1%}'
+        )
+    else:
+        floor_line = '- Measured noise floor: n/a (single round)'
+
+    return '\n'.join([
+        '**Summary**',
+        '',
+        slow_line,
+        fast_line,
+        f'- Within noise: {within}',
+        floor_line,
+    ])
+
+def nbsp(text):
+    """Join with non-breaking spaces so a table cell renders on one line."""
+    return text.strip().replace(' ', '&nbsp;')
 
 def render_table(rows):
-    """Render the per-benchmark table wrapped in a closed-by-default <details> block."""
+    """Render the per-benchmark comparison wrapped in a closed `<details>` block."""
     out = []
-    out.append("<details>")
-    out.append(f"<summary>Per-benchmark results ({len(rows)} rows)</summary>")
-    out.append("")
+    out.append('<details>')
+    out.append(f'<summary>Per-benchmark results ({len(rows)} rows)</summary>')
+    out.append('')
     out.append(
-        f"**Legend:** {SIGNIFICANT_SLOWDOWN} ≥ 2x slower &nbsp;·&nbsp;"
-        f"{SLIGHT_SLOWDOWN} < 2x slower &nbsp;·&nbsp;"
-        f"{SLIGHT_SPEEDUP} < 2x faster &nbsp;·&nbsp;"
-        f"{SIGNIFICANT_SPEEDUP} ≥ 2x faster"
+        f'**Legend:** {SIGNIFICANT_SLOWDOWN} ≥ 2x slower &nbsp;·&nbsp;'
+        f'{SLOWDOWN} beyond noise, slower &nbsp;·&nbsp;'
+        f'{SPEEDUP} beyond noise, faster &nbsp;·&nbsp;'
+        f'{SIGNIFICANT_SPEEDUP} ≥ 2x faster &nbsp;·&nbsp;'
+        'unmarked: within noise. '
+        'Base and PR cells show the best time across rounds; self-noise is the '
+        'worst per-side spread between rounds of identical code.'
     )
-    out.append("")
-    out.append("| Test | Base         | PR               | Change |")
-    out.append("|------|--------------|------------------|--------|")
+    out.append('')
+    out.append('| Test | Base | PR | Change | Self-noise |')
+    out.append('|------|------|----|--------|------------|')
     for r in rows:
         name_cell = f"`{r['name']}`" if r['name'] else ''
-        difference = format_difference(r['ratio'])
-        emoji = change_emoji(r['ratio'], r['significant'])
-        # Non-breaking spaces keep the marker and ratio on one line so the
-        # Change cell renders without wrapping.
-        change_cell = f"{emoji} {difference}".strip().replace(" ", "&nbsp;")
-        out.append(f"| {name_cell} | {r['base_display']} | {r['chg_display']} | {change_cell} |")
-    out.append("")
-    out.append("</details>")
-    return "\n".join(out)
+        base_cell = r['base']['display'] if r['base'] else 'N/A'
+        chg_cell = r['chg']['display'] if r['chg'] else 'N/A'
+        change_cell = nbsp(f"{change_emoji(r)} {format_difference(r['ratio'])}")
+        noise_cell = f"±{max(r['spreads']):.1%}" if r['spreads'] else ''
+        out.append(f'| {name_cell} | {base_cell} | {chg_cell} | {change_cell} | {noise_cell} |')
+    out.append('')
+    out.append('</details>')
+    return '\n'.join(out)
+
+def render_rounds_table(rows, num_rounds):
+    """Render the raw per-round times wrapped in a closed `<details>` block."""
+    out = []
+    out.append('<details>')
+    out.append('<summary>Per-round raw times</summary>')
+    out.append('')
+    header = '| Test |'
+    divider = '|------|'
+    for round_idx in range(1, num_rounds + 1):
+        header += f' Base r{round_idx} | PR r{round_idx} |'
+        divider += '------|------|'
+    out.append(header)
+    out.append(divider)
+    for r in rows:
+        cells = [f"`{r['name']}`" if r['name'] else '']
+        for base_m, chg_m in r['per_round']:
+            cells.append(base_m['display'] if base_m else 'N/A')
+            cells.append(chg_m['display'] if chg_m else 'N/A')
+        out.append('| ' + ' | '.join(cells) + ' |')
+    out.append('')
+    out.append('</details>')
+    return '\n'.join(out)
 
 def main():
-    lines = sys.stdin.read().splitlines()
-    rows = parse_rows(lines)
+    paths = sys.argv[1:]
+    if not paths:
+        print('usage: parse_critcmp.py <critcmp-round-output>...', file=sys.stderr)
+        sys.exit(2)
+    rounds = []
+    for path in paths:
+        with open(path, encoding='utf-8') as f:
+            rounds.append(parse_round(f.read().splitlines()))
+    rows = combine_rounds(rounds)
     print(render_summary(rows))
-    print("")
+    print('')
     print(render_table(rows))
+    if len(rounds) > 1:
+        print('')
+        print(render_rounds_table(rows, len(rounds)))
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
