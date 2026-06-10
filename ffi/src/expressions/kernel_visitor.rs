@@ -751,7 +751,7 @@ fn visit_predicate_opaque_impl(
     if resolve_opaque_children(state, children.map(|c| c as usize)).is_none() {
         return Ok(0);
     }
-    tracing::debug!("opaque predicate `{name}` has no eval callbacks; kernel will not prune on it");
+    tracing::info!("opaque predicate `{name}`: no eval callbacks; kernel will not prune on it");
     Ok(wrap_predicate(state, Predicate::null_literal()))
 }
 
