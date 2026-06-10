@@ -356,10 +356,6 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
     ) -> DeltaResult<Option<bool>> {
         // Abstains from scalar evaluation (e.g. partition pruning).
         // TODO: support it by invoking the engine callback with a one-row stats batch.
-        tracing::info!(
-            "opaque predicate `{}`: scalar eval unsupported; not partition-pruning on it",
-            self.name
-        );
         Ok(None)
     }
 
@@ -373,10 +369,6 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         // `as_data_skipping_predicate` rewrite, then `evaluate_predicate` -> `eval_pred`.
         // TODO: support row-group skipping by invoking the engine callback with a one-row stats
         // batch.
-        tracing::info!(
-            "opaque predicate `{}`: row-group skipping unsupported; file-level pruning only",
-            self.name
-        );
         None
     }
 
