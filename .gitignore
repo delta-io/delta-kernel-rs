@@ -22,6 +22,9 @@
 target/
 integration-tests/Cargo.lock
 
+# Python
+__pycache__
+
 # Project
 acceptance/tests/dat/
 acceptance/workloads/
