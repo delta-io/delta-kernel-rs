@@ -70,12 +70,25 @@ echo "Parsed filter: ${FILTER:-<none>}"
 [[ -n "$TAGS" ]] && export BENCH_TAGS="$TAGS"
 
 # ---------------------------------------------------------------------------
-# 2. Benchmark the PR branch (already checked out by the workflow)
+# 2. Log the runner environment
+#    GitHub-hosted runners draw from a heterogeneous pool (different CPU
+#    models, cache sizes, and neighbor load). Recording the hardware and load
+#    alongside each run lets a reader correlate noisy comparisons with the
+#    machine they ran on.
+# ---------------------------------------------------------------------------
+echo "=== Runner environment ==="
+lscpu | grep -E '^(Model name|CPU\(s\)|Thread|CPU( max| min)? MHz|L[123][a-z]* cache)' || true
+echo "loadavg: $(cat /proc/loadavg)"
+echo "mem: $(free -m | awk '/^Mem:/ {print $2 " MB total, " $7 " MB available"}')"
+echo "==========================="
+
+# ---------------------------------------------------------------------------
+# 3. Benchmark the PR branch (already checked out by the workflow)
 # ---------------------------------------------------------------------------
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER")
 
 # ---------------------------------------------------------------------------
-# 3. Switch to the base branch and benchmark it
+# 4. Switch to the base branch and benchmark it
 #    The benchmarks/target/ directory is not tracked by git, so the
 #    "changes" baseline files are preserved across the branch switch.
 # ---------------------------------------------------------------------------
@@ -84,12 +97,12 @@ git checkout FETCH_HEAD
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
 
 # ---------------------------------------------------------------------------
-# 4. Compare baselines with critcmp and format as a markdown comment
+# 5. Compare baselines with critcmp and format as a markdown comment
 #    (summary block + collapsed per-benchmark table; see
 #    benchmarks/ci/parse_critcmp.py for the format and significance rules).
 #      - Parses actual duration values (not rank factors) to compute a ratio
 # ---------------------------------------------------------------------------
-# Step 3 left the working tree on the base branch, so parse_critcmp.py on disk
+# Step 4 left the working tree on the base branch, so parse_critcmp.py on disk
 # is the base version. Restore the PR-head tree so the comment is formatted by
 # the PR's own formatter (a formatter change is then exercised on the PR that
 # introduces it). Only tracked sources move; the `base`/`changes` criterion
@@ -101,7 +114,7 @@ git checkout "$HEAD_SHA"
 COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/parse_critcmp.py)
 
 # ---------------------------------------------------------------------------
-# 5. Write results to /tmp/bench-comment.md
+# 6. Write results to /tmp/bench-comment.md
 #    benchmark.yml uploads this as an artifact; benchmark-post-comment.yml
 #    downloads it and posts the PR comment in base-branch context.
 # ---------------------------------------------------------------------------
