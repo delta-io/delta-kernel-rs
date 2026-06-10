@@ -54,6 +54,16 @@ impl FileActionKey {
     }
 }
 
+/// `HashSet` used to deduplicate file actions during log replay. Uses `foldhash`'s random
+/// state for ~2x faster hashing than the std default while keeping per-process seeding so
+/// path keys read from the Delta log remain HashDoS-resistant.
+///
+/// Crate-private so the alternate hasher type parameter does not leak into the public API
+/// (the serializable boundary still uses the std `HashSet<FileActionKey>`).
+///
+/// cbindgen:ignore
+pub(crate) type SeenFileKeys = HashSet<FileActionKey, foldhash::fast::RandomState>;
+
 /// Maintains state and provides functionality for deduplicating file actions during log replay.
 ///
 /// This struct is embedded in visitors to track which files have been seen across multiple
@@ -68,7 +78,7 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
     /// of seen file keys that persists across multiple log batches.
-    seen_file_keys: &'seen mut HashSet<FileActionKey>,
+    seen_file_keys: &'seen mut SeenFileKeys,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
     /// Whether we're processing a commit log JSON file (`true`) or a checkpoint file (`false`).
@@ -88,7 +98,7 @@ pub(crate) struct FileActionDeduplicator<'seen> {
 
 impl<'seen> FileActionDeduplicator<'seen> {
     pub(crate) fn new(
-        seen_file_keys: &'seen mut HashSet<FileActionKey>,
+        seen_file_keys: &'seen mut SeenFileKeys,
         is_log_batch: bool,
         add_path_index: usize,
         add_size_index: usize,
@@ -399,7 +409,7 @@ pub(crate) trait HasSelectionVector {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     use rstest::rstest;
 
@@ -474,7 +484,7 @@ mod tests {
 
     /// Helper to create a FileActionDeduplicator with standard indices
     fn create_deduplicator(
-        seen: &mut HashSet<FileActionKey>,
+        seen: &mut SeenFileKeys,
         is_log_batch: bool,
     ) -> FileActionDeduplicator<'_> {
         FileActionDeduplicator::new(
@@ -518,7 +528,7 @@ mod tests {
         #[case] raw_size: Option<i64>,
         #[case] expected_size: u64,
     ) -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_add = MockGetData::new();
@@ -540,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_remove() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_remove = MockGetData::new();
@@ -558,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_dv = MockGetData::new();
@@ -582,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_skip_removes() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_remove = MockGetData::new();
@@ -604,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_no_action_found() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let getters = create_getters_with_mocks(None, None);
@@ -617,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_check_and_record_seen() {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
 
         // Pre-populate with an existing key
         let pre_existing_key = FileActionKey::new("existing.parquet", None);
@@ -667,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_is_log_batch() {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
 
         // Test with is_log_batch = true
         let deduplicator_log = create_deduplicator(&mut seen, true);
@@ -682,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
-        let seen = HashSet::new();
+        let seen = SeenFileKeys::default();
         let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
 
         let mut mock_add = MockGetData::new();
@@ -701,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
-        let seen = HashSet::new();
+        let seen = SeenFileKeys::default();
         let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2)?;
 
         let mut mock_dv = MockGetData::new();
@@ -726,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_deduplicator_filters_commit_duplicates() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = SeenFileKeys::default();
 
         // Files "seen" during commit processing
         seen.insert(FileActionKey::new("modified_in_commit.parquet", None));

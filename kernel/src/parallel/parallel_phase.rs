@@ -121,7 +121,6 @@ impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::Arc;
     use std::thread;
 
@@ -133,7 +132,7 @@ mod tests {
     use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::log_replay::FileActionKey;
+    use crate::log_replay::{FileActionKey, SeenFileKeys};
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
     use crate::object_store::memory::InMemory;
@@ -197,7 +196,7 @@ mod tests {
     ) -> DeltaResult<ScanLogReplayProcessor> {
         let state_info = Arc::new(get_simple_state_info(test_schema(), vec![])?);
 
-        let seen_file_keys: HashSet<FileActionKey> = seen_paths
+        let seen_file_keys: SeenFileKeys = seen_paths
             .iter()
             .map(|path| FileActionKey::new(*path, None))
             .collect();

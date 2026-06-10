@@ -10,13 +10,11 @@
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
-use std::collections::HashSet;
-
 use tracing::warn;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::log_replay::FileActionKey;
+use crate::log_replay::{FileActionKey, SeenFileKeys};
 use crate::DeltaResult;
 
 /// Information we want to return to the add-dedup about file related actions
@@ -89,7 +87,7 @@ pub(crate) trait Deduplicator {
 /// [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 #[allow(unused)]
 pub(crate) struct CheckpointDeduplicator<'a> {
-    seen_file_keys: &'a HashSet<FileActionKey>,
+    seen_file_keys: &'a SeenFileKeys,
     add_path_index: usize,
     add_size_index: usize,
     add_dv_start_index: usize,
@@ -98,7 +96,7 @@ pub(crate) struct CheckpointDeduplicator<'a> {
 impl<'a> CheckpointDeduplicator<'a> {
     #[allow(unused)]
     pub(crate) fn try_new(
-        seen_file_keys: &'a HashSet<FileActionKey>,
+        seen_file_keys: &'a SeenFileKeys,
         add_path_index: usize,
         add_size_index: usize,
         add_dv_start_index: usize,

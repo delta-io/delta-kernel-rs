@@ -43,6 +43,9 @@ delta_kernel_derive = { path = "../derive-macros", version = "0.24.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
+# Fast non-cryptographic hasher for log-replay dedup. Per-process random seeding
+# preserves HashDoS resistance for path keys read from the Delta log.
+foldhash = "0.1"
 indexmap = "2.10.0"
 itertools = "0.14"
 percent-encoding = "2"

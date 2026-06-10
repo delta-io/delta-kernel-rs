@@ -8,7 +8,7 @@ use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
-use crate::log_replay::{FileActionDeduplicator, FileActionKey};
+use crate::log_replay::{FileActionDeduplicator, FileActionKey, SeenFileKeys};
 use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
@@ -132,7 +132,7 @@ impl IncrementalScanBuilder {
             base_version: self.base_version,
             target_version,
             actions,
-            seen_file_keys: HashSet::new(),
+            seen_file_keys: SeenFileKeys::default(),
             live_adds: HashSet::new(),
             removes: HashSet::new(),
             errored: false,
@@ -160,7 +160,7 @@ pub struct IncrementalScanStream {
     base_version: Version,
     target_version: Version,
     actions: FileDataReadResultIterator,
-    seen_file_keys: HashSet<FileActionKey>,
+    seen_file_keys: SeenFileKeys,
     live_adds: HashSet<FileActionKey>,
     removes: HashSet<FileActionKey>,
     errored: bool,
@@ -479,7 +479,7 @@ impl std::fmt::Debug for IncrementalListingAgainstBase {
 /// rows for this batch, or `None` if no Adds survived dedup in this batch.
 fn process_batch(
     batch: Box<dyn EngineData>,
-    seen_file_keys: &mut HashSet<FileActionKey>,
+    seen_file_keys: &mut SeenFileKeys,
     live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
 ) -> DeltaResult<Option<FilteredEngineData>> {

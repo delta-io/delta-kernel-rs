@@ -1277,6 +1277,7 @@ dependencies = [
  "criterion",
  "delta_kernel",
  "delta_kernel_derive",
+ "foldhash",
  "futures",
  "hdfs-native",
  "hdfs-native-object-store",

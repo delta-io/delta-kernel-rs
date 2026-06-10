@@ -18,7 +18,7 @@ use crate::expressions::{
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
-    ParallelLogReplayProcessor,
+    ParallelLogReplayProcessor, SeenFileKeys,
 };
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
@@ -105,6 +105,11 @@ pub struct SerializableScanState {
     /// Opaque internal state blob
     pub internal_state_blob: Vec<u8>,
     /// Set of file action keys that have already been processed.
+    ///
+    /// Uses the standard `HashSet` (with the std random-state hasher) so that the serialized
+    /// wire format is stable across kernel builds and engines that hand-roll their own
+    /// serialization. The in-memory dedup set inside `ScanLogReplayProcessor` uses a faster
+    /// hasher; conversion happens at the phase boundary.
     pub seen_file_keys: HashSet<FileActionKey>,
     /// Information about checkpoint reading for stats optimization
     pub(crate) checkpoint_info: CheckpointReadInfo,
@@ -149,7 +154,7 @@ pub struct ScanLogReplayProcessor {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen_file_keys: HashSet<FileActionKey>,
+    seen_file_keys: SeenFileKeys,
     /// Read-time stats options.
     stats_options: ScanStatsOptions,
     /// Information about checkpoint reading for stats optimization
@@ -181,7 +186,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             checkpoint_info,
-            HashSet::with_capacity(dedup_capacity),
+            SeenFileKeys::with_capacity_and_hasher(dedup_capacity, Default::default()),
             stats_options,
         )
     }
@@ -201,7 +206,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
-        seen_file_keys: HashSet<FileActionKey>,
+        seen_file_keys: SeenFileKeys,
         stats_options: ScanStatsOptions,
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
@@ -359,7 +364,7 @@ impl ScanLogReplayProcessor {
         Ok(SerializableScanState {
             predicate,
             internal_state_blob,
-            seen_file_keys: self.seen_file_keys,
+            seen_file_keys: self.seen_file_keys.into_iter().collect(),
             checkpoint_info: self.checkpoint_info,
         })
     }
@@ -415,7 +420,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             state.checkpoint_info,
-            state.seen_file_keys,
+            state.seen_file_keys.into_iter().collect(),
             internal_state.stats_options,
         )
     }
