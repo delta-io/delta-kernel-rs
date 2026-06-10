@@ -186,17 +186,17 @@ impl fmt::Display for LastCheckpointHintState {
 
 /// Materialization state of the catalog tail for catalog-managed tables.
 ///
-/// A catalog-managed table's most recent commits live in `_delta_log/_staged_commits/`
-/// until the catalog ratifies them by moving them to `_delta_log/{version}.json`. The
-/// kernel reaches staged commits via `Snapshot::builder_for(..).with_log_tail(..)`.
+/// A catalog-managed table's ratified commits live in `_delta_log/_staged_commits/`
+/// until they are published (copied) to `_delta_log/{version}.json`. The kernel reaches
+/// staged commits via `Snapshot::builder_for(..).with_log_tail(..)`.
 ///
 /// - [`None`](Self::None): no staged files; all commits are published JSONs. The default.
 /// - [`StagedOnly`](Self::StagedOnly): the last `num_versions` commits exist only as staged files.
 ///   The corresponding `{version}.json` files are absent and the log tail points at the staged
-///   commits. Models a fully-unratified tail.
+///   commits. Models a fully-unpublished tail.
 /// - [`StagedAndPublished`](Self::StagedAndPublished): the last `num_versions` commits exist as
 ///   both staged and published files on disk. The log tail interleaves the two forms per version,
-///   stress-testing log_tail resolution against filesystem discovery. Real catalogs ratify in
+///   stress-testing log_tail resolution against filesystem discovery. Real catalogs publish in
 ///   commit order (contiguous published prefix, staged suffix); this variant deliberately
 ///   interleaves. Requires `num_versions >= 2` so both forms appear in the tail.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1279,7 +1279,17 @@ impl TestTableBuilder {
         }
 
         // Data commits (versions 1..=latest). Checkpoint inline using the post-commit snapshot.
+        //
+        // Catalog-managed commits stay staged until published. Publish through the last
+        // version outside the requested staged tail (`StagedAndPublished` publishes the tail
+        // too, leaving both forms on disk). Checkpoints also force a publish first: kernel
+        // disallows checkpointing an unpublished snapshot.
         let latest = self.log_state.latest_version();
+        let committer = make_committer(is_catalog_managed);
+        let publish_through = match self.log_state.catalog_tail() {
+            CatalogTailState::StagedOnly { num_versions } => latest - num_versions,
+            CatalogTailState::None | CatalogTailState::StagedAndPublished { .. } => latest,
+        };
         for v in 1..=latest {
             snapshot = write_data_commit(
                 snapshot.clone(),
@@ -1292,6 +1302,9 @@ impl TestTableBuilder {
             )
             .await?
             .unwrap_post_commit_snapshot();
+            if is_catalog_managed && (v == publish_through || checkpoints_at.contains(&v)) {
+                snapshot = snapshot.publish(engine.as_ref(), committer.as_ref())?;
+            }
             if checkpoints_at.contains(&v) {
                 snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
                 if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
@@ -1317,8 +1330,8 @@ impl TestTableBuilder {
             }
         }
 
-        // Lay out the on-disk staged-commits shape per the requested [`CatalogTailState`].
-        let catalog_tail_paths = materialize_catalog_tail(
+        // Prune published-and-cleaned staged commits and compute the catalog tail.
+        let catalog_tail_paths = finalize_catalog_tail(
             &store,
             table_root,
             self.log_state.latest_version(),
@@ -1446,13 +1459,12 @@ fn make_committer(is_catalog_managed: bool) -> Box<dyn Committer> {
 // Test catalog committer
 // ===========================================================================
 
-/// A minimal [`Committer`] that writes commits to the published path (matching
-/// [`FileSystemCommitter`]) while reporting `is_catalog_committer() == true` so
-/// kernel accepts it for catalog-managed tables. The post-build catalog tail
-/// materialization step creates any staged files the layout needs.
-///
-/// For tests that need separate stage-then-publish semantics matching
-/// `UCCommitter`, use a more faithful committer.
+/// An in-process catalog [`Committer`] that mirrors `UCCommitter`'s file layout without a
+/// catalog service: version 0 is written to the published path (the create-table commit
+/// establishes the table before the catalog tracks it), and every later version is written
+/// as a staged commit at the kernel-generated `_staged_commits/` path. Ratification is
+/// implicit (every staged write succeeds). [`publish`](Self::publish) copies staged commits
+/// to their published locations, exactly like `UCCommitter::publish`.
 #[derive(Debug, Default)]
 struct TestCatalogCommitter;
 
@@ -1464,13 +1476,17 @@ impl Committer for TestCatalogCommitter {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         let version = commit_metadata.version();
-        let published = commit_metadata.published_commit_path()?;
+        let path = if version == 0 {
+            commit_metadata.published_commit_path()?
+        } else {
+            commit_metadata.staged_commit_path()?
+        };
         match engine
             .json_handler()
-            .write_json_file(&published, Box::new(actions), false)
+            .write_json_file(&path, Box::new(actions), false)
         {
             Ok(()) => {
-                let file_meta = engine.storage_handler().head(&published)?;
+                let file_meta = engine.storage_handler().head(&path)?;
                 Ok(CommitResponse::Committed { file_meta })
             }
             Err(delta_kernel::Error::FileAlreadyExists(_)) => {
@@ -1484,14 +1500,22 @@ impl Committer for TestCatalogCommitter {
         true
     }
 
-    /// No-op: this committer publishes eagerly during [`commit`](Self::commit).
-    fn publish(&self, _engine: &dyn Engine, _metadata: PublishMetadata) -> DeltaResult<()> {
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
+        for commit in publish_metadata.commits_to_publish() {
+            match engine
+                .storage_handler()
+                .copy_atomic(commit.location(), commit.published_location())
+            {
+                Ok(()) | Err(delta_kernel::Error::FileAlreadyExists(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 }
 
 // ===========================================================================
-// Catalog-managed tail materialization
+// Catalog-managed tail finalization
 // ===========================================================================
 
 /// Whether a given offset within a [`CatalogTailState::StagedAndPublished`] tail uses
@@ -1500,53 +1524,60 @@ fn mixed_tail_uses_staged(offset: u64) -> bool {
     offset.is_multiple_of(2)
 }
 
-/// Copy published commits into `_staged_commits/`, optionally remove the published forms,
-/// and return the log tail entries the catalog would track for the result. The returned
-/// paths are object-store paths relative to the table root, sorted ascending by version.
-async fn materialize_catalog_tail(
+/// Prune staged commits the catalog would have cleaned up after publishing, then return
+/// the log tail entries the catalog tracks. The builder's committer stages every commit
+/// at v >= 1, so after the in-loop publishes the staged dir holds one file per version;
+/// only the tail's staged files survive. Returned paths are object-store paths relative
+/// to the table root, sorted ascending by version.
+async fn finalize_catalog_tail(
     store: &Arc<DynObjectStore>,
     table_root: &str,
     latest_version: u64,
     state: CatalogTailState,
 ) -> DeltaResult<Vec<(Version, Path)>> {
-    let (always_staged, delete_published) = match state {
-        CatalogTailState::None => return Ok(Vec::new()),
-        CatalogTailState::StagedOnly { .. } => (true, true),
-        CatalogTailState::StagedAndPublished { .. } => (false, false),
-    };
+    let staged_dir = Path::from("_delta_log/_staged_commits");
+    let resolved_staged_dir = crate::resolve_table_path(table_root, &staged_dir)?;
+    let listing = store
+        .list_with_delimiter(Some(&resolved_staged_dir))
+        .await
+        .map_err(delta_kernel::Error::from)?;
+
     let num_versions = state.num_staged();
-    let staged_start = latest_version - num_versions + 1;
+    let staged_start = latest_version + 1 - num_versions;
+
+    let mut staged_by_version: HashMap<u64, Path> = HashMap::new();
+    for object in listing.objects {
+        let v = log_file_version(&object.location)
+            .unwrap_or_else(|| panic!("unparseable staged commit: {}", object.location));
+        if v < staged_start {
+            store
+                .delete(&object.location)
+                .await
+                .map_err(delta_kernel::Error::from)?;
+        } else {
+            let filename = object.location.filename().expect("staged commit filename");
+            let relative = Path::from(format!("_delta_log/_staged_commits/{filename}").as_str());
+            staged_by_version.insert(v, relative);
+        }
+    }
+
+    let always_staged = match state {
+        CatalogTailState::None => return Ok(Vec::new()),
+        CatalogTailState::StagedOnly { .. } => true,
+        CatalogTailState::StagedAndPublished { .. } => false,
+    };
 
     let mut out = Vec::with_capacity(num_versions as usize);
     for (offset, v) in (staged_start..=latest_version).enumerate() {
-        let offset = offset as u64;
-        let published = crate::delta_path_for_version(v, "json");
-        let resolved_published = crate::resolve_table_path(table_root, &published)?;
-        let bytes = store
-            .get(&resolved_published)
-            .await
-            .map_err(delta_kernel::Error::from)?
-            .bytes()
-            .await
-            .map_err(delta_kernel::Error::from)?;
-
-        let staged = crate::staged_commit_path_for_version(v);
-        let resolved_staged = crate::resolve_table_path(table_root, &staged)?;
-        store
-            .put(&resolved_staged, bytes.into())
-            .await
-            .map_err(delta_kernel::Error::from)?;
-
-        let use_staged = always_staged || mixed_tail_uses_staged(offset);
-        let picked = if use_staged { staged } else { published };
+        let use_staged = always_staged || mixed_tail_uses_staged(offset as u64);
+        let picked = if use_staged {
+            staged_by_version
+                .remove(&v)
+                .unwrap_or_else(|| panic!("missing staged commit for v={v}"))
+        } else {
+            crate::delta_path_for_version(v, "json")
+        };
         out.push((v, picked));
-
-        if delete_published {
-            store
-                .delete(&resolved_published)
-                .await
-                .map_err(delta_kernel::Error::from)?;
-        }
     }
     Ok(out)
 }
