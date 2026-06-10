@@ -29,8 +29,8 @@ use delta_kernel::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
-use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks, OptionalArrowFFIData};
-use crate::engine_data::ArrowFFIData;
+use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
+use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
 use crate::kernel_string_slice;
 
 // === FfiOpaquePredicateOp ===================================================

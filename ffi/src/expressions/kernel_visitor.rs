@@ -1142,8 +1142,7 @@ mod tests {
         use std::ffi::c_void;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::engine_data::ArrowFFIData;
-        use crate::expressions::opaque_eval::OptionalArrowFFIData;
+        use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
 
         static FREED: AtomicUsize = AtomicUsize::new(0);
 
@@ -1241,8 +1240,7 @@ mod tests {
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 
-        use crate::engine_data::ArrowFFIData;
-        use crate::expressions::opaque_eval::OptionalArrowFFIData;
+        use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
 
         static CALLS: AtomicUsize = AtomicUsize::new(0);
 

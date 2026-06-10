@@ -16,22 +16,8 @@
 
 use std::ffi::c_void;
 
-use crate::engine_data::ArrowFFIData;
+use crate::engine_data::{ArrowFFIData, OptionalArrowFFIData};
 use crate::KernelStringSlice;
-
-/// FFI-safe `Option<ArrowFFIData>`, the out-slot type for opaque-eval results. Layout matches the
-/// generic [`OptionalValue`]: C-int tag (`0` = Some, `1` = None) followed by the payload. Declared
-/// as a standalone monomorphic type so its C declaration carries this module's feature guard --
-/// cbindgen emits generic monomorphizations unguarded, which would reference the guarded
-/// `ArrowFFIData` by value and break header compilation without the feature define.
-///
-/// [`OptionalValue`]: crate::OptionalValue
-/// cbindgen:prefix-with-name
-#[repr(C)]
-pub enum OptionalArrowFFIData {
-    Some(ArrowFFIData),
-    None,
-}
 
 /// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
