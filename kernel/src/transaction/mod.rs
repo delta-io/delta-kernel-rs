@@ -20,7 +20,9 @@ use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
+use crate::expressions::{
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
+};
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::metrics::{CommitFailureReason, MetricId};
@@ -308,16 +310,16 @@ where
     let evaluation_handler = engine.evaluation_handler();
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
-            ExpressionStructPatch::new_top_level()
-                .with_inserted_field(
-                    Some("modificationTime"),
+            ExpressionStructPatchBuilder::new()
+                .with_inserted_field_after(
+                    "modificationTime",
                     Expression::literal(data_change).into(),
                 )
                 .with_replaced_field(
                     "stats",
                     Expression::unary(ToJson, Expression::column(["stats"])).into(),
                 ),
-        );
+        )?;
         let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
@@ -943,21 +945,20 @@ impl<S: SupportsDataFiles> Transaction<S> {
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
-        let partition_cols = self.effective_table_config.partition_columns().to_vec();
         // Check if partition columns should be materialized into data files.
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a StructPatch expression that drops partition columns (unless materialized) and
-        // void columns at all nesting levels.
-        let mut patch = ExpressionStructPatch::new_top_level();
+        // Build a StructPatch expression that drops partition columns from the input
+        // (unless they should be materialized) and drop void columns at all nesting levels.
+        let mut patch = ExpressionStructPatchBuilder::new();
         if !should_materialize_partition_columns {
-            for col in &partition_cols {
+            for col in self.effective_table_config.partition_columns() {
                 patch = patch.with_dropped_field_if_exists(col);
             }
         }
-        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema(), &[]);
-        Ok(Expression::struct_patch(patch))
+        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema());
+        Expression::struct_patch(patch)
     }
 
     /// Returns the logical partition column names for this table.
@@ -1425,8 +1426,8 @@ impl<S> Transaction<S> {
                 self.data_change,
                 columns_to_drop,
                 coalesce_stats_with_parsed,
-            );
-            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)]));
+            )?;
+            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
@@ -1475,49 +1476,41 @@ fn build_remove_struct_patch(
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
-) -> ExpressionStructPatch {
-    let mut patch = ExpressionStructPatch::new_top_level()
+) -> DeltaResult<ExpressionStructPatch> {
+    let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
-        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        .with_inserted_field_after("path", Expression::literal(commit_timestamp).into())
         // dataChange
-        .with_inserted_field(Some("path"), Expression::literal(data_change).into())
+        .with_inserted_field_after("path", Expression::literal(data_change).into())
         // extended_file_metadata
-        .with_inserted_field(Some("path"), Expression::literal(true).into())
-        .with_inserted_field(
-            Some("path"),
+        .with_inserted_field_after("path", Expression::literal(true).into())
+        .with_inserted_field_after(
+            "path",
             Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
         );
 
     if coalesce_stats_with_parsed {
-        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
-        // Both expressions are registered on the "stats" field_patch (is_replace=true),
-        // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
+        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             Expression::column(["stats"]),
             Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
         ]);
         patch = patch
             .with_replaced_field("stats", coalesce_stats.into())
-            .with_inserted_field(
-                Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-            )
-            .with_dropped_field_if_exists(STATS_PARSED_NAME);
-    } else {
-        // tags inserted after stats; stats passes through unchanged
-        patch = patch.with_inserted_field(
-            Some("stats"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-        );
+            .with_dropped_field(STATS_PARSED_NAME);
     }
 
     patch = patch
-        .with_inserted_field(
-            Some("deletionVector"),
+        .with_inserted_field_after(
+            "stats",
+            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+        )
+        .with_inserted_field_after(
+            "deletionVector",
             Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
         )
-        .with_inserted_field(
-            Some("deletionVector"),
+        .with_inserted_field_after(
+            "deletionVector",
             Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
@@ -1529,7 +1522,7 @@ fn build_remove_struct_patch(
         patch = patch.with_dropped_field(*column_to_drop);
     }
 
-    patch
+    patch.build()
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to

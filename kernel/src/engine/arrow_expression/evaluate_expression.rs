@@ -183,13 +183,6 @@ fn evaluate_struct_patch_expression(
         .map(|path| extract_column(batch, path))
         .transpose()?;
 
-    // For nested patches, get the source struct's null bitmap to preserve null rows
-    let source_null_buffer = source_array.as_ref().and_then(|arr| {
-        arr.as_any()
-            .downcast_ref::<StructArray>()
-            .and_then(|s| s.nulls().cloned())
-    });
-
     let source_data: &dyn ProvidesColumnByName = match source_array {
         Some(ref array) => array
             .as_any()
@@ -202,16 +195,15 @@ fn evaluate_struct_patch_expression(
     for input_field in source_data.schema_fields() {
         let field_name: &str = input_field.name();
 
-        // Any field that isn't replaced passes through unchanged
         let field_patch = patch.field_patches.get(field_name);
-        if !field_patch.is_some_and(|t| t.is_replace) {
+        if field_patch.is_none_or(|patch| patch.keep_input) {
             output_cols.push(extract_column(source_data, &[field_name])?);
             let _ = next_output_type()?; // consume and discard the output schema field
         }
 
-        // Process any insertions that come after this field
+        // Process any insertions that come at or after this field's output position.
         if let Some(field_patch) = field_patch {
-            for expr in &field_patch.exprs {
+            for expr in &field_patch.insertions {
                 output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
             }
             used_field_patches += 1;
@@ -228,6 +220,11 @@ fn evaluate_struct_patch_expression(
         return Err(Error::generic(
             "Some non-optional field patches reference invalid input field names",
         ));
+    }
+
+    // Handle appends (insertions after all input fields and field-specific insertions)
+    for expr in &patch.appended_fields {
+        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
     }
 
     // Verify we consumed all output schema fields
@@ -247,6 +244,14 @@ fn evaluate_struct_patch_expression(
             )
         })
         .collect();
+
+    // For nested patches, get the source struct's null bitmap to preserve null rows
+    let source_null_buffer = source_array.as_ref().and_then(|arr| {
+        arr.as_any()
+            .downcast_ref::<StructArray>()
+            .and_then(|s| s.nulls().cloned())
+    });
+
     let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)?;
     Ok(Arc::new(data))
 }
@@ -1033,7 +1038,8 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr, ExpressionStructPatch,
+        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr,
+        ExpressionStructPatchBuilder,
     };
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1101,7 +1107,7 @@ mod tests {
         let batch = create_test_batch();
 
         // Test 1: Empty patch (identity) - should be exactly equal to input
-        let patch = ExpressionStructPatch::new_top_level();
+        let patch = ExpressionStructPatchBuilder::new().build().unwrap();
         let output_schema = StructType::new_unchecked(vec![
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
@@ -1122,7 +1128,9 @@ mod tests {
 
         // Test 2: Nested path identity (struct relocation without modification)
         let nested_batch = create_nested_test_batch();
-        let nested_patch = ExpressionStructPatch::new_nested(["nested"]);
+        let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
+            .build()
+            .unwrap();
 
         let nested_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -1162,15 +1170,18 @@ mod tests {
     fn test_field_operations_and_multiple_insertions() {
         let batch = create_test_batch();
 
-        let patch = ExpressionStructPatch::new_top_level()
+        let patch = ExpressionStructPatchBuilder::new()
             .with_replaced_field("a", column_expr_ref!("b"))
             .with_dropped_field("b")
-            .with_inserted_field(None::<&str>, Expr::literal(1).into())
-            .with_inserted_field(None::<&str>, Expr::literal(2).into())
-            .with_inserted_field(None::<&str>, column_expr_ref!("c"))
-            .with_inserted_field(Some("c"), Expr::literal(42).into())
-            .with_inserted_field(Some("c"), column_expr_ref!("a"))
-            .with_inserted_field(Some("c"), Expr::literal(99).into());
+            .with_prepended_field(Expr::literal(1).into())
+            .with_prepended_field(Expr::literal(2).into())
+            .with_prepended_field(column_expr_ref!("c"))
+            .with_inserted_field_after("c", Expr::literal(42).into())
+            .with_inserted_field_after("c", column_expr_ref!("a"))
+            .with_inserted_field_after("c", Expr::literal(99).into())
+            .with_appended_field(Expr::literal(7).into())
+            .build()
+            .unwrap();
 
         let output_schema = StructType::new_unchecked(vec![
             StructField::new("pre1", DataType::INTEGER, false), // prepend 1
@@ -1181,6 +1192,7 @@ mod tests {
             StructField::new("after_c1", DataType::INTEGER, false), // first insertion after c
             StructField::new("after_c2", DataType::INTEGER, false), // second insertion after c
             StructField::new("after_c3", DataType::INTEGER, false), // third insertion after c
+            StructField::new("append1", DataType::INTEGER, false), // true append
         ]);
 
         let expr = Expr::StructPatch(patch);
@@ -1188,7 +1200,7 @@ mod tests {
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
 
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 8);
+        assert_eq!(struct_result.num_columns(), 9);
         assert_eq!(struct_result.len(), 3);
 
         // Verify multiple prepends (in order)
@@ -1206,6 +1218,41 @@ mod tests {
         validate_i32_column(struct_result, 5, &[42, 42, 42]);
         validate_i32_column(struct_result, 6, &[1, 2, 3]); // original column a
         validate_i32_column(struct_result, 7, &[99, 99, 99]);
+
+        // Verify true appends come after field-specific insertions
+        validate_i32_column(struct_result, 8, &[7, 7, 7]);
+    }
+
+    #[test]
+    fn test_replacement_position_is_independent_of_registration_order() {
+        let batch = create_test_batch();
+
+        let patch = ExpressionStructPatchBuilder::new()
+            .with_inserted_field_after("a", Expr::literal(42).into())
+            .with_replaced_field("a", column_expr_ref!("b"))
+            .build()
+            .unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("after_a", DataType::INTEGER, false),
+            StructField::new("b", DataType::INTEGER, false),
+            StructField::new("c", DataType::INTEGER, false),
+        ]);
+
+        let expr = Expr::StructPatch(patch);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(struct_result, 0, &[10, 20, 30]); // replacement column b
+        validate_i32_column(struct_result, 1, &[42, 42, 42]); // insertion after replacement
+        validate_i32_column(struct_result, 2, &[10, 20, 30]); // original column b
+        validate_i32_column(struct_result, 3, &[100, 200, 300]); // original column c
     }
 
     #[test]
@@ -1213,7 +1260,9 @@ mod tests {
         let nested_batch = create_nested_test_batch();
 
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
-        let copy_patch = ExpressionStructPatch::new_nested(["nested"]);
+        let copy_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
+            .build()
+            .unwrap();
 
         let copy_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -1245,9 +1294,11 @@ mod tests {
         }
 
         // Test 2: Modify nested struct and relocate it
-        let modify_patch = ExpressionStructPatch::new_nested(["nested"])
+        let modify_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
             .with_replaced_field("x".to_string(), Expr::literal(777).into())
-            .with_inserted_field(Some("y"), Expr::literal(555).into());
+            .with_inserted_field_after("y", Expr::literal(555).into())
+            .build()
+            .unwrap();
 
         let modify_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
@@ -1285,8 +1336,10 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let patch = ExpressionStructPatch::new_top_level()
-            .with_replaced_field("missing", Expr::literal(1).into());
+        let patch = ExpressionStructPatchBuilder::new()
+            .with_replaced_field("missing", Expr::literal(1).into())
+            .build()
+            .unwrap();
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
@@ -1302,8 +1355,10 @@ mod tests {
             .contains("reference invalid input field names"));
 
         // Test unused insertion keys
-        let insertion_patch = ExpressionStructPatch::new_top_level()
-            .with_inserted_field(Some("nonexistent"), Expr::literal(1).into());
+        let insertion_patch = ExpressionStructPatchBuilder::new()
+            .with_inserted_field_after("nonexistent", Expr::literal(1).into())
+            .build()
+            .unwrap();
 
         let expr2 = Expr::StructPatch(insertion_patch);
         let result2 =
@@ -1315,7 +1370,10 @@ mod tests {
             .contains("reference invalid input field names"));
 
         // Test column count mismatch -- too many output schema fields
-        let drop_patch = ExpressionStructPatch::new_top_level().with_dropped_field("a");
+        let drop_patch = ExpressionStructPatchBuilder::new()
+            .with_dropped_field("a")
+            .build()
+            .unwrap();
 
         let wrong_output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER), // expects a field that was dropped
@@ -1333,7 +1391,10 @@ mod tests {
             .contains("Too many fields in output schema"));
 
         // Test column count mismatch -- too few output schema fields
-        let drop_patch = ExpressionStructPatch::new_top_level().with_dropped_field("a");
+        let drop_patch = ExpressionStructPatchBuilder::new()
+            .with_dropped_field("a")
+            .build()
+            .unwrap();
 
         let wrong_output_schema =
             StructType::new_unchecked(vec![StructField::not_null("c", DataType::INTEGER)]);
@@ -1348,7 +1409,7 @@ mod tests {
             .contains("Too few fields in output schema"));
 
         // Test missing output schema
-        let patch = ExpressionStructPatch::new_top_level();
+        let patch = ExpressionStructPatchBuilder::new().build().unwrap();
         let expr4 = Expr::StructPatch(patch);
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());
@@ -1359,9 +1420,38 @@ mod tests {
     }
 
     #[test]
+    fn test_replacement_occupies_field_position() {
+        let batch = create_test_batch();
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+
+        let patch = ExpressionStructPatchBuilder::new()
+            .with_replaced_field("a", Expr::literal(1).into())
+            .build()
+            .unwrap();
+        let expr = Expr::StructPatch(patch);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema.clone()))),
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[1, 1, 1]);
+        validate_i32_column(result, 1, &[10, 20, 30]);
+        validate_i32_column(result, 2, &[100, 200, 300]);
+    }
+
+    #[test]
     fn test_drop_field_if_exists_present() {
         let batch = create_test_batch();
-        let patch = ExpressionStructPatch::new_top_level().with_dropped_field_if_exists("a");
+        let patch = ExpressionStructPatchBuilder::new()
+            .with_dropped_field_if_exists("a")
+            .build()
+            .unwrap();
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("b", DataType::INTEGER),
             StructField::not_null("c", DataType::INTEGER),
@@ -1377,8 +1467,10 @@ mod tests {
     #[test]
     fn test_drop_field_if_exists_missing() {
         let batch = create_test_batch();
-        let patch =
-            ExpressionStructPatch::new_top_level().with_dropped_field_if_exists("nonexistent");
+        let patch = ExpressionStructPatchBuilder::new()
+            .with_dropped_field_if_exists("nonexistent")
+            .build()
+            .unwrap();
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
@@ -1396,7 +1488,10 @@ mod tests {
     #[test]
     fn test_drop_field_non_optional_missing_still_errors() {
         let batch = create_test_batch();
-        let patch = ExpressionStructPatch::new_top_level().with_dropped_field("nonexistent");
+        let patch = ExpressionStructPatchBuilder::new()
+            .with_dropped_field("nonexistent")
+            .build()
+            .unwrap();
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
@@ -1669,11 +1764,15 @@ mod tests {
         let nested_batch = create_nested_test_batch();
 
         // Simple nested patch - replace a field in the nested struct
-        let nested_patch = ExpressionStructPatch::new_nested(["nested"])
-            .with_replaced_field("x", Expr::literal(999).into());
+        let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
+            .with_replaced_field("x", Expr::literal(999).into())
+            .build()
+            .unwrap();
 
-        let outer_patch = ExpressionStructPatch::new_top_level()
-            .with_inserted_field(Some("a"), Expr::StructPatch(nested_patch).into());
+        let outer_patch = ExpressionStructPatchBuilder::new()
+            .with_inserted_field_after("a", Expr::StructPatch(nested_patch).into())
+            .build()
+            .unwrap();
 
         let nested_output_schema = StructType::new_unchecked(vec![
             StructField::not_null("x", DataType::INTEGER),

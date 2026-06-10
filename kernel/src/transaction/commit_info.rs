@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::Transaction;
 use crate::actions::{get_log_commit_info_schema, CommitInfo, COMMIT_INFO_NAME};
-use crate::expressions::{ExpressionStructPatch, MapData, Scalar};
+use crate::expressions::{ExpressionStructPatchBuilder, MapData, Scalar};
 use crate::schema::{MapType, StructField, StructType, ToSchema};
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
 
@@ -91,13 +91,8 @@ impl<S> Transaction<S> {
                 // Step 2: Build literal expressions for each CommitInfo field.
                 let literal_exprs = commit_info_literal_exprs(kernel_commit_info)?;
 
-                // Step 3: Build ExpressionStructPatch. Replacements must be registered before
-                // insertions so that for the last engine field (which may itself be
-                // replaced), exprs is ordered as [replace_expr, insert_exprs...].
-                // The evaluator emits exprs in declaration order, so the replace
-                // value must come first.
-                let last_engine_field = engine_commit_info_schema.field_names().last().cloned();
-                let mut patch = ExpressionStructPatch::new_top_level();
+                // Step 3: Build ExpressionStructPatch.
+                let mut patch = ExpressionStructPatchBuilder::new();
 
                 // First pass: replace fields that already exist in the engine schema.
                 for (field_name, expr_ref) in &literal_exprs {
@@ -108,8 +103,7 @@ impl<S> Transaction<S> {
                 // Second pass: append kernel-only fields after the last engine field.
                 for (field_name, expr_ref) in &literal_exprs {
                     if !engine_commit_info_schema.contains(*field_name) {
-                        patch = patch
-                            .with_inserted_field(last_engine_field.as_deref(), expr_ref.clone());
+                        patch = patch.with_appended_field(expr_ref.clone());
                     }
                 }
 
@@ -117,7 +111,7 @@ impl<S> Transaction<S> {
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
                 // with the None branch which uses `get_log_commit_info_schema()`.
                 let wrapped_expr =
-                    Expression::struct_from([Arc::new(Expression::struct_patch(patch))]);
+                    Expression::struct_from([Arc::new(Expression::struct_patch(patch)?)]);
                 let wrapped_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
                     COMMIT_INFO_NAME,
                     output_schema,

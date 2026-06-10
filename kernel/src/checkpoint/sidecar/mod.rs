@@ -5,7 +5,7 @@ use itertools::Itertools;
 use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::filter_by_predicate;
-use crate::expressions::{Expression, ExpressionStructPatch, Predicate, Scalar, StructData};
+use crate::expressions::{Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta,
@@ -203,7 +203,7 @@ impl SidecarSplitter {
         let non_file_action_nullifier = eval_handler.new_expression_evaluator(
             checkpoint_data_schema.clone(),
             Arc::new(Expression::struct_patch(
-                ExpressionStructPatch::new_top_level()
+                ExpressionStructPatchBuilder::new()
                     .with_replaced_field(
                         ADD_NAME,
                         Arc::new(Expression::literal(Scalar::Null(
@@ -216,7 +216,7 @@ impl SidecarSplitter {
                             remove_field.data_type.clone(),
                         ))),
                     ),
-            )),
+            )?),
             checkpoint_data_schema.clone().into(),
         )?;
 

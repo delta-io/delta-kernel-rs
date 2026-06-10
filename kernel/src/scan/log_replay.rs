@@ -1144,11 +1144,12 @@ mod tests {
 
             // With sparse patches, we expect only one insertion for the partition column.
             assert!(patch.prepended_fields.is_empty());
+            assert!(patch.appended_fields.is_empty());
             let mut field_patches = patch.field_patches.iter();
             let (field_name, field_patch) = field_patches.next().unwrap();
             assert_eq!(field_name, "value");
-            assert!(!field_patch.is_replace);
-            let [expr] = &field_patch.exprs[..] else {
+            assert!(field_patch.keep_input);
+            let [expr] = &field_patch.insertions[..] else {
                 panic!("Expected a single insertion");
             };
             let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {
@@ -1231,10 +1232,10 @@ mod tests {
                     .field_patches
                     .get("row_id_col")
                     .expect("Should have row_id_col patch");
-                assert!(row_id_patch.is_replace);
-                assert_eq!(row_id_patch.exprs.len(), 1);
-                let expr = &row_id_patch.exprs[0];
-                let expeceted_expr = Arc::new(Expr::coalesce([
+                assert!(!row_id_patch.keep_input);
+                assert_eq!(row_id_patch.insertions.len(), 1);
+                let expr = &row_id_patch.insertions[0];
+                let expected_expr = Arc::new(Expr::coalesce([
                     Expr::column(["row_id_col"]),
                     Expr::binary(
                         BinaryExpressionOp::Plus,
@@ -1242,7 +1243,7 @@ mod tests {
                         Expr::column(["row_indexes_for_row_id_0"]),
                     ),
                 ]));
-                assert_eq!(expr, &expeceted_expr);
+                assert_eq!(expr, &expected_expr);
             } else {
                 panic!("Should have been a StructPatch expression");
             }
@@ -1748,11 +1749,12 @@ mod tests {
             Expression::StructPatch(p) => {
                 p.prepended_fields
                     .iter()
+                    .chain(p.appended_fields.iter())
                     .map(|e| count_to_json(e))
                     .sum::<usize>()
                     + p.field_patches
                         .values()
-                        .flat_map(|fp| fp.exprs.iter())
+                        .flat_map(|fp| fp.insertions.iter())
                         .map(|e| count_to_json(e))
                         .sum::<usize>()
             }

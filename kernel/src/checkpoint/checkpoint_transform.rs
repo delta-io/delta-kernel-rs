@@ -16,7 +16,9 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
-use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatch, UnaryExpressionOp};
+use crate::expressions::{
+    Expression, ExpressionRef, ExpressionStructPatchBuilder, UnaryExpressionOp,
+};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
@@ -81,17 +83,18 @@ pub(crate) fn build_checkpoint_transform(
     config: &StatsTransformConfig,
     stats_schema: &SchemaRef,
     partition_schema: Option<&SchemaRef>,
-) -> ExpressionRef {
-    let mut add_patch = ExpressionStructPatch::new_nested([ADD_NAME]);
+) -> DeltaResult<ExpressionRef> {
+    let mut patch_builder = ExpressionStructPatchBuilder::new();
 
     // Handle stats field
     if config.write_stats_as_json {
         // Populate stats from stats_parsed if needed (for old checkpoints that only had
         // stats_parsed)
-        add_patch = add_patch.with_replaced_field(STATS_FIELD, STATS_JSON_EXPR.clone());
+        patch_builder =
+            patch_builder.with_replaced_field_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
     } else {
         // Drop stats field when not writing as JSON
-        add_patch = add_patch.with_dropped_field(STATS_FIELD);
+        patch_builder = patch_builder.with_dropped_field_at([ADD_NAME], STATS_FIELD);
     }
 
     // Handle stats_parsed field
@@ -100,30 +103,30 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_struct {
         // Populate stats_parsed from JSON stats (for commits that only have JSON stats)
         let stats_parsed_expr = build_stats_parsed_expr(stats_schema);
-        add_patch = add_patch.with_replaced_field(STATS_PARSED_FIELD, stats_parsed_expr);
+        patch_builder =
+            patch_builder.with_replaced_field_at([ADD_NAME], STATS_PARSED_FIELD, stats_parsed_expr);
     } else {
         // Drop stats_parsed field when not writing as struct
-        add_patch = add_patch.with_dropped_field(STATS_PARSED_FIELD);
+        patch_builder = patch_builder.with_dropped_field_at([ADD_NAME], STATS_PARSED_FIELD);
     }
 
     // Handle partitionValues_parsed field (only for partitioned tables)
     if partition_schema.is_some() {
         if config.write_stats_as_struct {
             let pv_parsed_expr = build_partition_values_parsed_expr();
-            add_patch =
-                add_patch.with_replaced_field(PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
+            patch_builder = patch_builder.with_replaced_field_at(
+                [ADD_NAME],
+                PARTITION_VALUES_PARSED_FIELD,
+                pv_parsed_expr,
+            );
         } else {
             // Drop partitionValues_parsed since it was added to read schema
-            add_patch = add_patch.with_dropped_field(PARTITION_VALUES_PARSED_FIELD);
+            patch_builder =
+                patch_builder.with_dropped_field_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD);
         }
     }
 
-    // Wrap the nested Add patch in a top-level patch that replaces the Add field.
-    let add_patch_expr: ExpressionRef = Arc::new(Expression::struct_patch(add_patch));
-    let outer_patch =
-        ExpressionStructPatch::new_top_level().with_replaced_field(ADD_NAME, add_patch_expr);
-
-    Arc::new(Expression::struct_patch(outer_patch))
+    Ok(Arc::new(Expression::struct_patch(patch_builder)?))
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
@@ -319,6 +322,7 @@ fn build_add_output_schema(
 mod tests {
     use super::*;
     use crate::actions::NUM_RECORDS;
+    use crate::expressions::ExpressionStructPatch;
 
     #[test]
     fn test_config_defaults() {
@@ -358,15 +362,13 @@ mod tests {
             .field_patches
             .get(ADD_NAME)
             .expect("Outer patch should have 'add' field patch");
-        assert!(add_field_patch.is_replace, "Should replace 'add' field");
-        assert_eq!(
-            add_field_patch.exprs.len(),
-            1,
-            "Should have exactly one replacement expression"
+        assert!(
+            !add_field_patch.keep_input && !add_field_patch.insertions.is_empty(),
+            "Should replace 'add' field"
         );
 
         // Extract inner patch
-        let Expression::StructPatch(inner) = add_field_patch.exprs[0].as_ref() else {
+        let Expression::StructPatch(inner) = add_field_patch.insertions[0].as_ref() else {
             panic!("Expected inner StructPatch expression for 'add' field");
         };
 
@@ -385,8 +387,7 @@ mod tests {
         patch
             .field_patches
             .get(field)
-            .map(|ft| ft.is_replace && ft.exprs.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|ft| !ft.keep_input && ft.insertions.is_empty())
     }
 
     /// Helper to check if a field patch is a replacement with an expression.
@@ -394,8 +395,7 @@ mod tests {
         patch
             .field_patches
             .get(field)
-            .map(|ft| ft.is_replace && ft.exprs.len() == 1)
-            .unwrap_or(false)
+            .is_some_and(|ft| !ft.keep_input && !ft.insertions.is_empty())
     }
 
     #[test]
@@ -407,7 +407,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
+        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None).unwrap();
 
         let (_, inner) = extract_patches(&transform_expr);
 
@@ -433,7 +433,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
+        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None).unwrap();
 
         let (_, inner) = extract_patches(&transform_expr);
 
@@ -454,7 +454,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
+        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None).unwrap();
 
         let (_, inner) = extract_patches(&transform_expr);
 
@@ -478,7 +478,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
+        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None).unwrap();
 
         let (_, inner) = extract_patches(&transform_expr);
 
@@ -504,7 +504,8 @@ mod tests {
             StructField::nullable("year", DataType::INTEGER),
             StructField::nullable("month", DataType::INTEGER),
         ]));
-        let transform_expr = build_checkpoint_transform(&config, &stats_schema, Some(&pv_schema));
+        let transform_expr =
+            build_checkpoint_transform(&config, &stats_schema, Some(&pv_schema)).unwrap();
 
         let (_, inner) = extract_patches(&transform_expr);
 
@@ -527,7 +528,8 @@ mod tests {
             "year",
             DataType::INTEGER,
         )]));
-        let transform_expr = build_checkpoint_transform(&config, &stats_schema, Some(&pv_schema));
+        let transform_expr =
+            build_checkpoint_transform(&config, &stats_schema, Some(&pv_schema)).unwrap();
 
         let (_, inner) = extract_patches(&transform_expr);
 
@@ -546,7 +548,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None);
+        let transform_expr = build_checkpoint_transform(&config, &stats_schema, None).unwrap();
 
         let (_, inner) = extract_patches(&transform_expr);
 
