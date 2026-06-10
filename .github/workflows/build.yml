@@ -186,6 +186,10 @@ jobs:
         run: cargo clippy --locked --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
       - name: lint without default features - packages which don't depend on kernel with features enabled
         run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
+      - name: check kernel declarative-plans feature-only build
+        run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans
+      - name: lint kernel declarative-plans feature-only build
+        run: cargo clippy --locked -p delta_kernel --no-default-features --features declarative-plans --tests -- -D warnings
       - name: check kernel builds with default-engine-native-tls
         run: cargo build --locked -p feature_tests --features default-engine-native-tls
       - name: test native-tls backend has no crypto provider conflict
@@ -229,8 +233,8 @@ jobs:
         shell: bash
         run: |
           output=$(cargo run --profile test --example metrics-tester)
-          echo "$output" | grep -q 'invalid_field'
-          echo "$output" | grep -q 'Invalid uuid'
+          grep -q 'invalid_field' <<< "$output"
+          grep -q 'Invalid uuid' <<< "$output"
 
   ffi_test:
     runs-on: ${{ matrix.os }}

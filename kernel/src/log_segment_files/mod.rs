@@ -158,7 +158,7 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 /// Compaction and checkpoint files are skipped when empty -- they have fallbacks
 /// (individual commits, older checkpoints). Commit and CRC files are kept even
 /// if empty; the warning ensures the corrupt file is identifiable in logs.
-fn should_process_log_file(file: &ParsedLogPath) -> bool {
+pub(crate) fn should_process_log_file(file: &ParsedLogPath) -> bool {
     if file.location.size > 0 {
         return true;
     }

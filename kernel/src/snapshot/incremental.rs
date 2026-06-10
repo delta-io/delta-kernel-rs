@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
-use crate::crc::{read_crc_file_or_none, Crc};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::MetricId;
@@ -89,6 +88,7 @@ impl Snapshot {
         engine: &dyn Engine,
         target_version: impl Into<Option<Version>>,
         operation_id: MetricId,
+        incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Arc<Self>> {
         let existing_log_segment = &existing_snapshot.log_segment;
         let existing_snapshot_version = existing_snapshot.version();
@@ -173,15 +173,15 @@ impl Snapshot {
             if new_checkpoint_version > existing_snapshot_version {
                 // Case D.1: checkpoint ahead of existing snapshot. Commits between
                 // existing_snapshot_version+1 and new_checkpoint_version were filtered out
-                // of the listing, so a full rebuild is required. The new segment's CRC (if
-                // any) is read fresh; the existing snapshot's CRC is older than the new
-                // checkpoint and cannot apply.
+                // of the listing, so a full rebuild is required. The existing snapshot's CRC
+                // is older than the new checkpoint and cannot apply, but a fresh on-disk CRC
+                // at or above the new checkpoint still advances per `incremental_replay`.
                 let snapshot = Self::try_new_from_log_segment(
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
                     engine,
                     operation_id,
-                    IncrementalReplay::Disabled,
+                    incremental_replay,
                 );
                 return Ok(Arc::new(snapshot?));
             }
@@ -233,26 +233,8 @@ impl Snapshot {
             .ascending_compaction_files
             .retain(|log_path| existing_snapshot_version < log_path.version);
 
-        // `crc_file` is the CRC for the combined segment; `resolved_crc` is the read CRC
-        // (`None` when only a stale CRC applies).
-        let (crc_file, resolved_crc) = Self::resolve_crc(
-            &new_log_segment,
-            existing_log_segment,
-            existing_snapshot.crc(),
-            engine,
-        );
-
-        // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
-        // checkpoint. The existing snapshot supplies the P&M baseline.
-        let (new_metadata, new_protocol) = new_log_segment
-            .segment_after_version(existing_snapshot_version)
-            .read_protocol_metadata_opt(engine)?;
-        let table_configuration = TableConfiguration::try_new_from(
-            existing_snapshot.table_configuration(),
-            new_metadata,
-            new_protocol,
-            new_log_segment.end_version,
-        )?;
+        // The CRC file the combined segment carries on disk.
+        let crc_file = Self::resolve_crc_file(&new_log_segment, existing_log_segment);
 
         // Combine existing and new log segments. When the new listing found a checkpoint at or
         // below the existing snapshot version, trim existing commits and compaction files
@@ -309,14 +291,46 @@ impl Snapshot {
             new_checkpoint_schema,
         )?;
 
+        // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
+        // on-disk CRC the combined segment carries) to the new end version, subject to
+        // `incremental_replay`.
+        let crc = combined_log_segment.try_build_incremental_crc_with_base(
+            engine,
+            existing_snapshot.crc(),
+            incremental_replay,
+        )?;
+
+        let existing_table_config = existing_snapshot.table_configuration();
+        let (new_metadata, new_protocol) = match &crc {
+            Some(crc) => {
+                // If we were able to build a new CRC, then re-use it for TableConfiguration
+                // creation.
+                let new_metadata = (crc.metadata != *existing_table_config.metadata())
+                    .then(|| crc.metadata.clone());
+                let new_protocol = (crc.protocol != *existing_table_config.protocol())
+                    .then(|| crc.protocol.clone());
+                (new_metadata, new_protocol)
+            }
+            None => {
+                // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
+                // scanned any log files). Perform normal P & M replay.
+                combined_log_segment
+                    .segment_after_version(existing_snapshot_version)
+                    .read_protocol_metadata_opt(engine)?
+            }
+        };
+        let table_configuration = TableConfiguration::try_new_from(
+            existing_table_config,
+            new_metadata,
+            new_protocol,
+            new_end_version,
+        )?;
+
         tracing::Span::current().record("version", table_configuration.version());
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
-            // The snapshot holds a CRC only when it is at the new end version.
-            // TODO(#2674): advance the existing snapshot's CRC over the new tail commits instead
-            //              of dropping a stale one and falling back to full log replay.
-            resolved_crc.filter(|c| c.version == new_end_version),
+            crc,
         )?))
     }
 
@@ -324,26 +338,16 @@ impl Snapshot {
     // Helpers
     // ============================================================================
 
-    /// Determine the CRC file for the combined segment and eagerly read the CRC for an
-    /// incremental snapshot update.
+    /// Determine the on-disk CRC file the combined segment should carry.
     ///
-    /// The CRC file prefers the new segment's CRC; it falls back to the existing segment's CRC
-    /// if and only if its version is >= the new segment's checkpoint version. This preserves
-    /// the [`LogSegmentFiles`] invariant `crc.version >= checkpoint.version`.
-    ///
-    /// The returned `Crc` is read when the resolved CRC file is newer than
-    /// `existing_snapshot_version` (currently unused; see #2674) or at the new end version (which
-    /// backs the new snapshot). An older CRC can do neither, so it is left unread and only
-    /// contributes its path to the combined segment. When the resolved CRC is the one
-    /// `existing_crc` already holds, it is reused instead of re-read.
-    fn resolve_crc(
+    /// Prefers the new segment's CRC; falls back to the existing segment's CRC if and only if
+    /// its version is >= the new segment's checkpoint version, so the fallback never violates the
+    /// [`LogSegmentFiles`] invariant `crc.version >= checkpoint.version` (enforced in
+    /// [`LogSegment::try_new`]).
+    fn resolve_crc_file(
         new_log_segment: &LogSegment,
         existing_log_segment: &LogSegment,
-        existing_crc: Option<&Arc<Crc>>,
-        engine: &dyn Engine,
-    ) -> (Option<ParsedLogPath>, Option<Arc<Crc>>) {
-        let existing_snapshot_version = existing_log_segment.end_version;
-        let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
+    ) -> Option<ParsedLogPath> {
         let crc_satisfies_new_ckpt = |crc: &ParsedLogPath| {
             new_log_segment
                 .checkpoint_version
@@ -354,21 +358,11 @@ impl Snapshot {
             .latest_crc_file
             .clone()
             .filter(crc_satisfies_new_ckpt);
-        let crc_file = new_crc_file.or(existing_crc_file);
-
-        let crc = crc_file
-            .as_ref()
-            .filter(|f| {
-                f.version > existing_snapshot_version || f.version == new_log_segment.end_version
-            })
-            .and_then(|resolved| {
-                // Reuse the existing snapshot's CRC on a same-version refresh (Case D.2).
-                existing_crc
-                    .filter(|c| c.version == resolved.version)
-                    .map(Arc::clone)
-                    .or_else(|| read_crc_file_or_none(engine, resolved))
-            });
-        (crc_file, crc)
+        new_log_segment
+            .listed
+            .latest_crc_file
+            .clone()
+            .or(existing_crc_file)
     }
 
     /// Filters `files` to only those with version above `checkpoint_version`, or clones all if
@@ -550,6 +544,7 @@ mod tests {
             &engine,
             None,
             MetricId::default(),
+            IncrementalReplay::Disabled,
         )?;
         assert_eq!(result, base_snapshot);
 
@@ -626,6 +621,7 @@ mod tests {
             &engine,
             Some(2),
             MetricId::default(),
+            IncrementalReplay::Disabled,
         )?;
 
         // Latest commit should now be version 2
@@ -683,6 +679,7 @@ mod tests {
             &engine,
             Some(1),
             MetricId::default(),
+            IncrementalReplay::Disabled,
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
@@ -693,6 +690,7 @@ mod tests {
             &engine,
             Some(0),
             MetricId::default(),
+            IncrementalReplay::Disabled,
         );
         assert!(matches!(
             older_version,
@@ -1106,27 +1104,24 @@ mod tests {
     // Tests: stale-CRC resolution on the incremental path
     // ============================================================================
 
-    // `resolve_crc` when the new listing discovers a checkpoint *at or below* the existing
-    // snapshot version must correctly decide which CRC file the combined segment carries, and
-    // whether the resolved CRC is at the snapshot version (and thus stored on the snapshot).
+    // `resolve_crc_file` when the new listing discovers a checkpoint *at or below* the existing
+    // snapshot version must correctly decide which CRC file the combined segment carries on disk.
     // Each case below sets up commits 0-3, writes an existing CRC, builds snapshot_v3, writes
     // a checkpoint, optionally writes a new CRC, then runs the incremental update and checks
-    // the outcome. (The checkpoint-*ahead* path is covered separately by
+    // the segment's `latest_crc_file`. (The checkpoint-*ahead* path is covered separately by
     // `test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc`.)
     //
-    // The snapshot ends at version 3, so `crc()` is `Some` only when the resolved CRC file is
-    // at version 3; an older resolved CRC still appears as the segment's `latest_crc_file`.
+    // The update lands at the same version (v3), so the existing snapshot's in-memory crc@v3
+    // always carries forward; only the on-disk `latest_crc_file` differs per case.
     //
     // Cases:
     //   keep_existing:    existing crc@v2 stays when new ckpt@v1 is below it (invariant OK)
-    //                     and no newer CRC was listed; segment carries crc@v2 but it is stale
-    //                     relative to v3, so `crc()` is None.
-    //   refresh_to_newer: existing crc@v2 is superseded by a newly-listed crc@v3; the new CRC
-    //                     is at v3, so `crc()` is Some(v3).
+    //                     and no newer CRC was listed; segment carries crc@v2.
+    //   refresh_to_newer: existing crc@v2 is superseded by a newly-listed crc@v3.
     //   crc_equals_ckpt:  existing crc@v2 and new ckpt@v2 sit at the same version; sanity
     //                     coverage for the invariant boundary `crc.version >= ckpt.version`.
     //   drop_below_ckpt:  existing crc@v1 would violate the LogSegmentFiles invariant with
-    //                     new ckpt@v2 (1 < 2), so it is filtered out; result has no CRC.
+    //                     new ckpt@v2 (1 < 2), so it is filtered out; segment has no CRC file.
     #[rstest]
     #[case::keep_existing(2, 1, None, Some(2))]
     #[case::refresh_to_newer(2, 1, Some(3), Some(3))]
@@ -1199,22 +1194,61 @@ mod tests {
                 .map(|f| f.version),
             expected_crc_file_v
         );
-        // The snapshot stores the CRC only when the resolved CRC file is at the snapshot
-        // version (3); an older resolved CRC is carried in the segment but not stored.
+        assert_eq!(updated.crc().map(|c| c.version), Some(3));
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::disabled(IncrementalReplay::Disabled, None)]
+    #[case::unlimited(IncrementalReplay::Unlimited, Some(5))]
+    #[case::budget_exact(IncrementalReplay::UpToCommits(2), Some(5))]
+    #[case::budget_more_than_enough(IncrementalReplay::UpToCommits(5), Some(5))]
+    #[case::budget_too_small(IncrementalReplay::UpToCommits(1), None)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_update_advances_in_memory_crc_within_budget(
+        #[case] mode: IncrementalReplay,
+        #[case] expected_crc_v: Option<u64>,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
+        ctx.store
+            .put(
+                &delta_path_for_version(1, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+
+        let snapshot_a = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_a.crc().map(|c| c.version), Some(3));
+
+        let updated = Snapshot::builder_from(snapshot_a)
+            .with_incremental_crc_replay(mode)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(updated.version(), 5);
+        assert_eq!(updated.crc().map(|c| c.version), expected_crc_v);
         assert_eq!(
-            updated.crc().map(|c| c.version),
-            expected_crc_file_v.filter(|&v| v == updated.version())
+            updated
+                .log_segment
+                .listed
+                .latest_crc_file
+                .as_ref()
+                .map(|f| f.version),
+            Some(1)
         );
 
         Ok(())
     }
 
-    // Stronger regression for the `resolve_crc` invariant filter: set up a metadata change
+    // Stronger regression for the `resolve_crc_file` invariant filter: set up a metadata change
     // at the checkpoint version so that a stale inherited CRC would produce wrong
     // Metadata, not just wrong bookkeeping. Without the filter, the incremental update
-    // would return Metadata from commit 0 (via Case 2(b) fallback on a below-checkpoint
-    // CRC); the fresh rebuild would return Metadata from commit 2. `compare_snapshots`
-    // catches that on `table_configuration`.
+    // would inherit the below-checkpoint CRC and return Metadata from commit 0; the fresh
+    // rebuild would return Metadata from commit 2. `compare_snapshots` catches that on
+    // `table_configuration`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata(
     ) -> DeltaResult<()> {
@@ -1279,9 +1313,8 @@ mod tests {
             .checkpoint(ctx.engine.as_ref(), None)?;
 
         // Incremental update. With the filter: CRC@v1 dropped, log replay via checkpoint@v2
-        // returns the correct new metadata. Without the filter: Case 2(b) fallback returns
-        // CRC@v1's stale (empty) configuration, and compare_snapshots fails on
-        // table_configuration.
+        // returns the correct new metadata. Without the filter: the inherited CRC@v1 returns
+        // its stale (empty) configuration, and compare_snapshots fails on table_configuration.
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
         compare_snapshots(&updated, &fresh);
@@ -1368,7 +1401,7 @@ mod tests {
 
         // Incremental update. The pruned replay on commits > 3 is empty. With the stale-
         // CRC skip, the replay returns (None, None) and `TableConfiguration::try_new_from`
-        // preserves existing P&M. Without the skip, Case 2(b) would load CRC@v1's stale
+        // preserves existing P&M. Without the skip, the inherited CRC@v1 would load its stale
         // metadata and overwrite the existing (correct) v2 configuration.
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
@@ -1494,8 +1527,8 @@ mod tests {
 
         // Test CRC handling during incremental snapshot update (v0 -> v1).
         // The new log listing starts at v1, so the new log segment doesn't find 0.crc.
-        // a) Only 0.crc exists: resolve_crc falls back to old segment's 0.crc.
-        // b) Both 0.crc and 1.crc exist: resolve_crc picks up 1.crc.
+        // a) Only 0.crc exists: resolve_crc_file falls back to old segment's 0.crc.
+        // b) Both 0.crc and 1.crc exist: resolve_crc_file picks up 1.crc.
         let crc = json!({
             "table_size_bytes": 100,
             "num_files": 1,
@@ -1529,7 +1562,7 @@ mod tests {
             0
         );
 
-        // b) both 0.crc and 1.crc exist -- resolve_crc picks up 1.crc
+        // b) both 0.crc and 1.crc exist; resolve_crc_file picks up 1.crc
         let path = delta_path_for_version(1, "crc");
         let crc = json!({
             "table_size_bytes": 100,

@@ -9,6 +9,7 @@
 use std::marker::PhantomData;
 
 use crate::committer::Committer;
+use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::transaction::{AlterTable, Transaction};
@@ -47,6 +48,7 @@ impl AlterTableTransaction {
 
         Ok(Transaction {
             span,
+            operation_id: MetricId::new(),
             read_snapshot_opt: Some(read_snapshot),
             effective_table_config,
             should_emit_protocol: false,

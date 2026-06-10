@@ -38,6 +38,7 @@ pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::actions::DomainMetadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
 use crate::transaction::{CreateTable, Transaction};
@@ -150,6 +151,7 @@ impl CreateTableTransaction {
         );
         Ok(Transaction {
             span,
+            operation_id: MetricId::new(),
             read_snapshot_opt: None,
             effective_table_config,
             should_emit_protocol: true,
