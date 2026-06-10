@@ -4,11 +4,11 @@
 //! strings in table metadata. This module turns those strings into kernel [`Expression`] values
 //! so the kernel can interpret them without depending on a full SQL parser.
 //!
-//! [`parse_sql`] classifies its input into a small [`SqlForm`] discriminator and dispatches to
-//! a form-specific handler. New SQL forms (operators, casts, column references) are added as
-//! new [`SqlForm`] variants, keeping the literal path and the function-call path isolated.
+//! This is an intentionally light start: a small internal parser covering only the literal forms
+//! Delta metadata contains today. If the supported SQL surface grows, options include moving
+//! parsing behind the [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 
-// `parse_sql` has no in-crate caller yet -- it will be wired up by the column-defaults work
+// `parse_sql` has no in-crate caller yet; it will be wired up by the column-defaults work
 // (#2630).
 #![allow(dead_code)]
 
@@ -18,159 +18,44 @@ use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
 
-/// High-level syntactic shape of a SQL input. Adding a new SQL form means adding a variant here
-/// and an arm in [`parse_sql`].
-enum SqlForm<'a> {
-    /// `NULL` (case-insensitive). Valid for any data type.
-    Null,
-    /// `name(args)` -- a function-call envelope. The body of `args` is not parsed at
-    /// classification time; the per-function handler chooses how to interpret it.
-    FunctionCall { name: &'a str, args: &'a str },
-    /// Input has the *shape* of a literal we know (quoted string, hex binary, boolean,
-    /// numeric, or typed-literal prefix). Value parsing and shape-vs-target-type checks
-    /// happen in [`parse_literal`].
-    Literal,
-    /// Input does not match any SQL form this parser recognises today (e.g. bare identifiers,
-    /// arithmetic, casts, anything with operators).
-    Unknown,
-}
-
-/// Parse a SQL string into an [`Expression`] which yields a value of the given [`DataType`].
-///
-/// The caller supplies the expected `DataType` (e.g. the type of the column whose default is
-/// being parsed), and the parser produces an expression that yields a value of that exact type
-/// or returns an error.
-///
-/// Dispatch is performed on the *shape* of the SQL input ([`SqlForm`]) before consulting the
-/// target type, so that adding new SQL forms (function calls, casts, operators) does not require
-/// touching the literal path.
+/// Parse a SQL string into an [`Expression`] that yields a value of the given [`DataType`]
+/// (e.g. the type of the column whose default is being parsed).
 ///
 /// # Accepted grammar
 ///
 /// Leading and trailing whitespace are ignored. Keywords (`NULL`, `TRUE`, `FALSE`, `DATE`,
 /// `TIMESTAMP`, `X`) are case-insensitive.
 ///
-/// - `NULL` -- valid for any data type
+/// - `NULL`: valid for any data type
 /// - String: `'foo'`, with `''` interpreted as an embedded single quote
-/// - Boolean: `TRUE` / `FALSE`
 /// - Integer / Long / Short / Byte / Float / Double / Decimal: bare numeric literal with optional
 ///   leading `+` or `-`
+/// - Boolean: `TRUE` / `FALSE`
 /// - Date: `'2024-01-01'` or `DATE '2024-01-01'`
-/// - Timestamp / TimestampNtz: `'2024-01-01 12:00:00[.fff]'` or `TIMESTAMP '...'`. `Timestamp`
-///   additionally accepts ISO 8601 / RFC 3339 form (e.g. `'1970-01-01T00:00:00.123Z'`);
-///   `TimestampNtz` does not.
+/// - Timestamp / TimestampNtz: `'2024-01-01 12:00:00[.fff]'` or `TIMESTAMP '...'`. `Timestamp` also
+///   accepts ISO 8601 / RFC 3339 form (e.g. `'1970-01-01T00:00:00.123Z'`); `TimestampNtz` does not.
 /// - Binary: `X'deadbeef'` (even number of hex digits)
 ///
 /// # Errors
 ///
-/// Returns an error if the input cannot be parsed as a SQL form this parser accepts, or if the
-/// parsed value is not compatible with `data_type` (incompatible type, out of range, etc.).
+/// Returns an error if the input is not a SQL form this parser accepts, or if the parsed value
+/// is not compatible with `data_type` (incompatible type, out of range, etc.).
 pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
         return Err(Error::generic("empty SQL literal"));
     }
-    match classify(trimmed) {
-        SqlForm::Null => Ok(Expression::literal(Scalar::Null(data_type.clone()))),
-        SqlForm::FunctionCall { name, args } => parse_function_call(name, args, data_type, sql),
-        SqlForm::Literal => parse_literal(trimmed, data_type, sql),
-        SqlForm::Unknown => Err(Error::generic(format!("not a recognised SQL form: {sql}"))),
-    }
-}
-
-/// Classify the trimmed SQL input by syntactic shape. Function-call recognition is intentionally
-/// permissive: it requires only an identifier-shaped prefix followed by a parenthesised tail
-/// spanning to the end of the input. The function handler validates the contents of `args`.
-/// Inputs that are neither `NULL`, a function call, nor literal-shaped fall into
-/// [`SqlForm::Unknown`].
-fn classify(trimmed: &str) -> SqlForm<'_> {
+    // NULL is valid for any data type, including non-primitive ones.
     if trimmed.eq_ignore_ascii_case("null") {
-        return SqlForm::Null;
+        return Ok(Expression::literal(Scalar::Null(data_type.clone())));
     }
-    if let Some(open) = trimmed.find('(') {
-        let name = trimmed[..open].trim();
-        let mut chars = name.chars();
-        let is_identifier = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if is_identifier {
-            if let Some(args) = trimmed[open + 1..].strip_suffix(')') {
-                return SqlForm::FunctionCall {
-                    name,
-                    args: args.trim(),
-                };
-            }
-        }
-    }
-    if is_literal_shaped(trimmed) {
-        SqlForm::Literal
-    } else {
-        SqlForm::Unknown
-    }
+    // TODO(#2630): support SQL function calls (e.g. `current_date()`) when column defaults
+    // need them.
+    parse_literal(trimmed, data_type, sql)
 }
 
-/// Recognise the *shape* of a SQL literal we know how to parse. This is a fast prefix check, not
-/// a value parser -- e.g. `'unterminated` is literal-shaped (string envelope) and gets handed to
-/// the literal path, which then surfaces the missing-close-quote error.
-fn is_literal_shaped(s: &str) -> bool {
-    // Quoted string: 'foo'
-    if s.starts_with('\'') {
-        return true;
-    }
-    // Hex binary: X'..'
-    if let Some(rest) = s.strip_prefix(['x', 'X']) {
-        if rest.starts_with('\'') {
-            return true;
-        }
-    }
-    // Boolean
-    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") {
-        return true;
-    }
-    // Numeric: digit or `.` directly, or sign followed by digit-or-`.`. A lone `+`/`-` is not
-    // numeric-shaped and should fall through to Unknown. Internal whitespace disqualifies the
-    // whole input -- it can't be a single numeric literal, and routing `1 + 1` through the
-    // literal path would produce a misleading "could not parse as Integer" error.
-    let bytes = s.as_bytes();
-    let starts_numeric = matches!(bytes.first(), Some(b'0'..=b'9' | b'.'))
-        || (matches!(bytes.first(), Some(b'+' | b'-'))
-            && matches!(bytes.get(1), Some(b'0'..=b'9' | b'.')));
-    if starts_numeric && !s.bytes().any(|b| b.is_ascii_whitespace()) {
-        return true;
-    }
-    // Typed literal: `DATE 'YYYY-MM-DD'`, `TIMESTAMP '...'`, `TIMESTAMP_NTZ '...'`. The order
-    // matters: `TIMESTAMP_NTZ` must be checked before `TIMESTAMP` to avoid the shorter prefix
-    // matching first.
-    for kw in ["TIMESTAMP_NTZ", "TIMESTAMP", "DATE"] {
-        if let Some(rest) = s.get(..kw.len()) {
-            if rest.eq_ignore_ascii_case(kw) {
-                let after = &s[kw.len()..];
-                if after.starts_with(char::is_whitespace) && after.trim_start().starts_with('\'') {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Handle a [`SqlForm::FunctionCall`]. To add a function, insert a new arm above the catch-all
-/// that builds the appropriate [`Expression`].
-#[allow(clippy::match_single_binding)] // scaffold for future per-function arms
-fn parse_function_call(
-    name: &str,
-    _args: &str,
-    _data_type: &DataType,
-    sql: &str,
-) -> DeltaResult<Expression> {
-    match name.to_ascii_lowercase().as_str() {
-        _ => Err(Error::generic(format!(
-            "unsupported SQL function call: {sql}"
-        ))),
-    }
-}
-
-/// Handle a [`SqlForm::Literal`]: parse `trimmed` as a SQL literal of the given primitive
-/// `data_type`. NULL is handled earlier in [`parse_sql`], so this never sees a bare `NULL`.
+/// Parse `trimmed` as a SQL literal of the given primitive `data_type`. NULL is handled in
+/// [`parse_sql`], so this never sees a bare `NULL`.
 fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<Expression> {
     let DataType::Primitive(primitive) = data_type else {
         return Err(Error::generic(format!(
@@ -179,8 +64,8 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
     };
 
     // Binary uses a dedicated X'...' form. String is built directly from the unquoted body. Both
-    // bypass parse_scalar, which treats an empty input as SQL NULL (partition-value convention) --
-    // a SQL empty string `''` must round-trip as `Scalar::String("")`, distinct from `NULL`.
+    // bypass parse_scalar, which treats an empty input as SQL NULL (partition-value convention),
+    // whereas a SQL empty string `''` must round-trip as `Scalar::String("")`, distinct from NULL.
     match primitive {
         PrimitiveType::Binary => {
             let bytes = decode_binary_literal(trimmed)?;
@@ -213,7 +98,21 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
         }
     };
 
-    let scalar = primitive.parse_scalar(&raw)?;
+    // Trim the value inside the quotes to match Spark, whose stringToDate/stringToTimestamp
+    // trim their input. A no-op for the bare numeric/boolean path, which was trimmed with the
+    // whole input.
+    let raw = raw.trim();
+
+    // parse_scalar maps empty input to NULL (partition-value convention), but an empty quoted
+    // body like `DATE ''` is invalid SQL, not NULL. `NULL` is only accepted as a bare keyword,
+    // handled in parse_sql. Note that String is an exception which can be '' and is handled
+    // above, with its body kept verbatim.
+    if raw.is_empty() {
+        return Err(Error::generic(format!(
+            "empty {primitive:?} literal: {sql}"
+        )));
+    }
+    let scalar = primitive.parse_scalar(raw)?;
     Ok(Expression::literal(scalar))
 }
 
@@ -228,8 +127,8 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
             Error::generic(format!("expected a single-quoted SQL string, got: {input}"))
         })?;
 
-    // After splitting on `'`, every chunk except the last must be empty -- meaning the quote
-    // was doubled (SQL's escape for an embedded single quote).
+    // After splitting on `'`, every chunk except the last must be empty, meaning the quote was
+    // doubled (SQL's escape for an embedded single quote).
     let mut out = String::with_capacity(inner.len());
     let mut chunks = inner.split('\'').peekable();
     while let Some(chunk) = chunks.next() {
@@ -341,6 +240,7 @@ mod tests {
     #[case("TRUE", DataType::BOOLEAN, Scalar::Boolean(true))]
     #[case("false", DataType::BOOLEAN, Scalar::Boolean(false))]
     #[case("'hello'", DataType::STRING, Scalar::String("hello".into()))]
+    #[case("' hi '", DataType::STRING, Scalar::String(" hi ".into()))] // strings are not trimmed
     #[case("''", DataType::STRING, Scalar::String(String::new()))]
     #[case("'it''s'", DataType::STRING, Scalar::String("it's".into()))]
     #[case("'a''b''c'", DataType::STRING, Scalar::String("a'b'c".into()))]
@@ -370,6 +270,8 @@ mod tests {
     #[case("'2024-01-01'", date_days(2024, 1, 1))]
     #[case("DATE '2024-01-01'", date_days(2024, 1, 1))]
     #[case("date  '1970-01-02'", date_days(1970, 1, 2))]
+    #[case("' 2024-01-01 '", date_days(2024, 1, 1))] // body is trimmed, matching Spark
+    #[case("DATE ' 2024-01-01 '", date_days(2024, 1, 1))]
     fn parses_date_literals(#[case] sql: &str, #[case] expected_days: i32) {
         let got = parse_sql(sql, &DataType::DATE).unwrap();
         assert_eq!(got, Expression::literal(Scalar::Date(expected_days)));
@@ -380,6 +282,7 @@ mod tests {
     #[case("TIMESTAMP '2024-01-01 12:34:56.789'", "2024-01-01 12:34:56.789")]
     #[case("TIMESTAMP_NTZ '2024-01-01 12:34:56'", "2024-01-01 12:34:56")]
     #[case("timestamp_ntz '2024-01-01 12:34:56.789'", "2024-01-01 12:34:56.789")]
+    #[case("' 2024-01-01 12:34:56 '", "2024-01-01 12:34:56")] // body is trimmed, matching Spark
     fn parses_timestamp_literals(#[case] sql: &str, #[case] equivalent: &str) {
         let got = parse_sql(sql, &DataType::TIMESTAMP).unwrap();
         assert_eq!(
@@ -457,40 +360,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case("now()", DataType::TIMESTAMP)]
-    #[case("current_timestamp()", DataType::TIMESTAMP)]
-    #[case("current_date()", DataType::DATE)]
-    #[case("concat('a', 'b')", DataType::STRING)]
-    #[case("UnknownFn()", DataType::INTEGER)]
-    #[case("  now()  ", DataType::TIMESTAMP)]
-    fn function_calls_produce_function_call_error(#[case] sql: &str, #[case] ty: DataType) {
-        let err = parse_sql(sql, &ty).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("function call"),
-            "expected function-call error for {sql:?}, got: {msg}"
-        );
-    }
-
-    #[rstest]
-    #[case("1 + 1", DataType::INTEGER)]
-    #[case("foo", DataType::STRING)]
-    #[case("not-a-date", DataType::DATE)]
-    #[case("nope", DataType::BOOLEAN)]
-    #[case("+", DataType::INTEGER)]
-    fn unknown_form_returns_unknown_form_error(#[case] sql: &str, #[case] ty: DataType) {
-        let err = parse_sql(sql, &ty).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not a recognised SQL form"),
-            "expected unknown-form error for {sql:?}, got: {msg}"
-        );
-    }
-
-    #[rstest]
     #[case("", DataType::INTEGER)]
     #[case("   ", DataType::INTEGER)]
     #[case("'42'", DataType::INTEGER)] // quoted number for int
+    #[case("+", DataType::INTEGER)] // lone sign
+    #[case("UnknownFn()", DataType::INTEGER)] // function call
     #[case("42", DataType::STRING)] // unquoted number for string
     #[case("foo", DataType::STRING)] // unquoted string
     #[case("'unterminated", DataType::STRING)]
@@ -499,6 +373,15 @@ mod tests {
     #[case("'TRUE'", DataType::BOOLEAN)] // quoted boolean
     #[case("'2024-13-01'", DataType::DATE)] // bad month
     #[case("not-a-date", DataType::DATE)]
+    #[case("''", DataType::DATE)] // empty quoted body must not parse as NULL
+    #[case("DATE ''", DataType::DATE)]
+    #[case("' '", DataType::DATE)] // whitespace-only body trims to empty
+    #[case("DATE ' '", DataType::DATE)]
+    #[case("''", DataType::TIMESTAMP)]
+    #[case("' '", DataType::TIMESTAMP)]
+    #[case("TIMESTAMP ''", DataType::TIMESTAMP)]
+    #[case("TIMESTAMP_NTZ ''", DataType::TIMESTAMP_NTZ)]
+    #[case("  now()  ", DataType::TIMESTAMP)] // function call with padding
     #[case("X'0'", DataType::BINARY)] // odd number of hex digits
     #[case("X'gg'", DataType::BINARY)] // non-hex chars
     #[case("'deadbeef'", DataType::BINARY)] // missing X prefix
