@@ -101,11 +101,7 @@ impl CommitRangeBuilder {
 
         validate_version_range(start_version, end_version)?;
         if self.snapshot.is_some() {
-            validate_start_version_available(
-                start_version,
-                commit_files.first(),
-                log_segment.checkpoint_version,
-            )?;
+            validate_start_version_available(start_version, commit_files.first())?;
         }
         validate_number_of_commit_files(start_version, end_version, commit_files.len())?;
 
@@ -152,17 +148,13 @@ fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
 fn validate_start_version_available(
     start_version: Version,
     first_commit: Option<&ParsedLogPath>,
-    checkpoint_version: Option<Version>,
 ) -> DeltaResult<()> {
     if first_commit.map(|f| f.version) == Some(start_version) {
         return Ok(());
     }
     let earliest_available_commit = first_commit
         .map(|f| f.version)
-        .or_else(|| checkpoint_version.map(|v| v + 1))
-        .ok_or_else(|| {
-            Error::generic("snapshot's log segment must have a checkpoint or at least one commit")
-        })?;
+        .ok_or_else(|| Error::generic("snapshot's log segment must have at least one commit"))?;
     Err(Error::generic(format!(
         "start_version {start_version} is not available in the snapshot's log segment \
          (earliest available commit: {earliest_available_commit})",
