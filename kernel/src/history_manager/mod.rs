@@ -1884,7 +1884,7 @@ mod tests {
         Some(CommitAt::new(3, 30))
     )]
     #[tokio::test]
-    async fn timestamp_to_version_with_commit_type(
+    async fn test_timestamp_to_version_with_commit_type(
         #[case] commit_type: HistoryCommitType,
         #[case] timestamp: Timestamp,
         #[case] bound: Bound,
@@ -1905,7 +1905,7 @@ mod tests {
 
     #[rstest::rstest]
     #[tokio::test]
-    async fn timestamp_to_version_recreatable_matches_published_when_v0_present(
+    async fn test_timestamp_to_version_recreatable_matches_published_when_v0_present(
         #[values(0, 50, 100, 250, 300, 350, 1000)] timestamp: Timestamp,
         #[values(Bound::GreatestLower, Bound::LeastUpper)] bound: Bound,
     ) {
@@ -1946,7 +1946,7 @@ mod tests {
     #[case::published_sees_orphan(HistoryCommitType::Published, 25, Some(CommitAt::new(2, 20)))]
     #[case::recreatable_excludes_orphan(HistoryCommitType::Recreatable, 25, None)]
     #[tokio::test]
-    async fn latest_version_as_of_with_commit_type(
+    async fn test_latest_version_as_of_with_commit_type(
         #[case] commit_type: HistoryCommitType,
         #[case] timestamp: Timestamp,
         #[case] expected: Option<CommitAt>,
