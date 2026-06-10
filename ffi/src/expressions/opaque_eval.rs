@@ -24,16 +24,6 @@ use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
 use crate::{KernelStringSlice, OptionalValue};
 
-/// Which engine callback an opaque op dispatches to (set by the stats rewrite; internal to the FFI
-/// layer, not part of the ABI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EvalMode {
-    /// Row-time evaluation -> `eval_pred_rows`.
-    RowMode,
-    /// Stats-based evaluation (file data skipping) -> `eval_pred_stats`.
-    StatsMode,
-}
-
 /// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
 /// Kernel pre-evaluates the predicate's args into a `RecordBatch` (one field per arg) and exports

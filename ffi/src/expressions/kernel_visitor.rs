@@ -13,7 +13,9 @@ use delta_kernel::DeltaResult;
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::opaque_eval::SharedOpaqueEvalContext;
-use crate::expressions::{FfiOpaquePredicateOp, SharedExpression, SharedPredicate};
+#[cfg(feature = "default-engine-base")]
+use crate::expressions::FfiOpaquePredicateOp;
+use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -715,13 +717,15 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
     resolved.into_iter().collect()
 }
 
-/// Build `Predicate::Opaque(FfiOpaquePredicateOp(name), children)` without
-/// an engine eval context. The resulting predicate abstains during scalar /
-/// data-skipping evaluation and errors if it ever reaches the Arrow batch
-/// evaluator (kernel never wires the op to a callback).
+/// Build a placeholder for an engine-defined predicate that kernel cannot evaluate: a NULL
+/// boolean literal. NULL soundly abstains everywhere -- kernel keeps every file and row for this
+/// node, even under `NOT` -- while sibling predicates still prune normally. `children` are
+/// drained and discarded; the op's `name` is validated but not retained. Note that nesting the
+/// placeholder as a child of a `visit_predicate_opaque_with_eval` op makes that op abstain from
+/// stats pruning too (its rewrite cannot express the unknown child).
 ///
-/// Use [`visit_predicate_opaque_with_eval`] if you want kernel to call back
-/// into the engine for row-time evaluation.
+/// Use [`visit_predicate_opaque_with_eval`] to attach engine eval callbacks so the node itself
+/// can participate in file pruning.
 ///
 /// Returns 0 if any child ID is invalid.
 ///
@@ -744,21 +748,19 @@ fn visit_predicate_opaque_impl(
     children: &mut EngineIterator,
 ) -> DeltaResult<usize> {
     let name = name?;
-    let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
+    if resolve_opaque_children(state, children.map(|c| c as usize)).is_none() {
         return Ok(0);
-    };
-    Ok(wrap_predicate(
-        state,
-        Predicate::opaque(FfiOpaquePredicateOp::new(name), exprs),
-    ))
+    }
+    tracing::debug!("opaque predicate `{name}` has no eval callbacks; kernel will not prune on it");
+    Ok(wrap_predicate(state, Predicate::null_literal()))
 }
 
-/// Build `Predicate::Opaque(FfiOpaquePredicateOp(name, callbacks), children)`
-/// and route it through the default engine's Arrow batch evaluator. Kernel
-/// pre-evaluates each child arg recursively via its standard
-/// `evaluate_expression`, exports the resulting columns as a single
-/// `RecordBatch` over Arrow C Data Interface, and invokes the engine's eval
-/// callback. Engine never walks the AST.
+/// Build an opaque predicate over `FfiOpaquePredicateOp(name, callbacks)` and
+/// `children`, routed through the default engine's Arrow batch evaluator (via
+/// `Predicate::arrow_opaque`). Kernel pre-evaluates each child arg recursively
+/// via its standard `evaluate_expression`, exports the resulting columns as a
+/// single `RecordBatch` over Arrow C Data Interface, and invokes the engine's
+/// eval callback. Engine never walks the AST.
 ///
 /// Returns 0 if any child ID is invalid.
 ///
@@ -793,7 +795,7 @@ fn visit_predicate_opaque_with_eval_impl(
     let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
         return Ok(0);
     };
-    let op = FfiOpaquePredicateOp::new(name).with_callbacks(callbacks);
+    let op = FfiOpaquePredicateOp::new(name, callbacks);
     Ok(wrap_predicate(state, Predicate::arrow_opaque(op, exprs)))
 }
 
@@ -1074,20 +1076,17 @@ mod tests {
     }
 
     #[test]
-    fn visit_predicate_opaque_impl_builds_named_op_with_children() {
+    fn visit_predicate_opaque_impl_builds_null_literal_placeholder() {
         let mut state = KernelExpressionVisitorState::default();
         let (a, b) = make_two_literal_ids(&mut state);
         let (_keep, mut it) = make_iter(vec![a, b]);
         let id = visit_predicate_opaque_impl(&mut state, Ok("MY_OP".to_string()), &mut it).unwrap();
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
-        let Predicate::Opaque(opaque) = pred else {
-            panic!("expected Predicate::Opaque, got {pred:?}");
-        };
-        assert_eq!(opaque.op.name(), "MY_OP");
-        assert_eq!(opaque.exprs.len(), 2);
-        assert_eq!(opaque.exprs[0], Expression::literal(1i32));
-        assert_eq!(opaque.exprs[1], Expression::literal(2i32));
+        // No eval callbacks => NULL boolean literal, which abstains everywhere (even under NOT).
+        assert_eq!(pred, Predicate::null_literal());
+        // Children are drained from the visitor state even though they're discarded.
+        assert!(state.inflight_ids.is_empty());
     }
 
     #[test]
@@ -1109,7 +1108,7 @@ mod tests {
     use crate::kernel_string_slice;
 
     #[test]
-    fn visit_predicate_opaque_ffi_builds_predicate() {
+    fn visit_predicate_opaque_ffi_builds_null_literal_placeholder() {
         let mut state = KernelExpressionVisitorState::default();
         let (a, b) = make_two_literal_ids(&mut state);
         let (_keep, mut it) = make_iter(vec![a, b]);
@@ -1125,11 +1124,7 @@ mod tests {
         let id = ok_or_panic(result);
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
-        let Predicate::Opaque(opaque) = pred else {
-            panic!("expected Predicate::Opaque, got {pred:?}");
-        };
-        assert_eq!(opaque.op.name(), "MY_OP");
-        assert_eq!(opaque.exprs.len(), 2);
+        assert_eq!(pred, Predicate::null_literal());
     }
 
     /// Drives `visit_predicate_opaque_with_eval` end to end: create an eval context, build the

@@ -1,4 +1,4 @@
-//! `ArrowOpaquePredicateOp` impl for `FfiOpaquePredicateOp`.
+//! `FfiOpaquePredicateOp`: an engine-defined opaque predicate evaluated through callbacks.
 //!
 //! Kernel's `evaluate_predicate` recurses through compound expressions (Binary, Junction, etc.)
 //! natively. This module is the leaf: when kernel hits an opaque predicate, we evaluate each arg
@@ -29,10 +29,92 @@ use delta_kernel::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
-use super::opaque_eval::{COpaqueEvalCallbacks, EvalMode};
-use super::FfiOpaquePredicateOp;
+use super::opaque_eval::COpaqueEvalCallbacks;
 use crate::engine_data::ArrowFFIData;
 use crate::{kernel_string_slice, OptionalValue};
+
+// === FfiOpaquePredicateOp ===================================================
+
+/// Which engine callback an opaque op dispatches to (set by the stats rewrite; internal to the
+/// FFI layer, not part of the ABI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvalMode {
+    /// Row-time evaluation -> `eval_pred_rows`.
+    RowMode,
+    /// Stats-based evaluation (file data skipping) -> `eval_pred_stats`.
+    StatsMode,
+}
+
+/// Engine-defined opaque predicate identified by a name (e.g. `STARTS_WITH`, `LIKE`). Kernel
+/// routes evaluation through the engine's [`COpaqueEvalCallbacks`]: the engine receives
+/// pre-evaluated args as Arrow arrays and returns one verdict per row (or per file, in stats
+/// mode).
+///
+/// # Data skipping
+///
+/// `as_data_skipping_predicate` rewrites each `Column` arg into a
+/// `Struct[min, max, nullcount, rowcount]` and tags the op with `EvalMode::StatsMode`. Literals
+/// pass through; `Predicate` children recurse. This is the only mode that prunes files -- RowMode
+/// evaluates per data row and never drops files, and the scalar / partition-pruning paths always
+/// abstain. See [`EngineEvalRowsFn`] / [`EngineEvalStatsFn`] for the per-callback arg shapes.
+///
+/// Inverted predicates (`NOT op`) are rewritten too: the inversion is recorded on the op and
+/// forwarded to the engine callback's `inverted` flag, which must reason about the negated op (see
+/// [`EngineEvalStatsFn`]). The StatsMode rewrite abstains (keeps all files) when a `Column` arg has
+/// no sibling literal to infer its type from, or an arg is some kind other than `Column`,
+/// `Literal`, or `Predicate`.
+///
+/// [`EngineEvalRowsFn`]: super::opaque_eval::EngineEvalRowsFn
+/// [`EngineEvalStatsFn`]: super::opaque_eval::EngineEvalStatsFn
+#[derive(Debug, Clone)]
+pub(crate) struct FfiOpaquePredicateOp {
+    name: String,
+    callbacks: Arc<COpaqueEvalCallbacks>,
+    /// Which engine callback eval dispatches to.
+    mode: EvalMode,
+    /// Whether the op is negated. Set by the StatsMode rewrite so the eval callback can reason
+    /// about the negated op (see [`EngineEvalStatsFn`]); XORed with the eval-time `inverted`.
+    ///
+    /// [`EngineEvalStatsFn`]: super::opaque_eval::EngineEvalStatsFn
+    inverted: bool,
+}
+
+impl FfiOpaquePredicateOp {
+    /// Build a RowMode, non-inverted op identified by `name`, evaluated via `callbacks`.
+    pub(crate) fn new(name: impl Into<String>, callbacks: Arc<COpaqueEvalCallbacks>) -> Self {
+        Self {
+            name: name.into(),
+            callbacks,
+            mode: EvalMode::RowMode,
+            inverted: false,
+        }
+    }
+
+    /// Consume `self` and return it with `mode` overridden.
+    fn with_mode(mut self, mode: EvalMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Consume `self` and return it with `inverted` overridden.
+    fn with_inverted(mut self, inverted: bool) -> Self {
+        self.inverted = inverted;
+        self
+    }
+}
+
+impl PartialEq for FfiOpaquePredicateOp {
+    fn eq(&self, other: &Self) -> bool {
+        // Mode, inversion, and callbacks all change how the op evaluates, so equality includes
+        // them. Callbacks compare by `Arc` pointer identity (not otherwise comparable).
+        self.name == other.name
+            && self.mode == other.mode
+            && self.inverted == other.inverted
+            && Arc::ptr_eq(&self.callbacks, &other.callbacks)
+    }
+}
+
+impl Eq for FfiOpaquePredicateOp {}
 
 /// Pre-evaluate each arg into an `ArrayRef`, bundle them as a `RecordBatch` keyed `arg0..argN`.
 ///
@@ -232,7 +314,7 @@ fn call_eval_pred(
 
 impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
     fn name(&self) -> &str {
-        self.op_name()
+        &self.name
     }
 
     fn eval_pred(
@@ -241,13 +323,6 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         batch: &RecordBatch,
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
-        let cb = self.callbacks_clone().ok_or_else(|| {
-            Error::Generic(format!(
-                "opaque predicate `{}` has no eval context attached",
-                self.op_name()
-            ))
-        })?;
-
         // Materialize the args batch. In StatsMode this can fail when the rewrite referenced a
         // stats column the batch doesn't carry -- e.g. an opaque op pairs a min/max-ineligible
         // column (boolean, binary, or a complex type) with an eligible literal, so the lifted type
@@ -256,10 +331,10 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         // errors propagate.
         let args_batch = match evaluate_args(args, batch) {
             Ok(args_batch) => args_batch,
-            Err(e) if self.mode() == EvalMode::StatsMode => {
+            Err(e) if self.mode == EvalMode::StatsMode => {
                 tracing::debug!(
                     "opaque predicate `{}` stats args could not be materialized ({e}); keeping all files",
-                    self.op_name()
+                    self.name
                 );
                 return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
             }
@@ -267,8 +342,14 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         };
         // The StatsMode rewrite records inversion on the op (the stats predicate is then evaluated
         // non-inverted by kernel); RowMode carries it via the eval-time flag. XOR composes both.
-        let inverted = inverted ^ self.inverted();
-        call_eval_pred(&cb, self.op_name(), &args_batch, self.mode(), inverted)
+        let inverted = inverted ^ self.inverted;
+        call_eval_pred(
+            &self.callbacks,
+            &self.name,
+            &args_batch,
+            self.mode,
+            inverted,
+        )
     }
 
     fn eval_pred_scalar(
@@ -302,9 +383,6 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
-        // Abstain without callbacks: the rewritten predicate's eval would otherwise error.
-        self.callbacks_clone()?;
-
         // Each `Column` arg becomes a `Struct[min, max, nullcount, rowcount]`; literals pass
         // through; `Predicate` children recurse. If any arg can't be rewritten (e.g. a data
         // column with no type hint), the whole predicate abstains and kernel keeps every file.
@@ -469,13 +547,39 @@ mod tests {
         RecordBatch::try_new(schema, vec![arr]).unwrap()
     }
 
+    // === Op identity =============================================================
+
+    #[test]
+    fn op_equality_includes_name_mode_inversion_and_callback_identity() {
+        let cb = callbacks_for(engine_starts_with);
+        let op = FfiOpaquePredicateOp::new("LIKE", cb.clone());
+
+        // Same name + same callbacks Arc -> equal.
+        assert_eq!(op, FfiOpaquePredicateOp::new("LIKE", cb.clone()));
+        // Different name -> not equal.
+        assert_ne!(op, FfiOpaquePredicateOp::new("OTHER", cb.clone()));
+        // Mode and inversion change how the op evaluates -> not equal.
+        assert_ne!(
+            op,
+            FfiOpaquePredicateOp::new("LIKE", cb.clone()).with_mode(EvalMode::StatsMode)
+        );
+        assert_ne!(
+            op,
+            FfiOpaquePredicateOp::new("LIKE", cb).with_inverted(true)
+        );
+        // Distinct callback Arcs -> not equal (pointer identity).
+        assert_ne!(
+            op,
+            FfiOpaquePredicateOp::new("LIKE", callbacks_for(engine_starts_with))
+        );
+    }
+
     // === End-to-end: STARTS_WITH(LOWER(col), "foo") as one composite op =========
 
     #[test]
     fn composite_starts_with_lower_predicate_round_trips() {
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("STARTS_WITH_LOWER")
-                .with_callbacks(callbacks_for(engine_starts_with_lower)),
+            FfiOpaquePredicateOp::new("STARTS_WITH_LOWER", callbacks_for(engine_starts_with_lower)),
             [column_expr!("col"), Expression::literal("foo")],
         );
 
@@ -492,8 +596,7 @@ mod tests {
     #[test]
     fn inversion_flips_verdicts() {
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("STARTS_WITH_LOWER")
-                .with_callbacks(callbacks_for(engine_starts_with_lower)),
+            FfiOpaquePredicateOp::new("STARTS_WITH_LOWER", callbacks_for(engine_starts_with_lower)),
             [column_expr!("col"), Expression::literal("foo")],
         );
         let batch = batch_with_col(vec![Some("FOOBAR"), Some("Apple")]);
@@ -508,11 +611,11 @@ mod tests {
     fn composition_and_of_two_opaque_predicates() {
         let cb = callbacks_for(engine_starts_with);
         let lhs = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("STARTS_WITH").with_callbacks(cb.clone()),
+            FfiOpaquePredicateOp::new("STARTS_WITH", cb.clone()),
             [column_expr!("col"), Expression::literal("F")],
         );
         let rhs = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("STARTS_WITH").with_callbacks(cb),
+            FfiOpaquePredicateOp::new("STARTS_WITH", cb),
             [column_expr!("col"), Expression::literal("FO")],
         );
         let and_pred = Predicate::and_from([lhs, rhs]);
@@ -537,7 +640,7 @@ mod tests {
             OptionalValue::None
         }
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("ALWAYS_FAIL").with_callbacks(callbacks_for(engine_fail)),
+            FfiOpaquePredicateOp::new("ALWAYS_FAIL", callbacks_for(engine_fail)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
@@ -557,7 +660,7 @@ mod tests {
             OptionalValue::Some(ptr::null_mut())
         }
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("RETURNS_NULL").with_callbacks(callbacks_for(engine_null)),
+            FfiOpaquePredicateOp::new("RETURNS_NULL", callbacks_for(engine_null)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
@@ -578,7 +681,7 @@ mod tests {
             make_result(arr)
         }
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("RETURNS_INT").with_callbacks(callbacks_for(engine_int)),
+            FfiOpaquePredicateOp::new("RETURNS_INT", callbacks_for(engine_int)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x"), Some("y"), Some("z")]);
@@ -599,7 +702,7 @@ mod tests {
             OptionalValue::Some(crate::engine_data::arrow_ffi_data_new())
         }
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("EMPTY").with_callbacks(callbacks_for(engine_empty)),
+            FfiOpaquePredicateOp::new("EMPTY", callbacks_for(engine_empty)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
@@ -624,7 +727,7 @@ mod tests {
             make_result(arr)
         }
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("ZERO_ARG").with_callbacks(callbacks_for(engine_always_true)),
+            FfiOpaquePredicateOp::new("ZERO_ARG", callbacks_for(engine_always_true)),
             [] as [Expression; 0],
         );
         let batch = batch_with_col(vec![Some("a"); 5]);
@@ -673,7 +776,7 @@ mod tests {
 
         // RowMode (default) routes to eval_pred_rows only.
         let row_pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("OP").with_callbacks(callbacks()),
+            FfiOpaquePredicateOp::new("OP", callbacks()),
             [column_expr!("col")],
         );
         evaluate_predicate(&row_pred, &batch, false).unwrap();
@@ -686,9 +789,7 @@ mod tests {
 
         // StatsMode routes to eval_pred_stats only.
         let stats_pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("OP")
-                .with_mode(EvalMode::StatsMode)
-                .with_callbacks(callbacks()),
+            FfiOpaquePredicateOp::new("OP", callbacks()).with_mode(EvalMode::StatsMode),
             [column_expr!("col")],
         );
         evaluate_predicate(&stats_pred, &batch, false).unwrap();
@@ -887,7 +988,7 @@ mod tests {
         }
 
         fn op_with_callbacks(name: &str) -> FfiOpaquePredicateOp {
-            FfiOpaquePredicateOp::new(name).with_callbacks(callbacks_for(engine_starts_with))
+            FfiOpaquePredicateOp::new(name, callbacks_for(engine_starts_with))
         }
 
         fn rewrite(
@@ -953,7 +1054,7 @@ mod tests {
             }
 
             // Stats batch: a single file with id in [1, 10]. Target 11 is above the whole range.
-            let op = FfiOpaquePredicateOp::new("GE").with_callbacks(callbacks_for(engine_ge));
+            let op = FfiOpaquePredicateOp::new("GE", callbacks_for(engine_ge));
             let args = [column_expr!("col"), Expression::literal(11i64)];
             let stats_batch = single_col_int64_stats_batch();
 
@@ -972,13 +1073,6 @@ mod tests {
                 r.value(0),
                 "NOT GE(col,11) == col < 11: min 1 < 11 keeps the file"
             );
-        }
-
-        #[test]
-        fn abstains_when_no_callbacks() {
-            let op = FfiOpaquePredicateOp::new("STARTS_WITH");
-            let args = [column_expr!("col")];
-            assert!(rewrite(&op, &args, &rewriter(), false).is_none());
         }
 
         #[test]
@@ -1135,7 +1229,7 @@ mod tests {
                 make_result(arr)
             }
 
-            let op = FfiOpaquePredicateOp::new("OP").with_callbacks(callbacks_for(engine_count));
+            let op = FfiOpaquePredicateOp::new("OP", callbacks_for(engine_count));
             let args = [column_expr!("col"), Expression::literal(5i64)];
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
@@ -1186,8 +1280,8 @@ mod tests {
                 make_result(arr)
             }
 
-            let op = FfiOpaquePredicateOp::new("NEEDS_NULLCOUNT")
-                .with_callbacks(callbacks_for(engine_check_nullcount));
+            let op =
+                FfiOpaquePredicateOp::new("NEEDS_NULLCOUNT", callbacks_for(engine_check_nullcount));
             let args = [column_expr!("col"), Expression::literal(5i64)];
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
@@ -1231,8 +1325,7 @@ mod tests {
                 make_result(Arc::new(keep))
             }
 
-            let op = FfiOpaquePredicateOp::new("OP")
-                .with_callbacks(callbacks_for(engine_keep_on_null_bounds));
+            let op = FfiOpaquePredicateOp::new("OP", callbacks_for(engine_keep_on_null_bounds));
             let args = [column_expr!("col"), Expression::literal(5i64)];
             // `no_stats_rewriter` models a row with no collected stats (e.g. a Remove): null
             // min/max.
@@ -1302,7 +1395,7 @@ mod tests {
                 make_result(Arc::new(BooleanArray::from(vec![true; batch.num_rows()])))
             }
 
-            let op = FfiOpaquePredicateOp::new("OP").with_callbacks(callbacks_for(engine_count));
+            let op = FfiOpaquePredicateOp::new("OP", callbacks_for(engine_count));
             let args = [column_expr!("col"), Expression::literal(5i64)];
             let rewritten =
                 rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
