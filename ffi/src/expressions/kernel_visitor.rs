@@ -718,11 +718,8 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
 }
 
 /// Build a placeholder for an engine-defined predicate that kernel cannot evaluate: a NULL
-/// boolean literal. NULL soundly abstains everywhere -- kernel keeps every file and row for this
-/// node, even under `NOT` -- while sibling predicates still prune normally. `children` are
-/// drained and discarded; the op's `name` is validated but not retained. Note that nesting the
-/// placeholder as a child of a `visit_predicate_opaque_with_eval` op makes that op abstain from
-/// stats pruning too (its rewrite cannot express the unknown child).
+/// boolean literal, which abstains from all pruning (even under `NOT`) while sibling predicates
+/// prune normally. `children` are drained and discarded.
 ///
 /// Use [`visit_predicate_opaque_with_eval`] to attach engine eval callbacks so the node itself
 /// can participate in file pruning.
