@@ -1,38 +1,39 @@
 //! This module contains types needed to implement Engine-owned iterators returned from plan
 //! execution.
 //!
-//! Each `C*Iterator` type contains an opaque engine `state` pointer with a `next` function
-//! pointer that yields one iterator item per call.
+//! Each `C*Iterator` type contains an opaque engine `state` pointer, a `next` function pointer that
+//! yields one iterator item per call, and a `free` function pointer that releases the iterator
+//! state.
 //!
-//! //! # `next()` protocol
+//! # `next()` protocol
 //!
-//! Each `next` callback returns `OptionalValue<ExternResult<T>>`, mirroring Rust's
-//! `Option<Result<T>>`. This allows us to implement `DeltaResultIterator<T>`:
-//!     - The outer Option represents whether iteration is complete
-//!     - The inner Result represents the DeltaResult yielded by the iterator
+//! Each `next` callback writes its result as an `OptionalValue<EngineExecResult<T>>` (mirroring
+//! Rust's `Option<Result<T>>`) into a caller-provided out pointer. This allows us to implement
+//! `DeltaResultIterator<T>`:
+//!     - The outer Option represents whether iteration is complete (`None` = done)
+//!     - The inner [`EngineExecResult`] represents the item (`Success`) or an engine-side error
+//!       (`Failure`)
 //!
 //! # Iterator Memory Management
 //! There are 3 aspects to iterator memory management:
 //!
-//! 1. Iterator State - owned by the engine and must be freed by the kernel when it is done with it.
-//!    The kernel performs this cleanup by using the `free` function pointer associated with the
-//!    containing PlanResult (see [`super::result::CPlanResultWrapper`]). Each `Ffi*Iter` adapter
-//!    takes care of this by embedding `PlanResultCleanup`, which will invoke the `free` function
-//!    pointer when the adapter is dropped.
+//! 1. Iterator State - owned by the engine and freed by the kernel via the iterator's own `free`
+//!    function pointer. Each `Ffi*Iter` adapter invokes `free` exactly once when it is dropped.
 //!
 //! 2. Iterator Items - each data item (e.g EngineData, Bytes, FileMeta) yielded by the iterator has
 //!    its own separate lifetime and may have its own memory management rules. However we generally
 //!    use FFI_ArrowArray as a carrier for the item (which internally manages its own release
 //!    callback).
 //!
-//! 3. Item Wrappers (i.e OptionalValue, ExternResult, EngineError) - each yielded item is wrapped
-//!    in an OptionalValue + ExternResult which must also be freed. We expect these to be released
-//!    when the entire iterator is dropped (through the same `PlanResultCleanup` guard that frees
-//!    the iterator state).
+//! 3. Errors - each [`EngineExecError`](crate::error::EngineExecError) carries an engine-allocated
+//!    `ExclusiveRustString` message handle. Kernel takes ownership of the message and frees it when
+//!    converting the error into a kernel error (via `From<EngineExecError> for Error`).
 //!
 //! # Safety
 //! The engine is responsible for ensuring that all `state`, `next`, and `free` pointers
 //! are safe to send between threads.
+
+use std::mem::MaybeUninit;
 
 use bytes::Bytes;
 use delta_kernel::arrow::array::ffi::{self as arrow_ffi, FFI_ArrowArray, FFI_ArrowSchema};
@@ -43,15 +44,29 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowFi
 use delta_kernel::{DeltaResult, EngineData, Error};
 use url::Url;
 
-use super::result::PlanResultCleanup;
-use crate::error::ExternResult;
+use crate::error::EngineExecResult;
 use crate::handle::Handle;
-use crate::plans::result::engine_error_to_kernel;
 use crate::{ExclusiveEngineData, NullableCvoid, OptionalValue};
 
 // ============================================================================
 // repr(C) iterator types
 // ============================================================================
+
+/// Function pointer an engine iterator uses to yield its next item into `out`.
+///
+/// See "`next()` protocol" in the module docs.
+///
+/// # Safety
+///
+/// The engine MUST fully initialize `*out` before returning. Kernel reads
+/// `*out` via [`MaybeUninit::assume_init`](std::mem::MaybeUninit::assume_init), so returning
+/// without writing it will cause undefined behavior.
+pub type CIterNextFn<T> =
+    extern "C" fn(state: NullableCvoid, out: *mut OptionalValue<EngineExecResult<T>>);
+
+/// Function pointer that releases an engine iterator's `state`. Invoked exactly once by kernel once
+/// iteration is complete.
+pub type CIterFreeFn = extern "C" fn(state: NullableCvoid);
 
 /// An engine-owned iterator of [`EngineData`] batches.
 ///
@@ -59,9 +74,8 @@ use crate::{ExclusiveEngineData, NullableCvoid, OptionalValue};
 #[repr(C)]
 pub struct CEngineDataIterator {
     pub state: NullableCvoid,
-    pub next: extern "C" fn(
-        state: NullableCvoid,
-    ) -> OptionalValue<ExternResult<Handle<ExclusiveEngineData>>>,
+    pub next: CIterNextFn<Handle<ExclusiveEngineData>>,
+    pub free: CIterFreeFn,
 }
 
 /// An engine-owned iterator of byte buffers.
@@ -81,7 +95,8 @@ pub struct CEngineDataIterator {
 #[repr(C)]
 pub struct CBytesIterator {
     pub state: NullableCvoid,
-    pub next: extern "C" fn(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>>,
+    pub next: CIterNextFn<FFI_ArrowArray>,
+    pub free: CIterFreeFn,
 }
 
 /// An engine-owned iterator of [`FileMeta`](delta_kernel::FileMeta) batches.
@@ -98,29 +113,53 @@ pub struct CBytesIterator {
 #[repr(C)]
 pub struct CFileMetaIterator {
     pub state: NullableCvoid,
-    pub next: extern "C" fn(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>>,
+    pub next: CIterNextFn<FFI_ArrowArray>,
+    pub free: CIterFreeFn,
 }
 
 // ============================================================================
 // Rust Iterator adapters
 // ============================================================================
-//
-// Each adapter wraps a `C*Iterator`, implementing the Rust `Iterator` trait, and embeds a
-// `PlanResultCleanup` guard for freeing all associated engine resources when the adapter is
-// dropped.
+
+/// An abstraction for invoking an engine iterator's `free` callback exactly once, when dropped.
+///
+/// Embedding this in every `Ffi*Iter` adapter provides a single shared mechanism for ensuring the
+/// iterator is dropped correctly.
+pub(crate) struct IterCleanup {
+    state: NullableCvoid,
+    free: CIterFreeFn,
+}
+
+impl IterCleanup {
+    fn new(state: NullableCvoid, free: CIterFreeFn) -> Self {
+        Self { state, free }
+    }
+
+    /// The opaque engine state pointer, forwarded to each `next` call.
+    fn state(&self) -> NullableCvoid {
+        self.state
+    }
+}
+
+impl Drop for IterCleanup {
+    fn drop(&mut self) {
+        (self.free)(self.state);
+    }
+}
 
 /// Provides the Rust `Iterator` trait for [`EngineData`] batches on top of a
 /// [`CEngineDataIterator`].
 pub(crate) struct FfiEngineDataIter {
-    iter: CEngineDataIterator,
-    _cleanup: PlanResultCleanup,
+    next: CIterNextFn<Handle<ExclusiveEngineData>>,
+    cleanup: IterCleanup,
 }
 
 impl FfiEngineDataIter {
-    pub(crate) fn new(iter: CEngineDataIterator, cleanup: PlanResultCleanup) -> Self {
+    pub(crate) fn new(iter: CEngineDataIterator) -> Self {
+        let CEngineDataIterator { state, next, free } = iter;
         Self {
-            iter,
-            _cleanup: cleanup,
+            next,
+            cleanup: IterCleanup::new(state, free),
         }
     }
 }
@@ -129,11 +168,14 @@ impl Iterator for FfiEngineDataIter {
     type Item = DeltaResult<Box<dyn EngineData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.iter.next)(self.iter.state) {
+        let mut out = MaybeUninit::uninit();
+        (self.next)(self.cleanup.state(), out.as_mut_ptr());
+        // SAFETY: the engine contract (see `CIterNextFn`) requires `next` to initialize `out`
+        // before returning.
+        match unsafe { out.assume_init() } {
             OptionalValue::None => None,
-            // TODO: re-evaluate memory management; errors are currently freed by PlanResultCleanup
-            OptionalValue::Some(ExternResult::Err(err)) => Some(Err(engine_error_to_kernel(err))),
-            OptionalValue::Some(ExternResult::Ok(handle)) => {
+            OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
+            OptionalValue::Some(EngineExecResult::Success(handle)) => {
                 // into_inner transfers ownership of the EngineData to kernel, and kernel
                 // will free it when the yielded EngineData is dropped.
                 Some(Ok(unsafe { handle.into_inner() }))
@@ -148,15 +190,16 @@ unsafe impl Send for FfiEngineDataIter {}
 
 /// Provides the Rust `Iterator` trait for [`Bytes`] buffers on top of a [`CBytesIterator`].
 pub(crate) struct FfiBytesIter {
-    iter: CBytesIterator,
-    _cleanup: PlanResultCleanup,
+    next: CIterNextFn<FFI_ArrowArray>,
+    cleanup: IterCleanup,
 }
 
 impl FfiBytesIter {
-    pub(crate) fn new(iter: CBytesIterator, cleanup: PlanResultCleanup) -> Self {
+    pub(crate) fn new(iter: CBytesIterator) -> Self {
+        let CBytesIterator { state, next, free } = iter;
         Self {
-            iter,
-            _cleanup: cleanup,
+            next,
+            cleanup: IterCleanup::new(state, free),
         }
     }
 
@@ -191,11 +234,16 @@ impl Iterator for FfiBytesIter {
     type Item = DeltaResult<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.iter.next)(self.iter.state) {
+        let mut out = MaybeUninit::uninit();
+        (self.next)(self.cleanup.state(), out.as_mut_ptr());
+        // SAFETY: the engine contract (see `CIterNextFn`) requires `next` to initialize `out`
+        // before returning.
+        match unsafe { out.assume_init() } {
             OptionalValue::None => None,
-            // TODO: re-evaluate memory management; errors are currently freed by PlanResultCleanup
-            OptionalValue::Some(ExternResult::Err(err)) => Some(Err(engine_error_to_kernel(err))),
-            OptionalValue::Some(ExternResult::Ok(array)) => Some(Self::arrow_array_to_bytes(array)),
+            OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
+            OptionalValue::Some(EngineExecResult::Success(array)) => {
+                Some(Self::arrow_array_to_bytes(array))
+            }
         }
     }
 }
@@ -211,20 +259,21 @@ unsafe impl Send for FfiBytesIter {}
 /// terminates if the engine returns None or a batch fails to decode. Errors surfaced directly by
 /// the engine `next` callback are considered transient and do NOT terminate iteration.
 pub(crate) struct FfiFileMetaIter {
-    iter: CFileMetaIterator,
+    next: CIterNextFn<FFI_ArrowArray>,
+    cleanup: IterCleanup,
     // Decoded rows from the most recent engine batch
     buffer: std::vec::IntoIter<delta_kernel::FileMeta>,
     terminated: bool,
-    _cleanup: PlanResultCleanup,
 }
 
 impl FfiFileMetaIter {
-    pub(crate) fn new(iter: CFileMetaIterator, cleanup: PlanResultCleanup) -> Self {
+    pub(crate) fn new(iter: CFileMetaIterator) -> Self {
+        let CFileMetaIterator { state, next, free } = iter;
         Self {
-            iter,
+            next,
+            cleanup: IterCleanup::new(state, free),
             buffer: Vec::new().into_iter(),
             terminated: false,
-            _cleanup: cleanup,
         }
     }
 
@@ -318,17 +367,19 @@ impl Iterator for FfiFileMetaIter {
             }
 
             // Buffer drained and iteration is still live; pull the next batch from the engine.
-            match (self.iter.next)(self.iter.state) {
+            let mut out = MaybeUninit::uninit();
+            (self.next)(self.cleanup.state(), out.as_mut_ptr());
+            // SAFETY: the engine contract (see `CIterNextFn`) requires `next` to initialize `out`
+            // before returning.
+            match unsafe { out.assume_init() } {
                 OptionalValue::None => {
                     self.terminated = true;
                     return None;
                 }
-                // TODO: re-evaluate memory management; errors are currently freed by
-                // PlanResultCleanup
-                OptionalValue::Some(ExternResult::Err(err)) => {
-                    return Some(Err(engine_error_to_kernel(err)))
+                OptionalValue::Some(EngineExecResult::Failure(err)) => {
+                    return Some(Err(err.into()))
                 }
-                OptionalValue::Some(ExternResult::Ok(array)) => {
+                OptionalValue::Some(EngineExecResult::Success(array)) => {
                     match Self::arrow_array_to_file_metas(array) {
                         Ok(batch) => self.buffer = batch.into_iter(),
                         Err(e) => {
@@ -365,13 +416,13 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
 
     use super::*;
-    use crate::error::{EngineError, KernelError};
-    use crate::plans::result::PlanResultCleanup;
+    use crate::error::{EngineExecError, KernelError};
+    use crate::ExclusiveRustString;
 
     // === Shared Test Helpers ===
 
     struct MockIter<T> {
-        items: Mutex<VecDeque<OptionalValue<ExternResult<T>>>>,
+        items: Mutex<VecDeque<OptionalValue<EngineExecResult<T>>>>,
         cleanup_called: Arc<AtomicBool>,
     }
 
@@ -387,7 +438,7 @@ mod tests {
     //
     // Can be dropped using `free_mock_iter`.
     fn make_mock_iter<T>(
-        items: Vec<OptionalValue<ExternResult<T>>>,
+        items: Vec<OptionalValue<EngineExecResult<T>>>,
     ) -> (Box<MockIter<T>>, Arc<AtomicBool>) {
         let cleanup_called = Arc::new(AtomicBool::new(false));
         let iter = Box::new(MockIter {
@@ -401,8 +452,11 @@ mod tests {
         let _ = unsafe { Box::from_raw(state.unwrap().as_ptr() as *mut MockIter<T>) };
     }
 
-    fn err_ptr(err: &EngineError) -> *mut EngineError {
-        err as *const EngineError as *mut EngineError
+    // Builds an engine execution error whose message is a kernel-allocated `ExclusiveRustString`
+    // handle (mirroring the engine downcalling `allocate_kernel_string`).
+    fn make_exec_error(etype: KernelError, message: &str) -> EngineExecError {
+        let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();
+        EngineExecError { etype, message }
     }
 
     // === FfiEngineDataIter Test ===
@@ -422,40 +476,48 @@ mod tests {
 
     #[test]
     fn ffi_engine_data_iter_drains_and_runs_cleanup() {
-        let err = EngineError {
-            etype: KernelError::GenericError,
-        };
         let (mock_iter, cleanup_called) = make_mock_iter::<Handle<ExclusiveEngineData>>(vec![
-            OptionalValue::Some(ExternResult::Ok(make_data_handle(3))),
-            OptionalValue::Some(ExternResult::Err(err_ptr(&err))),
-            OptionalValue::Some(ExternResult::Ok(make_data_handle(5))),
+            OptionalValue::Some(EngineExecResult::Success(make_data_handle(3))),
+            OptionalValue::Some(EngineExecResult::Failure(make_exec_error(
+                KernelError::GenericError,
+                "boom",
+            ))),
+            OptionalValue::Some(EngineExecResult::Success(make_data_handle(5))),
         ]);
         let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
 
         extern "C" fn next(
             state: NullableCvoid,
-        ) -> OptionalValue<ExternResult<Handle<ExclusiveEngineData>>> {
+            out: *mut OptionalValue<EngineExecResult<Handle<ExclusiveEngineData>>>,
+        ) {
             let mock_iter = unsafe {
                 &*(state.unwrap().as_ptr() as *const MockIter<Handle<ExclusiveEngineData>>)
             };
-            mock_iter
+            let item = mock_iter
                 .items
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(OptionalValue::None)
+                .unwrap_or(OptionalValue::None);
+            unsafe { out.write(item) };
         }
 
-        let mut iter = FfiEngineDataIter::new(
-            CEngineDataIterator { state, next },
-            PlanResultCleanup::new(state, free_mock_iter::<Handle<ExclusiveEngineData>>),
-        );
+        let mut iter = FfiEngineDataIter::new(CEngineDataIterator {
+            state,
+            next,
+            free: free_mock_iter::<Handle<ExclusiveEngineData>>,
+        });
 
         let first = iter.next().expect("first item").expect("first ok");
         assert_eq!(first.len(), 3);
 
-        let second = iter.next().expect("second item");
-        assert!(second.is_err(), "second item should be Err");
+        let Some(Err(err)) = iter.next() else {
+            panic!("second item should be Err");
+        };
+        assert!(
+            err.to_string().contains("boom"),
+            "engine error message must propagate, got {err}"
+        );
 
         let third = iter.next().expect("third item").expect("third ok");
         assert_eq!(third.len(), 5);
@@ -484,37 +546,47 @@ mod tests {
 
     #[test]
     fn ffi_bytes_iter_drains_and_runs_cleanup() {
-        let err = EngineError {
-            etype: KernelError::GenericError,
-        };
         let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
-            OptionalValue::Some(ExternResult::Ok(make_binary_ffi_array(b"hello"))),
-            OptionalValue::Some(ExternResult::Err(err_ptr(&err))),
-            OptionalValue::Some(ExternResult::Ok(make_binary_ffi_array(b"world!"))),
+            OptionalValue::Some(EngineExecResult::Success(make_binary_ffi_array(b"hello"))),
+            OptionalValue::Some(EngineExecResult::Failure(make_exec_error(
+                KernelError::GenericError,
+                "boom",
+            ))),
+            OptionalValue::Some(EngineExecResult::Success(make_binary_ffi_array(b"world!"))),
         ]);
         let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
 
-        extern "C" fn next(state: NullableCvoid) -> OptionalValue<ExternResult<FFI_ArrowArray>> {
+        extern "C" fn next(
+            state: NullableCvoid,
+            out: *mut OptionalValue<EngineExecResult<FFI_ArrowArray>>,
+        ) {
             let mock_iter =
                 unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
-            mock_iter
+            let item = mock_iter
                 .items
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(OptionalValue::None)
+                .unwrap_or(OptionalValue::None);
+            unsafe { out.write(item) };
         }
 
-        let mut iter = FfiBytesIter::new(
-            CBytesIterator { state, next },
-            PlanResultCleanup::new(state, free_mock_iter::<FFI_ArrowArray>),
-        );
+        let mut iter = FfiBytesIter::new(CBytesIterator {
+            state,
+            next,
+            free: free_mock_iter::<FFI_ArrowArray>,
+        });
 
         let first = iter.next().expect("first item").expect("first ok");
         assert_eq!(first.as_ref(), b"hello");
 
-        let second = iter.next().expect("second item");
-        assert!(second.is_err(), "second item should be Err");
+        let Some(Err(err)) = iter.next() else {
+            panic!("second item should be Err");
+        };
+        assert!(
+            err.to_string().contains("boom"),
+            "engine error message must propagate, got {err}"
+        );
 
         let third = iter.next().expect("third item").expect("third ok");
         assert_eq!(third.as_ref(), b"world!");
@@ -558,14 +630,16 @@ mod tests {
 
     extern "C" fn file_meta_next(
         state: NullableCvoid,
-    ) -> OptionalValue<ExternResult<FFI_ArrowArray>> {
+        out: *mut OptionalValue<EngineExecResult<FFI_ArrowArray>>,
+    ) {
         let mock_iter = unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
-        mock_iter
+        let item = mock_iter
             .items
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(OptionalValue::None)
+            .unwrap_or(OptionalValue::None);
+        unsafe { out.write(item) };
     }
 
     /// Exercises batched yields with a multi-row batch, a transient engine error (which does not
@@ -573,16 +647,16 @@ mod tests {
     /// batch and surfaces one row per `Iterator::next` call.
     #[test]
     fn ffi_file_meta_iter_drains_and_runs_cleanup() {
-        let err = EngineError {
-            etype: KernelError::GenericError,
-        };
         let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
-            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[
+            OptionalValue::Some(EngineExecResult::Success(make_file_meta_ffi_array(&[
                 ("file:///a.parquet", 1, 100),
                 ("file:///b.parquet", 2, 200),
             ]))),
-            OptionalValue::Some(ExternResult::Err(err_ptr(&err))),
-            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[(
+            OptionalValue::Some(EngineExecResult::Failure(make_exec_error(
+                KernelError::GenericError,
+                "boom",
+            ))),
+            OptionalValue::Some(EngineExecResult::Success(make_file_meta_ffi_array(&[(
                 "file:///c.parquet",
                 3,
                 300,
@@ -590,13 +664,11 @@ mod tests {
         ]);
         let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
 
-        let mut iter = FfiFileMetaIter::new(
-            CFileMetaIterator {
-                state,
-                next: file_meta_next,
-            },
-            PlanResultCleanup::new(state, free_mock_iter::<FFI_ArrowArray>),
-        );
+        let mut iter = FfiFileMetaIter::new(CFileMetaIterator {
+            state,
+            next: file_meta_next,
+            free: free_mock_iter::<FFI_ArrowArray>,
+        });
 
         // First batch contributes two rows.
         let first = iter.next().expect("first item").expect("first ok");
@@ -610,8 +682,13 @@ mod tests {
         assert_eq!(second.size, 200);
 
         // After draining the first batch the adapter pulls the transient engine error.
-        let third = iter.next().expect("third item");
-        assert!(third.is_err(), "third item should be Err");
+        let Some(Err(err)) = iter.next() else {
+            panic!("third item should be Err");
+        };
+        assert!(
+            err.to_string().contains("boom"),
+            "engine error message must propagate, got {err}"
+        );
 
         // Transient engine errors do not terminate iteration; the fourth batch is still returned.
         let fourth = iter.next().expect("fourth item").expect("fourth ok");
@@ -630,8 +707,8 @@ mod tests {
     #[test]
     fn ffi_file_meta_iter_rejects_empty_batch_and_terminates() {
         let (mock_iter, cleanup_called) = make_mock_iter::<FFI_ArrowArray>(vec![
-            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[]))),
-            OptionalValue::Some(ExternResult::Ok(make_file_meta_ffi_array(&[(
+            OptionalValue::Some(EngineExecResult::Success(make_file_meta_ffi_array(&[]))),
+            OptionalValue::Some(EngineExecResult::Success(make_file_meta_ffi_array(&[(
                 "file:///trap.parquet",
                 99,
                 999,
@@ -646,13 +723,11 @@ mod tests {
             mock_iter.items.lock().unwrap().len()
         };
 
-        let mut iter = FfiFileMetaIter::new(
-            CFileMetaIterator {
-                state,
-                next: file_meta_next,
-            },
-            PlanResultCleanup::new(state, free_mock_iter::<FFI_ArrowArray>),
-        );
+        let mut iter = FfiFileMetaIter::new(CFileMetaIterator {
+            state,
+            next: file_meta_next,
+            free: free_mock_iter::<FFI_ArrowArray>,
+        });
 
         let first = iter.next().expect("first item");
         assert!(first.is_err(), "empty batch must surface as Err");

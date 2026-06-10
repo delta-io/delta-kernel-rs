@@ -66,16 +66,18 @@ pub unsafe extern "C" fn get_plan_based_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::EngineExecResult;
     use crate::ffi_test_utils::allocate_err;
     use crate::free_engine;
-    use crate::plans::result::CPlanResultWrapper;
+    use crate::plans::result::CPlanResult;
 
     #[test]
     fn get_plan_based_engine_returns_plan_based_engine() {
         extern "C" fn unreachable_callback(
             _context: NullableCvoid,
             _plan_proto: crate::KernelBytesSlice,
-        ) -> CPlanResultWrapper {
+            _out: *mut EngineExecResult<CPlanResult>,
+        ) {
             unreachable!("callback should not run -- this test only constructs the engine");
         }
 

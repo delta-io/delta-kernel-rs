@@ -1,5 +1,9 @@
 use delta_kernel::{DeltaResult, Error};
 
+#[cfg(feature = "declarative-plans")]
+use crate::handle::Handle;
+#[cfg(feature = "declarative-plans")]
+use crate::ExclusiveRustString;
 use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
@@ -228,5 +232,136 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
                 ExternResult::Err(err)
             }
         }
+    }
+}
+
+/// An error that can be returned from engine-side execution (e.g during an upcall).
+///
+/// This is intended to be a kernel-allocated error which Engines can return TO kernel. It is the
+/// inverse of [`EngineError`] (which is engine-allocated, and returned FROM kernel).
+///
+/// The message is an [`ExclusiveRustString`] handle, which means the engine must
+/// downcall to [`allocate_kernel_string`](crate::allocate_kernel_string) to construct it. Kernel
+/// can then take ownership and free it appropriately after receiving the error.
+#[cfg(feature = "declarative-plans")]
+#[repr(C)]
+pub struct EngineExecError {
+    // TODO: we re-use KernelError for convenience, but we should ideally split this into a
+    // separate enum, containing only error types that make sense for the engine to return.
+    pub etype: KernelError,
+    pub message: Handle<ExclusiveRustString>,
+}
+
+/// Generic result wrapper around an EngineExecError.
+///
+/// The variants are deliberately named `Success`/`Failure` rather than `Ok`/`Err` to avoid a
+/// conflict with [`ExternResult`]. This is due to an issue in cbindgen, where generic types sharing
+/// the same variant names causes failures during monomorphization (<https://github.com/mozilla/cbindgen/issues/1166>).
+#[cfg(feature = "declarative-plans")]
+#[repr(C)]
+pub enum EngineExecResult<T> {
+    Success(T),
+    Failure(EngineExecError),
+}
+
+#[cfg(feature = "declarative-plans")]
+impl From<EngineExecError> for Error {
+    /// Converts an [`EngineExecError`] into a [`delta_kernel::Error`], translating the
+    /// [`KernelError`] code back into its matching kernel error variant and consuming (and thereby
+    /// freeing) the message handle.
+    fn from(err: EngineExecError) -> Self {
+        let EngineExecError { etype, message } = err;
+        // SAFETY: `message` is an `ExclusiveRustString` handle that kernel owns and has not yet
+        // consumed. It is produced by the engine downcalling `allocate_kernel_string` and is
+        // consumed exactly once, here.
+        let message = *unsafe { message.into_inner() };
+        match etype {
+            KernelError::CheckpointWriteError => Error::CheckpointWrite(message),
+            KernelError::EngineDataTypeError => Error::EngineDataType(message),
+            KernelError::GenericError => Error::Generic(message),
+            KernelError::InternalError => Error::InternalError(message),
+            KernelError::FileNotFoundError => Error::FileNotFound(message),
+            KernelError::MissingColumnError => Error::MissingColumn(message),
+            KernelError::UnexpectedColumnTypeError => Error::UnexpectedColumnType(message),
+            KernelError::MissingDataError => Error::MissingData(message),
+            KernelError::DeletionVectorError => Error::DeletionVector(message),
+            KernelError::InvalidProtocolError => Error::InvalidProtocol(message),
+            KernelError::JoinFailureError => Error::JoinFailure(message),
+            KernelError::InvalidColumnMappingModeError => Error::InvalidColumnMappingMode(message),
+            KernelError::InvalidTableLocationError => Error::InvalidTableLocation(message),
+            KernelError::InvalidDecimalError => Error::InvalidDecimal(message),
+            KernelError::InvalidStructDataError => Error::InvalidStructData(message),
+            KernelError::InvalidExpression => Error::InvalidExpressionEvaluation(message),
+            KernelError::InvalidLogPath => Error::InvalidLogPath(message),
+            KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
+            KernelError::UnsupportedError => Error::Unsupported(message),
+            KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
+            KernelError::SchemaError => Error::Schema(message),
+            KernelError::MissingVersionError => Error::MissingVersion,
+            KernelError::MissingMetadataError => Error::MissingMetadata,
+            KernelError::MissingProtocolError => Error::MissingProtocol,
+            KernelError::MissingMetadataAndProtocolError => Error::MissingMetadataAndProtocol,
+
+            // These codes have no well-defined equivalent (e.g they wrap a foreign error type,
+            // carry a non-string payload, etc), so just map them to a generic error and
+            // preserve the code + message in the error string.
+            code @ (KernelError::UnknownError
+            | KernelError::FFIError
+            | KernelError::ExtractError
+            | KernelError::IOErrorError
+            | KernelError::InvalidUrlError
+            | KernelError::MalformedJsonError
+            | KernelError::ParseError
+            | KernelError::Utf8Error
+            | KernelError::ParseIntError
+            | KernelError::ParseIntervalError
+            | KernelError::ChangeDataFeedUnsupported
+            | KernelError::ChangeDataFeedIncompatibleSchema
+            | KernelError::LiteralExpressionTransformError) => {
+                Error::generic(format!("engine execution error ({code:?}): {message}"))
+            }
+            #[cfg(feature = "default-engine-base")]
+            code @ (KernelError::ArrowError
+            | KernelError::ParquetError
+            | KernelError::ObjectStoreError
+            | KernelError::ObjectStorePathError
+            | KernelError::ReqwestError) => {
+                Error::generic(format!("engine execution error ({code:?}): {message}"))
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "declarative-plans"))]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn exec_error(etype: KernelError, message: &str) -> EngineExecError {
+        let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();
+        EngineExecError { etype, message }
+    }
+
+    /// Each code should translate into its matching kernel error variant (preserving the message),
+    /// unit variants drop the message, and unmapped codes fall back to a generic error that retains
+    /// both the original code and message.
+    #[rstest]
+    #[case::file_not_found(KernelError::FileNotFoundError, "File not found: boom")]
+    #[case::schema(KernelError::SchemaError, "Schema error: boom")]
+    #[case::unsupported(KernelError::UnsupportedError, "Unsupported: boom")]
+    #[case::generic(KernelError::GenericError, "Generic delta kernel error: boom")]
+    #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
+    #[case::unit_missing_version(KernelError::MissingVersionError, "No table version found.")]
+    #[case::fallback_io(
+        KernelError::IOErrorError,
+        "Generic delta kernel error: engine execution error (IOErrorError): boom"
+    )]
+    fn engine_exec_error_maps_kernel_error_code(
+        #[case] etype: KernelError,
+        #[case] expected: &str,
+    ) {
+        let err: Error = exec_error(etype, "boom").into();
+        assert_eq!(err.to_string(), expected);
     }
 }
