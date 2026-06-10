@@ -9,6 +9,7 @@
 //! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC, and
 //!   on-demand API calls like `get_domain_metadata`)
 //! - [`scan`]: scan execution scenarios (`scan.execute()` parquet data-file reads)
+//! - [`commit`]: `Transaction::commit()` success / conflict metrics
 //!
 //! Where possible, tests use [`TestTableBuilder`] for table setup. Tests that need
 //! checkpoint, CRC, or log compaction features still use manual helpers until those

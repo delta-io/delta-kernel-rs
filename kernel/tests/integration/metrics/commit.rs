@@ -12,8 +12,11 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
+use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::{insert_data, install_thread_local_metrics_reporter, test_table_setup_mt};
+use test_utils::{
+    insert_data, insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt,
+};
 use url::Url;
 
 use super::{measuring_engine, simple_schema};
@@ -40,18 +43,29 @@ fn setup_empty_table() -> DeltaResult<(tempfile::TempDir, Url)> {
     Ok((temp_dir, table_url))
 }
 
+#[rstest]
+#[case::write_append("WRITE", true, false)]
+#[case::blind_append("WRITE", true, true)]
+#[case::optimize_no_data_change("OPTIMIZE", false, false)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_append_emits_success_metrics() -> DeltaResult<()> {
+async fn commit_append_emits_success_metrics(
+    #[case] operation: &str,
+    #[case] data_change: bool,
+    #[case] is_blind_append: bool,
+) -> DeltaResult<()> {
     let (_temp_dir, table_url) = setup_empty_table()?;
     let reporter = Arc::new(LastCommitSuccess::default());
     let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    insert_data(
+    insert_data_with(
         snap,
         &engine,
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        operation,
+        data_change,
+        is_blind_append,
     )
     .await?
     .unwrap_committed();
@@ -67,9 +81,9 @@ async fn commit_append_emits_success_metrics() -> DeltaResult<()> {
     assert!(success.add_files_bytes > 0);
     assert_eq!(success.num_remove_files, 0);
     assert_eq!(success.remove_files_bytes, 0);
-    assert_eq!(success.operation.as_deref(), Some("WRITE"));
-    assert!(success.data_change);
-    assert!(!success.is_blind_append);
+    assert_eq!(success.operation.as_deref(), Some(operation));
+    assert_eq!(success.data_change, data_change);
+    assert_eq!(success.is_blind_append, is_blind_append);
     assert!(success.total_duration >= success.prepare_duration + success.committer_duration);
     Ok(())
 }

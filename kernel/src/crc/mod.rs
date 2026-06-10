@@ -30,7 +30,7 @@ pub(crate) use delta::CrcDelta;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
-pub(crate) use file_stats::{is_incremental_safe_operation, FileStatsDelta};
+pub(crate) use file_stats::{is_incremental_safe_operation, size_to_u64, FileStatsDelta};
 pub(crate) use reader::read_crc_file_or_none;
 #[cfg(test)]
 pub(crate) use reader::try_read_crc_file;

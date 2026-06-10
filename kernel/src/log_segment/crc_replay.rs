@@ -20,8 +20,8 @@ use crate::actions::{
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::crc::{
-    is_incremental_safe_operation, read_crc_file_or_none, Crc, CrcDelta, FileSizeHistogram,
-    FileStatsDelta,
+    is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
+    FileSizeHistogram, FileStatsDelta,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{
@@ -288,10 +288,10 @@ impl CrcReplayAccumulator {
         }
         let fs = &mut self.delta.file_stats;
         fs.gross_add_files += 1;
-        fs.gross_add_bytes += size.max(0) as u64;
+        // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
+        //              Indeterminate instead, like a missing remove size.
+        fs.gross_add_bytes += size_to_u64(size)?;
         if let Some(hist) = fs.net_histogram.as_mut() {
-            // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
-            //              Indeterminate instead, like a missing remove size.
             hist.insert(size)?;
         }
         Ok(())
@@ -311,7 +311,7 @@ impl CrcReplayAccumulator {
             Some(s) => {
                 let fs = &mut self.delta.file_stats;
                 fs.gross_remove_files += 1;
-                fs.gross_remove_bytes += s.max(0) as u64;
+                fs.gross_remove_bytes += size_to_u64(s)?;
                 if let Some(hist) = fs.net_histogram.as_mut() {
                     hist.remove(s)?;
                 }

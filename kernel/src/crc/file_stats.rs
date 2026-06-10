@@ -135,8 +135,8 @@ impl FileStatsDelta {
         for batch in add_files_metadata {
             let mut visitor = FileStatsVisitor::new(None, false, &mut histogram);
             visitor.visit_rows_of(batch.as_ref())?;
-            gross_add_files += visitor.count.unsigned_abs();
-            gross_add_bytes += visitor.total_size.unsigned_abs();
+            gross_add_files += visitor.count;
+            gross_add_bytes += visitor.total_size;
         }
 
         // Visit remove files (remove from histogram). Each FilteredEngineData has its own
@@ -146,8 +146,8 @@ impl FileStatsDelta {
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
             let mut visitor = FileStatsVisitor::new(sv_opt, true, &mut histogram);
             visitor.visit_rows_of(filtered_batch.data())?;
-            gross_remove_files += visitor.count.unsigned_abs();
-            gross_remove_bytes += visitor.total_size.unsigned_abs();
+            gross_remove_files += visitor.count;
+            gross_remove_bytes += visitor.total_size;
         }
 
         Ok(FileStatsDelta {
@@ -160,11 +160,18 @@ impl FileStatsDelta {
     }
 }
 
+/// Read a file `size` (a non-negative byte count stored as `i64`) as `u64`, erroring on a
+/// negative size (corrupt input).
+pub(crate) fn size_to_u64(size: i64) -> DeltaResult<u64> {
+    u64::try_from(size)
+        .map_err(|_| Error::internal_error(format!("File size must be non-negative, got {size}")))
+}
+
 /// Visitor that extracts the `size` column from file metadata and updates a shared histogram.
 ///
-/// When `is_remove` is false (add files), each visited row increments the histogram bin's count
-/// and bytes. When true (remove files), each row decrements them. This builds a single delta
-/// histogram directly without needing separate add/remove histograms.
+/// `is_remove` selects whether each visited row is inserted into (add) or removed from (remove)
+/// the shared delta histogram. `count`/`total_size` always accumulate gross magnitude; the
+/// add/remove direction is the caller's to track.
 ///
 /// Accepts an optional selection vector to filter which rows are visited. AddFiles pass `None`
 /// (count every row); RemoveFiles may pass `Some(sv)` from [`FilteredEngineData`] to skip rows
@@ -175,12 +182,12 @@ struct FileStatsVisitor<'sv, 'h> {
     selection_vector: Option<&'sv [bool]>,
     /// Offset into the selection vector, tracking position across multiple visit calls.
     offset: usize,
-    /// Whether this visitor is processing remove files (decrements) vs add files (increments).
+    /// Whether visited rows are removed from (vs added to) the histogram.
     is_remove: bool,
-    /// Net file count contribution from this visitor. Negative for remove visitors.
-    count: i64,
-    /// Net byte size contribution from this visitor. Negative for remove visitors.
-    total_size: i64,
+    /// Count of files visited.
+    count: u64,
+    /// Total bytes of files visited.
+    total_size: u64,
     /// Shared histogram that all visitors (add and remove) write to.
     histogram: &'h mut FileSizeHistogram,
 }
@@ -224,13 +231,11 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
             };
             if selected {
                 let size: i64 = getters[0].get(i, "size")?;
+                self.count += 1;
+                self.total_size += size_to_u64(size)?;
                 if self.is_remove {
-                    self.count -= 1;
-                    self.total_size -= size;
                     self.histogram.remove(size)?;
                 } else {
-                    self.count += 1;
-                    self.total_size += size;
                     self.histogram.insert(size)?;
                 }
             }
