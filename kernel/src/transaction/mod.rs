@@ -3,6 +3,7 @@ use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
@@ -21,6 +22,8 @@ use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
 use crate::log_segment::LogSegment;
+use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
+use crate::metrics::{CommitFailureReason, MetricId};
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
 use crate::path::{LogRoot, ParsedLogPath};
@@ -221,6 +224,8 @@ impl SupportsDataFiles for CreateTable {}
 /// ```
 pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
+    // Correlates all metric events emitted by this transaction.
+    operation_id: MetricId,
     // The snapshot this transaction is based on. None for CREATE TABLE (no pre-existing table).
     // Use `read_snapshot()` to access; it returns an error if None.
     read_snapshot_opt: Option<SnapshotRef>,
@@ -334,14 +339,27 @@ impl<S> Transaction<S> {
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     #[instrument(
         parent = &self.span,
-        name = "txn.commit",
+        name = TRANSACTION_COMMIT_SPAN,
         skip_all,
         fields(
+            report,
+            operation_id = %self.operation_id,
             commit_version = self.get_commit_version(),
+            num_add_files,
+            num_remove_files,
+            add_files_bytes,
+            remove_files_bytes,
+            is_blind_append,
+            data_change,
+            operation,
+            prepare_duration_ns,
+            committer_duration_ns,
+            failure_reason,
         ),
         err
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+        let commit_start = Instant::now();
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -486,36 +504,79 @@ impl<S> Transaction<S> {
             metadata,
             dm_changes.clone(),
         )?;
-        match self
-            .committer
-            .commit(engine, Box::new(filtered_actions), commit_metadata)
-        {
+        let prepare_duration = commit_start.elapsed();
+        let committer_start = Instant::now();
+        let commit_response =
+            self.committer
+                .commit(engine, Box::new(filtered_actions), commit_metadata);
+        let committer_duration = committer_start.elapsed();
+        match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
+                // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
+                //              below must not fail the txn (and must not mislabel the metric).
                 let bin_boundaries = self
                     .read_snapshot_opt
                     .as_ref()
                     .and_then(|snap| snap.get_file_stats_if_present())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
-                let crc_delta = self.build_crc_delta(
-                    in_commit_timestamp,
-                    dm_changes,
+                let file_stats = FileStatsDelta::try_compute_for_txn(
+                    &self.add_files_metadata,
+                    &self.remove_files_metadata,
                     bin_boundaries.as_deref(),
                 )?;
+                self.record_commit_success_metrics(
+                    &file_stats,
+                    prepare_duration,
+                    committer_duration,
+                );
+                let crc_delta =
+                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
                 Ok(CommitResult::CommittedTransaction(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
             }
-            Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
-                self.into_conflicted(version),
-            )),
+            Ok(CommitResponse::Conflict { version }) => {
+                // Flips the metric event from success -> failure.
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::Conflict.as_ref());
+                Ok(CommitResult::ConflictedTransaction(
+                    self.into_conflicted(version),
+                ))
+            }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
             Err(e @ Error::IOError(_)) => {
+                // Flips the metric event from success -> failure.
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn record_commit_success_metrics(
+        &self,
+        file_stats: &FileStatsDelta,
+        prepare_duration: Duration,
+        committer_duration: Duration,
+    ) {
+        let span = tracing::Span::current();
+        span.record("num_add_files", file_stats.gross_add_files);
+        span.record("num_remove_files", file_stats.gross_remove_files);
+        span.record("add_files_bytes", file_stats.gross_add_bytes);
+        span.record("remove_files_bytes", file_stats.gross_remove_bytes);
+        span.record("is_blind_append", self.is_blind_append);
+        span.record("data_change", self.data_change);
+        if let Some(operation) = self.operation.as_deref() {
+            span.record("operation", operation);
+        }
+        span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
+        span.record(
+            "committer_duration_ns",
+            committer_duration.as_nanos() as u64,
+        );
     }
 
     /// Set the data change flag.
@@ -1260,18 +1321,14 @@ impl<S> Transaction<S> {
         })
     }
 
-    /// Build a [`CrcDelta`] from the transaction's staged file metadata and commit state.
+    /// Build a [`CrcDelta`] from the transaction's commit state and a precomputed
+    /// [`FileStatsDelta`].
     fn build_crc_delta(
         &self,
+        file_stats: FileStatsDelta,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
-        bin_boundaries: Option<&[i64]>,
     ) -> DeltaResult<CrcDelta> {
-        let file_stats = FileStatsDelta::try_compute_for_txn(
-            &self.add_files_metadata,
-            &self.remove_files_metadata,
-            bin_boundaries,
-        )?;
         // TODO: drop these conversions by migrating the upstream chain
         //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
         //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
@@ -1634,6 +1691,7 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
+    use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -1641,8 +1699,9 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
-        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
-        test_schema_with_array, test_schema_with_map,
+        install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
+        test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
+        CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -1666,6 +1725,31 @@ mod tests {
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             Err(Error::IOError(std::io::Error::other("simulated IO error")))
+        }
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A mock committer that always returns a non-retryable (non-IO) error, used to test the
+    /// terminal error path.
+    struct GenericErrorCommitter;
+
+    impl Committer for GenericErrorCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            Err(Error::generic("simulated commit error"))
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -2976,6 +3060,46 @@ mod tests {
             future_ict + 1,
             "CommitMetadata.in_commit_timestamp should be the computed ICT (prev_ict + 1), \
              not the wall-clock time"
+        );
+        Ok(())
+    }
+
+    // ===== Commit failure-metric tests =====
+
+    fn commit_failure_reason(reporter: &CapturingReporter) -> Option<CommitFailureReason> {
+        reporter.events().into_iter().find_map(|event| match event {
+            MetricEvent::TransactionCommitFailure(f) => Some(f.reason),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn test_commit_io_error_emits_retryable_io_failure_metric() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
+        add_dummy_file(&mut txn);
+        let result = txn.commit(engine.as_ref())?;
+        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
+        assert_eq!(
+            commit_failure_reason(&reporter),
+            Some(CommitFailureReason::RetryableIo)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_terminal_error_emits_error_failure_metric() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
+        add_dummy_file(&mut txn);
+        assert!(txn.commit(engine.as_ref()).is_err());
+        assert_eq!(
+            commit_failure_reason(&reporter),
+            Some(CommitFailureReason::Error)
         );
         Ok(())
     }

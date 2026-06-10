@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr as _;
 use std::time::Duration;
 
+use strum::{AsRefStr, Display as StrumDisplay, EnumString};
 use tracing::field::{Field, Visit};
 use tracing::span::Attributes;
 use tracing::warn;
@@ -78,6 +79,8 @@ pub enum MetricEvent {
     ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure),
     SnapshotBuildSuccess(SnapshotBuildSuccess),
     SnapshotBuildFailure(SnapshotBuildFailure),
+    TransactionCommitSuccess(TransactionCommitSuccess),
+    TransactionCommitFailure(TransactionCommitFailure),
     DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
     DomainMetadataLoadFailure,
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
@@ -100,6 +103,7 @@ impl MetricEvent {
             Self::LogSegmentLoadSuccess(e) => e.set_duration(d),
             Self::ProtocolMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SnapshotBuildSuccess(e) => e.set_duration(d),
+            Self::TransactionCommitSuccess(e) => e.set_duration(d),
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
             Self::CrcReadSuccess(e) => e.set_duration(d),
@@ -109,6 +113,7 @@ impl MetricEvent {
             Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::SnapshotBuildFailure(_)
+            | Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure
@@ -126,6 +131,7 @@ impl MetricEvent {
             // Variants with u64 fields set during span lifetime.
             Self::LogSegmentLoadSuccess(e) => e.record_u64(name, value),
             Self::SnapshotBuildSuccess(e) => e.record_u64(name, value),
+            Self::TransactionCommitSuccess(e) => e.record_u64(name, value),
             Self::DomainMetadataLoadSuccess(e) => e.record_u64(name, value),
             Self::CrcReadSuccess(e) => e.record_u64(name, value),
 
@@ -143,6 +149,7 @@ impl MetricEvent {
             Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
+            Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
@@ -153,6 +160,7 @@ impl MetricEvent {
         match self {
             // Variants with bool fields set during span lifetime.
             Self::LogSegmentLoadSuccess(e) => e.record_bool(name, value),
+            Self::TransactionCommitSuccess(e) => e.record_bool(name, value),
             Self::DomainMetadataLoadSuccess(e) => e.record_bool(name, value),
             Self::SetTransactionLoadSuccess(e) => e.record_bool(name, value),
 
@@ -171,9 +179,29 @@ impl MetricEvent {
             Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
+            Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+        }
+    }
+
+    pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        if name == "failure_reason" {
+            if let Self::TransactionCommitSuccess(e) = self {
+                let operation_id = e.operation_id;
+                *self = Self::TransactionCommitFailure(TransactionCommitFailure {
+                    operation_id,
+                    reason: value.parse().unwrap_or(CommitFailureReason::Error),
+                });
+            }
+            return Ok(());
+        }
+        // Only TransactionCommitSuccess records string fields today. If other events need them,
+        // dispatch per-variant like `record_u64`/`record_bool` above instead of this catch-all.
+        match self {
+            Self::TransactionCommitSuccess(e) => e.record_str(name, value),
+            _ => Ok(()),
         }
     }
 
@@ -191,6 +219,12 @@ impl MetricEvent {
             Self::SnapshotBuildSuccess(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: e.operation_id,
             }),
+            Self::TransactionCommitSuccess(e) => {
+                Self::TransactionCommitFailure(TransactionCommitFailure {
+                    operation_id: e.operation_id,
+                    reason: CommitFailureReason::Error,
+                })
+            }
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure,
@@ -200,6 +234,7 @@ impl MetricEvent {
             e @ (Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::SnapshotBuildFailure(_)
+            | Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure
@@ -222,6 +257,8 @@ impl fmt::Display for MetricEvent {
             Self::ProtocolMetadataLoadFailure(e) => e.fmt(f),
             Self::SnapshotBuildSuccess(e) => e.fmt(f),
             Self::SnapshotBuildFailure(e) => e.fmt(f),
+            Self::TransactionCommitSuccess(e) => e.fmt(f),
+            Self::TransactionCommitFailure(e) => e.fmt(f),
             Self::DomainMetadataLoadSuccess(e) => e.fmt(f),
             Self::DomainMetadataLoadFailure => f.write_str("DomainMetadataLoadFailure"),
             Self::SetTransactionLoadSuccess(e) => e.fmt(f),
@@ -464,6 +501,171 @@ impl fmt::Display for SnapshotBuildFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SnapshotBuildFailure(id={})", self.operation_id)
     }
+}
+
+// ====================================================================
+// TransactionCommit
+// ====================================================================
+
+pub(crate) const TRANSACTION_COMMIT_SPAN: &str = "txn.commit";
+
+/// A transaction was committed successfully.
+#[derive(Debug, Clone)]
+pub struct TransactionCommitSuccess {
+    // === Set on span creation ===
+    pub operation_id: MetricId,
+    pub commit_version: u64,
+
+    // === Set during span lifetime ===
+    pub num_add_files: u64,
+    pub num_remove_files: u64,
+    pub add_files_bytes: u64,
+    pub remove_files_bytes: u64,
+    pub is_blind_append: bool,
+    pub data_change: bool,
+    pub operation: Option<String>,
+    /// Time assembling and validating the commit, before the committer call.
+    pub prepare_duration: Duration,
+    /// Time in the committer's `commit()` call.
+    pub committer_duration: Duration,
+
+    // === Set on span close ===
+    pub total_duration: Duration,
+}
+
+impl TransactionCommitSuccess {
+    pub(crate) const SPAN_NAME: &'static str = TRANSACTION_COMMIT_SPAN;
+
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+        let mut v = TransactionCommitAttrs::default();
+        attrs.record(&mut v);
+        Self {
+            operation_id: MetricId::from_attrs(attrs),
+            commit_version: v.commit_version,
+            num_add_files: 0,
+            num_remove_files: 0,
+            add_files_bytes: 0,
+            remove_files_bytes: 0,
+            is_blind_append: false,
+            data_change: false,
+            operation: None,
+            prepare_duration: Duration::default(),
+            committer_duration: Duration::default(),
+            total_duration: Duration::default(),
+        }
+    }
+
+    pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        match name {
+            "num_add_files" => self.num_add_files = value,
+            "num_remove_files" => self.num_remove_files = value,
+            "add_files_bytes" => self.add_files_bytes = value,
+            "remove_files_bytes" => self.remove_files_bytes = value,
+            "prepare_duration_ns" => self.prepare_duration = Duration::from_nanos(value),
+            "committer_duration_ns" => self.committer_duration = Duration::from_nanos(value),
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        match name {
+            "is_blind_append" => self.is_blind_append = value,
+            "data_change" => self.data_change = value,
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        match name {
+            "operation" => self.operation = Some(value.to_string()),
+            _ => return Err(Self::SPAN_NAME),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_duration(&mut self, d: Duration) {
+        self.total_duration = d;
+    }
+}
+
+impl fmt::Display for TransactionCommitSuccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            operation_id,
+            commit_version,
+            num_add_files,
+            num_remove_files,
+            add_files_bytes,
+            remove_files_bytes,
+            is_blind_append,
+            data_change,
+            operation,
+            prepare_duration,
+            committer_duration,
+            total_duration,
+        } = self;
+        write!(
+            f,
+            "TransactionCommitSuccess(id={operation_id}, version={commit_version}, \
+             total_duration={total_duration:?}, prepare={prepare_duration:?}, committer={committer_duration:?}, \
+             add_files={num_add_files}, remove_files={num_remove_files}, \
+             add_bytes={add_files_bytes}, remove_bytes={remove_files_bytes}, \
+             is_blind_append={is_blind_append}, data_change={data_change}, operation={operation:?})"
+        )
+    }
+}
+
+/// Why a transaction commit did not succeed.
+///
+/// Serializes to its `snake_case` name for the `failure_reason` span field (e.g.
+/// `RetryableIo` -> `"retryable_io"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum CommitFailureReason {
+    /// The commit conflicted with a concurrently committed version.
+    Conflict,
+    /// A retryable IO error occurred during the commit.
+    RetryableIo,
+    /// A terminal (non-retryable) error occurred.
+    Error,
+}
+
+/// A transaction commit did not succeed; `reason` distinguishes conflict, retryable IO, and
+/// terminal errors.
+#[derive(Debug, Clone)]
+pub struct TransactionCommitFailure {
+    pub operation_id: MetricId,
+    pub reason: CommitFailureReason,
+}
+
+impl fmt::Display for TransactionCommitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            operation_id,
+            reason,
+        } = self;
+        write!(
+            f,
+            "TransactionCommitFailure(id={operation_id}, reason={reason})"
+        )
+    }
+}
+
+#[derive(Default)]
+struct TransactionCommitAttrs {
+    commit_version: u64,
+}
+
+impl Visit for TransactionCommitAttrs {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "commit_version" {
+            self.commit_version = value;
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
 }
 
 // ====================================================================
@@ -1122,4 +1324,68 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         dedup_visitor_time_ms = e.dedup_visitor_time_ms,
         predicate_eval_time_ms = e.predicate_eval_time_ms,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn commit_success(operation_id: MetricId) -> TransactionCommitSuccess {
+        TransactionCommitSuccess {
+            operation_id,
+            commit_version: 1,
+            num_add_files: 0,
+            num_remove_files: 0,
+            add_files_bytes: 0,
+            remove_files_bytes: 0,
+            is_blind_append: false,
+            data_change: false,
+            operation: None,
+            prepare_duration: Duration::default(),
+            committer_duration: Duration::default(),
+            total_duration: Duration::default(),
+        }
+    }
+
+    #[rstest]
+    #[case::conflict("conflict", CommitFailureReason::Conflict)]
+    #[case::retryable_io("retryable_io", CommitFailureReason::RetryableIo)]
+    #[case::error("error", CommitFailureReason::Error)]
+    #[case::unknown_defaults_to_error("totally_unknown", CommitFailureReason::Error)]
+    fn record_str_failure_reason_flips_to_expected_reason(
+        #[case] value: &str,
+        #[case] expected: CommitFailureReason,
+    ) {
+        let id = MetricId::new();
+        let mut event = MetricEvent::TransactionCommitSuccess(commit_success(id));
+        event.record_str("failure_reason", value).unwrap();
+        let MetricEvent::TransactionCommitFailure(failure) = event else {
+            panic!("expected TransactionCommitFailure");
+        };
+        assert_eq!(failure.operation_id, id);
+        assert_eq!(failure.reason, expected);
+    }
+
+    #[test]
+    fn record_str_operation_sets_field_without_flipping() {
+        let mut event = MetricEvent::TransactionCommitSuccess(commit_success(MetricId::new()));
+        event.record_str("operation", "WRITE").unwrap();
+        let MetricEvent::TransactionCommitSuccess(success) = event else {
+            panic!("expected TransactionCommitSuccess");
+        };
+        assert_eq!(success.operation.as_deref(), Some("WRITE"));
+    }
+
+    #[test]
+    fn into_failure_maps_commit_success_to_error_reason() {
+        let id = MetricId::new();
+        let failure = MetricEvent::TransactionCommitSuccess(commit_success(id)).into_failure();
+        let MetricEvent::TransactionCommitFailure(failure) = failure else {
+            panic!("expected TransactionCommitFailure");
+        };
+        assert_eq!(failure.operation_id, id);
+        assert_eq!(failure.reason, CommitFailureReason::Error);
+    }
 }

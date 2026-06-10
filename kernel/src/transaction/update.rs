@@ -27,6 +27,7 @@ use crate::error::Error;
 use crate::expressions::{
     column_name, ArrayData, ColumnName, ExpressionStructPatch, Scalar, StructData,
 };
+use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
@@ -77,6 +78,7 @@ impl Transaction {
 
         Ok(Transaction {
             span,
+            operation_id: MetricId::new(),
             read_snapshot_opt: Some(read_snapshot),
             effective_table_config,
             should_emit_protocol: false,
