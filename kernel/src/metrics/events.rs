@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr as _;
 use std::time::Duration;
 
+use strum::{AsRefStr, Display as StrumDisplay, EnumString};
 use tracing::field::{Field, Visit};
 use tracing::span::Attributes;
 use tracing::warn;
@@ -191,7 +192,7 @@ impl MetricEvent {
                 let operation_id = e.operation_id;
                 *self = Self::TransactionCommitFailure(TransactionCommitFailure {
                     operation_id,
-                    reason: CommitFailureReason::parse(value),
+                    reason: value.parse().unwrap_or(CommitFailureReason::Error),
                 });
             }
             return Ok(());
@@ -617,7 +618,11 @@ impl fmt::Display for TransactionCommitSuccess {
 }
 
 /// Why a transaction commit did not succeed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes to its `snake_case` name for the `failure_reason` span field (e.g.
+/// `RetryableIo` -> `"retryable_io"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum CommitFailureReason {
     /// The commit conflicted with a concurrently committed version.
     Conflict,
@@ -625,32 +630,6 @@ pub enum CommitFailureReason {
     RetryableIo,
     /// A terminal (non-retryable) error occurred.
     Error,
-}
-
-impl CommitFailureReason {
-    /// The `failure_reason` span-field string for this reason. Producer and parser share this.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Conflict => "conflict",
-            Self::RetryableIo => "retryable_io",
-            Self::Error => "error",
-        }
-    }
-
-    /// Parse the value of the `failure_reason` span field. Unknown values map to `Error`.
-    fn parse(s: &str) -> Self {
-        match s {
-            _ if s == Self::Conflict.as_str() => Self::Conflict,
-            _ if s == Self::RetryableIo.as_str() => Self::RetryableIo,
-            _ => Self::Error,
-        }
-    }
-}
-
-impl fmt::Display for CommitFailureReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// A transaction commit did not succeed; `reason` distinguishes conflict, retryable IO, and
@@ -1349,6 +1328,8 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn commit_success(operation_id: MetricId) -> TransactionCommitSuccess {
@@ -1368,32 +1349,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn commit_failure_reason_parse_round_trips_and_defaults_unknown_to_error() {
-        for reason in [
-            CommitFailureReason::Conflict,
-            CommitFailureReason::RetryableIo,
-            CommitFailureReason::Error,
-        ] {
-            assert_eq!(CommitFailureReason::parse(reason.as_str()), reason);
-        }
-        assert_eq!(
-            CommitFailureReason::parse("nope"),
-            CommitFailureReason::Error
-        );
-        assert_eq!(CommitFailureReason::parse(""), CommitFailureReason::Error);
-    }
-
-    #[test]
-    fn record_str_failure_reason_flips_success_to_failure_preserving_id() {
+    #[rstest]
+    #[case::conflict("conflict", CommitFailureReason::Conflict)]
+    #[case::retryable_io("retryable_io", CommitFailureReason::RetryableIo)]
+    #[case::error("error", CommitFailureReason::Error)]
+    #[case::unknown_defaults_to_error("totally_unknown", CommitFailureReason::Error)]
+    fn record_str_failure_reason_flips_to_expected_reason(
+        #[case] value: &str,
+        #[case] expected: CommitFailureReason,
+    ) {
         let id = MetricId::new();
         let mut event = MetricEvent::TransactionCommitSuccess(commit_success(id));
-        event.record_str("failure_reason", "retryable_io").unwrap();
+        event.record_str("failure_reason", value).unwrap();
         let MetricEvent::TransactionCommitFailure(failure) = event else {
             panic!("expected TransactionCommitFailure");
         };
         assert_eq!(failure.operation_id, id);
-        assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
+        assert_eq!(failure.reason, expected);
     }
 
     #[test]

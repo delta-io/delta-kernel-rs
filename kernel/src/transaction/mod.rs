@@ -536,13 +536,10 @@ impl<S> Transaction<S> {
                     self.into_committed(file_meta, crc_delta)?,
                 ))
             }
-            // The conflict and retryable arms both return Ok (the retryable arm converts the
-            // committer's IOError into Ok(RetryableTransaction)), so `#[instrument(err)]` does not
-            // flip the metric event. Each records its `failure_reason` to flip success -> failure.
-            // Only the terminal Err arm flips via `err`.
             Ok(CommitResponse::Conflict { version }) => {
+                // Flips the metric event from success -> failure.
                 tracing::Span::current()
-                    .record("failure_reason", CommitFailureReason::Conflict.as_str());
+                    .record("failure_reason", CommitFailureReason::Conflict.as_ref());
                 Ok(CommitResult::ConflictedTransaction(
                     self.into_conflicted(version),
                 ))
@@ -550,8 +547,9 @@ impl<S> Transaction<S> {
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
             Err(e @ Error::IOError(_)) => {
+                // Flips the metric event from success -> failure.
                 tracing::Span::current()
-                    .record("failure_reason", CommitFailureReason::RetryableIo.as_str());
+                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
             }
             Err(e) => Err(e),
@@ -1693,6 +1691,7 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
+    use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -1700,8 +1699,9 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
-        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
-        test_schema_with_array, test_schema_with_map,
+        install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
+        test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
+        CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -3066,11 +3066,9 @@ mod tests {
 
     // ===== Commit failure-metric tests =====
 
-    fn commit_failure_reason(
-        reporter: &crate::utils::test_utils::CapturingReporter,
-    ) -> Option<CommitFailureReason> {
+    fn commit_failure_reason(reporter: &CapturingReporter) -> Option<CommitFailureReason> {
         reporter.events().into_iter().find_map(|event| match event {
-            crate::metrics::MetricEvent::TransactionCommitFailure(f) => Some(f.reason),
+            MetricEvent::TransactionCommitFailure(f) => Some(f.reason),
             _ => None,
         })
     }
@@ -3078,9 +3076,8 @@ mod tests {
     #[test]
     fn test_commit_io_error_emits_retryable_io_failure_metric() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let reporter = Arc::new(crate::utils::test_utils::CapturingReporter::default());
-        let _guard =
-            crate::utils::test_utils::install_thread_local_metrics_reporter(reporter.clone());
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
@@ -3095,9 +3092,8 @@ mod tests {
     #[test]
     fn test_commit_terminal_error_emits_error_failure_metric() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let reporter = Arc::new(crate::utils::test_utils::CapturingReporter::default());
-        let _guard =
-            crate::utils::test_utils::install_thread_local_metrics_reporter(reporter.clone());
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         assert!(txn.commit(engine.as_ref()).is_err());
