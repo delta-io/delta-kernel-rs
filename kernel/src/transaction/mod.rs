@@ -42,6 +42,7 @@ use crate::schema::{
     StructTypeBuilder,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
@@ -141,29 +142,6 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
-
-/// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
-static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
-    let len = fields.len();
-    let insert_position = fields
-        .iter()
-        .position(|f| f.name() == "modificationTime")
-        .unwrap_or(len);
-    fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
-    Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
-});
-
-/// Extend a schema with a statistics column and return a new SchemaRef.
-///
-/// The stats column is of type string as required by the spec.
-///
-/// Note that this method is only useful to extend an Add action schema.
-fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
-    StructTypeBuilder::from_schema(schema)
-        .add_field(StructField::nullable("stats", DataType::STRING))
-        .build_arc_unchecked()
-}
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
@@ -297,34 +275,51 @@ impl<S> std::fmt::Debug for Transaction<S> {
     }
 }
 
-/// Transforms add file metadata into commit-ready add actions by converting stats to JSON
-/// and setting the `dataChange` field.
+/// Builds the projection for converting add file metadata into commit-ready Add actions.
+fn build_add_action_projection(
+    input_schema: &StructType,
+    data_change: bool,
+) -> DeltaResult<(SchemaRef, Expression)> {
+    let (output_schema, patch) = ProjectionStructPatchBuilder::new(input_schema)
+        .insert_after(
+            "modificationTime",
+            DATA_CHANGE_COLUMN.clone(),
+            lit(data_change),
+        )
+        .replace(
+            "stats",
+            StructField::nullable("stats", DataType::STRING),
+            Expression::unary(ToJson, col!("stats")),
+        )
+        .build()?;
+    let output_schema = Arc::new(output_schema);
+    let patch = Expression::struct_from([Expression::struct_patch(patch)?]);
+    Ok((output_schema, patch))
+}
+
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
+/// setting the `dataChange` field.
 fn build_add_actions<'a, I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
     input_schema: SchemaRef,
-    output_schema: SchemaRef,
     data_change: bool,
-) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
+) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a>
 where
     I: Iterator<Item = DeltaResult<T>> + Send + 'a,
     T: Deref<Target = dyn EngineData> + Send + 'a,
 {
     let evaluation_handler = engine.evaluation_handler();
-    add_files_metadata.map(move |add_files_batch| {
-        let patch_expr = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new()
-                .insert_after("modificationTime", lit(data_change))
-                .replace("stats", Expression::unary(ToJson, col!("stats"))),
-        )?;
-        let adds_expr = Expression::struct_from([patch_expr]);
+    let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
+    let adds_expr = Arc::new(adds_expr);
+    Ok(add_files_metadata.map(move |add_files_batch| {
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
-            Arc::new(adds_expr),
+            adds_expr.clone(),
             as_log_add_schema(output_schema.clone()).into(),
         )?;
         adds_evaluator.evaluate(add_files_batch?.deref())
-    })
+    }))
 }
 
 // =============================================================================
@@ -1190,9 +1185,8 @@ impl<S> Transaction<S> {
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
                 self.add_files_schema().clone(),
-                with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
                 self.data_change,
-            );
+            )?;
             Ok((Box::new(add_actions), None))
         }
     }
@@ -1258,9 +1252,8 @@ impl<S> Transaction<S> {
             engine,
             extended_add_files,
             with_row_tracking_cols(self.add_files_schema())?,
-            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()))?,
             self.data_change,
-        );
+        )?;
 
         // Generate a row tracking domain metadata based on the final high water mark
         let row_tracking_domain_metadata: RowTrackingDomainMetadata =
@@ -1894,6 +1887,47 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::base(false)]
+    #[case::row_tracking(true)]
+    fn test_add_action_projection_schema(#[case] row_tracking: bool) -> DeltaResult<()> {
+        let input_schema = if row_tracking {
+            with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?
+        } else {
+            BASE_ADD_FILES_SCHEMA.clone()
+        };
+        let (schema, _) = build_add_action_projection(input_schema.as_ref(), true)?;
+        let field_names: Vec<_> = schema.fields().map(|f| f.name().as_str()).collect();
+        let expected_field_names = if row_tracking {
+            vec![
+                "path",
+                "partitionValues",
+                "size",
+                "modificationTime",
+                "dataChange",
+                "stats",
+                "baseRowId",
+                "defaultRowCommitVersion",
+            ]
+        } else {
+            vec![
+                "path",
+                "partitionValues",
+                "size",
+                "modificationTime",
+                "dataChange",
+                "stats",
+            ]
+        };
+        assert_eq!(field_names, expected_field_names);
+        assert_eq!(schema.field("dataChange"), Some(&*DATA_CHANGE_COLUMN));
+        assert_eq!(
+            schema.field("stats").unwrap().data_type(),
+            &DataType::STRING
+        );
         Ok(())
     }
 

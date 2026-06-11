@@ -875,10 +875,8 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     pub fn build(self) -> DeltaResult<(StructType, ExpressionStructPatch)> {
         let (root, input_path, source_schema) = self.inner.begin_build(self.input_schema)?;
         let patch = root.to_expr_patch(input_path);
-        Ok((
-            StructType::try_new(schema_walk(root, source_schema)?)?,
-            patch,
-        ))
+        let schema = StructType::try_new(schema_walk(root, source_schema)?)?;
+        Ok((schema, patch))
     }
 }
 
