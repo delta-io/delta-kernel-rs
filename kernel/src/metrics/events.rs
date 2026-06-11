@@ -32,6 +32,12 @@ impl MetricId {
         Self(Uuid::new_v4())
     }
 
+    /// Return the 16 raw bytes of the underlying UUID. Useful for FFI consumers that want to
+    /// carry the id without allocating or parsing its string form.
+    pub fn as_bytes(&self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+
     /// Extract the `operation_id` field from span attributes. Returns a nil id if the field is
     /// absent, or warns and returns nil if the value is present but malformed.
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {

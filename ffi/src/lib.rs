@@ -51,6 +51,8 @@ use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
 #[cfg(feature = "tracing")]
+pub mod ffi_metrics;
+#[cfg(feature = "tracing")]
 pub mod ffi_tracing;
 pub mod log_path;
 #[cfg(feature = "declarative-plans")]

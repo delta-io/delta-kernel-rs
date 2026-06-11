@@ -1,0 +1,440 @@
+//! FFI-safe representations of kernel [`MetricEvent`]s.
+//!
+//! [`MetricEvent`] mirrors [`delta_kernel::metrics::MetricEvent`] field-for-field as a `repr(C)`
+//! tagged union so engines can receive structured metrics across the FFI boundary. See
+//! [`crate::ffi_tracing::enable_metrics_reporting`] for how an engine registers a callback to
+//! receive these events.
+//!
+//! Durations are reported as `u64` nanoseconds (`*_duration_ns` / `duration_ns`). Operation ids
+//! are the 16 raw bytes of the kernel UUID (see [`MetricId`]); the engine may format them however
+//! it likes. The single string-valued field (`TransactionCommitSuccess::operation`) is a
+//! [`KernelStringSlice`] valid only for the duration of the callback; an empty slice (`len == 0`)
+//! means the operation was unset.
+
+use delta_kernel::metrics as kernel;
+
+use crate::{kernel_string_slice, KernelStringSlice};
+
+/// The 16 raw bytes of an operation's UUID, used to correlate events from the same operation.
+#[repr(C)]
+pub struct MetricId {
+    pub bytes: [u8; 16],
+}
+
+impl From<kernel::MetricId> for MetricId {
+    fn from(id: kernel::MetricId) -> Self {
+        Self {
+            bytes: id.as_bytes(),
+        }
+    }
+}
+
+/// Which scan execution path produced a [`ScanMetadataCompleted`] event.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum ScanType {
+    SequentialPhase,
+    ParallelPhase,
+    Full,
+}
+
+impl From<kernel::ScanType> for ScanType {
+    fn from(t: kernel::ScanType) -> Self {
+        match t {
+            kernel::ScanType::SequentialPhase => Self::SequentialPhase,
+            kernel::ScanType::ParallelPhase => Self::ParallelPhase,
+            kernel::ScanType::Full => Self::Full,
+        }
+    }
+}
+
+/// Why a transaction commit did not succeed.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum CommitFailureReason {
+    Conflict,
+    RetryableIo,
+    Error,
+}
+
+impl From<kernel::CommitFailureReason> for CommitFailureReason {
+    fn from(r: kernel::CommitFailureReason) -> Self {
+        match r {
+            kernel::CommitFailureReason::Conflict => Self::Conflict,
+            kernel::CommitFailureReason::RetryableIo => Self::RetryableIo,
+            kernel::CommitFailureReason::Error => Self::Error,
+        }
+    }
+}
+
+// === Per-event payload structs ===
+
+/// A log segment was listed and assembled for a snapshot.
+#[repr(C)]
+pub struct LogSegmentLoadSuccess {
+    pub operation_id: MetricId,
+    pub duration_ns: u64,
+    pub num_commit_files: u64,
+    pub num_checkpoint_files: u64,
+    pub num_compaction_files: u64,
+    pub has_latest_crc_file: bool,
+}
+
+/// Listing the log segment for a snapshot failed.
+#[repr(C)]
+pub struct LogSegmentLoadFailure {
+    pub operation_id: MetricId,
+}
+
+/// Protocol and metadata actions were read from the log.
+#[repr(C)]
+pub struct ProtocolMetadataLoadSuccess {
+    pub operation_id: MetricId,
+    pub duration_ns: u64,
+}
+
+/// Reading protocol and metadata from the log failed.
+#[repr(C)]
+pub struct ProtocolMetadataLoadFailure {
+    pub operation_id: MetricId,
+}
+
+/// A snapshot was built successfully.
+#[repr(C)]
+pub struct SnapshotBuildSuccess {
+    pub operation_id: MetricId,
+    pub version: u64,
+    pub duration_ns: u64,
+}
+
+/// Building a snapshot failed.
+#[repr(C)]
+pub struct SnapshotBuildFailure {
+    pub operation_id: MetricId,
+}
+
+/// A transaction was committed successfully. `operation` is a slice into engine-supplied data that
+/// is only valid for the duration of the callback; an empty slice means it was unset.
+#[repr(C)]
+pub struct TransactionCommitSuccess {
+    pub operation_id: MetricId,
+    pub commit_version: u64,
+    pub num_add_files: u64,
+    pub num_remove_files: u64,
+    pub add_files_bytes: u64,
+    pub remove_files_bytes: u64,
+    pub is_blind_append: bool,
+    pub data_change: bool,
+    pub operation: KernelStringSlice,
+    pub prepare_duration_ns: u64,
+    pub committer_duration_ns: u64,
+    pub total_duration_ns: u64,
+}
+
+/// A transaction commit did not succeed; `reason` distinguishes conflict, retryable IO, and
+/// terminal errors.
+#[repr(C)]
+pub struct TransactionCommitFailure {
+    pub operation_id: MetricId,
+    pub reason: CommitFailureReason,
+}
+
+/// A domain metadata load completed.
+#[repr(C)]
+pub struct DomainMetadataLoadSuccess {
+    pub from_cache: bool,
+    pub num_domains_returned: u64,
+    pub duration_ns: u64,
+}
+
+/// A `SetTransaction` (app id) load completed.
+#[repr(C)]
+pub struct SetTransactionLoadSuccess {
+    pub from_cache: bool,
+    pub found: bool,
+    pub duration_ns: u64,
+}
+
+/// A CRC file was read and parsed successfully.
+#[repr(C)]
+pub struct CrcReadSuccess {
+    pub bytes_read: u64,
+    pub duration_ns: u64,
+}
+
+/// A `JsonHandler::read_json_files` call completed.
+#[repr(C)]
+pub struct JsonReadCompleted {
+    pub num_files: u64,
+    pub bytes_read: u64,
+}
+
+/// A `ParquetHandler::read_parquet_files` call completed.
+#[repr(C)]
+pub struct ParquetReadCompleted {
+    pub num_files: u64,
+    pub bytes_read: u64,
+}
+
+/// A scan metadata operation completed. See [`delta_kernel::metrics::ScanMetadataCompleted`] for
+/// field semantics.
+#[repr(C)]
+pub struct ScanMetadataCompleted {
+    pub operation_id: MetricId,
+    pub scan_type: ScanType,
+    pub duration_ns: u64,
+    pub num_add_files_seen: u64,
+    pub num_active_add_files: u64,
+    pub active_add_files_bytes: u64,
+    pub num_remove_files_seen: u64,
+    pub num_non_file_actions: u64,
+    pub num_predicate_filtered: u64,
+    pub peak_hash_set_size: u64,
+    pub dedup_visitor_time_ms: u64,
+    pub predicate_eval_time_ms: u64,
+}
+
+/// A storage list operation completed.
+#[repr(C)]
+pub struct StorageListCompleted {
+    pub duration_ns: u64,
+    pub num_files: u64,
+}
+
+/// A storage read operation completed.
+#[repr(C)]
+pub struct StorageReadCompleted {
+    pub duration_ns: u64,
+    pub num_files: u64,
+    pub bytes_read: u64,
+}
+
+/// A storage copy or rename operation completed.
+#[repr(C)]
+pub struct StorageCopyCompleted {
+    pub duration_ns: u64,
+}
+
+/// FFI-safe mirror of [`delta_kernel::metrics::MetricEvent`]. Delivered by value to the callback
+/// registered via [`crate::ffi_tracing::enable_metrics_reporting`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum MetricEvent {
+    LogSegmentLoadSuccess(LogSegmentLoadSuccess),
+    LogSegmentLoadFailure(LogSegmentLoadFailure),
+    ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess),
+    ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure),
+    SnapshotBuildSuccess(SnapshotBuildSuccess),
+    SnapshotBuildFailure(SnapshotBuildFailure),
+    TransactionCommitSuccess(TransactionCommitSuccess),
+    TransactionCommitFailure(TransactionCommitFailure),
+    DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
+    DomainMetadataLoadFailure,
+    SetTransactionLoadSuccess(SetTransactionLoadSuccess),
+    SetTransactionLoadFailure,
+    CrcReadSuccess(CrcReadSuccess),
+    CrcReadFailure,
+    JsonReadCompleted(JsonReadCompleted),
+    ParquetReadCompleted(ParquetReadCompleted),
+    ScanMetadataCompleted(ScanMetadataCompleted),
+    StorageListCompleted(StorageListCompleted),
+    StorageReadCompleted(StorageReadCompleted),
+    StorageCopyCompleted(StorageCopyCompleted),
+}
+
+impl MetricEvent {
+    /// Build an FFI event from a kernel event. `operation` carries the (already string-sliced)
+    /// `TransactionCommitSuccess::operation`, whose backing storage the caller must keep alive
+    /// until the callback returns; it is ignored for every other variant.
+    pub(crate) fn from_kernel(event: &kernel::MetricEvent, operation: KernelStringSlice) -> Self {
+        use kernel::MetricEvent as K;
+        let ns = |d: std::time::Duration| d.as_nanos() as u64;
+        match event {
+            K::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+                operation_id: e.operation_id.into(),
+                duration_ns: ns(e.duration),
+                num_commit_files: e.num_commit_files,
+                num_checkpoint_files: e.num_checkpoint_files,
+                num_compaction_files: e.num_compaction_files,
+                has_latest_crc_file: e.has_latest_crc_file,
+            }),
+            K::LogSegmentLoadFailure(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
+                operation_id: e.operation_id.into(),
+            }),
+            K::ProtocolMetadataLoadSuccess(e) => {
+                Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
+                    operation_id: e.operation_id.into(),
+                    duration_ns: ns(e.duration),
+                })
+            }
+            K::ProtocolMetadataLoadFailure(e) => {
+                Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+                    operation_id: e.operation_id.into(),
+                })
+            }
+            K::SnapshotBuildSuccess(e) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
+                operation_id: e.operation_id.into(),
+                version: e.version,
+                duration_ns: ns(e.duration),
+            }),
+            K::SnapshotBuildFailure(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
+                operation_id: e.operation_id.into(),
+            }),
+            K::TransactionCommitSuccess(e) => {
+                Self::TransactionCommitSuccess(TransactionCommitSuccess {
+                    operation_id: e.operation_id.into(),
+                    commit_version: e.commit_version,
+                    num_add_files: e.num_add_files,
+                    num_remove_files: e.num_remove_files,
+                    add_files_bytes: e.add_files_bytes,
+                    remove_files_bytes: e.remove_files_bytes,
+                    is_blind_append: e.is_blind_append,
+                    data_change: e.data_change,
+                    operation,
+                    prepare_duration_ns: ns(e.prepare_duration),
+                    committer_duration_ns: ns(e.committer_duration),
+                    total_duration_ns: ns(e.total_duration),
+                })
+            }
+            K::TransactionCommitFailure(e) => {
+                Self::TransactionCommitFailure(TransactionCommitFailure {
+                    operation_id: e.operation_id.into(),
+                    reason: e.reason.into(),
+                })
+            }
+            K::DomainMetadataLoadSuccess(e) => {
+                Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
+                    from_cache: e.from_cache,
+                    num_domains_returned: e.num_domains_returned,
+                    duration_ns: ns(e.duration),
+                })
+            }
+            K::DomainMetadataLoadFailure => Self::DomainMetadataLoadFailure,
+            K::SetTransactionLoadSuccess(e) => {
+                Self::SetTransactionLoadSuccess(SetTransactionLoadSuccess {
+                    from_cache: e.from_cache,
+                    found: e.found,
+                    duration_ns: ns(e.duration),
+                })
+            }
+            K::SetTransactionLoadFailure => Self::SetTransactionLoadFailure,
+            K::CrcReadSuccess(e) => Self::CrcReadSuccess(CrcReadSuccess {
+                bytes_read: e.bytes_read,
+                duration_ns: ns(e.duration),
+            }),
+            K::CrcReadFailure => Self::CrcReadFailure,
+            K::JsonReadCompleted(e) => Self::JsonReadCompleted(JsonReadCompleted {
+                num_files: e.num_files,
+                bytes_read: e.bytes_read,
+            }),
+            K::ParquetReadCompleted(e) => Self::ParquetReadCompleted(ParquetReadCompleted {
+                num_files: e.num_files,
+                bytes_read: e.bytes_read,
+            }),
+            K::ScanMetadataCompleted(e) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
+                operation_id: e.operation_id.into(),
+                scan_type: e.scan_type.into(),
+                duration_ns: ns(e.duration),
+                num_add_files_seen: e.num_add_files_seen,
+                num_active_add_files: e.num_active_add_files,
+                active_add_files_bytes: e.active_add_files_bytes,
+                num_remove_files_seen: e.num_remove_files_seen,
+                num_non_file_actions: e.num_non_file_actions,
+                num_predicate_filtered: e.num_predicate_filtered,
+                peak_hash_set_size: e.peak_hash_set_size as u64,
+                dedup_visitor_time_ms: e.dedup_visitor_time_ms,
+                predicate_eval_time_ms: e.predicate_eval_time_ms,
+            }),
+            K::StorageListCompleted(e) => Self::StorageListCompleted(StorageListCompleted {
+                duration_ns: ns(e.duration),
+                num_files: e.num_files,
+            }),
+            K::StorageReadCompleted(e) => Self::StorageReadCompleted(StorageReadCompleted {
+                duration_ns: ns(e.duration),
+                num_files: e.num_files,
+                bytes_read: e.bytes_read,
+            }),
+            K::StorageCopyCompleted(e) => Self::StorageCopyCompleted(StorageCopyCompleted {
+                duration_ns: ns(e.duration),
+            }),
+        }
+    }
+}
+
+/// Invoke `f` with the FFI [`MetricEvent`] built from `event`, keeping any borrowed string data
+/// alive for the duration of the call. This indirection exists because
+/// `TransactionCommitSuccess::operation` is a [`KernelStringSlice`] that must point at storage
+/// living across the callback -- the slice cannot outlive a `from_kernel` call that owns the
+/// backing `String`, so the `String` is held here on the stack instead.
+pub(crate) fn with_ffi_event<R>(
+    event: &kernel::MetricEvent,
+    f: impl FnOnce(MetricEvent) -> R,
+) -> R {
+    let operation = match event {
+        kernel::MetricEvent::TransactionCommitSuccess(e) => e.operation.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+    let slice = kernel_string_slice!(operation);
+    f(MetricEvent::from_kernel(event, slice))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::TryFromStringSlice;
+
+    #[test]
+    fn from_kernel_transaction_commit_success_carries_operation_and_id() {
+        let id = kernel::MetricId::new();
+        let event =
+            kernel::MetricEvent::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
+                operation_id: id,
+                commit_version: 7,
+                num_add_files: 2,
+                num_remove_files: 1,
+                add_files_bytes: 100,
+                remove_files_bytes: 50,
+                is_blind_append: true,
+                data_change: false,
+                operation: Some("WRITE".to_string()),
+                prepare_duration: Duration::from_nanos(10),
+                committer_duration: Duration::from_nanos(20),
+                total_duration: Duration::from_nanos(30),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::TransactionCommitSuccess(e) = ffi else {
+                panic!("expected TransactionCommitSuccess");
+            };
+            assert_eq!(e.operation_id.bytes, id.as_bytes());
+            assert_eq!(e.commit_version, 7);
+            assert_eq!(e.add_files_bytes, 100);
+            assert!(e.is_blind_append);
+            assert_eq!(e.prepare_duration_ns, 10);
+            assert_eq!(e.total_duration_ns, 30);
+            let op: &str = unsafe { TryFromStringSlice::try_from_slice(&e.operation).unwrap() };
+            assert_eq!(op, "WRITE");
+        });
+    }
+
+    #[test]
+    fn from_kernel_maps_failure_reason() {
+        let id = kernel::MetricId::new();
+        let failure =
+            kernel::MetricEvent::TransactionCommitFailure(kernel::TransactionCommitFailure {
+                operation_id: id,
+                reason: kernel::CommitFailureReason::Conflict,
+            });
+        with_ffi_event(&failure, |ffi| {
+            let MetricEvent::TransactionCommitFailure(e) = ffi else {
+                panic!("expected TransactionCommitFailure");
+            };
+            assert!(matches!(e.reason, CommitFailureReason::Conflict));
+            assert_eq!(e.operation_id.bytes, id.as_bytes());
+        });
+    }
+}
