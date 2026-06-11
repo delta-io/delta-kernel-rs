@@ -130,38 +130,37 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
     Ok(Expression::literal(scalar))
 }
 
-/// Strip surrounding single quotes from a SQL string literal and un-escape the doubled-quote
-/// sequence `''` -> `'`. Errors if the input is not surrounded by single quotes or contains an
-/// unescaped interior quote.
+/// Unquote a SQL string literal: strip the surrounding single quotes and un-escape each
+/// doubled-quote sequence `''` into a single `'`. Errors if `input` is not a properly
+/// terminated single-quoted string, including a missing closing quote or trailing characters
+/// after it.
 fn unquote_string(input: &str) -> DeltaResult<String> {
-    let inner = input
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .ok_or_else(|| {
-            Error::generic(format!("expected a single-quoted SQL string, got: {input}"))
-        })?;
+    let body = input.strip_prefix('\'').ok_or_else(|| {
+        Error::generic(format!("expected a single-quoted SQL string, got: {input}"))
+    })?;
 
-    // After splitting on `'`, every chunk except the last must be empty, meaning the quote was
-    // doubled (SQL's escape for an embedded single quote).
-    let mut out = String::with_capacity(inner.len());
-    let mut chunks = inner.split('\'').peekable();
-    while let Some(chunk) = chunks.next() {
-        out.push_str(chunk);
-        match chunks.peek() {
-            None => break,
-            Some(&"") => {
-                // Doubled quote: consume the empty chunk and emit a single quote.
-                chunks.next();
-                out.push('\'');
-            }
+    // Walk the body after the opening quote. A `'` either escapes a literal quote (`''`) or
+    // closes the string; reaching the end without a closing quote is an unterminated literal.
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            None => return Ok(out),
+            Some('\'') => out.push('\''),
             Some(_) => {
                 return Err(Error::generic(format!(
-                    "unescaped single quote in SQL string literal: {input}"
-                )));
+                    "unexpected characters after closing quote in SQL string literal: {input}"
+                )))
             }
         }
     }
-    Ok(out)
+    Err(Error::generic(format!(
+        "unterminated SQL string literal: {input}"
+    )))
 }
 
 /// Strip an optional typed-literal keyword prefix (e.g. `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`)
@@ -258,10 +257,8 @@ mod tests {
     #[case("''", DataType::STRING, Scalar::String(String::new()))]
     #[case("'it''s'", DataType::STRING, Scalar::String("it's".into()))]
     #[case("'a''b''c'", DataType::STRING, Scalar::String("a'b'c".into()))]
-    #[case("'''", DataType::STRING, Scalar::String("'".into()))]
     #[case("'''hello'", DataType::STRING, Scalar::String("'hello".into()))]
     #[case("'hello'''", DataType::STRING, Scalar::String("hello'".into()))]
-    #[case("'''''", DataType::STRING, Scalar::String("''".into()))]
     #[case("'''bad'''", DataType::STRING, Scalar::String("'bad'".into()))]
     #[case(
         "1.23",
@@ -382,7 +379,10 @@ mod tests {
     #[case("42", DataType::STRING)] // unquoted number for string
     #[case("foo", DataType::STRING)] // unquoted string
     #[case("'unterminated", DataType::STRING)]
-    #[case("'bad'quote'", DataType::STRING)] // unescaped interior quote
+    #[case("'bad'quote'", DataType::STRING)] // characters after the closing quote
+    #[case("'''", DataType::STRING)] // unterminated: odd number of quotes
+    #[case("'''''", DataType::STRING)] // unterminated: odd number of quotes
+    #[case("'ab''", DataType::STRING)] // unterminated: trailing escaped quote, no close
     #[case("nope", DataType::BOOLEAN)]
     #[case("'TRUE'", DataType::BOOLEAN)] // quoted boolean
     #[case("'2024-13-01'", DataType::DATE)] // bad month
