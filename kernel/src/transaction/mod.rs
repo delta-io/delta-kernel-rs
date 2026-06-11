@@ -897,12 +897,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 .iter()
                 .map(String::as_str)
                 .collect();
-            // Insert each partition columns after the nearest preceding field that
-            // survives(non-partition and non-void fields) into the physical schema.
-            //
-            // The partition columns are inserted in the order they appear in the logical schema.
-            // This keeps the post-transform data aligned with
-            // [`SharedWriteState::physical_schema`].
+            // Insert each partition column after the nearest preceding surviving field
+            // (non-partition and non-void), in the order they appear in the logical schema.
+            // This keeps the post-transform data aligned with the physical schema.
             let mut predecessor: Option<&str> = None;
             for field in logical_schema.fields() {
                 let name = field.name().as_str();

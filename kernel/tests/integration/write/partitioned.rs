@@ -852,11 +852,7 @@ async fn test_materialized_partition_columns_excluded_from_stats(
 async fn test_materialize_partition_columns_e2e(
     #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cm = match cm_mode {
-        ColumnMappingMode::None => "none",
-        ColumnMappingMode::Name => "name",
-        ColumnMappingMode::Id => "id",
-    };
+    let cm = cm_mode_str(cm_mode);
     // Partition columns p1, p2 sit in the middle of the data columns.
     let table_schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("d1", DataType::INTEGER),
@@ -1028,11 +1024,7 @@ async fn test_input_data_with_partition_column_errors(
     )]
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cm = match cm_mode {
-        ColumnMappingMode::None => "none",
-        ColumnMappingMode::Name => "name",
-        ColumnMappingMode::Id => "id",
-    };
+    let cm = cm_mode_str(cm_mode);
     let partition_col = "partition";
     let table_schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("number", DataType::INTEGER),
@@ -1100,7 +1092,7 @@ async fn test_input_data_with_partition_column_errors(
 // engine.
 
 /// Validates the e2e NOT NULL contract on partition values: a null-equivalent value into a
-/// `nullable: false` partition column is rejected before serialization, , and ordinary
+/// `nullable: false` partition column is rejected before serialization, and ordinary
 /// non-null values pass through unchanged.
 ///
 /// Three value cases, cross-multiplied against column-mapping modes and materialization:

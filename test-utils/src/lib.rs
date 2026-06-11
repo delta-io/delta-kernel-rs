@@ -1187,8 +1187,7 @@ pub async fn write_batch_to_table(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
-    let partition_cols: Vec<String> = txn.logical_partition_columns().to_vec();
-    let write_context = if partition_cols.is_empty() {
+    let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
             "partition_values should be empty for unpartitioned tables"
