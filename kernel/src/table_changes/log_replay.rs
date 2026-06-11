@@ -14,7 +14,9 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, column_expr_ref, column_name, ColumnName, Expression};
+use crate::expressions::{
+    column_expr, column_expr_ref, column_name, ColumnName, Expression, Predicate,
+};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
@@ -92,6 +94,10 @@ pub(crate) fn table_changes_action_iter(
                 stats_expr,
                 None, // no partition columns for table changes (partition_expr unused)
                 column_expr_ref!("partitionValues_parsed"),
+                // Raw action batches keep the nested layout, so Add rows are `add.path IS NOT
+                // NULL`. Remove and cdc rows must never be dropped by data skipping: their
+                // change events would silently vanish from the feed.
+                Arc::new(Predicate::is_not_null(column_expr!("add.path")).into()),
                 get_log_add_schema().clone(),
                 &physical_stats_columns,
                 None, // Table changes doesn't use metrics yet

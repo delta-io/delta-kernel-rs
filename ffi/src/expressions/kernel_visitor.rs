@@ -1373,4 +1373,137 @@ mod tests {
             "engine callback must fire in StatsMode"
         );
     }
+
+    /// A misbehaving engine that violates the keep-on-null-bounds contract (returns `false` for
+    /// rows with null stats, as checkpoint Remove rows present) must not corrupt Add/Remove
+    /// reconciliation: kernel's `OR(NOT is_add, ...)` guard keeps Remove rows regardless of the
+    /// verdict, so the tombstone still suppresses the earlier Add instead of resurrecting it.
+    #[cfg(any(
+        feature = "default-engine-rustls",
+        feature = "default-engine-native-tls"
+    ))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn misbehaving_stats_callback_cannot_resurrect_removed_file() {
+        use std::ffi::c_void;
+        use std::sync::Arc;
+
+        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
+        use delta_kernel::object_store::memory::InMemory;
+        use delta_kernel::scan::state::ScanFile;
+        use delta_kernel::Snapshot;
+        use delta_kernel_default_engine::DefaultEngineBuilder;
+        use test_utils::add_commit;
+
+        use crate::engine_data::ArrowFFIData;
+        use crate::OptionalValue;
+
+        // Contract violation: skip (false) any row whose min/max bounds are null instead of
+        // keeping it. Remove rows carry null stats, so without a kernel-side guard this would
+        // drop tombstones from log replay.
+        unsafe extern "C" fn engine_skip_null_bounds(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _inverted: bool,
+            out: *mut OptionalValue<ArrowFFIData>,
+        ) {
+            let array =
+                std::mem::replace(unsafe { &mut (*args_in).array }, FFI_ArrowArray::empty());
+            let schema =
+                std::mem::replace(unsafe { &mut (*args_in).schema }, FFI_ArrowSchema::empty());
+            let data = unsafe { from_ffi(array, &schema) }.unwrap();
+            let batch: RecordBatch = StructArray::from(data).into();
+
+            let stats = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let (min, max) = (stats.column(0), stats.column(1));
+            let keep: BooleanArray = (0..batch.num_rows())
+                .map(|i| Some(!min.is_null(i) && !max.is_null(i)))
+                .collect();
+
+            let arr: ArrayRef = Arc::new(keep);
+            let array_data = arr.to_data();
+            let ffi = ArrowFFIData {
+                array: FFI_ArrowArray::new(&array_data),
+                schema: FFI_ArrowSchema::try_from(array_data.data_type()).unwrap(),
+            };
+            unsafe { *out = OptionalValue::Some(ffi) };
+        }
+        unsafe extern "C" fn noop_free(_: *mut c_void) {}
+
+        let mut state = KernelExpressionVisitorState::default();
+        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
+        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let (_keep, mut it) = make_iter(vec![col_id, target]);
+        let name = "IN_RANGE";
+        let id = ok_or_panic(unsafe {
+            visit_predicate_opaque_with_eval(
+                &mut state,
+                kernel_string_slice!(name),
+                &mut it,
+                COpaqueEvalCallbacks {
+                    engine_state: std::ptr::null_mut(),
+                    eval_pred_rows: engine_skip_null_bounds,
+                    eval_pred_stats: engine_skip_null_bounds,
+                    free_state: noop_free,
+                },
+                allocate_err,
+            )
+        });
+        let predicate = Arc::new(unwrap_kernel_predicate(&mut state, id).unwrap());
+
+        // Version 0 adds two files (both with stats the engine keeps); version 1 removes
+        // b.parquet. Log replay must surface only a.parquet.
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}"#;
+        let add = |path: &str, lo: i64, hi: i64| {
+            format!(
+                r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":10,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\":{lo}}},\"maxValues\":{{\"id\":{hi}}}}}"}}}}"#
+            )
+        };
+        let commit0 = [
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+            format!(
+                r#"{{"metaData":{{"id":"t","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{schema}","partitionColumns":[],"configuration":{{}},"createdTime":1587968586000}}}}"#
+            ),
+            add("a.parquet", 20, 30),
+            add("b.parquet", 20, 30),
+        ]
+        .join("\n");
+        add_commit(table_root, storage.as_ref(), 0, commit0)
+            .await
+            .unwrap();
+        let commit1 = r#"{"remove":{"path":"b.parquet","deletionTimestamp":1587968586001,"dataChange":true}}"#.to_string();
+        add_commit(table_root, storage.as_ref(), 1, commit1)
+            .await
+            .unwrap();
+
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()
+            .unwrap();
+
+        fn push_path(paths: &mut Vec<String>, scan_file: ScanFile) {
+            paths.push(scan_file.path);
+        }
+        let mut paths: Vec<String> = Vec::new();
+        for sm in scan.scan_metadata(&engine).unwrap() {
+            paths = sm.unwrap().visit_scan_files(paths, push_path).unwrap();
+        }
+
+        assert_eq!(
+            paths,
+            vec!["a.parquet".to_string()],
+            "the Remove tombstone must survive a skip-on-null-bounds verdict; \
+             b.parquet reappearing means a resurrected deleted file"
+        );
+    }
 }
