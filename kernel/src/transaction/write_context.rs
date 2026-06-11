@@ -60,9 +60,8 @@ pub(super) struct SharedWriteState {
 #[derive(Debug)]
 pub struct WriteContext {
     pub(super) shared: Arc<SharedWriteState>,
-    /// Transforms logical input data to physical data for writing. The logical input data
-    /// must not contain any partition columns. The transform will inject the partition columns if
-    /// needed.
+    /// Transforms logical data to physical data for writing. The logical data must not contain
+    /// any partition columns. The transform will inject the partition columns if needed.
     pub(super) logical_to_physical: ExpressionRef,
     /// Physical column name -> serialized value (`None` = null partition value).
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from

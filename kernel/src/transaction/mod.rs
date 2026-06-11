@@ -2134,8 +2134,8 @@ mod tests {
         )?;
         let rb = eval_logical_to_physical(&wc, batch)?;
 
-        // Void is stripped; partition literals land at their schema positions. Names/order follow
-        // the physical schema.
+        // With void stripped and partition literals inserted, the output names/order must match
+        // the physical schema exactly.
         let rb_schema = rb.schema();
         let names: Vec<&str> = rb_schema
             .fields()
@@ -2149,7 +2149,7 @@ mod tests {
             .collect();
         assert_eq!(names, expected_names);
 
-        // Look up by the physical column names (CM-dependent) collected above, in schema order.
+        // Verify the transformed data.
         assert_eq!(get_column!(rb, names[0], StringArray).value(0), "aa"); // p1 (prepended)
         assert_eq!(get_column!(rb, names[1], Int32Array).value(0), 7); // p2 (prepended)
         assert_eq!(get_column!(rb, names[2], Int32Array).value(0), 10); // d1
