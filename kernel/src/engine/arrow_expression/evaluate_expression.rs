@@ -1915,7 +1915,7 @@ mod tests {
         )
         .unwrap();
 
-        // The 64-bit offsets pass through without a cast back to 32-bit Binary.
+        // LargeBinary is preserved, not cast.
         assert_eq!(result.data_type(), &variant_arrow_type);
     }
 

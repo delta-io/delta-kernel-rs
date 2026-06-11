@@ -79,8 +79,7 @@ impl EnsureDataTypes {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
             // A variant is physically a struct of binary fields. Validate it like a struct so
-            // that engines may use any arrow binary representation (Binary, LargeBinary,
-            // BinaryView) for its fields.
+            // that engines may use any arrow binary representation for its fields.
             (DataType::Variant(variant_fields), ArrowDataType::Struct(_)) => {
                 self.ensure_data_types(&DataType::Struct(variant_fields.clone()), arrow_type)
             }
@@ -328,7 +327,6 @@ mod tests {
     use super::*;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
-    use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
     use crate::utils::test_utils::assert_result_error_with_message;
 
@@ -391,9 +389,20 @@ mod tests {
         assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
     }
 
-    fn variant_struct_arrow_type(binary_type: ArrowDataType, nullable: bool) -> ArrowDataType {
+    /// The canonical `unshredded_variant_arrow_type` shape with the binary representation and
+    /// field nullability swapped out.
+    fn unshredded_variant_arrow_type_with(
+        binary_type: ArrowDataType,
+        nullable: bool,
+    ) -> ArrowDataType {
         let metadata_field = ArrowField::new("metadata", binary_type.clone(), nullable);
         let value_field = ArrowField::new("value", binary_type, nullable);
+        ArrowDataType::Struct(vec![metadata_field, value_field].into())
+    }
+
+    fn wrong_field_names_variant_arrow_type() -> ArrowDataType {
+        let metadata_field = ArrowField::new("field_1", ArrowDataType::Binary, true);
+        let value_field = ArrowField::new("field_2", ArrowDataType::Binary, true);
         ArrowDataType::Struct(vec![metadata_field, value_field].into())
     }
 
@@ -409,7 +418,7 @@ mod tests {
         assert_eq!(
             ensure_data_types(
                 &DataType::unshredded_variant(),
-                &variant_struct_arrow_type(binary_type, false),
+                &unshredded_variant_arrow_type_with(binary_type, false),
                 ValidationMode::Full,
             )
             .unwrap(),
@@ -417,46 +426,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ensure_variants() {
-        fn incorrect_variant_arrow_type() -> ArrowDataType {
-            let metadata_field = ArrowField::new("field_1", ArrowDataType::Binary, true);
-            let value_field = ArrowField::new("field_2", ArrowDataType::Binary, true);
-            let fields = vec![metadata_field, value_field];
-            ArrowDataType::Struct(fields.into())
-        }
-
-        assert!(ensure_data_types(
-            &DataType::unshredded_variant(),
-            &unshredded_variant_arrow_type(),
-            ValidationMode::Full
-        )
-        .is_ok());
+    #[rstest]
+    #[case::wrong_field_names(
+        wrong_field_names_variant_arrow_type(),
+        "Missing Struct fields metadata, value"
+    )]
+    #[case::nullable_fields(
+        unshredded_variant_arrow_type_with(ArrowDataType::LargeBinary, true),
+        "metadata has nullablily false in kernel and true in arrow"
+    )]
+    #[case::not_a_struct(ArrowDataType::Binary, "Incorrect datatype")]
+    fn ensure_variant_rejects(#[case] arrow_type: ArrowDataType, #[case] expected_err: &str) {
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::unshredded_variant(),
-                &incorrect_variant_arrow_type(),
+                &arrow_type,
                 ValidationMode::Full,
             ),
-            "Invalid argument error: Missing Struct fields metadata, value",
-        );
-        // Full mode still enforces the non-nullability of the variant's fields.
-        assert_result_error_with_message(
-            ensure_data_types(
-                &DataType::unshredded_variant(),
-                &variant_struct_arrow_type(ArrowDataType::LargeBinary, true),
-                ValidationMode::Full,
-            ),
-            "metadata has nullablily false in kernel and true in arrow",
-        );
-        // A variant must be a struct in arrow.
-        assert_result_error_with_message(
-            ensure_data_types(
-                &DataType::unshredded_variant(),
-                &ArrowDataType::Binary,
-                ValidationMode::Full,
-            ),
-            "Invalid argument error: Incorrect datatype",
+            expected_err,
         );
     }
 
