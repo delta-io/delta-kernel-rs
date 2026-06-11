@@ -12,6 +12,7 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::CheckpointReadInfo;
+use crate::metrics::TableType;
 use crate::scan::log_replay::{scan_action_iter, ScanStatsOptions};
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
@@ -167,6 +168,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         physical_stats_schema: None,
         physical_partition_schema: None,
         physical_stats_columns: HashSet::new(),
+        table_type: TableType::PathBased,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let (iter, _metrics) = scan_action_iter(

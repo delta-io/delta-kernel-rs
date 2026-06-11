@@ -58,6 +58,7 @@ impl SequentialScanMetadata {
             AfterSequential::Done(processor) => {
                 let event = processor.get_metrics().to_event(
                     self.operation_id,
+                    processor.table_type(),
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -70,6 +71,7 @@ impl SequentialScanMetadata {
             AfterSequential::Parallel { processor, files } => {
                 let event = processor.get_metrics().to_event(
                     self.operation_id,
+                    processor.table_type(),
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -145,6 +147,7 @@ impl ParallelState {
     pub fn log_metrics(&self) {
         let event = self.inner.get_metrics().to_event(
             self.operation_id,
+            self.inner.table_type(),
             ScanType::ParallelPhase,
             self.parallel_start.elapsed(),
         );
@@ -262,5 +265,67 @@ impl Iterator for ParallelScanMetadata {
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();
         self.processor.next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use super::ParallelState;
+    use crate::engine::sync::SyncEngine;
+    use crate::log_segment::CheckpointReadInfo;
+    use crate::metrics::{MetricEvent, ScanType, TableType};
+    use crate::scan::log_replay::{ScanLogReplayProcessor, ScanStatsOptions};
+    use crate::scan::state_info::StateInfo;
+    use crate::scan::PhysicalPredicate;
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::table_features::ColumnMappingMode;
+    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+    #[test]
+    fn test_parallel_state_log_metrics_carries_round_tripped_table_type() {
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )]));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
+            table_type: TableType::CatalogManaged,
+        });
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            CheckpointReadInfo::without_stats_parsed(),
+            ScanStatsOptions::default(),
+        )
+        .unwrap();
+        let serialized = processor.into_serializable_state().unwrap();
+        let state = ParallelState::from_serializable_state(&engine, serialized).unwrap();
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        state.log_metrics();
+
+        let event = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted(c) => Some(c),
+                _ => None,
+            })
+            .expect("ScanMetadataCompleted emitted");
+        assert_eq!(event.table_type, TableType::CatalogManaged);
+        assert_eq!(event.scan_type, ScanType::ParallelPhase);
     }
 }

@@ -85,11 +85,12 @@ use std::sync::Arc;
 
 pub use events::{
     emit_json_read_completed, emit_parquet_read_completed, CommitFailureReason, CrcReadSuccess,
-    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
-    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
-    ProtocolMetadataLoadSuccess, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
-    SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted,
-    StorageReadCompleted, TransactionCommitFailure, TransactionCommitSuccess,
+    SnapshotLoadMetricContext, DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure,
+    LogSegmentLoadSuccess, MetricEvent, MetricId, ParquetReadCompleted,
+    ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess, ScanMetadataCompleted, ScanType,
+    SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted,
+    StorageListCompleted, StorageReadCompleted, TableType, TransactionCommitFailure,
+    TransactionCommitSuccess,
 };
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_json::MeteredJsonHandler;

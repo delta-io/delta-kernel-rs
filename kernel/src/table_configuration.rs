@@ -18,6 +18,7 @@ use url::Url;
 
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
+use crate::metrics::TableType;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
@@ -502,6 +503,11 @@ impl TableConfiguration {
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.is_feature_supported(&TableFeature::CatalogManaged)
             || self.is_feature_supported(&TableFeature::CatalogOwnedPreview)
+    }
+
+    #[internal_api]
+    pub(crate) fn table_type(&self) -> TableType {
+        TableType::from_catalog_managed(self.is_catalog_managed())
     }
 
     /// The [`ColumnMappingMode`] for this table at this version.

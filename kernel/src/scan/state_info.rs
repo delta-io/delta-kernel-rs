@@ -8,6 +8,7 @@ use tracing::{debug, enabled, warn, Level};
 
 use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
+use crate::metrics::TableType;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PhysicalPredicate, StatsOptions, StructStats};
@@ -44,6 +45,7 @@ pub(crate) struct StateInfo {
     ///
     /// Read-path mirror of `SharedWriteState.stats_columns`.
     pub(crate) physical_stats_columns: HashSet<ColumnName>,
+    pub(crate) table_type: TableType,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -421,6 +423,7 @@ impl StateInfo {
             physical_stats_schema,
             physical_partition_schema,
             physical_stats_columns,
+            table_type: table_configuration.table_type(),
         })
     }
 

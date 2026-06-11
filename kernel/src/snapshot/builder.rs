@@ -5,7 +5,7 @@ use tracing::{info, instrument};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-use crate::metrics::MetricId;
+use crate::metrics::{SnapshotLoadMetricContext, MetricId};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
@@ -190,13 +190,27 @@ impl SnapshotBuilder {
     ///
     /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        let metric_context = SnapshotLoadMetricContext {
+            operation_id: MetricId::new(),
+            is_catalog_managed: self.max_catalog_version.is_some(),
+        };
+        self.build_inner(engine, metric_context)
+    }
+
+    // `metric_context.is_catalog_managed` is the requested load mode, not the confirmed protocol
+    // (see `IS_CATALOG_MANAGED_FIELD`).
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = tracing::field::Empty),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+    fn build_inner(
+        self,
+        engine: &dyn Engine,
+        metric_context: SnapshotLoadMetricContext,
+    ) -> DeltaResult<SnapshotRef> {
         info!(
             target = self.target_version_str(),
             from_version = ?self.existing_snapshot.as_ref().map(|s| s.version()),
@@ -216,11 +230,6 @@ impl SnapshotBuilder {
         } = self;
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
-        let operation_id = MetricId::new();
-        // TODO(#2605): this late `record` is silently dropped by the metrics layer, so every
-        //              `SnapshotBuildSuccess` event carries a nil operation_id. Bind eagerly via a
-        //              `build_inner(self, engine, operation_id)` helper instead.
-        tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
         // Pre-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
@@ -237,13 +246,13 @@ impl SnapshotBuilder {
                     table_url.join("_delta_log/")?,
                     log_tail,
                     effective_version,
-                    operation_id,
+                    metric_context,
                 )?;
                 Snapshot::try_new_from_log_segment(
                     table_url,
                     log_segment,
                     engine,
-                    operation_id,
+                    metric_context,
                     incremental_replay,
                 )
                 .map(Into::into)
@@ -261,7 +270,7 @@ impl SnapshotBuilder {
                         log_tail,
                         engine,
                         effective_version,
-                        operation_id,
+                        metric_context,
                         incremental_replay,
                     )
                 })

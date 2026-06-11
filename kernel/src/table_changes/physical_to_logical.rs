@@ -132,6 +132,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::Expression;
+    use crate::metrics::TableType;
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::transform_spec::FieldTransformSpec;
@@ -189,6 +190,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            table_type: TableType::PathBased,
         }
     }
 
@@ -411,6 +413,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
+            table_type: TableType::PathBased,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
