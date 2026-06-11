@@ -1192,7 +1192,7 @@ impl LogSegment {
     }
 
     /// Schema to read just the sidecar column from a checkpoint file.
-    fn sidecar_read_schema() -> SchemaRef {
+    pub(crate) fn sidecar_read_schema() -> SchemaRef {
         static SIDECAR_SCHEMA: LazyLock<SchemaRef> =
             lazy_schema_ref! { nullable SIDECAR_NAME: (Sidecar::to_schema()) };
         SIDECAR_SCHEMA.clone()
