@@ -71,8 +71,24 @@ pub(crate) fn list_from_storage(
     end_version: Version,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let log_root_str = log_root.to_string();
     let files = storage
         .list_from(&start_from)?
+        // The listing is recursive and sorted by full path, and every file kernel lists has a
+        // 20-digit version prefix. Once a path sorts past '9' nothing relevant can follow, so stop
+        // pulling listing pages there. In particular this avoids paging through
+        // `_staged_commits/`, which can hold thousands of files and is only consumed via
+        // `log_tail` ('_' sorts after '9'). Paths outside `log_root` are conservatively kept;
+        // parsing filters them below.
+        .take_while(move |meta_res| match meta_res {
+            Ok(meta) => meta
+                .location
+                .as_str()
+                .strip_prefix(&log_root_str)
+                .and_then(|rel| rel.as_bytes().first())
+                .is_none_or(|b| *b <= b'9'),
+            Err(_) => true,
+        })
         .map(|meta| ParsedLogPath::try_from(meta?))
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel

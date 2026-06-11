@@ -116,12 +116,14 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
     );
 }
 
-/// A [`StorageHandler`] wrapper that counts the number of `list_from` calls.
-/// Used to verify that `list_with_backward_checkpoint_scan` issues the expected
-/// number of storage listing requests.
+/// A [`StorageHandler`] wrapper that counts the number of `list_from` calls and the number of
+/// items consumed from the returned iterators. Used to verify that
+/// `list_with_backward_checkpoint_scan` issues the expected number of storage listing requests,
+/// and that listing terminates without consuming files past the version-named region.
 struct CountingStorageHandler {
     inner: Arc<dyn StorageHandler>,
     list_from_count: AtomicU32,
+    items_listed: Arc<AtomicU32>,
 }
 
 impl CountingStorageHandler {
@@ -129,11 +131,16 @@ impl CountingStorageHandler {
         Self {
             inner,
             list_from_count: AtomicU32::new(0),
+            items_listed: Arc::new(AtomicU32::new(0)),
         }
     }
 
     fn call_count(&self) -> u32 {
         self.list_from_count.load(Ordering::Relaxed)
+    }
+
+    fn items_listed(&self) -> u32 {
+        self.items_listed.load(Ordering::Relaxed)
     }
 }
 
@@ -143,7 +150,11 @@ impl StorageHandler for CountingStorageHandler {
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
-        self.inner.list_from(path)
+        let items_listed = self.items_listed.clone();
+        let iter = self.inner.list_from(path)?;
+        Ok(Box::new(iter.inspect(move |_| {
+            items_listed.fetch_add(1, Ordering::Relaxed);
+        })))
     }
 
     fn read_files(
@@ -457,6 +468,31 @@ async fn test_listing_with_large_end_version() {
     assert_eq!(commits[1].version, 1);
     assert_eq!(latest_commit.unwrap().version, 1);
     assert_eq!(max_pub, Some(1));
+}
+
+#[tokio::test]
+async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() {
+    let mut log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
+    // reaches them only after all relevant files. None should be consumed beyond the first.
+    log_files
+        .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
+
+    let (storage, log_root) = create_storage(log_files).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, None);
+
+    assert_eq!(commits.len(), 3);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // 3 commits plus the single staged commit that stops the listing
+    assert_eq!(storage.items_listed(), 4);
 }
 
 #[tokio::test]
