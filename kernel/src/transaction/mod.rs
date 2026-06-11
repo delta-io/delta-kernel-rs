@@ -3,6 +3,7 @@ use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
@@ -19,8 +20,12 @@ use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
+use crate::expressions::{
+    col, lit, ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
+};
 use crate::log_segment::LogSegment;
+use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
+use crate::metrics::{CommitFailureReason, MetricId};
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
 use crate::path::{LogRoot, ParsedLogPath};
@@ -32,7 +37,10 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
+use crate::schema::{
+    ArrayType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    StructTypeBuilder,
+};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
@@ -160,14 +168,14 @@ fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
-    StructTypeBuilder::from_schema(schema)
-        .add_field(StructField::nullable("baseRowId", DataType::LONG))
-        .add_field(StructField::nullable(
+fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
+    let patch = SchemaStructPatchBuilder::new()
+        .append(StructField::nullable("baseRowId", DataType::LONG))
+        .append(StructField::nullable(
             "defaultRowCommitVersion",
             DataType::LONG,
-        ))
-        .build_arc_unchecked()
+        ));
+    Ok(Arc::new(patch.build(schema)?))
 }
 
 /// Marker type for transactions on existing tables.
@@ -221,6 +229,8 @@ impl SupportsDataFiles for CreateTable {}
 /// ```
 pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
+    // Correlates all metric events emitted by this transaction.
+    operation_id: MetricId,
     // The snapshot this transaction is based on. None for CREATE TABLE (no pre-existing table).
     // Use `read_snapshot()` to access; it returns an error if None.
     read_snapshot_opt: Option<SnapshotRef>,
@@ -303,16 +313,10 @@ where
     let evaluation_handler = engine.evaluation_handler();
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
-            ExpressionStructPatch::new_top_level()
-                .with_inserted_field(
-                    Some("modificationTime"),
-                    Expression::literal(data_change).into(),
-                )
-                .with_replaced_field(
-                    "stats",
-                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                ),
-        );
+            ExpressionStructPatchBuilder::new()
+                .insert_after("modificationTime", lit(data_change))
+                .replace("stats", Expression::unary(ToJson, col!("stats"))),
+        )?;
         let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
@@ -334,14 +338,27 @@ impl<S> Transaction<S> {
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     #[instrument(
         parent = &self.span,
-        name = "txn.commit",
+        name = TRANSACTION_COMMIT_SPAN,
         skip_all,
         fields(
+            report,
+            operation_id = %self.operation_id,
             commit_version = self.get_commit_version(),
+            num_add_files,
+            num_remove_files,
+            add_files_bytes,
+            remove_files_bytes,
+            is_blind_append,
+            data_change,
+            operation,
+            prepare_duration_ns,
+            committer_duration_ns,
+            failure_reason,
         ),
         err
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+        let commit_start = Instant::now();
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -486,36 +503,79 @@ impl<S> Transaction<S> {
             metadata,
             dm_changes.clone(),
         )?;
-        match self
-            .committer
-            .commit(engine, Box::new(filtered_actions), commit_metadata)
-        {
+        let prepare_duration = commit_start.elapsed();
+        let committer_start = Instant::now();
+        let commit_response =
+            self.committer
+                .commit(engine, Box::new(filtered_actions), commit_metadata);
+        let committer_duration = committer_start.elapsed();
+        match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
+                // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
+                //              below must not fail the txn (and must not mislabel the metric).
                 let bin_boundaries = self
                     .read_snapshot_opt
                     .as_ref()
                     .and_then(|snap| snap.get_file_stats_if_present())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
-                let crc_delta = self.build_crc_delta(
-                    in_commit_timestamp,
-                    dm_changes,
+                let file_stats = FileStatsDelta::try_compute_for_txn(
+                    &self.add_files_metadata,
+                    &self.remove_files_metadata,
                     bin_boundaries.as_deref(),
                 )?;
+                self.record_commit_success_metrics(
+                    &file_stats,
+                    prepare_duration,
+                    committer_duration,
+                );
+                let crc_delta =
+                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
                 Ok(CommitResult::CommittedTransaction(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
             }
-            Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
-                self.into_conflicted(version),
-            )),
+            Ok(CommitResponse::Conflict { version }) => {
+                // Flips the metric event from success -> failure.
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::Conflict.as_ref());
+                Ok(CommitResult::ConflictedTransaction(
+                    self.into_conflicted(version),
+                ))
+            }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
             Err(e @ Error::IOError(_)) => {
+                // Flips the metric event from success -> failure.
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn record_commit_success_metrics(
+        &self,
+        file_stats: &FileStatsDelta,
+        prepare_duration: Duration,
+        committer_duration: Duration,
+    ) {
+        let span = tracing::Span::current();
+        span.record("num_add_files", file_stats.gross_add_files);
+        span.record("num_remove_files", file_stats.gross_remove_files);
+        span.record("add_files_bytes", file_stats.gross_add_bytes);
+        span.record("remove_files_bytes", file_stats.gross_remove_bytes);
+        span.record("is_blind_append", self.is_blind_append);
+        span.record("data_change", self.data_change);
+        if let Some(operation) = self.operation.as_deref() {
+            span.record("operation", operation);
+        }
+        span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
+        span.record(
+            "committer_duration_ns",
+            committer_duration.as_nanos() as u64,
+        );
     }
 
     /// Set the data change flag.
@@ -882,21 +942,20 @@ impl<S: SupportsDataFiles> Transaction<S> {
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
-        let partition_cols = self.effective_table_config.partition_columns().to_vec();
         // Check if partition columns should be materialized into data files.
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a StructPatch expression that drops partition columns (unless materialized) and
-        // void columns at all nesting levels.
-        let mut patch = ExpressionStructPatch::new_top_level();
+        // Build a StructPatch expression that drops partition columns from the input
+        // (unless they should be materialized) and drop void columns at all nesting levels.
+        let mut patch = ExpressionStructPatchBuilder::new();
         if !should_materialize_partition_columns {
-            for col in &partition_cols {
-                patch = patch.with_dropped_field_if_exists(col);
+            for col in self.effective_table_config.partition_columns() {
+                patch = patch.drop_if_exists(col);
             }
         }
-        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema(), &[]);
-        Ok(Expression::struct_patch(patch))
+        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema());
+        Expression::struct_patch(patch)
     }
 
     /// Returns the logical partition column names for this table.
@@ -1185,8 +1244,10 @@ impl<S> Transaction<S> {
                 let commit_versions_array =
                     ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
+                let row_tracking_schema =
+                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![])))?;
                 add_files_batch.append_columns(
-                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
+                    row_tracking_schema,
                     vec![base_row_ids_array, commit_versions_array],
                 )
             },
@@ -1196,8 +1257,8 @@ impl<S> Transaction<S> {
         let add_actions = build_add_actions(
             engine,
             extended_add_files,
-            with_row_tracking_cols(self.add_files_schema()),
-            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+            with_row_tracking_cols(self.add_files_schema())?,
+            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()))?,
             self.data_change,
         );
 
@@ -1260,18 +1321,14 @@ impl<S> Transaction<S> {
         })
     }
 
-    /// Build a [`CrcDelta`] from the transaction's staged file metadata and commit state.
+    /// Build a [`CrcDelta`] from the transaction's commit state and a precomputed
+    /// [`FileStatsDelta`].
     fn build_crc_delta(
         &self,
+        file_stats: FileStatsDelta,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
-        bin_boundaries: Option<&[i64]>,
     ) -> DeltaResult<CrcDelta> {
-        let file_stats = FileStatsDelta::try_compute_for_txn(
-            &self.add_files_metadata,
-            &self.remove_files_metadata,
-            bin_boundaries,
-        )?;
         // TODO: drop these conversions by migrating the upstream chain
         //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
         //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
@@ -1368,8 +1425,8 @@ impl<S> Transaction<S> {
                 self.data_change,
                 columns_to_drop,
                 coalesce_stats_with_parsed,
-            );
-            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)]));
+            )?;
+            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
@@ -1418,61 +1475,47 @@ fn build_remove_struct_patch(
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
-) -> ExpressionStructPatch {
-    let mut patch = ExpressionStructPatch::new_top_level()
+) -> DeltaResult<ExpressionStructPatch> {
+    let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
-        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        .insert_after("path", lit(commit_timestamp))
         // dataChange
-        .with_inserted_field(Some("path"), Expression::literal(data_change).into())
+        .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .with_inserted_field(Some("path"), Expression::literal(true).into())
-        .with_inserted_field(
-            Some("path"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
-        );
+        .insert_after("path", lit(true))
+        .insert_after("path", col!(FILE_CONSTANT_VALUES_NAME, "partitionValues"));
 
     if coalesce_stats_with_parsed {
-        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
-        // Both expressions are registered on the "stats" field_patch (is_replace=true),
-        // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
+        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
-            Expression::column(["stats"]),
-            Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
+            col!("stats"),
+            Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch
-            .with_replaced_field("stats", coalesce_stats.into())
-            .with_inserted_field(
-                Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-            )
-            .with_dropped_field_if_exists(STATS_PARSED_NAME);
-    } else {
-        // tags inserted after stats; stats passes through unchanged
-        patch = patch.with_inserted_field(
-            Some("stats"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-        );
+            .replace("stats", coalesce_stats)
+            .drop(STATS_PARSED_NAME);
     }
 
     patch = patch
-        .with_inserted_field(
-            Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
+        .insert_after("stats", col!(FILE_CONSTANT_VALUES_NAME, TAGS_NAME))
+        .insert_after(
+            "deletionVector",
+            col!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME),
         )
-        .with_inserted_field(
-            Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
+        .insert_after(
+            "deletionVector",
+            col!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME),
         )
-        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-        .with_dropped_field("modificationTime")
+        .drop(FILE_CONSTANT_VALUES_NAME)
+        .drop("modificationTime")
         // Added to scan output when the predicate touches a partition column.
-        .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
+        .drop_if_exists(PARTITION_VALUES_PARSED_NAME);
 
     for column_to_drop in columns_to_drop {
-        patch = patch.with_dropped_field(*column_to_drop);
+        patch = patch.drop(*column_to_drop);
     }
 
-    patch
+    patch.build()
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to
@@ -1634,6 +1677,7 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
+    use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -1641,8 +1685,9 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
-        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
-        test_schema_with_array, test_schema_with_map,
+        install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
+        test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
+        CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -1666,6 +1711,31 @@ mod tests {
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
             Err(Error::IOError(std::io::Error::other("simulated IO error")))
+        }
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A mock committer that always returns a non-retryable (non-IO) error, used to test the
+    /// terminal error path.
+    struct GenericErrorCommitter;
+
+    impl Committer for GenericErrorCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            Err(Error::generic("simulated commit error"))
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -2976,6 +3046,46 @@ mod tests {
             future_ict + 1,
             "CommitMetadata.in_commit_timestamp should be the computed ICT (prev_ict + 1), \
              not the wall-clock time"
+        );
+        Ok(())
+    }
+
+    // ===== Commit failure-metric tests =====
+
+    fn commit_failure_reason(reporter: &CapturingReporter) -> Option<CommitFailureReason> {
+        reporter.events().into_iter().find_map(|event| match event {
+            MetricEvent::TransactionCommitFailure(f) => Some(f.reason),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn test_commit_io_error_emits_retryable_io_failure_metric() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
+        add_dummy_file(&mut txn);
+        let result = txn.commit(engine.as_ref())?;
+        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
+        assert_eq!(
+            commit_failure_reason(&reporter),
+            Some(CommitFailureReason::RetryableIo)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_terminal_error_emits_error_failure_metric() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
+        add_dummy_file(&mut txn);
+        assert!(txn.commit(engine.as_ref()).is_err());
+        assert_eq!(
+            commit_failure_reason(&reporter),
+            Some(CommitFailureReason::Error)
         );
         Ok(())
     }

@@ -55,7 +55,7 @@ message ValuesNode {
 // ============================================================================
 
 message ProjectNode {
-  repeated delta.kernel.expressions.Expression exprs = 1;
+  delta.kernel.expressions.Expression expr = 1;
   delta.kernel.schema.StructType schema = 2;
 }
 

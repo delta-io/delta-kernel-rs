@@ -12,7 +12,8 @@ use tracing_subscriber::Layer;
 use super::events::{
     storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
     LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
-    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess, STORAGE_SPAN,
+    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
+    TransactionCommitSuccess, STORAGE_SPAN,
 };
 
 // ====================================================================
@@ -115,6 +116,9 @@ where
             }
             SnapshotBuildSuccess::SPAN_NAME => Some(MetricEvent::SnapshotBuildSuccess(
                 SnapshotBuildSuccess::from_attrs(attrs),
+            )),
+            TransactionCommitSuccess::SPAN_NAME => Some(MetricEvent::TransactionCommitSuccess(
+                TransactionCommitSuccess::from_attrs(attrs),
             )),
             DomainMetadataLoadSuccess::SPAN_NAME => Some(MetricEvent::DomainMetadataLoadSuccess(
                 DomainMetadataLoadSuccess::from_attrs(attrs),
@@ -239,6 +243,15 @@ impl Visit for EventVisitor {
             return;
         };
         if let Err(span_name) = event.record_bool(field.name(), value) {
+            self.warn_invalid(field, span_name);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let Some(event) = self.event.as_mut() else {
+            return;
+        };
+        if let Err(span_name) = event.record_str(field.name(), value) {
             self.warn_invalid(field, span_name);
         }
     }
