@@ -264,16 +264,16 @@ fn action_to_field(action: &DeltaAction) -> StructField {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, LazyLock};
+    use std::sync::Arc;
 
     use test_utils::add_commit;
 
     use super::*;
+    use crate::actions::visitors::{AddVisitor, RemoveVisitor};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+    use crate::engine_data::RowVisitor;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
     use crate::Snapshot;
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
@@ -322,38 +322,6 @@ mod tests {
         }
     }
 
-    /// Visitor capturing `(add.path, remove.path)` per row.
-    #[derive(Default)]
-    struct AddRemovePathVisitor {
-        rows: Vec<(Option<String>, Option<String>)>,
-    }
-
-    impl RowVisitor for AddRemovePathVisitor {
-        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-            static COLS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                (
-                    vec![column_name!("add.path"), column_name!("remove.path")],
-                    vec![DataType::STRING, DataType::STRING],
-                )
-                    .into()
-            });
-            COLS.as_ref()
-        }
-
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
-            for i in 0..row_count {
-                let add_path: Option<String> = getters[0].get_opt(i, "add.path")?;
-                let remove_path: Option<String> = getters[1].get_opt(i, "remove.path")?;
-                self.rows.push((add_path, remove_path));
-            }
-            Ok(())
-        }
-    }
-
     #[test]
     fn test_commits_actions_project_to_requested_schema() {
         // v=1 of table-with-dv-small contains commitInfo + remove + add (DV rewrite).
@@ -368,25 +336,19 @@ mod tests {
         assert_eq!(commit.version(), 1);
         assert!(iter.next().is_none(), "single-commit range yields only v=1");
 
-        let mut visitor = AddRemovePathVisitor::default();
+        let mut add_visitor = AddVisitor::default();
+        let mut remove_visitor = RemoveVisitor::default();
         for batch_res in commit.get_actions(engine.as_ref()).unwrap() {
-            visitor.visit_rows_of(batch_res.unwrap().as_ref()).unwrap();
+            let batch = batch_res.unwrap();
+            add_visitor.visit_rows_of(batch.as_ref()).unwrap();
+            remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
         }
-
-        let adds = visitor
-            .rows
-            .iter()
-            .filter_map(|(a, _)| a.as_deref())
-            .collect::<Vec<_>>();
-        let removes = visitor
-            .rows
-            .iter()
-            .filter_map(|(_, r)| r.as_deref())
-            .collect::<Vec<_>>();
-        assert_eq!(adds.len(), 1, "v=1 has exactly one add");
-        assert_eq!(removes.len(), 1, "v=1 has exactly one remove");
-        // DV rewrite: the same physical file path appears on both sides.
-        assert_eq!(adds[0], removes[0], "DV rewrite shares the file path");
+        assert_eq!(add_visitor.adds.len(), 1, "v=1 has exactly one add");
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "v=1 has exactly one remove"
+        );
     }
 
     /// Build an in-memory engine pre-loaded with `commits` (each `(version, body)` pair becomes
@@ -606,16 +568,19 @@ mod tests {
         assert!(saw_batch, "expected at least one emitted batch");
     }
 
-    // Collect every (add.path, remove.path) row from `commit.get_actions()`.
-    fn collect_add_remove_rows(
+    // Collect the `Add` and `Remove` actions from `commit.get_actions()`.
+    fn collect_adds_and_removes(
         commit: &CommitAction,
         engine: &dyn Engine,
-    ) -> DeltaResult<Vec<(Option<String>, Option<String>)>> {
-        let mut visitor = AddRemovePathVisitor::default();
+    ) -> DeltaResult<(Vec<Add>, Vec<Remove>)> {
+        let mut add_visitor = AddVisitor::default();
+        let mut remove_visitor = RemoveVisitor::default();
         for batch_res in commit.get_actions(engine)? {
-            visitor.visit_rows_of(batch_res?.as_ref())?;
+            let batch = batch_res?;
+            add_visitor.visit_rows_of(batch.as_ref())?;
+            remove_visitor.visit_rows_of(batch.as_ref())?;
         }
-        Ok(visitor.rows)
+        Ok((add_visitor.adds, remove_visitor.removes))
     }
 
     #[test]
@@ -628,9 +593,9 @@ mod tests {
             .unwrap();
         let commit = iter.next().expect("v=0 commit").unwrap();
 
-        let first = collect_add_remove_rows(&commit, engine.as_ref()).unwrap();
-        let second = collect_add_remove_rows(&commit, engine.as_ref()).unwrap();
-        assert!(!first.is_empty(), "v=0 should yield at least one row");
+        let first = collect_adds_and_removes(&commit, engine.as_ref()).unwrap();
+        let second = collect_adds_and_removes(&commit, engine.as_ref()).unwrap();
+        assert!(!first.0.is_empty(), "v=0 should yield at least one add");
         assert_eq!(
             first, second,
             "get_actions must yield identical content across calls",
