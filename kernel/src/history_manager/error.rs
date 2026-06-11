@@ -82,6 +82,16 @@ pub enum LogHistoryError {
         /// `NearestTimestamp::Earliest(100)`.
         nearest_timestamp: NearestTimestamp,
     },
+    /// Commit files exist in the log but the table cannot be reconstructed: commit version 0
+    /// is missing and no complete checkpoint is present to anchor the surviving commits.
+    #[error(
+        "No recreatable commits found at {log_root}: commits exist but version 0 is missing \
+         and no complete checkpoint is present"
+    )]
+    NoRecreatableCommit {
+        /// The log root URL that was scanned.
+        log_root: Url,
+    },
     /// An internal error occurred during timestamp conversion.
     #[error("{context}{}", source.as_ref().map(|e| format!(": {e}")).unwrap_or_default())]
     Internal {

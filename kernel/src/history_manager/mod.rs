@@ -20,6 +20,7 @@
 //! not guaranteed to be monotonically increasing across commits.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use error::{LogHistoryError, NearestTimestamp};
 use itertools::Itertools;
@@ -28,7 +29,7 @@ use tracing::{info, trace, warn};
 use url::Url;
 
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::list_from_storage;
+use crate::log_segment_files::{list_from_storage, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -624,7 +625,7 @@ pub fn timestamp_range_to_versions(
     Ok((start_version, end_version))
 }
 
-/// Returns the earliest published commit version available on the file system for this table.
+/// Returns the earliest commit version available on the file system for this table.
 ///
 /// The returned version is the version of the lowest-numbered `*.json` commit file present in
 /// `log_root`. The returned version is not guaranteed to exist by the time the caller
@@ -644,10 +645,7 @@ pub fn timestamp_range_to_versions(
 ///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
 ///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
 ///   indicates a broken invariant rather than a normal missing version.
-// TODO: remove the `#[allow(unused)]` once the public earliest-commit-version API that calls
-// this helper lands.
-#[allow(unused)]
-#[tracing::instrument(skip(engine), ret)]
+#[tracing::instrument(skip(engine), ret, err)]
 fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
@@ -671,19 +669,178 @@ fn get_earliest_published_commit_version(
         })
 }
 
+/// Returns the earliest table version that can be fully reconstructed, and from which we can replay
+/// forward in time to the current version `log_root`. This is either commit version 0 (if
+/// `00...00.json` exists), or the version of the earliest complete checkpoint. The returned version
+/// is not guaranteed to exist by the time the caller acts on it: a concurrent log-cleanup operation
+/// may delete the file. This method assumes that the commits are contiguous.
+///
+/// # Parameters
+/// - `engine`: kernel engine used to list `log_root`.
+/// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
+/// - `earliest_ratified_commit_version`: For catalog-managed tables, it is the earliest version the
+///   catalog has ratified commit. Pass `None` for filesystem-only tables.
+///
+/// # Errors
+/// - Propagate any error from listing the log directory.
+/// - [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at all
+/// (empty directory, or only checkpoint files) -- unless `earliest_ratified_commit_version`
+/// is `Some(0)`, in which case it returns a generic [`Error`](crate::Error) flagging the
+/// broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
+/// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
+/// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
+#[tracing::instrument(skip(engine), err, ret)]
+fn get_earliest_recreatable_commit(
+    engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+) -> DeltaResult<Version> {
+    let mut last_complete_checkpoint: Option<Version> = None;
+    // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
+    // checkpoint completeness.
+    let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
+    let mut earliest_commit_version: Option<Version> = None;
+
+    let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
+    for parsed_result in listing {
+        let parsed_log_path = parsed_result?;
+        if !should_process_log_file(&parsed_log_path) {
+            continue;
+        }
+        match parsed_log_path.file_type {
+            LogPathFileType::Commit => {
+                if parsed_log_path.version == 0 {
+                    return Ok(0);
+                }
+
+                let earliest_version =
+                    *earliest_commit_version.get_or_insert(parsed_log_path.version);
+
+                if let Some(checkpoint_version) = last_complete_checkpoint {
+                    if checkpoint_version >= earliest_version {
+                        // Given the contiguity assumption of delta_log commits,
+                        // when a full checkpoint has contiguous commits starting before or at
+                        // checkpoint_version that table can be
+                        // recreated at checkpoint_version.
+                        return Ok(checkpoint_version);
+                    }
+                }
+            }
+            LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint => {
+                last_complete_checkpoint = Some(parsed_log_path.version);
+            }
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } => {
+                let parts = multi_part_checkpoint_progress
+                    .entry((parsed_log_path.version, num_parts))
+                    .or_default();
+                parts.insert(part_num);
+                if parts.len() == num_parts as usize {
+                    last_complete_checkpoint = Some(parsed_log_path.version);
+                }
+            }
+            LogPathFileType::StagedCommit
+            | LogPathFileType::CompactedCommit { .. }
+            | LogPathFileType::Crc
+            | LogPathFileType::Unknown => {}
+        }
+    }
+
+    // Files are listed in ascending lexicography order, so any recreatable version, e.g commit 0,
+    // or a complete checkpoint immediately followed by its contiguous commit, is detected and
+    // returned inside the loop above. Reaching here therefore means no such version exists,
+    // which is always an error.
+    if earliest_commit_version.is_some() {
+        // Commits exist, but none is anchored by commit 0 or a complete checkpoint.
+        return Err(DeltaError::from(LogHistoryError::NoRecreatableCommit {
+            log_root: log_root.clone(),
+        }));
+    }
+    if earliest_ratified_commit_version == Some(0) {
+        // Broken CCv2 invariant: the catalog ratified commit 0, but no published commit exists.
+        return Err(DeltaError::generic(format!(
+            "expected a published v0 commit for catalog-managed table {log_root}, \
+             but the log listing returned no commits"
+        )));
+    }
+    Err(DeltaError::from(LogHistoryError::NoCommitsFound {
+        log_root: log_root.clone(),
+    }))
+}
+
+/// Selects which commit the [`get_earliest_commit`] query returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryCommitType {
+    /// A filesystem or catalog commit present in the table's `_delta_log/`. Its presence does not
+    /// guarantee that the table can be reconstructed at that commit's version.
+    Published,
+    /// A commit whose version the table state can be fully reconstructed at and replayed forward
+    /// from to the latest version.
+    Recreatable,
+}
+
+/// Returns the earliest table version available on the file system at `log_root`. The returned
+/// version is not guaranteed to exist by the time the caller acts on it: a concurrent log-cleanup
+/// operation may delete the underlying file.
+///
+/// # Parameters
+/// - `engine`: kernel engine used to list `log_root`.
+/// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
+/// - `earliest_ratified_commit_version`: For catalog-managed tables, the earliest version the
+///   catalog has ratified a commit at. Pass `None` for filesystem-only tables.
+/// - `commit_type`: selects the query. [`HistoryCommitType::Published`] returns the lowest-numbered
+///   published commit; [`HistoryCommitType::Recreatable`] returns the earliest version whose state
+///   can be fully reconstructed (commit 0 or the earliest complete checkpoint).
+///
+/// # Errors
+/// - Propagates any error from listing the log directory.
+/// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits and
+///   `earliest_ratified_commit_version` is not `Some(0)`.
+/// - [`LogHistoryError::NoRecreatableCommit`] when `commit_type` is
+///   [`HistoryCommitType::Recreatable`], commits exist, but neither `00...00.json` nor a checkpoint
+///   anchoring the smallest commit is present.
+/// - [`DeltaError::Generic`] when the listing yields no commits and
+///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
+///   (ratified commit 0 with no published filesystem commit).
+#[tracing::instrument(skip(engine), err, ret)]
+pub fn get_earliest_commit(
+    engine: &dyn Engine,
+    log_root: &Url,
+    earliest_ratified_commit_version: Option<Version>,
+    commit_type: HistoryCommitType,
+) -> DeltaResult<Version> {
+    match commit_type {
+        HistoryCommitType::Published => get_earliest_published_commit_version(
+            engine,
+            log_root,
+            earliest_ratified_commit_version,
+        ),
+
+        HistoryCommitType::Recreatable => {
+            get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs::{remove_file, OpenOptions};
+    use std::ops::RangeInclusive;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
+    use bytes::Bytes;
     use test_utils::delta_path_for_version;
     use url::Url;
+    use uuid::Uuid;
 
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
@@ -1628,10 +1785,169 @@ mod tests {
         }
     }
 
+    /// Builds an in-memory store with a mock entry per given log file path and returns
+    /// an engine wired to it plus the corresponding `_delta_log/` URL. Paths listed in
+    /// `empty_paths` are written as 0-byte files to exercise empty-file skipping.
+    fn engine_with_log_files(paths: &[String], empty_paths: &HashSet<String>) -> (SyncEngine, Url) {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let storage = engine.storage_handler();
+        for path in paths {
+            let bytes = if empty_paths.contains(path) {
+                Bytes::new()
+            } else {
+                Bytes::from_static(b"x")
+            };
+            let url = Url::parse(&format!("memory:///{path}")).unwrap();
+            storage.put(&url, bytes, false).expect("put log file");
+        }
+        (engine, Url::parse("memory:///_delta_log/").unwrap())
+    }
+
+    fn commit_path(version_range: RangeInclusive<Version>) -> Vec<String> {
+        version_range
+            .map(|v| delta_path_for_version(v, "json").to_string())
+            .collect()
+    }
+
+    fn single_part_checkpoint_path(v: Version) -> String {
+        format!("_delta_log/{v:020}.checkpoint.parquet")
+    }
+
+    fn uuid_checkpoint_path(v: Version) -> String {
+        format!("_delta_log/{v:020}.checkpoint.{}.parquet", Uuid::new_v4())
+    }
+
+    fn multi_part_checkpoint_paths(v: Version, num_parts: u32) -> Vec<String> {
+        (1..=num_parts)
+            .map(|part| format!("_delta_log/{v:020}.checkpoint.{part:010}.{num_parts:010}.parquet"))
+            .collect()
+    }
+
+    /// Builds a "truncated log" layout: `checkpoint_paths` plus commits over `commit_range`.
+    fn truncated_log(
+        checkpoint_paths: Vec<String>,
+        commit_range: RangeInclusive<Version>,
+    ) -> Vec<String> {
+        let mut paths: Vec<String> = checkpoint_paths;
+        paths.extend(commit_path(commit_range));
+        paths
+    }
+
+    #[rstest::rstest]
+    #[case::v0_exists(commit_path(0..=5), None, Expected::Version(0))]
+    #[case::truncated_single_part(truncated_log(vec![single_part_checkpoint_path(5)], 5..=9), None, Expected::Version(5))]
+    #[case::truncated_uuid(truncated_log(vec![uuid_checkpoint_path(5)], 5..=9), None, Expected::Version(5))]
+    #[case::truncated_multi_part(truncated_log(multi_part_checkpoint_paths(5, 3), 5..=9), None, Expected::Version(5))]
+    #[case::ratified_zero_with_v0_present(commit_path(0..=3), Some(0), Expected::Version(0))]
+    #[case::non_zero_ratified_falls_through_to_scan(commit_path(0..=3), Some(4), Expected::Version(0))]
+    #[case::commit_cleanup_before_checkpoint(
+        {
+            let mut p = commit_path(2..=4);
+            p.push(uuid_checkpoint_path(4));
+            p
+        },
+        None,
+        Expected::Version(4)
+    )]
+    #[case::picks_first_anchored_checkpoint(
+        {
+            let mut p = vec![single_part_checkpoint_path(3)];
+            p.extend(multi_part_checkpoint_paths(7, 2));
+            p.extend(commit_path(7..=8));
+            p
+        },
+        None,
+        Expected::Version(7),
+    )]
+    #[case::listing_with_multiple_full_checkpoints(
+        {
+            let mut p = vec![single_part_checkpoint_path(3)];
+            p.extend(commit_path(3..=7));
+            p.push(single_part_checkpoint_path(7));
+            p
+        },
+        None,
+        Expected::Version(3),
+    )]
+    #[case::listing_with_cleanup_checkpoints(
+            {
+                let mut p = multi_part_checkpoint_paths(3, 3);
+                p.remove(0);
+                p.extend(commit_path(3..=7));
+                p.push(single_part_checkpoint_path(7));
+                p
+            },
+            None,
+            Expected::Version(7),
+        )]
+    #[case::listing_with_v0_and_full_checkpoint(
+        {
+            let mut p = commit_path(0..=5);
+            p.push(single_part_checkpoint_path(5));
+            p
+        },
+        None,
+        Expected::Version(0),
+    )]
+    #[case::checkpoint_before_smallest_commit_anchors(
+        {
+            let mut p = vec![single_part_checkpoint_path(5)];
+            p.extend(commit_path(6..=8));
+            p
+        },
+        None,
+        Expected::NoRecreatableCommit,
+    )]
+    #[case::empty_log(vec![], None, Expected::NoCommitsFound)]
+    #[case::crc_only(vec![format!("_delta_log/{:020}.crc", 5)], None, Expected::NoCommitsFound)]
+    #[case::compacted_only(vec![format!("_delta_log/{:020}.{:020}.compacted.json", 0, 5)], None, Expected::NoCommitsFound)]
+    #[case::checkpoint_only(vec![single_part_checkpoint_path(5)], None, Expected::NoCommitsFound)]
+    #[case::non_zero_ratified_on_empty_log(vec![], Some(5), Expected::NoCommitsFound)]
+    #[case::ratified_zero_on_empty_log(vec![], Some(0), Expected::CCv2MissingV0FilesystemCommit)]
+    #[case::commits_have_no_anchor(commit_path(2..=3), None, Expected::NoRecreatableCommit)]
+    #[case::ratified_zero_commits_no_anchor(commit_path(2..=3), Some(0), Expected::NoRecreatableCommit)]
+    fn earliest_recreatable_returns_expected(
+        #[case] paths: Vec<String>,
+        #[case] ratified: Option<Version>,
+        #[case] expected: Expected,
+    ) {
+        let (engine, log_root) = engine_with_log_files(&paths, &HashSet::new());
+        let res = get_earliest_recreatable_commit(&engine, &log_root, ratified);
+        match expected {
+            Expected::Version(v) => assert_eq!(res.unwrap(), v),
+            Expected::NoCommitsFound => assert!(
+                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
+                "expected NoCommitsFound error, got {res:?}"
+            ),
+            Expected::NoRecreatableCommit => assert!(
+                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoRecreatableCommit { .. })),
+                "expected NoRecreatableCommit error, got {res:?}"
+            ),
+            Expected::CCv2MissingV0FilesystemCommit => {
+                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+            }
+        }
+    }
+
     enum Expected {
         Version(Version),
         NoCommitsFound,
+        NoRecreatableCommit,
         CCv2MissingV0FilesystemCommit,
+    }
+
+    #[test]
+    fn test_empty_checkpoint_is_skipped() {
+        let mut paths = vec![single_part_checkpoint_path(5)];
+        paths.extend(commit_path(5..=9));
+        paths.push(single_part_checkpoint_path(8));
+
+        let mut empty_paths = HashSet::new();
+        empty_paths.insert(single_part_checkpoint_path(5));
+
+        let (engine, log_root) = engine_with_log_files(&paths, &empty_paths);
+        let version = get_earliest_recreatable_commit(&engine, &log_root, None).unwrap();
+        assert_eq!(version, 8);
     }
 
     #[tokio::test]
@@ -1680,6 +1996,11 @@ mod tests {
             ),
             Expected::CCv2MissingV0FilesystemCommit => {
                 assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+            }
+            Expected::NoRecreatableCommit => {
+                unreachable!(
+                    "get_earliest_published_commit_version never returns NoRecreatableCommit"
+                )
             }
         }
     }

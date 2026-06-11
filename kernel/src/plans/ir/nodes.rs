@@ -242,13 +242,17 @@ pub struct Values {
     pub rows: Vec<Vec<Scalar>>,
 }
 
-/// Projects the single input through `exprs` into rows of `schema`.
+/// Projects the input through `expr` into rows of `schema`.
 ///
-/// `exprs.len() == schema.fields().count()`. For each output index `i`, the engine
-/// evaluates `exprs[i]` against an input row and binds the result to the **logical name**
-/// `schema.fields()[i].name`. Output column names always come from `schema`,
-/// not from the expression tree; expressions only supply values. Downstream nodes see the
-/// logical field names declared in `schema`.
+/// `expr` must be a struct constructor or struct patch whose fields match `schema`. It is
+/// evaluated with `schema` as its output struct type: the struct's fields are the output
+/// columns, `schema` supplies names and nullability, and any type or arity mismatch is an error.
+/// Downstream nodes see the logical field names declared in `schema`.
+///
+/// A struct patch carries the input struct through field by field, naming only the columns that
+/// change -- replacing or dropping existing fields and injecting new ones -- while everything else
+/// passes through unchanged, so it costs O(changes) rather than O(schema width). The patched
+/// result still covers every field in `schema`.
 ///
 /// # Example
 ///
@@ -258,7 +262,7 @@ pub struct Values {
 ///
 /// ```text
 /// Project {
-///     exprs: [
+///     expr: Expression::struct_from([
 ///         col("id"),
 ///         Expression::array([col("first"), col("last")]),
 ///         Expression::struct_from([
@@ -266,7 +270,7 @@ pub struct Values {
 ///             col("add.size"),
 ///             col("add.stats_parsed.numRecords"),
 ///         ]),
-///     ],
+///     ]),
 ///     schema: {
 ///         id: int,
 ///         names: array<string>,
@@ -276,7 +280,7 @@ pub struct Values {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Project {
-    pub exprs: Vec<ExpressionRef>,
+    pub expr: ExpressionRef,
     pub schema: SchemaRef,
 }
 
