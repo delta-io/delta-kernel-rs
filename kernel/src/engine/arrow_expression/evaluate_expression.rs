@@ -1073,11 +1073,11 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, MapBuilder, StringArray,
-        StringBuilder, StructArray, TimestampMicrosecondArray,
+        ArrayRef, BooleanArray, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        MapBuilder, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
         col, column_expr, column_expr_ref, lit, BinaryExpressionOp, Expression as Expr,
@@ -1892,6 +1892,31 @@ mod tests {
         assert_eq!(b_col.value(0), "hello");
         assert_eq!(b_col.value(1), "world");
         assert_eq!(b_col.value(2), "test");
+    }
+
+    #[test]
+    fn test_extract_variant_column_with_large_binary_fields() {
+        let fields: Fields = vec![
+            ArrowField::new("metadata", ArrowDataType::LargeBinary, false),
+            ArrowField::new("value", ArrowDataType::LargeBinary, false),
+        ]
+        .into();
+        let variant_arrow_type = ArrowDataType::Struct(fields.clone());
+        let metadata = Arc::new(LargeBinaryArray::from(vec![&[0x01, 0x00, 0x00][..]])) as ArrayRef;
+        let value = Arc::new(LargeBinaryArray::from(vec![&[0x0C, 0x01][..]])) as ArrayRef;
+        let variant = StructArray::try_new(fields, vec![metadata, value], None).unwrap();
+        let schema = ArrowSchema::new(vec![ArrowField::new("v", variant_arrow_type.clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(variant)]).unwrap();
+
+        let result = evaluate_expression(
+            &column_expr!("v"),
+            &batch,
+            Some(&DataType::unshredded_variant()),
+        )
+        .unwrap();
+
+        // The 64-bit offsets pass through without a cast back to 32-bit Binary.
+        assert_eq!(result.data_type(), &variant_arrow_type);
     }
 
     #[test]
