@@ -37,7 +37,7 @@
 //! )? {
 //!     let commit = commit?;
 //!     println!("v={} ts={}", commit.version(), commit.timestamp());
-//!     for batch in commit.get_actions()? {
+//!     for batch in commit.get_actions(engine.as_ref())? {
 //!         let _batch = batch?;
 //!     }
 //! }
@@ -201,7 +201,7 @@ impl CommitActionsIterator {
     fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
-            self.engine.clone(),
+            self.engine.as_ref(),
             self.table_root.clone(),
             log_path,
             self.read_schema.clone(),
@@ -362,14 +362,14 @@ mod tests {
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let mut iter = range
-            .commits(engine, Some(anchor_snapshot), &actions)
+            .commits(engine.clone(), Some(anchor_snapshot), &actions)
             .unwrap();
         let commit = iter.next().expect("v=1 commit").unwrap();
         assert_eq!(commit.version(), 1);
         assert!(iter.next().is_none(), "single-commit range yields only v=1");
 
         let mut visitor = AddRemovePathVisitor::default();
-        for batch_res in commit.get_actions().unwrap() {
+        for batch_res in commit.get_actions(engine.as_ref()).unwrap() {
             visitor.visit_rows_of(batch_res.unwrap().as_ref()).unwrap();
         }
 
@@ -412,9 +412,9 @@ mod tests {
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
     ) -> DeltaResult<()> {
-        for commit_res in range.commits(engine, start_snapshot, actions)? {
+        for commit_res in range.commits(engine.clone(), start_snapshot, actions)? {
             let commit = commit_res?;
-            for batch_res in commit.get_actions()? {
+            for batch_res in commit.get_actions(engine.as_ref())? {
                 batch_res?;
             }
         }
@@ -579,11 +579,11 @@ mod tests {
         let (range, engine, anchor_snapshot) = open_test_range_at(0);
         let mut saw_batch = false;
         for commit in range
-            .commits(engine, Some(anchor_snapshot), actions)
+            .commits(engine.clone(), Some(anchor_snapshot), actions)
             .unwrap()
         {
             let commit = commit.unwrap();
-            for batch in commit.get_actions().unwrap() {
+            for batch in commit.get_actions(engine.as_ref()).unwrap() {
                 let batch = batch.unwrap();
                 let arrow = batch
                     .any_ref()
@@ -609,9 +609,10 @@ mod tests {
     // Collect every (add.path, remove.path) row from `commit.get_actions()`.
     fn collect_add_remove_rows(
         commit: &CommitAction,
+        engine: &dyn Engine,
     ) -> DeltaResult<Vec<(Option<String>, Option<String>)>> {
         let mut visitor = AddRemovePathVisitor::default();
-        for batch_res in commit.get_actions()? {
+        for batch_res in commit.get_actions(engine)? {
             visitor.visit_rows_of(batch_res?.as_ref())?;
         }
         Ok(visitor.rows)
@@ -623,12 +624,12 @@ mod tests {
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let mut iter = range
-            .commits(engine, Some(anchor_snapshot), &actions)
+            .commits(engine.clone(), Some(anchor_snapshot), &actions)
             .unwrap();
         let commit = iter.next().expect("v=0 commit").unwrap();
 
-        let first = collect_add_remove_rows(&commit).unwrap();
-        let second = collect_add_remove_rows(&commit).unwrap();
+        let first = collect_add_remove_rows(&commit, engine.as_ref()).unwrap();
+        let second = collect_add_remove_rows(&commit, engine.as_ref()).unwrap();
         assert!(!first.is_empty(), "v=0 should yield at least one row");
         assert_eq!(
             first, second,

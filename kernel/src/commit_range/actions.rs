@@ -49,7 +49,6 @@ static HEADER_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// Reading the commit's action batches is lazy and re-buildable via
 /// [`Self::get_actions`], which issues a fresh JSON read on every call.
 pub struct CommitAction {
-    engine: Arc<dyn Engine>,
     table_root: Url,
     log_path: ParsedLogPath,
     read_schema: SchemaRef,
@@ -68,7 +67,7 @@ impl CommitAction {
     /// carries onto the seed, validates that the kernel can read the resulting configuration,
     /// and resolves the commit timestamp.
     pub(crate) fn try_new(
-        engine: Arc<dyn Engine>,
+        engine: &dyn Engine,
         table_root: Url,
         log_path: ParsedLogPath,
         read_schema: SchemaRef,
@@ -77,7 +76,6 @@ impl CommitAction {
     ) -> DeltaResult<Self> {
         let timestamp = log_path.location.last_modified;
         let mut this = Self {
-            engine,
             table_root,
             log_path,
             read_schema,
@@ -85,7 +83,7 @@ impl CommitAction {
             metadata: seed_metadata,
             timestamp,
         };
-        let extracted_ict = this.read_commit_header()?;
+        let extracted_ict = this.read_commit_header(engine)?;
         // Build the effective table configuration once (when both protocol and metadata are
         // known) and reuse it for both validation and timestamp resolution.
         let table_config = match (&this.protocol, &this.metadata) {
@@ -131,8 +129,8 @@ impl CommitAction {
     /// Read the commit header projected to `[protocol, metadata, commitInfo]`, overlay any
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
-    fn read_commit_header(&mut self) -> DeltaResult<Option<i64>> {
-        let json_iter = self.engine.json_handler().read_json_files(
+    fn read_commit_header(&mut self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+        let json_iter = engine.json_handler().read_json_files(
             slice::from_ref(&self.log_path.location),
             HEADER_READ_SCHEMA.clone(),
             None,
@@ -222,8 +220,8 @@ impl CommitAction {
     ///
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
-    pub fn get_actions(&self) -> DeltaResult<FileDataReadResultIterator> {
-        self.engine.json_handler().read_json_files(
+    pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
+        engine.json_handler().read_json_files(
             slice::from_ref(&self.log_path.location),
             self.read_schema.clone(),
             None,

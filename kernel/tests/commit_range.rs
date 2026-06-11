@@ -22,9 +22,13 @@ fn setup_test(rel_path: &str) -> Result<(Url, Arc<dyn Engine>), Box<dyn Error>> 
 /// Count rows with a non-null entry in each requested action column for a single commit.
 /// `actions` must match what was passed to `CommitRange::commits` so the field indices align
 /// with the emitted top-level columns.
-fn count_action_rows(commit: &CommitAction, actions: &[DeltaAction]) -> DeltaResult<Vec<usize>> {
+fn count_action_rows(
+    commit: &CommitAction,
+    actions: &[DeltaAction],
+    engine: &dyn Engine,
+) -> DeltaResult<Vec<usize>> {
     let mut counts = vec![0usize; actions.len()];
-    for batch_res in commit.get_actions()? {
+    for batch_res in commit.get_actions(engine)? {
         let rb: RecordBatch = batch_res?.try_into_record_batch()?;
         for (idx, count) in counts.iter_mut().enumerate() {
             let col = rb.column(idx);
@@ -72,7 +76,7 @@ fn reads_all_commits_in_requested_order(
     {
         let version = commit.version();
         assert_eq!(version, expected_version, "version order");
-        let counts = count_action_rows(&commit, &actions)?;
+        let counts = count_action_rows(&commit, &actions, engine.as_ref())?;
         assert_eq!(counts, expected_counts, "v={version} action counts");
     }
 
