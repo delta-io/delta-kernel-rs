@@ -1906,6 +1906,16 @@ mod tests {
     #[case::ratified_zero_on_empty_log(vec![], Some(0), Expected::CCv2MissingV0FilesystemCommit)]
     #[case::commits_have_no_anchor(commit_path(2..=3), None, Expected::NoRecreatableCommit)]
     #[case::ratified_zero_commits_no_anchor(commit_path(2..=3), Some(0), Expected::NoRecreatableCommit)]
+    #[case::staged_commits_and_last_checkpoint_ignored(
+        {
+            let mut p = truncated_log(vec![single_part_checkpoint_path(5)], 5..=9);
+            p.push("_delta_log/_last_checkpoint".to_string());
+            p.push(format!("_delta_log/_staged_commits/{:020}.{}.json", 9, Uuid::new_v4()));
+            p
+        },
+        None,
+        Expected::Version(5)
+    )]
     fn earliest_recreatable_returns_expected(
         #[case] paths: Vec<String>,
         #[case] ratified: Option<Version>,

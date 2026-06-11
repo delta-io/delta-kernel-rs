@@ -59,7 +59,9 @@ pub(crate) struct LogSegmentFiles {
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
 /// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
-/// files (e.g. staged commits, dot-prefixed files), and stopping at `end_version`.
+/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
+/// underlying listing at the first path past the version-named region, so directories like
+/// `_staged_commits/` are never paged through.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
@@ -74,12 +76,11 @@ pub(crate) fn list_from_storage(
     let log_root_str = log_root.to_string();
     let files = storage
         .list_from(&start_from)?
-        // The listing is recursive and sorted by full path, and every file kernel lists has a
-        // 20-digit version prefix. Once a path sorts past '9' nothing relevant can follow, so stop
-        // pulling listing pages there. In particular this avoids paging through
-        // `_staged_commits/`, which can hold thousands of files and is only consumed via
-        // `log_tail` ('_' sorts after '9'). Paths outside `log_root` are conservatively kept;
-        // parsing filters them below.
+        // The listing is sorted by full path and every listable log file begins with a 20-digit
+        // version, so nothing relevant follows the first relative path starting past '9'. Stopping
+        // there avoids paging through `_staged_commits/` ('_' > '9'), which can hold thousands of
+        // files. A path that doesn't strip the log_root prefix is kept; parsing discards it.
+        // TODO(#2740): push the bound into the listing request itself.
         .take_while(move |meta_res| match meta_res {
             Ok(meta) => meta
                 .location

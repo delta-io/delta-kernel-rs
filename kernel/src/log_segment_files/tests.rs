@@ -54,8 +54,24 @@ fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> Stri
 async fn create_storage(
     log_files: Vec<(Version, LogPathFileType, CommitSource)>,
 ) -> (Arc<dyn StorageHandler>, Url) {
+    create_storage_with_raw_paths(log_files, &[]).await
+}
+
+/// Like [`create_storage`] but also writes `raw_paths` verbatim, for log entries that
+/// [`log_path_for_file_type`] cannot produce (e.g. `_last_checkpoint`).
+async fn create_storage_with_raw_paths(
+    log_files: Vec<(Version, LogPathFileType, CommitSource)>,
+    raw_paths: &[&str],
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+    for path in raw_paths {
+        store
+            .put(&ObjectPath::from(*path), bytes::Bytes::from("raw").into())
+            .await
+            .expect("Failed to put raw test file");
+    }
 
     for (version, file_type, source) in log_files {
         let path = log_path_for_file_type(version, &file_type);
@@ -450,27 +466,6 @@ async fn test_listing_omits_staged_commits() {
 }
 
 #[tokio::test]
-async fn test_listing_with_large_end_version() {
-    let log_files = vec![
-        (0, LogPathFileType::Commit, CommitSource::Filesystem),
-        (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
-        (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
-    ];
-
-    let (storage, log_root) = create_storage(log_files).await;
-    // note we let you request end version past the end of log. up to consumer to interpret
-    let (commits, _, _, _, latest_commit, max_pub) =
-        list_and_destructure(storage.as_ref(), &log_root, vec![], None, Some(3));
-
-    // we must only see two regular commits
-    assert_eq!(commits.len(), 2);
-    assert_eq!(commits[0].version, 0);
-    assert_eq!(commits[1].version, 1);
-    assert_eq!(latest_commit.unwrap().version, 1);
-    assert_eq!(max_pub, Some(1));
-}
-
-#[tokio::test]
 async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -493,6 +488,63 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(max_pub, Some(2));
     // 3 commits plus the single staged commit that stops the listing
     assert_eq!(storage.items_listed(), 4);
+}
+
+#[tokio::test]
+async fn test_listing_stops_at_last_checkpoint_marker() {
+    // In a real table `_last_checkpoint` sorts before `_staged_commits/` ('_la' < '_st'), so
+    // it is the path that stops the listing.
+    let mut log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            2,
+            LogPathFileType::SinglePartCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (2, LogPathFileType::Crc, CommitSource::Filesystem),
+    ];
+    log_files.extend((0..50).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
+
+    let (storage, log_root) =
+        create_storage_with_raw_paths(log_files, &["_delta_log/_last_checkpoint"]).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, checkpoint_parts, latest_crc, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, None);
+
+    // The checkpoint at version 2 subsumes all commits; only latest_commit_file is retained
+    assert!(commits.is_empty());
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 2);
+    assert_eq!(latest_crc.unwrap().version, 2);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // 5 version-named files plus the `_last_checkpoint` that stops the listing; no staged
+    // commit is ever consumed
+    assert_eq!(storage.items_listed(), 6);
+}
+
+#[tokio::test]
+async fn test_listing_with_large_end_version() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
+        (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+    ];
+
+    let (storage, log_root) = create_storage(log_files).await;
+    // note we let you request end version past the end of log. up to consumer to interpret
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, Some(3));
+
+    // we must only see two regular commits
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].version, 0);
+    assert_eq!(commits[1].version, 1);
+    assert_eq!(latest_commit.unwrap().version, 1);
+    assert_eq!(max_pub, Some(1));
 }
 
 #[tokio::test]
