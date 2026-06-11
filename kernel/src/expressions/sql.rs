@@ -33,7 +33,8 @@ use crate::{DeltaResult, Error};
 /// - Boolean: `TRUE` / `FALSE`
 /// - Date: `'2024-01-01'` or `DATE '2024-01-01'`
 /// - Timestamp / TimestampNtz: `'2024-01-01 12:00:00[.fff]'` or `TIMESTAMP '...'`. `Timestamp` also
-///   accepts ISO 8601 / RFC 3339 form (e.g. `'1970-01-01T00:00:00.123Z'`); `TimestampNtz` does not.
+///   accepts ISO 8601 / RFC 3339 form with a `Z` (UTC) suffix (e.g. `'1970-01-01T00:00:00.123Z'`);
+///   non-UTC offsets are not yet supported. `TimestampNtz` does not accept ISO form.
 /// - Binary: `X'deadbeef'` (even number of hex digits)
 ///
 /// # Errors
@@ -112,6 +113,19 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
             "empty {primitive:?} literal: {sql}"
         )));
     }
+
+    // TODO(#2733): parse_scalar matches an RFC 3339 offset then drops it, so `14:30:00+05:00`
+    // reads as 14:30 UTC instead of 09:30. Reject non-Z offsets for now (only follow the `T`/`t`).
+    let has_non_utc_offset = *primitive == PrimitiveType::Timestamp
+        && raw
+            .split_once(['T', 't'])
+            .is_some_and(|(_, time)| time.contains(['+', '-']));
+    if has_non_utc_offset {
+        return Err(Error::generic(format!(
+            "timestamp literal with a non-UTC offset is not yet supported; use 'Z' (UTC): {sql}"
+        )));
+    }
+
     let scalar = primitive.parse_scalar(raw)?;
     Ok(Expression::literal(scalar))
 }
@@ -381,6 +395,8 @@ mod tests {
     #[case("' '", DataType::TIMESTAMP)]
     #[case("TIMESTAMP ''", DataType::TIMESTAMP)]
     #[case("TIMESTAMP_NTZ ''", DataType::TIMESTAMP_NTZ)]
+    #[case("'2024-06-15T14:30:00+05:00'", DataType::TIMESTAMP)] // non-Z offset, see TODO(#2733)
+    #[case("TIMESTAMP '2024-06-15T14:30:00-05:00'", DataType::TIMESTAMP)] // non-Z offset
     #[case("  now()  ", DataType::TIMESTAMP)] // function call with padding
     #[case("X'0'", DataType::BINARY)] // odd number of hex digits
     #[case("X'gg'", DataType::BINARY)] // non-hex chars
