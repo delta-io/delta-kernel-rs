@@ -88,15 +88,15 @@ impl ExpressionStructPatch {
 pub struct StructPatchBuilder<Item> {
     /// None for a top-level patch; otherwise the path of the nested struct this patch targets.
     input_path: Option<ColumnName>,
-    /// The patch tree assembled so far, with each `with_*` call applied eagerly.
+    /// The patch tree assembled so far, with each builder call applied eagerly.
     root: StructPatchNode<Item>,
-    /// The first error produced by a `with_*` call, surfaced by `build`. Once set, later `with_*`
-    /// calls are skipped so the original (most relevant) error is preserved.
+    /// The first error produced by a builder call, surfaced by `build`. Once set, later calls are
+    /// skipped so the original (most relevant) error is preserved.
     error: DeltaResult<()>,
 }
 
 /// The patch builder internally represents the in-progress patch specification as a tree of struct
-/// and field patches, incrementally built up by validated calls to `with_*`. For example, the
+/// and field patches, incrementally built up by validated builder calls. For example, the
 /// following sequence of calls (in any order):
 ///
 /// ```ignore
@@ -209,7 +209,7 @@ impl<Item> FieldPatchOp<Item> {
     }
 }
 
-// Empty path passed by StructPatchBuilder::with_xxx wrappers to with_xxx_at
+// Empty path passed by top-level methods to their nested-path counterparts.
 const TOP_LEVEL: &[String] = &[];
 
 impl<Item> StructPatchBuilder<Item> {
@@ -437,7 +437,7 @@ impl StructPatchBuilder<ExpressionRef> {
     ///
     /// # Errors
     ///
-    /// Returns an error when a `with_*` call requested multiple drop/replace operations for the
+    /// Returns an error when builder calls request multiple drop/replace operations for the
     /// same field, or when a destructive operation on one field overlapped with an operation on a
     /// nested child field.
     pub fn build(self) -> DeltaResult<ExpressionStructPatch> {
@@ -516,7 +516,7 @@ impl StructPatchBuilder<StructField> {
     ///
     /// # Errors
     ///
-    /// Returns an error if a `with_*` call produced a conflicting operation, the input path cannot
+    /// Returns an error if a builder call produced a conflicting operation, the input path cannot
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
     pub fn build(self, input_schema: &StructType) -> DeltaResult<StructType> {

@@ -1488,7 +1488,7 @@ fn build_remove_struct_patch(
     if coalesce_stats_with_parsed {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
-            Expression::column(["stats"]),
+            col!("stats"),
             Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch

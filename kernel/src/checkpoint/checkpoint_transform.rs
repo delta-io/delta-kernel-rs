@@ -17,7 +17,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{
-    Expression, ExpressionRef, ExpressionStructPatchBuilder, UnaryExpressionOp,
+    col, Expression, ExpressionRef, ExpressionStructPatchBuilder, UnaryExpressionOp,
 };
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::table_properties::TableProperties;
@@ -198,15 +198,11 @@ pub(crate) fn build_checkpoint_output_schema(
 /// If `stats_parsed` is non-null, the data originated from a checkpoint (commits only
 /// contain JSON stats, so `stats_parsed` will be null for commit-sourced rows).
 ///
-/// Column paths are relative to the full batch (not the nested Add struct), so we use
-/// ["add", "stats"] instead of just ["stats"].
+/// Column paths are relative to the full batch, not the nested Add struct.
 fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
-        Expression::parse_json(
-            Expression::column([ADD_NAME, STATS_FIELD]),
-            stats_schema.clone(),
-        ),
+        col!(ADD_NAME, STATS_PARSED_FIELD),
+        Expression::parse_json(col!(ADD_NAME, STATS_FIELD), stats_schema.clone()),
     ]))
 }
 
@@ -219,26 +215,24 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// itself carries no schema, so the expression evaluator uses the expected output type to
 /// parse each string value into the correct native type.
 ///
-/// Column paths are relative to the full batch (not the nested Add struct), so we use
-/// `["add", "partitionValues"]` instead of just `["partitionValues"]`.
+/// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
-        Expression::map_to_struct(Expression::column([ADD_NAME, PARTITION_VALUES_FIELD])),
+        col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
+        Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD)),
     ]))
 }
 
 /// Static expression: `stats = COALESCE(stats, ToJson(stats_parsed))`
 ///
 /// This expression prefers existing JSON stats, falling back to converting stats_parsed.
-/// Column paths are relative to the full batch (not the nested Add struct), so we use
-/// ["add", "stats"] instead of just ["stats"].
+/// Column paths are relative to the full batch, not the nested Add struct.
 static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, STATS_FIELD]),
+        col!(ADD_NAME, STATS_FIELD),
         Expression::unary(
             UnaryExpressionOp::ToJson,
-            Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
+            col!(ADD_NAME, STATS_PARSED_FIELD),
         ),
     ]))
 });
