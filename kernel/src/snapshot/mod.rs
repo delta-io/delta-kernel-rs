@@ -788,8 +788,11 @@ impl Snapshot {
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
     /// and the overall checkpoint process.
-    pub fn create_checkpoint_writer(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
-        CheckpointWriter::try_new(self)
+    pub fn create_checkpoint_writer(
+        self: Arc<Self>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<CheckpointWriter> {
+        CheckpointWriter::try_new(self, engine)
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -976,7 +979,7 @@ impl Snapshot {
             _ => {}
         }
 
-        let writer = Arc::clone(self).create_checkpoint_writer()?;
+        let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
