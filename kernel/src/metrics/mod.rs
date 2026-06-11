@@ -19,14 +19,14 @@
 //! impl MetricsReporter for LoggingReporter {
 //!     fn report(&self, event: MetricEvent) {
 //!         match event {
-//!             MetricEvent::LogSegmentLoaded(e) => {
+//!             MetricEvent::LogSegmentLoadSuccess(e) => {
 //!                 println!("Log segment loaded in {:?}: {} commits", e.duration, e.num_commit_files);
 //!             }
-//!             MetricEvent::SnapshotCompleted(e) => {
+//!             MetricEvent::SnapshotBuildSuccess(e) => {
 //!                 println!("Snapshot completed: v{} in {:?}", e.version, e.duration);
 //!             }
-//!             MetricEvent::SnapshotFailed(e) => {
-//!                 println!("Snapshot failed: {} after {:?}", e.operation_id, e.duration);
+//!             MetricEvent::SnapshotBuildFailure(e) => {
+//!                 println!("Snapshot failed: {}", e.operation_id);
 //!             }
 //!             _ => {}
 //!         }
@@ -84,11 +84,12 @@ mod streaming_metrics_iterator;
 use std::sync::Arc;
 
 pub use events::{
-    emit_json_read_completed, emit_parquet_read_completed, CrcReadCompleted, DomainMetadataLoaded,
-    JsonReadCompleted, LogSegmentLoaded, MetricEvent, MetricId, ParquetReadCompleted,
-    ProtocolMetadataLoaded, ScanMetadataCompleted, ScanType, SetTransactionLoaded,
-    SnapshotCompleted, SnapshotFailed, StorageCopyCompleted, StorageListCompleted,
-    StorageReadCompleted,
+    emit_json_read_completed, emit_parquet_read_completed, CommitFailureReason, CrcReadSuccess,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
+    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
+    ProtocolMetadataLoadSuccess, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
+    SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted,
+    StorageReadCompleted, TransactionCommitFailure, TransactionCommitSuccess,
 };
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_json::MeteredJsonHandler;

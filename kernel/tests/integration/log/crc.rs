@@ -108,6 +108,89 @@ async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -
     Ok(())
 }
 
+// Tests incremental CRC replay when building a new snapshot from a base snapshot.
+// Base snapshot has a CRC at v3.
+#[rstest]
+// no checkpoint, no newer CRC -> advance the base snapshot's crc@v3.
+#[case::in_memory_base(None, None, Some(5))]
+// a newer crc@v4 lands on disk and beats the base snapshot's crc@v3 -> advance crc@v4.
+#[case::newer_disk_crc(None, Some(4), Some(5))]
+// a checkpoint at v2 (below the base snapshot version) appears; the base snapshot's crc@v3 still
+// applies (a CRC may sit above its checkpoint), so advance it.
+#[case::checkpoint_before_base_snap_reuses_crc(Some(2), None, Some(5))]
+// a checkpoint at v4 (above the base snapshot version) forces a rebuild; the base snapshot's
+// crc@v3 is below it and dropped, so the on-disk crc@v4 advances instead.
+#[case::checkpoint_after_base_snap_with_crc(Some(4), Some(4), Some(5))]
+// a checkpoint at v4 (above the base snapshot version) forces a rebuild with no CRC at or above it
+// -> no stats.
+#[case::checkpoint_after_base_snap_no_crc(Some(4), None, None)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incremental_update_advances_crc_with_real_file_stats(
+    #[case] checkpoint_version: Option<Version>,
+    #[case] crc_version: Option<Version>,
+    #[case] expected_num_files: Option<i64>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    // ===== GIVEN: v0 (0 files, crc on disk), then five WRITE inserts (one file each) to v5 =====
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
+    snapshot.write_checksum(engine.as_ref())?;
+    for i in 1..=5i32 {
+        snapshot = insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![i]))])
+            .await?
+            .unwrap_committed()
+            .post_commit_snapshot()
+            .unwrap()
+            .clone();
+    }
+
+    // ===== AND: load the base snapshot from disk at v3 (will have in-memory CRC) =====
+    let base_snapshot = Snapshot::builder_for(&table_path)
+        .at_version(3)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(base_snapshot.crc().unwrap().version, 3);
+
+    // ===== AND: conditionally write a CRC and/or checkpoint =====
+    if let Some(v) = crc_version {
+        Snapshot::builder_for(&table_path)
+            .at_version(v)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+            .build(engine.as_ref())?
+            .write_checksum(engine.as_ref())?;
+    }
+    if let Some(v) = checkpoint_version {
+        Snapshot::builder_for(&table_path)
+            .at_version(v)
+            .build(engine.as_ref())?
+            .checkpoint(engine.as_ref(), None)?;
+    }
+
+    // ===== WHEN: incrementally update the base snapshot to the latest version =====
+    let updated_snapshot = Snapshot::builder_from(base_snapshot)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+
+    // ===== THEN: an in-memory CRC is loaded exactly when expected; when loaded it sits at the
+    //             snapshot version and reflects all five files =====
+    assert_eq!(updated_snapshot.version(), 5);
+    match expected_num_files {
+        Some(num_files) => {
+            let crc = updated_snapshot.crc().expect("expected an in-memory CRC");
+            assert_eq!(crc.version, updated_snapshot.version());
+            let stats = updated_snapshot.get_file_stats_if_present().unwrap();
+            assert_eq!(stats.num_files(), num_files);
+        }
+        None => {
+            assert!(updated_snapshot.crc().is_none());
+            assert!(updated_snapshot.get_file_stats_if_present().is_none());
+        }
+    }
+
+    Ok(())
+}
+
 // An unreadable CRC at the snapshot version must not break loading: the snapshot falls back
 // to log replay for P&M and exposes no CRC.
 #[tokio::test]
@@ -575,8 +658,8 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
 }
 
 // Incremental update where only the old segment has a CRC file (no new CRC written).
-// The old segment's CRC file is preserved on the combined segment, but since it is at v0
-// while the snapshot is at v1, it is not stored on the snapshot.
+// The old segment's CRC file is preserved on the combined segment, but with the default
+// (disabled) replay budget the v0 CRC is not advanced to v1, so the snapshot carries no CRC.
 #[tokio::test]
 async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -613,10 +696,11 @@ async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
     let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
     assert_eq!(incremental_v1.version(), 1);
 
-    // The CRC is at v0, not v1, so it is not stored on the v1 snapshot.
+    // builder_from defaults to IncrementalReplay::Disabled, so the v0 CRC is not advanced to
+    // v1 and the snapshot carries no CRC. (With Unlimited it would advance to v1.)
     assert!(
         incremental_v1.crc().is_none(),
-        "CRC at v0 should not be stored on the v1 snapshot (version mismatch)"
+        "CRC at v0 should not be stored on the v1 snapshot (replay disabled)"
     );
 
     Ok(())

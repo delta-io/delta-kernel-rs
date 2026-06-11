@@ -2,6 +2,7 @@
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
 pub mod ir;
+pub mod proto;
 mod query_builder;
 
 use bytes::Bytes;

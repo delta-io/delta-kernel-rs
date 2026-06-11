@@ -10,9 +10,10 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
 use super::events::{
-    storage_metric_from_attrs, CrcReadCompleted, DomainMetadataLoaded, JsonReadCompleted,
-    LogSegmentLoaded, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoaded,
-    ScanMetadataCompleted, SetTransactionLoaded, SnapshotCompleted, STORAGE_SPAN,
+    storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
+    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
+    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
+    TransactionCommitSuccess, STORAGE_SPAN,
 };
 
 // ====================================================================
@@ -105,23 +106,28 @@ where
             return;
         };
         let event = match metadata.name() {
-            LogSegmentLoaded::SPAN_NAME => Some(MetricEvent::LogSegmentLoaded(
-                LogSegmentLoaded::from_attrs(attrs),
+            LogSegmentLoadSuccess::SPAN_NAME => Some(MetricEvent::LogSegmentLoadSuccess(
+                LogSegmentLoadSuccess::from_attrs(attrs),
             )),
-            ProtocolMetadataLoaded::SPAN_NAME => Some(MetricEvent::ProtocolMetadataLoaded(
-                ProtocolMetadataLoaded::from_attrs(attrs),
+            ProtocolMetadataLoadSuccess::SPAN_NAME => {
+                Some(MetricEvent::ProtocolMetadataLoadSuccess(
+                    ProtocolMetadataLoadSuccess::from_attrs(attrs),
+                ))
+            }
+            SnapshotBuildSuccess::SPAN_NAME => Some(MetricEvent::SnapshotBuildSuccess(
+                SnapshotBuildSuccess::from_attrs(attrs),
             )),
-            SnapshotCompleted::SPAN_NAME => Some(MetricEvent::SnapshotCompleted(
-                SnapshotCompleted::from_attrs(attrs),
+            TransactionCommitSuccess::SPAN_NAME => Some(MetricEvent::TransactionCommitSuccess(
+                TransactionCommitSuccess::from_attrs(attrs),
             )),
-            DomainMetadataLoaded::SPAN_NAME => Some(MetricEvent::DomainMetadataLoaded(
-                DomainMetadataLoaded::from_attrs(attrs),
+            DomainMetadataLoadSuccess::SPAN_NAME => Some(MetricEvent::DomainMetadataLoadSuccess(
+                DomainMetadataLoadSuccess::from_attrs(attrs),
             )),
-            SetTransactionLoaded::SPAN_NAME => Some(MetricEvent::SetTransactionLoaded(
-                SetTransactionLoaded::from_attrs(attrs),
+            SetTransactionLoadSuccess::SPAN_NAME => Some(MetricEvent::SetTransactionLoadSuccess(
+                SetTransactionLoadSuccess::from_attrs(attrs),
             )),
-            CrcReadCompleted::SPAN_NAME => Some(MetricEvent::CrcReadCompleted(
-                CrcReadCompleted::from_attrs(attrs),
+            CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
+                CrcReadSuccess::from_attrs(attrs),
             )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
@@ -145,7 +151,7 @@ where
     // RUNTIME CHANNEL. Both on_event and on_record route Span::current().record(...) updates
     // (and info!() events within a span) through EventVisitor -> MetricEvent::record_u64 /
     // record_bool. The visitor's record_debug also handles `#[instrument(err)]`'s `error` field,
-    // flipping SnapshotCompleted into SnapshotFailed.
+    // flipping a success event into its failure counterpart.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         Self::drain_into_visitor(ctx.event_span(event), |v| event.record(v));
     }
@@ -241,23 +247,21 @@ impl Visit for EventVisitor {
         }
     }
 
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let Some(event) = self.event.as_mut() else {
+            return;
+        };
+        if let Err(span_name) = event.record_str(field.name(), value) {
+            self.warn_invalid(field, span_name);
+        }
+    }
+
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
         match field.name() {
             "return" => {} // default to the success case
             "error" => {
                 // `#[instrument(err)]` records `error` when the wrapped function returns Err.
-                self.event = match self.event.take() {
-                    // Flip SnapshotCompleted into SnapshotFailed.
-                    Some(MetricEvent::SnapshotCompleted(snap)) => {
-                        Some(MetricEvent::SnapshotFailed(snap.into_failed()))
-                    }
-                    // A "Loaded" event represents a successful load. Drop it on error so a
-                    // failed load is not reported as an empty successful one.
-                    Some(
-                        MetricEvent::DomainMetadataLoaded(_) | MetricEvent::SetTransactionLoaded(_),
-                    ) => None,
-                    other => other,
-                };
+                self.event = self.event.take().map(MetricEvent::into_failure);
             }
             _ => {}
         }

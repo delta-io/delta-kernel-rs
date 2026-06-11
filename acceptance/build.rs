@@ -88,6 +88,20 @@ fn extract_acceptance_workloads() {
     let dir = PathBuf::from(manifest_dir);
 
     let output_dir = dir.join("workloads");
+
+    // if DELTA_ACCEPTANCE_WORKLOADS_PATH is set, point `workloads/` at that locally-generated
+    // corpus instead of downloading the pinned release, so a dev can iterate against their own
+    // corpus.
+    println!("cargo::rerun-if-env-changed=DELTA_ACCEPTANCE_WORKLOADS_PATH");
+    if let Ok(local) = env::var("DELTA_ACCEPTANCE_WORKLOADS_PATH") {
+        link_local_workloads(&local, &output_dir);
+        return;
+    }
+    // Drop a stale override symlink (from a prior run) so we download into a real directory.
+    if output_dir.is_symlink() {
+        std::fs::remove_file(&output_dir).expect("Failed to remove stale workloads symlink");
+    }
+
     let done_marker = output_dir.join(".done");
 
     // Tell Cargo to re-run if the done marker changes
@@ -140,4 +154,44 @@ fn extract_acceptance_workloads() {
         File::create(&done_marker).expect("Failed to create acceptance workloads .done file"),
     );
     write!(done_file, "done").expect("Failed to write acceptance workloads .done file");
+}
+
+/// Point `workloads/` at a locally-generated corpus (`DELTA_ACCEPTANCE_WORKLOADS_PATH`) via a
+/// symlink, replacing any prior download.
+fn link_local_workloads(local: &str, output_dir: &Path) {
+    let local_path = std::fs::canonicalize(local).unwrap_or_else(|e| {
+        panic!("DELTA_ACCEPTANCE_WORKLOADS_PATH '{local}' is not accessible: {e}")
+    });
+    assert!(
+        local_path.is_dir(),
+        "DELTA_ACCEPTANCE_WORKLOADS_PATH '{}' is not a directory",
+        local_path.display()
+    );
+
+    // Replace whatever is at workloads/ (a prior download dir, or an old symlink).
+    if output_dir.is_symlink() || output_dir.is_file() {
+        std::fs::remove_file(output_dir).expect("Failed to remove existing workloads path");
+    } else if output_dir.is_dir() {
+        std::fs::remove_dir_all(output_dir).expect("Failed to remove existing workloads dir");
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&local_path, output_dir).unwrap_or_else(|e| {
+        panic!(
+            "Failed to symlink workloads -> {}: {e}",
+            local_path.display()
+        )
+    });
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&local_path, output_dir).unwrap_or_else(|e| {
+        panic!(
+            "Failed to symlink workloads -> {}: {e}",
+            local_path.display()
+        )
+    });
+
+    println!(
+        "cargo::warning=acceptance: using local workloads from {}",
+        local_path.display()
+    );
 }

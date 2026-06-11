@@ -107,6 +107,7 @@ pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
+pub mod struct_patch;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -672,9 +673,13 @@ pub trait JsonHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Atomically (!) write a single JSON file. Each row of the input data should be written as a
-    /// new JSON object appended to the file. this write must:
-    /// (1) serialize the data to newline-delimited json (each row is a json object literal)
+    /// Atomically (!) write a single JSON file. Each selected row of the input data must be
+    /// written as a new JSON object appended to the file; rows not selected by a batch's
+    /// selection vector (see [`FilteredEngineData`]) must not be written.
+    /// [`FilteredEngineData::apply_selection_vector`] produces the selected-rows view for
+    /// implementations that do not filter during serialization. This write must:
+    /// (1) serialize the selected rows to newline-delimited json (each row is a json object
+    ///     literal)
     /// (2) write the data to storage atomically (i.e. if the file already exists, fail unless the
     ///     overwrite flag is set)
     ///
@@ -689,9 +694,7 @@ pub trait JsonHandler: AsAny {
     /// # Parameters
     ///
     /// - `path` - URL specifying the location to write the JSON file
-    /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as a
-    ///   new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
-    ///   each row is a JSON object on a single line)
+    /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
     fn write_json_file(

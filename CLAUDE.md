@@ -76,7 +76,9 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   cargo feature off, writes to tables listing this feature are blocked.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only
+- `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
+  proto wire format mirroring it (`kernel/proto/`). Auto-enables `internal-api` and `arrow`.
+- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
 
 ## Architecture at a Glance
 
@@ -165,7 +167,9 @@ This list is non-exhaustive -- when in doubt, browse the source files directly
 **Engine + table setup (from `test_utils`)**
 
 - `test_table_setup()` / `test_table_setup_mt()` -- engine + temp table path. Use the `_mt`
-  variant under `#[tokio::test(flavor = "multi_thread")]`.
+  variant under `#[tokio::test(flavor = "multi_thread")]`. Required whenever a test calls
+  `snapshot.checkpoint()`: it issues nested `block_on` calls that deadlock on a single-threaded
+  runtime / `TokioBackgroundExecutor`.
 - `engine_store_setup(name, opts)` -- returns `(store, engine, table_location)` when a test
   needs direct object-store access.
 - `setup_test_tables(...)` -- multiple pre-built tables for read/scan tests.

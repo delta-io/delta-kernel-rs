@@ -84,11 +84,17 @@ git checkout FETCH_HEAD
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
 
 # ---------------------------------------------------------------------------
-# 4. Compare baselines with critcmp and format as a markdown table.
+# 4. Compare baselines with critcmp and format as a markdown comment
+#    (summary block + collapsed per-benchmark table; see
+#    benchmarks/ci/parse_critcmp.py for the format and significance rules).
 #      - Parses actual duration values (not rank factors) to compute a ratio
-#      - Bolds the Change cell when the difference is statistically
-#        significant (error bounds do not overlap)
 # ---------------------------------------------------------------------------
+# Step 3 left the working tree on the base branch, so parse_critcmp.py on disk
+# is the base version. Restore the PR-head tree so the comment is formatted by
+# the PR's own formatter (a formatter change is then exercised on the PR that
+# introduces it). Only tracked sources move; the `base`/`changes` criterion
+# baselines live in gitignored benchmarks/target/ and survive the checkout.
+git checkout "$HEAD_SHA"
 # Use `critcmp` to compare the criterion output for `base` and `changes`. We use `critcmp` instead of manually
 # parsing criterion outputs because criterion may update its output format. By using `critcmp`, we inherit all
 # updated criterion output parsing.

@@ -38,6 +38,11 @@ pub(crate) mod void_utils;
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
+/// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
+/// fields, lowered into an output [`StructType`] directly from an input schema via
+/// [`build`](crate::struct_patch::StructPatchBuilder::<StructField>::build).
+pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<StructField>;
+
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
 #[internal_api]
@@ -1125,79 +1130,6 @@ impl StructType {
         Ok(())
     }
 
-    /// Returns a StructType with `new_field` inserted after the field named `after`.
-    /// If `new_field`  already presents in the schema, an error is returned.
-    /// If `after` is None, `new_field` is appended to the end.
-    /// If `after` is not found, an error is returned.
-    pub fn with_field_inserted_after(
-        mut self,
-        after: Option<&str>,
-        new_field: StructField,
-    ) -> DeltaResult<Self> {
-        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
-        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
-        // for inserting protocol-defined fields (e.g. stats_parsed) where exact-name matching
-        // is sufficient.
-        if self.fields.contains_key(&new_field.name) {
-            return Err(Error::generic(format!(
-                "Field {} already exists",
-                new_field.name
-            )));
-        }
-
-        let insert_index = after
-            .map(|after| {
-                self.fields
-                    .get_index_of(after)
-                    .map(|index| index + 1)
-                    .ok_or_else(|| Error::generic(format!("Field {after} not found")))
-            })
-            .unwrap_or_else(|| Ok(self.fields.len()))?;
-
-        self.fields
-            .insert_before(insert_index, new_field.name.clone(), new_field);
-        Ok(self)
-    }
-
-    /// Returns a StructType with `new_field` inserted before the field named `before`.
-    /// If `new_field` already presents in the schema, an error is returned.
-    /// If `before` is None, `new_field` is inserted at the beginning.
-    /// If `before` is not found, an error is returned.
-    pub fn with_field_inserted_before(
-        mut self,
-        before: Option<&str>,
-        new_field: StructField,
-    ) -> DeltaResult<Self> {
-        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
-        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
-        // for inserting protocol-defined fields where exact-name matching is sufficient.
-        if self.fields.contains_key(&new_field.name) {
-            return Err(Error::generic(format!(
-                "Field {} already exists",
-                new_field.name
-            )));
-        }
-
-        let index_of_before = before
-            .map(|before| {
-                self.fields
-                    .get_index_of(before)
-                    .ok_or_else(|| Error::generic(format!("Field {before} not found")))
-            })
-            .unwrap_or_else(|| Ok(0))?;
-
-        self.fields
-            .insert_before(index_of_before, new_field.name.clone(), new_field);
-        Ok(self)
-    }
-
-    /// Returns a StructType with the named field removed.
-    /// Returns self unchanged if field doesn't exist.
-    pub fn with_field_removed(mut self, name: &str) -> Self {
-        self.fields.shift_remove(name);
-        self
-    }
-
     /// Returns a new [`StructType`] containing only the top-level fields for which `predicate`
     /// returns `true`. This does not recurse into nested [`StructType`] fields.
     pub fn with_fields_filtered(
@@ -1222,22 +1154,6 @@ impl StructType {
         } else {
             Ok(Some(filtered))
         }
-    }
-
-    /// Returns a StructType with the named field replaced.
-    /// Returns an error if field doesn't exist.
-    pub fn with_field_replaced(
-        mut self,
-        name: &str,
-        new_field: StructField,
-    ) -> DeltaResult<StructType> {
-        let replace_field = self
-            .fields
-            .get_mut(name)
-            .ok_or_else(|| Error::generic(format!("Field {name} not found")))?;
-
-        *replace_field = new_field;
-        Ok(self)
     }
 }
 
@@ -2179,7 +2095,7 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
-struct MakePhysical<'a> {
+pub(crate) struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
     logical_path: Vec<&'a str>,
@@ -2191,6 +2107,9 @@ struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
+    /// When `true`, skips the physical-name + metadata rewrite, only validates the column
+    /// mapping annotations.
+    validation_only: bool,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -2199,7 +2118,20 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
+            validation_only: false,
         }
+    }
+
+    /// Walks `schema` and validates its column-mapping annotations.
+    pub(crate) fn validate_schema_column_mapping(
+        mode: ColumnMappingMode,
+        schema: &'a StructType,
+    ) -> DeltaResult<()> {
+        let mut walker = Self {
+            validation_only: true,
+            ..Self::new(mode)
+        };
+        walker.transform_struct(schema).map(|_| ())
     }
 
     fn transform_inner<T>(
@@ -2250,10 +2182,11 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
         self.transform_inner(field.name(), |this| {
             let field = this.recurse_into_struct_field(field)?;
-
+            if this.validation_only {
+                return Ok(field);
+            }
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
             let name = physical_name.to_owned();
-
             Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
         })
     }
@@ -3985,186 +3918,6 @@ mod tests {
             ColumnMetadataKey::ParquetFieldId.as_ref(),
             "parquet.field.id"
         );
-    }
-
-    #[test]
-    fn test_with_field_inserted_empty_struct() {
-        let schema = StructType::try_new([]).unwrap();
-        let schema = schema
-            .with_field_inserted_after(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted should produce a valid schema");
-        assert_eq!(schema.num_fields(), 1);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "age");
-    }
-
-    #[test]
-    fn test_with_field_inserted() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_after(Some("id"), StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted should produce a valid schema");
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "age");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_inserted_append_to_end() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_after(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted should produce a valid schema");
-
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "name");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "age");
-    }
-
-    #[test]
-    fn test_with_field_inserted_after_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_inserted_after(
-            Some("nonexistent"),
-            StructField::new("name", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-    }
-
-    #[test]
-    fn test_with_field_inserted_after_duplicate_field() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let new_schema = schema.with_field_inserted_after(
-            Some("name"),
-            StructField::new("id", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-        assert_result_error_with_message(new_schema, "Field id already exists");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_before(
-                Some("name"),
-                StructField::new("age", DataType::STRING, true),
-            )
-            .expect("with field inserted before should produce a valid schema");
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "age");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_duplicate_field() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let new_schema = schema.with_field_inserted_before(
-            Some("name"),
-            StructField::new("id", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-        assert_result_error_with_message(new_schema, "Field id already exists");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_at_beginning() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_before(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted before should produce a valid schema");
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "age");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_inserted_before(
-            Some("nonexistent"),
-            StructField::new("name", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_empty_struct() {
-        let schema = StructType::try_new([]).unwrap();
-        let schema = schema
-            .with_field_inserted_before(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted before on empty struct should succeed");
-        assert_eq!(schema.num_fields(), 1);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "age");
-    }
-
-    #[test]
-    fn test_with_field_removed() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_removed("id");
-        assert_eq!(new_schema.num_fields(), 0);
-    }
-
-    #[test]
-    fn test_with_field_removed_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_removed("nonexistent");
-        assert_eq!(new_schema.num_fields(), 1);
-        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "id");
-    }
-
-    #[test]
-    fn test_with_field_replaced() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema
-            .with_field_replaced("id", StructField::new("name", DataType::STRING, true))
-            .unwrap();
-
-        assert_eq!(new_schema.num_fields(), 1);
-        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_replaced_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_replaced(
-            "nonexistent",
-            StructField::new("name", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err(), "Expected error for non-existent field");
     }
 
     /// Schema: { a: { b: { c: double } } } — supports walks at depths 1, 2, and 3.

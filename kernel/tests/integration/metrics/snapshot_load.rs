@@ -517,7 +517,7 @@ async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) ->
 }
 
 #[tokio::test]
-async fn failed_loads_emit_no_metric() -> DeltaResult<()> {
+async fn failed_loads_emit_failure_metric() -> DeltaResult<()> {
     let (table_url, _temp_dir) = setup_table_with_dms_and_set_txns(false).await?;
 
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -532,6 +532,8 @@ async fn failed_loads_emit_no_metric() -> DeltaResult<()> {
     assert!(snap.get_app_id_version("my-app", &engine).is_err());
     assert_eq!(reporter.domain_metadata_loads.get(), 0);
     assert_eq!(reporter.set_transaction_loads.get(), 0);
+    assert_eq!(reporter.domain_metadata_load_failures.get(), 1);
+    assert_eq!(reporter.set_transaction_load_failures.get(), 1);
 
     Ok(())
 }

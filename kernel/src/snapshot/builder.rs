@@ -43,9 +43,10 @@ pub struct SnapshotBuilder {
     incremental_replay: IncrementalReplay,
 }
 
-/// Controls whether kernel replays commits to advance a stale on-disk CRC to the target snapshot
-/// version on load. A CRC already at the target version is always used regardless of this
-/// setting; this only bounds the cost of advancing a *stale* CRC.
+/// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
+/// in-memory CRC, or an on-disk CRC) to the target snapshot version on load. A CRC already at the
+/// target version is always used regardless of this setting; this only bounds the cost of
+/// advancing a *stale* CRC.
 ///
 /// A resolved CRC gives the snapshot precomputed file statistics (file count and sizes, useful
 /// for query optimization and for writers producing a post-commit CRC) along with domain metadata
@@ -160,17 +161,13 @@ impl SnapshotBuilder {
         self
     }
 
-    /// Bound how many commits kernel will replay to advance a stale on-disk CRC to the target
-    /// version. See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
+    /// Bound how many commits kernel will replay to advance a stale CRC to the target version.
+    /// See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
     ///
     /// Writers should set this to [`IncrementalReplay::Unlimited`] for faster writes, as should
     /// readers that always want table-level file statistics for query optimization.
     ///
-    /// This setting applies only to builds from a table root; it does not carry into incremental
-    /// updates derived from the resulting snapshot. [`Snapshot::builder_from`] does not yet advance
-    /// stale CRCs regardless of this value (see #2674).
-    ///
-    /// [`Snapshot::builder_from`]: crate::Snapshot::builder_from
+    /// Applies to both fresh and incremental builds.
     pub fn with_incremental_crc_replay(mut self, mode: IncrementalReplay) -> Self {
         self.incremental_replay = mode;
         self
@@ -184,14 +181,15 @@ impl SnapshotBuilder {
     /// returning a reference to an existing snapshot if the request to build a new snapshot
     /// matches the version of an existing snapshot.
     ///
-    /// Reports metrics: [`MetricEvent::SnapshotCompleted`] or [`MetricEvent::SnapshotFailed`].
+    /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
+    /// [`MetricEvent::SnapshotBuildFailure`].
     ///
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     ///
-    /// [`MetricEvent::SnapshotCompleted`]: crate::metrics::MetricEvent::SnapshotCompleted
-    /// [`MetricEvent::SnapshotFailed`]: crate::metrics::MetricEvent::SnapshotFailed
+    /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
+    /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
@@ -220,7 +218,7 @@ impl SnapshotBuilder {
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
         // TODO(#2605): this late `record` is silently dropped by the metrics layer, so every
-        //              `SnapshotCompleted` event carries a nil operation_id. Bind eagerly via a
+        //              `SnapshotBuildSuccess` event carries a nil operation_id. Bind eagerly via a
         //              `build_inner(self, engine, operation_id)` helper instead.
         tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
@@ -264,6 +262,7 @@ impl SnapshotBuilder {
                         engine,
                         effective_version,
                         operation_id,
+                        incremental_replay,
                     )
                 })
         };
@@ -560,14 +559,68 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
-            "expected SnapshotFailed event on build failure"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "expected SnapshotBuildFailure event on build failure"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
-            "should not emit SnapshotCompleted on failure"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            "should not emit SnapshotBuildSuccess on failure"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn log_segment_load_failure_emits_metric_on_empty_log(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, _store, table_root) = setup_test();
+        let (reporter, _guard) = measuring_reporter();
+
+        assert!(SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .is_err());
+
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .any(|e| matches!(e, MetricEvent::LogSegmentLoadFailure(_))),
+            "expected LogSegmentLoadFailure when the log has no commits"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn protocol_metadata_load_failure_emits_metric_when_actions_absent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        // A commit with no protocol/metadata: the segment lists fine, then the read fails.
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
+        )
+        .await?;
+        let (reporter, _guard) = measuring_reporter();
+
+        assert!(SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .is_err());
+
+        let events = reporter.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_))),
+            "expected ProtocolMetadataLoadFailure when protocol/metadata are absent"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+            "must not emit ProtocolMetadataLoadSuccess when the load fails"
         );
         Ok(())
     }
@@ -593,10 +646,10 @@ mod tests {
         let (version, duration) = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::SnapshotCompleted(s) => Some((s.version, s.duration)),
+                MetricEvent::SnapshotBuildSuccess(s) => Some((s.version, s.duration)),
                 _ => None,
             })
-            .expect("expected SnapshotCompleted event");
+            .expect("expected SnapshotBuildSuccess event");
         assert_eq!(version, 1, "version should match the updated snapshot");
         assert!(duration > Duration::ZERO, "duration should be non-zero");
         Ok(())
@@ -626,14 +679,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed(_))),
-            "expected SnapshotFailed when version update goes backwards"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "expected SnapshotBuildFailure when version update goes backwards"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted(_))),
-            "should not emit SnapshotCompleted when version update fails"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            "should not emit SnapshotBuildSuccess when version update fails"
         );
         Ok(())
     }
@@ -651,17 +704,17 @@ mod tests {
         let snap_duration = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::SnapshotCompleted(s) => Some(s.duration),
+                MetricEvent::SnapshotBuildSuccess(s) => Some(s.duration),
                 _ => None,
             })
-            .expect("expected SnapshotCompleted event");
+            .expect("expected SnapshotBuildSuccess event");
         let segment_duration = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::LogSegmentLoaded(s) => Some(s.duration),
+                MetricEvent::LogSegmentLoadSuccess(s) => Some(s.duration),
                 _ => None,
             })
-            .expect("expected LogSegmentLoaded event");
+            .expect("expected LogSegmentLoadSuccess event");
 
         assert!(
             snap_duration > Duration::ZERO,
@@ -669,7 +722,7 @@ mod tests {
         );
         assert!(
             snap_duration >= segment_duration,
-            "SnapshotCompleted.duration ({snap_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
+            "SnapshotBuildSuccess.duration ({snap_duration:?}) should be >= LogSegmentLoadSuccess.duration ({segment_duration:?})"
         );
         Ok(())
     }

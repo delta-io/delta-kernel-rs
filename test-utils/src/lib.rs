@@ -820,12 +820,28 @@ pub async fn insert_data<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
 ) -> DeltaResult<CommitResult> {
+    insert_data_with(snapshot, engine, columns, "WRITE", true, false).await
+}
+
+/// Like [`insert_data`] but with the commit's `operation`, `data_change`, and blind-append flag
+/// configurable.
+pub async fn insert_data_with<E: TaskExecutor>(
+    snapshot: Arc<Snapshot>,
+    engine: &Arc<DefaultEngine<E>>,
+    columns: Vec<ArrayRef>,
+    operation: &str,
+    data_change: bool,
+    is_blind_append: bool,
+) -> DeltaResult<CommitResult> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let mut txn = begin_transaction(snapshot, engine.as_ref())?
-        .with_operation("WRITE".to_string())
-        .with_data_change(true);
+        .with_operation(operation.to_string())
+        .with_data_change(data_change);
+    if is_blind_append {
+        txn = txn.with_blind_append();
+    }
 
     let write_context = txn.unpartitioned_write_context()?;
     let add_files_metadata = engine

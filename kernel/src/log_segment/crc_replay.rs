@@ -20,8 +20,8 @@ use crate::actions::{
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::crc::{
-    is_incremental_safe_operation, read_crc_file_or_none, Crc, CrcDelta, FileSizeHistogram,
-    FileStatsDelta,
+    is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
+    FileSizeHistogram, FileStatsDelta,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{
@@ -72,21 +72,35 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 impl LogSegment {
-    /// Try to build the CRC at this segment's `end_version`. Handles three cases:
-    /// - Case 1: CRC absent (1A) or read fails (1B) -> return None
-    /// - Case 2: CRC at `end_version` -> return it as-is
-    /// - Case 3: Stale CRC older than `end_version` -> advance it to `end_version` when
-    ///   `incremental_replay` permits, else fall back to normal log replay (return None)
+    /// Try to build the CRC at this segment's `end_version` from this segment's on-disk
+    /// `latest_crc_file`. See [`Self::try_build_incremental_crc_with_base`].
     pub(crate) fn try_build_incremental_crc(
         &self,
         engine: &dyn Engine,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Option<Arc<Crc>>> {
-        let Some(crc_file) = self.listed.latest_crc_file.as_ref() else {
-            return Ok(None); // Case 1A
-        };
-        let Some(base_crc) = read_crc_file_or_none(engine, crc_file) else {
-            return Ok(None); // Case 1B
+        self.try_build_incremental_crc_with_base(
+            engine,
+            None, /* in_memory_base */
+            incremental_replay,
+        )
+    }
+
+    /// Try to build the CRC at this segment's `end_version` from the latest available base: the
+    /// in-memory base (e.g. the CRC the updating snapshot holds) or this segment's on-disk CRC.
+    /// Handles three cases:
+    /// - Case 1: no base CRC available -> return None
+    /// - Case 2: base CRC at `end_version` -> return it as-is
+    /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
+    ///   `incremental_replay` permits, else fall back to normal log replay (return None)
+    pub(crate) fn try_build_incremental_crc_with_base(
+        &self,
+        engine: &dyn Engine,
+        in_memory_base: Option<&Arc<Crc>>,
+        incremental_replay: IncrementalReplay,
+    ) -> DeltaResult<Option<Arc<Crc>>> {
+        let Some(base_crc) = self.pick_latest_base_crc(engine, in_memory_base) else {
+            return Ok(None); // Case 1 (1A: absent, 1B: read failed)
         };
         if base_crc.version == self.end_version {
             return Ok(Some(base_crc)); // Case 2
@@ -97,6 +111,22 @@ impl LogSegment {
         }
         let advanced = self.build_incremental_crc_from_base(engine, &base_crc)?;
         Ok(Some(Arc::new(advanced)))
+    }
+
+    fn pick_latest_base_crc(
+        &self,
+        engine: &dyn Engine,
+        in_memory_base: Option<&Arc<Crc>>,
+    ) -> Option<Arc<Crc>> {
+        // A failed on-disk read falls back to the in-memory base.
+        let preferred_disk_crc = self
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
+        preferred_disk_crc
+            .and_then(|f| read_crc_file_or_none(engine, f))
+            .or_else(|| in_memory_base.cloned())
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
@@ -281,17 +311,17 @@ impl CrcReplayAccumulator {
     fn on_add(&mut self, size: i64) -> DeltaResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
-        // file-stats state to `Indeterminate` and discard `net_files`/`net_bytes`/histogram.
-        // Stop accumulating; further math is wasted work.
+        // file-stats state to `Indeterminate` and discard the accumulated file stats and
+        // histogram. Stop accumulating; further math is wasted work.
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
         let fs = &mut self.delta.file_stats;
-        fs.net_files += 1;
-        fs.net_bytes += size;
+        fs.gross_add_files += 1;
+        // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
+        //              Indeterminate instead, like a missing remove size.
+        fs.gross_add_bytes += size_to_u64(size)?;
         if let Some(hist) = fs.net_histogram.as_mut() {
-            // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
-            //              Indeterminate instead, like a missing remove size.
             hist.insert(size)?;
         }
         Ok(())
@@ -302,16 +332,16 @@ impl CrcReplayAccumulator {
     fn on_remove(&mut self, path: &str, size: Option<i64>) -> DeltaResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
-        // file-stats state to `Indeterminate` and discard `net_files`/`net_bytes`/histogram.
-        // Stop accumulating; further math is wasted work.
+        // file-stats state to `Indeterminate` and discard the accumulated file stats and
+        // histogram. Stop accumulating; further math is wasted work.
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
         match size {
             Some(s) => {
                 let fs = &mut self.delta.file_stats;
-                fs.net_files -= 1;
-                fs.net_bytes -= s;
+                fs.gross_remove_files += 1;
+                fs.gross_remove_bytes += size_to_u64(s)?;
                 if let Some(hist) = fs.net_histogram.as_mut() {
                     hist.remove(s)?;
                 }
@@ -540,8 +570,8 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_add(100).unwrap();
         acc.on_add(200).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files, 2);
-        assert_eq!(acc.delta.file_stats.net_bytes, 300);
+        assert_eq!(acc.delta.file_stats.net_files(), 2);
+        assert_eq!(acc.delta.file_stats.net_bytes(), 300);
         assert!(acc.delta.is_incremental_safe);
     }
 
@@ -551,8 +581,8 @@ mod tests {
     fn on_remove_with_size_decrements_files_and_bytes() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_remove("p", Some(50)).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files, -1);
-        assert_eq!(acc.delta.file_stats.net_bytes, -50);
+        assert_eq!(acc.delta.file_stats.net_files(), -1);
+        assert_eq!(acc.delta.file_stats.net_bytes(), -50);
         assert!(acc.delta.is_incremental_safe);
     }
 
@@ -617,8 +647,8 @@ mod tests {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_add(42).unwrap();
         let delta = acc.into_crc_delta();
-        assert_eq!(delta.file_stats.net_files, 1);
-        assert_eq!(delta.file_stats.net_bytes, 42);
+        assert_eq!(delta.file_stats.net_files(), 1);
+        assert_eq!(delta.file_stats.net_bytes(), 42);
     }
 
     #[test]
