@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+use delta_kernel::arrow::array::ffi::from_ffi;
 use delta_kernel::arrow::array::{
     make_array, Array, ArrayRef, BooleanArray, RecordBatch, StructArray,
 };
@@ -184,15 +184,19 @@ fn rewrite_stat_arg(
     let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
     match arg {
         Expression::Column(col) => {
-            // Probe with LONG to detect partition columns: kernel returns Some regardless of type
-            // for partition cols, and the `partitionValues_parsed` prefix reveals the kind.
+            // Classify the column by probing `get_min_stat` with an arbitrary type (LONG).
+            // Partition columns must be detected before the type-hint check below: they don't
+            // need a hint, so a partition-only predicate like `OP(part_col)` must not abstain
+            // just because no sibling literal exists. The probe works because kernel answers a
+            // partition column with a `partitionValues_parsed.<col>` reference regardless of the
+            // requested type; that prefix is the classification signal. For data columns the
+            // probe result is discarded -- their stats refs are rebuilt with the real type.
             let probe = evaluator.get_min_stat(col, &DataType::LONG);
             let (min, max, is_partition_col) = match probe.filter(is_partition_column_ref) {
-                // Partition value is exact and type-agnostic: reuse the probe for both bounds.
+                // A partition value is exact (every row in the file shares it), so the same
+                // reference serves as both bounds.
                 Some(partition_min) => {
-                    let max = evaluator
-                        .get_max_stat(col, &DataType::LONG)
-                        .unwrap_or_else(null_long);
+                    let max = partition_min.clone();
                     (partition_min, max, true)
                 }
                 // Data column: reading min/max stats requires the column type, which we lift from
@@ -239,17 +243,19 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
         .map_err(|e| Error::Generic(format!("struct arg construction: {e}")))
 }
 
-/// Import an `ArrowFFIData` produced by the engine back into an `ArrayRef`.
-fn import_ffi_array(ffi: &mut ArrowFFIData) -> DeltaResult<ArrayRef> {
-    // A released array means an unpopulated result (empty arrays carry no release callback).
+/// Import an engine-produced `ArrowFFIData` into an `ArrayRef`, consuming the Arrow C Data
+/// Interface handles.
+fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
+    // A released (empty) array means the engine reported success without populating the result
+    // slot. This check is load-bearing: `from_ffi` asserts on the empty structs' null pointers,
+    // and kernel must never panic -- so reject the unpopulated case with an error up front.
     if ffi.array.is_released() {
         return Err(Error::Generic(
             "engine callback returned success but no result array".into(),
         ));
     }
 
-    let array = std::mem::replace(&mut ffi.array, FFI_ArrowArray::empty());
-    let schema = std::mem::replace(&mut ffi.schema, FFI_ArrowSchema::empty());
+    let ArrowFFIData { array, schema } = ffi;
 
     // SAFETY: the engine promised these structs are valid Arrow C Data
     // Interface payloads it produced and handed to us.
@@ -258,7 +264,13 @@ fn import_ffi_array(ffi: &mut ArrowFFIData) -> DeltaResult<ArrayRef> {
     Ok(make_array(array_data))
 }
 
-fn require_boolean_array(arr: ArrayRef) -> DeltaResult<BooleanArray> {
+fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<BooleanArray> {
+    if arr.len() != expected_rows {
+        return Err(Error::Generic(format!(
+            "opaque predicate eval_pred returned {} rows, expected {expected_rows}",
+            arr.len()
+        )));
+    }
     arr.as_any()
         .downcast_ref::<BooleanArray>()
         .cloned()
@@ -273,10 +285,11 @@ fn require_boolean_array(arr: ArrayRef) -> DeltaResult<BooleanArray> {
 fn call_eval_pred(
     cb: &COpaqueEvalCallbacks,
     op_name: &str,
-    args_batch: &RecordBatch,
+    args_batch: RecordBatch,
     mode: EvalMode,
     inverted: bool,
 ) -> DeltaResult<BooleanArray> {
+    let num_rows = args_batch.num_rows();
     let mut args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
 
     // Out-pointer convention: kernel owns the result slot on its stack, pre-initialized to None;
@@ -295,14 +308,14 @@ fn call_eval_pred(
         };
         eval(cb.engine_state, name, &mut args_ffi, inverted, &mut result);
     }
-    let OptionalValue::Some(mut result_ffi) = result else {
+    let OptionalValue::Some(result_ffi) = result else {
         return Err(Error::Generic(format!(
             "engine opaque-eval callback reported failure for `{op_name}`"
         )));
     };
 
-    let arr = import_ffi_array(&mut result_ffi)?;
-    require_boolean_array(arr)
+    let arr = import_ffi_array(result_ffi)?;
+    require_boolean_array(arr, num_rows)
 }
 
 // === ArrowOpaquePredicateOp ====================================================
@@ -341,7 +354,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         call_eval_pred(
             &self.callbacks.inner,
             &self.name,
-            &args_batch,
+            args_batch,
             self.mode,
             inverted,
         )
@@ -406,7 +419,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
 
-    use delta_kernel::arrow::array::ffi::from_ffi;
+    use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
     use delta_kernel::arrow::array::{
         ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
     };
@@ -658,6 +671,31 @@ mod tests {
         let batch = batch_with_col(vec![Some("x"), Some("y"), Some("z")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
         assert!(format!("{err}").contains("non-boolean array"), "got: {err}");
+    }
+
+    #[test]
+    fn engine_returning_wrong_length_array_errors() {
+        unsafe extern "C" fn engine_short(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _inverted: bool,
+            out: *mut OptionalValue<ArrowFFIData>,
+        ) {
+            let _ = unsafe { take_ffi_record_batch(args_in) };
+            let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+            unsafe { write_result(out, arr) }
+        }
+        let pred = Predicate::arrow_opaque(
+            FfiOpaquePredicateOp::new("RETURNS_SHORT", callbacks_for(engine_short)),
+            [column_expr!("col")],
+        );
+        let batch = batch_with_col(vec![Some("x"), Some("y"), Some("z")]);
+        let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
+        assert!(
+            format!("{err}").contains("returned 1 rows, expected 3"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1288,9 +1326,11 @@ mod tests {
             );
         }
 
-        /// Add/Remove reconciliation safety: a row with no collected stats (as a checkpoint Remove
-        /// row presents) rewrites to null min/max, and a conservative engine must keep it --
-        /// dropping it would resurrect a deleted file. Pins the contract the soundness relies on.
+        /// A row with no collected stats rewrites to null min/max, and a conservative engine
+        /// keeps it -- pins the keep-on-null-bounds contract that pruning accuracy relies on.
+        /// Log-replay safety does not depend on it: kernel's `OR(NOT is_add, ...)` guard keeps
+        /// Remove rows regardless of the verdict (see
+        /// `misbehaving_stats_callback_cannot_resurrect_removed_file`).
         #[test]
         fn null_bounds_keep_file_for_remove_row_safety() {
             unsafe extern "C" fn engine_keep_on_null_bounds(

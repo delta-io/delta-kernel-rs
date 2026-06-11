@@ -58,10 +58,11 @@ pub type EngineEvalRowsFn = unsafe extern "C" fn(
 ///
 /// Stats are *conservative*: `min`/`max` only bound the values and `nullcount`/`rowcount` may
 /// overcount, so skip a file only when the predicate *cannot* hold for any value in `[min, max]`.
-/// Returning `false` (skip) on null/absent bounds is unsound: during checkpoint replay the skipping
-/// batch also carries Remove rows (which have null stats), and dropping one resurrects a deleted
-/// file -- corrupting Add/Remove reconciliation, not just pruning accuracy. Keep (`true`/`null`)
-/// whenever the stats can't prove the predicate impossible.
+/// Keep (`true`/`null`) whenever the stats can't prove the predicate impossible -- in particular
+/// on null/absent bounds, where skipping silently drops live files from the scan. Log-replay
+/// soundness does not rest on the engine, though: kernel wraps the rewritten predicate with an
+/// `OR(NOT is_add, ...)` guard, so Remove rows (which carry null stats) are kept regardless of
+/// the verdict and a misbehaving callback cannot resurrect deleted files.
 /// When `inverted`, evaluate `NOT op` -- not `!verdict`; if you can't reason soundly about the
 /// negated op, keep every file. Result/out-pointer/panic contract matches [`EngineEvalRowsFn`].
 pub type EngineEvalStatsFn = unsafe extern "C" fn(
@@ -82,6 +83,13 @@ pub type EngineFreeStateFn = unsafe extern "C" fn(engine_state: *mut c_void);
 /// call: `free_state` is invoked exactly once when the predicate built from it (including any
 /// data-skipping clones kernel derives) is dropped. Engines attaching the same logical state to
 /// multiple opaque ops must pass independently freeable state per call.
+///
+/// # Thread safety
+///
+/// Kernel may invoke the eval callbacks -- and ultimately `free_state` -- from any thread,
+/// potentially concurrently: the predicate is shared across whatever threads drive the scan, and
+/// the last reference may drop on any of them. The engine must hand over only an `engine_state`
+/// and callbacks that tolerate this; any synchronization is the engine's responsibility.
 ///
 /// [`visit_predicate_opaque_with_eval`]: crate::expressions::kernel_visitor::visit_predicate_opaque_with_eval
 #[repr(C)]
@@ -119,8 +127,11 @@ impl FfiOpaqueEvalCallbacks {
     }
 }
 
-// SAFETY: `engine_state` and the function pointers may be touched from any kernel thread. The
-// adapter lives behind `Arc<...>` inside the opaque op, and predicates must be `Send + Sync`.
+// SAFETY: values of this type exist only via the engine handover in
+// `visit_predicate_opaque_with_eval`, whose thread-safety contract (see `COpaqueEvalCallbacks`)
+// obligates the engine to pass only state and callbacks that are safe to use from any thread,
+// concurrently. Kernel adds no thread-affine state of its own, so sharing the adapter across
+// threads (behind the op's `Arc`) is sound.
 unsafe impl Send for FfiOpaqueEvalCallbacks {}
 unsafe impl Sync for FfiOpaqueEvalCallbacks {}
 

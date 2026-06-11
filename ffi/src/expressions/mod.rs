@@ -1,5 +1,8 @@
 //! This module holds functionality for moving expressions across the FFI boundary, both from
 //! engine to kernel, and from kernel to engine.
+//!
+//! This FFI exposes only opaque predicates, not opaque expressions; see the `opaque_eval` module
+//! docs for why (expression-level functions fold into composite opaque predicates).
 use std::ffi::c_void;
 
 use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp};
@@ -98,6 +101,3 @@ pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
     let name = op.name();
     visit(data, kernel_string_slice!(name));
 }
-
-// This FFI exposes only opaque predicates, not opaque expressions; see the `opaque_eval` module
-// docs for why (expression-level functions fold into composite opaque predicates).
