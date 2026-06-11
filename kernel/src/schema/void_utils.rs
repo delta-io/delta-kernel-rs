@@ -165,9 +165,9 @@ pub(crate) fn add_void_stripping(
 /// Recursive helper that records a drop for every void field in `st`, threading `path` (the field
 /// names from the root struct down to `st`) so nested drops are recorded at their full path.
 ///
-/// The builder lowers each `with_dropped_field_at` into the appropriate nested patch and only
-/// materializes a nested patch when a drop actually lands under that path, so structs with no void
-/// fields contribute nothing. `path` is pushed/popped in place to avoid reallocating at each level.
+/// The builder lowers each `drop_at` call into the appropriate nested patch and only materializes a
+/// nested patch when a drop actually lands under that path, so structs with no void fields
+/// contribute nothing. `path` is pushed/popped in place to avoid reallocating at each level.
 ///
 /// This intentionally descends only through Struct fields; write validation rejects void
 /// placements inside Array or Map before this patch is used.
@@ -178,7 +178,7 @@ fn add_void_stripping_inner<'a>(
 ) -> ExpressionStructPatchBuilder {
     for field in st.fields() {
         if *field.data_type() == DataType::VOID {
-            patch = patch.with_dropped_field_at(path.iter().copied(), field.name());
+            patch = patch.drop_at(path.iter().copied(), field.name());
         } else if let DataType::Struct(inner) = field.data_type() {
             path.push(field.name());
             patch = add_void_stripping_inner(patch, inner, path);

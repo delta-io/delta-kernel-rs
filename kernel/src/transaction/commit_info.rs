@@ -97,13 +97,13 @@ impl<S> Transaction<S> {
                 // First pass: replace fields that already exist in the engine schema.
                 for (field_name, expr_ref) in &literal_exprs {
                     if engine_commit_info_schema.contains(*field_name) {
-                        patch = patch.with_replaced_field(*field_name, expr_ref.clone());
+                        patch = patch.replace(*field_name, expr_ref.clone());
                     }
                 }
                 // Second pass: append kernel-only fields after the last engine field.
                 for (field_name, expr_ref) in &literal_exprs {
                     if !engine_commit_info_schema.contains(*field_name) {
-                        patch = patch.with_appended_field(expr_ref.clone());
+                        patch = patch.append(expr_ref.clone());
                     }
                 }
 

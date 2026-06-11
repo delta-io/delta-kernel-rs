@@ -17,9 +17,9 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{
-    Expression, ExpressionRef, ExpressionStructPatchBuilder, UnaryExpressionOp,
+    col, Expression, ExpressionRef, ExpressionStructPatchBuilder, UnaryExpressionOp,
 };
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
@@ -90,11 +90,10 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_json {
         // Populate stats from stats_parsed if needed (for old checkpoints that only had
         // stats_parsed)
-        patch_builder =
-            patch_builder.with_replaced_field_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
+        patch_builder = patch_builder.replace_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
     } else {
         // Drop stats field when not writing as JSON
-        patch_builder = patch_builder.with_dropped_field_at([ADD_NAME], STATS_FIELD);
+        patch_builder = patch_builder.drop_at([ADD_NAME], STATS_FIELD);
     }
 
     // Handle stats_parsed field
@@ -103,26 +102,21 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_struct {
         // Populate stats_parsed from JSON stats (for commits that only have JSON stats)
         let stats_parsed_expr = build_stats_parsed_expr(stats_schema);
-        patch_builder =
-            patch_builder.with_replaced_field_at([ADD_NAME], STATS_PARSED_FIELD, stats_parsed_expr);
+        patch_builder = patch_builder.replace_at([ADD_NAME], STATS_PARSED_FIELD, stats_parsed_expr);
     } else {
         // Drop stats_parsed field when not writing as struct
-        patch_builder = patch_builder.with_dropped_field_at([ADD_NAME], STATS_PARSED_FIELD);
+        patch_builder = patch_builder.drop_at([ADD_NAME], STATS_PARSED_FIELD);
     }
 
     // Handle partitionValues_parsed field (only for partitioned tables)
     if partition_schema.is_some() {
         if config.write_stats_as_struct {
             let pv_parsed_expr = build_partition_values_parsed_expr();
-            patch_builder = patch_builder.with_replaced_field_at(
-                [ADD_NAME],
-                PARTITION_VALUES_PARSED_FIELD,
-                pv_parsed_expr,
-            );
+            patch_builder =
+                patch_builder.replace_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
         } else {
             // Drop partitionValues_parsed since it was added to read schema
-            patch_builder =
-                patch_builder.with_dropped_field_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD);
+            patch_builder = patch_builder.drop_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD);
         }
     }
 
@@ -160,17 +154,17 @@ pub(crate) fn build_checkpoint_read_schema(
                 "partitionValues_parsed field already exists in Add schema",
             ));
         }
-        let mut result = add_struct.clone().with_field_inserted_after(
-            Some(STATS_FIELD),
+        let mut patch = SchemaStructPatchBuilder::new().insert_after(
+            STATS_FIELD,
             StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
-        )?;
+        );
         if let Some(pv_schema) = partition_schema {
-            result = result.with_field_inserted_after(
-                Some(PARTITION_VALUES_FIELD),
+            patch = patch.insert_after(
+                PARTITION_VALUES_FIELD,
                 StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
-            )?;
+            );
         }
-        Ok(result)
+        patch.build(add_struct)
     })
 }
 
@@ -204,15 +198,11 @@ pub(crate) fn build_checkpoint_output_schema(
 /// If `stats_parsed` is non-null, the data originated from a checkpoint (commits only
 /// contain JSON stats, so `stats_parsed` will be null for commit-sourced rows).
 ///
-/// Column paths are relative to the full batch (not the nested Add struct), so we use
-/// ["add", "stats"] instead of just ["stats"].
+/// Column paths are relative to the full batch, not the nested Add struct.
 fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
-        Expression::parse_json(
-            Expression::column([ADD_NAME, STATS_FIELD]),
-            stats_schema.clone(),
-        ),
+        col!(ADD_NAME, STATS_PARSED_FIELD),
+        Expression::parse_json(col!(ADD_NAME, STATS_FIELD), stats_schema.clone()),
     ]))
 }
 
@@ -225,26 +215,24 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// itself carries no schema, so the expression evaluator uses the expected output type to
 /// parse each string value into the correct native type.
 ///
-/// Column paths are relative to the full batch (not the nested Add struct), so we use
-/// `["add", "partitionValues"]` instead of just `["partitionValues"]`.
+/// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
-        Expression::map_to_struct(Expression::column([ADD_NAME, PARTITION_VALUES_FIELD])),
+        col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
+        Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD)),
     ]))
 }
 
 /// Static expression: `stats = COALESCE(stats, ToJson(stats_parsed))`
 ///
 /// This expression prefers existing JSON stats, falling back to converting stats_parsed.
-/// Column paths are relative to the full batch (not the nested Add struct), so we use
-/// ["add", "stats"] instead of just ["stats"].
+/// Column paths are relative to the full batch, not the nested Add struct.
 static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
     Arc::new(Expression::coalesce([
-        Expression::column([ADD_NAME, STATS_FIELD]),
+        col!(ADD_NAME, STATS_FIELD),
         Expression::unary(
             UnaryExpressionOp::ToJson,
-            Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
+            col!(ADD_NAME, STATS_PARSED_FIELD),
         ),
     ]))
 });
@@ -253,8 +241,6 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
 ///
 /// This helper applies a transformation function to the Add struct and returns
 /// a new schema with the modified Add field.
-// TODO(https://github.com/delta-io/delta-kernel-rs/issues/1820): Replace manual field
-// iteration with StructType helper methods (e.g., with_field_inserted, with_field_removed).
 ///
 /// # Errors
 ///
@@ -278,15 +264,11 @@ fn transform_add_schema(
     };
 
     let modified_add = transform_fn(add_struct)?;
-    let new_schema = base_schema.clone().with_field_replaced(
-        ADD_NAME,
-        StructField {
-            name: ADD_NAME.to_string(),
-            data_type: DataType::from(modified_add),
-            nullable: add_field.nullable,
-            metadata: add_field.metadata.clone(),
-        },
-    )?;
+    let new_add_field = StructField::new(ADD_NAME, modified_add, add_field.nullable)
+        .with_metadata(add_field.metadata.clone());
+    let new_schema = SchemaStructPatchBuilder::new()
+        .replace(ADD_NAME, new_add_field)
+        .build(base_schema)?;
 
     Ok(Arc::new(new_schema))
 }
@@ -297,25 +279,24 @@ fn build_add_output_schema(
     stats_schema: &StructType,
     partition_schema: Option<&StructType>,
 ) -> DeltaResult<StructType> {
-    let mut new_schema = add_schema.clone();
+    let mut patch = SchemaStructPatchBuilder::new();
     if config.write_stats_as_struct {
-        new_schema = new_schema.with_field_inserted_after(
-            Some(STATS_FIELD),
+        patch = patch.insert_after(
+            STATS_FIELD,
             StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
-        )?;
+        );
         if let Some(pv_schema) = partition_schema {
-            new_schema = new_schema.with_field_inserted_after(
-                Some(PARTITION_VALUES_FIELD),
+            patch = patch.insert_after(
+                PARTITION_VALUES_FIELD,
                 StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
-            )?;
+            );
         }
     }
 
-    if config.write_stats_as_json {
-        Ok(new_schema)
-    } else {
-        Ok(new_schema.with_field_removed(STATS_FIELD))
+    if !config.write_stats_as_json {
+        patch = patch.drop(STATS_FIELD);
     }
+    patch.build(add_schema)
 }
 
 #[cfg(test)]
@@ -559,31 +540,6 @@ mod tests {
                 .contains_key(PARTITION_VALUES_PARSED_FIELD),
             "non-partitioned table should not have partitionValues_parsed transform"
         );
-    }
-
-    #[test]
-    fn test_field_inserted_after_in_add_schema() {
-        let add_schema = StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::nullable("stats", DataType::STRING),
-            StructField::nullable("tags", DataType::STRING),
-        ]);
-
-        let injected_schema =
-            StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]);
-
-        let result = add_schema
-            .with_field_inserted_after(
-                Some(STATS_FIELD),
-                StructField::nullable(STATS_PARSED_FIELD, injected_schema),
-            )
-            .expect("inserting stats_parsed should succeed");
-
-        // Should have 4 fields: path, stats, stats_parsed, tags
-        assert_eq!(result.fields().count(), 4);
-
-        let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
-        assert_eq!(field_names, vec!["path", "stats", "stats_parsed", "tags"]);
     }
 
     #[test]

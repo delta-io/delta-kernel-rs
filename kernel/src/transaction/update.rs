@@ -25,7 +25,7 @@ use crate::engine_data::{
 };
 use crate::error::Error;
 use crate::expressions::{
-    column_name, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
+    col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
 use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
@@ -497,13 +497,10 @@ impl<S> Transaction<S> {
         // schema fields.
         let with_new_dv_expr = Expression::struct_patch(
             ExpressionStructPatchBuilder::new()
-                .with_replaced_field(
-                    "deletionVector",
-                    Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
-                )
-                .with_replaced_field("stats", Expression::column([NEW_STATS_NAME]).into())
-                .with_dropped_field(NEW_DELETION_VECTOR_NAME)
-                .with_dropped_field(NEW_STATS_NAME),
+                .replace("deletionVector", col!(NEW_DELETION_VECTOR_NAME))
+                .replace("stats", col!(NEW_STATS_NAME))
+                .drop(NEW_DELETION_VECTOR_NAME)
+                .drop(NEW_STATS_NAME),
         )?;
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
@@ -516,10 +513,8 @@ impl<S> Transaction<S> {
             nullable_restored_add_schema().clone().into(),
         )?;
         let with_data_change_patch = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new_nested(["add"]).with_inserted_field_after(
-                "modificationTime",
-                Expression::literal(self.data_change).into(),
-            ),
+            ExpressionStructPatchBuilder::new_nested(["add"])
+                .insert_after("modificationTime", lit(self.data_change)),
         )?;
         let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(

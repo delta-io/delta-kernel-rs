@@ -1038,7 +1038,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr,
+        col, column_expr, column_expr_ref, lit, BinaryExpressionOp, Expression as Expr,
         ExpressionStructPatchBuilder,
     };
     use crate::schema::{DataType, StructField, StructType};
@@ -1107,14 +1107,14 @@ mod tests {
         let batch = create_test_batch();
 
         // Test 1: Empty patch (identity) - should be exactly equal to input
-        let patch = ExpressionStructPatchBuilder::new().build().unwrap();
+        let patch = ExpressionStructPatchBuilder::new();
         let output_schema = StructType::new_unchecked(vec![
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
             StructField::new("c", DataType::INTEGER, false),
         ]);
 
-        let expr = Expr::StructPatch(patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
 
@@ -1128,16 +1128,14 @@ mod tests {
 
         // Test 2: Nested path identity (struct relocation without modification)
         let nested_batch = create_nested_test_batch();
-        let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
-            .build()
-            .unwrap();
+        let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"]);
 
         let nested_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::INTEGER, false),
         ]);
 
-        let expr_nested = Expr::StructPatch(nested_patch);
+        let expr_nested = Expr::struct_patch(nested_patch).unwrap();
         let result_nested = evaluate_expression(
             &expr_nested,
             &nested_batch,
@@ -1171,17 +1169,15 @@ mod tests {
         let batch = create_test_batch();
 
         let patch = ExpressionStructPatchBuilder::new()
-            .with_replaced_field("a", column_expr_ref!("b"))
-            .with_dropped_field("b")
-            .with_prepended_field(Expr::literal(1).into())
-            .with_prepended_field(Expr::literal(2).into())
-            .with_prepended_field(column_expr_ref!("c"))
-            .with_inserted_field_after("c", Expr::literal(42).into())
-            .with_inserted_field_after("c", column_expr_ref!("a"))
-            .with_inserted_field_after("c", Expr::literal(99).into())
-            .with_appended_field(Expr::literal(7).into())
-            .build()
-            .unwrap();
+            .replace("a", col!("b"))
+            .drop("b")
+            .prepend(lit(1))
+            .prepend(lit(2))
+            .prepend(col!("c"))
+            .insert_after("c", lit(42))
+            .insert_after("c", col!("a"))
+            .insert_after("c", lit(99))
+            .append(lit(7));
 
         let output_schema = StructType::new_unchecked(vec![
             StructField::new("pre1", DataType::INTEGER, false), // prepend 1
@@ -1195,7 +1191,7 @@ mod tests {
             StructField::new("append1", DataType::INTEGER, false), // true append
         ]);
 
-        let expr = Expr::StructPatch(patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
 
@@ -1228,10 +1224,8 @@ mod tests {
         let batch = create_test_batch();
 
         let patch = ExpressionStructPatchBuilder::new()
-            .with_inserted_field_after("a", Expr::literal(42).into())
-            .with_replaced_field("a", column_expr_ref!("b"))
-            .build()
-            .unwrap();
+            .insert_after("a", lit(42))
+            .replace("a", col!("b"));
 
         let output_schema = StructType::new_unchecked(vec![
             StructField::new("a", DataType::INTEGER, false),
@@ -1240,7 +1234,7 @@ mod tests {
             StructField::new("c", DataType::INTEGER, false),
         ]);
 
-        let expr = Expr::StructPatch(patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(
             &expr,
             &batch,
@@ -1260,16 +1254,14 @@ mod tests {
         let nested_batch = create_nested_test_batch();
 
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
-        let copy_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
-            .build()
-            .unwrap();
+        let copy_patch = ExpressionStructPatchBuilder::new_nested(["nested"]);
 
         let copy_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::INTEGER, false),
         ]);
 
-        let expr_copy = Expr::StructPatch(copy_patch);
+        let expr_copy = Expr::struct_patch(copy_patch).unwrap();
         let result_copy = evaluate_expression(
             &expr_copy,
             &nested_batch,
@@ -1295,10 +1287,8 @@ mod tests {
 
         // Test 2: Modify nested struct and relocate it
         let modify_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
-            .with_replaced_field("x".to_string(), Expr::literal(777).into())
-            .with_inserted_field_after("y", Expr::literal(555).into())
-            .build()
-            .unwrap();
+            .replace("x", lit(777))
+            .insert_after("y", lit(555));
 
         let modify_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
@@ -1306,7 +1296,7 @@ mod tests {
             StructField::new("new_field", DataType::INTEGER, false), // inserted after y
         ]);
 
-        let expr_modify = Expr::StructPatch(modify_patch);
+        let expr_modify = Expr::struct_patch(modify_patch).unwrap();
         let result_modify = evaluate_expression(
             &expr_modify,
             &nested_batch,
@@ -1336,17 +1326,14 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let patch = ExpressionStructPatchBuilder::new()
-            .with_replaced_field("missing", Expr::literal(1).into())
-            .build()
-            .unwrap();
+        let patch = ExpressionStructPatchBuilder::new().replace("missing", lit(1));
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
             StructField::not_null("c", DataType::INTEGER),
         ]);
 
-        let expr = Expr::StructPatch(patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema.clone())));
         assert!(result
@@ -1355,12 +1342,10 @@ mod tests {
             .contains("reference invalid input field names"));
 
         // Test unused insertion keys
-        let insertion_patch = ExpressionStructPatchBuilder::new()
-            .with_inserted_field_after("nonexistent", Expr::literal(1).into())
-            .build()
-            .unwrap();
+        let insertion_patch =
+            ExpressionStructPatchBuilder::new().insert_after("nonexistent", lit(1));
 
-        let expr2 = Expr::StructPatch(insertion_patch);
+        let expr2 = Expr::struct_patch(insertion_patch).unwrap();
         let result2 =
             evaluate_expression(&expr2, &batch, Some(&DataType::from(output_schema.clone())));
         assert!(result2.is_err());
@@ -1370,10 +1355,7 @@ mod tests {
             .contains("reference invalid input field names"));
 
         // Test column count mismatch -- too many output schema fields
-        let drop_patch = ExpressionStructPatchBuilder::new()
-            .with_dropped_field("a")
-            .build()
-            .unwrap();
+        let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
 
         let wrong_output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER), // expects a field that was dropped
@@ -1381,7 +1363,7 @@ mod tests {
             StructField::not_null("c", DataType::INTEGER),
         ]);
 
-        let expr3 = Expr::StructPatch(drop_patch);
+        let expr3 = Expr::struct_patch(drop_patch).unwrap();
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
@@ -1391,15 +1373,12 @@ mod tests {
             .contains("Too many fields in output schema"));
 
         // Test column count mismatch -- too few output schema fields
-        let drop_patch = ExpressionStructPatchBuilder::new()
-            .with_dropped_field("a")
-            .build()
-            .unwrap();
+        let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
 
         let wrong_output_schema =
             StructType::new_unchecked(vec![StructField::not_null("c", DataType::INTEGER)]);
 
-        let expr3 = Expr::StructPatch(drop_patch);
+        let expr3 = Expr::struct_patch(drop_patch).unwrap();
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
@@ -1409,8 +1388,8 @@ mod tests {
             .contains("Too few fields in output schema"));
 
         // Test missing output schema
-        let patch = ExpressionStructPatchBuilder::new().build().unwrap();
-        let expr4 = Expr::StructPatch(patch);
+        let patch = ExpressionStructPatchBuilder::new();
+        let expr4 = Expr::struct_patch(patch).unwrap();
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());
         assert!(result4
@@ -1428,11 +1407,8 @@ mod tests {
             StructField::not_null("c", DataType::INTEGER),
         ]);
 
-        let patch = ExpressionStructPatchBuilder::new()
-            .with_replaced_field("a", Expr::literal(1).into())
-            .build()
-            .unwrap();
-        let expr = Expr::StructPatch(patch);
+        let patch = ExpressionStructPatchBuilder::new().replace("a", lit(1));
+        let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(
             &expr,
             &batch,
@@ -1448,15 +1424,12 @@ mod tests {
     #[test]
     fn test_drop_field_if_exists_present() {
         let batch = create_test_batch();
-        let patch = ExpressionStructPatchBuilder::new()
-            .with_dropped_field_if_exists("a")
-            .build()
-            .unwrap();
+        let patch = ExpressionStructPatchBuilder::new().drop_if_exists("a");
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("b", DataType::INTEGER),
             StructField::not_null("c", DataType::INTEGER),
         ]);
-        let expr = Expr::StructPatch(patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
         let result = result.as_any().downcast_ref::<StructArray>().unwrap();
@@ -1467,16 +1440,13 @@ mod tests {
     #[test]
     fn test_drop_field_if_exists_missing() {
         let batch = create_test_batch();
-        let patch = ExpressionStructPatchBuilder::new()
-            .with_dropped_field_if_exists("nonexistent")
-            .build()
-            .unwrap();
+        let patch = ExpressionStructPatchBuilder::new().drop_if_exists("nonexistent");
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
             StructField::not_null("c", DataType::INTEGER),
         ]);
-        let expr = Expr::StructPatch(patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
         let result = result.as_any().downcast_ref::<StructArray>().unwrap();
@@ -1488,16 +1458,13 @@ mod tests {
     #[test]
     fn test_drop_field_non_optional_missing_still_errors() {
         let batch = create_test_batch();
-        let patch = ExpressionStructPatchBuilder::new()
-            .with_dropped_field("nonexistent")
-            .build()
-            .unwrap();
+        let patch = ExpressionStructPatchBuilder::new().drop("nonexistent");
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
             StructField::not_null("b", DataType::INTEGER),
             StructField::not_null("c", DataType::INTEGER),
         ]);
-        let expr = Expr::StructPatch(patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema)));
         assert!(result
             .unwrap_err()
@@ -1763,16 +1730,7 @@ mod tests {
     fn test_nested_patches() {
         let nested_batch = create_nested_test_batch();
 
-        // Simple nested patch - replace a field in the nested struct
-        let nested_patch = ExpressionStructPatchBuilder::new_nested(["nested"])
-            .with_replaced_field("x", Expr::literal(999).into())
-            .build()
-            .unwrap();
-
-        let outer_patch = ExpressionStructPatchBuilder::new()
-            .with_inserted_field_after("a", Expr::StructPatch(nested_patch).into())
-            .build()
-            .unwrap();
+        let patch = ExpressionStructPatchBuilder::new().replace_at(["nested"], "x", lit(999));
 
         let nested_output_schema = StructType::new_unchecked(vec![
             StructField::not_null("x", DataType::INTEGER),
@@ -1780,17 +1738,16 @@ mod tests {
         ]);
         let output_schema = StructType::new_unchecked(vec![
             StructField::not_null("a", DataType::INTEGER),
-            StructField::not_null("transformed", nested_output_schema.clone()),
             StructField::not_null("nested", nested_output_schema),
         ]);
 
-        let expr = Expr::StructPatch(outer_patch);
+        let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &nested_batch, Some(&DataType::from(output_schema)))
                 .unwrap();
 
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 3);
+        assert_eq!(struct_result.num_columns(), 2);
         assert_eq!(struct_result.len(), 3);
 
         // Verify original field 'a' (should be [100, 200, 300])
@@ -1803,15 +1760,6 @@ mod tests {
             .downcast_ref::<StructArray>()
             .unwrap();
         validate_i32_column(nested_struct_result, 0, &[999, 999, 999]);
-        validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
-
-        // Verify nested patch passed both 'x' and 'y' unchanged.
-        let nested_struct_result = struct_result
-            .column(2)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        validate_i32_column(nested_struct_result, 0, &[1, 2, 3]);
         validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
     }
 

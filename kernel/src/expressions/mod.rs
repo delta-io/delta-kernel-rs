@@ -11,22 +11,19 @@ pub use self::column_names::{
     col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
     joined_column_name, ColumnName,
 };
-pub use self::patches::{
-    ExpressionFieldPatch, ExpressionStructPatch, ExpressionStructPatchBuilder,
-};
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
+pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::CollectInto;
 use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
-mod patches;
 pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
 
@@ -45,6 +42,11 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 pub fn lit(value: impl Into<Scalar>) -> Expression {
     Expression::literal(value)
 }
+
+/// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are
+/// expressions, lowered into an [`ExpressionStructPatch`] that can be embedded in an
+/// [`Expression`].
+pub type ExpressionStructPatchBuilder = crate::struct_patch::StructPatchBuilder<ExpressionRef>;
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -1209,7 +1211,7 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+            col, column_expr, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
             Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
@@ -1402,28 +1404,24 @@ mod tests {
                 // Identity transform
                 Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
                 // Drop field
-                Expression::struct_patch(
-                    ExpressionStructPatchBuilder::new().with_dropped_field("old_column"),
-                )
-                .unwrap(),
+                Expression::struct_patch(ExpressionStructPatchBuilder::new().drop("old_column"))
+                    .unwrap(),
                 // Replace field
                 Expression::struct_patch(
-                    ExpressionStructPatchBuilder::new()
-                        .with_replaced_field("original", Arc::new(Expression::literal(0))),
+                    ExpressionStructPatchBuilder::new().replace("original", lit(0)),
                 )
                 .unwrap(),
                 // Insert fields
                 Expression::struct_patch(
                     ExpressionStructPatchBuilder::new()
-                        .with_inserted_field_after("after_col", Arc::new(column_expr!("new_col")))
-                        .with_prepended_field(Arc::new(Expression::literal("prepended")))
-                        .with_appended_field(Arc::new(Expression::literal("appended"))),
+                        .insert_after("after_col", col!("new_col"))
+                        .prepend(lit("prepended"))
+                        .append(lit("appended")),
                 )
                 .unwrap(),
                 // Nested transform
                 Expression::struct_patch(
-                    ExpressionStructPatchBuilder::new_nested(["parent", "child"])
-                        .with_dropped_field("to_drop"),
+                    ExpressionStructPatchBuilder::new_nested(["parent", "child"]).drop("to_drop"),
                 )
                 .unwrap(),
             ];
