@@ -12,6 +12,9 @@
 //! This is the IO-bearing front half of log-replay planning. It is deliberately independent of
 //! the plan-construction surface and the reconciliation pipeline: a caller resolves the shape
 //! here, then feeds it into a (separately built) reconciliation plan.
+//!
+//! Sibling: `LogSegment::get_file_actions_schema_and_sidecars` performs the same leaf/manifest
+//! classification for the engine-driven read path; the two must stay in sync.
 
 use url::Url;
 
@@ -125,21 +128,18 @@ impl ScanShape {
                 } else {
                     None
                 };
-                match sidecar {
-                    Some(sidecar) => Some(sidecar),
-                    // No `sidecar` column (V1 leaf) or column present but unreferenced (V2 inline
-                    // leaf): either way `cp_schema` is the leaf schema, so probe it for parsed
-                    // stats when the caller requested them.
-                    _ => {
-                        leaf_parsed_stats = stats_schema.is_some_and(|reqd| {
-                            LogSegment::schema_has_compatible_stats_parsed(
-                                cp_schema.as_ref(),
-                                reqd.as_ref(),
-                            )
-                        });
-                        None
-                    }
+                // No `sidecar` column (V1 leaf) or column present but unreferenced (V2 inline
+                // leaf): either way `cp_schema` is the leaf schema, so probe it for parsed stats
+                // when the caller requested them.
+                if sidecar.is_none() {
+                    leaf_parsed_stats = stats_schema.is_some_and(|reqd| {
+                        LogSegment::schema_has_compatible_stats_parsed(
+                            cp_schema.as_ref(),
+                            reqd.as_ref(),
+                        )
+                    });
                 }
+                sidecar
             }
             FileType::Json => {
                 collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
@@ -243,6 +243,8 @@ mod tests {
     // A V2 parquet checkpoint carries a `sidecar` column even when it inlines its actions; with
     // zero sidecar references it is still a leaf, so the column alone must not classify it.
     #[case::leaf_parquet_inline("v2-checkpoints-parquet-without-sidecars", CheckpointShape::Leaf)]
+    // A multi-part V1 checkpoint is always parquet and carries no `sidecar` column: a leaf.
+    #[case::leaf_multipart("v1-multi-part-struct-stats-only", CheckpointShape::Leaf)]
     fn resolve_classifies_checkpoint(#[case] table: &str, #[case] expected: CheckpointShape) {
         let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
         let exec = SyncPlanExecutor::new();
@@ -258,13 +260,18 @@ mod tests {
     /// `maxValues` request is trivially compatible, so this isolates "does the checkpoint have
     /// an `add.stats_parsed` struct at all".
     #[rstest]
-    #[case::json_stats_manifest("v2-classic-checkpoint-parquet", false)]
+    #[case::json_stats_classic_leaf("v2-classic-checkpoint-parquet", false)]
     #[case::json_stats_sidecars("v2-checkpoints-parquet-with-sidecars", false)]
     #[case::struct_stats_leaf("v2-classic-parquet-struct-stats-only", true)]
     // Manifest sidecar probe: the parsed-stats answer comes from a sidecar footer, exercising the
     // JSON drain-then-probe path (JSON) and the lazy parquet drain (parquet).
     #[case::struct_stats_json_manifest("v2-json-sidecars-struct-stats-only", true)]
     #[case::struct_stats_parquet_manifest("v2-parquet-sidecars-struct-stats-only", true)]
+    // A multi-part V1 leaf surfaces struct stats via its checkpoint footer / `_last_checkpoint`
+    // hint.
+    #[case::struct_stats_multipart_leaf("v1-multi-part-struct-stats-only", true)]
+    // A JSON leaf has no footer, so it never reports native parsed stats even when requested.
+    #[case::json_leaf_no_parsed("v2-checkpoints-json-without-sidecars", false)]
     fn resolve_reports_parsed_stats(#[case] table: &str, #[case] expect_parsed: bool) {
         let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
         let exec = SyncPlanExecutor::new();
