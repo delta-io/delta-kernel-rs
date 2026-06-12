@@ -756,8 +756,9 @@ mod tests {
             panic!("expected an error when the engine does not initialize the out pointer");
         };
         assert!(
-            matches!(err, Error::InternalError(_)),
-            "expected an internal error when the engine does not write the out pointer, got {err}"
+            err.to_string()
+                .contains("FFI engine iterator returned from next upcall without writing an item"),
+            "expected the engine-did-not-write message, got {err}"
         );
     }
 }

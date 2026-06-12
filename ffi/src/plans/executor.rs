@@ -62,15 +62,14 @@ impl PlanExecutor for FfiPlanExecutor {
 
         let mut out = EngineExecResult::Uninit;
         (self.callback)(self.context, plan_proto_slice, &mut out);
-        let plan_result = match out {
-            EngineExecResult::Success(plan) => plan,
-            EngineExecResult::Failure(err) => return Err(err.into()),
-            EngineExecResult::Uninit => {
-                return Err(Error::internal_error(
-                    "engine returned from execute_op upcall without writing the plan result",
-                ))
-            }
-        };
+        let plan_result =
+            match out {
+                EngineExecResult::Success(plan) => plan,
+                EngineExecResult::Failure(err) => return Err(err.into()),
+                EngineExecResult::Uninit => return Err(Error::internal_error(
+                    "FFI engine returned from execute_op upcall without writing the plan result",
+                )),
+            };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
             CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiEngineDataIter::new(it)))),
@@ -217,8 +216,10 @@ mod tests {
             panic!("execute_op should surface an error when the engine does not write the result");
         };
         assert!(
-            matches!(err, Error::InternalError(_)),
-            "expected Error::InternalError, got {err:?}"
+            err.to_string().contains(
+                "FFI engine returned from execute_op upcall without writing the plan result"
+            ),
+            "expected the engine-did-not-write message, got {err}"
         );
     }
 
