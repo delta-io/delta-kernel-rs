@@ -70,11 +70,10 @@ impl FilteredEngineData {
         }
     }
 
-    /// Apply the contained selection vector and return an engine data with only the valid rows
-    /// included. This consumes the `FilteredEngineData`
+    /// Apply the contained selection vector and return an engine data with only the selected rows
+    /// included. This consumes the `FilteredEngineData`.
     pub fn apply_selection_vector(self) -> DeltaResult<Box<dyn EngineData>> {
-        self.data
-            .apply_selection_vector(self.selection_vector.clone())
+        self.data.apply_selection_vector(self.selection_vector)
     }
 }
 
@@ -503,7 +502,7 @@ pub trait RowVisitor {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
 ///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
-///     todo!() // filter out unselected rows and return the new set of data
+///     todo!() // filter out unselected rows; rows beyond the selection vector's end are selected
 ///   }
 ///   fn has_field(&self, name: &ColumnName) -> bool {
 ///     todo!() // determine whether the field exists in the data
@@ -555,9 +554,14 @@ pub trait EngineData: AsAny {
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Apply a selection vector to the data and return a data where only the valid rows are
+    /// Apply a selection vector to the data and return a data where only the selected rows are
     /// included. This consumes the EngineData, allowing engines to implement this "in place" if
-    /// desired
+    /// desired.
+    ///
+    /// The selection vector may be shorter than the data; rows beyond its end are selected and
+    /// must be retained (see [`FilteredEngineData`]). An empty selection vector selects all rows.
+    /// A selection vector longer than the data is invalid and must be rejected, e.g. with
+    /// [`Error::InvalidSelectionVector`].
     fn apply_selection_vector(
         self: Box<Self>,
         selection_vector: Vec<bool>,

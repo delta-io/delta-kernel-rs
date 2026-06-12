@@ -22,6 +22,7 @@ pub use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
@@ -292,6 +293,14 @@ impl EngineData for ArrowEngineData {
         self: Box<Self>,
         mut selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        require!(
+            selection_vector.len() <= self.len(),
+            Error::InvalidSelectionVector(format!(
+                "Selection vector is larger than data length: {} > {}",
+                selection_vector.len(),
+                self.len()
+            ))
+        );
         selection_vector.resize(self.len(), true);
         let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
         Ok(Box::new(Self::new(filtered)))
@@ -1767,5 +1776,23 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_apply_selection_vector_shorter_than_data_keeps_trailing_rows() -> DeltaResult<()> {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b", "c"]));
+        let filtered = data.apply_selection_vector(vec![false])?;
+        let batch = extract_record_batch(filtered.as_ref())?;
+        let column = batch.column(0).as_string::<i32>();
+        let values: Vec<_> = column.iter().flatten().collect();
+        assert_eq!(values, ["b", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_selection_vector_longer_than_data_returns_error() {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b"]));
+        let result = data.apply_selection_vector(vec![true, true, true]);
+        assert_result_error_with_message(result, "Selection vector is larger than data length");
     }
 }

@@ -70,7 +70,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Use V2 schema for the checkpoint metadata batch
     let checkpoint_batch =
@@ -331,7 +331,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -404,7 +404,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
@@ -456,7 +456,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
     let data_iter = writer.checkpoint_data(&engine)?;
 
     /* The returned data iterator has batches that we do not consume */
@@ -559,7 +559,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -648,7 +648,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
         .build(&engine)?;
 
     assert!(matches!(
-        snapshot.create_checkpoint_writer().unwrap_err(),
+        snapshot.create_checkpoint_writer(&engine).unwrap_err(),
         crate::Error::Generic(e) if e == "Log segment is not published"
     ));
     Ok(())
@@ -1126,7 +1126,7 @@ async fn test_stats_config_round_trip(
     // The add action for file1.parquet comes from checkpoint 1, so the COALESCE
     // expressions must recover stats across format changes.
     let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer2 = snapshot2.create_checkpoint_writer()?;
+    let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
     let mut result2 = writer2.checkpoint_data(&engine)?;
 
     // Verify checkpoint 2 schema matches new settings
@@ -1204,7 +1204,7 @@ async fn test_stats_config_round_trip_partitioned(
 
     // Build snapshot that reads from checkpoint 1 + commit 2
     let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer2 = snapshot2.create_checkpoint_writer()?;
+    let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
     let result2 = writer2.checkpoint_data(&engine)?;
 
     // Collect all checkpoint batches

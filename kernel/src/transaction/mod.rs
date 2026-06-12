@@ -20,7 +20,9 @@ use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{ArrayData, ColumnName, ExpressionStructPatch, Scalar};
+use crate::expressions::{
+    col, lit, ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
+};
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::metrics::{CommitFailureReason, MetricId};
@@ -35,7 +37,10 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
+use crate::schema::{
+    ArrayType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    StructTypeBuilder,
+};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
@@ -163,14 +168,14 @@ fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
-    StructTypeBuilder::from_schema(schema)
-        .add_field(StructField::nullable("baseRowId", DataType::LONG))
-        .add_field(StructField::nullable(
+fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
+    let patch = SchemaStructPatchBuilder::new()
+        .append(StructField::nullable("baseRowId", DataType::LONG))
+        .append(StructField::nullable(
             "defaultRowCommitVersion",
             DataType::LONG,
-        ))
-        .build_arc_unchecked()
+        ));
+    Ok(Arc::new(patch.build(schema)?))
 }
 
 /// Marker type for transactions on existing tables.
@@ -308,16 +313,10 @@ where
     let evaluation_handler = engine.evaluation_handler();
     add_files_metadata.map(move |add_files_batch| {
         let patch_expr = Expression::struct_patch(
-            ExpressionStructPatch::new_top_level()
-                .with_inserted_field(
-                    Some("modificationTime"),
-                    Expression::literal(data_change).into(),
-                )
-                .with_replaced_field(
-                    "stats",
-                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                ),
-        );
+            ExpressionStructPatchBuilder::new()
+                .insert_after("modificationTime", lit(data_change))
+                .replace("stats", Expression::unary(ToJson, col!("stats"))),
+        )?;
         let adds_expr = Expression::struct_from([patch_expr]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
@@ -943,21 +942,20 @@ impl<S: SupportsDataFiles> Transaction<S> {
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
-        let partition_cols = self.effective_table_config.partition_columns().to_vec();
         // Check if partition columns should be materialized into data files.
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a StructPatch expression that drops partition columns (unless materialized) and
-        // void columns at all nesting levels.
-        let mut patch = ExpressionStructPatch::new_top_level();
+        // Build a StructPatch expression that drops partition columns from the input
+        // (unless they should be materialized) and drop void columns at all nesting levels.
+        let mut patch = ExpressionStructPatchBuilder::new();
         if !should_materialize_partition_columns {
-            for col in &partition_cols {
-                patch = patch.with_dropped_field_if_exists(col);
+            for col in self.effective_table_config.partition_columns() {
+                patch = patch.drop_if_exists(col);
             }
         }
-        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema(), &[]);
-        Ok(Expression::struct_patch(patch))
+        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema());
+        Expression::struct_patch(patch)
     }
 
     /// Returns the logical partition column names for this table.
@@ -1140,7 +1138,7 @@ impl<S> Transaction<S> {
                     .iter()
                     .map(|col| {
                         let data_type = physical_schema
-                            .walk_column_fields(col)?
+                            .fields_of_path(col)?
                             .last()
                             .map(|field| field.data_type().clone())
                             .ok_or_else(|| {
@@ -1246,8 +1244,10 @@ impl<S> Transaction<S> {
                 let commit_versions_array =
                     ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
+                let row_tracking_schema =
+                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![])))?;
                 add_files_batch.append_columns(
-                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
+                    row_tracking_schema,
                     vec![base_row_ids_array, commit_versions_array],
                 )
             },
@@ -1257,8 +1257,8 @@ impl<S> Transaction<S> {
         let add_actions = build_add_actions(
             engine,
             extended_add_files,
-            with_row_tracking_cols(self.add_files_schema()),
-            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+            with_row_tracking_cols(self.add_files_schema())?,
+            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()))?,
             self.data_change,
         );
 
@@ -1425,8 +1425,8 @@ impl<S> Transaction<S> {
                 self.data_change,
                 columns_to_drop,
                 coalesce_stats_with_parsed,
-            );
-            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)]));
+            )?;
+            let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
@@ -1475,61 +1475,47 @@ fn build_remove_struct_patch(
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
-) -> ExpressionStructPatch {
-    let mut patch = ExpressionStructPatch::new_top_level()
+) -> DeltaResult<ExpressionStructPatch> {
+    let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
-        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        .insert_after("path", lit(commit_timestamp))
         // dataChange
-        .with_inserted_field(Some("path"), Expression::literal(data_change).into())
+        .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .with_inserted_field(Some("path"), Expression::literal(true).into())
-        .with_inserted_field(
-            Some("path"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
-        );
+        .insert_after("path", lit(true))
+        .insert_after("path", col!(FILE_CONSTANT_VALUES_NAME, "partitionValues"));
 
     if coalesce_stats_with_parsed {
-        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
-        // Both expressions are registered on the "stats" field_patch (is_replace=true),
-        // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
+        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
-            Expression::column(["stats"]),
-            Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
+            col!("stats"),
+            Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch
-            .with_replaced_field("stats", coalesce_stats.into())
-            .with_inserted_field(
-                Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-            )
-            .with_dropped_field_if_exists(STATS_PARSED_NAME);
-    } else {
-        // tags inserted after stats; stats passes through unchanged
-        patch = patch.with_inserted_field(
-            Some("stats"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-        );
+            .replace("stats", coalesce_stats)
+            .drop(STATS_PARSED_NAME);
     }
 
     patch = patch
-        .with_inserted_field(
-            Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
+        .insert_after("stats", col!(FILE_CONSTANT_VALUES_NAME, TAGS_NAME))
+        .insert_after(
+            "deletionVector",
+            col!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME),
         )
-        .with_inserted_field(
-            Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
+        .insert_after(
+            "deletionVector",
+            col!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME),
         )
-        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-        .with_dropped_field("modificationTime")
+        .drop(FILE_CONSTANT_VALUES_NAME)
+        .drop("modificationTime")
         // Added to scan output when the predicate touches a partition column.
-        .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
+        .drop_if_exists(PARTITION_VALUES_PARSED_NAME);
 
     for column_to_drop in columns_to_drop {
-        patch = patch.with_dropped_field(*column_to_drop);
+        patch = patch.drop(*column_to_drop);
     }
 
-    patch
+    patch.build()
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to

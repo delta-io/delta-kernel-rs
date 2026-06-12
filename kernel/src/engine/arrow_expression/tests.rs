@@ -1284,9 +1284,8 @@ fn test_evaluator_mixed_string_types_identity_transform() {
     let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
     let handler = ArrowEvaluationHandler;
-    let expression: ExpressionRef = Arc::new(Expression::StructPatch(
-        ExpressionStructPatch::new_top_level(),
-    ));
+    let expression: ExpressionRef =
+        Arc::new(Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap());
     handler
         .new_expression_evaluator(input_schema, expression, output_type)
         .unwrap()

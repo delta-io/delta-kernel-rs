@@ -12,8 +12,8 @@ use uuid::Uuid;
 use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, ColumnName, DataType, ExistingColumnMappingAnnotations, MapType,
-    MetadataValue, Schema, StructField, StructType,
+    ArrayType, ColumnMetadataKey, ColumnName, DataType, ExistingColumnMappingAnnotations,
+    MakePhysical, MapType, MetadataValue, Schema, StructField, StructType,
 };
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -109,13 +109,7 @@ pub(crate) fn column_mapping_mode(
 /// ]}
 /// ```
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
-    let mut validator = ValidateColumnMappings {
-        mode,
-        logical_path: vec![],
-        seen_ids: HashMap::new(),
-        sibling_names_stack: vec![],
-    };
-    validator.transform_struct(schema)
+    MakePhysical::validate_schema_column_mapping(mode, schema)
 }
 
 /// Validates a field's column mapping annotations and extracts the physical name and column
@@ -286,70 +280,6 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     }
 
     Ok((physical_name, id))
-}
-
-struct ValidateColumnMappings<'a> {
-    mode: ColumnMappingMode,
-    /// Logical path of current field's parent, used for error messages.
-    logical_path: Vec<&'a str>,
-    /// `delta.columnMapping.id` -> first claimer logical name.
-    seen_ids: HashMap<i64, &'a str>,
-    /// Stack of sibling-`physicalName` maps. The top of the stack holds the current field's
-    /// siblings: key is the sibling's physical name, value is its logical name. Frames are
-    /// pushed in `transform_struct` (root struct included) and popped after iterating its
-    /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
-    /// elements / keys / values are anonymous.
-    sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
-}
-
-impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner<V>(&mut self, logical_name: &'a str, validate: V) -> DeltaResult<()>
-    where
-        V: FnOnce(&mut Self) -> DeltaResult<()>,
-    {
-        self.logical_path.push(logical_name);
-        let result = validate(self);
-        self.logical_path.pop();
-        result
-    }
-}
-
-impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
-    transform_output_type!(|'a, T| DeltaResult<()>);
-
-    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<()> {
-        self.sibling_names_stack.push(HashMap::new());
-        let result = self.recurse_into_struct(stype);
-        self.sibling_names_stack.pop();
-        result
-    }
-
-    // Override array element and map key/value for better error messages
-    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
-        self.transform_inner("<array element>", |this| this.transform(etype))
-    }
-    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<()> {
-        self.transform_inner("<map key>", |this| this.transform(ktype))
-    }
-    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<()> {
-        self.transform_inner("<map value>", |this| this.transform(vtype))
-    }
-    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
-        validate_and_extract_column_mapping_annotations(
-            field,
-            self.mode,
-            &self.logical_path,
-            Some(&mut self.seen_ids),
-            self.sibling_names_stack.last_mut(),
-        )?;
-        self.transform_inner(field.name(), |this| this.recurse_into_struct_field(field))
-    }
-    fn transform_variant(&mut self, _stype: &'a StructType) -> DeltaResult<()> {
-        // don't recurse into variant's fields, as they are not expected to have column mapping
-        // annotations
-        // TODO: this changes with icebergcompat right? see issue#1125 for icebergcompat.
-        Ok(())
-    }
 }
 
 // ============================================================================
@@ -789,7 +719,7 @@ pub(crate) fn get_any_level_column_physical_name(
     col_name: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ColumnName> {
-    let fields = schema.walk_column_fields(col_name)?;
+    let fields = schema.fields_of_path(col_name)?;
     let physical_path: Vec<String> = fields
         .iter()
         .map(|field| -> DeltaResult<String> {
@@ -825,11 +755,16 @@ pub(crate) fn physical_to_logical_column_name(
     physical_col: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ColumnName> {
-    let fields = logical_schema.walk_column_fields_by(physical_col, |s, phys_name| {
-        s.fields()
-            .find(|f| f.physical_name(column_mapping_mode) == phys_name)
-    })?;
-    Ok(ColumnName::new(fields.iter().map(|f| f.name.clone())))
+    let mut fields = vec![];
+    logical_schema.visit_fields_of_path_by(
+        physical_col,
+        |s, phys_name| {
+            s.fields()
+                .find(|f| f.physical_name(column_mapping_mode) == phys_name)
+        },
+        |field| fields.push(field),
+    )?;
+    Ok(ColumnName::new(fields.iter().map(|f| &f.name)))
 }
 
 #[cfg(test)]

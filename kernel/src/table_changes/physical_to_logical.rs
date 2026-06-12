@@ -228,17 +228,17 @@ mod tests {
         // Should have a patch for the "id" field with CDF metadata
         assert!(patch.field_patches.contains_key("id"));
         let id_patch = &patch.field_patches["id"];
-        assert!(!id_patch.is_replace);
-        assert_eq!(id_patch.exprs.len(), 2);
+        assert!(id_patch.keep_input);
+        assert_eq!(id_patch.insertions.len(), 2);
 
         // Verify _change_type is "insert" for Add files
-        let Expression::Literal(change_type) = id_patch.exprs[0].as_ref() else {
+        let Expression::Literal(change_type) = id_patch.insertions[0].as_ref() else {
             panic!("Expected literal for _change_type");
         };
         assert_eq!(change_type, &Scalar::String("insert".to_string()));
 
         // Verify _commit_version
-        let Expression::Literal(version) = id_patch.exprs[1].as_ref() else {
+        let Expression::Literal(version) = id_patch.insertions[1].as_ref() else {
             panic!("Expected literal for _commit_version");
         };
         assert_eq!(version, &Scalar::Long(100));
@@ -272,10 +272,10 @@ mod tests {
         };
 
         let name_patch = &patch.field_patches["name"];
-        assert_eq!(name_patch.exprs.len(), 1);
+        assert_eq!(name_patch.insertions.len(), 1);
 
         // Verify _change_type is "delete" for Remove files
-        let Expression::Literal(change_type) = name_patch.exprs[0].as_ref() else {
+        let Expression::Literal(change_type) = name_patch.insertions[0].as_ref() else {
             panic!("Expected literal for _change_type");
         };
         assert_eq!(change_type, &Scalar::String("delete".to_string()));
@@ -322,8 +322,8 @@ mod tests {
 
         // Should have age partition value
         let id_patch = &patch.field_patches["id"];
-        assert_eq!(id_patch.exprs.len(), 1);
-        let Expression::Literal(age_value) = id_patch.exprs[0].as_ref() else {
+        assert_eq!(id_patch.insertions.len(), 1);
+        let Expression::Literal(age_value) = id_patch.insertions[0].as_ref() else {
             panic!("Expected literal for age");
         };
         assert_eq!(age_value, &Scalar::Long(30));
@@ -332,10 +332,10 @@ mod tests {
         // The transform spec has DynamicColumn which becomes a Column expression for CDC files
         // (not a literal metadata value)
         let name_patch = &patch.field_patches["name"];
-        assert_eq!(name_patch.exprs.len(), 1);
+        assert_eq!(name_patch.insertions.len(), 1);
         // Should be a Column expression, not a Literal
         assert!(matches!(
-            name_patch.exprs[0].as_ref(),
+            name_patch.insertions[0].as_ref(),
             Expression::Column(_)
         ));
     }
