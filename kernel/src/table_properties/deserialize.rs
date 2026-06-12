@@ -104,6 +104,9 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
+        WRITE_PARTITION_COLUMNS_TO_PARQUET => {
+            props.write_partition_columns_to_parquet = Some(parse_bool(v)?)
+        }
         _ => return None,
     }
     Some(())

@@ -23,6 +23,8 @@ use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::{begin_transaction, read_scan, test_table_setup_mt, write_batch_to_table};
 
+use crate::common::write_utils::read_parquet_root_schema;
+
 // ==============================================================================
 // Tests
 // ==============================================================================
@@ -826,6 +828,106 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     assert!(
         stats[NULL_COUNT].get(partition_col).is_none(),
         "partition column should not have nullCount even when materialized"
+    );
+
+    Ok(())
+}
+
+/// Verifies that partition columns are materialized in parquet data files under all combinations
+/// of `delta.writePartitionColumnsToParquet`, `materializePartitionColumns`, and `icebergCompatV3`.
+/// Partition columns should be present in parquet in every case EXCEPT when
+/// `writePartitionColumnsToParquet` is explicitly `false` and neither
+/// `materializePartitionColumns` nor `icebergCompatV3` is enabled.
+#[rstest]
+#[case::default_property_materializes(None, false, false, true)]
+#[case::explicit_true_materializes(Some("true"), false, false, true)]
+#[case::false_strips_partition_col(Some("false"), false, false, false)]
+#[case::materialize_feature_overrides_false(Some("false"), true, false, true)]
+#[case::iceberg_v3_overrides_false(Some("false"), false, true, true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_partition_columns_to_parquet_property(
+    #[case] write_pcols_property_value: Option<&str>,
+    #[case] enable_materialize_feature: bool,
+    #[case] enable_iceberg_v3: bool,
+    #[case] expected_materialized: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let partition_col = "region";
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::nullable(partition_col, DataType::STRING),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = url::Url::from_directory_path(&table_path).unwrap();
+
+    let mut props: Vec<(&str, &str)> = Vec::new();
+    if let Some(val) = write_pcols_property_value {
+        props.push(("delta.writePartitionColumnsToParquet", val));
+    }
+    if enable_materialize_feature {
+        props.push(("delta.feature.materializePartitionColumns", "supported"));
+    }
+    if enable_iceberg_v3 {
+        props.push(("delta.enableIcebergCompatV3", "true"));
+    }
+
+    let _ = create_table(&table_path, schema.clone(), "test/1.0")
+        .with_data_layout(DataLayout::partitioned([partition_col]))
+        .with_table_properties(props)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+
+    // Write one row.
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![42])),
+            Arc::new(StringArray::from(vec!["us-east"])),
+        ],
+    )?;
+    let partition_values =
+        HashMap::from([(partition_col.to_string(), Scalar::String("us-east".into()))]);
+    let _snapshot =
+        write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // Read the add action from the write commit (version 1) and locate the parquet file.
+    let (_add, rel_path) = read_single_add(&table_path, 1)?;
+    let parquet_url = table_url.join(&rel_path).unwrap();
+    let parquet_file_path = parquet_url.to_file_path().unwrap();
+    let parquet_schema = read_parquet_root_schema(&parquet_file_path);
+
+    // Resolve the physical name of the partition column (differs under column mapping).
+    let logical_schema = snapshot.schema();
+    let cm_mode = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let physical_name = logical_schema
+        .field(partition_col)
+        .unwrap()
+        .physical_name(cm_mode);
+
+    let has_partition_col = parquet_schema
+        .get_fields()
+        .iter()
+        .any(|f| f.name() == physical_name);
+
+    assert_eq!(
+        has_partition_col,
+        expected_materialized,
+        "partition column '{partition_col}' (physical: '{physical_name}') {} in parquet; \
+         write_pcols={write_pcols_property_value:?}, materialize_feature={enable_materialize_feature}, \
+         iceberg_v3={enable_iceberg_v3}",
+        if expected_materialized {
+            "should be present"
+        } else {
+            "should NOT be present"
+        }
     );
 
     Ok(())
