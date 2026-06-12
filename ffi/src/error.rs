@@ -1,4 +1,6 @@
 use delta_kernel::{DeltaResult, Error};
+#[cfg(feature = "declarative-plans")]
+use tracing::warn;
 
 #[cfg(feature = "declarative-plans")]
 use crate::handle::Handle;
@@ -252,7 +254,11 @@ pub struct EngineExecError {
     pub message: Handle<ExclusiveRustString>,
 }
 
-/// Generic result wrapper around an EngineExecError.
+/// Generic wrapper around an EngineExecError, representing the result of an engine upcall.
+///
+/// Typically, engines will populate an out pointer with this result type. We include an `Uninit`
+/// variant to signal that the engine returned without writing to the out pointer. Kernel should
+/// always initialize such an out pointer to `Uninit` before handing it to an engine upcall.
 ///
 /// The variants are deliberately named `Success`/`Failure` rather than `Ok`/`Err` to avoid a
 /// conflict with [`ExternResult`]. This is due to an issue in cbindgen, where generic types sharing
@@ -262,6 +268,18 @@ pub struct EngineExecError {
 pub enum EngineExecResult<T> {
     Success(T),
     Failure(EngineExecError),
+    Uninit,
+}
+
+/// Maps the given KernelError code to the given Error variant. Logs a warning if the associated
+/// error message is non-empty. Useful for mapping kernel errors to error variants that don't
+/// carry a message, but for some reason the engine still provided one.
+#[cfg(feature = "declarative-plans")]
+fn messageless_error(code: KernelError, message: String, error: Error) -> Error {
+    if !message.is_empty() {
+        warn!("Discarding message for engine execution error ({code:?}): {message}");
+    }
+    error
 }
 
 #[cfg(feature = "declarative-plans")]
@@ -297,10 +315,18 @@ impl From<EngineExecError> for Error {
             KernelError::UnsupportedError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
             KernelError::SchemaError => Error::Schema(message),
-            KernelError::MissingVersionError => Error::MissingVersion,
-            KernelError::MissingMetadataError => Error::MissingMetadata,
-            KernelError::MissingProtocolError => Error::MissingProtocol,
-            KernelError::MissingMetadataAndProtocolError => Error::MissingMetadataAndProtocol,
+            code @ KernelError::MissingVersionError => {
+                messageless_error(code, message, Error::MissingVersion)
+            }
+            code @ KernelError::MissingMetadataError => {
+                messageless_error(code, message, Error::MissingMetadata)
+            }
+            code @ KernelError::MissingProtocolError => {
+                messageless_error(code, message, Error::MissingProtocol)
+            }
+            code @ KernelError::MissingMetadataAndProtocolError => {
+                messageless_error(code, message, Error::MissingMetadataAndProtocol)
+            }
 
             // These codes have no well-defined equivalent (e.g they wrap a foreign error type,
             // carry a non-string payload, etc), so just map them to a generic error and

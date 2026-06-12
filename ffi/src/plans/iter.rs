@@ -8,8 +8,10 @@
 //! # `next()` protocol
 //!
 //! Each `next` callback writes its result as an `OptionalValue<EngineExecResult<T>>` (mirroring
-//! Rust's `Option<Result<T>>`) into a caller-provided out pointer. This allows us to implement
-//! `DeltaResultIterator<T>`:
+//! Rust's `Option<Result<T>>`) into a caller-provided out pointer. The out pointer is
+//! pre-initialized to `Some(EngineExecResult::Uninit)`.
+//!
+//! This allows us to implement `DeltaResultIterator<T>` semantics:
 //!     - The outer Option represents whether iteration is complete (`None` = done)
 //!     - The inner [`EngineExecResult`] represents the item (`Success`) or an engine-side error
 //!       (`Failure`)
@@ -25,15 +27,13 @@
 //!    use FFI_ArrowArray as a carrier for the item (which internally manages its own release
 //!    callback).
 //!
-//! 3. Errors - each [`EngineExecError`](crate::error::EngineExecError) carries an engine-allocated
+//! 3. Errors - each [`EngineExecError`](crate::error::EngineExecError) carries a kernel-allocated
 //!    `ExclusiveRustString` message handle. Kernel takes ownership of the message and frees it when
 //!    converting the error into a kernel error (via `From<EngineExecError> for Error`).
 //!
 //! # Safety
 //! The engine is responsible for ensuring that all `state`, `next`, and `free` pointers
 //! are safe to send between threads.
-
-use std::mem::MaybeUninit;
 
 use bytes::Bytes;
 use delta_kernel::arrow::array::ffi::{self as arrow_ffi, FFI_ArrowArray, FFI_ArrowSchema};
@@ -55,12 +55,6 @@ use crate::{ExclusiveEngineData, NullableCvoid, OptionalValue};
 /// Function pointer an engine iterator uses to yield its next item into `out`.
 ///
 /// See "`next()` protocol" in the module docs.
-///
-/// # Safety
-///
-/// The engine MUST fully initialize `*out` before returning. Kernel reads
-/// `*out` via [`MaybeUninit::assume_init`](std::mem::MaybeUninit::assume_init), so returning
-/// without writing it will cause undefined behavior.
 pub type CIterNextFn<T> =
     extern "C" fn(state: NullableCvoid, out: *mut OptionalValue<EngineExecResult<T>>);
 
@@ -121,6 +115,21 @@ pub struct CFileMetaIterator {
 // Rust Iterator adapters
 // ============================================================================
 
+/// Helper function for invokeing an engine iterator's `next` callback and normalizing its
+/// out-pointer result into the next raw item.
+fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<DeltaResult<T>> {
+    let mut out = OptionalValue::Some(EngineExecResult::Uninit);
+    next(state, &mut out);
+    match out {
+        OptionalValue::None => None,
+        OptionalValue::Some(EngineExecResult::Success(item)) => Some(Ok(item)),
+        OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
+        OptionalValue::Some(EngineExecResult::Uninit) => Some(Err(Error::internal_error(
+            "FFI engine iterator returned from next upcall without writing an item",
+        ))),
+    }
+}
+
 /// An abstraction for invoking an engine iterator's `free` callback exactly once, when dropped.
 ///
 /// Embedding this in every `Ffi*Iter` adapter provides a single shared mechanism for ensuring the
@@ -168,19 +177,10 @@ impl Iterator for FfiEngineDataIter {
     type Item = DeltaResult<Box<dyn EngineData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut out = MaybeUninit::uninit();
-        (self.next)(self.cleanup.state(), out.as_mut_ptr());
-        // SAFETY: the engine contract (see `CIterNextFn`) requires `next` to initialize `out`
-        // before returning.
-        match unsafe { out.assume_init() } {
-            OptionalValue::None => None,
-            OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
-            OptionalValue::Some(EngineExecResult::Success(handle)) => {
-                // into_inner transfers ownership of the EngineData to kernel, and kernel
-                // will free it when the yielded EngineData is dropped.
-                Some(Ok(unsafe { handle.into_inner() }))
-            }
-        }
+        // into_inner transfers ownership of the EngineData to kernel, and kernel will free it when
+        // the yielded EngineData is dropped.
+        next_item(self.next, self.cleanup.state())
+            .map(|item| item.map(|handle| unsafe { handle.into_inner() }))
     }
 }
 
@@ -234,17 +234,8 @@ impl Iterator for FfiBytesIter {
     type Item = DeltaResult<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut out = MaybeUninit::uninit();
-        (self.next)(self.cleanup.state(), out.as_mut_ptr());
-        // SAFETY: the engine contract (see `CIterNextFn`) requires `next` to initialize `out`
-        // before returning.
-        match unsafe { out.assume_init() } {
-            OptionalValue::None => None,
-            OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
-            OptionalValue::Some(EngineExecResult::Success(array)) => {
-                Some(Self::arrow_array_to_bytes(array))
-            }
-        }
+        next_item(self.next, self.cleanup.state())
+            .map(|item| item.and_then(Self::arrow_array_to_bytes))
     }
 }
 
@@ -256,7 +247,7 @@ unsafe impl Send for FfiBytesIter {}
 /// [`CFileMetaIterator`].
 ///
 /// Buffers each engine-yielded batch and surfaces one row per `Iterator::next` call. Permanantly
-/// terminates if the engine returns None or a batch fails to decode. Errors surfaced directly by
+/// terminates if the engine returns None or a batch fails to decode. Errors surfaced from
 /// the engine `next` callback are considered transient and do NOT terminate iteration.
 pub(crate) struct FfiFileMetaIter {
     next: CIterNextFn<FFI_ArrowArray>,
@@ -367,27 +358,22 @@ impl Iterator for FfiFileMetaIter {
             }
 
             // Buffer drained and iteration is still live; pull the next batch from the engine.
-            let mut out = MaybeUninit::uninit();
-            (self.next)(self.cleanup.state(), out.as_mut_ptr());
-            // SAFETY: the engine contract (see `CIterNextFn`) requires `next` to initialize `out`
-            // before returning.
-            match unsafe { out.assume_init() } {
-                OptionalValue::None => {
+            let array = match next_item(self.next, self.cleanup.state()) {
+                None => {
                     self.terminated = true;
                     return None;
                 }
-                OptionalValue::Some(EngineExecResult::Failure(err)) => {
-                    return Some(Err(err.into()))
-                }
-                OptionalValue::Some(EngineExecResult::Success(array)) => {
-                    match Self::arrow_array_to_file_metas(array) {
-                        Ok(batch) => self.buffer = batch.into_iter(),
-                        Err(e) => {
-                            // Decoder errors (including empty batches) are fatal
-                            self.terminated = true;
-                            return Some(Err(e));
-                        }
-                    }
+                // Engine-reported errors (and a missing result) are transient and do not terminate
+                // iteration.
+                Some(Err(err)) => return Some(Err(err)),
+                Some(Ok(array)) => array,
+            };
+            match Self::arrow_array_to_file_metas(array) {
+                Ok(batch) => self.buffer = batch.into_iter(),
+                Err(e) => {
+                    // Decoder errors (including empty batches) indicate corrupt data and are fatal.
+                    self.terminated = true;
+                    return Some(Err(e));
                 }
             }
         }
@@ -747,5 +733,31 @@ mod tests {
         assert!(!cleanup_called.load(Ordering::SeqCst));
         drop(iter);
         assert!(cleanup_called.load(Ordering::SeqCst));
+    }
+
+    /// A `next` callback that returns without writing the out pointer must surface as an internal
+    /// error (from the pre-initialized `Uninit` sentinel) rather than reading uninitialized memory.
+    #[test]
+    fn ffi_iter_uninitialized_out_surfaces_internal_error() {
+        extern "C" fn noop_next(
+            _state: NullableCvoid,
+            _out: *mut OptionalValue<EngineExecResult<Handle<ExclusiveEngineData>>>,
+        ) {
+        }
+        extern "C" fn noop_free(_state: NullableCvoid) {}
+
+        let mut iter = FfiEngineDataIter::new(CEngineDataIterator {
+            state: None,
+            next: noop_next,
+            free: noop_free,
+        });
+
+        let Some(Err(err)) = iter.next() else {
+            panic!("expected an error when the engine does not initialize the out pointer");
+        };
+        assert!(
+            matches!(err, Error::InternalError(_)),
+            "expected an internal error when the engine does not write the out pointer, got {err}"
+        );
     }
 }

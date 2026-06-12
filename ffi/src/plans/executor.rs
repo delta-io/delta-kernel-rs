@@ -1,9 +1,8 @@
 //! This module provides an FFI-backed implementation of the [`PlanExecutor`] trait (allowing plan
 //! execution to happen outside of Rust).
-use std::mem::MaybeUninit;
 use std::sync::Arc;
 
-use delta_kernel::{DeltaResult, Operation, ParquetFooter, PlanExecutor, PlanResult};
+use delta_kernel::{DeltaResult, Error, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::EngineExecResult;
@@ -24,13 +23,8 @@ pub struct SharedPlanExecutor;
 /// `out` - an out pointer into which the engine writes the result.
 ///
 /// Since the out result is written to caller (Kernel) provided memory, the kernel will also be
-/// responsible for freeing it.
-///
-/// # Safety
-///
-/// The engine MUST fully initialize `*out` before returning. Kernel reads `*out` via
-/// [`MaybeUninit::assume_init`](std::mem::MaybeUninit::assume_init), so returning without writing
-/// will cause undefined behavior.
+/// responsible for freeing it. Kernel will pre-initialize the out pointer to
+/// [`EngineExecResult::Uninit`] before handing it to the engine upcall.
 pub type CExecuteOpFn = extern "C" fn(
     context: NullableCvoid,
     plan_proto: KernelBytesSlice,
@@ -66,12 +60,16 @@ impl PlanExecutor for FfiPlanExecutor {
         let plan_proto_bytes: &[u8] = &[];
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
-        let mut out = MaybeUninit::uninit();
-        (self.callback)(self.context, plan_proto_slice, out.as_mut_ptr());
-        // SAFETY: the engine contract requires the callback to initialize `out` before returning.
-        let plan_result = match unsafe { out.assume_init() } {
+        let mut out = EngineExecResult::Uninit;
+        (self.callback)(self.context, plan_proto_slice, &mut out);
+        let plan_result = match out {
             EngineExecResult::Success(plan) => plan,
             EngineExecResult::Failure(err) => return Err(err.into()),
+            EngineExecResult::Uninit => {
+                return Err(Error::internal_error(
+                    "engine returned from execute_op upcall without writing the plan result",
+                ))
+            }
         };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
@@ -196,6 +194,31 @@ mod tests {
         assert!(
             matches!(err, Error::Unsupported(ref msg) if msg == "kaboom"),
             "expected Error::Unsupported(\"kaboom\"), got {err:?}"
+        );
+    }
+
+    /// A callback that returns without writing the out pointer must surface as an internal error
+    #[test]
+    fn execute_op_surfaces_uninitialized_out() {
+        extern "C" fn noop_execute_op(
+            _context: NullableCvoid,
+            _plan_proto: KernelBytesSlice,
+            _out: *mut EngineExecResult<CPlanResult>,
+        ) {
+        }
+
+        let executor = unsafe { get_plan_executor(None, noop_execute_op) };
+        let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
+
+        let url = Url::parse("memory:///table/").unwrap();
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+
+        let Err(err) = plan_executor.execute_op(op) else {
+            panic!("execute_op should surface an error when the engine does not write the result");
+        };
+        assert!(
+            matches!(err, Error::InternalError(_)),
+            "expected Error::InternalError, got {err:?}"
         );
     }
 
