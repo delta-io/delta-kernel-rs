@@ -12,7 +12,9 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
-use delta_kernel::history_manager::HistoryCommitType;
+use delta_kernel::history_manager::{
+    get_earliest_commit as kernel_get_earliest_commit, HistoryCommitType,
+};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
@@ -1030,17 +1032,14 @@ impl From<FfiHistoryCommitType> for HistoryCommitType {
 
 /// Get the earliest commit version available in the table's `_delta_log/` directory.
 ///
-/// The returned version is a lower bound only -- a concurrent log-cleanup operation may delete the
-/// underlying file before the caller acts on it.
-///
 /// # Parameters
 /// - `engine`: engine handle used to list the log directory.
 /// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
 /// - `earliest_ratified_commit_version`: for catalog-managed tables, the earliest version the
 ///   catalog has ratified a commit at; pass `OptionalValue::None` for filesystem-only tables.
-/// - `commit_type`: selects the query. [`FfiHistoryCommitType::Published`] returns the lowest
-///   published commit; [`FfiHistoryCommitType::Recreatable`] returns the earliest fully
-///   reconstructable version (commit 0 or the earliest complete checkpoint).
+/// - `commit_type`: selects the query. [`FfiHistoryCommitType::Published`] returns the earliest
+///   commit; [`FfiHistoryCommitType::Recreatable`] returns the earliest fully reconstructable
+///   version.
 ///
 /// # Safety
 ///
@@ -1069,7 +1068,7 @@ fn get_earliest_commit_impl(
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
 ) -> DeltaResult<Version> {
-    delta_kernel::history_manager::get_earliest_commit(
+    kernel_get_earliest_commit(
         extern_engine.engine().as_ref(),
         &log_root?,
         earliest_ratified_commit_version.into(),
@@ -1610,16 +1609,14 @@ mod tests {
     ) -> Handle<SharedExternEngine> {
         match setup {
             EarliestCommitTableSetupScenario::Filesystem => {
-                let (_storage, engine, snapshot) =
-                    make_engine_and_v0_snapshot(table_root).await.unwrap();
+                let (_, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await.unwrap();
                 unsafe { free_snapshot(snapshot) };
                 engine
             }
             EarliestCommitTableSetupScenario::CatalogManaged => {
-                let (_storage, engine, snapshot) =
-                    make_catalog_managed_engine_and_v0_snapshot(table_root)
-                        .await
-                        .unwrap();
+                let (_, engine, snapshot) = make_catalog_managed_engine_and_v0_snapshot(table_root)
+                    .await
+                    .unwrap();
                 unsafe { free_snapshot(snapshot) };
                 engine
             }
