@@ -375,6 +375,9 @@ fn binary_search_ict_timestamps(
 ///   `timestamp`.
 /// - `Bound::LeastUpper`: There is no commit whose timestamp is greater than or equal to the given
 ///   `timestamp`.
+///
+/// Propagates a [`LogHistoryError`] from getting the earliest recreatable commit when
+/// `resolved_commit_type` is [`HistoryCommitType::Recreatable`].
 pub(crate) fn timestamp_to_version(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -422,17 +425,31 @@ pub(crate) fn timestamp_to_version(
         ));
     }
 
-    let start_version: Option<Version> = match resolved_commit_type {
+    let listing_limit = match resolved_commit_type {
         HistoryCommitType::Published => None,
-        HistoryCommitType::Recreatable => Some(
-            get_earliest_commit(
+        HistoryCommitType::Recreatable => {
+            let earliest = get_earliest_commit(
                 engine,
                 &snapshot.log_segment().log_root,
                 None,
                 HistoryCommitType::Recreatable,
             )
-            .map_err(|e| LogHistoryError::internal("failed to get earliest commit", e))?,
-        ),
+            .map_err(|e| match e {
+                DeltaError::LogHistory(inner) => *inner,
+                _ => LogHistoryError::internal("failed to get earliest commit", e),
+            })?;
+            let limit = snapshot
+                .version()
+                .checked_sub(earliest)
+                .and_then(|diff| usize::try_from(diff + 1).ok())
+                .and_then(NonZero::new)
+                .ok_or_else(|| {
+                    LogHistoryError::internal_message(
+                        "earliest recreatable version exceeds snapshot version",
+                    )
+                })?;
+            Some(limit)
+        }
     };
 
     // Build a dedicated log segment for timestamp conversion. We cannot reuse
@@ -443,11 +460,7 @@ pub(crate) fn timestamp_to_version(
         engine.storage_handler().as_ref(),
         snapshot.log_segment().log_root.clone(),
         snapshot.version(),
-        start_version
-            .and_then(|v| snapshot.version().checked_sub(v))
-            .map(|diff| diff + 1)
-            .and_then(|count| usize::try_from(count).ok())
-            .and_then(NonZero::new),
+        listing_limit,
     )
     .map_err(|e| {
         LogHistoryError::internal("failed to build log segment for timestamp conversion", e)
@@ -1965,7 +1978,7 @@ mod tests {
     #[case::published_sees_orphan(HistoryCommitType::Published, 15, CommitAt::new(2, 20))]
     #[case::recreatable_skips_to_anchor(HistoryCommitType::Recreatable, 15, CommitAt::new(3, 30))]
     #[tokio::test]
-    async fn first_version_after_with_commit_type(
+    async fn test_first_version_after_with_commit_type(
         #[case] commit_type: HistoryCommitType,
         #[case] timestamp: Timestamp,
         #[case] expected: CommitAt,

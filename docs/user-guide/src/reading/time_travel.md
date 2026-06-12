@@ -176,6 +176,11 @@ the table's full history. `timestamp_range_to_versions` is the most
 common of the three because it translates a `[start_ts, end_ts]` window
 into the version range that change data feed (CDF) queries need to read.
 
+The helper function also take a `resolved_commit_type`, controlling which
+versions are eligible. Pass `HistoryCommitType::Recreatable` to restrict
+the result to versions whose table state you can actually load.
+Pass `HistoryCommitType::Published` to allow any version that still has a commit file.
+
 ```rust,no_run
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
