@@ -345,8 +345,8 @@ impl From<EngineExecError> for Error {
             | KernelError::ParseIntervalError
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
-            | KernelError::LiteralExpressionTransformError)
-            | KernelError::LogHistoryError => {
+            | KernelError::LiteralExpressionTransformError
+            | KernelError::LogHistoryError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
             #[cfg(feature = "default-engine-base")]
