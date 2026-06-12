@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int64Array, RecordBatch};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
     column_expr, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
@@ -23,6 +24,8 @@ use delta_kernel::expressions::{
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -561,6 +564,89 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
         2
+    );
+    Ok(())
+}
+
+// === RFC 3339 offset partition values (#2733) ===
+//
+// A foreign writer can emit a timestamp partition value with a non-UTC RFC 3339 offset
+// (spec-conformant writers emit only the `Z` form). The offset must be honored and the
+// value normalized to UTC. Before the #2733 fix, `2024-06-15T14:30:00+05:00` was read as
+// 14:30 UTC instead of 09:30 UTC, silently inverting partition pruning.
+
+/// Builds a Delta commit body containing a `commitInfo` plus one stats-less Add per
+/// `(path, ts_partition_value)`.
+fn commit_with_ts_partitioned_adds(version: u64, adds: &[(&str, &str)]) -> String {
+    let mut lines = vec![format!(
+        r#"{{"commitInfo":{{"timestamp":1700000000000,"operation":"WRITE","version":{version}}}}}"#
+    )];
+    for (path, ts) in adds {
+        lines.push(format!(
+            r#"{{"add":{{"path":"{path}","size":1024,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{{"ts":"{ts}"}}}}}}"#
+        ));
+    }
+    lines.join("\n")
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_pruning_honors_rfc3339_offset_partition_values(
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("ts", DataType::TIMESTAMP),
+        StructField::nullable("v", DataType::LONG),
+    ])?);
+    create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["ts"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // v1: adds in the style of an offset-emitting foreign writer. Pruning never opens data
+    // files, so fake paths are fine. The two partition values denote *different* instants:
+    // file_A is 2024-06-15T09:30:00Z once its +05:00 offset is honored, file_B is 14:30:00Z.
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        commit_with_ts_partitioned_adds(
+            1,
+            &[
+                ("file_A.parquet", "2024-06-15T14:30:00+05:00"),
+                ("file_B.parquet", "2024-06-15T14:30:00Z"),
+            ],
+        ),
+    )
+    .await?;
+
+    let nine_thirty_utc_us: i64 = 1_718_443_800_000_000; // 2024-06-15T09:30:00Z
+    let fourteen_thirty_utc_us: i64 = 1_718_461_800_000_000; // 2024-06-15T14:30:00Z
+
+    // ts == 09:30Z must keep only file_A (its +05:00 value normalized to 09:30 UTC). Before
+    // the fix this kept zero files: file_A's offset was dropped, so it read as 14:30 UTC.
+    let predicate = Arc::new(Pred::eq(
+        column_expr!("ts"),
+        Expr::literal(Scalar::Timestamp(nine_thirty_utc_us)),
+    ));
+    assert_eq!(
+        surviving_files(&table_path, engine.clone(), predicate, use_parallel)?,
+        1
+    );
+
+    // ts == 14:30Z must keep only file_B. Before the fix this kept both files.
+    let predicate = Arc::new(Pred::eq(
+        column_expr!("ts"),
+        Expr::literal(Scalar::Timestamp(fourteen_thirty_utc_us)),
+    ));
+    assert_eq!(
+        surviving_files(&table_path, engine, predicate, use_parallel)?,
+        1
     );
     Ok(())
 }
