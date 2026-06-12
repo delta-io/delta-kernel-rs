@@ -11,7 +11,9 @@ rust-version.workspace = true
 
 # for cargo-release
 [package.metadata.release]
-release = false
+pre-release-replacements = [
+  { file = "../README.md", search = "delta_kernel_default_engine = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel_default_engine = { version = \"{{version}}\"" },
+]
 
 [dependencies]
 delta_kernel = { path = "../kernel", version = "0.24.0", features = [

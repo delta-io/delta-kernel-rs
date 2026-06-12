@@ -450,13 +450,8 @@ fn resolve_input_schema<'a>(
         Some(input_path) if !input_path.path().is_empty() => input_path,
         _ => return Ok(input_schema),
     };
-    let fields = input_schema.walk_column_fields(input_path)?;
-    let Some(leaf) = fields.last() else {
-        return Err(Error::internal_error(format!(
-            "walk_column_fields returned an empty field list for input path '{input_path}'"
-        )));
-    };
-    let DataType::Struct(nested_schema) = leaf.data_type() else {
+    let field = input_schema.field_at(input_path)?;
+    let DataType::Struct(nested_schema) = field.data_type() else {
         return Err(Error::generic(format!(
             "Patching failed: input path '{input_path}' references a non-struct field"
         )));
@@ -687,13 +682,8 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         ]
         .into_iter()
         .collect();
-        let fields = self.input_schema.walk_column_fields(&field_path)?;
-        let field = fields.last().ok_or_else(|| {
-            Error::internal_error(format!(
-                "walk_column_fields returned an empty field list for input path '{field_path}'"
-            ))
-        })?;
-        Ok((*field).clone())
+        let field = self.input_schema.field_at(&field_path)?;
+        Ok(field.clone())
     }
 
     /// Creates a new top-level projection patch builder over `input_schema`.
