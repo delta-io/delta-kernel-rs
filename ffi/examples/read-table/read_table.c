@@ -371,6 +371,9 @@ int main(int argc, char* argv[])
   enable_event_tracing(tracing_callback, TRACE);
   // we could also do something like this if we want less control over formatting
   // enable_formatted_log_line_tracing(log_line_callback, TRACE, FULL, true, true, false, false);
+
+  // also enable printing metrics
+  enable_metrics_reporting(print_metric);
 #else
   enable_event_tracing(tracing_callback, WARN);
 #endif
