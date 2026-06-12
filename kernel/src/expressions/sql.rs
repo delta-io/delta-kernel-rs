@@ -4,6 +4,10 @@
 //! strings in table metadata. This module turns those strings into kernel [`Expression`] values
 //! so the kernel can interpret them without depending on a full SQL parser.
 //!
+//! The grammar follows the Spark SQL standard: this parser implements a subset of Spark's SQL
+//! grammar rather than defining a kernel-specific dialect, so the forms it accepts match what
+//! Spark reads and writes.
+//!
 //! This is an intentionally light start: a small internal parser covering only the literal forms
 //! Delta metadata contains today. If the supported SQL surface grows, options include moving
 //! parsing behind the [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
@@ -21,21 +25,15 @@ use crate::{DeltaResult, Error};
 /// Parse a SQL string into an [`Expression`] that yields a value of the given [`DataType`]
 /// (e.g. the type of the column whose default is being parsed).
 ///
-/// # Accepted grammar
+/// Leading and trailing whitespace are ignored. `NULL` (case-insensitive) is accepted for any
+/// data type. All other input is parsed as a typed literal.
 ///
-/// Leading and trailing whitespace are ignored. Keywords (`NULL`, `TRUE`, `FALSE`, `DATE`,
-/// `TIMESTAMP`, `X`) are case-insensitive.
+/// # Examples
 ///
-/// - `NULL`: valid for any data type
-/// - String: `'foo'`, with `''` interpreted as an embedded single quote
-/// - Integer / Long / Short / Byte / Float / Double / Decimal: bare numeric literal with optional
-///   leading `+` or `-`
-/// - Boolean: `TRUE` / `FALSE`
-/// - Date: `'2024-01-01'` or `DATE '2024-01-01'`
-/// - Timestamp / TimestampNtz: `'2024-01-01 12:00:00[.fff]'` or `TIMESTAMP '...'`. `Timestamp` also
-///   accepts ISO 8601 / RFC 3339 form with a `Z` (UTC) suffix (e.g. `'1970-01-01T00:00:00.123Z'`);
-///   non-UTC offsets are not yet supported. `TimestampNtz` does not accept ISO form.
-/// - Binary: `X'deadbeef'` (even number of hex digits)
+/// The SQL comes from table metadata. A column declared `c DATE DEFAULT DATE '2024-01-01'` stores
+/// the string `DATE '2024-01-01'` as its default, and `parse_sql("DATE '2024-01-01'", &DATE)`
+/// parses it into `Expression::literal(Scalar::Date(..))`. The bare form `'2024-01-01'` is
+/// equivalent; the `DATE` keyword is optional.
 ///
 /// # Errors
 ///
@@ -55,8 +53,28 @@ pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expressi
     parse_literal(trimmed, data_type, sql)
 }
 
-/// Parse `trimmed` as a SQL literal of the given primitive `data_type`. NULL is handled in
-/// [`parse_sql`], so this never sees a bare `NULL`.
+/// Parse `trimmed` as a SQL literal of the given primitive `data_type`. Errors on a non-primitive
+/// `data_type`, or input that is not one of the accepted literal forms below.
+///
+/// # Accepted grammar
+///
+/// Keywords (`TRUE`, `FALSE`, `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`, `X`) are case-insensitive.
+///
+/// - String: `'foo'`, with `''` an embedded single quote (e.g. `'it''s'` -> `it's`). A backslash is
+///   rejected: Spark applies backslash escapes (`\n`, `\\`, ...) to string literals, not yet
+///   implemented here.
+/// - Integer / Long / Short / Byte / Float / Double / Decimal: bare numeric literal with optional
+///   leading `+` or `-`. Non-finite floats (`NaN`, `Infinity`) are rejected: Spark only emits those
+///   via an explicit cast (e.g. `CAST('NaN' AS DOUBLE)`), never as a bare literal.
+/// - Boolean: `TRUE` / `FALSE`
+/// - Date: `'2024-01-01'`, `DATE '2024-01-01'`, or `DATE'2024-01-01'` (the keyword may butt against
+///   the quote)
+/// - TimestampNtz: zoneless `'2024-01-01 12:00:00[.fff]'` or `TIMESTAMP_NTZ '...'` (wall-clock, no
+///   timezone)
+/// - Timestamp: ISO 8601 / RFC 3339 form with an explicit UTC `Z` suffix, e.g.
+///   `'1970-01-01T00:00:00.123Z'` or `TIMESTAMP '...Z'`. Zoneless and non-UTC-offset literals are
+///   rejected: Spark resolves them against the session timezone, which kernel cannot know.
+/// - Binary: `X'deadbeef'` (even number of hex digits)
 fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<Expression> {
     let DataType::Primitive(primitive) = data_type else {
         return Err(Error::generic(format!(
@@ -99,9 +117,9 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
         }
     };
 
-    // Trim the value inside the quotes to match Spark, whose stringToDate/stringToTimestamp
-    // trim their input. A no-op for the bare numeric/boolean path, which was trimmed with the
-    // whole input.
+    // Trim the value inside the quotes to match Spark, whose stringToDate/stringToTimestamp trim
+    // their input (e.g. `DATE ' 2024-01-01 '` -> `2024-01-01`). A no-op for the bare
+    // numeric/boolean path, which was already trimmed with the whole input.
     let raw = raw.trim();
 
     // parse_scalar maps empty input to NULL (partition-value convention), but an empty quoted
@@ -114,26 +132,40 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
         )));
     }
 
-    // TODO(#2733): parse_scalar matches an RFC 3339 offset then drops it, so `14:30:00+05:00`
-    // reads as 14:30 UTC instead of 09:30. Reject non-Z offsets for now (only follow the `T`/`t`).
-    let has_non_utc_offset = *primitive == PrimitiveType::Timestamp
-        && raw
-            .split_once(['T', 't'])
-            .is_some_and(|(_, time)| time.contains(['+', '-']));
-    if has_non_utc_offset {
+    // Spark resolves a zoneless TIMESTAMP (LTZ) against the session timezone, which kernel cannot
+    // know, so require an explicit UTC `Z`. This also covers non-UTC offsets (TODO(#2733)).
+    // TimestampNtz carries no zone, so it is unaffected.
+    if *primitive == PrimitiveType::Timestamp && !raw.ends_with(['Z', 'z']) {
         return Err(Error::generic(format!(
-            "timestamp literal with a non-UTC offset is not yet supported; use 'Z' (UTC): {sql}"
+            "TIMESTAMP literal must be in UTC with a 'Z' suffix; zoneless and non-UTC timestamps \
+             are not yet supported (Spark resolves them against the session timezone): {sql}"
         )));
     }
 
     let scalar = primitive.parse_scalar(raw)?;
+
+    // Spark stores a special float only as an explicit `CAST('NaN' AS DOUBLE)` (kept verbatim in
+    // the default), never as a bare `NaN`/`Infinity` token. Rust's float parser accepts those bare
+    // tokens, so reject the non-finite result here to stay consistent with Spark.
+    let is_non_finite = match scalar {
+        Scalar::Float(f) => !f.is_finite(),
+        Scalar::Double(d) => !d.is_finite(),
+        _ => false,
+    };
+    if is_non_finite {
+        return Err(Error::generic(format!(
+            "non-finite float literal requires an explicit cast, e.g. CAST('NaN' AS DOUBLE): {sql}"
+        )));
+    }
+
     Ok(Expression::literal(scalar))
 }
 
 /// Unquote a SQL string literal: strip the surrounding single quotes and un-escape each
 /// doubled-quote sequence `''` into a single `'`. Errors if `input` is not a properly
 /// terminated single-quoted string, including a missing closing quote or trailing characters
-/// after it.
+/// after it. Also errors on a backslash, since Spark applies backslash escapes (`\n`, `\\`, ...)
+/// to string literals and this parser does not yet implement them.
 fn unquote_string(input: &str) -> DeltaResult<String> {
     let body = input.strip_prefix('\'').ok_or_else(|| {
         Error::generic(format!("expected a single-quoted SQL string, got: {input}"))
@@ -144,6 +176,11 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars();
     while let Some(c) = chars.next() {
+        if c == '\\' {
+            return Err(Error::generic(format!(
+                "backslash escapes in SQL string literals are not yet supported: {input}"
+            )));
+        }
         if c != '\'' {
             out.push(c);
             continue;
@@ -163,17 +200,20 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
     )))
 }
 
-/// Strip an optional typed-literal keyword prefix (e.g. `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`)
-/// and then unwrap the required `'...'` quoted body. Any of the given `keywords` may appear
-/// as the prefix; case-insensitive.
+/// Strip an optional typed-literal keyword prefix (e.g. `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`) and
+/// unwrap the required `'...'` quoted body. Any of `keywords` may appear as the prefix
+/// (case-insensitive), separated from the quote by optional whitespace, so `DATE '2024-01-01'`,
+/// `DATE'2024-01-01'`, and bare `'2024-01-01'` are all accepted.
 fn strip_typed_prefix_and_unquote(input: &str, keywords: &[&str]) -> DeltaResult<String> {
-    let body = match input.split_once(char::is_whitespace) {
-        Some((prefix, rest)) if keywords.iter().any(|kw| prefix.eq_ignore_ascii_case(kw)) => {
-            rest.trim_start()
-        }
-        _ => input,
-    };
-    unquote_string(body)
+    // Match a keyword only as a complete token: it must be followed by the opening quote or
+    // whitespace, never more identifier characters (so `DATEX '..'` is not read as `DATE`).
+    let body = keywords.iter().find_map(|kw| {
+        let prefix = input.get(..kw.len())?;
+        let rest = &input[kw.len()..];
+        let is_token = rest.starts_with('\'') || rest.starts_with(char::is_whitespace);
+        (prefix.eq_ignore_ascii_case(kw) && is_token).then(|| rest.trim_start())
+    });
+    unquote_string(body.unwrap_or(input))
 }
 
 /// Decode a `X'hex'` SQL binary literal into a byte vector. The leading `X` is case-insensitive;
@@ -280,6 +320,7 @@ mod tests {
     #[rstest]
     #[case("'2024-01-01'", date_days(2024, 1, 1))]
     #[case("DATE '2024-01-01'", date_days(2024, 1, 1))]
+    #[case("DATE'2024-01-01'", date_days(2024, 1, 1))] // keyword butted against the quote
     #[case("date  '1970-01-02'", date_days(1970, 1, 2))]
     #[case("' 2024-01-01 '", date_days(2024, 1, 1))] // body is trimmed, matching Spark
     #[case("DATE ' 2024-01-01 '", date_days(2024, 1, 1))]
@@ -290,21 +331,30 @@ mod tests {
 
     #[rstest]
     #[case("'2024-01-01 12:34:56'", "2024-01-01 12:34:56")]
-    #[case("TIMESTAMP '2024-01-01 12:34:56.789'", "2024-01-01 12:34:56.789")]
     #[case("TIMESTAMP_NTZ '2024-01-01 12:34:56'", "2024-01-01 12:34:56")]
+    #[case("TIMESTAMP_NTZ'2024-01-01 12:34:56'", "2024-01-01 12:34:56")] // keyword butted against quote
     #[case("timestamp_ntz '2024-01-01 12:34:56.789'", "2024-01-01 12:34:56.789")]
     #[case("' 2024-01-01 12:34:56 '", "2024-01-01 12:34:56")] // body is trimmed, matching Spark
-    fn parses_timestamp_literals(#[case] sql: &str, #[case] equivalent: &str) {
-        let got = parse_sql(sql, &DataType::TIMESTAMP).unwrap();
+    fn parses_zoneless_timestamp_ntz_literals(#[case] sql: &str, #[case] equivalent: &str) {
+        let got = parse_sql(sql, &DataType::TIMESTAMP_NTZ).unwrap();
         assert_eq!(
             got,
-            Expression::literal(Scalar::Timestamp(ts_micros(equivalent)))
-        );
-
-        let got_ntz = parse_sql(sql, &DataType::TIMESTAMP_NTZ).unwrap();
-        assert_eq!(
-            got_ntz,
             Expression::literal(Scalar::TimestampNtz(ts_micros(equivalent)))
+        );
+    }
+
+    #[rstest]
+    #[case("'2024-01-01 12:34:56'")] // zoneless
+    #[case("TIMESTAMP '2024-01-01 12:34:56.789'")] // zoneless, with keyword
+    #[case("TIMESTAMP'2024-01-01 12:34:56'")] // zoneless, keyword butted against quote
+    #[case("' 2024-01-01 12:34:56 '")] // zoneless, padded
+    #[case("'2024-06-15T14:30:00+05:00'")] // non-UTC offset (parse_scalar drops it, see TODO(#2733))
+    #[case("TIMESTAMP '2024-06-15T14:30:00-05:00'")] // non-UTC offset
+    fn rejects_zoneless_and_non_utc_timestamp_ltz(#[case] sql: &str) {
+        let result = parse_sql(sql, &DataType::TIMESTAMP);
+        assert!(
+            result.is_err(),
+            "expected error for zoneless/non-UTC TIMESTAMP {sql:?}, got {result:?}"
         );
     }
 
@@ -391,12 +441,14 @@ mod tests {
     #[case("DATE ''", DataType::DATE)]
     #[case("' '", DataType::DATE)] // whitespace-only body trims to empty
     #[case("DATE ' '", DataType::DATE)]
+    #[case("DATEX '2024-01-01'", DataType::DATE)] // extra chars after keyword, not a token
+    #[case("DATEX'2024-01-01'", DataType::DATE)] // ditto, no space
     #[case("''", DataType::TIMESTAMP)]
     #[case("' '", DataType::TIMESTAMP)]
     #[case("TIMESTAMP ''", DataType::TIMESTAMP)]
+    #[case("TIMESTAMPX '2024-01-01 12:34:56'", DataType::TIMESTAMP)] // extra chars after keyword
     #[case("TIMESTAMP_NTZ ''", DataType::TIMESTAMP_NTZ)]
-    #[case("'2024-06-15T14:30:00+05:00'", DataType::TIMESTAMP)] // non-Z offset, see TODO(#2733)
-    #[case("TIMESTAMP '2024-06-15T14:30:00-05:00'", DataType::TIMESTAMP)] // non-Z offset
+    #[case("timestamp_ntza'2024-01-01 12:34:56'", DataType::TIMESTAMP_NTZ)] // extra chars, no space
     #[case("  now()  ", DataType::TIMESTAMP)] // function call with padding
     #[case("X'0'", DataType::BINARY)] // odd number of hex digits
     #[case("X'gg'", DataType::BINARY)] // non-hex chars
@@ -406,6 +458,40 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error for {sql:?} as {ty:?}, got {result:?}"
+        );
+    }
+
+    #[rstest]
+    fn rejects_bare_non_finite_floats(
+        #[values(
+            "NaN",
+            "nan",
+            "Infinity",
+            "infinity",
+            "inf",
+            "-inf",
+            "+inf",
+            "-Infinity"
+        )]
+        sql: &str,
+        #[values(DataType::FLOAT, DataType::DOUBLE)] ty: DataType,
+    ) {
+        let result = parse_sql(sql, &ty);
+        assert!(
+            result.is_err(),
+            "expected error for bare non-finite literal {sql:?} as {ty:?}, got {result:?}"
+        );
+    }
+
+    #[rstest]
+    #[case(r"'a\nb'")] // would-be newline escape
+    #[case(r"'c:\temp'")] // literal backslash in a path
+    #[case(r"'\\'")] // doubled backslash
+    fn rejects_backslash_in_string_literal(#[case] sql: &str) {
+        let result = parse_sql(sql, &DataType::STRING);
+        assert!(
+            result.is_err(),
+            "expected error for backslash in string literal {sql:?}, got {result:?}"
         );
     }
 
@@ -433,8 +519,6 @@ mod tests {
         assert!(parse_sql("'foo'", &ty).is_err());
     }
 
-    // NULL is special-cased and accepted before the primitive check, matching the protocol's
-    // stance that any column can be null.
     #[rstest]
     #[case::struct_target(struct_ty())]
     #[case::array_target(array_ty())]
