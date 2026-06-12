@@ -3,23 +3,26 @@
 //! Probes a snapshot's checkpoint topology -- no checkpoint, an inline *leaf* checkpoint, or a
 //! V2 *manifest* that references sidecars -- and, when stats are requested, resolves how those
 //! stats are surfaced (native `add.stats_parsed` struct vs JSON `add.stats` string). The probe is
-//! driven synchronously through a [`PlanExecutor`]. A checkpoint is a manifest only if it actually
-//! references sidecars: a parquet footer with no `sidecar` column is a leaf outright, but otherwise
-//! (a `sidecar` column present, or any JSON checkpoint) the column is drained through
+//! driven synchronously through a [`PlanExecutor`]. A V2 checkpoint is identified by a
+//! `checkpointMetadata` column in its schema (the footer or `_last_checkpoint` hint); only V2
+//! checkpoints can reference sidecars, so a parquet checkpoint lacking that column is a classic V1
+//! leaf outright. For a V2 (or any JSON) checkpoint the `sidecar` column is drained through
 //! [`SidecarVisitor`] -- no references means an inline leaf, one or more a manifest. For a
-//! manifest, that same first sidecar then answers the parsed-stats probe via its footer.
+//! manifest, that first sidecar then answers the parsed-stats probe via its footer.
 //!
 //! This is the IO-bearing front half of log-replay planning. It is deliberately independent of
 //! the plan-construction surface and the reconciliation pipeline: a caller resolves the shape
 //! here, then feeds it into a (separately built) reconciliation plan.
 //!
-//! Sibling: `LogSegment::get_file_actions_schema_and_sidecars` performs the same leaf/manifest
-//! classification for the engine-driven read path; the two must stay in sync.
+//! Sibling: `LogSegment::get_file_actions_schema_and_sidecars` reaches the same leaf/manifest
+//! outcome for the engine-driven read path, though it detects V2 via the `sidecar` column rather
+//! than `checkpointMetadata` (the latter is the spec-mandated V2 marker -- every V2 checkpoint
+//! carries it, classic V1 never does). Keep their behavior aligned.
 
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::SIDECAR_NAME;
+use crate::actions::CHECKPOINT_METADATA_NAME;
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -81,8 +84,9 @@ impl ScanShape {
     ///
     /// # Errors
     ///
-    /// Propagates executor failures from the footer reads or the manifest scan, errors visiting the
-    /// `sidecar` column, and any error resolving a sidecar reference to a [`FileMeta`].
+    /// Propagates executor failures from the footer reads or the sidecar-drain scan, errors
+    /// visiting the `sidecar` column, and any error resolving a sidecar reference to a
+    /// [`FileMeta`].
     pub fn resolve(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
@@ -106,14 +110,14 @@ impl ScanShape {
         };
         let file_format = checkpoint_file_type(first);
 
-        // Classify leaf vs manifest by whether the checkpoint actually references sidecars. A
-        // `sidecar` *column* in the schema is necessary but NOT sufficient: a V2 checkpoint that
-        // inlines its actions still carries an all-null `sidecar` column. So we drain that column
-        // whenever it could be populated, and treat an empty drain as an inline leaf.
-        //
-        // Parquet exposes its schema in the footer (or the `_last_checkpoint` hint): no `sidecar`
-        // column means a V1 leaf, and that schema IS the leaf schema we probe for parsed stats.
-        // JSON has no footer, so we always drain. Either way: >=1 sidecar => manifest, 0 => leaf.
+        // Classify leaf vs manifest. Only V2 checkpoints can reference sidecars, and a V2
+        // checkpoint is marked by a `checkpointMetadata` column in its schema -- so a
+        // parquet checkpoint whose schema (footer or `_last_checkpoint` hint) lacks that
+        // column is a classic V1 leaf with no sidecars to drain, and that schema IS the
+        // leaf schema we probe for parsed stats. For a V2 checkpoint we drain the `sidecar`
+        // column: an empty drain is an inline leaf (V2 checkpoints carry an all-null
+        // `sidecar` column even when inlining), >=1 a manifest. JSON checkpoints are always
+        // V2 and have no footer schema, so we always drain.
         let mut leaf_parsed_stats = false;
         let sidecar = match file_format {
             FileType::Parquet => {
@@ -123,14 +127,14 @@ impl ScanShape {
                     Some(schema) => schema,
                     None => read_footer_schema(exec, first.location.clone())?,
                 };
-                let sidecar = if cp_schema.contains(SIDECAR_NAME) {
+                let sidecar = if cp_schema.contains(CHECKPOINT_METADATA_NAME) {
                     collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
                 } else {
                     None
                 };
-                // No `sidecar` column (V1 leaf) or column present but unreferenced (V2 inline
-                // leaf): either way `cp_schema` is the leaf schema, so probe it for parsed stats
-                // when the caller requested them.
+                // No `checkpointMetadata` column (classic V1 leaf) or a V2 checkpoint that inlines
+                // its actions (drain found no sidecars): either way `cp_schema` is the leaf schema,
+                // so probe it for parsed stats when the caller requested them.
                 if sidecar.is_none() {
                     leaf_parsed_stats = stats_schema.is_some_and(|reqd| {
                         LogSegment::schema_has_compatible_stats_parsed(
