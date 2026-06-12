@@ -87,26 +87,6 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
     Ok(())
 }
 
-/// Builds the physical data schema (partition columns excluded) from the `full` physical schema.
-///
-/// Partition columns are excluded because their values live in the Add action's `partitionValues`,
-/// not in the data files. `logical_schema` must be the logical schema `full_physical_schema` was
-/// derived from (same field order), so partition columns can be matched positionally.
-fn build_physical_data_schema(
-    full_physical_schema: &StructType,
-    logical_schema: &StructType,
-    partition_columns: &[String],
-) -> SchemaRef {
-    let partition_columns: HashSet<&str> = partition_columns.iter().map(|s| s.as_str()).collect();
-    let fields = logical_schema
-        .fields()
-        .zip(full_physical_schema.fields())
-        .filter(|(logical_field, _)| !partition_columns.contains(logical_field.name().as_str()))
-        .map(|(_, physical_field)| physical_field.clone());
-    // Safety: subset of an already-valid schema.
-    Arc::new(StructType::new_unchecked(fields))
-}
-
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
 /// to check whether a table supports a feature or has it enabled. For example, deletion vector
@@ -192,11 +172,22 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
-        let physical_data_schema_without_partition_columns = build_physical_data_schema(
-            &physical_schema,
-            &logical_schema,
-            metadata.partition_columns(),
-        );
+        let physical_data_schema_without_partition_columns = {
+            let partition_columns: HashSet<&str> = metadata
+                .partition_columns()
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let fields = logical_schema
+                .fields()
+                .zip(physical_schema.fields())
+                .filter(|(logical_field, _)| {
+                    !partition_columns.contains(logical_field.name().as_str())
+                })
+                .map(|(_, physical_field)| physical_field.clone());
+            // Safety: subset of an already-valid schema.
+            Arc::new(StructType::new_unchecked(fields))
+        };
 
         let table_config = Self {
             logical_schema,
