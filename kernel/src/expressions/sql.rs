@@ -26,7 +26,8 @@ use crate::{DeltaResult, Error};
 /// (e.g. the type of the column whose default is being parsed).
 ///
 /// Leading and trailing whitespace are ignored. `NULL` (case-insensitive) is accepted for any
-/// data type. All other input is parsed as a typed literal.
+/// data type. All other input is parsed as a typed literal, which is supported only for primitive
+/// types.
 ///
 /// # Examples
 ///
@@ -58,22 +59,30 @@ pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expressi
 ///
 /// # Accepted grammar
 ///
-/// Keywords (`TRUE`, `FALSE`, `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`, `X`) are case-insensitive.
+/// Keywords (`TRUE`, `FALSE`, `DATE`, `TIMESTAMP`, `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, `X`) are
+/// case-insensitive.
 ///
-/// - String: `'foo'`, with `''` an embedded single quote (e.g. `'it''s'` -> `it's`). A backslash is
-///   rejected: Spark applies backslash escapes (`\n`, `\\`, ...) to string literals, not yet
-///   implemented here.
+/// - String: single-quoted `'foo'`, with `''` an embedded single quote (e.g. `'it''s'` -> `it's`).
+///   A backslash is rejected: Spark applies backslash escapes (`\n`, `\\`, ...) to string literals,
+///   not yet implemented here. Double-quoted strings (`"foo"`) are also rejected: Spark accepts
+///   them under its default config, but kernel does not yet.
 /// - Integer / Long / Short / Byte / Float / Double / Decimal: bare numeric literal with optional
 ///   leading `+` or `-`. Non-finite floats (`NaN`, `Infinity`) are rejected: Spark only emits those
-///   via an explicit cast (e.g. `CAST('NaN' AS DOUBLE)`), never as a bare literal.
+///   via an explicit cast (e.g. `CAST('NaN' AS DOUBLE)`), never as a bare literal. A plain
+///   negative-zero float (`-0.0`) is normalized to `+0.0` to match Spark, where `-0.0` is a decimal
+///   `0.0` that folds to `+0.0`; an exponent form like `-0.0E0` is a Spark double literal that
+///   keeps its sign, so it is left untouched.
 /// - Boolean: `TRUE` / `FALSE`
 /// - Date: `'2024-01-01'`, `DATE '2024-01-01'`, or `DATE'2024-01-01'` (the keyword may butt against
 ///   the quote)
 /// - TimestampNtz: zoneless `'2024-01-01 12:00:00[.fff]'` or `TIMESTAMP_NTZ '...'` (wall-clock, no
 ///   timezone)
 /// - Timestamp: ISO 8601 / RFC 3339 form with an explicit UTC `Z` suffix, e.g.
-///   `'1970-01-01T00:00:00.123Z'` or `TIMESTAMP '...Z'`. Zoneless and non-UTC-offset literals are
-///   rejected: Spark resolves them against the session timezone, which kernel cannot know.
+///   `'1970-01-01T00:00:00.123Z'`, `TIMESTAMP '...Z'`, or `TIMESTAMP_LTZ '...Z'` (`TIMESTAMP_LTZ`
+///   is an explicit spelling of LTZ). Zoneless literals are rejected (Spark resolves them against
+///   the session timezone, which kernel cannot know); literals carrying a numeric offset (e.g.
+///   `+05:00`, including `+00:00`) are rejected because `parse_scalar` silently drops the offset
+///   (TODO(#2733)).
 /// - Binary: `X'deadbeef'` (even number of hex digits)
 fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<Expression> {
     let DataType::Primitive(primitive) = data_type else {
@@ -101,9 +110,17 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
     // `PrimitiveType::parse_scalar` for the actual value parsing.
     let raw: Cow<'_, str> = match primitive {
         PrimitiveType::Date => Cow::Owned(strip_typed_prefix_and_unquote(trimmed, &["DATE"])?),
-        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => Cow::Owned(
-            strip_typed_prefix_and_unquote(trimmed, &["TIMESTAMP_NTZ", "TIMESTAMP"])?,
-        ),
+        // Each timestamp type accepts only its own keyword(s): a mismatched keyword (e.g. an NTZ
+        // literal on an LTZ column) carries different timezone semantics and must not be reused.
+        // `TIMESTAMP_LTZ` is an explicit spelling of LTZ (== bare `TIMESTAMP`), so both route here
+        // through the same UTC-`Z` guard below.
+        PrimitiveType::Timestamp => Cow::Owned(strip_typed_prefix_and_unquote(
+            trimmed,
+            &["TIMESTAMP", "TIMESTAMP_LTZ"],
+        )?),
+        PrimitiveType::TimestampNtz => {
+            Cow::Owned(strip_typed_prefix_and_unquote(trimmed, &["TIMESTAMP_NTZ"])?)
+        }
         // Numeric and Boolean: parse_scalar handles signed numbers and case-insensitive
         // TRUE/FALSE directly. Reject any input that looks like a quoted SQL string to avoid
         // accidentally treating `'42'` as the integer 42.
@@ -124,39 +141,54 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
 
     // parse_scalar maps empty input to NULL (partition-value convention), but an empty quoted
     // body like `DATE ''` is invalid SQL, not NULL. `NULL` is only accepted as a bare keyword,
-    // handled in parse_sql. Note that String is an exception which can be '' and is handled
-    // above, with its body kept verbatim.
+    // handled in parse_sql.
     if raw.is_empty() {
         return Err(Error::generic(format!(
             "empty {primitive:?} literal: {sql}"
         )));
     }
 
-    // Spark resolves a zoneless TIMESTAMP (LTZ) against the session timezone, which kernel cannot
-    // know, so require an explicit UTC `Z`. This also covers non-UTC offsets (TODO(#2733)).
-    // TimestampNtz carries no zone, so it is unaffected.
+    // A TIMESTAMP (LTZ) literal must pin an absolute instant, but parse_scalar only honors a `Z`
+    // (UTC) suffix today. TimestampNtz carries no zone, so it is unaffected.
     if *primitive == PrimitiveType::Timestamp && !raw.ends_with(['Z', 'z']) {
-        return Err(Error::generic(format!(
-            "TIMESTAMP literal must be in UTC with a 'Z' suffix; zoneless and non-UTC timestamps \
-             are not yet supported (Spark resolves them against the session timezone): {sql}"
-        )));
+        // An explicit offset lives in the time part after the date/time separator (`T`/space).
+        let has_offset = raw
+            .split_once(['T', 't', ' '])
+            .is_some_and(|(_, time)| time.contains(['+', '-']));
+        return Err(if has_offset {
+            // Only `Z` is honored; parse_scalar's `%+` path silently drops any numeric offset
+            // (including `+00:00`) and reads the wall clock as UTC (TODO(#2733)).
+            Error::generic(format!(
+                "TIMESTAMP literal with an explicit offset is not yet supported; use 'Z' (UTC): {sql}"
+            ))
+        } else {
+            Error::generic(format!(
+                "zoneless TIMESTAMP literal is not yet supported; use an explicit 'Z' (UTC) suffix \
+                 since Spark resolves a bare timestamp against the session timezone: {sql}"
+            ))
+        });
     }
 
     let scalar = primitive.parse_scalar(raw)?;
 
-    // Spark stores a special float only as an explicit `CAST('NaN' AS DOUBLE)` (kept verbatim in
-    // the default), never as a bare `NaN`/`Infinity` token. Rust's float parser accepts those bare
-    // tokens, so reject the non-finite result here to stay consistent with Spark.
-    let is_non_finite = match scalar {
-        Scalar::Float(f) => !f.is_finite(),
-        Scalar::Double(d) => !d.is_finite(),
-        _ => false,
-    };
-    if is_non_finite {
-        return Err(Error::generic(format!(
+    // Reconcile Float/Double with Spark's constant folding, which Rust's float parser does not
+    // match (see the grammar doc above). Non-finite (`NaN`/`Infinity`): Spark only produces these
+    // via an explicit cast, never as a bare literal, so reject them. Negative zero: `+ 0.0` folds a
+    // plain `-0.0` to `+0.0` (a no-op for every other value); exponent forms keep their sign, so
+    // skip them.
+    let normalize_neg_zero = !raw.contains(['e', 'E']);
+    let non_finite_error = || {
+        Error::generic(format!(
             "non-finite float literal requires an explicit cast, e.g. CAST('NaN' AS DOUBLE): {sql}"
-        )));
-    }
+        ))
+    };
+    let scalar = match scalar {
+        Scalar::Float(f) if !f.is_finite() => return Err(non_finite_error()),
+        Scalar::Double(d) if !d.is_finite() => return Err(non_finite_error()),
+        Scalar::Float(f) if normalize_neg_zero => Scalar::Float(f + 0.0),
+        Scalar::Double(d) if normalize_neg_zero => Scalar::Double(d + 0.0),
+        other => other,
+    };
 
     Ok(Expression::literal(scalar))
 }
@@ -347,14 +379,48 @@ mod tests {
     #[case("'2024-01-01 12:34:56'")] // zoneless
     #[case("TIMESTAMP '2024-01-01 12:34:56.789'")] // zoneless, with keyword
     #[case("TIMESTAMP'2024-01-01 12:34:56'")] // zoneless, keyword butted against quote
+    #[case("TIMESTAMP_LTZ '2024-01-01 12:34:56'")] // zoneless, explicit LTZ keyword
     #[case("' 2024-01-01 12:34:56 '")] // zoneless, padded
-    #[case("'2024-06-15T14:30:00+05:00'")] // non-UTC offset (parse_scalar drops it, see TODO(#2733))
-    #[case("TIMESTAMP '2024-06-15T14:30:00-05:00'")] // non-UTC offset
-    fn rejects_zoneless_and_non_utc_timestamp_ltz(#[case] sql: &str) {
+    #[case("'2024-06-15T14:30:00+05:00'")] // offset (parse_scalar drops it, see TODO(#2733))
+    #[case("TIMESTAMP '2024-06-15T14:30:00-05:00'")] // offset
+    #[case("'2024-06-15T14:30:00+00:00'")] // +00:00 is UTC-valued but dropped, so still rejected
+    fn rejects_zoneless_and_offset_timestamp_ltz(#[case] sql: &str) {
         let result = parse_sql(sql, &DataType::TIMESTAMP);
         assert!(
             result.is_err(),
-            "expected error for zoneless/non-UTC TIMESTAMP {sql:?}, got {result:?}"
+            "expected error for zoneless/offset TIMESTAMP {sql:?}, got {result:?}"
+        );
+    }
+
+    // The two LTZ rejections carry distinct messages; assert on the message so the
+    // zoneless-vs-offset split stays pinned (both otherwise just return an error).
+    #[rstest]
+    #[case("'2024-01-01 12:34:56'", "zoneless")]
+    #[case("TIMESTAMP '2024-01-01 12:34:56'", "zoneless")]
+    #[case("'2024-06-15T14:30:00+05:00'", "offset")]
+    #[case("'2024-06-15T14:30:00+00:00'", "offset")] // +00:00 is UTC-valued but dropped, so rejected
+    fn timestamp_ltz_rejection_distinguishes_zoneless_from_offset(
+        #[case] sql: &str,
+        #[case] needle: &str,
+    ) {
+        let err = parse_sql(sql, &DataType::TIMESTAMP)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(needle),
+            "{sql:?} message missing {needle:?}: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case("TIMESTAMP_NTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP)] // NTZ keyword, LTZ target
+    #[case("TIMESTAMP '2024-01-01 12:34:56'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ target
+    #[case("TIMESTAMP_LTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ target
+    fn rejects_mismatched_timestamp_keyword(#[case] sql: &str, #[case] ty: DataType) {
+        let result = parse_sql(sql, &ty);
+        assert!(
+            result.is_err(),
+            "expected error for mismatched timestamp keyword {sql:?} as {ty:?}, got {result:?}"
         );
     }
 
@@ -365,6 +431,8 @@ mod tests {
     #[case("'1970-01-01T00:00:00.123Z'", "1970-01-01 00:00:00.123")]
     #[case("'2024-06-15T14:30:00Z'", "2024-06-15 14:30:00")]
     #[case("TIMESTAMP '2024-06-15T14:30:00.456Z'", "2024-06-15 14:30:00.456")]
+    #[case("TIMESTAMP_LTZ '2024-06-15T14:30:00Z'", "2024-06-15 14:30:00")] // explicit LTZ spelling
+    #[case("TIMESTAMP_LTZ'1970-01-01T00:00:00.123Z'", "1970-01-01 00:00:00.123")] // butted against quote
     fn iso_8601_form_accepted_only_for_timestamp(#[case] sql: &str, #[case] equivalent: &str) {
         let got = parse_sql(sql, &DataType::TIMESTAMP).unwrap();
         assert_eq!(
@@ -412,6 +480,8 @@ mod tests {
     #[case("now()", DataType::TIMESTAMP)]
     #[case("1 + 1", DataType::INTEGER)]
     #[case("concat('a', 'b')", DataType::STRING)]
+    #[case("0", decimal_type(10, 2))] // parse_scalar requires the literal's scale to match exactly
+    #[case("1.2", decimal_type(5, 2))]
     fn currently_unsupported_valid_sql(#[case] sql: &str, #[case] ty: DataType) {
         let result = parse_sql(sql, &ty);
         assert!(
@@ -453,6 +523,8 @@ mod tests {
     #[case("X'0'", DataType::BINARY)] // odd number of hex digits
     #[case("X'gg'", DataType::BINARY)] // non-hex chars
     #[case("'deadbeef'", DataType::BINARY)] // missing X prefix
+    #[case("128", DataType::BYTE)] // out of range for i8
+    #[case("2147483648", DataType::INTEGER)] // out of range for i32
     fn rejects_invalid_input(#[case] sql: &str, #[case] ty: DataType) {
         let result = parse_sql(sql, &ty);
         assert!(
@@ -471,7 +543,9 @@ mod tests {
             "inf",
             "-inf",
             "+inf",
-            "-Infinity"
+            "-Infinity",
+            "1e999",  // overflows to infinity
+            "-1e999"
         )]
         sql: &str,
         #[values(DataType::FLOAT, DataType::DOUBLE)] ty: DataType,
@@ -480,6 +554,58 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error for bare non-finite literal {sql:?} as {ty:?}, got {result:?}"
+        );
+    }
+
+    // A plain `-0.0` is a Spark decimal that folds to `+0.0`, so the parser normalizes the sign.
+    // `assert_eq` on `Scalar` can't see it (`-0.0 == 0.0`), so check the sign bit directly.
+    #[rstest]
+    #[case("-0.0")]
+    #[case("-0")]
+    #[case("-0.00")]
+    fn normalizes_negative_zero_to_positive(#[case] sql: &str) {
+        let Expression::Literal(Scalar::Double(d)) = parse_sql(sql, &DataType::DOUBLE).unwrap()
+        else {
+            panic!("expected a Double literal for {sql:?}");
+        };
+        assert!(
+            d == 0.0 && d.is_sign_positive(),
+            "DOUBLE {sql:?} kept the sign: {d}"
+        );
+
+        let Expression::Literal(Scalar::Float(f)) = parse_sql(sql, &DataType::FLOAT).unwrap()
+        else {
+            panic!("expected a Float literal for {sql:?}");
+        };
+        assert!(
+            f == 0.0 && f.is_sign_positive(),
+            "FLOAT {sql:?} kept the sign: {f}"
+        );
+    }
+
+    // An exponent literal like `-0.0E0` is a Spark double literal that keeps its sign, so the
+    // parser must not normalize it.
+    #[rstest]
+    #[case("-0.0E0")]
+    #[case("-0E0")]
+    #[case("-0.0e10")]
+    fn preserves_negative_zero_with_exponent(#[case] sql: &str) {
+        let Expression::Literal(Scalar::Double(d)) = parse_sql(sql, &DataType::DOUBLE).unwrap()
+        else {
+            panic!("expected a Double literal for {sql:?}");
+        };
+        assert!(
+            d == 0.0 && d.is_sign_negative(),
+            "DOUBLE {sql:?} should keep the negative sign: {d}"
+        );
+
+        let Expression::Literal(Scalar::Float(f)) = parse_sql(sql, &DataType::FLOAT).unwrap()
+        else {
+            panic!("expected a Float literal for {sql:?}");
+        };
+        assert!(
+            f == 0.0 && f.is_sign_negative(),
+            "FLOAT {sql:?} should keep the negative sign: {f}"
         );
     }
 
@@ -492,6 +618,18 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error for backslash in string literal {sql:?}, got {result:?}"
+        );
+    }
+
+    // Spark accepts double-quoted strings; kernel does not yet.
+    #[rstest]
+    #[case(r#""foo""#)]
+    #[case(r#""it's""#)] // embedded single quote
+    fn rejects_double_quoted_string(#[case] sql: &str) {
+        let result = parse_sql(sql, &DataType::STRING);
+        assert!(
+            result.is_err(),
+            "expected error for double-quoted string {sql:?}, got {result:?}"
         );
     }
 
