@@ -292,8 +292,7 @@ fn build_add_action_projection(
             Expression::unary(ToJson, col!("stats")),
         )
         .build()?;
-    let output_schema = Arc::new(output_schema);
-    let patch = Expression::struct_from([Expression::struct_patch(patch)?]);
+    let patch = Expression::struct_from([patch]);
     Ok((output_schema, patch))
 }
 

@@ -11,7 +11,7 @@
 //! * [`SchemaStructPatchBuilder`](crate::schema::SchemaStructPatchBuilder) emits schema fields and
 //!   produces an output [`StructType`] directly from an input schema.
 //! * [`ProjectionStructPatchBuilder`] pairs each output field with the expression that produces it
-//!   and lowers both at once to an output [`StructType`] plus a sparse [`ExpressionStructPatch`].
+//!   and lowers both at once to a matched ([`SchemaRef`], `[ExpressionRef`]) pair.
 
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
-use crate::schema::{DataType, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
 
@@ -858,8 +858,8 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
 
     // === Build ===
 
-    /// Builds a full output schema together with a sparse [`ExpressionStructPatch`] that produces
-    /// it. Untouched input fields pass through implicitly and only inserted, replaced, dropped, or
+    /// Builds a full output schema together with a matching sparse struct-patch expression.
+    /// Untouched input fields pass through implicitly and only inserted, replaced, dropped, or
     /// nested fields are recorded.
     ///
     /// The returned schema is always dense (it enumerates every output field), since a schema has
@@ -872,11 +872,11 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     /// Returns an error if a `with_*` call produced a conflicting operation, the input path cannot
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
-    pub fn build(self) -> DeltaResult<(StructType, ExpressionStructPatch)> {
+    pub fn build(self) -> DeltaResult<(SchemaRef, ExpressionRef)> {
         let (root, input_path, source_schema) = self.inner.begin_build(self.input_schema)?;
         let patch = root.to_expr_patch(input_path);
         let schema = StructType::try_new(schema_walk(root, source_schema)?)?;
-        Ok((schema, patch))
+        Ok((Arc::new(schema), Arc::new(Expression::StructPatch(patch))))
     }
 }
 
@@ -896,7 +896,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::expressions::{
-        lit, Expression as Expr, ExpressionRef, ExpressionStructPatchBuilder,
+        lit, Expression as Expr, ExpressionRef, ExpressionStructPatch, ExpressionStructPatchBuilder,
     };
     use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -904,6 +904,13 @@ mod tests {
 
     fn expr(value: impl Into<crate::expressions::Scalar>) -> ExpressionRef {
         Arc::new(lit(value))
+    }
+
+    fn projection_patch(expr: &ExpressionRef) -> &ExpressionStructPatch {
+        let Expr::StructPatch(patch) = expr.as_ref() else {
+            panic!("Expected struct patch expression");
+        };
+        patch
     }
 
     #[test]
@@ -1115,6 +1122,7 @@ mod tests {
             .append(field("appended"), expr(3))
             .build()
             .unwrap();
+        let patch = projection_patch(&patch);
 
         assert_eq!(
             field_names(&output_schema),
@@ -1145,6 +1153,7 @@ mod tests {
             .insert_after_at(["nested"], "nested_a", field("nested_inserted"), expr(9))
             .build()
             .unwrap();
+        let patch = projection_patch(&patch);
 
         assert_eq!(field_names(&output_schema), ["nested", "top"]);
         let DataType::Struct(nested_schema) = output_schema.field("nested").unwrap().data_type()
@@ -1182,6 +1191,7 @@ mod tests {
                 .replace_expr("nested_b", expr(9))
                 .build()
                 .unwrap();
+        let patch = projection_patch(&patch);
 
         assert_eq!(field_names(&output_schema), ["nested_a", "nested_b"]);
         assert_eq!(

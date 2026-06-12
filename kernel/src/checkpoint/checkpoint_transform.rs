@@ -125,10 +125,7 @@ pub(crate) fn build_checkpoint_transform(
         }
     }
 
-    let (output_schema, patch) = patch_builder.build()?;
-    let schema = Arc::new(output_schema);
-    let expression = Arc::new(Expression::StructPatch(patch));
-    Ok((schema, expression))
+    patch_builder.build()
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`

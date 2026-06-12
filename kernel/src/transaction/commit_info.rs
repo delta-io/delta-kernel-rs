@@ -105,8 +105,7 @@ impl<S> Transaction<S> {
                 // Step 3: Wrap the patch in a struct expression so the output matches the
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
                 // with the None branch which uses `get_log_commit_info_schema()`.
-                let wrapped_expr =
-                    Expression::struct_from([Arc::new(Expression::struct_patch(patch)?)]);
+                let wrapped_expr = Expression::struct_from([patch]);
                 let wrapped_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
                     COMMIT_INFO_NAME,
                     output_schema,
