@@ -719,7 +719,7 @@ pub(crate) fn get_any_level_column_physical_name(
     col_name: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ColumnName> {
-    let fields = schema.walk_column_fields(col_name)?;
+    let fields = schema.fields_of_path(col_name)?;
     let physical_path: Vec<String> = fields
         .iter()
         .map(|field| -> DeltaResult<String> {
@@ -755,11 +755,16 @@ pub(crate) fn physical_to_logical_column_name(
     physical_col: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ColumnName> {
-    let fields = logical_schema.walk_column_fields_by(physical_col, |s, phys_name| {
-        s.fields()
-            .find(|f| f.physical_name(column_mapping_mode) == phys_name)
-    })?;
-    Ok(ColumnName::new(fields.iter().map(|f| f.name.clone())))
+    let mut fields = vec![];
+    logical_schema.visit_fields_of_path_by(
+        physical_col,
+        |s, phys_name| {
+            s.fields()
+                .find(|f| f.physical_name(column_mapping_mode) == phys_name)
+        },
+        |field| fields.push(field),
+    )?;
+    Ok(ColumnName::new(fields.iter().map(|f| &f.name)))
 }
 
 #[cfg(test)]
