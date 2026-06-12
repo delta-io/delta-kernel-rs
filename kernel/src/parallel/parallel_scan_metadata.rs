@@ -58,7 +58,7 @@ impl SequentialScanMetadata {
             AfterSequential::Done(processor) => {
                 let event = processor.get_metrics().to_event(
                     self.operation_id,
-                    processor.table_type(),
+                    processor.is_catalog_managed(),
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -71,7 +71,7 @@ impl SequentialScanMetadata {
             AfterSequential::Parallel { processor, files } => {
                 let event = processor.get_metrics().to_event(
                     self.operation_id,
-                    processor.table_type(),
+                    processor.is_catalog_managed(),
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -147,7 +147,7 @@ impl ParallelState {
     pub fn log_metrics(&self) {
         let event = self.inner.get_metrics().to_event(
             self.operation_id,
-            self.inner.table_type(),
+            self.inner.is_catalog_managed(),
             ScanType::ParallelPhase,
             self.parallel_start.elapsed(),
         );
@@ -301,7 +301,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            table_type: TableType::CatalogManaged,
+            is_catalog_managed: true,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,

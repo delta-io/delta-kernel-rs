@@ -5,7 +5,7 @@ use tracing::{info, instrument};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-use crate::metrics::{SnapshotLoadMetricContext, MetricId};
+use crate::metrics::{MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
@@ -41,6 +41,8 @@ pub struct SnapshotBuilder {
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
     incremental_replay: IncrementalReplay,
+    /// Kernel-minted id correlating this build's metric events with its child events.
+    operation_id: MetricId,
 }
 
 /// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
@@ -100,6 +102,7 @@ impl SnapshotBuilder {
             log_tail: Vec::new(),
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
+            operation_id: MetricId::new(),
         }
     }
 
@@ -111,6 +114,7 @@ impl SnapshotBuilder {
             log_tail: Vec::new(),
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
+            operation_id: MetricId::new(),
         }
     }
 
@@ -190,27 +194,15 @@ impl SnapshotBuilder {
     ///
     /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
-        let metric_context = SnapshotLoadMetricContext {
-            operation_id: MetricId::new(),
-            is_catalog_managed: self.max_catalog_version.is_some(),
-        };
-        self.build_inner(engine, metric_context)
-    }
-
-    // `metric_context.is_catalog_managed` is the requested load mode, not the confirmed protocol
+    // `is_catalog_managed` is the requested load mode, not the confirmed protocol
     // (see `IS_CATALOG_MANAGED_FIELD`).
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some()),
         err
     )]
-    fn build_inner(
-        self,
-        engine: &dyn Engine,
-        metric_context: SnapshotLoadMetricContext,
-    ) -> DeltaResult<SnapshotRef> {
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
         info!(
             target = self.target_version_str(),
             from_version = ?self.existing_snapshot.as_ref().map(|s| s.version()),
@@ -227,7 +219,13 @@ impl SnapshotBuilder {
             log_tail,
             max_catalog_version,
             incremental_replay,
+            operation_id,
         } = self;
+
+        let metric_context = SnapshotLoadMetricContext {
+            operation_id,
+            is_catalog_managed: max_catalog_version.is_some(),
+        };
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
 

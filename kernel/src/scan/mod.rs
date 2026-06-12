@@ -834,7 +834,7 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
         let operation_id = MetricId::new();
-        let table_type = self.snapshot.table_configuration().table_type();
+        let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
@@ -854,7 +854,12 @@ impl Scan {
         };
 
         let on_complete = move || {
-            let event = metrics.to_event(operation_id, table_type, ScanType::Full, start.elapsed());
+            let event = metrics.to_event(
+                operation_id,
+                is_catalog_managed,
+                ScanType::Full,
+                start.elapsed(),
+            );
             info!(%event);
             emit_scan_metadata_completed(&event);
         };

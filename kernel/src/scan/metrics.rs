@@ -110,13 +110,13 @@ impl ScanMetrics {
     pub(crate) fn to_event(
         &self,
         operation_id: MetricId,
-        table_type: TableType,
+        is_catalog_managed: bool,
         scan_type: ScanType,
         duration: Duration,
     ) -> ScanMetadataCompleted {
         ScanMetadataCompleted {
             operation_id,
-            table_type,
+            table_type: TableType::from_catalog_managed(is_catalog_managed),
             scan_type,
             duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),

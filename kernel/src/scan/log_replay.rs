@@ -21,7 +21,6 @@ use crate::log_replay::{
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
-use crate::metrics::TableType;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
@@ -78,7 +77,7 @@ struct InternalScanState {
     #[serde(default)]
     physical_stats_columns: HashSet<ColumnName>,
     #[serde(default)]
-    table_type: TableType,
+    is_catalog_managed: bool,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -312,8 +311,8 @@ impl ScanLogReplayProcessor {
         self.metrics.as_ref()
     }
 
-    pub(crate) fn table_type(&self) -> TableType {
-        self.state_info.table_type
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.state_info.is_catalog_managed
     }
 
     /// Serialize the processor state for distributed processing.
@@ -341,7 +340,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema,
             physical_partition_schema,
             physical_stats_columns,
-            table_type,
+            is_catalog_managed,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -361,7 +360,7 @@ impl ScanLogReplayProcessor {
             stats_options: self.stats_options,
             physical_partition_schema,
             physical_stats_columns,
-            table_type,
+            is_catalog_managed,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
@@ -419,7 +418,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema: internal_state.physical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
             physical_stats_columns: internal_state.physical_stats_columns,
-            table_type: internal_state.table_type,
+            is_catalog_managed: internal_state.is_catalog_managed,
         });
 
         Self::new_with_seen_files(
@@ -982,7 +981,7 @@ mod tests {
 
     use super::{
         get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanStatsOptions, SerializableScanState, TableType,
+        ScanStatsOptions, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
@@ -1107,7 +1106,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            table_type: TableType::PathBased,
+            is_catalog_managed: false,
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -1438,7 +1437,7 @@ mod tests {
                 physical_stats_schema: None,
                 physical_partition_schema: None,
                 physical_stats_columns: HashSet::new(),
-                table_type: TableType::PathBased,
+                is_catalog_managed: false,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor = ScanLogReplayProcessor::new(
@@ -1476,7 +1475,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            table_type: TableType::PathBased,
+            is_catalog_managed: false,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1494,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_round_trips_table_type() {
+    fn test_serialization_round_trips_is_catalog_managed() {
         let engine = SyncEngine::new();
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
             "id",
@@ -1510,7 +1509,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            table_type: TableType::CatalogManaged,
+            is_catalog_managed: true,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1522,7 +1521,7 @@ mod tests {
         let serialized = processor.into_serializable_state().unwrap();
         let deserialized =
             ScanLogReplayProcessor::from_serializable_state(&engine, serialized).unwrap();
-        assert_eq!(deserialized.table_type(), TableType::CatalogManaged);
+        assert!(deserialized.is_catalog_managed());
     }
 
     #[test]
@@ -1559,7 +1558,7 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            table_type: TableType::PathBased,
+            is_catalog_managed: false,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1593,7 +1592,7 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
-            table_type: TableType::PathBased,
+            is_catalog_managed: false,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
