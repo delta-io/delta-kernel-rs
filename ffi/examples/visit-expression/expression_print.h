@@ -18,6 +18,22 @@ void print_expression_item_list(ExpressionItemList list, int depth) {
     print_tree_helper(list.list[i], depth);
   }
 }
+void print_expression_item_list_field(const char* field_name, ExpressionItemList list, int depth) {
+  print_n_spaces(depth);
+  printf("%s\n", field_name);
+  print_expression_item_list(list, depth + 1);
+}
+void print_non_empty_expression_item_list_field(
+    const char* field_name, ExpressionItemList list, int depth) {
+  if (list.len == 0) {
+    return;
+  }
+  print_expression_item_list_field(field_name, list, depth);
+}
+void print_bool_field(const char* field_name, bool value, int depth) {
+  print_n_spaces(depth);
+  printf("%s: %s\n", field_name, value ? "true" : "false");
+}
 void print_opaque_op_name(void* op_type, KernelStringSlice name) {
   int len = name.len & 0x7fffffff; // truncate to 31 bits to ensure a positive value
   printf("%s(%.*s)\n", (char*) op_type, len, name.ptr);
@@ -93,22 +109,25 @@ void print_tree_helper(ExpressionItem ref, int depth) {
     case StructPatch: {
       struct StructPatchExpression* patch = ref.ref;
       printf("StructPatch\n");
-      print_expression_item_list(patch->input_path, depth + 1);
-      print_expression_item_list(patch->field_patches, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "input_path", patch->input_path, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "prepended_fields", patch->prepended_fields, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "field_patches", patch->field_patches, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "appended_fields", patch->appended_fields, depth + 1);
       break;
     }
     case FieldPatch: {
       struct FieldPatch* field_patch = ref.ref;
-      if (!field_patch->field_name) {
-        printf("Prepend\n");
-      } else if (!field_patch->is_replace) {
-        printf("Insert(%s)\n", field_patch->field_name);
-      } else if (!field_patch->exprs.len) {
-        printf("Drop(%s)\n", field_patch->field_name);
-      } else {
-        printf("Replace(%s)\n", field_patch->field_name);
-      }
-      print_expression_item_list(field_patch->exprs, depth + 1);
+      printf("FieldPatch\n");
+      print_n_spaces(depth + 1);
+      printf("field_name: %s\n", field_patch->field_name);
+      print_non_empty_expression_item_list_field(
+          "insertions", field_patch->insertions, depth + 1);
+      print_bool_field("keep_input", field_patch->keep_input, depth + 1);
+      print_bool_field("optional", field_patch->optional, depth + 1);
       break;
     }
     case OpaqueExpression: {

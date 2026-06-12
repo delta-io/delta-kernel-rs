@@ -20,7 +20,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
-use crate::snapshot::IncrementalReplay;
+use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::{DeltaResult, Engine, Snapshot};
 
 // ============================================================================
@@ -32,11 +32,11 @@ const SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"i
 const COMMIT_INFO_TIMESTAMP: i64 = 1587968586154;
 const DEFAULT_OPERATION: &str = "TEST_OP";
 
-fn protocol_v2() -> Protocol {
+fn protocol_a() -> Protocol {
     Protocol::try_new_modern(["v2Checkpoint"], ["v2Checkpoint"]).unwrap()
 }
 
-fn protocol_v2_dv() -> Protocol {
+fn protocol_b() -> Protocol {
     Protocol::try_new_modern(
         ["v2Checkpoint", "deletionVectors"],
         ["v2Checkpoint", "deletionVectors"],
@@ -44,7 +44,7 @@ fn protocol_v2_dv() -> Protocol {
     .unwrap()
 }
 
-fn protocol_v2_dv_ntz() -> Protocol {
+fn protocol_c() -> Protocol {
     Protocol::try_new_modern(
         ["v2Checkpoint", "deletionVectors", "timestampNtz"],
         ["v2Checkpoint", "deletionVectors", "timestampNtz"],
@@ -52,7 +52,7 @@ fn protocol_v2_dv_ntz() -> Protocol {
     .unwrap()
 }
 
-fn protocol_v2_ict() -> Protocol {
+fn protocol_ict() -> Protocol {
     Protocol::try_new_modern(["v2Checkpoint"], ["v2Checkpoint", "inCommitTimestamp"]).unwrap()
 }
 
@@ -105,7 +105,7 @@ fn metadata_ict() -> Metadata {
 fn create_table_actions() -> Vec<serde_json::Value> {
     vec![
         commit_info("CREATE", None),
-        protocol(protocol_v2()),
+        protocol(protocol_a()),
         metadata(metadata_a()),
     ]
 }
@@ -113,7 +113,7 @@ fn create_table_actions() -> Vec<serde_json::Value> {
 fn create_table_actions_with_ict() -> Vec<serde_json::Value> {
     vec![
         commit_info("CREATE", None),
-        protocol(protocol_v2_ict()),
+        protocol(protocol_ict()),
         metadata(metadata_a()),
     ]
 }
@@ -406,11 +406,14 @@ impl BuiltCrcTest {
         )
     }
 
-    /// Build a snapshot at `version` (or latest if `None`) and return it
+    /// Build a snapshot at `version` (or latest if `None`) under `mode`, returning it
     /// alongside a human-readable label like `"v2"` or `"latest"`.
-    fn snapshot_at(&self, version: Option<u64>) -> (crate::snapshot::SnapshotRef, String) {
-        let mut builder = Snapshot::builder_for(self.url.clone())
-            .with_incremental_crc_replay(IncrementalReplay::Unlimited);
+    fn snapshot_at_with_replay(
+        &self,
+        version: Option<u64>,
+        mode: IncrementalReplay,
+    ) -> (SnapshotRef, String) {
+        let mut builder = Snapshot::builder_for(self.url.clone()).with_incremental_crc_replay(mode);
         if let Some(v) = version {
             builder = builder.at_version(v);
         }
@@ -419,8 +422,22 @@ impl BuiltCrcTest {
         (snapshot, label)
     }
 
-    fn snapshot_latest_with_replay(&self, mode: IncrementalReplay) -> crate::snapshot::SnapshotRef {
-        Snapshot::builder_for(self.url.clone())
+    /// Build a snapshot at `version` with no incremental CRC replay (the `Disabled` default).
+    fn snapshot_at(&self, version: Option<u64>) -> (SnapshotRef, String) {
+        self.snapshot_at_with_replay(version, IncrementalReplay::Disabled)
+    }
+
+    fn snapshot_latest_with_replay(&self, mode: IncrementalReplay) -> SnapshotRef {
+        self.snapshot_at_with_replay(None, mode).0
+    }
+
+    /// Build a snapshot at `from_version`, then incrementally advance it to latest under `mode`.
+    fn snapshot_from(&self, from_version: u64, mode: IncrementalReplay) -> SnapshotRef {
+        let base = Snapshot::builder_for(self.url.clone())
+            .at_version(from_version)
+            .build(&self.engine)
+            .unwrap();
+        Snapshot::builder_from(base)
             .with_incremental_crc_replay(mode)
             .build(&self.engine)
             .unwrap()
@@ -432,18 +449,27 @@ impl BuiltCrcTest {
         expected_protocol: &Protocol,
         expected_metadata: &Metadata,
     ) {
-        let (snapshot, label) = self.snapshot_at(version.into());
-        let table_config = snapshot.table_configuration();
-        assert_eq!(
-            table_config.protocol(),
-            expected_protocol,
-            "Protocol mismatch at {label}"
-        );
-        assert_eq!(
-            table_config.metadata(),
-            expected_metadata,
-            "Metadata mismatch at {label}"
-        );
+        let version = version.into();
+        // Protocol and Metadata must resolve identically regardless of the CRC replay budget
+        // (no advance / bounded advance / unbounded advance), so assert across the spectrum.
+        for mode in [
+            IncrementalReplay::Disabled,
+            IncrementalReplay::UpToCommits(2),
+            IncrementalReplay::Unlimited,
+        ] {
+            let (snapshot, label) = self.snapshot_at_with_replay(version, mode);
+            let table_config = snapshot.table_configuration();
+            assert_eq!(
+                table_config.protocol(),
+                expected_protocol,
+                "Protocol mismatch at {label} ({mode:?})"
+            );
+            assert_eq!(
+                table_config.metadata(),
+                expected_metadata,
+                "Metadata mismatch at {label} ({mode:?})"
+            );
+        }
     }
 
     fn assert_ict(&self, version: impl Into<Option<u64>>, expected_ict: Option<i64>) {
@@ -479,7 +505,7 @@ async fn test_get_p_m_from_delta_no_checkpoint() {
             0, // <-- P & M from here
             [
                 commit_info(DEFAULT_OPERATION, None),
-                protocol(protocol_v2()),
+                protocol(protocol_a()),
                 metadata(metadata_a()),
             ],
         )
@@ -487,19 +513,16 @@ async fn test_get_p_m_from_delta_no_checkpoint() {
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .build()
         .await
-        .assert_p_m(None, &protocol_v2(), &metadata_a());
+        .assert_p_m(None, &protocol_a(), &metadata_a());
 }
 
 #[tokio::test]
 async fn test_get_p_and_m_from_different_deltas() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(
             1, // <-- P from here
-            [
-                commit_info(DEFAULT_OPERATION, None),
-                protocol(protocol_v2_dv()),
-            ],
+            [commit_info(DEFAULT_OPERATION, None), protocol(protocol_b())],
         )
         .commit(
             2, // <-- M from here
@@ -507,36 +530,36 @@ async fn test_get_p_and_m_from_different_deltas() {
         )
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
+        .assert_p_m(None, &protocol_b(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_get_p_m_from_checkpoint() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(0, protocol_a(), metadata_a()) // <-- P & M from here
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .build()
         .await
-        .assert_p_m(None, &protocol_v2(), &metadata_a());
+        .assert_p_m(None, &protocol_a(), &metadata_a());
 }
 
 #[tokio::test]
 async fn test_get_p_m_from_delta_after_checkpoint() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(
             1, // <-- P & M from here
             [
                 commit_info(DEFAULT_OPERATION, None),
-                protocol(protocol_v2_dv()),
+                protocol(protocol_b()),
                 metadata(metadata_b()),
             ],
         )
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
+        .assert_p_m(None, &protocol_b(), &metadata_b());
 }
 
 // ============================================================================
@@ -546,13 +569,13 @@ async fn test_get_p_m_from_delta_after_checkpoint() {
 #[tokio::test]
 async fn test_get_p_m_from_crc_at_target() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(2, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
+        .crc(2, protocol_b(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
+        .assert_p_m(None, &protocol_b(), &metadata_b());
 }
 
 #[tokio::test]
@@ -560,32 +583,32 @@ async fn test_crc_preferred_over_delta_at_target() {
     // The P & M for the 002.crc and 002.json should NOT be different in practice.
     // We only do this for this test so we can differentiate which P & M is used.
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(
             2, // <-- P from here
             [
                 commit_info(DEFAULT_OPERATION, None),
-                protocol(protocol_v2_dv()),
+                protocol(protocol_b()),
                 metadata(metadata_a()),
             ],
         )
-        .crc(2, protocol_v2_dv_ntz(), metadata_b(), None) // <-- P & M from here
+        .crc(2, protocol_c(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv_ntz(), &metadata_b());
+        .assert_p_m(None, &protocol_c(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_corrupt_crc_at_target_falls_back() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(0, protocol_a(), metadata_a()) // <-- P & M from here
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .corrupt_crc(2) // <-- Corrupt! Fall back to replay.
         .build()
         .await
-        .assert_p_m(None, &protocol_v2(), &metadata_a());
+        .assert_p_m(None, &protocol_a(), &metadata_a());
 }
 
 #[tokio::test]
@@ -593,27 +616,27 @@ async fn test_crc_wins_over_checkpoint() {
     // The P & M for the 002.crc and the v2 checkpoint should NOT be different in practice.
     // We only do this for this test so we can differentiate which P & M is used.
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
-        .v2_checkpoint(2, protocol_v2(), metadata_a())
-        .crc(2, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
+        .v2_checkpoint(2, protocol_a(), metadata_a())
+        .crc(2, protocol_b(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
+        .assert_p_m(None, &protocol_b(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_checkpoint_on_corrupt_crc() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
-        .v2_checkpoint(2, protocol_v2(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(2, protocol_a(), metadata_a()) // <-- P & M from here
         .corrupt_crc(2) // <-- Corrupt! Fall back to replay.
         .build()
         .await
-        .assert_p_m(None, &protocol_v2(), &metadata_a());
+        .assert_p_m(None, &protocol_a(), &metadata_a());
 }
 
 // ============================================================================
@@ -623,58 +646,55 @@ async fn test_checkpoint_on_corrupt_crc() {
 #[tokio::test]
 async fn test_crc_at_earlier_version() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
+        .crc(1, protocol_b(), metadata_b(), None) // <-- P & M from here
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
+        .assert_p_m(None, &protocol_b(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_get_p_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- M from here
+        .crc(1, protocol_b(), metadata_b(), None) // <-- M from here
         .commit(
             2,
-            [
-                commit_info(DEFAULT_OPERATION, None),
-                protocol(protocol_v2_dv_ntz()),
-            ],
+            [commit_info(DEFAULT_OPERATION, None), protocol(protocol_c())],
         )
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv_ntz(), &metadata_b());
+        .assert_p_m(None, &protocol_c(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_get_m_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- P from here
+        .crc(1, protocol_b(), metadata_b(), None) // <-- P from here
         .commit(
             2, // <-- M from here
             [commit_info(DEFAULT_OPERATION, None), metadata(metadata_a())],
         )
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv(), &metadata_a());
+        .assert_p_m(None, &protocol_b(), &metadata_a());
 }
 
 #[tokio::test]
 async fn test_corrupt_crc_at_non_target_version_falls_back() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(0, protocol_a(), metadata_a()) // <-- P & M from here
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .corrupt_crc(1) // <-- Corrupt! Fall back to replay.
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .build()
         .await
-        .assert_p_m(None, &protocol_v2(), &metadata_a());
+        .assert_p_m(None, &protocol_a(), &metadata_a());
 }
 
 #[tokio::test]
@@ -684,17 +704,17 @@ async fn test_crc_before_checkpoint_is_ignored() {
             0,
             [
                 commit_info(DEFAULT_OPERATION, None),
-                protocol(protocol_v2()),
+                protocol(protocol_a()),
                 metadata(metadata_a()),
             ],
         )
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(1, protocol_v2_dv_ntz(), metadata_b(), None)
-        .v2_checkpoint(2, protocol_v2_dv(), metadata_a()) // <-- P & M from here
+        .crc(1, protocol_c(), metadata_b(), None)
+        .v2_checkpoint(2, protocol_b(), metadata_a()) // <-- P & M from here
         .commit(3, [commit_info(DEFAULT_OPERATION, None)])
         .build()
         .await
-        .assert_p_m(None, &protocol_v2_dv(), &metadata_a());
+        .assert_p_m(None, &protocol_b(), &metadata_a());
 }
 
 // ============================================================================
@@ -704,9 +724,9 @@ async fn test_crc_before_checkpoint_is_ignored() {
 #[tokio::test]
 async fn test_ict_from_crc_at_snapshot_version() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
+        .v2_checkpoint(0, protocol_ict(), metadata_ict())
         .commit(1, [commit_info(DEFAULT_OPERATION, Some(2000))])
-        .crc(1, protocol_v2_ict(), metadata_ict(), 1000) // <-- ICT from here
+        .crc(1, protocol_ict(), metadata_ict(), 1000) // <-- ICT from here
         .build()
         .await
         .assert_ict(None, Some(1000));
@@ -715,9 +735,9 @@ async fn test_ict_from_crc_at_snapshot_version() {
 #[tokio::test]
 async fn test_ict_errors_when_crc_has_no_ict() {
     let setup = CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
+        .v2_checkpoint(0, protocol_ict(), metadata_ict())
         .commit(1, [commit_info(DEFAULT_OPERATION, Some(2000))])
-        .crc(1, protocol_v2_ict(), metadata_ict(), None)
+        .crc(1, protocol_ict(), metadata_ict(), None)
         .build()
         .await;
 
@@ -806,9 +826,9 @@ fn txn_entry(app_id: &str, version: i64, last_updated: Option<i64>) -> (String, 
 // === Protocol / metadata ===
 
 #[rstest]
-#[case::newest_p_wins(vec![protocol(protocol_v2_dv()), commit_info("WRITE", None)], protocol_v2_dv(), metadata_a())]
-#[case::newest_m_wins(vec![metadata(metadata_b()), commit_info("WRITE", None)], protocol_v2(), metadata_b())]
-#[case::base_preserved_when_segment_has_none(vec![commit_info("WRITE", None)], protocol_v2(), metadata_a())]
+#[case::newest_p_wins(vec![protocol(protocol_b()), commit_info("WRITE", None)], protocol_b(), metadata_a())]
+#[case::newest_m_wins(vec![metadata(metadata_b()), commit_info("WRITE", None)], protocol_a(), metadata_b())]
+#[case::base_preserved_when_segment_has_none(vec![commit_info("WRITE", None)], protocol_a(), metadata_a())]
 #[tokio::test]
 async fn test_p_m_propagation(
     #[case] v1_actions: Vec<Value>,
@@ -816,7 +836,7 @@ async fn test_p_m_propagation(
     #[case] expected_m: Metadata,
 ) {
     let base = Crc {
-        protocol: protocol_v2(),
+        protocol: protocol_a(),
         metadata: metadata_a(),
         ..crc_complete_empty_dm_set_txn()
     };
@@ -1050,7 +1070,7 @@ async fn test_from_disk_advances_file_stats() {
     let built = CrcReadTest::new()
         .commit(0, create_table_actions())
         // Base CRC: a (100 B, bin 0) + b (10_000 B, bin 1).
-        .crc_with_files(0, protocol_v2(), metadata_a(), None, &[100, 10_000])
+        .crc_with_files(0, protocol_a(), metadata_a(), None, &[100, 10_000])
         .commit(1, [commit_info("WRITE", None), add("c", 20_000)]) // c lands in bin 2
         .commit(2, [remove("a", Some(100)), commit_info("WRITE", None)]) // a removed from bin 0
         .build()
@@ -1075,7 +1095,7 @@ async fn test_from_disk_no_histogram_means_no_result_histogram() {
     // Empty file_sizes => no histogram persisted on disk.
     let built = CrcReadTest::new()
         .commit(0, create_table_actions())
-        .crc(0, protocol_v2(), metadata_a(), None)
+        .crc(0, protocol_a(), metadata_a(), None)
         .commit(1, [commit_info("WRITE", None), add("a", 100)])
         .build()
         .await;
@@ -1091,7 +1111,7 @@ async fn test_from_disk_with_non_zero_crc_version() {
         .commit(0, create_table_actions())
         .commit(1, [commit_info("WRITE", None), add("a", 100)])
         .commit(2, [commit_info("WRITE", None), add("b", 200)])
-        .crc_with_files(2, protocol_v2(), metadata_a(), None, &[100, 200])
+        .crc_with_files(2, protocol_a(), metadata_a(), None, &[100, 200])
         .commit(3, [commit_info("WRITE", None), add("c", 300)])
         .build()
         .await;
@@ -1110,7 +1130,7 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
     // more, removes an older file, updates metadata, and stamps an ICT. The create_table_actions
     // (and the base) use an ICT-enabled protocol so the v=2 ICT is well-formed.
     let base = Crc {
-        protocol: protocol_v2_ict(),
+        protocol: protocol_ict(),
         metadata: metadata_a(),
         ..crc_complete_empty_dm_set_txn()
     };
@@ -1142,7 +1162,7 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
         .unwrap();
 
     // Newest commit's M and ICT win; protocol stays at create_table_actions's ICT-enabled choice.
-    assert_eq!(crc.protocol, protocol_v2_ict());
+    assert_eq!(crc.protocol, protocol_ict());
     assert_eq!(crc.metadata, metadata_b());
     assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
 
@@ -1183,14 +1203,79 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     #[case] expected_crc_version: Option<u64>,
 ) {
     let built = CrcReadTest::new()
-        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
         .commit(3, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(crc_version, protocol_v2(), metadata_a(), None)
+        .crc(crc_version, protocol_a(), metadata_a(), None)
         .build()
         .await;
     let snapshot = built.snapshot_latest_with_replay(mode);
     assert_eq!(snapshot.version(), 3);
     assert_eq!(snapshot.crc().map(|c| c.version), expected_crc_version);
+}
+
+// ============================================================================
+// Tests: incremental build (builder_from) reads P&M from the CRC
+// ============================================================================
+
+// `builder_from` (incremental snapshot) Protocol resolution.
+// - CRC layouts: no new CRC / CRC below a json change / CRC above a json change / CRC at latest.
+// - Replay modes: normal CRC replay / incremental CRC replay (Unlimited).
+// The JSON protocol change is `protocol_b`; the CRC carries `protocol_c`, which matches no JSON
+// version, so the result traces its source. The newer JSON change wins when it is above the CRC;
+// otherwise the CRC supersedes it.
+#[rstest]
+#[case::no_crc(6, None, protocol_b())] // change found by replay
+#[case::crc_below_change(8, Some(6), protocol_b())] // newer JSON change wins
+#[case::crc_above_change(6, Some(8), protocol_c())] // CRC supersedes the change
+#[case::crc_at_latest(6, Some(10), protocol_c())] // CRC at end version
+#[tokio::test]
+async fn test_incremental_build_from_reads_protocol_from_crc(
+    #[case] protocol_change_version: u64,
+    #[case] crc_version: Option<u64>,
+    #[case] expected_protocol: Protocol,
+    // Protocol & Metadata must resolve identically regardless of the CRC replay strategy or
+    // budget.
+    #[values(
+        IncrementalReplay::Disabled,
+        IncrementalReplay::UpToCommits(2),
+        IncrementalReplay::Unlimited
+    )]
+    mode: IncrementalReplay,
+) {
+    // ====== GIVEN =====
+    // v0 sets protocol_a; v5 is the "from" Snapshot version.
+    let mut setup = CrcReadTest::new().commit(
+        0,
+        [
+            commit_info(DEFAULT_OPERATION, None),
+            protocol(protocol_a()),
+            metadata(metadata_a()),
+        ],
+    );
+    // `protocol_change_version` has a JSON commit changing the protocol to protocol_b.
+    for v in 1..=10 {
+        let mut actions = vec![commit_info(DEFAULT_OPERATION, None)];
+        if v == protocol_change_version {
+            actions.push(protocol(protocol_b()));
+        }
+        setup = setup.commit(v, actions);
+    }
+    if let Some(v) = crc_version {
+        // Hack: the CRC carries protocol_c, matching no JSON version.
+        setup = setup.crc(v, protocol_c(), metadata_a(), None);
+    }
+    let built = setup.build().await;
+
+    // ====== WHEN =====
+    let snapshot = built.snapshot_from(5, mode);
+
+    // ====== THEN =====
+    assert_eq!(snapshot.version(), 10);
+    assert_eq!(
+        snapshot.table_configuration().protocol(),
+        &expected_protocol,
+        "protocol_change@{protocol_change_version} crc={crc_version:?} mode={mode:?}"
+    );
 }
