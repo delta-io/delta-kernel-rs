@@ -4,8 +4,10 @@
 //! engines to receive structured metrics across the FFI boundary. To enable metrics reporting call
 //! [`crate::ffi_tracing::enable_metrics_reporting`].
 //!
-//! - Durations are reported as `u64` nanoseconds.
-//! - Operation ids are UUIDs in kernel (see [`MetricId`]). Here we report the raw 16 bytes of the UUID.
+//! - Durations are reported as `u64`, either nanoseconds or milliseconds, indicated by an `ns` or
+//!   `ms` suffix
+//! - Operation ids are UUIDs in kernel (see [`MetricId`]). Here we report the raw 16 bytes of the
+//!   UUID.
 
 use delta_kernel::metrics as kernel;
 
@@ -245,9 +247,9 @@ pub enum MetricEvent {
 }
 
 impl MetricEvent {
-    /// Build an FFI event from a kernel event. `operation` carries the (already string-sliced)
-    /// `TransactionCommitSuccess::operation`, whose backing storage the caller must keep alive
-    /// until the callback returns; it is ignored for every other variant.
+    /// Build an FFI event from a kernel event. Note that this event is only valid as long as the
+    /// passed argument is still alive, since we might make `KernelStringSlices` out of some
+    /// fields.
     pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Self {
         use kernel::MetricEvent as K;
         let ns = |d: std::time::Duration| d.as_nanos() as u64;
@@ -347,7 +349,7 @@ impl MetricEvent {
                 num_remove_files_seen: e.num_remove_files_seen,
                 num_non_file_actions: e.num_non_file_actions,
                 num_predicate_filtered: e.num_predicate_filtered,
-                peak_hash_set_size: e.peak_hash_set_size as u64,
+                peak_hash_set_size: e.peak_hash_set_size as u64, // note usize -> u64 cast
                 dedup_visitor_time_ms: e.dedup_visitor_time_ms,
                 predicate_eval_time_ms: e.predicate_eval_time_ms,
             }),
@@ -377,6 +379,7 @@ pub(crate) fn with_ffi_event<R>(
 
 #[cfg(test)]
 mod tests {
+    use std::mem::discriminant;
     use std::time::Duration;
 
     use super::*;
@@ -455,6 +458,64 @@ mod tests {
             };
             assert!(matches!(e.reason, CommitFailureReason::Conflict));
             assert_eq!(e.operation_id.bytes, id.as_bytes());
+        });
+    }
+
+    #[test]
+    fn from_kernel_scan_metadata_completed_maps_all_fields() {
+        let id = kernel::MetricId::new();
+        let event = kernel::MetricEvent::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
+            operation_id: id,
+            scan_type: kernel::ScanType::ParallelPhase,
+            duration: Duration::from_nanos(13),
+            num_add_files_seen: 17,
+            num_active_add_files: 19,
+            active_add_files_bytes: 23,
+            num_remove_files_seen: 29,
+            num_non_file_actions: 31,
+            num_predicate_filtered: 37,
+            peak_hash_set_size: 41,
+            dedup_visitor_time_ms: 43,
+            predicate_eval_time_ms: 47,
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::ScanMetadataCompleted(e) = ffi else {
+                panic!("expected ScanMetadataCompleted");
+            };
+            assert_eq!(e.operation_id.bytes, id.as_bytes());
+            assert_eq!(
+                discriminant(&e.scan_type),
+                discriminant(&ScanType::ParallelPhase)
+            );
+            assert_eq!(e.duration_ns, 13);
+            assert_eq!(e.num_add_files_seen, 17);
+            assert_eq!(e.num_active_add_files, 19);
+            assert_eq!(e.active_add_files_bytes, 23);
+            assert_eq!(e.num_remove_files_seen, 29);
+            assert_eq!(e.num_non_file_actions, 31);
+            assert_eq!(e.num_predicate_filtered, 37);
+            assert_eq!(e.peak_hash_set_size, 41);
+            assert_eq!(e.dedup_visitor_time_ms, 43);
+            assert_eq!(e.predicate_eval_time_ms, 47);
+        });
+    }
+
+    #[test]
+    fn from_kernel_set_transaction_load_success_distinguishes_bools() {
+        // from_cache and found are adjacent bools that are trivial to swap; assert distinct values.
+        let event =
+            kernel::MetricEvent::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
+                from_cache: true,
+                found: false,
+                duration: Duration::from_nanos(53),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::SetTransactionLoadSuccess(e) = ffi else {
+                panic!("expected SetTransactionLoadSuccess");
+            };
+            assert!(e.from_cache);
+            assert!(!e.found);
+            assert_eq!(e.duration_ns, 53);
         });
     }
 }

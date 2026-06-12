@@ -8,9 +8,9 @@
 //! - The logging layer is a type-erased [`Layer`] that an `enable_*_tracing` call swaps in (either
 //!   event-based or formatted log-line)
 //! - The metrics slot is a [`ReportGeneratorLayer`] that is `OFF` (zero overhead) until
-//! [`enable_metrics_reporting`] turns it on.
+//!   [`enable_metrics_reporting`] turns it on.
 //!
-//! Both layers are wrapped in a [`reload::Layer`] so they can be swapped.
+//! Both are reloadable so they can be swapped.
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::{fmt, io};
@@ -358,7 +358,7 @@ impl<'a> MakeWriter<'a> for BufferedMessageWriter {
 
 /// Callback an engine registers via [`enable_metrics_reporting`] to receive kernel
 /// [`MetricEvent`]s. This is invoked synchronously on the thread that emitted the event. Note that
-/// the `event`,and any [`KernelStringSlice`] it carries, are only valid for the duration of the
+/// the `event`, and any [`KernelStringSlice`] it carries, are only valid for the duration of the
 /// call.
 pub type MetricsEventFn = extern "C" fn(event: MetricEvent);
 
@@ -582,7 +582,7 @@ fn setup_log_line_subscriber(
 }
 
 /// Enable getting called back with structured kernel metric events. `callback` receives a
-/// [`MetricEvent`] each time kernel emits a report. (See the [`metrics`] module).
+/// [`MetricEvent`] each time kernel emits a report. (See the [`delta_kernel::metrics`] module).
 ///
 /// Calling this replaces any previously set callback.
 ///

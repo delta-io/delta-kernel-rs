@@ -24,5 +24,5 @@ EngineError* allocate_error(KernelError etype, const KernelStringSlice msg);
 // utility function to convert key/val into slices and set them on a builder
 // returns false on failure
 bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val);
-/// print out metric info
+// print out metric info
 void print_metric(MetricEvent event);

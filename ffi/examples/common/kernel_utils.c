@@ -104,6 +104,7 @@ void print_metric(MetricEvent event) {
     PM_U64(lsls, num_commit_files);
     PM_U64(lsls, num_checkpoint_files);
     PM_U64(lsls, num_compaction_files);
+    PM_BOOL(lsls, has_latest_crc_file);
     PM_END;
     return;
 
@@ -148,6 +149,7 @@ void print_metric(MetricEvent event) {
   case MetricEventTransactionCommitSuccess:
     PM_START(TransactionCommitSuccess);
     TransactionCommitSuccess tcs = event.transaction_commit_success;
+    PM_ID(tcs, operation_id);
     PM_U64(tcs, commit_version);
     PM_U64(tcs, num_add_files);
     PM_U64(tcs, num_remove_files);
@@ -181,6 +183,7 @@ void print_metric(MetricEvent event) {
     PM_BOOL(dmls, from_cache);
     PM_U64(dmls, num_domains_returned);
     PM_U64(dmls, duration_ns);
+    PM_END;
     return;
 
   case MetricEventDomainMetadataLoadFailure:
@@ -194,6 +197,7 @@ void print_metric(MetricEvent event) {
     PM_BOOL(stls, from_cache);
     PM_BOOL(stls, found);
     PM_U64(stls, duration_ns);
+    PM_END;
     return;
 
   case MetricEventSetTransactionLoadFailure:
@@ -206,6 +210,7 @@ void print_metric(MetricEvent event) {
     CrcReadSuccess crs = event.crc_read_success;
     PM_U64(crs, bytes_read);
     PM_U64(crs, duration_ns);
+    PM_END;
     return;
 
   case MetricEventCrcReadFailure:
