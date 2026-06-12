@@ -1597,7 +1597,8 @@ mod tests {
         Filesystem,
         /// Catalog-managed table with a single v0 metadata commit.
         CatalogManaged,
-        /// Filesystem-only table with a mock checkpoint created.
+        /// Filesystem table with commits at versions 2-4 (no commit 0) plus a mocked checkpoint at
+        /// version 4.
         CheckpointWithLogCleanUp,
         /// Empty store -- the log directory contains no commits.
         Empty,
