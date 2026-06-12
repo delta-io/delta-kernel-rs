@@ -902,10 +902,6 @@ mod tests {
     use crate::struct_patch::ProjectionStructPatchBuilder;
     use crate::utils::test_utils::assert_result_error_with_message;
 
-    fn expr(value: impl Into<crate::expressions::Scalar>) -> ExpressionRef {
-        Arc::new(lit(value))
-    }
-
     fn projection_patch(expr: &ExpressionRef) -> &ExpressionStructPatch {
         let Expr::StructPatch(patch) = expr.as_ref() else {
             panic!("Expected struct patch expression");
@@ -1115,11 +1111,11 @@ mod tests {
     fn projection_sparse_build_produces_schema_and_sparse_patch() {
         let input_schema = schema(&["a", "b", "c", "untouched"]);
         let (output_schema, patch) = ProjectionStructPatchBuilder::new(&input_schema)
-            .prepend(field("prepended"), expr(0))
-            .insert_after("a", field("after_a"), expr(1))
-            .replace("b", field("bb"), expr(2))
+            .prepend(field("prepended"), lit(0))
+            .insert_after("a", field("after_a"), lit(1))
+            .replace("b", field("bb"), lit(2))
             .drop("c")
-            .append(field("appended"), expr(3))
+            .append(field("appended"), lit(3))
             .build()
             .unwrap();
         let patch = projection_patch(&patch);
@@ -1128,18 +1124,18 @@ mod tests {
             field_names(&output_schema),
             ["prepended", "a", "after_a", "bb", "untouched", "appended"]
         );
-        assert_eq!(patch.prepended_fields, vec![expr(0)]);
-        assert_eq!(patch.appended_fields, vec![expr(3)]);
+        assert_eq!(patch.prepended_fields, vec![Arc::new(lit(0))]);
+        assert_eq!(patch.appended_fields, vec![Arc::new(lit(3))]);
         assert!(patch.input_path().is_none());
         assert!(!patch.field_patches.contains_key("untouched"));
 
         let a = patch.field_patches.get("a").unwrap();
         assert!(a.keep_input);
-        assert_eq!(a.insertions, vec![expr(1)]);
+        assert_eq!(a.insertions, vec![Arc::new(lit(1))]);
 
         let b = patch.field_patches.get("b").unwrap();
         assert!(!b.keep_input);
-        assert_eq!(b.insertions, vec![expr(2)]);
+        assert_eq!(b.insertions, vec![Arc::new(lit(2))]);
 
         let c = patch.field_patches.get("c").unwrap();
         assert!(!c.keep_input);
@@ -1150,7 +1146,7 @@ mod tests {
     fn projection_sparse_build_lowers_nested_patch_to_sparse_struct_patch() {
         let input_schema = nested_input_schema();
         let (output_schema, patch) = ProjectionStructPatchBuilder::new(&input_schema)
-            .insert_after_at(["nested"], "nested_a", field("nested_inserted"), expr(9))
+            .insert_after_at(["nested"], "nested_a", field("nested_inserted"), lit(9))
             .build()
             .unwrap();
         let patch = projection_patch(&patch);
@@ -1180,7 +1176,41 @@ mod tests {
 
         let nested_a = inner.field_patches.get("nested_a").unwrap();
         assert!(nested_a.keep_input);
-        assert_eq!(nested_a.insertions, vec![expr(9)]);
+        assert_eq!(nested_a.insertions, vec![Arc::new(lit(9))]);
+    }
+
+    #[test]
+    fn projection_sparse_build_replace_expr_at_preserves_nested_field() {
+        let input_schema = nested_input_schema();
+        let (output_schema, patch) = ProjectionStructPatchBuilder::new(&input_schema)
+            .replace_expr_at(["nested"], "nested_b", lit(9))
+            .build()
+            .unwrap();
+        let patch = projection_patch(&patch);
+
+        assert_eq!(field_names(&output_schema), ["nested", "top"]);
+        let DataType::Struct(output_nested_schema) =
+            output_schema.field("nested").unwrap().data_type()
+        else {
+            panic!("Expected nested struct field");
+        };
+        let DataType::Struct(input_nested_schema) =
+            input_schema.field("nested").unwrap().data_type()
+        else {
+            panic!("Expected nested struct field");
+        };
+        assert_eq!(
+            output_nested_schema.field("nested_b"),
+            input_nested_schema.field("nested_b")
+        );
+
+        let nested_patch = patch.field_patches.get("nested").unwrap();
+        let Expr::StructPatch(inner) = nested_patch.insertions[0].as_ref() else {
+            panic!("Expected nested struct patch");
+        };
+        let nested_b = inner.field_patches.get("nested_b").unwrap();
+        assert!(!nested_b.keep_input);
+        assert_eq!(nested_b.insertions, vec![Arc::new(lit(9))]);
     }
 
     #[test]
@@ -1188,7 +1218,7 @@ mod tests {
         let input_schema = nested_input_schema();
         let (output_schema, patch) =
             ProjectionStructPatchBuilder::new_nested(&input_schema, ["nested"])
-                .replace_expr("nested_b", expr(9))
+                .replace_expr("nested_b", lit(9))
                 .build()
                 .unwrap();
         let patch = projection_patch(&patch);
@@ -1201,7 +1231,7 @@ mod tests {
 
         let nested_b = patch.field_patches.get("nested_b").unwrap();
         assert!(!nested_b.keep_input);
-        assert_eq!(nested_b.insertions, vec![expr(9)]);
+        assert_eq!(nested_b.insertions, vec![Arc::new(lit(9))]);
     }
 
     #[test]
