@@ -581,13 +581,8 @@ fn resolve_input_schema<'a>(
         Some(input_path) if !input_path.path().is_empty() => input_path,
         _ => return Ok(input_schema),
     };
-    let fields = input_schema.walk_column_fields(input_path)?;
-    let Some(leaf) = fields.last() else {
-        return Err(Error::internal_error(format!(
-            "walk_column_fields returned an empty field list for input path '{input_path}'"
-        )));
-    };
-    let DataType::Struct(nested_schema) = leaf.data_type() else {
+    let field = input_schema.field_at(input_path)?;
+    let DataType::Struct(nested_schema) = field.data_type() else {
         return Err(Error::generic(format!(
             "Patching failed: input path '{input_path}' references a non-struct field"
         )));

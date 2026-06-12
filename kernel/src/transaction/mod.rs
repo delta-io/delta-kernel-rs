@@ -1138,7 +1138,7 @@ impl<S> Transaction<S> {
                     .iter()
                     .map(|col| {
                         let data_type = physical_schema
-                            .walk_column_fields(col)?
+                            .fields_of_path(col)?
                             .last()
                             .map(|field| field.data_type().clone())
                             .ok_or_else(|| {
