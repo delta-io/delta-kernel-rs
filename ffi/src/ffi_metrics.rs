@@ -416,6 +416,32 @@ mod tests {
     }
 
     #[test]
+    fn from_kernel_transaction_commit_success_unset_operation_is_empty_slice() {
+        let event =
+            kernel::MetricEvent::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
+                operation_id: kernel::MetricId::new(),
+                commit_version: 1,
+                num_add_files: 0,
+                num_remove_files: 0,
+                add_files_bytes: 0,
+                remove_files_bytes: 0,
+                is_blind_append: false,
+                data_change: true,
+                operation: None,
+                prepare_duration: Duration::from_nanos(0),
+                committer_duration: Duration::from_nanos(0),
+                total_duration: Duration::from_nanos(0),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::TransactionCommitSuccess(e) = ffi else {
+                panic!("expected TransactionCommitSuccess");
+            };
+            let op: &str = unsafe { TryFromStringSlice::try_from_slice(&e.operation).unwrap() };
+            assert_eq!(op, "");
+        });
+    }
+
+    #[test]
     fn from_kernel_maps_failure_reason() {
         let id = kernel::MetricId::new();
         let failure =

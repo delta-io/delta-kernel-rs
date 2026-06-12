@@ -147,9 +147,10 @@ impl KernelStringSlice {
         }
     }
 
+    #[cfg(feature = "tracing")]
     pub(crate) fn empty() -> Self {
         KernelStringSlice {
-            ptr: std::ptr::null(),
+            ptr: NonNull::<u8>::dangling().as_ptr().cast(),
             len: 0,
         }
     }
