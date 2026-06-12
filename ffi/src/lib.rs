@@ -146,6 +146,13 @@ impl KernelStringSlice {
             len: source.len(),
         }
     }
+
+    pub(crate) fn empty() -> Self {
+        KernelStringSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        }
+    }
 }
 
 /// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.

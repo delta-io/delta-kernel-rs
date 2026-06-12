@@ -1,15 +1,11 @@
 //! FFI-safe representations of kernel [`MetricEvent`]s.
 //!
-//! [`MetricEvent`] mirrors [`delta_kernel::metrics::MetricEvent`] field-for-field as a `repr(C)`
-//! tagged union so engines can receive structured metrics across the FFI boundary. See
-//! [`crate::ffi_tracing::enable_metrics_reporting`] for how an engine registers a callback to
-//! receive these events.
+//! [`MetricEvent`] is a `repr(C)` version of [`delta_kernel::metrics::MetricEvent`], to allow
+//! engines to receive structured metrics across the FFI boundary. To enable metrics reporting call
+//! [`crate::ffi_tracing::enable_metrics_reporting`].
 //!
-//! Durations are reported as `u64` nanoseconds (`*_duration_ns` / `duration_ns`). Operation ids
-//! are the 16 raw bytes of the kernel UUID (see [`MetricId`]); the engine may format them however
-//! it likes. The single string-valued field (`TransactionCommitSuccess::operation`) is a
-//! [`KernelStringSlice`] valid only for the duration of the callback; an empty slice (`len == 0`)
-//! means the operation was unset.
+//! - Durations are reported as `u64` nanoseconds.
+//! - Operation ids are UUIDs in kernel (see [`MetricId`]). Here we report the raw 16 bytes of the UUID.
 
 use delta_kernel::metrics as kernel;
 
@@ -28,6 +24,11 @@ impl From<kernel::MetricId> for MetricId {
         }
     }
 }
+
+// we add cbindgen:prefix-with-name=true below otherwise we get name conflicts. For example
+// CommitFailureReason::Error would become just `Error`, which conflicts with the type in
+// error.rs. Not all variants cause conflicts, but since they refer to common kernel concepts we
+// prefix all enums to avoid future issues.
 
 /// Which scan execution path produced a [`ScanMetadataCompleted`] event.
 ///
@@ -69,9 +70,7 @@ impl From<kernel::CommitFailureReason> for CommitFailureReason {
     }
 }
 
-// === Per-event payload structs ===
-
-/// A log segment was listed and assembled for a snapshot.
+/// A log segment was loaded.
 #[repr(C)]
 pub struct LogSegmentLoadSuccess {
     pub operation_id: MetricId,
@@ -82,7 +81,7 @@ pub struct LogSegmentLoadSuccess {
     pub has_latest_crc_file: bool,
 }
 
-/// Listing the log segment for a snapshot failed.
+/// Listing the log segment failed.
 #[repr(C)]
 pub struct LogSegmentLoadFailure {
     pub operation_id: MetricId,
@@ -217,8 +216,8 @@ pub struct StorageCopyCompleted {
     pub duration_ns: u64,
 }
 
-/// FFI-safe mirror of [`delta_kernel::metrics::MetricEvent`]. Delivered by value to the callback
-/// registered via [`crate::ffi_tracing::enable_metrics_reporting`].
+/// C version of [`delta_kernel::metrics::MetricEvent`]. Passed by value to a callback registered
+/// via [`crate::ffi_tracing::enable_metrics_reporting`].
 ///
 /// cbindgen:prefix-with-name=true
 #[repr(C)]
@@ -249,7 +248,7 @@ impl MetricEvent {
     /// Build an FFI event from a kernel event. `operation` carries the (already string-sliced)
     /// `TransactionCommitSuccess::operation`, whose backing storage the caller must keep alive
     /// until the callback returns; it is ignored for every other variant.
-    pub(crate) fn from_kernel(event: &kernel::MetricEvent, operation: KernelStringSlice) -> Self {
+    pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Self {
         use kernel::MetricEvent as K;
         let ns = |d: std::time::Duration| d.as_nanos() as u64;
         match event {
@@ -284,6 +283,10 @@ impl MetricEvent {
                 operation_id: e.operation_id.into(),
             }),
             K::TransactionCommitSuccess(e) => {
+                let operation = match e.operation.as_ref() {
+                    Some(o) => kernel_string_slice!(o),
+                    None => KernelStringSlice::empty(),
+                };
                 Self::TransactionCommitSuccess(TransactionCommitSuccess {
                     operation_id: e.operation_id.into(),
                     commit_version: e.commit_version,
@@ -364,21 +367,12 @@ impl MetricEvent {
     }
 }
 
-/// Invoke `f` with the FFI [`MetricEvent`] built from `event`, keeping any borrowed string data
-/// alive for the duration of the call. This indirection exists because
-/// `TransactionCommitSuccess::operation` is a [`KernelStringSlice`] that must point at storage
-/// living across the callback -- the slice cannot outlive a `from_kernel` call that owns the
-/// backing `String`, so the `String` is held here on the stack instead.
+/// Invoke `f` with the FFI [`MetricEvent`] built from `event`.
 pub(crate) fn with_ffi_event<R>(
     event: &kernel::MetricEvent,
     f: impl FnOnce(MetricEvent) -> R,
 ) -> R {
-    let operation = match event {
-        kernel::MetricEvent::TransactionCommitSuccess(e) => e.operation.clone().unwrap_or_default(),
-        _ => String::new(),
-    };
-    let slice = kernel_string_slice!(operation);
-    f(MetricEvent::from_kernel(event, slice))
+    f(MetricEvent::from_kernel(event))
 }
 
 #[cfg(test)]
