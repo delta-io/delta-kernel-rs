@@ -8,8 +8,8 @@
 # Benchmarks run on four triggers:
 #   - pull_request: every push to a non-draft PR auto-runs with BENCH_TAGS=base
 #   - push (main only): warms the rust-cache so PR runs restore a warm target/
-#   - issue_comment: a /bench [--tags ...] [--filter ...] comment runs with
-#                    the supplied flags (including on draft PRs)
+#   - issue_comment: a /bench comment runs with the supplied flags (including
+#                    on draft PRs); see benchmarks/README.md for the syntax
 #   - merge_group: declared so this workflow can be added to branch protection
 #                  as a required status check later. Currently a no-op.
 # Comment posting lives in a separate workflow_run-triggered workflow at

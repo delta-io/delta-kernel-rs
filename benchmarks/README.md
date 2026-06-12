@@ -112,14 +112,20 @@ same comment that the auto-trigger uses.
 To trigger benchmarks on a pull request manually, post a comment using the following syntax:
 
 ```
-/bench [--tags <comma separated list of tags>] [--filter <regex>]
+/bench [--tags <comma separated list of tags>] [--filter <regex>] [--rounds <n>]
+       [--sample-size <n>] [--measurement-time <secs>] [--warm-up-time <secs>]
 ```
 
 - `--tags` sets `BENCH_TAGS` (comma-separated), controlling which table groupings run.
 - `--filter` is a single-token Criterion regex matched against benchmark names.
-- Both flags are optional and independent; they can be given in any order.
-- When both are specified, they apply as AND: only benchmarks from tables that match the tag filter AND whose name matches the regex are run.
-- Running just `/bench` (with no flags) defaults to `BENCH_TAGS=base`. If neither flag is parsed, the same default applies.
+- `--rounds` sets how many alternating base/PR measurement rounds run (1 to 5, default 2).
+- `--sample-size`, `--measurement-time`, and `--warm-up-time` are passed through to Criterion,
+  trading per-pass cost against per-pass precision.
+- All flags are optional and independent; they can be given in any order.
+- When both `--tags` and `--filter` are specified, they apply as AND: only benchmarks from
+  tables that match the tag filter AND whose name matches the regex are run.
+- Running just `/bench` (with no flags) defaults to `BENCH_TAGS=base`. If neither `--tags`
+  nor `--filter` is parsed, the same default applies.
 
 Examples:
 ```
@@ -131,7 +137,14 @@ Examples:
 ```
 
 See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for how tags work and [By benchmark name](#by-benchmark-name) for regex pattern examples. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.
-CI timings are noisy and tend to run higher than on dedicated hardware, but proportional differences between branches are a rough signal for performance changes.
+
+CI timings are noisy and tend to run higher than on dedicated hardware. To keep that noise
+out of the comparison, the CI run compiles one bench binary per branch and executes them in
+alternating rounds (base, PR, base, PR, ...), so machine-state drift spreads over both sides
+instead of biasing one. The posted comment compares the best time per side across rounds,
+flags a change only when it exceeds a noise band and the combined error bars, and reports the
+round-to-round spread of identical code as the run's measured noise floor. Treat wall-clock
+results on shared runners as advisory; rerun locally before acting on a small difference.
 
 ## Workload data layout
 
