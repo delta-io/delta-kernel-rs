@@ -1674,7 +1674,7 @@ mod tests {
         EarliestCommitTableSetupScenario::Empty,
         OptionalValue::None,
         FfiHistoryCommitType::Published,
-        Err(KernelError::LogHistory)
+        Err(KernelError::LogHistoryError)
     )]
     #[case::checkpoint_published(
         EarliestCommitTableSetupScenario::CheckpointWithLogCleanUp,

@@ -73,7 +73,7 @@ pub enum KernelError {
     LiteralExpressionTransformError = 40,
     CheckpointWriteError = 41,
     SchemaError = 42,
-    LogHistory = 43,
+    LogHistoryError = 43,
 }
 
 impl From<Error> for KernelError {
@@ -135,7 +135,7 @@ impl From<Error> for KernelError {
                 KernelError::LiteralExpressionTransformError
             }
             Error::Schema(_) => KernelError::SchemaError,
-            Error::LogHistory(_) => KernelError::LogHistory,
+            Error::LogHistory(_) => KernelError::LogHistoryError,
             _ => KernelError::UnknownError,
         }
     }
@@ -345,7 +345,8 @@ impl From<EngineExecError> for Error {
             | KernelError::ParseIntervalError
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
-            | KernelError::LiteralExpressionTransformError) => {
+            | KernelError::LiteralExpressionTransformError)
+            | KernelError::LogHistoryError => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
             #[cfg(feature = "default-engine-base")]
