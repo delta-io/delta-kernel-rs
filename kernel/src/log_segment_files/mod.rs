@@ -25,7 +25,7 @@ use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{may_begin_listable_log_path, LogPathFileType, ParsedLogPath};
 use crate::{DeltaResult, Error, StorageHandler, Version};
 
 #[cfg(test)]
@@ -61,7 +61,7 @@ pub(crate) struct LogSegmentFiles {
 /// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
 /// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
 /// underlying listing at the first path past the version-named region, so directories like
-/// `_staged_commits/` are never paged through.
+/// `_staged_commits/` and `_sidecars/` are never paged through.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
@@ -76,18 +76,17 @@ pub(crate) fn list_from_storage(
     let log_root_str = log_root.to_string();
     let files = storage
         .list_from(&start_from)?
-        // The listing is sorted by full path and every listable log file begins with a 20-digit
-        // version, so nothing relevant follows the first relative path starting past '9'. Stopping
-        // there avoids paging through `_staged_commits/` ('_' > '9'), which can hold thousands of
-        // files. A path that doesn't strip the log_root prefix is kept; parsing discards it.
+        // The listing is sorted by full path, so nothing relevant follows the first relative path
+        // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
+        // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
+        // A path that doesn't strip the log_root prefix is kept; parsing discards it.
         // TODO(#2740): push the bound into the listing request itself.
         .take_while(move |meta_res| match meta_res {
             Ok(meta) => meta
                 .location
                 .as_str()
                 .strip_prefix(&log_root_str)
-                .and_then(|rel| rel.as_bytes().first())
-                .is_none_or(|b| *b <= b'9'),
+                .is_none_or(may_begin_listable_log_path),
             Err(_) => true,
         })
         .map(|meta| ParsedLogPath::try_from(meta?))

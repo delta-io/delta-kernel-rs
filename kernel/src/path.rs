@@ -108,6 +108,18 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
     path_segments.any(|p| p == DELTA_LOG_DIR)
 }
 
+/// Returns whether `rel_path`, a path relative to the `_delta_log/` directory, could still be
+/// within the version-named region of a lexicographically sorted log listing.
+///
+/// Every listable log file begins with a 20-digit version, so its first byte is an ASCII digit.
+/// Paths like `_staged_commits/`, `_sidecars/`, and `_last_checkpoint` sort after every
+/// version-named file because `'_'` (0x5F) > `'9'` (0x39), so a sorted listing can stop at the
+/// first relative path whose first byte sorts past `'9'`. An empty `rel_path` is conservatively
+/// kept.
+pub(crate) fn may_begin_listable_log_path(rel_path: &str) -> bool {
+    rel_path.as_bytes().first().is_none_or(|b| *b <= b'9')
+}
+
 impl<Location: AsUrl> ParsedLogPath<Location> {
     /// Estimated heap size in bytes, best-effort estimate.
     ///

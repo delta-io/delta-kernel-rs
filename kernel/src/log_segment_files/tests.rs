@@ -490,6 +490,35 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(storage.items_listed(), 4);
 }
 
+// Any path past the version-named region stops the listing, not just `_staged_commits/`:
+// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
+// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
+// is ever consumed.
+#[rstest]
+#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
+#[case::non_underscore_sentinel("_delta_log/Zsentinel")]
+#[tokio::test]
+async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_path: &str) {
+    let mut log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+    log_files.extend((0..50).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
+
+    let (storage, log_root) = create_storage_with_raw_paths(log_files, &[sentinel_path]).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, None);
+
+    assert_eq!(commits.len(), 3);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // 3 commits plus the sentinel that stops the listing
+    assert_eq!(storage.items_listed(), 4);
+}
+
 #[tokio::test]
 async fn test_listing_stops_at_last_checkpoint_marker() {
     // In a real table `_last_checkpoint` sorts before `_staged_commits/` ('_la' < '_st'), so
