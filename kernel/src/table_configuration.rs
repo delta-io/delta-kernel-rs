@@ -401,7 +401,7 @@ impl TableConfiguration {
         self.logical_schemas
             .without_partition
             .get_or_init(|| {
-                let partition_columns = self.partition_columns();
+                let partition_columns: HashSet<&String> = self.partition_columns().iter().collect();
                 // Safety: subset of an already-valid schema.
                 Arc::new(StructType::new_unchecked(
                     self.logical_schemas

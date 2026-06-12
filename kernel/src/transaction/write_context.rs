@@ -160,8 +160,7 @@ impl WriteContext {
         url
     }
 
-    /// Returns the logical (user-facing) table schema. Connectors use this to determine
-    /// the schema of data to write.
+    /// Returns the schema which connectors' logical data should conform to.
     pub fn logical_schema(&self) -> &SchemaRef {
         &self.shared.logical_schema
     }

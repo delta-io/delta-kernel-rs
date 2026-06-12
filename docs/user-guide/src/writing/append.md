@@ -153,13 +153,12 @@ writes the file, collects statistics, and returns file metadata that you pass to
 
 ### Using a custom engine
 
-If you do not use `DefaultEngine`, you can write the file in customized way, the expected
-flow:
+If you do not use `DefaultEngine`, write the files yourself. The expected flow is:
 
-1. Evaluate `write_context.logical_to_physical()` to transform your 
-logical data into physical data.
-2. Write the data under `write_context.write_dir()`, pass the corresponding addFile
-to `txn.add_files()`.
+1. Evaluate `write_context.logical_to_physical()` to transform your logical data into
+   physical data.
+2. Write the physical data under `write_context.write_dir()`, then pass the corresponding
+   add-file metadata to `txn.add_files()`.
 
 ```rust,ignore
 // Assume: data: Box<dyn EngineData> (logical), engine: impl Engine,
@@ -173,9 +172,8 @@ let evaluator = engine.evaluation_handler().new_expression_evaluator(
 )?;
 let physical_data = evaluator.evaluate(data.as_ref())?;
 
-// 2. Write `physical_data` and add to the transaction.
-// You can write `physical_data` and get `add_file_metadata` in any 
-// customized way.
+// 2. Write `physical_data` under `write_context.write_dir()` in whatever way your
+// engine writes Parquet, producing `add_file_metadata` for the written file.
 
 txn.add_files(add_file_metadata);
 ```

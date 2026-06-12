@@ -90,6 +90,10 @@ Key points:
   to the schema case.
 - **No partition columns in your logical data**: your data batches should follow the logical write
   schema (`wc.logical_schema()`), which excludes partition columns.
+- **Materialization is automatic**: some table features (such as
+  `materializePartitionColumns` and `icebergCompatV3`) require partition values to also be
+  written into the data files as regular columns. Kernel handles this through the
+  logical-to-physical transform.
 
 > [!TIP]
 > To get the partition column names at runtime, call `txn.logical_partition_columns()`.
