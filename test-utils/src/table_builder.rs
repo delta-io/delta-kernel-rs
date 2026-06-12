@@ -1337,11 +1337,8 @@ async fn write_data_commit<E: TaskExecutor>(
             if partition_columns.contains(&kernel_field.name().to_string()) {
                 continue;
             }
-            columns.push(generate_column(
-                arrow_field.data_type(),
-                rows_per_file,
-                base,
-            ));
+            let data_type = arrow_field.data_type();
+            columns.push(generate_column(data_type, rows_per_file, base));
             data_fields.push(arrow_field.clone());
         }
         let data_arrow_schema = ArrowSchema::new(data_fields);

@@ -87,10 +87,7 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
     Ok(())
 }
 
-/// Physical schema variants for a table.
-///
-/// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
-/// - `without_partition`: lazily computed variant that excludes partition columns.
+/// Cached schema variants for a table.
 ///
 /// Note:
 /// `without_partition` is wrapped in an `Arc` so that the lazily-initialized schema is shared
@@ -99,12 +96,12 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
 /// the empty `OnceLock`, meaning later schema loads would unnecessarily store independent
 /// copies of the same schema.
 #[derive(Debug, Clone, Eq)]
-struct PhysicalSchemas {
+struct CachedSchemas {
     full: SchemaRef,
     without_partition: Arc<OnceLock<SchemaRef>>,
 }
 
-impl PhysicalSchemas {
+impl CachedSchemas {
     fn new(full: SchemaRef) -> Self {
         Self {
             full,
@@ -113,11 +110,11 @@ impl PhysicalSchemas {
     }
 }
 
-impl PartialEq for PhysicalSchemas {
+impl PartialEq for CachedSchemas {
     fn eq(&self, other: &Self) -> bool {
         // `without_partition` is deterministically derived from `full` and partition columns
         // (compared via `metadata` in TableConfiguration's PartialEq), so comparing it is
-        // redundant. Two PhysicalSchemas with the same `full` are considered equal even if
+        // redundant. Two CachedSchemas with the same `full` are considered equal even if
         // one has `without_partition` initialized and the other does not.
         self.full == other.full
     }
@@ -138,9 +135,9 @@ impl PartialEq for PhysicalSchemas {
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
-    /// Logical schema: field names are the user-facing (logical) column names.
-    logical_schema: SchemaRef,
-    physical_schemas: PhysicalSchemas,
+    /// Logical schemas: field names are the user-facing (logical) column names.
+    logical_schemas: CachedSchemas,
+    physical_schemas: CachedSchemas,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -205,10 +202,10 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
-        let physical_schemas = PhysicalSchemas::new(physical_schema);
+        let physical_schemas = CachedSchemas::new(physical_schema);
 
         let table_config = Self {
-            logical_schema,
+            logical_schemas: CachedSchemas::new(logical_schema),
             physical_schemas,
             metadata,
             protocol,
@@ -218,7 +215,7 @@ impl TableConfiguration {
             version,
         };
 
-        validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
+        validate_partition_columns(&table_config.metadata, &table_config.logical_schemas.full)?;
 
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
@@ -399,19 +396,22 @@ impl TableConfiguration {
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
-    /// Returns the logical schema for data columns (excludes partition columns).
-    ///
-    /// Partition columns are excluded because statistics are only collected for data columns
-    /// that are physically stored in the parquet files. Partition values are stored in the
-    /// file path, not in the file content, so they don't have file-level statistics.
-    fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.partition_columns();
-        Arc::new(StructType::new_unchecked(
-            self.logical_schema()
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name()))
-                .cloned(),
-        ))
+    /// Returns the logical schema excluding partition columns.
+    pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
+        self.logical_schemas
+            .without_partition
+            .get_or_init(|| {
+                let partition_columns = self.partition_columns();
+                // Safety: subset of an already-valid schema.
+                Arc::new(StructType::new_unchecked(
+                    self.logical_schemas
+                        .full
+                        .fields()
+                        .filter(|field| !partition_columns.contains(field.name()))
+                        .cloned(),
+                ))
+            })
+            .clone()
     }
 
     /// Returns the physical data schema excluding partition columns.
@@ -447,7 +447,7 @@ impl TableConfiguration {
             .data_skipping_stats_columns
             .as_ref()
             .map(|cols| {
-                let logical_schema = self.logical_data_schema();
+                let logical_schema = self.logical_schema_without_partition_columns();
                 let mode = self.column_mapping_mode();
                 cols.iter()
                     .filter_map(|col| {
@@ -483,7 +483,7 @@ impl TableConfiguration {
     /// The logical schema ([`SchemaRef`]) of this table at this version.
     #[internal_api]
     pub(crate) fn logical_schema(&self) -> SchemaRef {
-        self.logical_schema.clone()
+        self.logical_schemas.full.clone()
     }
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.
@@ -743,7 +743,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && schema_has_invariants(self.logical_schema.as_ref())
+            && schema_has_invariants(self.logical_schemas.full.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
@@ -2208,7 +2208,7 @@ mod test {
         );
 
         // try_new_from that actually changes metadata (here: drop one partition column) must
-        // also build a fresh PhysicalSchemas. The new cached schema differs from the original.
+        // also build fresh schemas. The new cached schema differs from the original.
         let new_schema = partitioned_schema_with_column_mapping();
         let new_metadata = Metadata::try_new(
             None,

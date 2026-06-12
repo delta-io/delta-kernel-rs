@@ -20,6 +20,7 @@ use crate::{DeltaResult, Error};
 #[derive(Debug)]
 pub(super) struct SharedWriteState {
     pub(super) table_root: Url,
+    /// Logical schema of the data to write: the table schema minus partition columns.
     pub(super) logical_schema: SchemaRef,
     pub(super) physical_schema: SchemaRef,
     pub(super) column_mapping_mode: ColumnMappingMode,

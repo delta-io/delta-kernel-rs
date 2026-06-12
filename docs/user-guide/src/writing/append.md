@@ -12,7 +12,7 @@ Appending data to a Delta table follows these steps:
 1. Get a `Snapshot` of the table
 2. Create a `Transaction` from the snapshot
 3. Get the `WriteContext` from the transaction
-4. Write Parquet files using the engine and `WriteContext`
+4. [Write Parquet files](#writing-parquet-files) using the engine and `WriteContext`
 5. Register the written files with the transaction via `add_files`
 6. Commit the transaction
 
@@ -122,7 +122,7 @@ For partitioned tables, see
 |--------|---------|---------|
 | `table_root_dir()` | `&Url` | The table root URL |
 | `write_dir()` | `Url` | The URL for writing files |
-| `logical_schema()` | `&SchemaRef` | The full user-defined table schema |
+| `logical_schema()` | `&SchemaRef` | The schema your logical data should conform to |
 | `physical_schema()` | `&SchemaRef` | The schema for the on-disk physical data |
 | `logical_to_physical()` | `ExpressionRef` | Expression that transforms logical data to physical |
 | `column_mapping_mode()` | `ColumnMappingMode` | The column mapping mode for this table |
@@ -131,7 +131,12 @@ For partitioned tables, see
 
 ## Writing Parquet files
 
-The `DefaultEngine` provides an async helper for writing Parquet:
+Start with the logical `data: EngineData` you want to write. Its schema should conform to
+`write_context.logical_schema()`.
+
+### Using `DefaultEngine`
+
+The `DefaultEngine` provides an async helper that does everything for you:
 
 ```rust,ignore
 let file_metadata = engine
@@ -146,8 +151,36 @@ let file_metadata = engine
 writes the file, collects statistics, and returns file metadata that you pass to
 `txn.add_files()`.
 
-You can call `write_parquet` and `add_files` multiple times to write multiple files in one
-transaction.
+### Using a custom engine
+
+If you do not use `DefaultEngine`, you can write the file in customized way, the expected
+flow:
+
+1. Evaluate `write_context.logical_to_physical()` to transform your 
+logical data into physical data.
+2. Write the data under `write_context.write_dir()`, pass the corresponding addFile
+to `txn.add_files()`.
+
+```rust,ignore
+// Assume: data: Box<dyn EngineData> (logical), engine: impl Engine,
+// write_context: WriteContext.
+
+// 1. Transform logical data into physical data
+let evaluator = engine.evaluation_handler().new_expression_evaluator(
+    write_context.logical_schema().clone(),
+    write_context.logical_to_physical(),
+    write_context.physical_schema().clone().into(),
+)?;
+let physical_data = evaluator.evaluate(data.as_ref())?;
+
+// 2. Write `physical_data` and add to the transaction.
+// You can write `physical_data` and get `add_file_metadata` in any 
+// customized way.
+
+txn.add_files(add_file_metadata);
+```
+
+You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
 > Methods that produce or register data files (`unpartitioned_write_context`,

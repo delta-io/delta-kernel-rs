@@ -56,7 +56,7 @@ for (partition_values, batch) in partitions {
     // 1. Create a WriteContext for this partition
     let wc = txn.partitioned_write_context(partition_values)?;
 
-    // 2. Write the data (partition columns must be excluded from the batch)
+    // 2. Write the data (the logical write schema excludes partition columns)
     let data = ArrowEngineData::new(batch);
     let file_metadata = engine.write_parquet(&data, &wc).await?;
 
@@ -88,10 +88,8 @@ Key points:
   Kernel rejects type mismatches.
 - **Case-insensitive keys**: `"YEAR"` matches schema column `"year"`. Kernel normalizes
   to the schema case.
-- **Physical schema**: `wc.physical_schema()` excludes partition columns, unless the table
-  materializes them (e.g. `materializePartitionColumns` or `icebergCompatV3`). Either way, the
-  batch you transform with `WriteContext::logical_to_physical` must not contain partition columns.
-  The `logical_to_physical` transform handles the materialization automatically.
+- **No partition columns in your logical data**: your data batches should follow the logical write
+  schema (`wc.logical_schema()`), which excludes partition columns.
 
 > [!TIP]
 > To get the partition column names at runtime, call `txn.logical_partition_columns()`.

@@ -1007,7 +1007,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let props = table_config.table_properties();
         Ok(Arc::new(SharedWriteState {
             table_root: table_config.table_root().clone(),
-            logical_schema: table_config.logical_schema(),
+            logical_schema: table_config.logical_schema_without_partition_columns(),
             physical_schema: table_config.physical_write_schema(),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
@@ -1070,12 +1070,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
             !shared.logical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
         );
-
         // Validate keys (completeness, case normalization) and value types, then return
         // the map re-keyed to schema case.
+        let full_logical_schema = self.effective_table_config.logical_schema();
         let normalized = validate_partition_values(
             &shared.logical_partition_columns,
-            &shared.logical_schema,
+            &full_logical_schema,
             partition_values,
         )?;
 
@@ -1088,8 +1088,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 ))
             })?;
             let value = serialize_partition_value(scalar)?;
-            let physical_name = shared
-                .logical_schema
+            let physical_name = full_logical_schema
                 .field(logical_name)
                 .ok_or_else(|| {
                     Error::internal_error(format!(
@@ -2023,7 +2022,8 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_write_context_schemas_exclude_partition_columns(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2039,13 +2039,11 @@ mod tests {
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
-        // Logical schema should include the partition column
+        // Both schemas exclude partition columns.
         assert!(
-            logical_schema.contains("letter"),
-            "Logical schema should contain partition column 'letter'"
+            !logical_schema.contains("letter"),
+            "Logical schema should not contain partition column 'letter'"
         );
-
-        // Physical schema should exclude the partition column
         assert!(
             !physical_schema.contains("letter"),
             "Physical schema should not contain partition column 'letter' (stored in path)"
