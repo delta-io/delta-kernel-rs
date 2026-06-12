@@ -444,8 +444,12 @@ pub(crate) fn timestamp_to_version(
                 .and_then(|diff| usize::try_from(diff + 1).ok())
                 .and_then(NonZero::new)
                 .ok_or_else(|| {
-                    LogHistoryError::internal_message(
+                    LogHistoryError::internal(
                         "earliest recreatable version exceeds snapshot version",
+                        DeltaError::generic(format!(
+                            "earliest = {earliest}, snapshot version = {}",
+                            snapshot.version()
+                        )),
                     )
                 })?;
             Some(limit)
