@@ -137,7 +137,7 @@ impl<'col> StatsColumnFilter<'col> {
                     continue;
                 }
                 // Verify the required column exists in schema before adding
-                if schema.walk_column_fields(col).is_ok() {
+                if schema.field_at(col).is_ok() {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",

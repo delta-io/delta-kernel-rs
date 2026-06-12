@@ -875,6 +875,29 @@ impl StructType {
         self.fields.get(name.as_ref())
     }
 
+    /// Retrieves the nested field named by the given column path.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    pub fn field_at<'a>(&'a self, col: &ColumnName) -> DeltaResult<&'a StructField> {
+        let mut field = None;
+        self.visit_fields_of_path(col, |f| field = Some(f))?;
+        field.ok_or_else(|| Error::generic("Empty path"))
+    }
+
+    /// Visits all fields along the given column path.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    #[internal_api]
+    pub(crate) fn visit_fields_of_path<'a>(
+        &'a self,
+        col: &ColumnName,
+        visit_field: impl FnMut(&'a StructField),
+    ) -> DeltaResult<()> {
+        self.visit_fields_of_path_by(col, |s, name| s.field(name), visit_field)
+    }
+
     /// Resolves a column path through nested structs, returning references to all
     /// [`StructField`]s along the path. The last element is the leaf field.
     ///
@@ -884,23 +907,25 @@ impl StructType {
     /// Returns an error if the path is empty, a field is not found, or an intermediate
     /// field is not a struct type.
     #[internal_api]
-    pub(crate) fn walk_column_fields<'a>(
+    pub(crate) fn fields_of_path<'a>(
         &'a self,
         col: &ColumnName,
     ) -> DeltaResult<Vec<&'a StructField>> {
-        self.walk_column_fields_by(col, |s, name| s.field(name))
+        let mut result = Vec::with_capacity(col.path().len());
+        self.visit_fields_of_path(col, |f| result.push(f))?;
+        Ok(result)
     }
 
-    /// Helper to walk through nested columns. For each path component in `col`, calls
-    ///                                                                                             
-    /// `find_field(current_struct, component)` to locate the matching field, then descends
-    ///                                                                                             
-    /// into the next nested struct. Returns references to all [`StructField`]s along the path.
-    pub(crate) fn walk_column_fields_by<'a, F>(
+    /// Visits all fields along the given column path, using a caller-provided field name resolver.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    pub(crate) fn visit_fields_of_path_by<'a, F>(
         &'a self,
         col: &ColumnName,
         find_field: F,
-    ) -> DeltaResult<Vec<&'a StructField>>
+        mut visit_field: impl FnMut(&'a StructField),
+    ) -> DeltaResult<()>
     where
         F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
     {
@@ -909,14 +934,13 @@ impl StructType {
             return Err(Error::generic("Column path cannot be empty"));
         }
         let mut current_struct = self;
-        let mut fields = Vec::with_capacity(path.len());
         for (i, field_name) in path.iter().enumerate() {
             let field = find_field(current_struct, field_name).ok_or_else(|| {
                 Error::generic(format!(
                     "Could not resolve column '{col}': field '{field_name}' not found in schema"
                 ))
             })?;
-            fields.push(field);
+            visit_field(field);
             if i < path.len() - 1 {
                 let DataType::Struct(inner) = field.data_type() else {
                     return Err(Error::generic(format!(
@@ -927,7 +951,7 @@ impl StructType {
                 current_struct = inner;
             }
         }
-        Ok(fields)
+        Ok(())
     }
 
     /// Gets the field with the given name and its index.
@@ -3945,7 +3969,7 @@ mod tests {
     ) {
         let schema = walk_test_schema();
         let fields = schema
-            .walk_column_fields(&ColumnName::new(col_path.iter().copied()))
+            .fields_of_path(&ColumnName::new(col_path.iter().copied()))
             .unwrap();
         assert_eq!(fields.len(), expected_names.len());
         for (field, name) in fields.iter().zip(expected_names.iter()) {
@@ -3962,7 +3986,7 @@ mod tests {
     #[test]
     fn test_walk_column_fields_error(#[case] col_path: Vec<&str>, #[case] expected_error: &str) {
         let schema = walk_test_schema();
-        let result = schema.walk_column_fields(&ColumnName::new(col_path.iter().copied()));
+        let result = schema.fields_of_path(&ColumnName::new(col_path.iter().copied()));
         assert_result_error_with_message(result, expected_error);
     }
 

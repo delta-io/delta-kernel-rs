@@ -76,15 +76,8 @@ pub(crate) fn validate_clustering_columns(
             )));
         }
 
-        // Walk the column path through nested structs and validate the leaf type.
-        // walk_column_fields validates: non-empty path, each field exists, intermediates are
-        // structs.
-        let fields = schema.walk_column_fields(col)?;
-        let leaf_type = fields
-            .last()
-            .ok_or_else(|| Error::generic(format!("Could not resolve column '{col}' in schema")))?
-            .data_type();
-        match leaf_type {
+        let field = schema.field_at(col)?;
+        match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
                 return Err(Error::generic(format!(

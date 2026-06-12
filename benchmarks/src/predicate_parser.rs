@@ -124,12 +124,7 @@ fn synthesize_expr(schema: &Schema, expr: &PExpr) -> Option<(KExpr, DataType)> {
         }
         PExpr::CompoundIdentifier(parts) => {
             let col_name = ColumnName::new(parts.iter().map(|p| p.value.clone()));
-            let ty = schema
-                .walk_column_fields(&col_name)
-                .ok()?
-                .last()?
-                .data_type()
-                .clone();
+            let ty = schema.field_at(&col_name).ok()?.data_type().clone();
             let expr = KExpr::column(parts.iter().map(|p| p.value.clone()));
             Some((expr, ty))
         }
