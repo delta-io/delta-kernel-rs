@@ -126,10 +126,9 @@ pub(crate) fn build_checkpoint_transform(
     }
 
     let (output_schema, patch) = patch_builder.build()?;
-    Ok((
-        Arc::new(output_schema),
-        Arc::new(Expression::StructPatch(patch)),
-    ))
+    let schema = Arc::new(output_schema);
+    let expression = Arc::new(Expression::StructPatch(patch));
+    Ok((schema, expression))
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
@@ -364,19 +363,6 @@ mod tests {
             .expect("build checkpoint transform should produce a valid schema and expression")
     }
 
-    fn add_field_names(output_schema: &StructType) -> Vec<&str> {
-        let add_field = output_schema
-            .field(ADD_NAME)
-            .expect("Expected output schema to contain add field");
-        let DataType::Struct(add_schema) = add_field.data_type() else {
-            panic!("Expected output add field to be a struct");
-        };
-        add_schema
-            .fields()
-            .map(|field| field.name.as_str())
-            .collect()
-    }
-
     fn add_schema(with_partition_schema: bool) -> StructType {
         let fields = [
             Some(StructField::not_null("path", DataType::STRING)),
@@ -481,6 +467,16 @@ mod tests {
 
         let (output_schema, _) =
             build_checkpoint_transform(&config, &stats_schema, pv_schema.as_ref());
-        assert_eq!(add_field_names(&output_schema), expected_names);
+        let add_field = output_schema
+            .field(ADD_NAME)
+            .expect("Expected output schema to contain add field");
+        let DataType::Struct(add_schema) = add_field.data_type() else {
+            panic!("Expected output add field to be a struct");
+        };
+        let field_names: Vec<_> = add_schema
+            .fields()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(field_names, expected_names);
     }
 }
