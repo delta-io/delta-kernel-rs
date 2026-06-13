@@ -53,6 +53,18 @@ impl Default for ScanStatsOptions {
     }
 }
 
+/// Read-time partition value toggles consumed by [`ScanLogReplayProcessor`].
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ScanPartitionValuesOptions {
+    /// Leave the `fileConstantValues.partitionValues` string map null in scan metadata
+    /// output. The raw column is still read wherever it is the parse source for
+    /// `partitionValues_parsed` or per-row transforms.
+    pub(crate) skip_string_map: bool,
+    /// Emit the typed `partitionValues_parsed` struct column in scan metadata output,
+    /// independent of any predicate.
+    pub(crate) parsed_struct: bool,
+}
+
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -67,6 +79,8 @@ struct InternalScanState {
     physical_stats_schema: Option<SchemaRef>,
     #[serde(default)]
     stats_options: ScanStatsOptions,
+    #[serde(default)]
+    partition_values_options: ScanPartitionValuesOptions,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
     /// Physical leaf paths which are expected to have stats collected. Carried alongside
@@ -155,6 +169,8 @@ pub struct ScanLogReplayProcessor {
     seen_file_keys: HashSet<FileActionKey>,
     /// Read-time stats options.
     stats_options: ScanStatsOptions,
+    /// Read-time partition value options.
+    partition_values_options: ScanPartitionValuesOptions,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
@@ -178,6 +194,7 @@ impl ScanLogReplayProcessor {
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
         stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
@@ -186,6 +203,7 @@ impl ScanLogReplayProcessor {
             checkpoint_info,
             HashSet::with_capacity(dedup_capacity),
             stats_options,
+            partition_values_options,
         )
     }
 
@@ -200,16 +218,20 @@ impl ScanLogReplayProcessor {
     /// - `checkpoint_info`: Information about checkpoint reading for stats optimization
     /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
     /// - `stats_options`: Read-time stats options (see [`ScanStatsOptions`])
+    /// - `partition_values_options`: Read-time partition value options (see
+    ///   [`ScanPartitionValuesOptions`])
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
         stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
+            partition_values_dropped,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
         let ScanStatsOptions {
@@ -229,14 +251,22 @@ impl ScanLogReplayProcessor {
 
         // When skip_stats is enabled, disable both data column skipping and partition pruning.
         // Both rely on the same DataSkippingFilter columnar pass, so they are controlled together.
-        let (stats_schema_for_transform, partition_schema_for_transform) = if skip_stats {
-            (None, None)
+        let stats_schema_for_transform = if skip_stats {
+            None
         } else {
-            (
-                state_info.physical_stats_schema.clone(),
-                state_info.physical_partition_schema.clone(),
-            )
+            state_info.physical_stats_schema.clone()
         };
+
+        // The partition schema feeds two consumers: the DataSkippingFilter (predicate
+        // pruning, disabled by skip_stats together with stats) and the engine-facing
+        // `partitionValues_parsed` output column (requested via `parsed_struct`, independent
+        // of skip_stats). Either consumer keeps the transform emitting the column.
+        let partition_schema_for_transform =
+            if partition_values_options.parsed_struct || !skip_stats {
+                state_info.physical_partition_schema.clone()
+            } else {
+                None
+            };
 
         let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
@@ -266,6 +296,15 @@ impl ScanLogReplayProcessor {
             )
         };
 
+        // A dropped string-map column is only valid when the engine opted out of the string
+        // map: the transform then emits a null literal and never references the column.
+        require!(
+            !partition_values_dropped || partition_values_options.skip_string_map,
+            Error::internal_error(
+                "checkpoint dropped add.partitionValues but the engine requested the string map"
+            )
+        );
+
         Ok(Self {
             data_skipping_filter,
             // Log transform: parse JSON for stats, MapToStruct for partition values
@@ -278,6 +317,7 @@ impl ScanLogReplayProcessor {
                     synthesize_json,
                     partition_schema_for_transform.clone(),
                     false,
+                    partition_values_options.skip_string_map,
                 ),
                 output_schema.clone().into(),
             )?,
@@ -291,12 +331,14 @@ impl ScanLogReplayProcessor {
                     synthesize_json,
                     partition_schema_for_transform,
                     has_partition_values_parsed,
+                    partition_values_options.skip_string_map,
                 ),
                 output_schema.into(),
             )?,
             seen_file_keys,
             state_info,
             stats_options,
+            partition_values_options,
             checkpoint_info,
             metrics,
         })
@@ -358,6 +400,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             stats_options: self.stats_options,
+            partition_values_options: self.partition_values_options,
             physical_partition_schema,
             physical_stats_columns,
             is_catalog_managed,
@@ -427,6 +470,7 @@ impl ScanLogReplayProcessor {
             state.checkpoint_info,
             state.seen_file_keys,
             internal_state.stats_options,
+            internal_state.partition_values_options,
         )
     }
 }
@@ -440,6 +484,10 @@ struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    /// Whether this batch's data lacks the `add.partitionValues` column (dropped from the
+    /// checkpoint read schema). The visitor then selects the reduced column list and splices
+    /// a null getter in its place so getter indices stay stable.
+    partition_values_dropped: bool,
     metrics: &'a ScanMetrics,
 }
 
@@ -448,6 +496,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
+        partition_values_dropped: bool,
         metrics: &'a ScanMetrics,
     ) -> AddRemoveDedupVisitor<'a, D> {
         AddRemoveDedupVisitor {
@@ -455,6 +504,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             selection_vector,
             state_info,
             row_transform_exprs: Vec::new(),
+            partition_values_dropped,
             metrics,
         }
     }
@@ -497,11 +547,17 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
 
         // Parse partition values for building the per-row transform expression.
         // Partition pruning is handled by DataSkippingFilter in the columnar data skipping phase,
-        // so we only need to parse values here for the transform.
+        // so we only need to parse values here for the transform. When the column was dropped
+        // from the checkpoint read schema (only legal for transform specs without
+        // partition-derived columns), the empty map is never read by the transform.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(row, "add.partitionValues")?;
+                let partition_values = if self.partition_values_dropped {
+                    Default::default()
+                } else {
+                    getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                        .get(row, "add.partitionValues")?
+                };
                 parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -565,9 +621,22 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
         });
+        // Variant of the checkpoint column list without `add.partitionValues`, for
+        // checkpoint batches whose read schema dropped the column. The data no longer
+        // contains the leaf, and extraction errors on missing leaves.
+        static NAMES_AND_TYPES_NO_PARTITION_VALUES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| {
+                let (names, types) = NAMES_AND_TYPES.as_ref();
+                let keep = |i: &usize| *i != 1;
+                let names: Vec<_> = (0..7).filter(keep).map(|i| names[i].clone()).collect();
+                let types: Vec<_> = (0..7).filter(keep).map(|i| types[i].clone()).collect();
+                (names, types).into()
+            });
         let (names, types) = NAMES_AND_TYPES.as_ref();
         if self.deduplicator.is_log_batch() {
             (names, types)
+        } else if self.partition_values_dropped {
+            NAMES_AND_TYPES_NO_PARTITION_VALUES.as_ref()
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
@@ -579,7 +648,12 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 11 } else { 7 };
+        let partition_values_dropped = !is_log_batch && self.partition_values_dropped;
+        let expected_getters = match (is_log_batch, partition_values_dropped) {
+            (true, _) => 11,
+            (false, false) => 7,
+            (false, true) => 6,
+        };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -587,6 +661,20 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
                 getters.len()
             ))
         );
+
+        // Re-insert a null getter where `add.partitionValues` would be, so the fixed getter
+        // indices used by the deduplicator and transform parsing stay valid.
+        let spliced: Vec<&dyn GetData<'_>>;
+        let getters = if partition_values_dropped {
+            let mut with_null = Vec::with_capacity(7);
+            with_null.push(getters[0]);
+            with_null.push(&() as &dyn GetData<'_>);
+            with_null.extend_from_slice(&getters[1..]);
+            spliced = with_null;
+            spliced.as_slice()
+        } else {
+            getters
+        };
 
         for row in 0..row_count {
             if self.selection_vector[row] {
@@ -686,6 +774,10 @@ fn scan_row_schema_with_parsed_columns(
 ///   value parsing is not needed.
 /// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed
 ///   column.
+/// - `skip_string_map`: When true, replaces the `fileConstantValues.partitionValues` string map
+///   output with a null literal. The raw column is then only referenced as the parse source for
+///   `partitionValues_parsed` when no pre-parsed column exists, which also allows the checkpoint
+///   reader to drop the raw column entirely when one does.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -697,6 +789,7 @@ fn get_add_transform_expr(
     synthesize_json: bool,
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
+    skip_string_map: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
@@ -713,6 +806,13 @@ fn get_add_transform_expr(
     } else {
         column_expr_ref!("add.stats")
     };
+    let partition_values_expr = if skip_string_map {
+        Arc::new(Expression::Literal(Scalar::Null(
+            MapType::new(DataType::STRING, DataType::STRING, true).into(),
+        )))
+    } else {
+        column_expr_ref!("add.partitionValues")
+    };
     let mut fields = vec![
         column_expr_ref!("add.path"),
         column_expr_ref!("add.size"),
@@ -720,7 +820,7 @@ fn get_add_transform_expr(
         stats_expr,
         column_expr_ref!("add.deletionVector"),
         Arc::new(Expression::struct_from([
-            column_expr_ref!("add.partitionValues"),
+            partition_values_expr,
             column_expr_ref!("add.baseRowId"),
             column_expr_ref!("add.defaultRowCommitVersion"),
             column_expr_ref!("add.tags"),
@@ -840,6 +940,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             deduplicator,
             selection_vector,
             self.state_info.clone(),
+            self.checkpoint_info.partition_values_dropped,
             &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
@@ -921,6 +1022,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             deduplicator,
             selection_vector,
             self.state_info.clone(),
+            !is_log_batch && self.checkpoint_info.partition_values_dropped,
             &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
@@ -962,12 +1064,18 @@ pub(crate) fn scan_action_iter(
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
+    partition_values_options: ScanPartitionValuesOptions,
 ) -> DeltaResult<(
     impl Iterator<Item = DeltaResult<ScanMetadata>>,
     Arc<ScanMetrics>,
 )> {
-    let processor =
-        ScanLogReplayProcessor::new(engine, state_info, checkpoint_info, stats_options)?;
+    let processor = ScanLogReplayProcessor::new(
+        engine,
+        state_info,
+        checkpoint_info,
+        stats_options,
+        partition_values_options,
+    )?;
     let metrics = processor.metrics.clone();
     Ok((processor.process_actions_iter(action_iter), metrics))
 }
@@ -981,7 +1089,7 @@ mod tests {
 
     use super::{
         get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanStatsOptions, SerializableScanState,
+        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
@@ -1116,6 +1224,7 @@ mod tests {
             state_info,
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         for res in iter {
@@ -1144,6 +1253,7 @@ mod tests {
             Arc::new(state_info),
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1230,6 +1340,7 @@ mod tests {
             Arc::new(state_info),
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1275,6 +1386,7 @@ mod tests {
             Arc::new(get_simple_state_info(schema.clone(), vec![]).unwrap()),
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1347,6 +1459,7 @@ mod tests {
             state_info.clone(),
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1404,6 +1517,7 @@ mod tests {
             state_info.clone(),
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1445,6 +1559,7 @@ mod tests {
                 state_info,
                 checkpoint_info.clone(),
                 ScanStatsOptions::default(),
+                ScanPartitionValuesOptions::default(),
             )
             .unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1482,6 +1597,7 @@ mod tests {
             state_info,
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let serialized = processor.into_serializable_state().unwrap();
@@ -1516,6 +1632,7 @@ mod tests {
             state_info,
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let serialized = processor.into_serializable_state().unwrap();
@@ -1556,6 +1673,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             stats_options: ScanStatsOptions::default(),
+            partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
@@ -1590,6 +1708,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             stats_options: ScanStatsOptions::default(),
+            partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
@@ -1661,6 +1780,7 @@ mod tests {
                 skip_stats: true,
                 ..Default::default()
             },
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1751,6 +1871,7 @@ mod tests {
             Arc::new(state_info),
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1837,6 +1958,7 @@ mod tests {
             true,  // synthesize_json
             partition_schema.clone(),
             has_partition_values_parsed,
+            false, // skip_string_map
         );
         assert_eq!(
             count_to_json(&with_synthesis),
@@ -1852,11 +1974,62 @@ mod tests {
             false, // synthesize_json
             partition_schema,
             has_partition_values_parsed,
+            false, // skip_string_map
         );
         assert_eq!(
             count_to_json(&without_synthesis),
             0,
             "expected no ToJson nodes anywhere in the transform when synthesis is skipped"
+        );
+    }
+
+    /// Returns the `fileConstantValues.partitionValues` source expression: the first field of the
+    /// struct_from at top-level index 5 of the add transform.
+    fn partition_values_source(expr: &ExpressionRef) -> Expression {
+        let Expression::Struct(top, _) = expr.as_ref() else {
+            panic!("add transform must be a struct, got {expr:?}");
+        };
+        let Expression::Struct(file_constant_values, _) = top[5].as_ref() else {
+            panic!("expected fileConstantValues struct at index 5");
+        };
+        file_constant_values[0].as_ref().clone()
+    }
+
+    #[test]
+    fn add_transform_nulls_string_map_when_skip_string_map() {
+        let partition_schema: Option<SchemaRef> = Some(Arc::new(StructType::new_unchecked([
+            StructField::nullable("date", DataType::DATE),
+        ])));
+
+        let kept = get_add_transform_expr(
+            None,  // physical_stats_schema
+            false, // has_stats_parsed
+            false, // skip_stats
+            true,  // synthesize_json
+            partition_schema.clone(),
+            false, // has_partition_values_parsed
+            false, // skip_string_map
+        );
+        assert!(
+            matches!(partition_values_source(&kept), Expression::Column(_)),
+            "string map should be read from the column when not skipped"
+        );
+
+        let skipped = get_add_transform_expr(
+            None,  // physical_stats_schema
+            false, // has_stats_parsed
+            false, // skip_stats
+            true,  // synthesize_json
+            partition_schema,
+            false, // has_partition_values_parsed
+            true,  // skip_string_map
+        );
+        assert!(
+            matches!(
+                partition_values_source(&skipped),
+                Expression::Literal(Scalar::Null(_))
+            ),
+            "string map should be a null literal when skipped"
         );
     }
 }

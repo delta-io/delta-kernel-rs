@@ -59,6 +59,12 @@ pub(crate) struct CheckpointReadInfo {
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,
+    /// Whether `add.partitionValues` was dropped from the checkpoint read schema. Only set
+    /// when the caller allowed the drop and the checkpoint has a compatible pre-parsed
+    /// `partitionValues_parsed` column to serve as the sole partition value source.
+    #[serde(default)]
+    #[allow(unused)]
+    pub partition_values_dropped: bool,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -72,6 +78,7 @@ impl CheckpointReadInfo {
         Self {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
+            partition_values_dropped: false,
             checkpoint_read_schema: get_log_add_schema().clone(),
         }
     }
@@ -689,6 +696,7 @@ impl LogSegment {
     /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
     /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
     #[internal_api]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
@@ -697,6 +705,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        allow_partition_values_drop: bool,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -719,6 +728,7 @@ impl LogSegment {
             effective_predicate,
             stats_schema,
             partition_schema,
+            allow_partition_values_drop,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -743,6 +753,7 @@ impl LogSegment {
             None,
             None,
             None,
+            false,
         )?;
         Ok(result.actions)
     }
@@ -892,6 +903,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        allow_partition_values_drop: bool,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -915,10 +927,16 @@ impl LogSegment {
             .zip(file_actions_schema.as_ref())
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
 
+        // Skip reading the `add.partitionValues` string map when the caller allowed it and
+        // the pre-parsed column can serve as the sole partition value source. This avoids
+        // decoding the map column from checkpoint parquet entirely.
+        let partition_values_dropped = allow_partition_values_drop && has_partition_values_parsed;
+
         // Build final schema with any additional fields needed
         // (stats_parsed, partitionValues_parsed, sidecar)
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
+        let needs_add_augmentation =
+            has_stats_parsed || has_partition_values_parsed || partition_values_dropped;
         let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
             let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
                 (needs_add_augmentation, action_schema.field("add"))
@@ -928,7 +946,11 @@ impl LogSegment {
                         "add field in action schema must be a struct",
                     ));
                 };
-                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+                let mut add_fields: Vec<StructField> = add_struct
+                    .fields()
+                    .filter(|f| !(partition_values_dropped && f.name() == "partitionValues"))
+                    .cloned()
+                    .collect();
 
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
                     add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
@@ -1031,6 +1053,7 @@ impl LogSegment {
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
+            partition_values_dropped,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
