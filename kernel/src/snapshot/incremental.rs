@@ -53,8 +53,9 @@ impl Snapshot {
     /// Case F:     C1 .. S1 ====== S2              [C1+1, S2]   (S1, S2]   incremental update
     /// ```
     ///
-    /// In the incremental cases (D.2, F), the existing snapshot's P+M at `S1` is the baseline
-    /// and only commits in `(S1, S2]` are replayed.
+    /// In the incremental cases (D.2, F), the existing snapshot's P+M at `S1` is the baseline, and
+    /// only commits in `(S1, S2]` are replayed for newer P+M on top of it. A base CRC newer than
+    /// `S1`, when present, serves as the baseline instead.
     ///
     /// - **A.** `T == S1`: return the existing snapshot unchanged.
     /// - **B.** `T < S1`: error. The incremental path only moves forward.
@@ -294,14 +295,15 @@ impl Snapshot {
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
         // `incremental_replay`.
-        let crc = combined_log_segment.try_build_incremental_crc_with_base(
+        let base_crc = combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.crc());
+        let crc_at_version = combined_log_segment.try_build_crc_within_budget(
             engine,
-            existing_snapshot.crc(),
+            base_crc.as_ref(),
             incremental_replay,
         )?;
 
         let existing_table_config = existing_snapshot.table_configuration();
-        let (new_metadata, new_protocol) = match &crc {
+        let (new_metadata, new_protocol) = match &crc_at_version {
             Some(crc) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
                 // creation.
@@ -313,10 +315,15 @@ impl Snapshot {
             }
             None => {
                 // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
-                // scanned any log files). Perform normal P & M replay.
+                // scanned any log files). Replay the new commits `(existing_snapshot_version, end]`
+                // for P&M, rooted at the base CRC when it is newer than the existing snapshot
+                // (else the existing snapshot is the baseline).
+                let newer_base = base_crc
+                    .as_ref()
+                    .filter(|c| c.version > existing_snapshot_version);
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine)?
+                    .read_protocol_metadata_opt(engine, newer_base)?
             }
         };
         let table_configuration = TableConfiguration::try_new_from(
@@ -330,7 +337,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
-            crc,
+            crc_at_version,
         )?))
     }
 
