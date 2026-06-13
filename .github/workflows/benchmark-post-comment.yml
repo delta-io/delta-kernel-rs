@@ -10,9 +10,22 @@
 # `pull_request` / `push` / `merge_group` / `issue_comment` with `contents: read`
 # only -- it has no write scope on PR-triggered runs from forks (read-only
 # GITHUB_TOKEN per GitHub's default), so it cannot post a comment itself.
-# Instead, it uploads the comment body as an artifact, and this workflow runs
-# in base-branch context (which does have write scope), downloads the artifact,
-# and posts/updates the PR comment.
+# Instead, run-benchmarks.sh writes the comment body to /tmp/bench-comment.md,
+# benchmark.yml uploads that file as the `bench-comment` artifact, and this
+# workflow (running in base-branch context, which does have write scope)
+# downloads it and posts/updates the PR comment.
+#
+# Two jobs, routed by whether the `bench-comment` artifact exists:
+#
+#   bench succeeds: `bench-comment` uploaded
+#       -> post-comment posts the table; post-failure-comment skips
+#   bench fails
+#     ├─ regression gate tripped (a benchmark >=15% slower): benchmark.yml
+#     │    uploads `bench-comment` before the gate runs, so it exists despite
+#     │    the failed job
+#     │      -> post-comment posts the table; post-failure-comment skips
+#     └─ broke before writing /tmp/bench-comment.md (e.g. compile error)
+#          -> no artifact; post-failure-comment posts a static failure note
 #
 # Pattern is identical to pr-validator.yml + comment-on-title-failure.yml.
 #
@@ -48,11 +61,12 @@ concurrency:
 jobs:
   post-comment:
     name: Post benchmark results
-    # Only post when the upstream succeeded AND the upstream event was a PR
-    # event with a conversation to post to. `merge_group` and `push: main`
-    # runs of workflow A have no PR to comment on.
+    # Post when the upstream succeeded OR failed (a failure is usually the
+    # regression gate tripping, and the result table still exists), and the
+    # upstream event was a PR event with a conversation to post to.
+    # `merge_group` and `push: main` runs of workflow A have no PR to comment on.
     if: >
-      github.event.workflow_run.conclusion == 'success'
+      contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
       && (github.event.workflow_run.event == 'pull_request'
           || github.event.workflow_run.event == 'issue_comment')
     runs-on: ubuntu-latest
@@ -166,10 +180,10 @@ jobs:
   post-failure-comment:
     name: Post benchmark failure note
     # Replace any existing success comment with a failure note so reviewers
-    # don't see stale-green after a regression-causing push that breaks the
-    # bench itself. `timed_out` counts as failure for our purposes; we skip
-    # `cancelled` (a superseding run will post its own update) and `skipped`
-    # (nothing meaningful happened, e.g., draft).
+    # don't see stale-green after a push that breaks the bench itself.
+    # `timed_out` counts as failure for our purposes; we skip `cancelled` (a
+    # superseding run will post its own update) and `skipped` (nothing
+    # meaningful happened, e.g., draft).
     if: >
       contains(fromJSON('["failure","timed_out"]'), github.event.workflow_run.conclusion)
       && (github.event.workflow_run.event == 'pull_request'
@@ -242,16 +256,30 @@ jobs:
           else
             printf 'number=%s\n' "$NUM" >> "$GITHUB_OUTPUT"
           fi
+      - name: Probe for bench comment artifact
+        # Detect whether the bench produced a comment artifact; continue-on-error
+        # so "absent" is a clean outcome rather than a job failure. The find/post
+        # steps below run only when it's absent: when present, the failure was the
+        # gate tripping and post-comment owns the comment (see the header routing).
+        id: probe-body
+        if: steps.pr.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bench-comment
+          path: /tmp/
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
       - name: Find existing bench comment
         id: find
-        if: steps.pr.outputs.skip != 'true'
+        if: steps.pr.outputs.skip != 'true' && steps.probe-body.outcome != 'success'
         uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e # v3.1.0
         with:
           issue-number: ${{ steps.pr.outputs.number }}
           comment-author: 'github-actions[bot]'
           body-includes: '<!-- delta-kernel-bench-comment -->'
       - name: Post or update failure note
-        if: steps.pr.outputs.skip != 'true'
+        if: steps.pr.outputs.skip != 'true' && steps.probe-body.outcome != 'success'
         uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043 # v4.0.0
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
@@ -261,6 +289,6 @@ jobs:
           edit-mode: replace
           body: |
             <!-- delta-kernel-bench-comment -->
-            ## Benchmark results
+            ## Benchmark results: ❌ Fail
 
-            <sub>Benchmark run failed. [See workflow run](${{ env.RUN_URL }}) for details.</sub>
+            <sub>Benchmark run failed before producing results. [See workflow run](${{ env.RUN_URL }}) for details.</sub>
