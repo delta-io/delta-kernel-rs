@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
@@ -13,6 +14,7 @@ use crate::arrow::array::{
     RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
+use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -893,6 +895,44 @@ pub fn coalesce_arrays(
     Ok(make_array(mutable.freeze()))
 }
 
+/// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
+///
+/// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
+/// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
+/// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
+/// timestamp carrying an explicit offset) and interpret no-offset timestamps as UTC, matching
+/// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
+/// harmless on the read path. All other types go through `parse_scalar`, including its handling of
+/// the empty string as a null value.
+fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match prim {
+        PrimitiveType::Date => {
+            let days = Date32Type::parse(raw).ok_or_else(|| {
+                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
+            })?;
+            return Ok(Some(Scalar::Date(days)));
+        }
+        PrimitiveType::Timestamp => {
+            let micros = string_to_datetime(&Utc, raw)
+                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
+                .timestamp_micros();
+            return Ok(Some(Scalar::Timestamp(micros)));
+        }
+        PrimitiveType::TimestampNtz => {
+            let micros = string_to_datetime(&Utc, raw)
+                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
+                .timestamp_micros();
+            return Ok(Some(Scalar::TimestampNtz(micros)));
+        }
+        _ => {}
+    }
+    let scalar = prim.parse_scalar(raw)?;
+    Ok((!matches!(scalar, Scalar::Null(_))).then_some(scalar))
+}
+
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type using Delta's partition value serialization rules,
 /// producing a `StructArray`.
@@ -983,8 +1023,10 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                let scalar = target_types[i].parse_scalar(raw)?;
-                scalar.append_to(builder, 1)?;
+                match parse_partition_scalar(target_types[i], raw)? {
+                    Some(scalar) => scalar.append_to(builder, 1)?,
+                    None => Scalar::append_null(builder, field.data_type(), 1)?,
+                }
             } else {
                 Scalar::append_null(builder, field.data_type(), 1)?;
             }
@@ -2369,6 +2411,100 @@ mod tests {
         let expr = Expr::map_to_struct(column_expr!("s"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_map_to_struct_empty_string_is_null() {
+        // An empty string maps to null, matching `parse_scalar`. MapToStruct must agree with the
+        // canonical partition-value parser used elsewhere in the kernel.
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("region");
+        builder.values().append_value("");
+        builder.keys().append_value("blob");
+        builder.values().append_value("");
+        builder.append(true).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::nullable("region", DataType::STRING),
+            StructField::nullable("blob", DataType::BINARY),
+        ]);
+        let result_type = DataType::from(output_schema);
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let regions = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(regions.is_null(0));
+
+        let blobs = structs
+            .column(1)
+            .as_any()
+            .downcast_ref::<crate::arrow::array::BinaryArray>()
+            .unwrap();
+        assert!(blobs.is_null(0));
+    }
+
+    #[test]
+    fn test_map_to_struct_date_and_fractional_timestamp() {
+        use crate::arrow::array::{Date32Array, TimestampMicrosecondArray};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("d");
+        builder.values().append_value("2024-01-15");
+        builder.keys().append_value("ts");
+        builder.values().append_value("2024-01-15 12:34:56.789123");
+        builder.append(true).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::nullable("d", DataType::DATE),
+            StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
+        ]);
+        let result_type = DataType::from(output_schema);
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let dates = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(dates.value(0), 19737); // 2024-01-15
+
+        // The arrow timestamp parser must land on the same microsecond instant that
+        // `parse_scalar` (chrono) would produce for the same value.
+        let expected = PrimitiveType::TimestampNtz
+            .parse_scalar("2024-01-15 12:34:56.789123")
+            .unwrap();
+        let Scalar::TimestampNtz(expected_micros) = expected else {
+            panic!("expected a timestamp scalar, got {expected:?}");
+        };
+        let timestamps = structs
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), expected_micros);
     }
 
     /// Helper to build a batch with Int32 column `a` and a Boolean column `is_valid`.
