@@ -12,7 +12,7 @@ use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTO
 use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
-use crate::metrics::MetricId;
+use crate::metrics::SnapshotLoadMetricContext;
 use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
@@ -23,12 +23,12 @@ impl LogSegment {
     /// snapshot creation where both Protocol and Metadata must exist.
     ///
     /// Reports metrics: `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure`.
-    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %operation_id), skip(engine, crc))]
+    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed), skip(engine, crc))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-        operation_id: MetricId,
+        metric_context: SnapshotLoadMetricContext,
     ) -> DeltaResult<(Metadata, Protocol)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p)) => Ok((m, p)),

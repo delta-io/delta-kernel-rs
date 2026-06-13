@@ -2543,7 +2543,7 @@ async fn test_latest_commit_file_field_is_captured() {
         log_root.clone(),
         vec![],
         None,
-        MetricId::default(),
+        SnapshotLoadMetricContext::default(),
     )
     .unwrap();
 
@@ -2576,7 +2576,7 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
         log_root.clone(),
         vec![],
         None,
-        MetricId::default(),
+        SnapshotLoadMetricContext::default(),
     )
     .unwrap();
 
@@ -2603,7 +2603,7 @@ async fn test_latest_commit_file_with_no_commits() {
         log_root.clone(),
         vec![],
         None,
-        MetricId::default(),
+        SnapshotLoadMetricContext::default(),
     )
     .unwrap();
 
@@ -2633,7 +2633,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
         log_root.clone(),
         vec![],
         None,
-        MetricId::default(),
+        SnapshotLoadMetricContext::default(),
     )
     .unwrap();
 
@@ -2665,7 +2665,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
         log_root.clone(),
         vec![],
         None,
-        MetricId::default(),
+        SnapshotLoadMetricContext::default(),
     )
     .unwrap();
 

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::metrics::{MetricEvent, MetricsReporter, TransactionCommitSuccess};
+use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, TransactionCommitSuccess};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
@@ -19,6 +19,7 @@ use test_utils::{
 };
 use url::Url;
 
+use super::table_type::{create_simple_table, make_committer};
 use super::{measuring_engine, simple_schema};
 
 /// Reporter that keeps the last `TransactionCommitSuccess` for field-level assertions.
@@ -63,6 +64,7 @@ async fn commit_append_emits_success_metrics(
         snap,
         &engine,
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        Box::new(FileSystemCommitter::new()),
         operation,
         data_change,
         is_blind_append,
@@ -76,6 +78,7 @@ async fn commit_append_emits_success_metrics(
         .unwrap()
         .clone()
         .expect("commit success event");
+    assert_eq!(success.table_type, TableType::PathBased);
     assert_eq!(success.commit_version, 1);
     assert_eq!(success.num_add_files, 1);
     assert!(success.add_files_bytes > 0);
@@ -113,5 +116,49 @@ async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
     assert_eq!(reporter.transaction_commits.get(), 1);
     assert_eq!(reporter.commit_conflicts.get(), 1);
     assert_eq!(reporter.commit_errors.get(), 0);
+    Ok(())
+}
+
+#[rstest]
+#[case::path_based(false)]
+#[case::catalog_managed(true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_success_carries_table_type(#[case] catalog_managed: bool) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    create_simple_table(engine.as_ref(), &table_path, catalog_managed)?;
+
+    let reporter = Arc::new(LastCommitSuccess::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let builder = Snapshot::builder_for(table_url);
+    let builder = if catalog_managed {
+        builder.with_max_catalog_version(0)
+    } else {
+        builder
+    };
+    let snapshot = builder.build(engine.as_ref())?;
+    insert_data_with(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1]))],
+        make_committer(catalog_managed),
+        "WRITE",
+        /* data_change */ true,
+        /* is_blind_append */ false,
+    )
+    .await?
+    .unwrap_committed();
+
+    let success = reporter
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("commit success event");
+    assert_eq!(
+        success.table_type,
+        TableType::from_catalog_managed(catalog_managed)
+    );
     Ok(())
 }

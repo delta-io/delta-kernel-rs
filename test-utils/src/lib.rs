@@ -146,7 +146,7 @@ use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
-    CountingReporter, RelaxedCounter,
+    CapturingReporter, CountingReporter, RelaxedCounter,
 };
 use delta_kernel::actions::{
     get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
@@ -159,7 +159,9 @@ use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
-use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::committer::{
+    CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
+};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::expressions::Scalar;
@@ -172,7 +174,10 @@ use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::{CommitResult, Transaction};
-use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
+use delta_kernel::{
+    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, FileMeta,
+    FilteredEngineData, LogPath, Snapshot,
+};
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
 pub use delta_kernel_default_engine;
@@ -820,15 +825,26 @@ pub async fn insert_data<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
 ) -> DeltaResult<CommitResult> {
-    insert_data_with(snapshot, engine, columns, "WRITE", true, false).await
+    insert_data_with(
+        snapshot,
+        engine,
+        columns,
+        Box::new(FileSystemCommitter::new()),
+        "WRITE",
+        /* data_change */ true,
+        /* is_blind_append */ false,
+    )
+    .await
 }
 
-/// Like [`insert_data`] but with the commit's `operation`, `data_change`, and blind-append flag
-/// configurable.
+/// Like [`insert_data`] but with the `committer` and the commit's `operation`, `data_change`, and
+/// blind-append flag configurable. Pass [`TestCatalogCommitter`] for catalog-managed tables.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_data_with<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
+    committer: Box<dyn Committer>,
     operation: &str,
     data_change: bool,
     is_blind_append: bool,
@@ -836,7 +852,8 @@ pub async fn insert_data_with<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?
+    let mut txn = snapshot
+        .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
         .with_data_change(data_change);
     if is_blind_append {
@@ -855,6 +872,35 @@ pub async fn insert_data_with<E: TaskExecutor>(
 /// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
 pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
     snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+}
+
+/// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
+/// path, so catalog-managed tables can be created and appended to without a real catalog.
+pub struct TestCatalogCommitter;
+
+impl Committer for TestCatalogCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let path = commit_metadata.published_commit_path()?;
+        engine
+            .json_handler()
+            .write_json_file(&path, Box::new(actions), false)?;
+        Ok(CommitResponse::Committed {
+            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), 0),
+        })
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        true
+    }
+
+    fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> DeltaResult<()> {
+        Ok(())
+    }
 }
 
 /// Load latest snapshot from `table_url` and start a transaction using a [`FileSystemCommitter`].

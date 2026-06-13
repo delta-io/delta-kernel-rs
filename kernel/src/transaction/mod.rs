@@ -343,6 +343,7 @@ impl<S> Transaction<S> {
         fields(
             report,
             operation_id = %self.operation_id,
+            is_catalog_managed = self.effective_table_config.is_catalog_managed(),
             commit_version = self.get_commit_version(),
             num_add_files,
             num_remove_files,
@@ -1677,7 +1678,7 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
-    use crate::metrics::MetricEvent;
+    use crate::metrics::{MetricEvent, TableType, TransactionCommitFailure};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -3052,9 +3053,9 @@ mod tests {
 
     // ===== Commit failure-metric tests =====
 
-    fn commit_failure_reason(reporter: &CapturingReporter) -> Option<CommitFailureReason> {
+    fn commit_failure_event(reporter: &CapturingReporter) -> Option<TransactionCommitFailure> {
         reporter.events().into_iter().find_map(|event| match event {
-            MetricEvent::TransactionCommitFailure(f) => Some(f.reason),
+            MetricEvent::TransactionCommitFailure(f) => Some(f),
             _ => None,
         })
     }
@@ -3068,10 +3069,9 @@ mod tests {
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(matches!(result, CommitResult::RetryableTransaction(_)));
-        assert_eq!(
-            commit_failure_reason(&reporter),
-            Some(CommitFailureReason::RetryableIo)
-        );
+        let failure = commit_failure_event(&reporter).expect("commit failure event");
+        assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
+        assert_eq!(failure.table_type, TableType::PathBased);
         Ok(())
     }
 
@@ -3083,10 +3083,9 @@ mod tests {
         let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         assert!(txn.commit(engine.as_ref()).is_err());
-        assert_eq!(
-            commit_failure_reason(&reporter),
-            Some(CommitFailureReason::Error)
-        );
+        let failure = commit_failure_event(&reporter).expect("commit failure event");
+        assert_eq!(failure.reason, CommitFailureReason::Error);
+        assert_eq!(failure.table_type, TableType::PathBased);
         Ok(())
     }
 }

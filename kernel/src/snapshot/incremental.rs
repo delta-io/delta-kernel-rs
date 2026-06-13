@@ -10,7 +10,7 @@ use tracing::instrument;
 use super::{IncrementalReplay, Snapshot};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::MetricId;
+use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -82,13 +82,13 @@ impl Snapshot {
     ///
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
-    #[instrument(err, fields(version, operation_id = %operation_id), skip(engine, target_version))]
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id), skip(engine, target_version))]
     pub(super) fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         target_version: impl Into<Option<Version>>,
-        operation_id: MetricId,
+        metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Arc<Self>> {
         let existing_log_segment = &existing_snapshot.log_segment;
@@ -181,7 +181,7 @@ impl Snapshot {
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
                     engine,
-                    operation_id,
+                    metric_context,
                     incremental_replay,
                 );
                 return Ok(Arc::new(snapshot?));
@@ -550,7 +550,7 @@ mod tests {
             vec![],
             &engine,
             None,
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         )?;
         assert_eq!(result, base_snapshot);
@@ -627,7 +627,7 @@ mod tests {
             log_tail,
             &engine,
             Some(2),
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         )?;
 
@@ -685,7 +685,7 @@ mod tests {
             vec![],
             &engine,
             Some(1),
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
@@ -696,7 +696,7 @@ mod tests {
             vec![],
             &engine,
             Some(0),
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         );
         assert!(matches!(

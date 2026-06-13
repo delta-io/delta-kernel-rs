@@ -119,41 +119,15 @@ pub fn get_final_required_properties_for_uc(
 mod tests {
     use std::sync::Arc;
 
-    use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
-    use delta_kernel::{DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData};
     use delta_kernel_default_engine::DefaultEngineBuilder;
+    use test_utils::TestCatalogCommitter;
 
     use super::*;
-
-    /// A mock catalog committer that writes directly to the published path.
-    struct MockCatalogCommitter;
-    impl Committer for MockCatalogCommitter {
-        fn commit(
-            &self,
-            engine: &dyn Engine,
-            actions: DeltaResultIterator<'_, FilteredEngineData>,
-            commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
-            let path = commit_metadata.published_commit_path()?;
-            engine
-                .json_handler()
-                .write_json_file(&path, Box::new(actions), false)?;
-            Ok(CommitResponse::Committed {
-                file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), 0),
-            })
-        }
-        fn is_catalog_committer(&self) -> bool {
-            true
-        }
-        fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> DeltaResult<()> {
-            Ok(())
-        }
-    }
 
     #[test]
     fn test_get_required_properties_for_disk() {
@@ -182,7 +156,7 @@ mod tests {
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
             .with_data_layout(DataLayout::clustered(["region"]))
-            .build(&engine, Box::new(MockCatalogCommitter))
+            .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -250,7 +224,7 @@ mod tests {
                     ColumnName::new(["address", "city"]),
                 ],
             })
-            .build(&engine, Box::new(MockCatalogCommitter))
+            .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -285,7 +259,7 @@ mod tests {
         let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(MockCatalogCommitter))
+            .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -294,7 +268,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction(Box::new(MockCatalogCommitter), &engine)
+            .transaction(Box::new(TestCatalogCommitter), &engine)
             .unwrap()
             .commit(&engine)
             .unwrap();

@@ -31,8 +31,10 @@ use test_utils::{
 use url::Url;
 
 mod commit;
+mod parallel_scan;
 mod scan;
 mod snapshot_load;
+mod table_type;
 
 /// Build a `DefaultEngine` + `CountingReporter` backed by `store`, for use in the
 /// *measurement* phase (building a snapshot and asserting metric counters).
