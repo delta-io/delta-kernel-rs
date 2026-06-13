@@ -452,6 +452,7 @@ mod tests {
         reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
+            correlation_id: None,
             version: 0,
             duration: dur(),
         }));
@@ -464,6 +465,7 @@ mod tests {
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
+            correlation_id: None,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
@@ -483,6 +485,7 @@ mod tests {
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
+            correlation_id: None,
             duration: dur(),
             num_commit_files: 3,
             num_checkpoint_files: 1,
@@ -559,6 +562,7 @@ mod tests {
             TransactionCommitSuccess {
                 operation_id: MetricId::new(),
                 table_type: TableType::PathBased,
+                correlation_id: None,
                 commit_version: 1,
                 num_add_files: 3,
                 num_remove_files: 2,
@@ -591,6 +595,7 @@ mod tests {
                 TransactionCommitFailure {
                     operation_id: MetricId::new(),
                     table_type: TableType::PathBased,
+                    correlation_id: None,
                     reason,
                 },
             ));
@@ -608,12 +613,14 @@ mod tests {
             ProtocolMetadataLoadSuccess {
                 operation_id: MetricId::new(),
                 table_type: TableType::PathBased,
+                correlation_id: None,
                 duration: dur(),
             },
         ));
         reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
+            correlation_id: None,
         }));
         assert_eq!(reporter.snapshot_completions.get(), 0);
     }
@@ -636,6 +643,7 @@ mod tests {
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
+            correlation_id: None,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,

@@ -1589,6 +1589,7 @@ mod scan_metadata_completed_tests {
     fn run_scan(
         table: &str,
         predicate: Option<Arc<Pred>>,
+        correlation_id: Option<&str>,
     ) -> (
         Arc<CapturingReporter>,
         tracing::subscriber::DefaultGuard,
@@ -1603,6 +1604,9 @@ mod scan_metadata_completed_tests {
         let mut builder = snapshot.scan_builder();
         if let Some(pred) = predicate {
             builder = builder.with_predicate(pred);
+        }
+        if let Some(id) = correlation_id {
+            builder = builder.with_correlation_id(id);
         }
         let scan = builder.build().unwrap();
         let results: Vec<_> = scan
@@ -1656,7 +1660,7 @@ mod scan_metadata_completed_tests {
         #[case] expected_removes: u64,
         #[case] expected_filtered: u64,
     ) {
-        let (reporter, _guard, _) = run_scan(table, predicate);
+        let (reporter, _guard, _) = run_scan(table, predicate, None);
         let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
@@ -1666,6 +1670,19 @@ mod scan_metadata_completed_tests {
         assert_eq!(e.active_add_files_bytes, expected_active_bytes);
         assert_eq!(e.num_remove_files_seen, expected_removes);
         assert_eq!(e.num_predicate_filtered, expected_filtered);
+    }
+
+    // The parallel-scan paths (both sequential and parallel phase events) are covered by
+    // `parallel_scan_metadata_phases_carry_correlation_id` in `parallel::parallel_phase`.
+    #[rstest]
+    #[case::with_id(Some("scan-req-1"))]
+    #[case::without_id(None)]
+    fn scan_metadata_completed_carries_correlation_id(#[case] correlation_id: Option<&str>) {
+        let (reporter, _guard, _) = run_scan("./tests/data/parsed-stats/", None, correlation_id);
+        let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert_eq!(e.correlation_id.as_deref(), correlation_id);
     }
 
     #[test]

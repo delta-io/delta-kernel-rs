@@ -49,6 +49,7 @@ impl AlterTableTransaction {
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
+            correlation_id: None,
             read_snapshot_opt: Some(read_snapshot),
             effective_table_config,
             should_emit_protocol: false,

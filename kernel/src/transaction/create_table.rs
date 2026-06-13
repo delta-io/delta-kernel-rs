@@ -152,6 +152,7 @@ impl CreateTableTransaction {
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
+            correlation_id: None,
             read_snapshot_opt: None,
             effective_table_config,
             should_emit_protocol: true,
