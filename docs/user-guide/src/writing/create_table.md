@@ -232,7 +232,7 @@ create_table(url.as_str(), schema, "my-app/1.0")
 
 Partition column values are stored in the `partitionValues` field of each `add` action in
 the transaction log rather than inside the data files, although specific table
-features additionally materialize them into the data files; see
+features may additionally materialize them into the data files; see
 [Writing to Partitioned Tables](./partitioned_writes.md).
 
 > [!NOTE]

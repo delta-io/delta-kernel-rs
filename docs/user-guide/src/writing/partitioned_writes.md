@@ -13,8 +13,8 @@ Before reading this page, make sure you understand
 
 For unpartitioned tables, you create one `WriteContext` and write all data through it.
 For partitioned tables, you create one `WriteContext` per distinct partition value
-combination. Partition values are baked into the `WriteContext` at creation time, not
-passed at write time.
+combination. Partition values are file-constant metadata baked into the `WriteContext`
+at creation time, not data columns passed at write time.
 
 ```text
 Unpartitioned:  1 WriteContext  -->  write all data
