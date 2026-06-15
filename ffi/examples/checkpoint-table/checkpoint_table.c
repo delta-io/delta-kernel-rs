@@ -14,42 +14,44 @@
 //   ./checkpoint_table /path/to/existing/table <sub-flow>
 //
 // where <sub-flow> is one of:
-//   inline            -- no setter; kernel auto-picks V1/V2 from table protocol.
-//   v2_no_sidecar     -- checkpoint_builder_set_v2_no_sidecar; V2 manifest, no sidecars.
-//   v2_with_sidecars  -- checkpoint_builder_set_v2_with_sidecars(2); V2 manifest + sidecars.
+//   inline            -- spec = NULL; kernel auto-picks V1/V2 from table protocol.
+//   v2_no_sidecar     -- FfiCheckpointSpec::V2NoSidecar; V2 manifest, no sidecars.
+//   v2_with_sidecars  -- FfiCheckpointSpec::V2WithSidecar { hint = 2 }; V2 + sidecars.
 //
-// Demonstrates the opaque FfiCheckpointBuilder family:
-//   - checkpoint_builder_for(snapshot, engine)
-//   - checkpoint_builder_set_v2_no_sidecar(builder)
-//   - checkpoint_builder_set_v2_with_sidecars(builder, hint)
-//   - checkpoint_builder_build(builder) -> ExternResultFfiCheckpointWriteResult
-//   - free_checkpoint_builder(builder) for the discard path (not exercised here)
+// Demonstrates the checkpoint FFI surface:
+//   - checkpoint_snapshot(snapshot, engine, spec) -> ExternResultFfiCheckpointWriteResult
+//   - FfiCheckpointSpec discriminated-union construction (V1 / V2NoSidecar / V2WithSidecar)
 //   - FfiCheckpointWriteResult discriminator inspection (Written vs AlreadyExists)
 //   - free_snapshot on the returned snapshot handle from either variant
 
 static int run_sub_flow(HandleSharedSnapshot snapshot,
                         SharedExternEngine* engine,
                         const char* sub_flow) {
-  HandleMutableFfiCheckpointBuilder builder = checkpoint_builder_for(snapshot, engine);
+  FfiCheckpointSpec spec;
+  FfiCheckpointSpec* spec_ptr;
 
   if (strcmp(sub_flow, "inline") == 0) {
-    // No setter -- kernel auto-picks V1 or V2 based on table protocol features.
+    // Spec = NULL => kernel auto-picks V1 or V2 based on table protocol features.
+    spec_ptr = NULL;
   } else if (strcmp(sub_flow, "v2_no_sidecar") == 0) {
-    checkpoint_builder_set_v2_no_sidecar(&builder);
+    spec.tag = FfiCheckpointSpecV2NoSidecar;
+    spec_ptr = &spec;
   } else if (strcmp(sub_flow, "v2_with_sidecars") == 0) {
     // Pass a small hint (2) so the fixture's handful of file actions splits across
     // multiple sidecars, making the on-disk shape observably different from the
     // V2-no-sidecar sub-flow.
-    checkpoint_builder_set_v2_with_sidecars(&builder, 2);
+    spec.tag = FfiCheckpointSpecV2WithSidecar;
+    spec.v2_with_sidecar.file_actions_per_sidecar_hint = 2;
+    spec_ptr = &spec;
   } else {
     fprintf(stderr, "Unknown sub-flow: %s\n", sub_flow);
-    free_checkpoint_builder(builder);
     return 1;
   }
 
-  ExternResultFfiCheckpointWriteResult build_res = checkpoint_builder_build(builder);
+  ExternResultFfiCheckpointWriteResult build_res =
+      checkpoint_snapshot(snapshot, engine, spec_ptr);
   if (build_res.tag != OkFfiCheckpointWriteResult) {
-    print_error("checkpoint_builder_build failed.", (Error*)build_res.err);
+    print_error("checkpoint_snapshot failed.", (Error*)build_res.err);
     free_error((Error*)build_res.err);
     return 1;
   }
