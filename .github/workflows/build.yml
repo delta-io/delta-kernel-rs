@@ -208,6 +208,13 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            ffi:
+              - 'ffi/src/handle.rs'
+              - 'ffi-proc-macros/**'
       - name: Install minimal stable with clippy and rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
@@ -219,6 +226,9 @@ jobs:
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
         run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: trybuild tests
+        if: steps.filter.outputs.ffi == 'true'
+        run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
       - name: metrics deadlock test
         shell: bash
         run: |
