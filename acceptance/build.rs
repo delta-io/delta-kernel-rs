@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::{Agent, Proxy};
 
 const DAT_EXISTS_FILE_CHECK: &str = "tests/dat/.done";
@@ -46,14 +47,7 @@ fn download_dat_files() -> Vec<u8> {
 }
 
 fn download_tarball(url: &str) -> Vec<u8> {
-    let response = if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
-        let proxy = Proxy::new(&proxy_url).unwrap();
-        let config = Agent::config_builder().proxy(proxy.into()).build();
-        let agent = Agent::new_with_config(config);
-        agent.get(url).call().unwrap()
-    } else {
-        ureq::get(url).call().unwrap()
-    };
+    let response = build_agent().get(url).call().unwrap();
 
     let mut tarball_data: Vec<u8> = Vec::new();
     response
@@ -63,6 +57,27 @@ fn download_tarball(url: &str) -> Vec<u8> {
         .unwrap();
 
     tarball_data
+}
+
+/// Build a `ureq` agent that validates TLS against the OS trust store (native-tls) rather than
+/// ureq's default rustls + bundled webpki-roots.
+///
+/// ureq defaults to `RootCerts::WebPki` to resist MITM proxies, but behind a sanctioned
+/// TLS-intercepting corporate proxy the interception CA lives in the system trust store and not
+/// in the Mozilla bundle, so the default backend rejects the chain with `UnknownIssuer`.
+/// `RootCerts::PlatformVerifier` makes native-tls use the system roots (like `curl`). Honors
+/// `HTTPS_PROXY` if set.
+fn build_agent() -> Agent {
+    let tls_config = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    let mut config = Agent::config_builder().tls_config(tls_config);
+    if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
+        let proxy = Proxy::new(&proxy_url).unwrap();
+        config = config.proxy(Some(proxy));
+    }
+    Agent::new_with_config(config.build())
 }
 
 fn extract_dat_tarball(tarball_data: Vec<u8>) {

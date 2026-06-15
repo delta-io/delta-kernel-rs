@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::{Agent, Proxy};
 
 const VERSION: &str = "0.0.5-preview"; // release tag
@@ -36,13 +37,7 @@ fn download_workloads() -> Vec<u8> {
 }
 
 fn download_tarball(url: &str) -> Vec<u8> {
-    let response = if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
-        let proxy = Proxy::new(&proxy_url).unwrap();
-        let config = Agent::config_builder().proxy(proxy.into()).build();
-        Agent::new_with_config(config).get(url).call().unwrap()
-    } else {
-        ureq::get(url).call().unwrap()
-    };
+    let response = build_agent().get(url).call().unwrap();
 
     let mut data: Vec<u8> = Vec::new();
     response
@@ -51,6 +46,19 @@ fn download_tarball(url: &str) -> Vec<u8> {
         .read_to_end(&mut data)
         .unwrap();
     data
+}
+
+fn build_agent() -> Agent {
+    let tls_config = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    let mut config = Agent::config_builder().tls_config(tls_config);
+    if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
+        let proxy = Proxy::new(&proxy_url).unwrap();
+        config = config.proxy(Some(proxy));
+    }
+    Agent::new_with_config(config.build())
 }
 
 fn extract_tarball(tarball_data: Vec<u8>, output_dir: &Path) {
