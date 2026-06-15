@@ -2,8 +2,7 @@
 
 #[cfg(feature = "arrow-58")]
 mod arrow_compat_shims {
-    pub use arrow_58 as arrow;
-    pub use parquet_58 as parquet;
+    pub use {arrow_58 as arrow, parquet_58 as parquet};
 
     pub mod object_store {
         pub use object_store_13::*;
@@ -12,8 +11,7 @@ mod arrow_compat_shims {
 
 #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
 mod arrow_compat_shims {
-    pub use arrow_57 as arrow;
-    pub use parquet_57 as parquet;
+    pub use {arrow_57 as arrow, parquet_57 as parquet};
 
     pub mod object_store {
         use std::future::Future;

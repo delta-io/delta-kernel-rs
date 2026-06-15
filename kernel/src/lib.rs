@@ -88,6 +88,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod commit_range;
 pub mod committer;
 #[cfg(feature = "internal-api")]
 pub mod crc;

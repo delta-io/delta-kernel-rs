@@ -56,6 +56,7 @@ pub mod log_path;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
 pub mod scan;
+pub mod commit_range;
 pub mod schema;
 pub mod schema_visitor;
 
