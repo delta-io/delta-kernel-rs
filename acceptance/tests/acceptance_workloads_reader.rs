@@ -174,10 +174,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "void_007_void_with_backticks/specs/void_007_void_with_backticks_read_all",
         ],
     ),
-    // Interval columns read as their physical integer (i32 months / i64 microseconds), which
-    // the rest of the intv_* suite now passes. Partitioned interval columns additionally
-    // require materializing the partition value as a Scalar, which interval does not yet
-    // support (no Scalar::Interval variant).
+    // Partitioned interval columns need a Scalar::Interval to materialize, not yet supported.
     (
         "Interval partition values not supported (needs Scalar::Interval)",
         &["intv_003_interval_partitioned/specs/intv_003_interval_partitioned_read_all"],

@@ -341,7 +341,6 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
             &DataType::VOID => call!(visit_void),
             &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
-                // No FFI visitor callback for interval types yet; the field is skipped.
                 tracing::warn!("Skipping unsupported interval field '{name}' in FFI schema visit");
             }
         }

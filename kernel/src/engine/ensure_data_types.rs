@@ -699,8 +699,6 @@ mod tests {
 
     #[test]
     fn interval_maps_to_physical_integer() {
-        // Interval types are read as their physical integer (i32 months / i64 microseconds),
-        // matching the on-disk Parquet representation -- no cast needed.
         assert_eq!(
             ensure_data_types(
                 &DataType::INTERVAL_YEAR_MONTH,
