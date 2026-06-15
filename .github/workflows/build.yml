@@ -150,6 +150,7 @@ jobs:
   # 1. build/clippy all packages that depend on the kernel with some features enabled:
   #    - acceptance
   #    - test_utils
+  #    - delta_kernel_workloads
   #    - feature_tests
   #    (and examples)
   #    - inspect-table

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::models::{Spec, TableInfo, Workload};
+use delta_kernel_workloads::models::{Spec, TableInfo, Workload};
 
 // Environment variable used to filter benchmarks by tag (e.g. `BENCH_TAGS=base,feature_x`).
 pub const BENCH_TAGS_ENV_VAR: &str = "BENCH_TAGS";
