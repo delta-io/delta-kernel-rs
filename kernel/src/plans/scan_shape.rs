@@ -1,23 +1,14 @@
-//! Checkpoint-shape resolution for scan / FSR log replay.
+//! Checkpoint-shape resolution for scan
 //!
-//! Probes a snapshot's checkpoint topology -- no checkpoint, an inline *leaf* checkpoint, or a
-//! V2 *manifest* that references sidecars -- and, when stats are requested, resolves how those
-//! stats are surfaced (native `add.stats_parsed` struct vs JSON `add.stats` string). The probe is
-//! driven synchronously through a [`PlanExecutor`]. A V2 checkpoint is identified by a
-//! `checkpointMetadata` column in its schema (the footer or `_last_checkpoint` hint); only V2
-//! checkpoints can reference sidecars, so a parquet checkpoint lacking that column is a classic V1
-//! leaf outright. For a V2 (or any JSON) checkpoint the `sidecar` column is drained through
-//! [`SidecarVisitor`] -- no references means an inline leaf, one or more a manifest. For a
-//! manifest, that first sidecar then answers the parsed-stats probe via its footer.
-//!
-//! This is the IO-bearing front half of log-replay planning. It is deliberately independent of
-//! the plan-construction surface and the reconciliation pipeline: a caller resolves the shape
-//! here, then feeds it into a (separately built) reconciliation plan.
-//!
-//! Sibling: `LogSegment::get_file_actions_schema_and_sidecars` reaches the same leaf/manifest
-//! outcome for the engine-driven read path, though it detects V2 via the `sidecar` column rather
-//! than `checkpointMetadata` (the latter is the spec-mandated V2 marker -- every V2 checkpoint
-//! carries it, classic V1 never does). Keep their behavior aligned.
+//! Probes a snapshot's checkpoint topology, categorizing it into one of:
+//!     1) no checkpoint
+//!     2) leaf-level checkpoints, containing only file contents. This includes single-part and
+//!        legacy multi-part checkpoints.
+//!     3) manifest-level checkpoints, containing references to sidecar files that hold the file
+//!        contents.
+//! When stats are requested, it also resolves how those stats are surfaced (a structured
+//! `add.stats_parsed` struct vs a JSON `add.stats` string). The probe is driven through a
+//! [`PlanExecutor`].
 
 use url::Url;
 
@@ -74,19 +65,10 @@ pub struct ScanShape {
 }
 
 impl ScanShape {
-    /// Resolve `snapshot`'s scan shape, driving all IO synchronously through `exec`.
-    ///
-    /// Determines the checkpoint topology and, when `stats_schema` is `Some`, whether the
-    /// checkpoint surfaces native parsed stats compatible with it. For a leaf the parsed-stats
-    /// answer comes from the checkpoint footer; for a manifest it comes from a sidecar footer.
-    /// The `_last_checkpoint` hint describes the manifest rather than the leaf rows, so it is not
-    /// consulted for the parsed-stats decision.
-    ///
-    /// # Errors
-    ///
-    /// Propagates executor failures from the footer reads or the sidecar-drain scan, errors
-    /// visiting the `sidecar` column, and any error resolving a sidecar reference to a
-    /// [`FileMeta`].
+    /// Resolve `snapshot`'s scan shape. Determines the checkpoint topology and, when `stats_schema`
+    /// is `Some`, whether the checkpoint surfaces native parsed stats compatible with it. For a
+    /// leaf the parsed-stats answer comes from the checkpoint footer; for a manifest it comes from
+    /// a sidecar footer.
     pub fn resolve(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
@@ -132,8 +114,7 @@ impl ScanShape {
                 } else {
                     None
                 };
-                // No `checkpointMetadata` column (classic V1 leaf) or a V2 checkpoint that inlines
-                // its actions (drain found no sidecars): either way `cp_schema` is the leaf schema,
+                // `cp_schema` is the leaf schema here (classic V1, or inline V2 with no sidecars),
                 // so probe it for parsed stats when the caller requested them.
                 if sidecar.is_none() {
                     leaf_parsed_stats = stats_schema.is_some_and(|reqd| {
@@ -146,6 +127,8 @@ impl ScanShape {
                 sidecar
             }
             FileType::Json => {
+                // JSON checkpoints have no footer schema, so drain the `sidecar` column to
+                // classify: empty -> inline leaf, non-empty -> manifest.
                 collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
             }
         };
@@ -182,11 +165,6 @@ fn read_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<Sc
 
 /// Scan the checkpoint `file` and drain its `sidecar` column through [`SidecarVisitor`], resolving
 /// the first reference to a [`FileMeta`] under `log_root`.
-///
-/// This mimics a streaming reducer kernel-side: it pulls each batch from the executor's result
-/// stream and visits its rows, stopping as soon as a sidecar reference appears. The scan projects
-/// only the `sidecar` column, so manifest action rows (`add` / `remove`) read as null and are
-/// skipped by the visitor.
 fn collect_sidecar(
     exec: &dyn PlanExecutor,
     file: FileMeta,
@@ -233,96 +211,127 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::load_test_table;
 
+    /// Resolves checkpoint shape and, when stats are requested, whether parsed stats are
+    /// available. `expect_parsed = None` skips the stats probe (checkpoint-only cases). A
+    /// partition schema is varied (present/absent) across every case to assert it passes through
+    /// verbatim, independent of checkpoint topology and stats.
     #[rstest]
-    #[case::no_checkpoint("app-txn-no-checkpoint", CheckpointShape::None)]
-    #[case::leaf_parquet("with_checkpoint_no_last_checkpoint", CheckpointShape::Leaf)]
-    #[case::manifest_parquet("v2-checkpoints-parquet-with-sidecars", CheckpointShape::Manifest)]
-    #[case::manifest_json("v2-checkpoints-json-with-sidecars", CheckpointShape::Manifest)]
+    #[case::no_checkpoint("app-txn-no-checkpoint", CheckpointShape::None, None)]
+    #[case::leaf_parquet("with_checkpoint_no_last_checkpoint", CheckpointShape::Leaf, None)]
+    #[case::manifest_parquet(
+        "v2-checkpoints-parquet-with-sidecars",
+        CheckpointShape::Manifest,
+        Some(false)
+    )]
+    #[case::manifest_json("v2-checkpoints-json-with-sidecars", CheckpointShape::Manifest, None)]
     // A V2 JSON checkpoint with no sidecar references inlines its actions: a leaf, not a manifest.
-    #[case::leaf_json_inline("v2-checkpoints-json-without-sidecars", CheckpointShape::Leaf)]
+    #[case::leaf_json_inline(
+        "v2-checkpoints-json-without-sidecars",
+        CheckpointShape::Leaf,
+        Some(false)
+    )]
     // A V2 parquet checkpoint carries a `sidecar` column even when it inlines its actions; with
     // zero sidecar references it is still a leaf, so the column alone must not classify it.
-    #[case::leaf_parquet_inline("v2-checkpoints-parquet-without-sidecars", CheckpointShape::Leaf)]
+    #[case::leaf_parquet_inline(
+        "v2-checkpoints-parquet-without-sidecars",
+        CheckpointShape::Leaf,
+        None
+    )]
     // A multi-part V1 checkpoint is always parquet and carries no `sidecar` column: a leaf.
-    #[case::leaf_multipart("v1-multi-part-struct-stats-only", CheckpointShape::Leaf)]
-    fn resolve_classifies_checkpoint(#[case] table: &str, #[case] expected: CheckpointShape) {
-        let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
-        let exec = SyncPlanExecutor::new();
-        // No stats requested: topology only.
-        let shape = ScanShape::resolve(&exec, snapshot.as_ref(), None, None).unwrap();
-        assert!(shape.stats.is_none(), "{table}: stats not requested");
-        assert_eq!(shape.checkpoint, expected, "{table}: checkpoint shape");
-    }
-
-    /// When stats are requested, `StatsInfo` carries the requested schema verbatim and reports
-    /// whether the checkpoint surfaces it as native parsed stats: `true` for the
-    /// struct-stats-only tables, `false` for the JSON-stats tables. An empty `minValues` /
-    /// `maxValues` request is trivially compatible, so this isolates "does the checkpoint have
-    /// an `add.stats_parsed` struct at all".
-    #[rstest]
-    #[case::json_stats_classic_leaf("v2-classic-checkpoint-parquet", false)]
-    #[case::json_stats_sidecars("v2-checkpoints-parquet-with-sidecars", false)]
-    #[case::struct_stats_leaf("v2-classic-parquet-struct-stats-only", true)]
+    // It surfaces struct stats via its checkpoint footer / `_last_checkpoint` hint.
+    #[case::leaf_multipart("v1-multi-part-struct-stats-only", CheckpointShape::Leaf, Some(true))]
+    #[case::json_stats_classic(
+        "v2-classic-checkpoint-parquet",
+        CheckpointShape::Manifest,
+        Some(false)
+    )]
+    #[case::struct_stats_leaf(
+        "v2-classic-parquet-struct-stats-only",
+        CheckpointShape::Leaf,
+        Some(true)
+    )]
     // Manifest sidecar probe: the parsed-stats answer comes from a sidecar footer, exercising the
     // JSON drain-then-probe path (JSON) and the lazy parquet drain (parquet).
-    #[case::struct_stats_json_manifest("v2-json-sidecars-struct-stats-only", true)]
-    #[case::struct_stats_parquet_manifest("v2-parquet-sidecars-struct-stats-only", true)]
-    // A multi-part V1 leaf surfaces struct stats via its checkpoint footer / `_last_checkpoint`
-    // hint.
-    #[case::struct_stats_multipart_leaf("v1-multi-part-struct-stats-only", true)]
-    // A JSON leaf has no footer, so it never reports native parsed stats even when requested.
-    #[case::json_leaf_no_parsed("v2-checkpoints-json-without-sidecars", false)]
-    fn resolve_reports_parsed_stats(#[case] table: &str, #[case] expect_parsed: bool) {
+    #[case::struct_stats_json_manifest(
+        "v2-json-sidecars-struct-stats-only",
+        CheckpointShape::Manifest,
+        Some(true)
+    )]
+    #[case::struct_stats_parquet_manifest(
+        "v2-parquet-sidecars-struct-stats-only",
+        CheckpointShape::Manifest,
+        Some(true)
+    )]
+    fn resolve_checkpoint_stats_and_partition(
+        #[case] table: &str,
+        #[case] expected_checkpoint: CheckpointShape,
+        #[case] expect_parsed: Option<bool>,
+        #[values(false, true)] with_partition: bool,
+    ) {
         let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
         let exec = SyncPlanExecutor::new();
-        let stats_schema = probe_stats_schema();
-
-        let shape =
-            ScanShape::resolve(&exec, snapshot.as_ref(), Some(&stats_schema), None).unwrap();
-        let stats = shape.stats.expect("stats requested");
-        assert_eq!(
-            stats.schema, stats_schema,
-            "{table}: schema passed through verbatim"
-        );
-        assert_eq!(
-            stats.has_parsed_stats, expect_parsed,
-            "{table}: parsed-stats detection"
-        );
-    }
-
-    /// `partition_schema` is threaded through verbatim, independent of checkpoint topology.
-    #[rstest]
-    #[case::no_checkpoint("app-txn-no-checkpoint")]
-    #[case::manifest("v2-checkpoints-parquet-with-sidecars")]
-    fn resolve_passes_partition_schema_through(#[case] table: &str) {
-        let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
-        let exec = SyncPlanExecutor::new();
-        let partition_schema: SchemaRef =
+        let stats_schema = expect_parsed.map(|_| probe_stats_schema());
+        let partition_schema: Option<SchemaRef> = with_partition.then(|| {
             Arc::new(StructType::new_unchecked([StructField::nullable(
                 "p",
                 DataType::INTEGER,
-            )]));
+            )]))
+        });
+
         let shape = ScanShape::resolve(
             &exec,
             snapshot.as_ref(),
-            None,
-            Some(partition_schema.clone()),
+            stats_schema.as_ref(),
+            partition_schema.clone(),
         )
         .unwrap();
-        assert_eq!(shape.partition_schema, Some(partition_schema), "{table}");
+
+        assert_eq!(
+            shape.checkpoint, expected_checkpoint,
+            "{table}: checkpoint shape"
+        );
+        assert_eq!(
+            shape.partition_schema, partition_schema,
+            "{table}: partition schema passthrough"
+        );
+
+        match expect_parsed {
+            None => assert!(shape.stats.is_none(), "{table}: stats not requested"),
+            Some(parsed) => {
+                let stats = shape.stats.expect("stats requested");
+                assert_eq!(
+                    stats.schema,
+                    stats_schema.unwrap(),
+                    "{table}: schema passed through verbatim"
+                );
+                assert_eq!(
+                    stats.has_parsed_stats, parsed,
+                    "{table}: parsed-stats detection"
+                );
+            }
+        }
     }
 
-    /// A minimal requested stats schema: empty `minValues` / `maxValues` structs. Compatibility
-    /// then reduces to whether the checkpoint carries an `add.stats_parsed` struct.
+    /// A realistic requested stats schema mirroring the `*-struct-stats-only` fixtures
+    /// (`id: long, value: string`): `numRecords` plus `minValues` / `maxValues` over the data
+    /// columns. Compatibility then exercises real per-column type matching against the
+    /// checkpoint's `add.stats_parsed`, not just the presence of the struct.
     fn probe_stats_schema() -> SchemaRef {
-        let empty = || StructType::new_unchecked([]);
+        let columns = || {
+            StructType::new_unchecked([
+                StructField::nullable("id", DataType::LONG),
+                StructField::nullable("value", DataType::STRING),
+            ])
+        };
         Arc::new(StructType::new_unchecked([
-            StructField::nullable("minValues", empty()),
-            StructField::nullable("maxValues", empty()),
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(MIN_VALUES, columns()),
+            StructField::nullable(MAX_VALUES, columns()),
         ]))
     }
 }
