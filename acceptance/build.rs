@@ -16,11 +16,8 @@ const DAT_OUTPUT_FOLDER: &str = "tests/dat";
 const DAT_VERSION: &str = "0.0.3";
 const ACCEPTANCE_WORKLOADS_VERSION: &str = "0.0.4";
 
-// SHA-256 of the release assets. Each download is otherwise trusted purely on TLS; verifying these
-// digests before extraction stops a tampered or MITM'd tarball from being unpacked to disk. Update
-// alongside the version constants above.
-const DAT_CHECKSUM: &str = "19c045bc6f4e8531d1985d0f7bb156d788e65078b435d613c8e4a9c753b4a982";
-const WORKLOAD_CHECKSUM: &str = "c129283e152239c810a6cf2e35571268bd7452fb379f6294abcee340f2436312";
+const DAT_CHECKSUM: &str = "19c045bc6f4e8531d1985d0f7bb156d788e65078b435d613c8e4a9c753b4a982"; // dat checksum
+const WORKLOAD_CHECKSUM: &str = "c129283e152239c810a6cf2e35571268bd7452fb379f6294abcee340f2436312"; // workloads checksum
 
 /// Workloads to skip on Windows due to invalid filename characters.
 /// Windows does not support these characters in filenames: < > : " | ? *
@@ -81,14 +78,6 @@ fn verify_checksum(data: &[u8], expected: &str) {
     }
 }
 
-/// Build a `ureq` agent that validates TLS against the OS trust store (native-tls) rather than
-/// ureq's default rustls + bundled webpki-roots.
-///
-/// ureq defaults to `RootCerts::WebPki` to resist MITM proxies, but behind a sanctioned
-/// TLS-intercepting corporate proxy the interception CA lives in the system trust store and not
-/// in the Mozilla bundle, so the default backend rejects the chain with `UnknownIssuer`.
-/// `RootCerts::PlatformVerifier` makes native-tls use the system roots (like `curl`). Honors
-/// `HTTPS_PROXY` if set.
 fn build_agent() -> Agent {
     let tls_config = TlsConfig::builder()
         .provider(TlsProvider::NativeTls)
