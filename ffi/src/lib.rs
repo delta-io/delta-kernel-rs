@@ -15,7 +15,7 @@ use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
-    latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType, Timestamp,
+    latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
 };
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
@@ -1087,7 +1087,7 @@ pub struct FfiCommitAt {
     /// Timestamp (milliseconds since the Unix epoch) associated with this commit. This is the
     /// commit's in-commit timestamp (ICT) when ICT is enabled, otherwise the commit's file
     /// modification time.
-    pub timestamp: Timestamp,
+    pub timestamp: i64,
 }
 
 impl From<CommitAt> for FfiCommitAt {
@@ -1114,7 +1114,7 @@ impl From<CommitAt> for FfiCommitAt {
 pub unsafe extern "C" fn latest_version_as_of(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
-    timestamp: Timestamp,
+    timestamp: i64,
     commit_type: FfiHistoryCommitType,
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
@@ -1144,7 +1144,7 @@ pub unsafe extern "C" fn latest_version_as_of(
 pub unsafe extern "C" fn first_version_after(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
-    timestamp: Timestamp,
+    timestamp: i64,
     commit_type: FfiHistoryCommitType,
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
@@ -1886,7 +1886,7 @@ mod tests {
     type HistoryQueryFn = unsafe extern "C" fn(
         Handle<SharedSnapshot>,
         Handle<SharedExternEngine>,
-        Timestamp,
+        i64,
         FfiHistoryCommitType,
     ) -> ExternResult<FfiCommitAt>;
 
@@ -1898,8 +1898,8 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_version_at_timestamp_cases(
         #[case] query: HistoryQueryFn,
-        #[case] timestamp: Timestamp,
-        #[case] expected: Result<(Version, Timestamp), KernelError>,
+        #[case] timestamp: i64,
+        #[case] expected: Result<(Version, i64), KernelError>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
