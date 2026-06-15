@@ -6,6 +6,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 use tar::Archive;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::{Agent, Proxy};
@@ -14,6 +15,12 @@ const DAT_EXISTS_FILE_CHECK: &str = "tests/dat/.done";
 const DAT_OUTPUT_FOLDER: &str = "tests/dat";
 const DAT_VERSION: &str = "0.0.3";
 const ACCEPTANCE_WORKLOADS_VERSION: &str = "0.0.4";
+
+// SHA-256 of the release assets. Each download is otherwise trusted purely on TLS; verifying these
+// digests before extraction stops a tampered or MITM'd tarball from being unpacked to disk. Update
+// alongside the version constants above.
+const DAT_CHECKSUM: &str = "19c045bc6f4e8531d1985d0f7bb156d788e65078b435d613c8e4a9c753b4a982";
+const WORKLOAD_CHECKSUM: &str = "c129283e152239c810a6cf2e35571268bd7452fb379f6294abcee340f2436312";
 
 /// Workloads to skip on Windows due to invalid filename characters.
 /// Windows does not support these characters in filenames: < > : " | ? *
@@ -43,10 +50,10 @@ fn download_dat_files() -> Vec<u8> {
         "https://github.com/delta-incubator/dat/releases/download/v{DAT_VERSION}/deltalake-dat-v{DAT_VERSION}.tar.gz"
     );
 
-    download_tarball(&tarball_url)
+    download_tarball(&tarball_url, DAT_CHECKSUM)
 }
 
-fn download_tarball(url: &str) -> Vec<u8> {
+fn download_tarball(url: &str, expected_checksum: &str) -> Vec<u8> {
     let response = build_agent().get(url).call().unwrap();
 
     let mut tarball_data: Vec<u8> = Vec::new();
@@ -56,7 +63,22 @@ fn download_tarball(url: &str) -> Vec<u8> {
         .read_to_end(&mut tarball_data)
         .unwrap();
 
+    verify_checksum(&tarball_data, expected_checksum);
+
     tarball_data
+}
+
+/// Panic unless the SHA-256 of `data` equals `expected` (lowercase hex). Called before any
+/// extraction, so a download whose digest doesn't match the pinned value fails the build instead
+/// of being unpacked to disk.
+fn verify_checksum(data: &[u8], expected: &str) {
+    let actual: String = Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if actual != expected {
+        panic!("tarball checksum mismatch: expected {expected}, got {actual}");
+    }
 }
 
 /// Build a `ureq` agent that validates TLS against the OS trust store (native-tls) rather than
@@ -131,7 +153,7 @@ fn extract_acceptance_workloads() {
         "https://github.com/delta-incubator/dat/releases/download/v0.04-preview/v{ACCEPTANCE_WORKLOADS_VERSION}_dat_workloads.tar.gz"
     );
 
-    let tarball_data = download_tarball(&tarball_url);
+    let tarball_data = download_tarball(&tarball_url, WORKLOAD_CHECKSUM);
 
     // Extract tarball, skipping files with invalid Windows filenames
     let decoder = GzDecoder::new(BufReader::new(&tarball_data[..]));

@@ -15,6 +15,7 @@ dependencies = [
  "itertools 0.14.0",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tempfile",
  "test-case",
@@ -1333,6 +1334,7 @@ dependencies = [
  "object_store 0.12.5",
  "rayon",
  "serde_json",
+ "sha2",
  "tar",
  "test_utils",
  "tokio",
@@ -4017,6 +4019,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]

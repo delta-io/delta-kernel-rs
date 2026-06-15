@@ -42,6 +42,7 @@ url = "2"
 # webpki-roots. See build.rs `build_agent`.
 ureq = { version = "3.1", default-features = false, features = ["native-tls", "gzip"] }
 flate2 = "1.1"
+sha2 = "0.10"
 tar = "0.4"
 
 [dev-dependencies]
