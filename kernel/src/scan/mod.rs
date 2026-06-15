@@ -35,8 +35,8 @@ use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::FieldTransformSpec;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    ArrayType, DataType, MapType, MetadataColumnSpec, PrimitiveType, Schema, SchemaRef,
+    StructField, StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
@@ -258,6 +258,7 @@ pub struct ScanBuilder {
     predicate: Option<PredicateRef>,
     stats: StatsOptions,
     partition_values: PartitionValuesOptions,
+    without_row_transforms: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -267,6 +268,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("predicate", &self.predicate)
             .field("stats", &self.stats)
             .field("partition_values", &self.partition_values)
+            .field("without_row_transforms", &self.without_row_transforms)
             .finish()
     }
 }
@@ -280,6 +282,7 @@ impl ScanBuilder {
             predicate: None,
             stats: StatsOptions::default(),
             partition_values: PartitionValuesOptions::default(),
+            without_row_transforms: false,
         }
     }
 
@@ -347,6 +350,25 @@ impl ScanBuilder {
         self
     }
 
+    /// Declare that the engine will reconstruct logical rows itself and will not consume
+    /// [`ScanMetadata::scan_file_transforms`].
+    ///
+    /// The kernel then skips building the per-file physical-to-logical transform expressions,
+    /// which also skips the per-row partition-value parse done only to build them. Intended for
+    /// engines that use the scan for file listing and metadata (path, stats,
+    /// `partitionValues_parsed`) and read data through their own reader. The returned
+    /// `scan_file_transforms` will be empty.
+    ///
+    /// This is a low-level opt-out: with it set, the kernel does not apply partition columns,
+    /// column-mapping renames, or generated row ids to scanned data. [`Scan::execute`] therefore
+    /// cannot produce correct logical data and returns an error. Pair this with
+    /// [`PartitionValuesOptions::all_struct`] so partition values still reach the engine via the
+    /// typed output column.
+    pub fn without_row_transforms(mut self) -> Self {
+        self.without_row_transforms = true;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -373,11 +395,28 @@ impl ScanBuilder {
             .logical_read_schema
             .unwrap_or_else(|| table_schema.clone());
 
+        // Row id / row commit version columns are produced by the row transform. Skipping
+        // transforms would leave them ungenerated with no error, so reject the combination.
+        if self.without_row_transforms {
+            let requests_generated_column = logical_read_schema.fields().any(|f| {
+                matches!(
+                    f.get_metadata_column_spec(),
+                    Some(MetadataColumnSpec::RowId | MetadataColumnSpec::RowCommitVersion)
+                )
+            });
+            if requests_generated_column {
+                return Err(Error::unsupported(
+                    "without_row_transforms cannot be combined with row id or row commit version \
+                     metadata columns, which are produced by the row transform",
+                ));
+            }
+        }
+
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        let state_info = StateInfo::try_new(
+        let mut state_info = StateInfo::try_new(
             logical_read_schema,
             table_schema,
             self.snapshot.table_configuration(),
@@ -387,11 +426,18 @@ impl ScanBuilder {
             (), // No classifier, default is for scans
         )?;
 
+        // The engine reconstructs logical rows itself, so drop the transform spec. This skips the
+        // per-row partition-value parse and per-file transform-expression construction.
+        if self.without_row_transforms {
+            state_info.transform_spec = None;
+        }
+
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
             partition_values: self.partition_values,
+            without_row_transforms: self.without_row_transforms,
         })
     }
 }
@@ -652,6 +698,10 @@ pub struct Scan {
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
     partition_values: PartitionValuesOptions,
+
+    /// Set via [`ScanBuilder::without_row_transforms`]. When true the scan emits no row
+    /// transforms and [`Scan::execute`] is unsupported.
+    without_row_transforms: bool,
 }
 
 impl std::fmt::Debug for Scan {
@@ -1144,6 +1194,17 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+        // The engine opted out of row transforms, so the kernel cannot reconstruct logical data
+        // (partition columns, column-mapping renames, row ids). Reading data here would silently
+        // return physical rows. Such a scan is for listing and metadata only.
+        if self.without_row_transforms {
+            return Err(Error::unsupported(
+                "Scan::execute is not supported when the scan was built with \
+                 without_row_transforms; use scan_metadata for listing and read data with your \
+                 own reader",
+            ));
+        }
+
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
             batches.push(file);
         }

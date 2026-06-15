@@ -410,6 +410,98 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     );
 }
 
+#[test]
+fn test_without_row_transforms_drops_transform_spec() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(0)
+        .build(engine.as_ref())
+        .unwrap();
+
+    // A partitioned scan builds a transform spec whose per-row partition parse blocks dropping
+    // the string map from the checkpoint read.
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::all_struct())
+        .build()
+        .unwrap();
+    assert!(scan.state_info.transform_spec.is_some());
+    assert!(!scan.can_drop_partition_values_from_checkpoint());
+
+    // Opting out of transforms drops the spec entirely, so there is no per-row parse and, with
+    // all_struct, the string map becomes droppable.
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::all_struct())
+        .without_row_transforms()
+        .build()
+        .unwrap();
+    assert!(scan.state_info.transform_spec.is_none());
+    assert!(scan.can_drop_partition_values_from_checkpoint());
+}
+
+#[test]
+fn test_without_row_transforms_rejects_execute() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(0)
+        .build(engine.as_ref())
+        .unwrap();
+
+    // The scan reconstructs no logical rows, so execute() must refuse rather than return
+    // physical data.
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::all_struct())
+        .without_row_transforms()
+        .build()
+        .unwrap();
+    let err = scan
+        .execute(engine)
+        .err()
+        .expect("execute must error when row transforms are skipped");
+    assert!(
+        err.to_string().contains("without_row_transforms"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_without_row_transforms_rejects_row_id_column() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(0)
+        .build(engine.as_ref())
+        .unwrap();
+
+    // Row ids are produced by the row transform; requesting them while skipping transforms is a
+    // contradiction and must error at build time.
+    let schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)
+            .unwrap(),
+    );
+    let err = snapshot
+        .scan_builder()
+        .with_schema(schema)
+        .without_row_transforms()
+        .build()
+        .err()
+        .expect("build must reject a row id column under without_row_transforms");
+    assert!(
+        err.to_string().contains("without_row_transforms"),
+        "unexpected error: {err}"
+    );
+}
+
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
