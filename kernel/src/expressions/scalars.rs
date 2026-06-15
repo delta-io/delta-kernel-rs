@@ -1092,7 +1092,6 @@ mod tests {
         );
     }
 
-    // space-separated form (protocol partition-value format), accepted by both timestamp types
     #[rstest]
     #[case::seconds("2011-01-11 13:06:07", 1294751167000000)]
     #[case::fractional_seconds("2011-01-11 13:06:07.123456", 1294751167123456)]
@@ -1110,8 +1109,6 @@ mod tests {
         assert_eq!(p_type.parse_scalar(raw).unwrap(), expected);
     }
 
-    // ISO 8601 / RFC 3339 form, accepted by Timestamp only; offsets are honored and the
-    // value normalized to UTC
     #[rstest]
     #[case::z_fractional("1971-07-22T03:06:40.678910Z", 49000000678910)]
     #[case::z_seconds("1971-07-22T03:06:40Z", 49000000000000)]

@@ -1032,7 +1032,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, MapBuilder, StringArray,
-        StringBuilder, StructArray,
+        StringBuilder, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -2235,8 +2235,6 @@ mod tests {
 
     #[test]
     fn test_map_to_struct_timestamp_offset_normalized_to_utc() {
-        use crate::arrow::array::TimestampMicrosecondArray;
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("ts");
         builder.values().append_value("2024-06-15T14:30:00+05:00");
