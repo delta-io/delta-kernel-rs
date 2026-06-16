@@ -318,7 +318,7 @@ impl LogSegment {
         name = LOG_SEGMENT_LOADED_SPAN,
         err,
         skip(storage, time_travel_version),
-        fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
+        fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(

@@ -92,6 +92,29 @@ async fn commit_append_emits_success_metrics(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
+    let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(LastCommitSuccess::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    create_table(&table_path, simple_schema(), "Test/1.0")
+        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .with_correlation_id("commit-req-1")
+        .commit(setup_engine.as_ref())?
+        .unwrap_committed();
+
+    let success = reporter
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("commit success event");
+    assert_eq!(success.commit_version, 0);
+    assert_eq!(success.correlation_id.as_deref(), Some("commit-req-1"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
     // GIVEN a table at v0 (00.json) and a snapshot pinned to it.
     let (_temp_dir, table_url) = setup_empty_table()?;

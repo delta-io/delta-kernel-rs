@@ -209,6 +209,9 @@ pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
     // Correlates all metric events emitted by this transaction.
     operation_id: MetricId,
+    // Opaque, caller-supplied id recorded on this transaction's commit metric events alongside
+    // `operation_id`. Set via `with_correlation_id`; not interpreted by kernel.
+    correlation_id: Option<Arc<str>>,
     // The snapshot this transaction is based on. None for CREATE TABLE (no pre-existing table).
     // Use `read_snapshot()` to access; it returns an error if None.
     read_snapshot_opt: Option<SnapshotRef>,
@@ -338,6 +341,7 @@ impl<S> Transaction<S> {
             report,
             operation_id = %self.operation_id,
             is_catalog_managed = self.effective_table_config.is_catalog_managed(),
+            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
             commit_version = self.get_commit_version(),
             num_add_files,
             num_remove_files,
@@ -599,6 +603,14 @@ impl<S> Transaction<S> {
     /// Set the engine info field of this transaction's commit info action. This field is optional.
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining this transaction's commit
+    /// metric events to the caller's own request or operation id. An empty id is treated as unset.
+    /// When unset, behavior is unchanged.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
 

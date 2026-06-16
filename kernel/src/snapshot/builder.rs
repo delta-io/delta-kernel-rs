@@ -1,5 +1,7 @@
 //! Builder for creating [`Snapshot`] instances.
 
+use std::sync::Arc;
+
 use tracing::{info, instrument};
 
 use crate::log_path::LogPath;
@@ -43,6 +45,9 @@ pub struct SnapshotBuilder {
     incremental_replay: IncrementalReplay,
     /// Kernel-minted id correlating this build's metric events with its child events.
     operation_id: MetricId,
+    /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
+    /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
+    correlation_id: Option<Arc<str>>,
 }
 
 /// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
@@ -103,6 +108,7 @@ impl SnapshotBuilder {
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
+            correlation_id: None,
         }
     }
 
@@ -115,6 +121,7 @@ impl SnapshotBuilder {
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
+            correlation_id: None,
         }
     }
 
@@ -177,6 +184,14 @@ impl SnapshotBuilder {
         self
     }
 
+    /// Attach an opaque, caller-supplied correlation id for joining this build's metric events to
+    /// the caller's own request or operation id. An empty id is treated as unset. When unset,
+    /// behavior is unchanged.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
     // ============================================================================
     // Terminal: build the Snapshot
     // ============================================================================
@@ -199,7 +214,7 @@ impl SnapshotBuilder {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some()),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or("")),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
@@ -220,11 +235,13 @@ impl SnapshotBuilder {
             max_catalog_version,
             incremental_replay,
             operation_id,
+            correlation_id,
         } = self;
 
         let metric_context = SnapshotLoadMetricContext {
             operation_id,
             is_catalog_managed: max_catalog_version.is_some(),
+            correlation_id,
         };
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
@@ -244,7 +261,7 @@ impl SnapshotBuilder {
                     table_url.join("_delta_log/")?,
                     log_tail,
                     effective_version,
-                    metric_context,
+                    metric_context.clone(),
                 )?;
                 Snapshot::try_new_from_log_segment(
                     table_url,
@@ -730,6 +747,56 @@ mod tests {
         assert!(
             snap_duration >= segment_duration,
             "SnapshotBuildSuccess.duration ({snap_duration:?}) should be >= LogSegmentLoadSuccess.duration ({segment_duration:?})"
+        );
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::with_id(Some("req-abc-123"))]
+    #[case::without_id(None)]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_build_and_child_events_carry_correlation_id(
+        #[case] correlation_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        let (reporter, _guard) = measuring_reporter();
+        let mut builder = SnapshotBuilder::new_for(table_root);
+        if let Some(id) = correlation_id {
+            builder = builder.with_correlation_id(id);
+        }
+        builder.build(engine.as_ref())?;
+
+        // The build event and its snapshot-load child events must all carry the id, since they
+        // ride the same SnapshotLoadMetricContext.
+        let events = reporter.events();
+        let id_of = |pick: fn(&MetricEvent) -> Option<&Option<Arc<str>>>| {
+            events
+                .iter()
+                .find_map(pick)
+                .expect("expected event")
+                .as_deref()
+                .map(str::to_string)
+        };
+        let build_id = id_of(|e| match e {
+            MetricEvent::SnapshotBuildSuccess(s) => Some(&s.correlation_id),
+            _ => None,
+        });
+        let segment_id = id_of(|e| match e {
+            MetricEvent::LogSegmentLoadSuccess(s) => Some(&s.correlation_id),
+            _ => None,
+        });
+        let metadata_id = id_of(|e| match e {
+            MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(&s.correlation_id),
+            _ => None,
+        });
+        let expected = correlation_id.map(str::to_string);
+        assert_eq!(build_id, expected);
+        assert_eq!(segment_id, expected, "log-segment child must carry the id");
+        assert_eq!(
+            metadata_id, expected,
+            "protocol/metadata child must carry the id"
         );
         Ok(())
     }

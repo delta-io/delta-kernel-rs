@@ -174,7 +174,7 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id), skip(engine))]
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,

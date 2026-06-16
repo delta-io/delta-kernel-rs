@@ -494,6 +494,73 @@ mod tests {
         Ok(())
     }
 
+    /// A caller-supplied correlation id reaches both the sequential and parallel phase
+    /// `ScanMetadataCompleted` events. The sequential event is emitted before any serialization so
+    /// it always carries the id. The parallel event carries it in-memory but loses it when
+    /// `ParallelState` is rebuilt from bytes, a documented limitation shared with `operation_id`
+    /// (tracked in #2736). Workers are driven inline (not on spawned threads) so every emission
+    /// stays on the thread holding the metrics reporter guard.
+    #[rstest::rstest]
+    #[case::in_memory(false, Some("scan-corr-xyz"))]
+    #[case::across_serde_boundary(true, None)]
+    fn parallel_scan_metadata_phases_carry_correlation_id(
+        #[case] with_serde: bool,
+        #[case] expected_parallel: Option<&str>,
+    ) -> DeltaResult<()> {
+        // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let scan = snapshot
+            .scan_builder()
+            .with_correlation_id("scan-corr-xyz")
+            .build()?;
+        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+        for sm in sequential.by_ref() {
+            sm?;
+        }
+        let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
+            panic!("table with sidecars should require a parallel phase");
+        };
+        let state = if with_serde {
+            Arc::new(ParallelState::from_bytes(
+                engine.as_ref(),
+                &state.into_bytes()?,
+            )?)
+        } else {
+            Arc::new(*state)
+        };
+        let mut parallel = ParallelScanMetadata::try_new(engine.clone(), state.clone(), files)?;
+        for sm in parallel.by_ref() {
+            sm?;
+        }
+        state.log_metrics();
+
+        let correlation_for = |phase: ScanType| {
+            reporter.events().into_iter().find_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted(s) if s.scan_type == phase => {
+                    Some(s.correlation_id)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            correlation_for(ScanType::SequentialPhase)
+                .expect("expected a sequential-phase event")
+                .as_deref(),
+            Some("scan-corr-xyz"),
+        );
+        assert_eq!(
+            correlation_for(ScanType::ParallelPhase)
+                .expect("expected a parallel-phase event")
+                .as_deref(),
+            expected_parallel,
+        );
+        Ok(())
+    }
+
     /// Extract a metric value from logs by searching for "metric_name=value"
     fn extract_metric(logs: &str, metric_name: &str) -> u64 {
         let Some(pos) = logs.find(&format!("{}=", metric_name)) else {

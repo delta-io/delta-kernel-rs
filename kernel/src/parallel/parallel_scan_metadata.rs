@@ -35,16 +35,22 @@ pub enum AfterSequentialScanMetadata {
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
     operation_id: MetricId,
+    /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
+    correlation_id: Option<Arc<str>>,
     start: Instant,
     span: Span,
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
+    pub(crate) fn new(
+        sequential: SequentialPhase<ScanLogReplayProcessor>,
+        correlation_id: Option<Arc<str>>,
+    ) -> Self {
         let operation_id = MetricId::new();
         Self {
             sequential,
             operation_id,
+            correlation_id,
             start: Instant::now(),
             // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
             // phases
@@ -59,6 +65,7 @@ impl SequentialScanMetadata {
                 let event = processor.get_metrics().to_event(
                     self.operation_id,
                     processor.is_catalog_managed(),
+                    self.correlation_id,
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -72,6 +79,7 @@ impl SequentialScanMetadata {
                 let event = processor.get_metrics().to_event(
                     self.operation_id,
                     processor.is_catalog_managed(),
+                    self.correlation_id.clone(),
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -85,6 +93,7 @@ impl SequentialScanMetadata {
                     state: Box::new(ParallelState {
                         inner: processor,
                         operation_id: self.operation_id,
+                        correlation_id: self.correlation_id,
                         parallel_start: Instant::now(),
                     }),
                     files,
@@ -111,6 +120,10 @@ pub struct ParallelState {
     inner: ScanLogReplayProcessor,
     /// Operation ID inherited from the sequential phase for event correlation.
     operation_id: MetricId,
+    /// Opaque, caller-supplied correlation id inherited from the sequential phase. Does not
+    /// survive the serialization boundary; a reconstructed state carries `None` (tracked in
+    /// #2736).
+    correlation_id: Option<Arc<str>>,
     /// Start time for the parallel phase, set when this state is created.
     parallel_start: Instant,
 }
@@ -148,6 +161,7 @@ impl ParallelState {
         let event = self.inner.get_metrics().to_event(
             self.operation_id,
             self.inner.is_catalog_managed(),
+            self.correlation_id.clone(),
             ScanType::ParallelPhase,
             self.parallel_start.elapsed(),
         );
@@ -192,7 +206,10 @@ impl ParallelState {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
         Ok(Self {
             inner,
+            // Neither operation_id nor correlation_id survive the serialization boundary today; a
+            // reconstructed state starts a fresh operation_id and has no correlation_id (#2736).
             operation_id: MetricId::new(),
+            correlation_id: None,
             parallel_start: Instant::now(),
         })
     }
