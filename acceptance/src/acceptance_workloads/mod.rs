@@ -80,7 +80,7 @@ pub mod workload;
 
 use std::path::{Path, PathBuf};
 
-use delta_kernel_benchmarks::models::{Spec, TableInfo};
+use delta_kernel_workloads::models::{Spec, TableInfo};
 use url::Url;
 
 /// A fully resolved test case ready for execution.
