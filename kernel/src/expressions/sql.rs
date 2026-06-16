@@ -56,11 +56,8 @@ pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expressi
 /// resulting [`Scalar`] in an [`Expression`]. Errors on a non-primitive `data_type` (only `NULL`,
 /// handled in [`parse_sql`], is valid for complex types).
 ///
-/// Each primitive's accepted grammar is documented on its parser (e.g. [`parse_date_literal`],
-/// [`parse_timestamp_ltz_literal`]); the bare numeric/boolean forms parse directly through
-/// [`parse_double_or_float`] (Float/Double) or `parse_scalar` (everything else). Typed-literal
-/// keywords (`DATE`, `TIMESTAMP`, `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, `X`) and `TRUE`/`FALSE` are
-/// case-insensitive.
+/// Typed-literal keywords (`DATE`, `TIMESTAMP`, `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, `X`) and
+/// `TRUE`/`FALSE` are case-insensitive.
 fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<Expression> {
     let DataType::Primitive(primitive) = data_type else {
         return Err(Error::generic(format!(
@@ -96,16 +93,21 @@ fn parse_binary_literal(trimmed: &str) -> DeltaResult<Scalar> {
     Ok(Scalar::Binary(decode_binary_literal(trimmed)?))
 }
 
-/// Parse a `Scalar::Date` from `'2024-01-01'`, `DATE '2024-01-01'`, or `DATE'2024-01-01'` (the
-/// keyword is optional and may touch the quote).
+/// Parse a `Scalar::Date` from a trimmed string.
+///
+/// Supported formats include `'2024-01-01'`, `DATE '2024-01-01'`, or `DATE'2024-01-01'`. The
+/// `DATE` keyword is optional and may have 0 or more whitespace before the apostrophe.
 fn parse_date_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
     let raw = unwrap_quoted_body(trimmed, &["DATE"], &PrimitiveType::Date, sql)?;
     PrimitiveType::Date.parse_scalar(&raw)
 }
 
-/// Parse a zoneless (wall-clock) `Scalar::TimestampNtz` from `'2024-01-01 12:00:00[.fff]'` or
-/// `TIMESTAMP_NTZ '...'`. Carrying no zone, it needs no UTC guard; only the keyword is stripped,
-/// and it must be `TIMESTAMP_NTZ` (not bare `TIMESTAMP`, which is LTZ).
+/// Parse a zoneless (wall-clock) `Scalar::TimestampNtz` from a trimmed string.
+///
+/// Supported formats include `'2024-01-01 12:00:00[.fff]'` or `TIMESTAMP_NTZ '2024-01-01
+/// 12:00:00'`. The `TIMESTAMP_NTZ` keyword is optional and may have 0 or more whitespace before the
+/// apostrophe; it must be `TIMESTAMP_NTZ`, not bare `TIMESTAMP` (which is LTZ). Carrying no zone,
+/// it needs no UTC guard.
 fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
     let raw = unwrap_quoted_body(
         trimmed,
@@ -116,11 +118,14 @@ fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> 
     PrimitiveType::TimestampNtz.parse_scalar(&raw)
 }
 
-/// Parse a `Scalar::Timestamp` (local-time-zone) in ISO 8601 / RFC 3339 form with an explicit UTC
-/// `Z` suffix, e.g. `'1970-01-01T00:00:00.123Z'`, `TIMESTAMP '...Z'`, or `TIMESTAMP_LTZ '...Z'`.
-/// Only the LTZ keywords are accepted: a mismatched keyword (e.g. an NTZ literal on an LTZ column)
-/// carries different timezone semantics and must not be reused. `TIMESTAMP_LTZ` is an explicit
-/// spelling of LTZ (== bare `TIMESTAMP`); both route through [`require_utc_z_suffix`].
+/// Parse a `Scalar::Timestamp` (local-time-zone) from a trimmed string in ISO 8601 / RFC 3339 form
+/// with an explicit UTC `Z` suffix.
+///
+/// Supported formats include `'1970-01-01T00:00:00.123Z'`, `TIMESTAMP '...Z'`, or
+/// `TIMESTAMP_LTZ '...Z'`. The keyword is optional and may have 0 or more whitespace before the
+/// apostrophe. Only the LTZ keywords are accepted: a mismatched keyword (e.g. an NTZ literal on an
+/// LTZ column) carries different timezone semantics and must not be reused. `TIMESTAMP_LTZ` is an
+/// explicit spelling of LTZ (== bare `TIMESTAMP`); both route through [`require_utc_z_suffix`].
 fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
     let raw = unwrap_quoted_body(
         trimmed,
@@ -132,13 +137,12 @@ fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> 
     PrimitiveType::Timestamp.parse_scalar(&raw)
 }
 
-/// Strip the typed-literal envelope and return the inner literal value, ready for `parse_scalar`:
-/// the unquoted, trimmed body with no surrounding quotes, e.g. `DATE '2024-01-01'` -> `2024-01-01`
-/// (not `'2024-01-01'`). The keyword is removed by [`strip_typed_prefix_and_unquote`], then the
-/// body is trimmed to match Spark's `stringToDate`/`stringToTimestamp` (e.g. `DATE ' 2024-01-01 '`
-/// -> `2024-01-01`). An empty body is rejected: `parse_scalar` maps empty input to NULL
-/// (partition-value convention), but an empty quoted body like `DATE ''` is invalid SQL, not NULL
-/// (`NULL` is accepted only as a bare keyword, handled in [`parse_sql`]).
+/// Strip the typed-literal keyword prefix, if any, and return the inner literal value, unquoted and
+/// trimmed: `DATE '2024-01-01'` and `DATE ' 2024-01-01 '` both return `2024-01-01`.
+///
+/// An empty body is rejected: `parse_scalar` maps empty input to NULL (partition-value convention),
+/// but an empty quoted body like `DATE ''` is invalid SQL, not NULL (`NULL` is accepted only as a
+/// bare keyword, handled in [`parse_sql`]).
 fn unwrap_quoted_body(
     trimmed: &str,
     keywords: &[&str],
@@ -146,6 +150,7 @@ fn unwrap_quoted_body(
     sql: &str,
 ) -> DeltaResult<String> {
     let body = strip_typed_prefix_and_unquote(trimmed, keywords)?;
+    // Trim the inner body to match Spark's `stringToDate`/ `stringToTimestamp`.
     let body = body.trim();
     if body.is_empty() {
         return Err(Error::generic(format!(
@@ -223,11 +228,12 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Del
 }
 
 /// Whether a bare non-exponent numeric literal exceeds Spark's DECIMAL precision cap of 38 and so
-/// would be rejected by Spark's parser. The effective precision is `max(significant_digits,
-/// scale)`, where `significant_digits` excludes only leading zeros (matching
-/// `java.math.BigDecimal.precision`, so embedded and trailing zeros count) and `scale` is the
-/// fractional digit count. Callers must exclude exponent forms, which Spark types as DOUBLE (no
-/// precision cap).
+/// would be rejected by Spark's parser.
+///
+/// The effective precision is `max(significant_digits, scale)`, where `significant_digits`
+/// excludes only leading zeros (matching `java.math.BigDecimal.precision`, so embedded and
+/// trailing zeros count) and `scale` is the fractional digit count. Callers must exclude exponent
+/// forms, which Spark types as DOUBLE (no precision cap).
 fn exceeds_decimal_precision(raw: &str) -> bool {
     let unsigned = raw.strip_prefix(['+', '-']).unwrap_or(raw);
     let scale = match unsigned.split_once('.') {
@@ -286,6 +292,9 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
 /// quotes: `DATE '2024-01-01'`, `DATE'2024-01-01'`, and bare `'2024-01-01'` all return
 /// `2024-01-01`. Any of `keywords` may appear as the prefix (case-insensitive), separated from
 /// the quote by optional whitespace.
+///
+/// Unlike [`unwrap_quoted_body`], the inner body is returned verbatim, not trimmed: `DATE
+/// ' 2024-01-01 '` returns ` 2024-01-01 ` (interior whitespace preserved).
 fn strip_typed_prefix_and_unquote(input: &str, keywords: &[&str]) -> DeltaResult<String> {
     // Match a keyword only as a complete token: it must be followed by the opening quote or
     // whitespace, never more identifier characters (so `DATEX '..'` is not read as `DATE`).
