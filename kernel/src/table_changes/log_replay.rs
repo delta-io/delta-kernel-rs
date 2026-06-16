@@ -94,9 +94,8 @@ pub(crate) fn table_changes_action_iter(
                 stats_expr,
                 None, // no partition columns for table changes (partition_expr unused)
                 column_expr_ref!("partitionValues_parsed"),
-                // Raw action batches keep the nested layout, so Add rows are `add.path IS NOT
-                // NULL`. Remove and cdc rows must never be dropped by data skipping: their
-                // change events would silently vanish from the feed.
+                // Raw action batches keep the nested layout, so Add rows are
+                // `add.path IS NOT NULL`.
                 Arc::new(Predicate::is_not_null(column_expr!("add.path")).into()),
                 get_log_add_schema().clone(),
                 &physical_stats_columns,
