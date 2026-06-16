@@ -25,7 +25,7 @@ use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{may_begin_listable_log_path, LogPathFileType, ParsedLogPath};
 use crate::{DeltaResult, Error, StorageHandler, Version};
 
 #[cfg(test)]
@@ -59,7 +59,9 @@ pub(crate) struct LogSegmentFiles {
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
 /// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
-/// files (e.g. staged commits, dot-prefixed files), and stopping at `end_version`.
+/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
+/// underlying listing at the first path past the version-named region, so directories like
+/// `_staged_commits/` and `_sidecars/` are never paged through.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
@@ -71,8 +73,22 @@ pub(crate) fn list_from_storage(
     end_version: Version,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let log_root_str = log_root.to_string();
     let files = storage
         .list_from(&start_from)?
+        // The listing is sorted by full path, so nothing relevant follows the first relative path
+        // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
+        // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
+        // A path that doesn't strip the log_root prefix is kept; parsing discards it.
+        // TODO(#2740): push the bound into the listing request itself.
+        .take_while(move |meta_res| match meta_res {
+            Ok(meta) => meta
+                .location
+                .as_str()
+                .strip_prefix(&log_root_str)
+                .is_none_or(may_begin_listable_log_path),
+            Err(_) => true,
+        })
         .map(|meta| ParsedLogPath::try_from(meta?))
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel

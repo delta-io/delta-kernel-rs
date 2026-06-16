@@ -42,6 +42,7 @@ use crate::schema::{
     StructTypeBuilder,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
@@ -142,29 +143,6 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
 
-/// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
-static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
-    let len = fields.len();
-    let insert_position = fields
-        .iter()
-        .position(|f| f.name() == "modificationTime")
-        .unwrap_or(len);
-    fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
-    Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
-});
-
-/// Extend a schema with a statistics column and return a new SchemaRef.
-///
-/// The stats column is of type string as required by the spec.
-///
-/// Note that this method is only useful to extend an Add action schema.
-fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
-    StructTypeBuilder::from_schema(schema)
-        .add_field(StructField::nullable("stats", DataType::STRING))
-        .build_arc_unchecked()
-}
-
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
@@ -231,6 +209,9 @@ pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
     // Correlates all metric events emitted by this transaction.
     operation_id: MetricId,
+    // Opaque, caller-supplied id recorded on this transaction's commit metric events alongside
+    // `operation_id`. Set via `with_correlation_id`; not interpreted by kernel.
+    correlation_id: Option<Arc<str>>,
     // The snapshot this transaction is based on. None for CREATE TABLE (no pre-existing table).
     // Use `read_snapshot()` to access; it returns an error if None.
     read_snapshot_opt: Option<SnapshotRef>,
@@ -297,34 +278,50 @@ impl<S> std::fmt::Debug for Transaction<S> {
     }
 }
 
-/// Transforms add file metadata into commit-ready add actions by converting stats to JSON
-/// and setting the `dataChange` field.
+/// Builds the projection for converting add file metadata into commit-ready Add actions.
+fn build_add_action_projection(
+    input_schema: &StructType,
+    data_change: bool,
+) -> DeltaResult<(SchemaRef, Expression)> {
+    let (output_schema, patch) = ProjectionStructPatchBuilder::new(input_schema)
+        .insert_after(
+            "modificationTime",
+            DATA_CHANGE_COLUMN.clone(),
+            lit(data_change),
+        )
+        .replace(
+            "stats",
+            StructField::nullable("stats", DataType::STRING),
+            Expression::unary(ToJson, col!("stats")),
+        )
+        .build()?;
+    let patch = Expression::struct_from([patch]);
+    Ok((output_schema, patch))
+}
+
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
+/// setting the `dataChange` field.
 fn build_add_actions<'a, I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
     input_schema: SchemaRef,
-    output_schema: SchemaRef,
     data_change: bool,
-) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
+) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a>
 where
     I: Iterator<Item = DeltaResult<T>> + Send + 'a,
     T: Deref<Target = dyn EngineData> + Send + 'a,
 {
     let evaluation_handler = engine.evaluation_handler();
-    add_files_metadata.map(move |add_files_batch| {
-        let patch_expr = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new()
-                .insert_after("modificationTime", lit(data_change))
-                .replace("stats", Expression::unary(ToJson, col!("stats"))),
-        )?;
-        let adds_expr = Expression::struct_from([patch_expr]);
+    let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
+    let adds_expr = Arc::new(adds_expr);
+    Ok(add_files_metadata.map(move |add_files_batch| {
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
-            Arc::new(adds_expr),
+            adds_expr.clone(),
             as_log_add_schema(output_schema.clone()).into(),
         )?;
         adds_evaluator.evaluate(add_files_batch?.deref())
-    })
+    }))
 }
 
 // =============================================================================
@@ -343,6 +340,8 @@ impl<S> Transaction<S> {
         fields(
             report,
             operation_id = %self.operation_id,
+            is_catalog_managed = self.effective_table_config.is_catalog_managed(),
+            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
             commit_version = self.get_commit_version(),
             num_add_files,
             num_remove_files,
@@ -604,6 +603,14 @@ impl<S> Transaction<S> {
     /// Set the engine info field of this transaction's commit info action. This field is optional.
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining this transaction's commit
+    /// metric events to the caller's own request or operation id. An empty id is treated as unset.
+    /// When unset, behavior is unchanged.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
 
@@ -1138,7 +1145,7 @@ impl<S> Transaction<S> {
                     .iter()
                     .map(|col| {
                         let data_type = physical_schema
-                            .walk_column_fields(col)?
+                            .fields_of_path(col)?
                             .last()
                             .map(|field| field.data_type().clone())
                             .ok_or_else(|| {
@@ -1190,9 +1197,8 @@ impl<S> Transaction<S> {
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
                 self.add_files_schema().clone(),
-                with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
                 self.data_change,
-            );
+            )?;
             Ok((Box::new(add_actions), None))
         }
     }
@@ -1258,9 +1264,8 @@ impl<S> Transaction<S> {
             engine,
             extended_add_files,
             with_row_tracking_cols(self.add_files_schema())?,
-            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()))?,
             self.data_change,
-        );
+        )?;
 
         // Generate a row tracking domain metadata based on the final high water mark
         let row_tracking_domain_metadata: RowTrackingDomainMetadata =
@@ -1677,7 +1682,7 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
-    use crate::metrics::MetricEvent;
+    use crate::metrics::{MetricEvent, TableType, TransactionCommitFailure};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -1894,6 +1899,47 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::base(false)]
+    #[case::row_tracking(true)]
+    fn test_add_action_projection_schema(#[case] row_tracking: bool) -> DeltaResult<()> {
+        let input_schema = if row_tracking {
+            with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?
+        } else {
+            BASE_ADD_FILES_SCHEMA.clone()
+        };
+        let (schema, _) = build_add_action_projection(input_schema.as_ref(), true)?;
+        let field_names: Vec<_> = schema.fields().map(|f| f.name().as_str()).collect();
+        let expected_field_names = if row_tracking {
+            vec![
+                "path",
+                "partitionValues",
+                "size",
+                "modificationTime",
+                "dataChange",
+                "stats",
+                "baseRowId",
+                "defaultRowCommitVersion",
+            ]
+        } else {
+            vec![
+                "path",
+                "partitionValues",
+                "size",
+                "modificationTime",
+                "dataChange",
+                "stats",
+            ]
+        };
+        assert_eq!(field_names, expected_field_names);
+        assert_eq!(schema.field("dataChange"), Some(&*DATA_CHANGE_COLUMN));
+        assert_eq!(
+            schema.field("stats").unwrap().data_type(),
+            &DataType::STRING
+        );
         Ok(())
     }
 
@@ -3052,9 +3098,9 @@ mod tests {
 
     // ===== Commit failure-metric tests =====
 
-    fn commit_failure_reason(reporter: &CapturingReporter) -> Option<CommitFailureReason> {
+    fn commit_failure_event(reporter: &CapturingReporter) -> Option<TransactionCommitFailure> {
         reporter.events().into_iter().find_map(|event| match event {
-            MetricEvent::TransactionCommitFailure(f) => Some(f.reason),
+            MetricEvent::TransactionCommitFailure(f) => Some(f),
             _ => None,
         })
     }
@@ -3068,10 +3114,9 @@ mod tests {
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(matches!(result, CommitResult::RetryableTransaction(_)));
-        assert_eq!(
-            commit_failure_reason(&reporter),
-            Some(CommitFailureReason::RetryableIo)
-        );
+        let failure = commit_failure_event(&reporter).expect("commit failure event");
+        assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
+        assert_eq!(failure.table_type, TableType::PathBased);
         Ok(())
     }
 
@@ -3083,10 +3128,9 @@ mod tests {
         let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         assert!(txn.commit(engine.as_ref()).is_err());
-        assert_eq!(
-            commit_failure_reason(&reporter),
-            Some(CommitFailureReason::Error)
-        );
+        let failure = commit_failure_event(&reporter).expect("commit failure event");
+        assert_eq!(failure.reason, CommitFailureReason::Error);
+        assert_eq!(failure.table_type, TableType::PathBased);
         Ok(())
     }
 }

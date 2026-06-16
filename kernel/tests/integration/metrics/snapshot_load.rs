@@ -234,28 +234,34 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
 }
 
 // ============================================================================
-// Scenario 6: CRC at a prior version (CRC exists but is older than latest)
+// Scenario 6: CRC older than the latest version
 // ============================================================================
 // TODO: migrate to TestTableBuilder when CRC LogState variants land (#2284)
 
-/// When a CRC file exists at an older version than the snapshot, the kernel advances it to the
-/// target version via reverse-replay: it reads the tail commits (those after the CRC version)
-/// once and reads the base CRC from storage. P&M come from the advanced CRC, so there is no
-/// separate P&M scan.
+/// A CRC older than the snapshot version: kernel roots Protocol & Metadata at the CRC and reads
+/// only the commits above it (plus the CRC), never the first commit. Both modes:
+/// - `Disabled` (default): the tail is replayed for P&M, falling back to the CRC's P&M; the stale
+///   CRC is not advanced, so the snapshot stores no CRC.
+/// - `Unlimited`: the same tail is reverse-replayed to advance the CRC to the target version, which
+///   the snapshot stores.
 ///
-/// This is a normal, expected table state -- having a CRC from a previous version is
-/// not an error or degraded condition.
+/// Reading only the tail (not the first commit) is the regression guard: a full-log replay under
+/// `Disabled` would read v0 too.
 ///
-/// `write_checksum` requires stats from a post-commit snapshot (not a freshly built
-/// one), so this test uses `create_table` commit -> `post_commit_snapshot` ->
-/// `write_checksum` to write the CRC at v0.
+/// `write_checksum` needs stats from a post-commit snapshot, so this uses `create_table` ->
+/// `post_commit_snapshot` -> `write_checksum` to write the CRC at v0.
+#[rstest]
+#[case::disabled(IncrementalReplay::Disabled, None)]
+#[case::unlimited(IncrementalReplay::Unlimited, Some(2))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crc_at_prior_version_advances_via_reverse_replay() -> DeltaResult<()> {
+async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
+    #[case] mode: IncrementalReplay,
+    #[case] expected_crc_version: Option<u64>,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    // commit 0: create table; write CRC from the post-commit snapshot.
-    // `write_checksum` requires an in-memory CRC computed during the transaction.
+    // commit 0: create table, then write its CRC (write_checksum needs the post-commit CRC).
     let create_committed = create_table(&table_path, simple_schema(), "Test/1.0")
         .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(setup_engine.as_ref())?
@@ -285,18 +291,18 @@ async fn crc_at_prior_version_advances_via_reverse_replay() -> DeltaResult<()> {
             .clone();
     }
 
-    // Measurement: build snapshot at latest (v2); CRC is at v0 (two versions behind)
+    // Measurement: build the snapshot at latest (v2); the CRC is at v0, two versions behind.
     let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let snap = Snapshot::builder_for(table_url)
-        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .with_incremental_crc_replay(mode)
         .build(&measure_engine)?;
-    assert_eq!(snap.crc().expect("stale CRC advanced to v2").version, 2);
+    assert_eq!(snap.crc().map(|c| c.version), expected_crc_version);
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
     assert_eq!(reporter.log_segment_loads.get(), 1);
     assert_eq!(reporter.commit_files.get(), 3); // v0, v1, v2
 
-    // Reverse-replay reads the tail commits v1 and v2 (after the CRC at v0) in one JSON call.
+    // Only the tail commits v1 and v2 (after the CRC at v0) are read, in one JSON call.
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 2);
     // The base CRC at v0 is read from storage.

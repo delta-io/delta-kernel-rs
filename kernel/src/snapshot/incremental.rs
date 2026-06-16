@@ -10,7 +10,7 @@ use tracing::instrument;
 use super::{IncrementalReplay, Snapshot};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::MetricId;
+use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -53,8 +53,9 @@ impl Snapshot {
     /// Case F:     C1 .. S1 ====== S2              [C1+1, S2]   (S1, S2]   incremental update
     /// ```
     ///
-    /// In the incremental cases (D.2, F), the existing snapshot's P+M at `S1` is the baseline
-    /// and only commits in `(S1, S2]` are replayed.
+    /// In the incremental cases (D.2, F), the existing snapshot's P+M at `S1` is the baseline, and
+    /// only commits in `(S1, S2]` are replayed for newer P+M on top of it. A base CRC newer than
+    /// `S1`, when present, serves as the baseline instead.
     ///
     /// - **A.** `T == S1`: return the existing snapshot unchanged.
     /// - **B.** `T < S1`: error. The incremental path only moves forward.
@@ -81,13 +82,13 @@ impl Snapshot {
     ///
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
-    #[instrument(err, fields(version, operation_id = %operation_id), skip(engine, target_version))]
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, target_version))]
     pub(super) fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         target_version: impl Into<Option<Version>>,
-        operation_id: MetricId,
+        metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Arc<Self>> {
         let existing_log_segment = &existing_snapshot.log_segment;
@@ -180,7 +181,7 @@ impl Snapshot {
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
                     engine,
-                    operation_id,
+                    metric_context,
                     incremental_replay,
                 );
                 return Ok(Arc::new(snapshot?));
@@ -294,14 +295,15 @@ impl Snapshot {
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
         // `incremental_replay`.
-        let crc = combined_log_segment.try_build_incremental_crc_with_base(
+        let base_crc = combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.crc());
+        let crc_at_version = combined_log_segment.try_build_crc_within_budget(
             engine,
-            existing_snapshot.crc(),
+            base_crc.as_ref(),
             incremental_replay,
         )?;
 
         let existing_table_config = existing_snapshot.table_configuration();
-        let (new_metadata, new_protocol) = match &crc {
+        let (new_metadata, new_protocol) = match &crc_at_version {
             Some(crc) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
                 // creation.
@@ -313,10 +315,15 @@ impl Snapshot {
             }
             None => {
                 // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
-                // scanned any log files). Perform normal P & M replay.
+                // scanned any log files). Replay the new commits `(existing_snapshot_version, end]`
+                // for P&M, rooted at the base CRC when it is newer than the existing snapshot
+                // (else the existing snapshot is the baseline).
+                let newer_base = base_crc
+                    .as_ref()
+                    .filter(|c| c.version > existing_snapshot_version);
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine)?
+                    .read_protocol_metadata_opt(engine, newer_base)?
             }
         };
         let table_configuration = TableConfiguration::try_new_from(
@@ -330,7 +337,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
-            crc,
+            crc_at_version,
         )?))
     }
 
@@ -543,7 +550,7 @@ mod tests {
             vec![],
             &engine,
             None,
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         )?;
         assert_eq!(result, base_snapshot);
@@ -620,7 +627,7 @@ mod tests {
             log_tail,
             &engine,
             Some(2),
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         )?;
 
@@ -678,7 +685,7 @@ mod tests {
             vec![],
             &engine,
             Some(1),
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
@@ -689,7 +696,7 @@ mod tests {
             vec![],
             &engine,
             Some(0),
-            MetricId::default(),
+            SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
         );
         assert!(matches!(

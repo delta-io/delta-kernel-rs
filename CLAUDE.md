@@ -51,6 +51,7 @@ cargo +nightly fmt \
 | Crate                                    | Directory                                  | Description                                             |
 |------------------------------------------|--------------------------------------------|---------------------------------------------------------|
 | `delta_kernel`                           | `kernel/`                                  | Core library                                            |
+| `delta_kernel_default_engine`            | `default-engine/`                          | Default Arrow/Tokio `Engine` implementation             |
 | `delta_kernel_ffi`                       | `ffi/`                                     | C/C++ FFI bindings                                      |
 | `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
 | `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
@@ -64,11 +65,12 @@ cargo +nightly fmt \
 
 Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list):
 
-- `default-engine-rustls` / `default-engine-native-tls` -- async Arrow/Tokio engine (pick a TLS backend)
+- TLS backend selection (`rustls` / `native-tls`) lives on the `delta_kernel_default_engine`
+  crate, not on kernel itself.
 - `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
   but the default engine does.
-- `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
+- `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
 - `column-defaults-in-dev` -- column defaults write support (experimental, in development).

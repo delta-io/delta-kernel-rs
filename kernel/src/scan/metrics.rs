@@ -1,11 +1,12 @@
 //! Metrics for scan log replay operations.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::info;
 
-use crate::metrics::{MetricId, ScanMetadataCompleted, ScanType};
+use crate::metrics::{MetricId, ScanMetadataCompleted, ScanType, TableType};
 
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
@@ -110,11 +111,15 @@ impl ScanMetrics {
     pub(crate) fn to_event(
         &self,
         operation_id: MetricId,
+        is_catalog_managed: bool,
+        correlation_id: Option<Arc<str>>,
         scan_type: ScanType,
         duration: Duration,
     ) -> ScanMetadataCompleted {
         ScanMetadataCompleted {
             operation_id,
+            table_type: TableType::from_catalog_managed(is_catalog_managed),
+            correlation_id,
             scan_type,
             duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),

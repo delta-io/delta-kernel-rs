@@ -35,4 +35,5 @@ delta_kernel = { path = "../kernel", features = ["default-engine-base", "test-ut
 delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"] }
 unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client", features = ["test-utils"] }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
+test_utils = { path = "../test-utils" }
 tempfile = "3"

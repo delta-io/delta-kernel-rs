@@ -88,8 +88,9 @@ pub use events::{
     DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
     MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
     ProtocolMetadataLoadSuccess, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
-    SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted,
-    StorageReadCompleted, TransactionCommitFailure, TransactionCommitSuccess,
+    SnapshotBuildFailure, SnapshotBuildSuccess, SnapshotLoadMetricContext, StorageCopyCompleted,
+    StorageListCompleted, StorageReadCompleted, TableType, TransactionCommitFailure,
+    TransactionCommitSuccess,
 };
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_json::MeteredJsonHandler;

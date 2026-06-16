@@ -23,7 +23,7 @@ use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
-use crate::metrics::MetricId;
+use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -170,23 +170,36 @@ impl Snapshot {
         })
     }
 
-    /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`], taking Protocol and
-    /// Metadata from the resolved CRC when one is present.
-    #[instrument(err, fields(version, operation_id = %operation_id), skip(engine))]
+    /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
+    /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
+    /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
+    /// replay when no CRC is present.
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
-        operation_id: MetricId,
+        metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Self> {
-        let crc = log_segment.try_build_incremental_crc(engine, incremental_replay)?;
+        // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
+        //         (or use it as-is when already there) per `incremental_replay`.
+        let base_crc = log_segment.read_latest_crc(engine);
+        let crc_at_version = log_segment.try_build_crc_within_budget(
+            engine,
+            base_crc.as_ref(),
+            incremental_replay,
+        )?;
 
+        // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
+        //         first commit.
         // TODO(#2677): emit an `IncrementalCrcLoad` metric on the CRC branch; the
         //              `ProtocolMetadataLoaded` span only fires on the replay branch below.
-        let (metadata, protocol) = match crc.as_deref() {
+        let (metadata, protocol) = match crc_at_version.as_deref() {
             Some(c) => (c.metadata.clone(), c.protocol.clone()),
-            None => log_segment.read_protocol_metadata(engine, operation_id)?,
+            None => {
+                log_segment.read_protocol_metadata(engine, base_crc.as_ref(), metric_context)?
+            }
         };
 
         let table_configuration =
@@ -194,7 +207,7 @@ impl Snapshot {
 
         tracing::Span::current().record("version", table_configuration.version());
 
-        Self::new_with_crc(log_segment, table_configuration, crc)
+        Self::new_with_crc(log_segment, table_configuration, crc_at_version)
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -788,8 +801,11 @@ impl Snapshot {
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
     /// and the overall checkpoint process.
-    pub fn create_checkpoint_writer(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
-        CheckpointWriter::try_new(self)
+    pub fn create_checkpoint_writer(
+        self: Arc<Self>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<CheckpointWriter> {
+        CheckpointWriter::try_new(self, engine)
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -976,7 +992,7 @@ impl Snapshot {
             _ => {}
         }
 
-        let writer = Arc::clone(self).create_checkpoint_writer()?;
+        let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
