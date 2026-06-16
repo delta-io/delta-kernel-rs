@@ -1598,6 +1598,19 @@ mod tests {
     }
 
     #[rstest]
+    #[case::conflict(CommitFailureReason::Conflict, "conflict")]
+    #[case::retryable_io(CommitFailureReason::RetryableIo, "retryable_io")]
+    #[case::error(CommitFailureReason::Error, "error")]
+    fn commit_failure_reason_serializes_to_wire_name_and_parses_back(
+        #[case] reason: CommitFailureReason,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = reason.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(CommitFailureReason::from_str(wire).unwrap(), reason);
+    }
+
+    #[rstest]
     #[case::sequential(ScanType::SequentialPhase, "sequential")]
     #[case::parallel(ScanType::ParallelPhase, "parallel")]
     #[case::full(ScanType::Full, "full")]
