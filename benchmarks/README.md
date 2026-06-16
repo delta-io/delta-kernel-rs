@@ -109,6 +109,10 @@ so the bench job itself runs with a read-only token even on fork PRs. To bench a
 override the tags or filter, post a `/bench` comment as documented below -- it updates the
 same comment that the auto-trigger uses.
 
+The bench job fails if any benchmark is at least 15% slower than the base branch. The result
+comment is still posted so you can see which benchmark regressed. To merge anyway (for an
+expected or noise-driven regression), add the `ignore-benchmark-failure` label to the PR.
+
 To trigger benchmarks on a pull request manually, post a comment using the following syntax:
 
 ```
