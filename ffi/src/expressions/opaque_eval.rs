@@ -22,10 +22,10 @@ use crate::KernelStringSlice;
 
 /// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
-/// Kernel pre-evaluates the predicate's args into a `RecordBatch` (one field per arg) and exports
-/// it across the Arrow C Data Interface; ownership of the inner `FFI_ArrowArray`/`FFI_ArrowSchema`
-/// transfers to the engine, which imports them and invokes their release callbacks. The batch's
-/// columns line up with the predicate's args by position:
+/// Kernel pre-evaluates the predicate's args into a `RecordBatch` (one field per arg) and passes it
+/// by value as `args_in` (an `ArrowFFIData`); the engine owns it and must release both Arrow C Data
+/// Interface handles on every path (including `Failure`/`Uninit`). The batch's columns line up with
+/// the predicate's args by position:
 /// - a `Column` arg arrives as its evaluated values
 /// - a `Literal` arg as the constant repeated for every row
 /// - a `Predicate` arg as a `BooleanArray` of its verdicts
@@ -37,8 +37,7 @@ use crate::KernelStringSlice;
 /// result `BooleanArray` as Arrow C Data Interface structs, transferring their ownership to kernel.
 /// On failure it writes `EngineExecResult::Failure` carrying a `KernelError` code and a message
 /// handle (built via `allocate_kernel_string`); leaving `*out` as `Uninit` is also treated as an
-/// error. On failure the engine may leave `args_in` unconsumed -- kernel releases whatever it did
-/// not import. When `inverted`, evaluate `NOT op`.
+/// error. When `inverted`, evaluate `NOT op`.
 ///
 /// # Safety
 /// `out` is valid only for the duration of the call; the engine must not retain it. The callback
@@ -46,7 +45,7 @@ use crate::KernelStringSlice;
 pub type EngineEvalRowsFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
-    args_in: *mut ArrowFFIData,
+    args_in: ArrowFFIData,
     inverted: bool,
     out: *mut EngineExecResult<ArrowFFIData>,
 );
@@ -70,7 +69,7 @@ pub type EngineEvalRowsFn = unsafe extern "C" fn(
 pub type EngineEvalStatsFn = unsafe extern "C" fn(
     engine_state: *mut c_void,
     op_name: KernelStringSlice,
-    args_in: *mut ArrowFFIData,
+    args_in: ArrowFFIData,
     inverted: bool,
     out: *mut EngineExecResult<ArrowFFIData>,
 );
@@ -159,7 +158,7 @@ pub(crate) mod tests {
     pub(crate) unsafe extern "C" fn noop_eval_pred(
         _state: *mut c_void,
         _op_name: KernelStringSlice,
-        _args_in: *mut ArrowFFIData,
+        _args_in: ArrowFFIData,
         _inverted: bool,
         _out: *mut EngineExecResult<ArrowFFIData>,
     ) {

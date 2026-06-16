@@ -1147,7 +1147,7 @@ mod tests {
         unsafe extern "C" fn stub_eval(
             _: *mut c_void,
             _: KernelStringSlice,
-            _: *mut ArrowFFIData,
+            _: ArrowFFIData,
             _: bool,
             _: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -1248,16 +1248,13 @@ mod tests {
         unsafe extern "C" fn engine_in_range(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _inverted: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             CALLS.fetch_add(1, Ordering::SeqCst);
 
-            let array =
-                std::mem::replace(unsafe { &mut (*args_in).array }, FFI_ArrowArray::empty());
-            let schema =
-                std::mem::replace(unsafe { &mut (*args_in).schema }, FFI_ArrowSchema::empty());
+            let ArrowFFIData { array, schema } = args_in;
             let data = unsafe { from_ffi(array, &schema) }.unwrap();
             let batch: RecordBatch = StructArray::from(data).into();
 
@@ -1404,14 +1401,11 @@ mod tests {
         unsafe extern "C" fn engine_skip_null_bounds(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _inverted: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
-            let array =
-                std::mem::replace(unsafe { &mut (*args_in).array }, FFI_ArrowArray::empty());
-            let schema =
-                std::mem::replace(unsafe { &mut (*args_in).schema }, FFI_ArrowSchema::empty());
+            let ArrowFFIData { array, schema } = args_in;
             let data = unsafe { from_ffi(array, &schema) }.unwrap();
             let batch: RecordBatch = StructArray::from(data).into();
 

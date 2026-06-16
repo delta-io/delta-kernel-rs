@@ -154,6 +154,11 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
 
 /// Lift a column type hint from the first `Literal` arg (kernel-native lifts the same way from
 /// the right-hand `Scalar` in `col < val`). Returns `None` when there's no literal to borrow.
+///
+/// The hint can be wrong: an opaque op's literal need not match the column's type (e.g.
+/// `STR_LEN_GT(5, col("string_field"))` lifts `INTEGER` for a string column). The type only gates
+/// min/max eligibility and the ref resolves to the real column type, so a wrong hint loses min/max
+/// only when that type is itself min/max-ineligible.
 fn pick_column_type_hint(exprs: &[Expression]) -> Option<DataType> {
     exprs.iter().find_map(|e| match e {
         Expression::Literal(scalar) => Some(scalar.data_type()),
@@ -175,9 +180,9 @@ fn rewrite_stat_arg(
     let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
     match arg {
         Expression::Column(col) => {
-            // One typed path for both column kinds: the evaluator returns the exact partition
-            // value for a partition column (ignoring the type) and `minValues`/`maxValues` refs
-            // for a data column. With no sibling literal to supply the type, abstain.
+            // The two column kinds go through the same call: a partition column resolves to its
+            // exact value (the type is ignored), a data column to its min/max refs. The data
+            // case needs the type, so abstain when no sibling literal supplies one.
             let ty = type_hint?;
             let min = evaluator.get_min_stat(col, ty).unwrap_or_else(null_long);
             let max = evaluator.get_max_stat(col, ty).unwrap_or_else(null_long);
@@ -193,8 +198,10 @@ fn rewrite_stat_arg(
     }
 }
 
-/// Build a `StructArray` from a struct expression's children, naming fields positionally
-/// (`f0`, `f1`, ...). Engines index into the struct by position; field names are placeholders.
+/// Materialize a stats-mode struct arg. Its children are the stat references the rewrite produced
+/// (`minValues.<col>`, `maxValues.<col>`, nullcount, rowcount); evaluating them against the stats
+/// batch resolves each to the actual per-file values. The results are packed into a `StructArray`
+/// with positional field names (`f0`, `f1`, ...) since the engine reads the struct by index.
 fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaResult<ArrayRef> {
     let arrays: Vec<ArrayRef> = fields
         .iter()
@@ -257,23 +264,23 @@ fn call_eval_pred(
     inverted: bool,
 ) -> DeltaResult<BooleanArray> {
     let num_rows = args_batch.num_rows();
-    let mut args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
+    let args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
 
-    // Out-pointer convention: kernel owns the result slot on its stack, pre-initialized to Uninit.
-    // The engine writes Success(result) -- transferring ownership of the written Arrow C Data
-    // Interface structs -- or Failure(err) carrying an engine-side error.
+    // The args batch transfers to the engine by value; the engine owns it and must release it (by
+    // importing via `from_ffi`, or otherwise) on every path. The result uses the out-pointer
+    // convention: kernel pre-initializes the slot to Uninit, and the engine writes Success(result)
+    // -- transferring ownership of the written Arrow C Data Interface structs -- or Failure(err).
     let mut result = EngineExecResult::Uninit;
 
-    // SAFETY: callback was supplied by the engine. We pass a writable args slot (the engine takes
-    // ownership of the Arrow FFI handles by moving them out of it) and a writable result slot
-    // valid for the duration of the call.
+    // SAFETY: callback was supplied by the engine. `args_ffi` is moved into the call (engine owns
+    // it now), and `result` is a writable slot valid for the duration of the call.
     unsafe {
         let name = kernel_string_slice!(op_name);
         let eval = match mode {
             EvalMode::RowMode => cb.eval_pred_rows,
             EvalMode::StatsMode => cb.eval_pred_stats,
         };
-        eval(cb.engine_state, name, &mut args_ffi, inverted, &mut result);
+        eval(cb.engine_state, name, args_ffi, inverted, &mut result);
     }
     let result_ffi = match result {
         EngineExecResult::Success(result_ffi) => result_ffi,
@@ -302,12 +309,9 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         batch: &RecordBatch,
         inverted: bool,
     ) -> DeltaResult<BooleanArray> {
-        // Materialize the args batch. In StatsMode this can fail when the rewrite referenced a
-        // stats column the batch doesn't carry -- e.g. an opaque op pairs a min/max-ineligible
-        // column (boolean, binary, or a complex type) with an eligible literal, so the lifted type
-        // hint points at an absent minValues/maxValues field. File pruning is best-effort, so
-        // abstain (keep every file) rather than abort the scan. RowMode has no safe abstain, so its
-        // errors propagate.
+        // Materialize the args batch. StatsMode pruning is best-effort: if the rewrite referenced a
+        // stats column the batch doesn't carry, abstain (keep every file) rather than abort the
+        // scan. RowMode has no safe abstain, so its errors propagate.
         let args_batch = match evaluate_args(args, batch) {
             Ok(args_batch) => args_batch,
             Err(e) if self.mode == EvalMode::StatsMode => {
@@ -409,11 +413,10 @@ mod tests {
     // `STARTS_WITH_LOWER(col, prefix)` folds the LOWER step into the predicate
     // callback, so no `Expression::Opaque` ever appears in the tree.
 
-    /// Take ownership of args FFI handles, leaving the slot empty so kernel's
-    /// drop is a no-op.
-    unsafe fn take_ffi_record_batch(args_in: *mut ArrowFFIData) -> RecordBatch {
-        let array = std::mem::replace(unsafe { &mut (*args_in).array }, FFI_ArrowArray::empty());
-        let schema = std::mem::replace(unsafe { &mut (*args_in).schema }, FFI_ArrowSchema::empty());
+    /// Import the by-value args batch, consuming its FFI handles (their release callbacks fire
+    /// when the imported data drops).
+    unsafe fn take_ffi_record_batch(args_in: ArrowFFIData) -> RecordBatch {
+        let ArrowFFIData { array, schema } = args_in;
         let array_data = unsafe { from_ffi(array, &schema) }.unwrap();
         let sa = StructArray::from(array_data);
         sa.into()
@@ -436,7 +439,7 @@ mod tests {
     unsafe extern "C" fn engine_starts_with_lower(
         _state: *mut c_void,
         _op_name: KernelStringSlice,
-        args_in: *mut ArrowFFIData,
+        args_in: ArrowFFIData,
         inverted: bool,
         out: *mut EngineExecResult<ArrowFFIData>,
     ) {
@@ -470,7 +473,7 @@ mod tests {
     unsafe extern "C" fn engine_starts_with(
         _state: *mut c_void,
         _op_name: KernelStringSlice,
-        args_in: *mut ArrowFFIData,
+        args_in: ArrowFFIData,
         inverted: bool,
         out: *mut EngineExecResult<ArrowFFIData>,
     ) {
@@ -607,7 +610,7 @@ mod tests {
         unsafe extern "C" fn engine_noop(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            _args_in: *mut ArrowFFIData,
+            _args_in: ArrowFFIData,
             _inverted: bool,
             _out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -630,7 +633,7 @@ mod tests {
         unsafe extern "C" fn engine_fail(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _inverted: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -658,7 +661,7 @@ mod tests {
         unsafe extern "C" fn engine_int(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _inverted: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -680,7 +683,7 @@ mod tests {
         unsafe extern "C" fn engine_short(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _inverted: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -705,7 +708,7 @@ mod tests {
         unsafe extern "C" fn engine_empty(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _inverted: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -729,7 +732,7 @@ mod tests {
         unsafe extern "C" fn engine_always_true(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _inverted: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -760,7 +763,7 @@ mod tests {
         unsafe extern "C" fn rows(
             _: *mut c_void,
             _: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -776,7 +779,7 @@ mod tests {
         unsafe extern "C" fn stats(
             _: *mut c_void,
             _: KernelStringSlice,
-            args_in: *mut ArrowFFIData,
+            args_in: ArrowFFIData,
             _: bool,
             out: *mut EngineExecResult<ArrowFFIData>,
         ) {
@@ -1041,7 +1044,7 @@ mod tests {
             unsafe extern "C" fn engine_ge(
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
-                args_in: *mut ArrowFFIData,
+                args_in: ArrowFFIData,
                 inverted: bool,
                 out: *mut EngineExecResult<ArrowFFIData>,
             ) {
@@ -1246,7 +1249,7 @@ mod tests {
             unsafe extern "C" fn engine_count(
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
-                args_in: *mut ArrowFFIData,
+                args_in: ArrowFFIData,
                 _inverted: bool,
                 out: *mut EngineExecResult<ArrowFFIData>,
             ) {
@@ -1283,7 +1286,7 @@ mod tests {
             unsafe extern "C" fn engine_check_nullcount(
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
-                args_in: *mut ArrowFFIData,
+                args_in: ArrowFFIData,
                 _inverted: bool,
                 out: *mut EngineExecResult<ArrowFFIData>,
             ) {
@@ -1338,7 +1341,7 @@ mod tests {
             unsafe extern "C" fn engine_keep_on_null_bounds(
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
-                args_in: *mut ArrowFFIData,
+                args_in: ArrowFFIData,
                 _inverted: bool,
                 out: *mut EngineExecResult<ArrowFFIData>,
             ) {
@@ -1418,7 +1421,7 @@ mod tests {
             unsafe extern "C" fn engine_count(
                 _state: *mut c_void,
                 _op_name: KernelStringSlice,
-                args_in: *mut ArrowFFIData,
+                args_in: ArrowFFIData,
                 _inverted: bool,
                 out: *mut EngineExecResult<ArrowFFIData>,
             ) {
