@@ -69,7 +69,7 @@ fn build_agent() -> Agent {
         .provider(TlsProvider::NativeTls)
         .root_certs(RootCerts::PlatformVerifier)
         .build();
-    let config = Agent::config_builder().tls_config(tls_config).proxy(Proxy::try_from_env())
+    let config = Agent::config_builder().tls_config(tls_config).proxy(Proxy::try_from_env());
     Agent::new_with_config(config.build())
 }
 
