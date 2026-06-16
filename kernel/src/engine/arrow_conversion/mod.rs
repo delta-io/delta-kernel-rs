@@ -369,6 +369,11 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
+                    PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                        Err(ArrowError::SchemaError(format!(
+                            "Interval types are not yet supported in the default engine: {p}"
+                        )))
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -682,7 +687,7 @@ mod tests {
             "name": "void_col",
             "type": "void",
             "nullable": true,
-            "metadata": {} 
+            "metadata": {}
         }
         "#;
 

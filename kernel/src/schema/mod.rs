@@ -1682,6 +1682,10 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     Void,
+    #[serde(rename = "interval year to month")]
+    IntervalYearMonth,
+    #[serde(rename = "interval day to second")]
+    IntervalDayTime,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
@@ -1789,6 +1793,8 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
             "void" => Ok(PrimitiveType::Void),
+            "interval year to month" => Ok(PrimitiveType::IntervalYearMonth),
+            "interval day to second" => Ok(PrimitiveType::IntervalDayTime),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1838,6 +1844,8 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
+            PrimitiveType::IntervalYearMonth => write!(f, "interval year to month"),
+            PrimitiveType::IntervalDayTime => write!(f, "interval day to second"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
@@ -1974,6 +1982,8 @@ impl DataType {
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
     pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
+    pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
+    pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -2483,6 +2493,8 @@ mod tests {
     #[case("date", DataType::DATE)]
     #[case("timestamp", DataType::TIMESTAMP)]
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
+    #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
     fn test_primitive_type_deserialization_still_works(
         #[case] type_str: &str,
         #[case] expected_type: DataType,
@@ -2570,10 +2582,27 @@ mod tests {
     #[case("\"date\"", DataType::DATE)]
     #[case("\"timestamp\"", DataType::TIMESTAMP)]
     #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
     #[case("\"variant\"", DataType::unshredded_variant())]
     fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
         let data_type: DataType = serde_json::from_str(type_json).unwrap();
         assert_eq!(data_type, expected);
+    }
+
+    #[rstest]
+    #[case(PrimitiveType::IntervalYearMonth, "interval year to month")]
+    #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
+    fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
+        assert_eq!(ptype.to_string(), name);
+        assert_eq!(
+            serde_json::to_string(&ptype).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<PrimitiveType>(&format!("\"{name}\"")).unwrap(),
+            ptype
+        );
     }
 
     #[test]
