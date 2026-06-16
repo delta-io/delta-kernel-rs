@@ -5,7 +5,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::engine::arrow_utils;
-use crate::plans::{Operation, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
@@ -42,7 +42,10 @@ impl JsonHandler for PlanBasedJsonHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = QueryPlanBuilder::scan_json(files.to_vec(), physical_schema).build()?;
+        if files.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?.build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -122,6 +125,18 @@ mod tests {
             &[1, 2, 3]
         );
         assert!(iter.next().is_none(), "expected exactly one batch");
+    }
+
+    /// No files -> an absent plan -> an empty data iterator (no rows, no error).
+    #[test]
+    fn test_read_json_files_empty_is_empty() {
+        let schema =
+            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
+        let count = make_handler()
+            .read_json_files(&[], schema, None)
+            .unwrap()
+            .count();
+        assert_eq!(count, 0);
     }
 
     #[test]

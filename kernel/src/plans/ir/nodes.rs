@@ -48,6 +48,28 @@ pub enum Operator {
     UnionAll(UnionAll),
 }
 
+macro_rules! impl_from_payload_for_operator {
+    ($($variant:ident),+ $(,)?) => {
+        $(impl From<$variant> for Operator {
+            fn from(payload: $variant) -> Self {
+                Operator::$variant(payload)
+            }
+        })+
+    };
+}
+
+impl_from_payload_for_operator!(
+    ScanParquet,
+    ScanJson,
+    Values,
+    Project,
+    Filter,
+    Load,
+    Aggregate,
+    SemiJoin,
+    UnionAll,
+);
+
 /// One file to scan plus literal values broadcast to every row read from that file.
 ///
 /// `file_constants` holds one [`Scalar`] per entry in the parent scan node's
@@ -315,13 +337,28 @@ pub struct LoadColumnFileMeta {
     pub num_records_column: ColumnName,
 }
 
+impl LoadColumnFileMeta {
+    /// The columns naming each file's path, size, and row-count.
+    pub fn new(
+        path_column: ColumnName,
+        file_size_column: ColumnName,
+        num_records_column: ColumnName,
+    ) -> Self {
+        Self {
+            path_column,
+            file_size_column,
+            num_records_column,
+        }
+    }
+}
+
 /// Reads data files from an upstream stream of file-metadata tuples, one input row per file.
 /// For each row, `file_meta` locates and sizes the file, the engine resolves its path against
-/// `base_url` (see below), opens it as `file_type`, and reads columns matching `schema`.
+/// `base_url` (see below), opens it as `file_type`, and produces rows of `schema`.
 ///
-/// `file_constant_columns` lists upstream columns whose per-file values are broadcast onto
-/// every emitted file row. This is file-constant metadata, the same concept as
-/// [`ScanParquet::file_constant_columns`]. See the example below.
+/// `schema` is the full output schema. Its fields are read from the file, except those named by
+/// `file_constant_columns`, which the engine broadcasts from the upstream row's same-named column
+/// onto every emitted file row (the same concept as [`ScanParquet::file_constant_columns`]).
 ///
 /// `dv_column` names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
@@ -355,7 +392,7 @@ pub struct LoadColumnFileMeta {
 /// ```
 /// ```text
 /// Load {
-///     schema: { id: int, name: string },
+///     schema: { id: int, name: string, version: long },
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
 ///     file_constant_columns: ["version"],
@@ -368,8 +405,8 @@ pub struct LoadColumnFileMeta {
 /// }
 /// ```
 /// The engine opens `s3://table/part-0.parquet` and `s3://table/part-1.parquet`, reads
-/// `{id, name}` from each, sees a NULL DV for each file so all rows survive, and
-/// broadcasts the row's `version` onto every emitted file row. One possible output
+/// `{id, name}` from each, sees a NULL DV for each file so all rows survive, and broadcasts the
+/// upstream `version` into the output `version` column. The output is rows of `schema`
 /// (row order is not guaranteed):
 /// ```text
 ///     | id | name | version
@@ -387,6 +424,42 @@ pub struct Load {
     pub file_constant_columns: Vec<ColumnName>,
     pub file_meta: LoadColumnFileMeta,
     pub dv_column: ColumnName,
+}
+
+impl Load {
+    /// A [`Load`] over `schema` reading `file_type` files, with no base URL and no file-constant
+    /// columns. Add those with [`Self::with_base_url`] / [`Self::with_file_constant_columns`].
+    pub fn new(
+        schema: impl Into<SchemaRef>,
+        file_type: FileType,
+        file_meta: LoadColumnFileMeta,
+        dv_column: ColumnName,
+    ) -> Self {
+        Self {
+            schema: schema.into(),
+            file_type,
+            base_url: None,
+            file_constant_columns: Vec::new(),
+            file_meta,
+            dv_column,
+        }
+    }
+
+    /// Set the base URL that per-row file paths resolve against.
+    pub fn with_base_url(mut self, base_url: Url) -> Self {
+        self.base_url = Some(base_url);
+        self
+    }
+
+    /// Set the output columns broadcast from the upstream row (see
+    /// [`Self::file_constant_columns`]).
+    pub fn with_file_constant_columns(
+        mut self,
+        columns: impl IntoIterator<Item = ColumnName>,
+    ) -> Self {
+        self.file_constant_columns = columns.into_iter().collect();
+        self
+    }
 }
 
 /// Groups input rows by `group_by` (a global aggregation over all rows when `group_by` is

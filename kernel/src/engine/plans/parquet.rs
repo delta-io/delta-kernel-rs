@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::plans::{IoOperation, Operation, PlanExecutor, QueryPlanBuilder};
+use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
@@ -33,7 +33,10 @@ impl ParquetHandler for PlanBasedParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = QueryPlanBuilder::scan_parquet(files.to_vec(), physical_schema).build()?;
+        if files.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?.build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -73,7 +76,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::schema::SchemaRef;
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::{FileMeta, ParquetHandler as _};
 
     fn make_handler() -> PlanBasedParquetHandler {
@@ -134,6 +137,19 @@ mod tests {
                 .values(),
             &[10, 20, 30]
         );
+    }
+
+    /// No files -> an absent plan -> an empty data iterator (no rows, no error).
+    #[test]
+    fn test_read_parquet_files_empty_is_empty() {
+        let schema: SchemaRef = Arc::new(
+            StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
+        );
+        let count = make_handler()
+            .read_parquet_files(&[], schema, None)
+            .unwrap()
+            .count();
+        assert_eq!(count, 0);
     }
 
     // TODO(#2618): Restore once `PlanBasedParquetHandler` moves to delta_kernel_default_engine
