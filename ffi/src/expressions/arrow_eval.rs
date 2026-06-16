@@ -30,7 +30,8 @@ use delta_kernel::{DeltaResult, Error, Predicate};
 
 use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::engine_data::ArrowFFIData;
-use crate::{kernel_string_slice, OptionalValue};
+use crate::error::EngineExecResult;
+use crate::kernel_string_slice;
 
 // === FfiOpaquePredicateOp ===================================================
 
@@ -258,10 +259,10 @@ fn call_eval_pred(
     let num_rows = args_batch.num_rows();
     let mut args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
 
-    // Out-pointer convention: kernel owns the result slot on its stack, pre-initialized to None;
-    // the engine overwrites it with Some(result) on success, transferring ownership of the written
-    // Arrow C Data Interface structs to kernel.
-    let mut result = OptionalValue::None;
+    // Out-pointer convention: kernel owns the result slot on its stack, pre-initialized to Uninit.
+    // The engine writes Success(result) -- transferring ownership of the written Arrow C Data
+    // Interface structs -- or Failure(err) carrying an engine-side error.
+    let mut result = EngineExecResult::Uninit;
 
     // SAFETY: callback was supplied by the engine. We pass a writable args slot (the engine takes
     // ownership of the Arrow FFI handles by moving them out of it) and a writable result slot
@@ -274,10 +275,14 @@ fn call_eval_pred(
         };
         eval(cb.engine_state, name, &mut args_ffi, inverted, &mut result);
     }
-    let OptionalValue::Some(result_ffi) = result else {
-        return Err(Error::Generic(format!(
-            "engine opaque-eval callback reported failure for `{op_name}`"
-        )));
+    let result_ffi = match result {
+        EngineExecResult::Success(result_ffi) => result_ffi,
+        EngineExecResult::Failure(err) => return Err(err.into()),
+        EngineExecResult::Uninit => {
+            return Err(Error::Generic(format!(
+                "engine opaque-eval callback for `{op_name}` returned without writing a result"
+            )))
+        }
     };
 
     let arr = import_ffi_array(result_ffi)?;
@@ -416,13 +421,13 @@ mod tests {
 
     /// Write an `ArrayRef` into kernel's result slot as Arrow C Data Interface structs, the way a
     /// real engine returns its result from `eval_pred` (out-pointer convention).
-    unsafe fn write_result(out: *mut OptionalValue<ArrowFFIData>, arr: ArrayRef) {
+    unsafe fn write_result(out: *mut EngineExecResult<ArrowFFIData>, arr: ArrayRef) {
         let array_data = arr.to_data();
         let ffi = ArrowFFIData {
             array: FFI_ArrowArray::new(&array_data),
             schema: FFI_ArrowSchema::try_from(array_data.data_type()).unwrap(),
         };
-        unsafe { *out = OptionalValue::Some(ffi) };
+        unsafe { *out = EngineExecResult::Success(ffi) };
     }
 
     /// Composite opaque predicate: `STARTS_WITH(LOWER(args[0]), args[1])`. Both
@@ -433,7 +438,7 @@ mod tests {
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
         inverted: bool,
-        out: *mut OptionalValue<ArrowFFIData>,
+        out: *mut EngineExecResult<ArrowFFIData>,
     ) {
         let batch = unsafe { take_ffi_record_batch(args_in) };
         assert_eq!(batch.num_columns(), 2);
@@ -467,7 +472,7 @@ mod tests {
         _op_name: KernelStringSlice,
         args_in: *mut ArrowFFIData,
         inverted: bool,
-        out: *mut OptionalValue<ArrowFFIData>,
+        out: *mut EngineExecResult<ArrowFFIData>,
     ) {
         let batch = unsafe { take_ffi_record_batch(args_in) };
         let lhs = batch
@@ -598,23 +603,54 @@ mod tests {
     // === Negative paths ==========================================================
 
     #[test]
-    fn engine_returning_none_surfaces_error() {
-        unsafe extern "C" fn engine_fail(
+    fn engine_leaving_result_uninit_surfaces_error() {
+        unsafe extern "C" fn engine_noop(
             _state: *mut c_void,
             _op_name: KernelStringSlice,
             _args_in: *mut ArrowFFIData,
             _inverted: bool,
-            _out: *mut OptionalValue<ArrowFFIData>,
+            _out: *mut EngineExecResult<ArrowFFIData>,
         ) {
-            // Leave *out untouched (kernel pre-initialized it to None) to signal failure.
+            // Leave *out as the pre-initialized `Uninit`: the engine returned without writing.
         }
         let pred = Predicate::arrow_opaque(
-            FfiOpaquePredicateOp::new("ALWAYS_FAIL", callbacks_for(engine_fail)),
+            FfiOpaquePredicateOp::new("WRITES_NOTHING", callbacks_for(engine_noop)),
             [column_expr!("col")],
         );
         let batch = batch_with_col(vec![Some("x")]);
         let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
-        assert!(format!("{err}").contains("engine opaque-eval callback reported failure"));
+        assert!(
+            format!("{err}").contains("returned without writing a result"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn engine_failure_surfaces_engine_error_message() {
+        unsafe extern "C" fn engine_fail(
+            _state: *mut c_void,
+            _op_name: KernelStringSlice,
+            args_in: *mut ArrowFFIData,
+            _inverted: bool,
+            out: *mut EngineExecResult<ArrowFFIData>,
+        ) {
+            let _ = unsafe { take_ffi_record_batch(args_in) };
+            let err = crate::error::EngineExecError {
+                etype: crate::error::KernelError::GenericError,
+                message: Box::new("boom from engine".to_string()).into(),
+            };
+            unsafe { *out = EngineExecResult::Failure(err) };
+        }
+        let pred = Predicate::arrow_opaque(
+            FfiOpaquePredicateOp::new("FAILS", callbacks_for(engine_fail)),
+            [column_expr!("col")],
+        );
+        let batch = batch_with_col(vec![Some("x")]);
+        let err = evaluate_predicate(&pred, &batch, false).unwrap_err();
+        assert!(
+            format!("{err}").contains("boom from engine"),
+            "engine-provided message should surface; got: {err}"
+        );
     }
 
     #[test]
@@ -624,7 +660,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             let _ = unsafe { take_ffi_record_batch(args_in) };
             let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
@@ -646,7 +682,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             let _ = unsafe { take_ffi_record_batch(args_in) };
             let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
@@ -671,11 +707,11 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             // Consume args but hand back an empty (unpopulated) result.
             let _ = unsafe { take_ffi_record_batch(args_in) };
-            unsafe { *out = OptionalValue::Some(ArrowFFIData::empty()) };
+            unsafe { *out = EngineExecResult::Success(ArrowFFIData::empty()) };
         }
         let pred = Predicate::arrow_opaque(
             FfiOpaquePredicateOp::new("EMPTY", callbacks_for(engine_empty)),
@@ -695,7 +731,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             let batch = unsafe { take_ffi_record_batch(args_in) };
             assert_eq!(batch.num_columns(), 0, "zero-arg => no columns");
@@ -726,7 +762,7 @@ mod tests {
             _: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             ROWS.fetch_add(1, AtomicOrdering::SeqCst);
             let batch = unsafe { take_ffi_record_batch(args_in) };
@@ -742,7 +778,7 @@ mod tests {
             _: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             STATS.fetch_add(1, AtomicOrdering::SeqCst);
             let batch = unsafe { take_ffi_record_batch(args_in) };
@@ -1007,7 +1043,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 inverted: bool,
-                out: *mut OptionalValue<ArrowFFIData>,
+                out: *mut EngineExecResult<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let stats = batch
@@ -1212,7 +1248,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalValue<ArrowFFIData>,
+                out: *mut EngineExecResult<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 CALL_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1249,7 +1285,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalValue<ArrowFFIData>,
+                out: *mut EngineExecResult<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let col = batch
@@ -1304,7 +1340,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalValue<ArrowFFIData>,
+                out: *mut EngineExecResult<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 let stats = batch
@@ -1384,7 +1420,7 @@ mod tests {
                 _op_name: KernelStringSlice,
                 args_in: *mut ArrowFFIData,
                 _inverted: bool,
-                out: *mut OptionalValue<ArrowFFIData>,
+                out: *mut EngineExecResult<ArrowFFIData>,
             ) {
                 let batch = unsafe { take_ffi_record_batch(args_in) };
                 CALLS.fetch_add(1, AtomicOrdering::SeqCst);

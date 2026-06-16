@@ -1140,7 +1140,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use crate::engine_data::ArrowFFIData;
-        use crate::OptionalValue;
+        use crate::error::EngineExecResult;
 
         static FREED: AtomicUsize = AtomicUsize::new(0);
 
@@ -1149,7 +1149,7 @@ mod tests {
             _: KernelStringSlice,
             _: *mut ArrowFFIData,
             _: bool,
-            _: *mut OptionalValue<ArrowFFIData>,
+            _: *mut EngineExecResult<ArrowFFIData>,
         ) {
         }
         unsafe extern "C" fn counting_free(_: *mut c_void) {
@@ -1239,7 +1239,7 @@ mod tests {
         use test_utils::add_commit;
 
         use crate::engine_data::ArrowFFIData;
-        use crate::OptionalValue;
+        use crate::error::EngineExecResult;
 
         static CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1250,7 +1250,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             CALLS.fetch_add(1, Ordering::SeqCst);
 
@@ -1298,7 +1298,7 @@ mod tests {
                 array: FFI_ArrowArray::new(&array_data),
                 schema: FFI_ArrowSchema::try_from(array_data.data_type()).unwrap(),
             };
-            unsafe { *out = OptionalValue::Some(ffi) };
+            unsafe { *out = EngineExecResult::Success(ffi) };
         }
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 
@@ -1396,7 +1396,7 @@ mod tests {
         use test_utils::add_commit;
 
         use crate::engine_data::ArrowFFIData;
-        use crate::OptionalValue;
+        use crate::error::EngineExecResult;
 
         // Contract violation: skip (false) any row whose min/max bounds are null instead of
         // keeping it. Remove rows carry null stats, so without a kernel-side guard this would
@@ -1406,7 +1406,7 @@ mod tests {
             _op_name: KernelStringSlice,
             args_in: *mut ArrowFFIData,
             _inverted: bool,
-            out: *mut OptionalValue<ArrowFFIData>,
+            out: *mut EngineExecResult<ArrowFFIData>,
         ) {
             let array =
                 std::mem::replace(unsafe { &mut (*args_in).array }, FFI_ArrowArray::empty());
@@ -1431,7 +1431,7 @@ mod tests {
                 array: FFI_ArrowArray::new(&array_data),
                 schema: FFI_ArrowSchema::try_from(array_data.data_type()).unwrap(),
             };
-            unsafe { *out = OptionalValue::Some(ffi) };
+            unsafe { *out = EngineExecResult::Success(ffi) };
         }
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 

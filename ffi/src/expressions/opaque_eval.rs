@@ -17,7 +17,8 @@
 use std::ffi::c_void;
 
 use crate::engine_data::ArrowFFIData;
-use crate::{KernelStringSlice, OptionalValue};
+use crate::error::EngineExecResult;
+use crate::KernelStringSlice;
 
 /// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
@@ -32,11 +33,12 @@ use crate::{KernelStringSlice, OptionalValue};
 /// The engine returns one bool per row.
 ///
 /// The result uses the out-pointer convention: kernel pre-initializes `*out` to
-/// `OptionalValue::None`; on success the engine overwrites it with
-/// `OptionalValue::Some` holding the result `BooleanArray` as Arrow C Data Interface
-/// structs, transferring their ownership to kernel. Leaving `*out` untouched (`None`) signals a
-/// (non-fatal) failure; in that case the engine may also leave `args_in` unconsumed -- kernel
-/// releases whatever the engine did not import. When `inverted`, evaluate `NOT op`.
+/// `EngineExecResult::Uninit`. On success the engine writes `EngineExecResult::Success` holding the
+/// result `BooleanArray` as Arrow C Data Interface structs, transferring their ownership to kernel.
+/// On failure it writes `EngineExecResult::Failure` carrying a `KernelError` code and a message
+/// handle (built via `allocate_kernel_string`); leaving `*out` as `Uninit` is also treated as an
+/// error. On failure the engine may leave `args_in` unconsumed -- kernel releases whatever it did
+/// not import. When `inverted`, evaluate `NOT op`.
 ///
 /// # Safety
 /// `out` is valid only for the duration of the call; the engine must not retain it. The callback
@@ -46,7 +48,7 @@ pub type EngineEvalRowsFn = unsafe extern "C" fn(
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
     inverted: bool,
-    out: *mut OptionalValue<ArrowFFIData>,
+    out: *mut EngineExecResult<ArrowFFIData>,
 );
 
 /// Engine callback for **stats-based** evaluation of an opaque predicate, for file data skipping.
@@ -70,7 +72,7 @@ pub type EngineEvalStatsFn = unsafe extern "C" fn(
     op_name: KernelStringSlice,
     args_in: *mut ArrowFFIData,
     inverted: bool,
-    out: *mut OptionalValue<ArrowFFIData>,
+    out: *mut EngineExecResult<ArrowFFIData>,
 );
 
 /// Destructor for the engine's state pointer.
@@ -159,7 +161,7 @@ pub(crate) mod tests {
         _op_name: KernelStringSlice,
         _args_in: *mut ArrowFFIData,
         _inverted: bool,
-        _out: *mut OptionalValue<ArrowFFIData>,
+        _out: *mut EngineExecResult<ArrowFFIData>,
     ) {
     }
 
