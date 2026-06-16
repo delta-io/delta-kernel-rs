@@ -20,9 +20,9 @@ use crate::{DeltaResult, Error};
 #[derive(Debug)]
 pub(super) struct SharedWriteState {
     pub(super) table_root: Url,
+    /// Logical schema of the data to write: the table schema minus partition columns.
     pub(super) logical_schema: SchemaRef,
     pub(super) physical_schema: SchemaRef,
-    pub(super) logical_to_physical: ExpressionRef,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
@@ -61,6 +61,9 @@ pub(super) struct SharedWriteState {
 #[derive(Debug)]
 pub struct WriteContext {
     pub(super) shared: Arc<SharedWriteState>,
+    /// Transforms logical data to physical data for writing. The logical data must not contain
+    /// any partition columns. The expression injects the partition columns when needed.
+    pub(super) logical_to_physical: ExpressionRef,
     /// Physical column name -> serialized value (`None` = null partition value).
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
     /// `shared.logical_partition_columns`, not from this map.
@@ -157,8 +160,7 @@ impl WriteContext {
         url
     }
 
-    /// Returns the logical (user-facing) table schema. Connectors use this to determine
-    /// the schema of data to write.
+    /// Returns the schema which connectors' logical data should conform to.
     pub fn logical_schema(&self) -> &SchemaRef {
         &self.shared.logical_schema
     }
@@ -171,7 +173,7 @@ impl WriteContext {
 
     /// Returns the expression that transforms logical data to physical data for writing.
     pub fn logical_to_physical(&self) -> ExpressionRef {
-        self.shared.logical_to_physical.clone()
+        self.logical_to_physical.clone()
     }
 
     /// The [`ColumnMappingMode`] for this table.
@@ -314,7 +316,6 @@ mod tests {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             logical_schema: schema.clone(),
             physical_schema: schema.clone(),
-            logical_to_physical: Arc::new(Expression::literal(true)),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
@@ -324,6 +325,7 @@ mod tests {
         });
         WriteContext {
             shared,
+            logical_to_physical: Arc::new(Expression::literal(true)),
             physical_partition_values: partition_values,
         }
     }

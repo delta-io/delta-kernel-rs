@@ -104,6 +104,8 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
+    /// The subset of the logical schema that remains after excluding partition columns.
+    logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
     physical_schema: SchemaRef,
     /// The subset of the physical schema that remains after excluding partition columns.
@@ -172,12 +174,12 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
+        let partition_columns: HashSet<&str> = metadata
+            .partition_columns()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let physical_data_schema_without_partition_columns = {
-            let partition_columns: HashSet<&str> = metadata
-                .partition_columns()
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
             let fields = logical_schema
                 .fields()
                 .zip(physical_schema.fields())
@@ -188,9 +190,18 @@ impl TableConfiguration {
             // Safety: subset of an already-valid schema.
             Arc::new(StructType::new_unchecked(fields))
         };
+        let logical_schema_without_partition_columns = {
+            let fields = logical_schema
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name().as_str()))
+                .cloned();
+            // Safety: subset of an already-valid schema.
+            Arc::new(StructType::new_unchecked(fields))
+        };
 
         let table_config = Self {
             logical_schema,
+            logical_schema_without_partition_columns,
             physical_schema,
             physical_data_schema_without_partition_columns,
             metadata,
@@ -382,19 +393,9 @@ impl TableConfiguration {
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
-    /// Returns the logical schema for data columns (excludes partition columns).
-    ///
-    /// Partition columns are excluded because statistics are only collected for data columns
-    /// that are physically stored in the parquet files. Partition values are stored in the
-    /// file path, not in the file content, so they don't have file-level statistics.
-    fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.partition_columns();
-        Arc::new(StructType::new_unchecked(
-            self.logical_schema()
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name()))
-                .cloned(),
-        ))
+    /// Returns the logical schema excluding partition columns.
+    pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
+        self.logical_schema_without_partition_columns.clone()
     }
 
     /// Returns the physical data schema excluding partition columns.
@@ -411,7 +412,7 @@ impl TableConfiguration {
             .data_skipping_stats_columns
             .as_ref()
             .map(|cols| {
-                let logical_schema = self.logical_data_schema();
+                let logical_schema = self.logical_schema_without_partition_columns();
                 let mode = self.column_mapping_mode();
                 cols.iter()
                     .filter_map(|col| {
