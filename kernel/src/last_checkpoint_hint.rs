@@ -16,12 +16,9 @@ use crate::{DeltaResult, Error, StorageHandler, Version};
 /// the latest checkpoint without a full directory listing.
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
-/// A more minimal version of LastCheckpointHint, storing only the version and schema.
-///
-/// This is primarily used by LogSegment to store necessary information about the latest
-/// checkpoint without retaining all of the metadata fields. If this struct grows
-/// to be similar in size to LastCheckpointHint, we should just switch to using LastCheckpointHint
-/// directly.
+/// A reduced view of [`LastCheckpointHint`] that [`crate::log_segment::LogSegment`] retains --
+/// just enough to validate and apply the hint without holding every metadata field. If this grows
+/// to be similar in size to `LastCheckpointHint`, we should switch to using it directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct LastCheckpointHintSummary {
@@ -32,6 +29,10 @@ pub(crate) struct LastCheckpointHintSummary {
     /// Useful for determining if `stats_parsed` is available for data skipping.
     /// `None` when the hint file did not include a `checkpointSchema` field.
     pub schema: Option<SchemaRef>,
+
+    /// File name of the V2 checkpoint the hint describes (`v2Checkpoint.path`); see
+    /// [`LastCheckpointHint::v2_checkpoint`]. `None` for V1 / classic checkpoints.
+    pub v2_checkpoint_path: Option<String>,
 }
 
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
@@ -56,6 +57,22 @@ pub(crate) struct LastCheckpointHint {
     pub(crate) checksum: Option<String>,
     /// Additional metadata about the last checkpoint.
     pub(crate) tags: Option<HashMap<String, String>>,
+    /// For a V2 checkpoint, the embedded V2 checkpoint info. Identifies the specific checkpoint
+    /// file the hint describes. Absent for V1 / classic checkpoints.
+    pub(crate) v2_checkpoint: Option<LastCheckpointV2>,
+}
+
+/// The `v2Checkpoint` object embedded in a `_last_checkpoint` hint for a V2 checkpoint.
+///
+/// Only the `path` (the checkpoint file's name) is parsed; it identifies which V2 checkpoint the
+/// hint's fields describe, since several V2 checkpoints can share a version.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct LastCheckpointV2 {
+    /// Bare file name of the V2 checkpoint this hint describes (a `path.getName()`-style value,
+    /// not a full path), matched against the selected checkpoint part's file name.
+    pub(crate) path: String,
 }
 
 impl LastCheckpointHint {
@@ -111,5 +128,42 @@ impl LastCheckpointHint {
     #[cfg(test)]
     pub(crate) fn to_json_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Failed to convert LastCheckpointHint to JSON bytes")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
+    /// `path`. Extra `v2Checkpoint` fields a writer emits (e.g. `sizeInBytes`, `sidecarFiles`) are
+    /// ignored. Guards the `camelCase` wire key -- a rename would otherwise silently parse to
+    /// `None` (errors are swallowed in `try_read`) and disable the identity filter.
+    #[test]
+    fn parses_v2_checkpoint_path_from_wire_json() {
+        let json = br#"{
+            "version": 5,
+            "size": 10,
+            "v2Checkpoint": {
+                "path": "00000000000000000005.checkpoint.0190e8f5-uuid.parquet",
+                "sizeInBytes": 1234,
+                "sidecarFiles": []
+            }
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        assert_eq!(
+            hint.v2_checkpoint,
+            Some(LastCheckpointV2 {
+                path: "00000000000000000005.checkpoint.0190e8f5-uuid.parquet".to_string(),
+            })
+        );
+    }
+
+    /// A `_last_checkpoint` without a `v2Checkpoint` object (V1 / classic) parses to `None`.
+    #[test]
+    fn v2_checkpoint_absent_parses_to_none() {
+        let json = br#"{"version": 5, "size": 10}"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        assert!(hint.v2_checkpoint.is_none());
     }
 }

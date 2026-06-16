@@ -2747,6 +2747,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         Some(LastCheckpointHintSummary {
             version: hint_version,
             schema: Some(hint_schema.clone()),
+            v2_checkpoint_path: None,
         }),
     )?;
 
@@ -2838,6 +2839,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         use_hint.then(|| LastCheckpointHintSummary {
             version: 1,
             schema: Some(v1_schema.clone()),
+            v2_checkpoint_path: None,
         }),
     )?;
 

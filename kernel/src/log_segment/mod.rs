@@ -376,6 +376,7 @@ impl LogSegment {
                 .map(|hint| LastCheckpointHintSummary {
                     version: hint.version,
                     schema: hint.checkpoint_schema.clone(),
+                    v2_checkpoint_path: hint.v2_checkpoint.as_ref().map(|v2| v2.path.clone()),
                 });
 
         // The end_version is the time_travel_version, if present
