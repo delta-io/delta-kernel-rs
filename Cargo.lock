@@ -1328,6 +1328,7 @@ dependencies = [
  "rayon",
  "serde_json",
  "tar",
+ "tempfile",
  "test_utils",
  "tokio",
  "unity-catalog-delta-client-api",

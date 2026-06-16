@@ -35,7 +35,12 @@ url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 
 [[bench]]
 name = "workload_bench"
+harness = false
+
+[[bench]]
+name = "insert_bench"
 harness = false
