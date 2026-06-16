@@ -366,10 +366,7 @@ fn test_sql_where() {
 fn test_timestamp_stats_enabled() {
     let empty = HashSet::new();
     let stats_columns: HashSet<ColumnName> = [column_name!("timestamp_col")].into_iter().collect();
-    let creator = DataSkippingPredicateCreator {
-        partition_columns: &empty,
-        stats_columns: &stats_columns,
-    };
+    let creator = DataSkippingPredicateCreator::new(&empty, &stats_columns);
     let col = &column_name!("timestamp_col");
 
     assert!(
@@ -392,6 +389,79 @@ fn test_timestamp_stats_enabled() {
             .is_some(),
         "get_max_stat should return Some for timestamp_ntz maxValues"
     );
+}
+
+#[test]
+fn schema_typed_stat_accessors_resolve_by_eligibility() {
+    let partition_columns: HashSet<String> = ["part"].into_iter().map(String::from).collect();
+    let stats_columns: HashSet<ColumnName> = [column_name!("a"), column_name!("nullcount_only")]
+        .into_iter()
+        .collect();
+    // Only `a` carries min/max in the stats schema; `nullcount_only` is statted but ineligible.
+    let min_max_columns: HashSet<ColumnName> = [column_name!("a")].into_iter().collect();
+    let creator = DataSkippingPredicateCreator::with_min_max_columns(
+        &partition_columns,
+        &stats_columns,
+        min_max_columns,
+    );
+
+    // Eligible data column -> stats_parsed.{min,max}Values ref, no caller-supplied type.
+    assert_eq!(
+        creator.get_min_stat_schema_typed(&column_name!("a")),
+        Some(Expr::from(ColumnName::new([
+            "stats_parsed",
+            "minValues",
+            "a"
+        ])))
+    );
+    assert_eq!(
+        creator.get_max_stat_schema_typed(&column_name!("a")),
+        Some(Expr::from(ColumnName::new([
+            "stats_parsed",
+            "maxValues",
+            "a"
+        ])))
+    );
+
+    // Partition column -> exact partition value (type is irrelevant for partitions).
+    assert_eq!(
+        creator.get_min_stat_schema_typed(&column_name!("part")),
+        Some(Expr::from(ColumnName::new([
+            "partitionValues_parsed",
+            "part"
+        ])))
+    );
+
+    // Statted but min/max-ineligible, and unknown columns -> None (engine gets null bounds).
+    assert!(creator
+        .get_min_stat_schema_typed(&column_name!("nullcount_only"))
+        .is_none());
+    assert!(creator
+        .get_max_stat_schema_typed(&column_name!("unknown"))
+        .is_none());
+}
+
+#[test]
+fn min_max_eligible_columns_reads_minvalues_leaves() {
+    let min_values = StructType::new_unchecked([
+        StructField::nullable("a", DataType::INTEGER),
+        StructField::nullable("b", DataType::INTEGER),
+    ]);
+    let stats_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable(MIN_VALUES, min_values),
+        StructField::nullable(NUM_RECORDS, DataType::LONG),
+    ]));
+    let cols = min_max_eligible_columns(&stats_schema);
+    assert_eq!(cols.len(), 2);
+    assert!(cols.contains(&column_name!("a")));
+    assert!(cols.contains(&column_name!("b")));
+
+    // A stats schema with no minValues (e.g. partition-only) yields an empty set.
+    let no_min: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        NUM_RECORDS,
+        DataType::LONG,
+    )]));
+    assert!(min_max_eligible_columns(&no_min).is_empty());
 }
 
 #[test]
@@ -1453,9 +1523,13 @@ fn stats_columns_gate_rewrite(
     #[case] stats: HashSet<ColumnName>,
     #[case] expected: &str,
 ) {
-    let result =
-        as_sql_data_skipping_predicate_with_stats_columns(&pred, &partition_columns, &stats)
-            .expect("SQL-WHERE rewrite always returns Some for these cases");
+    let result = as_sql_data_skipping_predicate_with_stats_columns(
+        &pred,
+        &partition_columns,
+        &stats,
+        HashSet::new(),
+    )
+    .expect("SQL-WHERE rewrite always returns Some for these cases");
     assert_eq!(result.to_string(), expected);
 }
 
@@ -1469,9 +1543,13 @@ fn mixed_and_non_stat_arm_still_prunes_via_stat_arm() {
         Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
     );
     let stats = stats_cols(&["stat"]);
-    let result =
-        as_sql_data_skipping_predicate_with_stats_columns(&pred, &Default::default(), &stats)
-            .unwrap();
+    let result = as_sql_data_skipping_predicate_with_stats_columns(
+        &pred,
+        &Default::default(),
+        &stats,
+        HashSet::new(),
+    )
+    .unwrap();
     let resolver = HashMap::from_iter([(
         column_name!("stats_parsed.maxValues.stat"),
         Scalar::from(50i32),

@@ -780,6 +780,20 @@ pub trait DataSkippingPredicateEvaluator {
     /// Retrieves the maximum value of a column, if it exists and has the requested type.
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Self::ColumnStat>;
 
+    /// Retrieves the minimum value of a column without a caller-supplied type, resolving min/max
+    /// eligibility from the evaluator's own stats schema. Prefer [`Self::get_min_stat`] when the
+    /// column type is known; this is for type-erased callers like the FFI opaque rewrite.
+    ///
+    /// Defaults to `None` (abstain); evaluators that know their stats schema override it.
+    fn get_min_stat_schema_typed(&self, _col: &ColumnName) -> Option<Self::ColumnStat> {
+        None
+    }
+
+    /// Like [`Self::get_min_stat_schema_typed`], for the maximum value.
+    fn get_max_stat_schema_typed(&self, _col: &ColumnName) -> Option<Self::ColumnStat> {
+        None
+    }
+
     /// Retrieves the null count of a column, if it exists.
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Self::ColumnStat>;
 

@@ -73,7 +73,12 @@ fn as_sql_data_skipping_predicate(
     partition_columns: &HashSet<String>,
 ) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
-    as_sql_data_skipping_predicate_with_stats_columns(pred, partition_columns, &stats_columns)
+    as_sql_data_skipping_predicate_with_stats_columns(
+        pred,
+        partition_columns,
+        &stats_columns,
+        HashSet::new(),
+    )
 }
 
 /// Like [`as_sql_data_skipping_predicate`] but only rewrites references to columns in
@@ -83,8 +88,27 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     pred: &Pred,
     partition_columns: &HashSet<String>,
     stats_columns: &HashSet<ColumnName>,
+    min_max_columns: HashSet<ColumnName>,
 ) -> Option<Pred> {
-    DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
+    DataSkippingPredicateCreator::with_min_max_columns(
+        partition_columns,
+        stats_columns,
+        min_max_columns,
+    )
+    .eval_sql_where(pred)
+}
+
+/// Physical leaf paths that carry `minValues` (equivalently `maxValues`) in `stats_schema` -- the
+/// min/max-eligible columns, whose min/max references the unified schema can resolve.
+fn min_max_eligible_columns(stats_schema: &SchemaRef) -> HashSet<ColumnName> {
+    let Some(DataType::Struct(min_values)) =
+        stats_schema.field(MIN_VALUES).map(StructField::data_type)
+    else {
+        return HashSet::new();
+    };
+    let leaves = min_values.leaves(None);
+    let (names, _types) = leaves.as_ref();
+    names.iter().cloned().collect()
 }
 
 #[internal_api]
@@ -194,6 +218,9 @@ impl DataSkippingFilter {
                     &predicate,
                     &partition_columns,
                     stats_columns,
+                    stats_schema
+                        .map(min_max_eligible_columns)
+                        .unwrap_or_default(),
                 )?),
             )
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
@@ -451,13 +478,28 @@ struct DataSkippingPredicateCreator<'a> {
     /// Must match the column set used to build `physical_stats_schema`; otherwise the
     /// rewritten predicate references columns absent from the unified schema.
     stats_columns: &'a HashSet<ColumnName>,
+    /// Physical leaf paths that carry min/max in the stats schema -- a subset of `stats_columns`
+    /// (see [`min_max_eligible_columns`]). Lets the schema-typed accessors emit min/max references
+    /// without a caller-supplied type; empty when no stats schema is supplied (the schema-typed
+    /// accessors then abstain).
+    min_max_columns: HashSet<ColumnName>,
 }
 
 impl<'a> DataSkippingPredicateCreator<'a> {
+    #[cfg(test)]
     fn new(partition_columns: &'a HashSet<String>, stats_columns: &'a HashSet<ColumnName>) -> Self {
+        Self::with_min_max_columns(partition_columns, stats_columns, HashSet::new())
+    }
+
+    fn with_min_max_columns(
+        partition_columns: &'a HashSet<String>,
+        stats_columns: &'a HashSet<ColumnName>,
+        min_max_columns: HashSet<ColumnName>,
+    ) -> Self {
         Self {
             partition_columns,
             stats_columns,
+            min_max_columns,
         }
     }
 
@@ -511,6 +553,34 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             Some(Expr::from(
                 ColumnName::new(["stats_parsed", MAX_VALUES]).join(col),
             ))
+        }
+    }
+
+    /// Minimum value of a column without a caller-supplied type. Partition columns return the
+    /// exact partition value; data columns return the `minValues` reference only when the column
+    /// actually carries min/max in the stats schema (`min_max_columns`); otherwise `None`.
+    fn get_min_stat_schema_typed(&self, col: &ColumnName) -> Option<Expr> {
+        if self.is_partition_column(col) {
+            Some(joined_column_expr!("partitionValues_parsed", col))
+        } else if self.min_max_columns.contains(col) {
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", MIN_VALUES]).join(col),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Like [`Self::get_min_stat_schema_typed`], for the maximum value.
+    fn get_max_stat_schema_typed(&self, col: &ColumnName) -> Option<Expr> {
+        if self.is_partition_column(col) {
+            Some(joined_column_expr!("partitionValues_parsed", col))
+        } else if self.min_max_columns.contains(col) {
+            Some(Expr::from(
+                ColumnName::new(["stats_parsed", MAX_VALUES]).join(col),
+            ))
+        } else {
+            None
         }
     }
 
