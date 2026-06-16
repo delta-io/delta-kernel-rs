@@ -939,8 +939,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .physical_stats_column_names(self.physical_clustering_columns.as_deref())
     }
 
-    // Generate the logical-to-physical transform expression which must be evaluated on every data
-    // chunk before writing.
+    // Generate the logical-to-physical expression which must be evaluated on every data chunk
+    // before writing.
     fn generate_logical_to_physical(
         &self,
         partition_values: Option<&HashMap<String, Scalar>>,
@@ -967,7 +967,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                     let value = partition_values.and_then(|m| m.get(name)).ok_or_else(|| {
                         Error::internal_error(format!(
                             "partition column '{name}' missing while building logical-to-physical \
-                             transform"
+                             expression"
                         ))
                     })?;
                     let literal = lit(value.clone());
@@ -1047,9 +1047,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///   become physical `"col-abc-123"` in the `partitionValues` map.
     ///
     /// - **Partition column materialization**: the returned [`WriteContext`]'s
-    ///   [`logical_to_physical`] transform injects partition columns when the table requires
+    ///   [`logical_to_physical`] expression injects partition columns when the table requires
     ///   materializing partition columns (e.g. `materializePartitionColumns` or `icebergCompatV3`).
-    ///   The input data fed to that transform must not contain partition columns.
+    ///   The input data fed to that expression must not contain partition columns.
     ///
     /// The returned [`WriteContext`] also provides a [`write_dir`] that returns the correct
     /// target directory (Hive-style paths when column mapping is off, random prefix when on).

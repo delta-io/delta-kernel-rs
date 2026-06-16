@@ -93,7 +93,7 @@ Key points:
 - **Materialization is automatic**: some table features (such as
   `materializePartitionColumns` and `icebergCompatV3`) require partition values to also be
   written into the data files as regular columns. Kernel handles this through the
-  logical-to-physical transform.
+  logical-to-physical expression.
 
 > [!TIP]
 > To get the partition column names at runtime, call `txn.logical_partition_columns()`.

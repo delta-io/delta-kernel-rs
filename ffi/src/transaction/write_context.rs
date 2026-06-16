@@ -102,14 +102,14 @@ pub unsafe extern "C" fn get_physical_write_schema(
     write_context.physical_schema().clone().into()
 }
 
-/// Returns the logical-to-physical transform from a [`WriteContext`] handle. Engines apply
+/// Returns the logical-to-physical expression from a [`WriteContext`] handle. Engines apply
 /// it via an [`ExpressionEvaluator`] to each batch of logical data before writing parquet.
 /// The logical data batches must not contain partition columns. The column rename itself is encoded
 /// in the physical schema (the evaluator matches input columns to output fields by position), not
 /// in this expression.
 ///
 /// To build the evaluator, pass the schema of the partition-free input data as the input, this
-/// expression as the transform, and [`get_physical_write_schema`] as the output. See
+/// value as the expression to evaluate, and [`get_physical_write_schema`] as the output. See
 /// [`crate::engine_funcs::new_expression_evaluator`].
 ///
 /// The returned expression must be freed via [`crate::expressions::free_kernel_expression`].

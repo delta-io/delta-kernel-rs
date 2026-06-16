@@ -420,7 +420,7 @@ const PARTITION_REGIONS: &[&str] = &["a", "b"];
 /// Build a [`RecordBatch`] with [`ROWS_PER_PARTITION`] rows following the schema of
 /// [`nested_schema_with_all_delta_types`], minus the `region` partition column. `random_seed` is
 /// used directly to produce different values so different calls produce distinguishable rows.
-fn build_partition_batch(random_seed: i32) -> RecordBatch {
+fn build_data_batch(random_seed: i32) -> RecordBatch {
     let rows = ROWS_PER_PARTITION as usize;
 
     // Data schema excludes the `region` partition column.
@@ -598,7 +598,7 @@ async fn write_partitioned_data(
     let mut snapshot = Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())
         .unwrap();
-    // Defensive sanity check: confirm the table schema matches what `build_partition_batch`
+    // Defensive sanity check: confirm the table schema matches what `build_data_batch`
     // produces. We compare top-level field names rather than full structs for simplicity.
     let actual_schema = snapshot.schema();
     let actual_fields: Vec<&str> = actual_schema.fields().map(|f| f.name().as_str()).collect();
@@ -613,7 +613,7 @@ async fn write_partitioned_data(
     );
 
     for region in PARTITION_REGIONS {
-        let batch = build_partition_batch(random_seed);
+        let batch = build_data_batch(random_seed);
         let partition_values =
             HashMap::from([("region".to_string(), Scalar::String(region.to_string()))]);
         snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values)
