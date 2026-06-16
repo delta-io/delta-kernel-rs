@@ -25,7 +25,6 @@ use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
-use delta_kernel::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use delta_kernel::schema::DataType;
 use delta_kernel::{DeltaResult, Error, Predicate};
 
@@ -152,15 +151,6 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
         .map_err(|e| Error::Generic(format!("opaque eval batch construction: {e}")))
 }
 
-/// True if `expr` is a `partitionValues_parsed.<col>` reference (kernel's signal that the
-/// column is partition-typed). Partition-only stats batches omit `stats_parsed` entirely.
-fn is_partition_column_ref(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::Column(name) if name.path().first().is_some_and(|p| p == PARTITION_VALUES_PARSED_NAME)
-    )
-}
-
 /// Lift a column type hint from the first `Literal` arg (kernel-native lifts the same way from
 /// the right-hand `Scalar` in `col < val`). Returns `None` when there's no literal to borrow.
 fn pick_column_type_hint(exprs: &[Expression]) -> Option<DataType> {
@@ -175,7 +165,7 @@ fn pick_column_type_hint(exprs: &[Expression]) -> Option<DataType> {
 /// recurses through kernel's standard data-skipping evaluator.
 ///
 /// Returns `None` (abstaining the whole predicate) when the arg can't be expressed against stats:
-/// an unsupported expression kind, or a data `Column` with no sibling literal to infer its type.
+/// an unsupported expression kind, or a `Column` with no sibling literal to infer its type.
 fn rewrite_stat_arg(
     evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
     arg: &Expression,
@@ -184,38 +174,14 @@ fn rewrite_stat_arg(
     let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
     match arg {
         Expression::Column(col) => {
-            // Classify the column by probing `get_min_stat` with an arbitrary type (LONG).
-            // Partition columns must be detected before the type-hint check below: they don't
-            // need a hint, so a partition-only predicate like `OP(part_col)` must not abstain
-            // just because no sibling literal exists. The probe works because kernel answers a
-            // partition column with a `partitionValues_parsed.<col>` reference regardless of the
-            // requested type; that prefix is the classification signal. For data columns the
-            // probe result is discarded -- their stats refs are rebuilt with the real type.
-            let probe = evaluator.get_min_stat(col, &DataType::LONG);
-            let (min, max, is_partition_col) = match probe.filter(is_partition_column_ref) {
-                // A partition value is exact (every row in the file shares it), so the same
-                // reference serves as both bounds.
-                Some(partition_min) => {
-                    let max = partition_min.clone();
-                    (partition_min, max, true)
-                }
-                // Data column: reading min/max stats requires the column type, which we lift from
-                // a sibling literal. With no literal the type is unknown, so we abstain. With a
-                // type but no stats collected for the column, min/max fall back to null and the
-                // engine prunes on nullcount/rowcount alone.
-                None => {
-                    let ty = type_hint?;
-                    let min = evaluator.get_min_stat(col, ty).unwrap_or_else(null_long);
-                    let max = evaluator.get_max_stat(col, ty).unwrap_or_else(null_long);
-                    (min, max, false)
-                }
-            };
+            // One typed path for both column kinds: the evaluator returns the exact partition
+            // value for a partition column (ignoring the type) and `minValues`/`maxValues` refs
+            // for a data column. With no sibling literal to supply the type, abstain.
+            let ty = type_hint?;
+            let min = evaluator.get_min_stat(col, ty).unwrap_or_else(null_long);
+            let max = evaluator.get_max_stat(col, ty).unwrap_or_else(null_long);
             let nullcount = evaluator.get_nullcount_stat(col).unwrap_or_else(null_long);
-            let rowcount = if is_partition_col {
-                null_long()
-            } else {
-                evaluator.get_rowcount_stat().unwrap_or_else(null_long)
-            };
+            let rowcount = evaluator.get_rowcount_stat().unwrap_or_else(null_long);
             Some(Expression::struct_from([min, max, nullcount, rowcount]))
         }
         Expression::Literal(_) => Some(arg.clone()),
@@ -1368,10 +1334,11 @@ mod tests {
             );
         }
 
-        /// Partition columns get typed-null rowcount; a `stats_parsed.numRecords` ref would
-        /// fail against partition-only batches that omit `stats_parsed`.
+        /// A partition column goes through the same path as a data column: it resolves to its
+        /// exact value as both min and max, with the uniform `numRecords` rowcount ref (no
+        /// partition special-case).
         #[test]
-        fn partition_column_rewrites_with_null_rowcount() {
+        fn partition_column_rewrites_to_exact_value_bounds() {
             let op = op_with_callbacks("OP");
             let args = [column_expr!("part_col"), Expression::literal("X")];
             let pred = rewrite(&op, &args, &partition_rewriter(), false)
@@ -1383,12 +1350,11 @@ mod tests {
                 panic!("expected Struct arg, got {:?}", opaque.exprs[0]);
             };
             assert_eq!(fields.len(), 4);
+            // Exact partition value serves as both bounds.
             assert_eq!(*fields[0], partition_col(&ColumnName::new(["part_col"])));
             assert_eq!(*fields[1], partition_col(&ColumnName::new(["part_col"])));
-            assert_eq!(
-                *fields[3],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
+            // Rowcount is the same `numRecords` ref as for data columns.
+            assert_eq!(*fields[3], stats_col_numrecords());
         }
 
         #[test]
