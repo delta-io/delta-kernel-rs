@@ -1,10 +1,4 @@
 //! Shared read helpers for integration tests.
-//!
-//! Each integration test file compiles as its own test binary and uses only a subset of these
-//! helpers; the blanket `#![allow(dead_code)]` suppresses the per-binary dead-code warnings that
-//! the unused subset would otherwise generate.
-
-#![allow(dead_code)]
 
 use std::fs::File;
 
