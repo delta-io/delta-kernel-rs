@@ -174,17 +174,10 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "void_007_void_with_backticks/specs/void_007_void_with_backticks_read_all",
         ],
     ),
+    // Partitioned interval columns need a Scalar::Interval to materialize, not yet supported.
     (
-        "Interval reads not yet supported in the default engine",
-        &[
-            "intv_001_interval_ym_basic/specs/intv_001_interval_ym_basic_read_all",
-            "intv_002_interval_dt_basic/specs/intv_002_interval_dt_basic_read_all",
-            "intv_003_interval_partitioned/specs/intv_003_interval_partitioned_read_all",
-            "intv_004_interval_negative/specs/intv_004_interval_negative_read_all",
-            "intv_005_interval_mixed/specs/intv_005_interval_mixed_read_all",
-            "intv_boundary_values/specs/intv_boundary_values_read_all",
-            "intv_sub_second/specs/intv_sub_second_read_all",
-        ],
+        "Interval partition values not supported (needs Scalar::Interval)",
+        &["intv_003_interval_partitioned/specs/intv_003_interval_partitioned_read_all"],
     ),
     (
         "Cannot fall back to log replay when checkpoint files are missing or incomplete",
