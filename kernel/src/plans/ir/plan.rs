@@ -379,8 +379,7 @@ impl PlanBuilder {
         let Some(b) = build.0 else {
             return self.record(inverted.then_some(p));
         };
-        let (probe_keys, build_keys): (Vec<_>, Vec<_>) =
-            key_pairs.into_iter().unzip();
+        let (probe_keys, build_keys): (Vec<_>, Vec<_>) = key_pairs.into_iter().unzip();
         self.append(
             Operator::SemiJoin(SemiJoin {
                 inverted,

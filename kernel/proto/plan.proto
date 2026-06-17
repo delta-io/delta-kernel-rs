@@ -84,7 +84,8 @@ message LoadNode {
 }
 
 // One aggregate function application (mirrors `Agg` / `AggOp` in nodes.rs). `value` is the column
-// whose value is emitted; `order` is the ordering column for the `*_by` functions.
+// whose value is emitted; `key` is the comparison column for the `*_by` functions (the row with the
+// least/greatest `key` wins).
 message MinAgg {
   delta.kernel.expressions.ColumnName value = 1;
 }
@@ -93,11 +94,11 @@ message MaxAgg {
 }
 message MinByAgg {
   delta.kernel.expressions.ColumnName value = 1;
-  delta.kernel.expressions.ColumnName order = 2;
+  delta.kernel.expressions.ColumnName key = 2;
 }
 message MaxByAgg {
   delta.kernel.expressions.ColumnName value = 1;
-  delta.kernel.expressions.ColumnName order = 2;
+  delta.kernel.expressions.ColumnName key = 2;
 }
 
 message AggOp {

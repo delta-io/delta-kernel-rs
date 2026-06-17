@@ -498,7 +498,7 @@ impl Aggregate {
 /// non-empty group:
 /// - [`min`](Self::min) / [`max`](Self::max): nullable iff the value column is nullable.
 /// - [`min_by`](Self::min_by) / [`max_by`](Self::max_by): nullable iff the value column or the
-///   ordering column is nullable.
+///   key column is nullable.
 #[derive(Debug, Clone)]
 pub struct Agg {
     /// The aggregate function and its operand column(s).
@@ -524,19 +524,19 @@ impl Agg {
         }))
     }
 
-    /// `min_by(value, order)`: the `value` from the row with the least non-null `order`.
-    pub fn min_by(value: impl Into<ColumnName>, order: impl Into<ColumnName>) -> Self {
+    /// `min_by(value, key)`: the `value` from the row with the least non-null `key`.
+    pub fn min_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
         Self::new(AggOp::MinBy(MinBy {
             value: value.into(),
-            order: order.into(),
+            key: key.into(),
         }))
     }
 
-    /// `max_by(value, order)`: the `value` from the row with the greatest non-null `order`.
-    pub fn max_by(value: impl Into<ColumnName>, order: impl Into<ColumnName>) -> Self {
+    /// `max_by(value, key)`: the `value` from the row with the greatest non-null `key`.
+    pub fn max_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
         Self::new(AggOp::MaxBy(MaxBy {
             value: value.into(),
-            order: order.into(),
+            key: key.into(),
         }))
     }
 
@@ -610,18 +610,18 @@ pub struct Max {
     pub value: ColumnName,
 }
 
-/// `min_by(value, order)` operands.
+/// `min_by(value, key)` operands.
 #[derive(Debug, Clone)]
 pub struct MinBy {
     pub value: ColumnName,
-    pub order: ColumnName,
+    pub key: ColumnName,
 }
 
-/// `max_by(value, order)` operands.
+/// `max_by(value, key)` operands.
 #[derive(Debug, Clone)]
 pub struct MaxBy {
     pub value: ColumnName,
-    pub order: ColumnName,
+    pub key: ColumnName,
 }
 
 impl AggOp {
@@ -641,8 +641,8 @@ impl AggOp {
         let value_nullable = input_schema.field_at(self.value())?.nullable;
         let nullable = match self {
             AggOp::Min(_) | AggOp::Max(_) => value_nullable,
-            AggOp::MinBy(MinBy { order, .. }) | AggOp::MaxBy(MaxBy { order, .. }) => {
-                value_nullable || input_schema.field_at(order)?.nullable
+            AggOp::MinBy(MinBy { key, .. }) | AggOp::MaxBy(MaxBy { key, .. }) => {
+                value_nullable || input_schema.field_at(key)?.nullable
             }
         };
         Ok(nullable)
@@ -842,13 +842,13 @@ mod tests {
     #[rstest::rstest]
     #[case::both_nonnull(false, false, false)]
     #[case::value_nullable(true, false, true)]
-    #[case::order_nullable(false, true, true)]
-    fn grouped_max_by_nullable_iff_value_or_order_nullable(
+    #[case::key_nullable(false, true, true)]
+    fn grouped_max_by_nullable_iff_value_or_key_nullable(
         #[case] value_nullable: bool,
-        #[case] order_nullable: bool,
+        #[case] key_nullable: bool,
         #[case] expected: bool,
     ) {
-        let input = schema(&[("g", false), ("a", value_nullable), ("v", order_nullable)]);
+        let input = schema(&[("g", false), ("a", value_nullable), ("v", key_nullable)]);
         let agg = Aggregate::group_by(input, [column_name!("g")])
             .aggregate(Agg::max_by(column_name!("a"), column_name!("v")))
             .build()
