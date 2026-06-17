@@ -1592,15 +1592,10 @@ mod tests {
     }
 
     enum EarliestCommitTableSetupScenario {
-        /// Filesystem-only table with a single v0 metadata commit.
-        Filesystem,
-        /// Catalog-managed table with a single v0 metadata commit.
-        CatalogManaged,
-        /// Filesystem table with commits at versions 2-4 (no commit 0) plus a mocked checkpoint at
-        /// version 4.
-        CheckpointWithLogCleanUp,
-        /// Empty store -- the log directory contains no commits.
-        Empty,
+        FilesystemV0Commit,
+        CatalogManagedV0Commit,
+        FilesystemV4CheckpointWithEarliestCommitAtV2,
+        NoCommits,
     }
 
     async fn setup_earliest_commit_table(
@@ -1608,19 +1603,19 @@ mod tests {
         table_root: &str,
     ) -> Handle<SharedExternEngine> {
         match setup {
-            EarliestCommitTableSetupScenario::Filesystem => {
+            EarliestCommitTableSetupScenario::FilesystemV0Commit => {
                 let (_, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await.unwrap();
                 unsafe { free_snapshot(snapshot) };
                 engine
             }
-            EarliestCommitTableSetupScenario::CatalogManaged => {
+            EarliestCommitTableSetupScenario::CatalogManagedV0Commit => {
                 let (_, engine, snapshot) = make_catalog_managed_engine_and_v0_snapshot(table_root)
                     .await
                     .unwrap();
                 unsafe { free_snapshot(snapshot) };
                 engine
             }
-            EarliestCommitTableSetupScenario::CheckpointWithLogCleanUp => {
+            EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2 => {
                 let storage = Arc::new(InMemory::new());
                 for version in 2..=4 {
                     add_commit(
@@ -1647,43 +1642,49 @@ mod tests {
                     allocate_err,
                 )
             }
-            EarliestCommitTableSetupScenario::Empty => get_default_engine(table_root),
+            EarliestCommitTableSetupScenario::NoCommits => get_default_engine(table_root),
         }
     }
 
     #[rstest]
     #[case::fs_published(
-        EarliestCommitTableSetupScenario::Filesystem,
+        EarliestCommitTableSetupScenario::FilesystemV0Commit,
         OptionalValue::None,
         FfiHistoryCommitType::Published,
         Ok(0)
     )]
     #[case::fs_recreatable(
-        EarliestCommitTableSetupScenario::Filesystem,
+        EarliestCommitTableSetupScenario::FilesystemV0Commit,
         OptionalValue::None,
         FfiHistoryCommitType::Recreatable,
         Ok(0)
     )]
     #[case::cm_ratified_zero(
-        EarliestCommitTableSetupScenario::CatalogManaged,
+        EarliestCommitTableSetupScenario::CatalogManagedV0Commit,
         OptionalValue::Some(0),
         FfiHistoryCommitType::Published,
         Ok(0)
     )]
+    #[case::cm_with_empty_delta_log(
+        EarliestCommitTableSetupScenario::NoCommits,
+        OptionalValue::Some(0),
+        FfiHistoryCommitType::Published,
+        Err(KernelError::GenericError)
+    )]
     #[case::empty_log_errors(
-        EarliestCommitTableSetupScenario::Empty,
+        EarliestCommitTableSetupScenario::NoCommits,
         OptionalValue::None,
         FfiHistoryCommitType::Published,
         Err(KernelError::LogHistoryError)
     )]
     #[case::checkpoint_published(
-        EarliestCommitTableSetupScenario::CheckpointWithLogCleanUp,
+        EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2,
         OptionalValue::None,
         FfiHistoryCommitType::Published,
         Ok(2)
     )]
     #[case::checkpoint_recreatable(
-        EarliestCommitTableSetupScenario::CheckpointWithLogCleanUp,
+        EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2,
         OptionalValue::None,
         FfiHistoryCommitType::Recreatable,
         Ok(4)
