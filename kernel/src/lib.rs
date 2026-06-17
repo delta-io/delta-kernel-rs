@@ -966,11 +966,10 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`PlanExecutor`].
     ///
-    /// The default implementation panics for now because the feature is still under development.
+    /// The default implementation returns a trivial executor that errors on every operation.
     #[cfg(feature = "declarative-plans")]
-    #[allow(clippy::panic)]
     fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
-        unimplemented!("this engine does not provide a PlanExecutor")
+        Arc::new(())
     }
 }
 
