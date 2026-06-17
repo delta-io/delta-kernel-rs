@@ -2,7 +2,7 @@
 //!
 //! - [`operation`] -- top-level [`Operation`] dispatch (I/O vs query) consumed by
 //!   [`PlanExecutor`](super::PlanExecutor).
-//! - [`nodes`] -- the plan nodes: [`nodes::NodeKind`] and its payload structs.
+//! - [`nodes`] -- the plan nodes: [`nodes::Operator`] and its payload structs.
 //! - [`plan`] -- plan topology: [`plan::Plan`] holds a sequence of [`plan::PlanNode`]s wired into a
 //!   DAG by their [`plan::RefId`] inputs and outputs.
 pub mod nodes;

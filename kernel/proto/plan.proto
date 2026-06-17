@@ -99,11 +99,11 @@ message SemiJoinNode {
 }
 
 // ============================================================================
-// NodeKind
+// Operator
 // ============================================================================
 
-message NodeKind {
-  oneof kind {
+message Operator {
+  oneof op {
     // Sources (0 inputs)
     ScanParquetNode scan_parquet = 1;
     ScanJsonNode scan_json = 2;
@@ -123,7 +123,7 @@ message NodeKind {
 // ============================================================================
 
 message PlanNode {
-  NodeKind kind = 1;
+  Operator op = 1;
   repeated RefId inputs = 2;
   RefId output = 3;
 }

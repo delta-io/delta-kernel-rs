@@ -8,7 +8,7 @@
 //!   ...).
 //! - [`expressions`] -- mirror of `kernel/src/expressions/mod.rs` and `scalars.rs` (`Expression`,
 //!   `Predicate`, `Scalar`, `ColumnName`, ...).
-//! - [`plan`] -- mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (`Plan`, `PlanNode`, `NodeKind`,
+//! - [`plan`] -- mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (`Plan`, `PlanNode`, `Operator`,
 //!   `RefId`, per-variant payload messages).
 
 pub mod schema {
