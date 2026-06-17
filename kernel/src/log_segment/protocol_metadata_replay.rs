@@ -13,7 +13,11 @@ use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
 use crate::metrics::SnapshotLoadMetricContext;
-use crate::{DeltaResult, Engine, Error};
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{Operation, Plan};
+#[cfg(feature = "declarative-plans")]
+use crate::schema::SchemaRef;
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -122,9 +126,251 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<DeltaResultIteratorStatic<ActionsBatch>> {
         let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        self.read_actions(engine, schema)
+
+        // Best-effort declarative path: when the engine provides a plan executor that can run the
+        // P&M query plan, use it; otherwise fall back to direct log replay. The default unit-type
+        // executor (and any executor that cannot yet run multi-node plans) errors, which triggers
+        // the same fallback transparently.
+        #[cfg(feature = "declarative-plans")]
+        if let Some(batches) = self.read_pm_batches_via_plan(engine, &schema) {
+            return Ok(batches);
+        }
+
+        Ok(Box::new(self.read_actions(engine, schema)?))
+    }
+}
+
+#[cfg(feature = "declarative-plans")]
+impl LogSegment {
+    /// Best-effort execution of the declarative P&M query plan. Returns `None` -- signaling the
+    /// caller to fall back to [`Self::read_actions`] -- when the plan cannot be built or the
+    /// engine's [`PlanExecutor`](crate::plans::PlanExecutor) cannot run it (including the default
+    /// unit-type executor, which errors on every operation).
+    fn read_pm_batches_via_plan(
+        &self,
+        engine: &dyn Engine,
+        pm_schema: &SchemaRef,
+    ) -> Option<DeltaResultIteratorStatic<ActionsBatch>> {
+        match self.try_execute_pm_plan(engine, pm_schema) {
+            Ok(batches) => Some(batches),
+            Err(err) => {
+                info!("declarative P&M plan unavailable, using direct replay: {err}");
+                None
+            }
+        }
+    }
+
+    /// Builds and executes the declarative P&M plan, mapping its output to commit
+    /// [`ActionsBatch`]es.
+    fn try_execute_pm_plan(
+        &self,
+        engine: &dyn Engine,
+        pm_schema: &SchemaRef,
+    ) -> DeltaResult<DeltaResultIteratorStatic<ActionsBatch>> {
+        let Some(plan) = self.build_pm_query_plan(pm_schema.clone())? else {
+            return Ok(Box::new(std::iter::empty()));
+        };
+        let batches = engine
+            .plan_executor()
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|batch| Ok(ActionsBatch::new(batch?, true)));
+        Ok(Box::new(batches))
+    }
+
+    /// Gathers this segment's checkpoint (parquet) and commit (json) files -- each tagged with its
+    /// version as a file constant -- into the declarative P&M query plan (see
+    /// [`query_plan::build_pm_plan`]).
+    ///
+    /// Compaction files are intentionally skipped: a single file constant cannot stand in for the
+    /// multiple commit versions a compaction spans, and the individual commit files already cover
+    /// the full version range.
+    fn build_pm_query_plan(&self, pm_schema: SchemaRef) -> DeltaResult<Option<Plan>> {
+        query_plan::build_pm_plan(
+            self.listed
+                .checkpoint_parts
+                .iter()
+                .map(query_plan::version_tagged_scan_file)
+                .collect(),
+            self.listed
+                .ascending_commit_files
+                .iter()
+                .map(query_plan::version_tagged_scan_file)
+                .collect(),
+            pm_schema,
+        )
+    }
+}
+
+// === Declarative Protocol & Metadata query plan ===
+//
+// WIP: `read_pm_batches` builds this plan and hands it to the engine's plan executor on a
+// best-effort basis, falling back to direct log replay when no executor can run it. The default
+// unit-type executor, and any executor that does not yet support multi-node union/aggregate plans,
+// error and thereby trigger that fallback.
+#[cfg(feature = "declarative-plans")]
+mod query_plan {
+    use std::sync::Arc;
+
+    use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
+    use crate::expressions::{ColumnName, Expression, Scalar};
+    use crate::path::ParsedLogPath;
+    use crate::plans::ir::nodes::{Agg, Aggregate, ScanFile};
+    use crate::plans::{Plan, PlanBuilder};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::{DeltaResult, Predicate};
+
+    /// Synthetic file-constant column carrying each file's commit/checkpoint version. It exists
+    /// only to order the `max_by` aggregates and is not emitted by the plan (the aggregate
+    /// projects away everything but the winning Protocol and Metadata).
+    const VERSION_COLUMN: &str = "version";
+
+    /// Builds the declarative Protocol & Metadata query plan over already-resolved scan files:
+    ///
+    /// ```text
+    /// ScanParquet(checkpoint)   ScanJson(commits)
+    ///            \                   /
+    ///             \                 /
+    ///              v               v
+    ///                 UnionAll
+    ///                    |
+    ///                    v
+    ///   Aggregate: max_by(protocol, version) FILTER (protocol IS NOT NULL),
+    ///              max_by(metaData, version) FILTER (metaData IS NOT NULL)
+    /// ```
+    ///
+    /// Returns `Ok(None)` when there are no files to scan (an empty plan). `pm_schema` is the
+    /// Protocol/Metadata projection; the scans additionally expose [`VERSION_COLUMN`].
+    pub(crate) fn build_pm_plan(
+        checkpoint_files: Vec<ScanFile>,
+        commit_files: Vec<ScanFile>,
+        pm_schema: SchemaRef,
+    ) -> DeltaResult<Option<Plan>> {
+        let scan_schema = scan_schema_with_version(&pm_schema)?;
+        let version_columns = vec![ColumnName::new([VERSION_COLUMN])];
+
+        let mut builder = PlanBuilder::new();
+        let checkpoint = builder.scan_parquet(
+            checkpoint_files,
+            version_columns.clone(),
+            scan_schema.clone(),
+        )?;
+        let commits = builder.scan_json(commit_files, version_columns, scan_schema.clone())?;
+        let source = builder.union_all([checkpoint, commits])?;
+
+        let version = ColumnName::new([VERSION_COLUMN]);
+        builder.aggregate(
+            source,
+            Aggregate::group_by(scan_schema, [])
+                .aggregate(newest_by_version(PROTOCOL_NAME, &version))
+                .aggregate(newest_by_version(METADATA_NAME, &version)),
+        )?;
+        builder.build()
+    }
+
+    /// `max_by(<action>, version) FILTER (<action> IS NOT NULL)`: the `<action>` value from the
+    /// newest commit that actually carries one. The filter excludes rows missing the action so a
+    /// later commit that omits it does not shadow an earlier one that has it.
+    fn newest_by_version(action: &str, version: &ColumnName) -> Agg {
+        let action = ColumnName::new([action]);
+        let present = Predicate::is_not_null(Expression::column(action.clone()));
+        Agg::max_by(action, version.clone()).filter(present)
+    }
+
+    /// Returns `pm_schema` extended with the synthetic, non-null [`VERSION_COLUMN`] (`LONG`).
+    fn scan_schema_with_version(pm_schema: &StructType) -> DeltaResult<SchemaRef> {
+        let mut fields = Vec::from_iter(pm_schema.fields().cloned());
+        fields.push(StructField::not_null(VERSION_COLUMN, DataType::LONG));
+        Ok(Arc::new(StructType::try_new(fields)?))
+    }
+
+    /// Builds a [`ScanFile`] for `path`, tagging it with its log version as the [`VERSION_COLUMN`]
+    /// file constant so the plan's `max_by(version)` aggregates can order rows across files.
+    pub(crate) fn version_tagged_scan_file(path: &ParsedLogPath) -> ScanFile {
+        ScanFile {
+            meta: path.location.clone(),
+            file_constants: vec![Scalar::Long(path.version as i64)],
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::actions::get_commit_schema;
+        use crate::expressions::Scalar;
+        use crate::plans::ir::nodes::{AggOp, Operator};
+        use crate::{FileMeta, Version};
+
+        fn pm_schema() -> SchemaRef {
+            get_commit_schema()
+                .project(&[PROTOCOL_NAME, METADATA_NAME])
+                .unwrap()
+        }
+
+        fn scan_file(name: &str, version: Version) -> ScanFile {
+            ScanFile {
+                meta: FileMeta {
+                    location: url::Url::parse(&format!("memory:///{name}")).unwrap(),
+                    last_modified: 0,
+                    size: 0,
+                },
+                file_constants: vec![Scalar::Long(version as i64)],
+            }
+        }
+
+        #[test]
+        fn build_pm_plan_wires_scans_union_and_aggregate() {
+            let plan = build_pm_plan(
+                vec![scan_file("checkpoint.parquet", 1)],
+                vec![scan_file("2.json", 2), scan_file("3.json", 3)],
+                pm_schema(),
+            )
+            .unwrap()
+            .expect("non-empty plan");
+
+            let nodes = plan.into_nodes();
+            // ScanParquet[0], ScanJson[1], UnionAll[2], Aggregate[3] (terminal).
+            assert_eq!(nodes.len(), 4);
+            assert!(matches!(nodes[0].op, Operator::ScanParquet(_)));
+            assert!(matches!(nodes[1].op, Operator::ScanJson(_)));
+            assert!(matches!(nodes[2].op, Operator::UnionAll));
+            assert_eq!(nodes[2].inputs, vec![0, 1]);
+
+            let Operator::Aggregate(agg) = &nodes[3].op else {
+                panic!("expected Aggregate terminal, got {:?}", nodes[3].op);
+            };
+            assert_eq!(nodes[3].inputs, vec![2]);
+            // Global aggregate (no group keys) producing newest protocol + metaData by version.
+            assert!(agg.group_by.is_empty());
+            assert!(agg
+                .aggs
+                .iter()
+                .all(|a| matches!(a.op, AggOp::MaxBy(_)) && a.filter.is_some()));
+            let out: Vec<&str> = agg.schema.fields().map(|f| f.name().as_str()).collect();
+            assert_eq!(out, [PROTOCOL_NAME, METADATA_NAME]);
+        }
+
+        #[test]
+        fn build_pm_plan_with_no_files_is_empty() {
+            assert!(build_pm_plan(vec![], vec![], pm_schema())
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn build_pm_plan_with_only_commits_skips_union() {
+            let plan = build_pm_plan(vec![], vec![scan_file("0.json", 0)], pm_schema())
+                .unwrap()
+                .expect("non-empty plan");
+            let nodes = plan.into_nodes();
+            // Union over a single arm collapses, so only ScanJson[0] and Aggregate[1] remain.
+            assert_eq!(nodes.len(), 2);
+            assert!(matches!(nodes[0].op, Operator::ScanJson(_)));
+            assert!(matches!(nodes[1].op, Operator::Aggregate(_)));
+            assert_eq!(nodes[1].inputs, vec![0]);
+        }
     }
 }
 

@@ -3,11 +3,10 @@
 //! This module is opt-in behind the `declarative-plans` feature flag.
 pub mod ir;
 pub mod proto;
-mod query_builder;
 
 use bytes::Bytes;
+pub use ir::plan::{Plan, PlanBuilder, RefId};
 pub use ir::{IoOperation, Operation};
-pub use query_builder::QueryPlanBuilder;
 
 use crate::{
     AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,
@@ -20,6 +19,17 @@ use crate::{
 pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult>;
+}
+
+/// The unit type is a trivial [`PlanExecutor`] that rejects every operation. It backs
+/// [`Engine::plan_executor`](crate::Engine::plan_executor)'s default so callers can attempt plan
+/// execution unconditionally and fall back on the resulting error when no real executor exists.
+impl PlanExecutor for () {
+    fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
+        Err(Error::unsupported(
+            "this engine does not provide a PlanExecutor",
+        ))
+    }
 }
 
 /// The result of executing an [`Operation`].

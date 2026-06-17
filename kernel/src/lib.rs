@@ -187,7 +187,7 @@ use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
-pub use plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanBuilder};
+pub use plans::{IoOperation, Operation, Plan, PlanBuilder, PlanExecutor, PlanResult, RefId};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -966,11 +966,10 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`PlanExecutor`].
     ///
-    /// The default implementation panics for now because the feature is still under development.
+    /// The default implementation returns a trivial executor that errors on every operation.
     #[cfg(feature = "declarative-plans")]
-    #[allow(clippy::panic)]
     fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
-        unimplemented!("this engine does not provide a PlanExecutor")
+        Arc::new(())
     }
 }
 

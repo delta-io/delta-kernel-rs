@@ -14,7 +14,7 @@ use super::json::SyncJsonHandler;
 use super::parquet::SyncParquetHandler;
 use super::storage::SyncStorageHandler;
 use crate::object_store::DynObjectStore;
-use crate::plans::ir::nodes::{NodeKind, ScanJson, ScanParquet};
+use crate::plans::ir::nodes::{Operator, ScanJson, ScanParquet};
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::{
@@ -106,19 +106,19 @@ impl SyncPlanExecutor {
 
     fn execute_query(&self, query: Plan) -> DeltaResult<PlanResult> {
         let node = into_single_node_plan(query)?;
-        match node.kind {
-            NodeKind::ScanJson(ScanJson { files, schema, .. }) => {
+        match node.op {
+            Operator::ScanJson(ScanJson { files, schema, .. }) => {
                 let files: Vec<FileMeta> = files.into_iter().map(|f| f.meta).collect();
                 let iter = self.json.read_json_files(&files, schema, None)?;
                 Ok(PlanResult::Data(iter))
             }
-            NodeKind::ScanParquet(ScanParquet { files, schema, .. }) => {
+            Operator::ScanParquet(ScanParquet { files, schema, .. }) => {
                 let files: Vec<FileMeta> = files.into_iter().map(|f| f.meta).collect();
                 let iter = self.parquet.read_parquet_files(&files, schema, None)?;
                 Ok(PlanResult::Data(iter))
             }
             other => Err(Error::generic(format!(
-                "SyncPlanExecutor only supports ScanJson / ScanParquet, got NodeKind::{other}",
+                "SyncPlanExecutor only supports ScanJson / ScanParquet, got Operator::{other}",
             ))),
         }
     }
@@ -126,7 +126,7 @@ impl SyncPlanExecutor {
 
 /// Returns the plan's sole [`PlanNode`], erroring if it is not a single-node plan.
 fn into_single_node_plan(plan: Plan) -> DeltaResult<PlanNode> {
-    let [node] = <[_; 1]>::try_from(plan.nodes).map_err(|nodes: Vec<_>| {
+    let [node] = <[_; 1]>::try_from(plan.into_nodes()).map_err(|nodes: Vec<_>| {
         Error::generic(format!(
             "expected single-node plan, got {} nodes",
             nodes.len()

@@ -8,8 +8,8 @@
 //!   ...).
 //! - [`expressions`] -- mirror of `kernel/src/expressions/mod.rs` and `scalars.rs` (`Expression`,
 //!   `Predicate`, `Scalar`, `ColumnName`, ...).
-//! - [`plan`] -- mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (`Plan`, `PlanNode`, `NodeKind`,
-//!   `RefId`, per-variant payload messages).
+//! - [`plan`] -- mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (`Plan`, `PlanNode`, `Operator`,
+//!   per-variant payload messages).
 
 pub mod schema {
     include!(concat!(env!("OUT_DIR"), "/delta.kernel.schema.rs"));

@@ -1198,3 +1198,257 @@ pub fn selection_vector(
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }
+
+// === Declarative scan-replay query plan (no data skipping or partition pruning) ===
+//
+// WIP: this builds the declarative scan-replay plan but does not yet execute it. It is the simpler
+// of the planned scan-replay implementations; a separate pruning-aware plan will be added alongside
+// it (not replacing it). Only construction is exercised here (by the unit tests); wiring into
+// `scan_metadata` execution lands later. It carries two limitations from its origin: path-only
+// replay keys (no `(path, dvid)` deletion-vector expansion) and per-commit file gathering (the
+// compaction-aware cover is a later optimization).
+#[cfg(feature = "declarative-plans")]
+mod scan_plan {
+    #![allow(dead_code)]
+
+    use std::sync::Arc;
+
+    use super::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
+    use crate::actions::{ADD_NAME, REMOVE_NAME};
+    use crate::expressions::{
+        column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef,
+        Predicate, PredicateRef,
+    };
+    use crate::plans::ir::nodes::{Agg, Aggregate, ScanFile};
+    use crate::plans::{Plan, PlanBuilder};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::{DeltaResult, Error};
+
+    /// File-constant column carrying each file's commit/checkpoint version. It orders the
+    /// `max_by(version)` dedup and is not part of the final scan output.
+    const VERSION_COLUMN: &str = "version";
+
+    /// Replay key derived from `coalesce(add.path, remove.path)`: the table path an add or remove
+    /// action operates on. Path-only for now; `(path, dvid)` expansion is a follow-up.
+    const REPLAY_KEY_COLUMN: &str = "replay_key_path";
+
+    /// Builds the no-pruning scan-replay plan over already-resolved scan files:
+    ///
+    /// ```text
+    ///   ScanJson(commits)                              ScanParquet(checkpoint)
+    ///         |                                                |
+    ///   Project(version, add, remove, replay_key_path)   Filter(add IS NOT NULL)
+    ///         |                                                |
+    ///   Aggregate group_by replay_key_path:                   |
+    ///     max_by(add, version)    FILTER (add IS NOT NULL),    |
+    ///     max_by(remove, version) FILTER (remove IS NOT NULL)  |
+    ///         |  \                                             |
+    ///         |   \------------------ build --------------> AntiJoin(add.path = replay_key_path)
+    ///   Filter(add IS NOT NULL)                                |
+    ///          \                                              /
+    ///           \------------------ UnionAll ----------------/
+    /// ```
+    ///
+    /// Returns `Ok(None)` when there are no files to scan. Degenerate inputs collapse via the
+    /// builder's absence algebra: with no commits the anti join forwards the checkpoint adds; with
+    /// no checkpoint the anti join (and its arm of the union) drop away, leaving the commit adds.
+    pub(crate) fn build_scan_replay_plan(
+        checkpoint_files: Vec<ScanFile>,
+        commit_files: Vec<ScanFile>,
+    ) -> DeltaResult<Option<Plan>> {
+        let version = ColumnName::new([VERSION_COLUMN]);
+        let version_columns = vec![version.clone()];
+        let commit_scan_schema = schema_with_version(&COMMIT_READ_SCHEMA);
+        let checkpoint_scan_schema = schema_with_version(&CHECKPOINT_READ_SCHEMA);
+        let commit_keyed_schema = commit_keyed_schema()?;
+
+        let mut builder = PlanBuilder::new();
+
+        // Commit side: dedup add/remove actions by replay key, keeping the newest by version. Used
+        // twice (the final commit adds, and the anti-join build side), so it is never orphaned.
+        let commits =
+            builder.scan_json(commit_files, version_columns.clone(), commit_scan_schema)?;
+        let commit_keyed =
+            builder.project(commits, commit_keyed_expr(), commit_keyed_schema.clone())?;
+        let commit_deduped = builder.aggregate(
+            commit_keyed,
+            Aggregate::group_by(commit_keyed_schema, [column_name!("replay_key_path")])
+                .aggregate(newest_non_null(ADD_NAME, &version))
+                .aggregate(newest_non_null(REMOVE_NAME, &version)),
+        )?;
+        let commit_adds = builder.filter(commit_deduped, add_is_not_null())?;
+
+        // Checkpoint side: keep adds not shadowed by any surviving commit action for the same path.
+        let checkpoint =
+            builder.scan_parquet(checkpoint_files, version_columns, checkpoint_scan_schema)?;
+        let checkpoint_adds = builder.filter(checkpoint, add_is_not_null())?;
+        let checkpoint_live = builder.anti_join(
+            checkpoint_adds,
+            commit_deduped,
+            [(column_name!("add.path"), column_name!("replay_key_path"))],
+        )?;
+
+        // Both arms still carry their dedup scaffolding (the commit arm its replay key and remove,
+        // the checkpoint arm its version). Project each down to the surviving `add` column so the
+        // union arms share a schema; everything else has served its purpose by now.
+        let add_only = add_only_schema()?;
+        let add_expr: ExpressionRef = Arc::new(Expression::struct_from([column_expr_ref!("add")]));
+        let commit_adds = builder.project(commit_adds, add_expr.clone(), add_only.clone())?;
+        let checkpoint_live = builder.project(checkpoint_live, add_expr, add_only)?;
+
+        builder.union_all([commit_adds, checkpoint_live])?;
+        builder.build()
+    }
+
+    /// `max_by(<action>, version) FILTER (<action> IS NOT NULL)`: the `<action>` value from the
+    /// newest commit that carries one, so a later commit omitting it does not shadow an earlier
+    /// one.
+    fn newest_non_null(action: &str, version: &ColumnName) -> Agg {
+        let action = ColumnName::new([action]);
+        let present = Predicate::is_not_null(Expression::column(action.clone()));
+        Agg::max_by(action, version.clone()).filter(present)
+    }
+
+    /// `add IS NOT NULL`: selects rows whose surviving action is an add.
+    fn add_is_not_null() -> PredicateRef {
+        Arc::new(Predicate::is_not_null(column_expr!("add")))
+    }
+
+    /// Projects scanned commit rows to `(version, add, remove, replay_key_path)`, deriving the
+    /// replay key from `coalesce(add.path, remove.path)`.
+    fn commit_keyed_expr() -> ExpressionRef {
+        Arc::new(Expression::struct_from([
+            column_expr_ref!("version"),
+            column_expr_ref!("add"),
+            column_expr_ref!("remove"),
+            Arc::new(Expression::coalesce([
+                column_expr!("add.path"),
+                column_expr!("remove.path"),
+            ])),
+        ]))
+    }
+
+    /// Returns `schema` extended with the synthetic, non-null [`VERSION_COLUMN`] (`LONG`).
+    fn schema_with_version(schema: &SchemaRef) -> SchemaRef {
+        let mut fields: Vec<StructField> = schema.fields().cloned().collect();
+        fields.push(StructField::not_null(VERSION_COLUMN, DataType::LONG));
+        Arc::new(StructType::new_unchecked(fields))
+    }
+
+    /// The `(version, add, remove, replay_key_path)` schema produced by [`commit_keyed_expr`].
+    fn commit_keyed_schema() -> DeltaResult<SchemaRef> {
+        let remove = commit_field(REMOVE_NAME)?;
+        Ok(Arc::new(StructType::new_unchecked([
+            StructField::not_null(VERSION_COLUMN, DataType::LONG),
+            commit_field(ADD_NAME)?,
+            remove,
+            StructField::nullable(REPLAY_KEY_COLUMN, DataType::STRING),
+        ])))
+    }
+
+    /// The single-column `{ add }` schema the two union arms share as their final output.
+    fn add_only_schema() -> DeltaResult<SchemaRef> {
+        Ok(Arc::new(StructType::new_unchecked([commit_field(
+            ADD_NAME,
+        )?])))
+    }
+
+    /// Returns the named field from [`COMMIT_READ_SCHEMA`], erroring if the protocol schema lacks
+    /// it (it cannot, by construction, but the projection is fallible).
+    fn commit_field(name: &str) -> DeltaResult<StructField> {
+        COMMIT_READ_SCHEMA.field(name).cloned().ok_or_else(|| {
+            Error::internal_error(format!("COMMIT_READ_SCHEMA missing {name} field"))
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::expressions::Scalar;
+        use crate::plans::ir::nodes::Operator;
+        use crate::{FileMeta, Version};
+
+        fn scan_file(name: &str, version: Version) -> ScanFile {
+            ScanFile {
+                meta: FileMeta {
+                    location: url::Url::parse(&format!("memory:///{name}")).unwrap(),
+                    last_modified: 0,
+                    size: 0,
+                },
+                file_constants: vec![Scalar::Long(version as i64)],
+            }
+        }
+
+        #[test]
+        fn build_scan_replay_plan_wires_commit_dedup_and_checkpoint_antijoin() {
+            let plan = build_scan_replay_plan(
+                vec![scan_file("checkpoint.parquet", 1)],
+                vec![scan_file("2.json", 2)],
+            )
+            .unwrap()
+            .expect("non-empty plan");
+
+            let nodes = plan.into_nodes();
+            // commit:     ScanJson[0] -> Project[1] -> Aggregate[2] -> Filter[3]
+            // checkpoint: ScanParquet[4] -> Filter[5] -> AntiJoin[6]
+            // add-only projections: Project[7] (commit), Project[8] (checkpoint)
+            // UnionAll[9] (terminal)
+            assert_eq!(nodes.len(), 10);
+            assert!(matches!(nodes[0].op, Operator::ScanJson(_)));
+            assert!(matches!(nodes[1].op, Operator::Project(_)));
+            assert!(matches!(nodes[2].op, Operator::Aggregate(_)));
+            assert!(matches!(nodes[3].op, Operator::Filter(_)));
+            assert!(matches!(nodes[4].op, Operator::ScanParquet(_)));
+            assert!(matches!(nodes[5].op, Operator::Filter(_)));
+            assert!(matches!(nodes[7].op, Operator::Project(_)));
+            assert!(matches!(nodes[8].op, Operator::Project(_)));
+            assert!(matches!(nodes[9].op, Operator::UnionAll));
+
+            let Operator::SemiJoin(semi_join) = &nodes[6].op else {
+                panic!("expected anti join, got {:?}", nodes[6].op);
+            };
+            assert!(semi_join.inverted, "scan replay uses an anti join");
+            // probe = checkpoint adds [5], build = deduped commit actions [2] (shared with [3]).
+            assert_eq!(nodes[6].inputs, vec![5, 2]);
+            // add-only projections feed the union: commit adds [3] -> [7], checkpoint live [6] ->
+            // [8].
+            assert_eq!(nodes[7].inputs, vec![3]);
+            assert_eq!(nodes[8].inputs, vec![6]);
+            assert_eq!(nodes[9].inputs, vec![7, 8]);
+        }
+
+        #[test]
+        fn build_scan_replay_plan_with_only_commits_drops_checkpoint_arm() {
+            let plan = build_scan_replay_plan(vec![], vec![scan_file("0.json", 0)])
+                .unwrap()
+                .expect("non-empty plan");
+            let nodes = plan.into_nodes();
+            // Checkpoint absent -> anti join's probe is absent -> the whole checkpoint arm drops,
+            // and the single-arm union collapses to the commit adds (Filter then add-only Project).
+            assert_eq!(nodes.len(), 5);
+            assert!(matches!(nodes[3].op, Operator::Filter(_)));
+            assert!(matches!(nodes[4].op, Operator::Project(_)));
+            assert_eq!(nodes[4].inputs, vec![3]);
+        }
+
+        #[test]
+        fn build_scan_replay_plan_with_only_checkpoint_forwards_probe() {
+            let plan = build_scan_replay_plan(vec![scan_file("checkpoint.parquet", 1)], vec![])
+                .unwrap()
+                .expect("non-empty plan");
+            let nodes = plan.into_nodes();
+            // Commits absent -> anti join's build is absent -> it forwards the probe (checkpoint
+            // adds), and the single-arm union collapses to that arm (Filter then add-only Project).
+            assert_eq!(nodes.len(), 3);
+            assert!(matches!(nodes[0].op, Operator::ScanParquet(_)));
+            assert!(matches!(nodes[1].op, Operator::Filter(_)));
+            assert!(matches!(nodes[2].op, Operator::Project(_)));
+            assert_eq!(nodes[2].inputs, vec![1]);
+        }
+
+        #[test]
+        fn build_scan_replay_plan_with_no_files_is_empty() {
+            assert!(build_scan_replay_plan(vec![], vec![]).unwrap().is_none());
+        }
+    }
+}

@@ -1,30 +1,33 @@
 //! Plan node operator kinds and their payloads.
 //!
-//! [`NodeKind`] enumerates every operator. Each operator's payload struct is defined
+//! [`Operator`] enumerates every operator. Each operator's payload struct is defined
 //! below.
+
+use std::sync::Arc;
 
 use strum::Display;
 use url::Url;
 
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::SchemaRef;
-use crate::FileMeta;
+use crate::schema::{SchemaRef, StructField, StructType};
+use crate::utils::CollectInto;
+use crate::{DeltaResult, Error, FileMeta};
 
 // ============================================================================
-// NodeKind: enumerates every operator kind
+// Operator: enumerates every operator kind
 // ============================================================================
 
-/// Plan node operator kinds.
+/// Plan node operators.
 ///
 /// Output schemas are stored on the payload struct for operators whose caller
 /// declares them (`ScanParquet`, `ScanJson`, `Values`, `Load`, `Project`,
-/// `MaxByVersion`); the remaining operators pass an input's schema through
+/// `Aggregate`); the remaining operators pass an input's schema through
 /// unchanged:
 /// - `Filter` from its input.
 /// - `UnionAll` from its inputs' common schema.
 /// - `SemiJoin` from the probe input.
 #[derive(Debug, Clone, Display)]
-pub enum NodeKind {
+pub enum Operator {
     // === Source operators (0 inputs) =========================================
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
@@ -34,13 +37,39 @@ pub enum NodeKind {
     Project(Project),
     Filter(Filter),
     Load(Load),
-    MaxByVersion(MaxByVersion),
+    Aggregate(Aggregate),
 
     // === Binary operators (2 inputs) =========================================
     SemiJoin(SemiJoin),
 
     // === N-ary operators (variable inputs) ===================================
-    UnionAll(UnionAll),
+    /// The unordered bag union of N input relations. All rows of all inputs appear in the
+    /// output, in arbitrary order. All input schemas must agree, and the output schema
+    /// is the common schema of the inputs.
+    ///
+    /// # Example
+    ///
+    /// `UnionAll` over two relations with schema `{ id: int }`:
+    ///
+    /// ```text
+    /// input 0:          input 1:
+    /// id                id
+    /// --                --
+    ///  1                 3
+    ///  2                 4
+    ///  3                 5
+    ///
+    /// output (arbitrary order; bag semantics keep the duplicate 3):
+    /// id
+    /// --
+    ///  4
+    ///  1
+    ///  3
+    ///  2
+    ///  5
+    ///  3
+    /// ```
+    UnionAll,
 }
 
 /// One file to scan plus literal values broadcast to every row read from that file.
@@ -384,84 +413,305 @@ pub struct Load {
     pub dv_column: ColumnName,
 }
 
-/// Per group, keep the input row with the greatest `version_column` value and project
-/// the columns named in `schema` from that row. Kernel uses this for dedupe
-/// across table versions (e.g. latest `add` per path in scan metadata).
+/// Groups input rows by `group_by` (a global aggregation over all rows when `group_by` is
+/// empty) and computes one output column per [`Agg`] in `aggs`. The output `schema` lists the
+/// group-by key columns first (in order), then the aggregate columns (in order).
 ///
-/// Each `schema` field selects a column from the winning row; group-by keys and
-/// the version column must appear in `schema` when they should be emitted.
+/// Build an `Aggregate` with [`Aggregate::group_by`], which derives `schema` from the input
+/// schema -- including each output column's type and nullability -- so callers never restate it.
 ///
-/// # SQL equivalents
+/// # Output schema
 ///
-/// The same semantics are expressible as SQL `MAX BY` or as a query with
-/// `ROW_NUMBER()`. Both express the same "keep the row with the greatest
-/// `version_column` per group" behavior over a single ordering column.
+/// - **Group keys** pass through verbatim: each key column keeps its input type, nullability, and
+///   metadata.
+/// - **Aggregate columns** take the type of their value column. Nullability is determined by the
+///   function and whether the group is guaranteed non-empty (see [`Agg`]).
 ///
-/// As `MAX BY`:
+/// # SQL equivalent
 ///
 /// ```sql
-/// SELECT
-///     <group_by fields>,
-///     MAX_BY(col_a, <version_column>),
-///     MAX_BY(col_b, <version_column>),
-///     ...
+/// SELECT <group_by columns>, <aggs>
 /// FROM input
-/// GROUP BY <group_by fields>
-/// ```
-///
-/// Equivalent window rewrite:
-///
-/// ```sql
-/// SELECT <schema fields>
-/// FROM (
-///     SELECT *,
-///            ROW_NUMBER() OVER (
-///                PARTITION BY <group_by>
-///                ORDER BY <version_column> DESC
-///            ) AS rn
-///     FROM input
-/// ) WHERE rn = 1
+/// GROUP BY <group_by columns>
 /// ```
 ///
 /// # Example
 ///
+/// Latest non-null protocol and metadata across an unordered union of log actions (the kernel
+/// Protocol & Metadata query), a global aggregation with no group keys:
+///
 /// ```text
-/// MaxByVersion {
-///     group_by: [col("person")],
-///     version_column: "year",
-///     schema: { person: string, year: int, likes_to_eat: string },
+/// Aggregate {
+///     group_by: [],
+///     aggs: [
+///         max_by(protocol, version) FILTER (protocol IS NOT NULL),
+///         max_by(metadata, version) FILTER (metadata IS NOT NULL),
+///     ],
+///     schema: { protocol: <struct>?, metadata: <struct>? },
 /// }
 /// ```
-///
-/// Input:
-///
-/// ```text
-/// input
-/// person   | year   | likes_to_eat
-/// ---------+--------+-----------
-///  Alice   | 2020   | pizza
-///  Alice   | 2026   | sushi
-///  Bob     | 2020   | pizza
-///  Bob     | 2025   | watermelon
-///  Charlie | 2021   | ice cream
-///  Charlie | 2026   | egg
-/// ```
-///
-/// Output:
-///
-/// ```text
-/// output
-/// person   | year   | likes_to_eat
-/// ---------+--------+-----------
-///  Alice   | 2026   | sushi
-///  Bob     | 2025   | watermelon
-///  Charlie | 2026   | egg
-/// ```
 #[derive(Debug, Clone)]
-pub struct MaxByVersion {
-    pub group_by: Vec<ExpressionRef>,
-    pub version_column: ColumnName,
+pub struct Aggregate {
+    /// Group-by key columns, emitted first in the output schema. Empty means a single global
+    /// group over all input rows.
+    pub group_by: Vec<ColumnName>,
+    /// The aggregate columns, emitted after the group keys in the output schema.
+    pub aggs: Vec<Agg>,
+    /// Output schema: group-by key columns followed by aggregate columns.
     pub schema: SchemaRef,
+}
+
+impl Aggregate {
+    /// Starts building an [`Aggregate`] over `input_schema`, grouped by `keys`. Pass an empty
+    /// iterator for a global aggregate (a single group over all input rows). Group keys are emitted
+    /// first in the output schema, in iteration order; add aggregators with
+    /// [`aggregate`](AggregateBuilder::aggregate). The builder derives the output schema from the
+    /// keys and aggregators.
+    pub fn group_by(
+        input_schema: SchemaRef,
+        keys: impl CollectInto<Vec<ColumnName>>,
+    ) -> AggregateBuilder {
+        AggregateBuilder::new(input_schema, keys)
+    }
+}
+
+/// One aggregate function application within an [`Aggregate`] operator.
+///
+/// An `Agg` is a function ([`AggOp`]) applied to input column(s), optionally restricted by a
+/// `filter` predicate (SQL `FILTER (WHERE ...)`) and renamed via `alias`. When `alias` is unset,
+/// the output column takes the name of the value column.
+///
+/// Construct with [`min`](Self::min) / [`max`](Self::max) / [`min_by`](Self::min_by) /
+/// [`max_by`](Self::max_by), then chain [`filter`](Self::filter) / [`alias`](Self::alias):
+///
+/// ```ignore
+/// Agg::max_by(column_name!("protocol"), column_name!("version"))
+///     .filter(protocol_is_not_null)
+///     .alias("latest_protocol")
+/// ```
+///
+/// # Nullability
+///
+/// An aggregate output is nullable when the per-group input multiset can be empty -- either there
+/// are no group keys (a global aggregate over possibly-empty input) or a `filter` is present
+/// (which can remove every row of a group) -- or when the function itself can yield NULL over a
+/// non-empty group:
+/// - [`min`](Self::min) / [`max`](Self::max): nullable iff the value column is nullable.
+/// - [`min_by`](Self::min_by) / [`max_by`](Self::max_by): nullable iff the value column or the
+///   ordering column is nullable.
+#[derive(Debug, Clone)]
+pub struct Agg {
+    /// The aggregate function and its operand column(s).
+    pub op: AggOp,
+    /// Optional `FILTER (WHERE ...)` predicate restricting the rows the function sees.
+    pub filter: Option<PredicateRef>,
+    /// Optional output column name. Defaults to the value column's name when unset.
+    pub alias: Option<String>,
+}
+
+impl Agg {
+    /// `min(value)`: the least non-null value in each group.
+    pub fn min(value: impl Into<ColumnName>) -> Self {
+        Self::new(AggOp::Min(Min {
+            value: value.into(),
+        }))
+    }
+
+    /// `max(value)`: the greatest non-null value in each group.
+    pub fn max(value: impl Into<ColumnName>) -> Self {
+        Self::new(AggOp::Max(Max {
+            value: value.into(),
+        }))
+    }
+
+    /// `min_by(value, order)`: the `value` from the row with the least non-null `order`.
+    pub fn min_by(value: impl Into<ColumnName>, order: impl Into<ColumnName>) -> Self {
+        Self::new(AggOp::MinBy(MinBy {
+            value: value.into(),
+            order: order.into(),
+        }))
+    }
+
+    /// `max_by(value, order)`: the `value` from the row with the greatest non-null `order`.
+    pub fn max_by(value: impl Into<ColumnName>, order: impl Into<ColumnName>) -> Self {
+        Self::new(AggOp::MaxBy(MaxBy {
+            value: value.into(),
+            order: order.into(),
+        }))
+    }
+
+    fn new(op: AggOp) -> Self {
+        Self {
+            op,
+            filter: None,
+            alias: None,
+        }
+    }
+
+    /// Restricts the aggregate to rows where `predicate` is true (SQL `FILTER (WHERE ...)`).
+    pub fn filter(mut self, predicate: impl Into<PredicateRef>) -> Self {
+        self.filter = Some(predicate.into());
+        self
+    }
+
+    /// Sets the output column name, overriding the default (the value column's name).
+    pub fn alias(mut self, name: impl Into<String>) -> Self {
+        self.alias = Some(name.into());
+        self
+    }
+
+    /// The output column name: the alias if set, else the value column's leaf name.
+    fn output_name(&self) -> DeltaResult<&str> {
+        if let Some(alias) = &self.alias {
+            return Ok(alias.as_str());
+        }
+        self.op
+            .value()
+            .path()
+            .last()
+            .map(String::as_str)
+            .ok_or_else(|| Error::generic("Aggregate value column has an empty path"))
+    }
+
+    /// Derives this aggregate's output [`StructField`] over `input_schema`. `grouped` indicates
+    /// whether the enclosing [`Aggregate`] has any group keys (which guarantees non-empty groups).
+    fn output_field(&self, input_schema: &StructType, grouped: bool) -> DeltaResult<StructField> {
+        let name = self.output_name()?;
+        let data_type = input_schema.field_at(self.op.value())?.data_type().clone();
+        // A group's input multiset can be empty when there are no group keys (global aggregate
+        // over possibly-empty input) or a filter is present (can remove every row).
+        let can_be_empty = !grouped || self.filter.is_some();
+        let nullable = can_be_empty || self.op.base_nullable(input_schema)?;
+        Ok(StructField::new(name, data_type, nullable))
+    }
+}
+
+/// An aggregate function and its operand column(s).
+///
+/// Each variant wraps a payload carrying exactly that function's operands, mirroring the
+/// [`Operator`] convention.
+#[derive(Debug, Clone)]
+pub enum AggOp {
+    Min(Min),
+    Max(Max),
+    MinBy(MinBy),
+    MaxBy(MaxBy),
+}
+
+/// `min(value)` operands.
+#[derive(Debug, Clone)]
+pub struct Min {
+    pub value: ColumnName,
+}
+
+/// `max(value)` operands.
+#[derive(Debug, Clone)]
+pub struct Max {
+    pub value: ColumnName,
+}
+
+/// `min_by(value, order)` operands.
+#[derive(Debug, Clone)]
+pub struct MinBy {
+    pub value: ColumnName,
+    pub order: ColumnName,
+}
+
+/// `max_by(value, order)` operands.
+#[derive(Debug, Clone)]
+pub struct MaxBy {
+    pub value: ColumnName,
+    pub order: ColumnName,
+}
+
+impl AggOp {
+    /// The column whose value this aggregate emits (and whose type the output column takes).
+    pub fn value(&self) -> &ColumnName {
+        match self {
+            AggOp::Min(Min { value })
+            | AggOp::Max(Max { value })
+            | AggOp::MinBy(MinBy { value, .. })
+            | AggOp::MaxBy(MaxBy { value, .. }) => value,
+        }
+    }
+
+    /// Nullability contributed by the function over a guaranteed non-empty group, ignoring the
+    /// empty-group / filter cases handled by [`Agg::output_field`].
+    fn base_nullable(&self, input_schema: &StructType) -> DeltaResult<bool> {
+        let value_nullable = input_schema.field_at(self.value())?.nullable;
+        let nullable = match self {
+            AggOp::Min(_) | AggOp::Max(_) => value_nullable,
+            AggOp::MinBy(MinBy { order, .. }) | AggOp::MaxBy(MaxBy { order, .. }) => {
+                value_nullable || input_schema.field_at(order)?.nullable
+            }
+        };
+        Ok(nullable)
+    }
+}
+
+/// Builds an [`Aggregate`] over an input schema, deriving the output schema from the group keys
+/// and aggregators.
+///
+/// Created by [`Aggregate::group_by`], which fixes the group keys. Aggregators are then collected
+/// by [`aggregate`](Self::aggregate); [`build`](Self::build) resolves keys and aggregators against
+/// the input schema, derives each output column's type and nullability, and validates that all
+/// output column names are unique.
+#[derive(Debug)]
+pub struct AggregateBuilder {
+    input_schema: SchemaRef,
+    group_by: Vec<ColumnName>,
+    aggs: Vec<Agg>,
+}
+
+impl AggregateBuilder {
+    /// Creates a builder over `input_schema` grouped by `keys`. Use [`Aggregate::group_by`].
+    fn new(input_schema: SchemaRef, keys: impl CollectInto<Vec<ColumnName>>) -> Self {
+        Self {
+            input_schema,
+            group_by: keys.collect_into(),
+            aggs: Vec::new(),
+        }
+    }
+
+    /// Adds an aggregate column, emitted after the group keys in call order.
+    pub fn aggregate(mut self, agg: Agg) -> Self {
+        self.aggs.push(agg);
+        self
+    }
+
+    /// Resolves group keys and aggregators against the input schema and builds the [`Aggregate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a group key or an aggregate's operand column is not found in the input
+    /// schema, or if two output columns would share a name (case-insensitive).
+    pub fn build(self) -> DeltaResult<Aggregate> {
+        let grouped = !self.group_by.is_empty();
+        let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
+        for key in &self.group_by {
+            fields.push(self.input_schema.field_at(key)?.clone());
+        }
+        for agg in &self.aggs {
+            fields.push(agg.output_field(&self.input_schema, grouped)?);
+        }
+        // `try_new` rejects duplicate (case-insensitive) output column names.
+        let schema = Arc::new(StructType::try_new(fields)?);
+        Ok(Aggregate {
+            group_by: self.group_by,
+            aggs: self.aggs,
+            schema,
+        })
+    }
+}
+
+impl TryFrom<AggregateBuilder> for Aggregate {
+    type Error = Error;
+
+    /// Finalizes the builder via [`AggregateBuilder::build`], so APIs can accept an
+    /// `impl TryInto<Aggregate>` and let callers pass an unbuilt builder directly.
+    fn try_from(builder: AggregateBuilder) -> DeltaResult<Self> {
+        builder.build()
+    }
 }
 
 /// Performs a semi join between two inputs, `inputs.len() == 2`, the child
@@ -498,6 +748,23 @@ pub struct MaxByVersion {
 ///  a   |   1
 ///  c   |   3
 /// ```
+///
+/// # Collapse over absent inputs
+///
+/// A `semi_join`/`anti_join` builder combinator collapses over an absent input per the set
+/// semantics above. The two differ in whether that collapse can be made orphan-safe (see the
+/// hazard on [`PlanBuilder`](super::plan::PlanBuilder)):
+/// - **Anti join** (difference) collapses to absent only if the *probe* is absent; an absent build
+///   subtracts nothing, so it forwards the probe unchanged. Building the probe first is therefore
+///   orphan-safe: skip the build side when the probe is absent, and an absent build simply forwards
+///   a present probe.
+/// - **Semi join** (intersection) collapses to absent if *either* input is absent (an absent probe
+///   emits nothing; an absent build matches nothing). This *cannot* be made orphan-safe by
+///   construction order: whichever side is built second strands the first when it turns out absent,
+///   and a side's absence is only discovered by building it. Callers must instead decide semi join
+///   presence from conditions known *before* constructing either side -- in practice the leaf scan
+///   file lists, since absence propagates deterministically from the leaves -- and build the two
+///   sides only when both are guaranteed present.
 #[derive(Debug, Clone)]
 pub struct SemiJoin {
     pub inverted: bool,
@@ -505,38 +772,151 @@ pub struct SemiJoin {
     pub build_keys: Vec<ColumnName>,
 }
 
-/// The unordered bag union of N input relations. All rows of all inputs appear in the
-/// output, in arbitrary order. All input schemas must agree, and the output schema
-/// is the common schema of the inputs.
-///
-/// # Example
-///
-/// `UnionAll` over two relations with schema `{ id: int }`:
-///
-/// ```text
-/// input 0:
-/// id
-/// --
-///  1
-///  2
-///  3
-///
-/// input 1:
-/// id
-/// --
-///  3
-///  4
-///  5
-///
-/// output (arbitrary order; bag semantics keep the duplicate 3):
-/// id
-/// --
-///  4
-///  1
-///  3
-///  2
-///  5
-///  3
-/// ```
-#[derive(Debug, Clone)]
-pub struct UnionAll;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expressions::{column_name, Expression, Predicate};
+    use crate::schema::{DataType, StructField};
+    use crate::utils::test_utils::assert_result_error_with_message;
+
+    /// Builds a flat `LONG` schema from `(name, nullable)` pairs.
+    fn schema(fields: &[(&str, bool)]) -> SchemaRef {
+        Arc::new(StructType::new_unchecked(fields.iter().map(
+            |(name, nullable)| {
+                if *nullable {
+                    StructField::nullable(*name, DataType::LONG)
+                } else {
+                    StructField::not_null(*name, DataType::LONG)
+                }
+            },
+        )))
+    }
+
+    #[test]
+    fn output_lists_group_keys_then_aggregates_in_order() {
+        let input = schema(&[("g", false), ("a", true), ("b", true)]);
+        let agg = Aggregate::group_by(input, [column_name!("g")])
+            .aggregate(Agg::max(column_name!("a")))
+            .aggregate(Agg::min(column_name!("b")))
+            .build()
+            .unwrap();
+        let names: Vec<&str> = agg.schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["g", "a", "b"]);
+    }
+
+    #[test]
+    fn group_key_passes_through_verbatim() {
+        let input = schema(&[("g", false), ("a", true)]);
+        let agg = Aggregate::group_by(input, [column_name!("g")])
+            .aggregate(Agg::max(column_name!("a")))
+            .build()
+            .unwrap();
+        let key = agg.schema.field("g").unwrap();
+        // A non-nullable key column stays non-nullable.
+        assert!(!key.nullable);
+    }
+
+    #[test]
+    fn global_aggregate_output_is_nullable_even_for_nonnull_inputs() {
+        let input = schema(&[("a", false), ("v", false)]);
+        let agg = Aggregate::group_by(input, [])
+            .aggregate(Agg::max_by(column_name!("a"), column_name!("v")))
+            .build()
+            .unwrap();
+        // No group keys -> input multiset may be empty -> nullable, despite non-null inputs.
+        assert!(agg.schema.field("a").unwrap().nullable);
+    }
+
+    #[rstest::rstest]
+    #[case::nonnull_value(false, false)]
+    #[case::nullable_value(true, true)]
+    fn grouped_max_nullability_follows_value(#[case] value_nullable: bool, #[case] expected: bool) {
+        let input = schema(&[("g", false), ("a", value_nullable)]);
+        let agg = Aggregate::group_by(input, [column_name!("g")])
+            .aggregate(Agg::max(column_name!("a")))
+            .build()
+            .unwrap();
+        assert_eq!(agg.schema.field("a").unwrap().nullable, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::both_nonnull(false, false, false)]
+    #[case::value_nullable(true, false, true)]
+    #[case::order_nullable(false, true, true)]
+    fn grouped_max_by_nullable_iff_value_or_order_nullable(
+        #[case] value_nullable: bool,
+        #[case] order_nullable: bool,
+        #[case] expected: bool,
+    ) {
+        let input = schema(&[("g", false), ("a", value_nullable), ("v", order_nullable)]);
+        let agg = Aggregate::group_by(input, [column_name!("g")])
+            .aggregate(Agg::max_by(column_name!("a"), column_name!("v")))
+            .build()
+            .unwrap();
+        assert_eq!(agg.schema.field("a").unwrap().nullable, expected);
+    }
+
+    #[test]
+    fn filter_forces_nullable_in_grouped_aggregate() {
+        let input = schema(&[("g", false), ("a", false)]);
+        let filter = Predicate::is_not_null(Expression::column(column_name!("a")));
+        let agg = Aggregate::group_by(input, [column_name!("g")])
+            .aggregate(Agg::max(column_name!("a")).filter(filter))
+            .build()
+            .unwrap();
+        // A filter can remove every row of a group, so the output is nullable.
+        assert!(agg.schema.field("a").unwrap().nullable);
+    }
+
+    #[test]
+    fn alias_overrides_default_output_name() {
+        let input = schema(&[("a", true)]);
+        let agg = Aggregate::group_by(input, [])
+            .aggregate(Agg::max(column_name!("a")).alias("a_max"))
+            .build()
+            .unwrap();
+        assert!(agg.schema.field("a_max").is_some());
+        assert!(agg.schema.field("a").is_none());
+    }
+
+    #[test]
+    fn duplicate_output_names_are_rejected() {
+        let input = schema(&[("a", true)]);
+        // min and max of the same column collide on the default name "a".
+        let result = Aggregate::group_by(input, [])
+            .aggregate(Agg::min(column_name!("a")))
+            .aggregate(Agg::max(column_name!("a")))
+            .build();
+        assert_result_error_with_message(result, "Duplicate field name");
+    }
+
+    #[test]
+    fn distinct_aliases_resolve_min_max_collision() {
+        let input = schema(&[("a", true)]);
+        let agg = Aggregate::group_by(input, [])
+            .aggregate(Agg::min(column_name!("a")).alias("a_min"))
+            .aggregate(Agg::max(column_name!("a")).alias("a_max"))
+            .build()
+            .unwrap();
+        let names: Vec<&str> = agg.schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["a_min", "a_max"]);
+    }
+
+    #[test]
+    fn missing_value_column_is_rejected() {
+        let input = schema(&[("a", true)]);
+        let result = Aggregate::group_by(input, [])
+            .aggregate(Agg::max(column_name!("missing")))
+            .build();
+        assert_result_error_with_message(result, "missing");
+    }
+
+    #[test]
+    fn missing_group_key_is_rejected() {
+        let input = schema(&[("a", true)]);
+        let result = Aggregate::group_by(input, [column_name!("missing")])
+            .aggregate(Agg::max(column_name!("a")))
+            .build();
+        assert_result_error_with_message(result, "missing");
+    }
+}
