@@ -620,11 +620,9 @@ mod tests {
     #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     use delta_kernel::object_store::ObjectStore;
 
-    /// Store wrapper counting `get_opts` calls, delegating everything else to `inner`. Footer
-    /// fetches route through `get_range` -> `get_opts` (counted); column-chunk data routes through
-    /// `get_ranges` (delegated, not counted), so the count isolates footer fetches. Only the
-    /// `ObjectStore` methods without defaults are implemented, plus `get_ranges` to keep data reads
-    /// off the counter.
+    /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
+    /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates
+    /// footer reads.
     #[derive(Debug)]
     struct GetOptsCountingStore<T: ObjectStore> {
         inner: T,
@@ -652,11 +650,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for GetOptsCountingStore<T> {
+        // ===== The method we instrument: count footer-fetch GETs =====
         async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
             self.get_opts_count.fetch_add(1, Ordering::SeqCst);
             self.inner.get_opts(location, options).await
         }
 
+        // ===== Everything else: behavior unchanged, delegate to inner =====
+        // Overridden (not inherited) so column-chunk data reads delegate straight to inner and
+        // stay off the get_opts counter.
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
@@ -686,6 +688,7 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
+        // ===== Required only by object_store 0.13 (arrow-58) =====
         #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
         fn delete_stream(
             &self,
@@ -694,6 +697,12 @@ mod tests {
             self.inner.delete_stream(locations)
         }
 
+        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        // ===== Required only by object_store 0.12 (arrow-57) =====
         #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
         async fn delete(&self, location: &Path) -> Result<()> {
             self.inner.delete(location).await
@@ -707,11 +716,6 @@ mod tests {
         #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
         async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
             self.inner.copy_if_not_exists(from, to).await
-        }
-
-        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-            self.inner.copy_opts(from, to, options).await
         }
     }
 
