@@ -1,7 +1,7 @@
 //! Plan containers ([`Plan`], [`PlanNode`]) and the [`RefId`] value handle.
 
 pub use super::nodes::Operator;
-use super::nodes::{Aggregate, Filter, Project, ScanFile, ScanJson, ScanParquet, SemiJoin};
+use super::nodes::{Aggregate, Filter, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error};
@@ -16,9 +16,12 @@ use crate::{DeltaResult, Error};
 /// later combinator. A `RefId` is either *present* -- it names a real relation -- or *absent*.
 /// Absent is the plan algebra's uninhabited relation: it can never be instantiated and can never
 /// produce rows, so it is the identity element that collapses combinators (a `UnionAll` drops an
-/// absent arm, an aggregate over an absent input is absent, and so on). This lets callers assemble
-/// plans unconditionally and let degenerate branches fall away. Distinguish the two cases with
-/// [`is_present`](Self::is_present) / [`is_absent`](Self::is_absent).
+/// absent arm, a grouped aggregate over an absent input is absent, and so on). The exception is a
+/// global aggregate (no group keys), which is an *absence barrier*: it always emits one row, so an
+/// absent input collapses to a one-row [`Values`] source rather than absent.
+/// This lets callers assemble plans unconditionally and let degenerate branches fall away.
+/// Distinguish the two cases with [`is_present`](Self::is_present) /
+/// [`is_absent`](Self::is_absent).
 ///
 /// `RefId` is meaningful only during construction. [`PlanBuilder::build`] resolves every present
 /// reference to a 0-based node index ([`PlanNode`]'s `inputs`), so a built [`Plan`] contains no
@@ -282,20 +285,46 @@ impl PlanBuilder {
         }
     }
 
-    /// Appends an [`Aggregate`] over `input`, returning its output [`RefId`], or an absent
-    /// [`RefId`] when `input` is absent (aggregating an absent relation is absent).
+    /// Appends an [`Aggregate`] over `input`. Over a present input this appends an
+    /// [`Aggregate`](Operator::Aggregate) node. Over an *absent* input the collapse is group-arity
+    /// dependent, matching the empty-relation semantics of SQL aggregation:
+    /// - a **grouped** aggregate (non-empty `group_by`) yields zero groups, so it returns an absent
+    ///   [`RefId`];
+    /// - a **global** aggregate (empty `group_by`) still yields exactly one row -- each aggregate's
+    ///   value over the empty multiset (see `Aggregate::empty_group_row`) -- so it is materialized
+    ///   as a one-row [`Values`] source. A global aggregate is therefore an
+    ///   *absence barrier*: absence never propagates past it. This is the same family of
+    ///   construction-time normalization as [`union_all`](Self::union_all), except it emits a new
+    ///   source instead of forwarding an existing input (an absent input has no node to forward).
     ///
     /// Accepts anything convertible into an [`Aggregate`], including an unbuilt
     /// [`AggregateBuilder`](super::nodes::AggregateBuilder) (from [`Aggregate::group_by`]), so
-    /// callers need not call [`build`](super::nodes::AggregateBuilder::build) themselves. The
-    /// conversion is skipped (and any error it would raise suppressed) when `input` is absent,
-    /// since the aggregate then collapses away.
+    /// callers need not call [`build`](super::nodes::AggregateBuilder::build) themselves. Unlike
+    /// the other unary combinators, the conversion runs even for an absent input, since the
+    /// group-by arity and output schema decide the collapse.
     pub fn aggregate<A>(&mut self, input: RefId, aggregate: A) -> DeltaResult<RefId>
     where
         A: TryInto<Aggregate>,
         Error: From<A::Error>,
     {
-        self.append_unary(input, || Ok(Operator::Aggregate(aggregate.try_into()?)))
+        if let Some(i) = input.0 {
+            return self.append(Operator::Aggregate(aggregate.try_into()?), [i]);
+        }
+        let aggregate = aggregate.try_into()?;
+        // Grouped aggregate over the empty relation: zero groups, hence absent.
+        if !aggregate.group_by.is_empty() {
+            return self.record(None);
+        }
+        // Global aggregate over the empty relation: still one row (the per-agg empty-multiset
+        // value), materialized as a literal source so the row survives downstream.
+        let rows = vec![aggregate.empty_group_row()];
+        self.append(
+            Operator::Values(Values {
+                schema: aggregate.schema,
+                rows,
+            }),
+            [],
+        )
     }
 
     /// Appends a [`Project`] over `input`, evaluating `expr` into rows of `schema`, returning its
@@ -485,6 +514,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::expressions::Scalar;
     use crate::plans::ir::nodes::Agg;
     use crate::schema::{column_name, DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -625,13 +655,36 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_over_absent_input_collapses_to_absent() {
-        let schema = test_schema();
-        // An unbuilt builder is accepted; its conversion is skipped because the input is absent.
-        let agg = Aggregate::group_by(schema, []).aggregate(Agg::max(column_name!("id")));
+    fn grouped_aggregate_over_absent_input_collapses_to_absent() {
+        let schema = test_schema_with_version();
+        // A grouped aggregate yields zero groups over the empty relation, so it collapses to
+        // absent.
+        let agg = Aggregate::group_by(schema, [column_name!("version")])
+            .aggregate(Agg::max(column_name!("id")));
         let mut builder = PlanBuilder::new();
         assert!(builder.aggregate(RefId(None), agg).unwrap().is_absent());
         assert!(builder.build().unwrap().is_none());
+    }
+
+    #[test]
+    fn global_aggregate_over_absent_input_materializes_one_null_row() {
+        let schema = test_schema_with_version();
+        // A global aggregate (no group keys) always emits one row, so over the empty relation it
+        // collapses to a one-row Values source (a typed NULL per agg), not to absent.
+        let agg = Aggregate::group_by(schema, [])
+            .aggregate(Agg::max_by(column_name!("id"), column_name!("version")));
+        let mut builder = PlanBuilder::new();
+        assert!(builder.aggregate(RefId(None), agg).unwrap().is_present());
+
+        let plan = builder.build().unwrap().expect("non-empty plan");
+        let [node] = <[_; 1]>::try_from(plan.into_nodes()).expect("single-node plan");
+        assert!(node.inputs.is_empty());
+        let Operator::Values(values) = node.op else {
+            panic!("expected Values, got {:?}", node.op);
+        };
+        assert_eq!(values.rows, vec![vec![Scalar::Null(DataType::LONG)]]);
+        let names: Vec<&str> = values.schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id"]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use strum::Display;
 use url::Url;
 
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error, FileMeta};
 
@@ -473,6 +473,21 @@ impl Aggregate {
     ) -> AggregateBuilder {
         AggregateBuilder::new(input_schema, keys)
     }
+
+    /// The single row a global (empty `group_by`) aggregate emits over an empty input: one
+    /// [`Scalar`] per output field, in schema order, each being the corresponding [`Agg`]'s value
+    /// over the empty multiset (see `AggOp::empty_value`).
+    ///
+    /// Only meaningful for a global aggregate: a grouped one yields zero rows over empty input. With
+    /// no group keys the output schema is exactly the aggregate columns, so aggs and fields align
+    /// 1:1.
+    pub(crate) fn empty_group_row(&self) -> Vec<Scalar> {
+        self.aggs
+            .iter()
+            .zip(self.schema.fields())
+            .map(|(agg, field)| agg.op.empty_value(field.data_type()))
+            .collect()
+    }
 }
 
 /// One aggregate function application within an [`Aggregate`] operator.
@@ -497,8 +512,8 @@ impl Aggregate {
 /// (which can remove every row of a group) -- or when the function itself can yield NULL over a
 /// non-empty group:
 /// - [`min`](Self::min) / [`max`](Self::max): nullable iff the value column is nullable.
-/// - [`min_by`](Self::min_by) / [`max_by`](Self::max_by): nullable iff the value column or the
-///   key column is nullable.
+/// - [`min_by`](Self::min_by) / [`max_by`](Self::max_by): nullable iff the value column or the key
+///   column is nullable.
 #[derive(Debug, Clone)]
 pub struct Agg {
     /// The aggregate function and its operand column(s).
@@ -632,6 +647,17 @@ impl AggOp {
             | AggOp::Max(Max { value })
             | AggOp::MinBy(MinBy { value, .. })
             | AggOp::MaxBy(MaxBy { value, .. }) => value,
+        }
+    }
+
+    /// This function's value over an *empty* input multiset, typed as `data_type`. Every current
+    /// aggregate (min/max/min_by/max_by) is NULL over the empty multiset; a future row-counting
+    /// aggregate would override this (e.g. `count` -> `0`).
+    fn empty_value(&self, data_type: &DataType) -> Scalar {
+        match self {
+            AggOp::Min(_) | AggOp::Max(_) | AggOp::MinBy(_) | AggOp::MaxBy(_) => {
+                Scalar::null(data_type.clone())
+            }
         }
     }
 
