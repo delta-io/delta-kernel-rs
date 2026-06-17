@@ -848,8 +848,9 @@ pub enum DataLayoutConfig {
 
 /// Period for sparse null injection. Data generation emits a null every
 /// `NULL_RATE_EVERY_NTH` rows for each nullable, non-partition column, regardless of
-/// [`DataLayoutConfig`]. Partition and clustering values are never nulled so partition
-/// values stay well-defined.
+/// [`DataLayoutConfig`]. The protocol permits null partition values, but the generator
+/// does not produce them: partition and clustering columns are left fully populated to
+/// keep their values well-defined for tests.
 pub const NULL_RATE_EVERY_NTH: usize = 3;
 
 impl DataLayoutConfig {
@@ -1337,6 +1338,9 @@ async fn write_data_commit<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
+    let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
+    let clustering_set: HashSet<&str> = clustering_columns.iter().map(String::as_str).collect();
+
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
         let partition_seed = (version as usize) * 1000 + file_idx * 100;
@@ -1345,14 +1349,13 @@ async fn write_data_commit<E: TaskExecutor>(
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (arrow_field, kernel_field) in arrow_schema.fields().iter().zip(logical_schema.fields())
         {
-            let name = kernel_field.name();
-            if partition_columns.iter().any(|c| c == name) {
+            let name = kernel_field.name().as_str();
+            if partition_set.contains(name) {
                 continue;
             }
             let data_type = arrow_field.data_type();
             let values = generate_column(data_type, rows_per_file, base);
-            let values = if arrow_field.is_nullable() && !clustering_columns.iter().any(|c| c == name)
-            {
+            let values = if arrow_field.is_nullable() && !clustering_set.contains(name) {
                 with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
             } else {
                 values
@@ -2069,10 +2072,10 @@ mod tests {
         Ok(())
     }
 
-    /// Partition and clustering columns must never be nulled, even though the data
-    /// generator injects sparse nulls into every other nullable column. Clustered tables
-    /// write through the unpartitioned path, so the clustering case guards against the
-    /// generator treating clustering columns like ordinary data columns.
+    /// The generator leaves partition and clustering columns fully populated, even though
+    /// it injects sparse nulls into every other nullable column. Clustered tables write
+    /// through the unpartitioned path, so the clustering case guards against the generator
+    /// treating clustering columns like ordinary data columns.
     #[rstest::rstest]
     #[case::partitioned(partitioned())]
     #[case::clustered(clustered())]
