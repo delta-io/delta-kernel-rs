@@ -90,6 +90,13 @@ handle_release_branch() {
 
     log_info "Starting release preparation for version $version..."
 
+    # git-cliff (invoked by the cargo-release pre-release-hook) fetches GitHub PR labels to
+    # build the "Breaking changes" changelog section. That needs a token; reuse the gh CLI's
+    # credential when GITHUB_TOKEN isn't already set.
+    if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
+        export GITHUB_TOKEN="$(gh auth token)"
+    fi
+
     # Update CHANGELOG and README
     log_info "Updating CHANGELOG.md and README.md..."
     if ! cargo release --workspace "$version" --no-publish --no-push --no-tag --execute; then

@@ -25,6 +25,9 @@ pre-release-replacements = [
 pre-release-hook = [
   "git",
   "cliff",
+  # load CA certs from the OS trust store so the GitHub API call works behind TLS-intercepting
+  # proxies (the bundled roots don't include corporate CAs); harmless on normal networks.
+  "--use-native-tls",
   "--repository",
   "../",
   "--config",
@@ -39,7 +42,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.24.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.25.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"

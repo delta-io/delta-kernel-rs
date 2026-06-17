@@ -68,3 +68,9 @@ filter_commits = false
 topo_order = false
 # sort the commits inside sections by oldest/newest order
 sort_commits = "oldest"
+
+[remote.github]
+# query upstream's PRs/labels (the breaking-change label lives here), not whatever
+# `origin` happens to point at. token comes from GITHUB_TOKEN in the environment.
+owner = "delta-io"
+repo = "delta-kernel-rs"
