@@ -308,6 +308,7 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_uuid_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(1),
@@ -403,6 +404,7 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_out_of_date_last_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -449,6 +451,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
@@ -500,6 +503,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
@@ -546,6 +550,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
 #[tokio::test]
 async fn build_snapshot_with_bad_checkpoint_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(1),
@@ -639,6 +644,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
     // Snapshot should be made of the most recent complete checkpoint and the commit files that
     // follow it.
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -750,6 +756,7 @@ async fn build_snapshot_without_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: None,
@@ -798,6 +805,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
 #[tokio::test]
 async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -840,6 +848,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
 #[rstest::rstest]
 #[case::no_hint(None)]
 #[case::stale_hint(Some(LastCheckpointHint {
+    v2_checkpoint: None,
     version: 10, // stale: 10 > end_version 5, so it is discarded
     size: 10,
     parts: None,
@@ -2667,6 +2676,7 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     };
 
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(1),
@@ -2699,6 +2709,96 @@ async fn test_checkpoint_schema_propagation_from_hint() {
 
     assert_eq!(log_segment.last_checkpoint_version(), Some(5));
     assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
+}
+
+/// A V2 checkpoint hint's schema is used only when the hint names the checkpoint file the segment
+/// selected. Multiple V2 checkpoints can share a version, so a hint describing a different
+/// same-version V2 checkpoint must be ignored (the version match alone is not enough).
+#[rstest]
+#[case::identity_matches(true)]
+#[case::identity_mismatch(false)]
+fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
+
+    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
+    let other = "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet";
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let hint_name = if identity_matches { selected } else { other };
+
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
+
+    let commit_v2 = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+            ascending_commit_files: vec![commit_v2.clone()],
+            latest_commit_file: Some(commit_v2),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHintSummary {
+            version: 1,
+            schema: Some(hint_schema.clone()),
+            v2_checkpoint_path: Some(hint_name.to_string()),
+        }),
+    )?;
+
+    assert_eq!(log_segment.checkpoint_version, Some(1));
+    if identity_matches {
+        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+    } else {
+        assert!(
+            log_segment.checkpoint_schema().is_none(),
+            "hint describing a different same-version V2 checkpoint must not be used"
+        );
+    }
+    Ok(())
+}
+
+/// Exercises the identity filter against real V2 checkpoint fixtures. When a table's
+/// `_last_checkpoint` carries a V2 identity that does NOT name the checkpoint the segment selected,
+/// the hint must be suppressed (not applied to the wrong file). `v2-classic-checkpoint-parquet` is
+/// exactly that case: its `_last_checkpoint` points at a UUID-named checkpoint while the segment
+/// selects the classic-named one, so `checkpoint_schema()` falls back to a footer read.
+#[rstest]
+#[case::parquet_with_last_checkpoint("v2-checkpoints-parquet-with-last-checkpoint")]
+#[case::json_with_last_checkpoint("v2-checkpoints-json-with-last-checkpoint")]
+#[case::parquet_with_sidecars("v2-checkpoints-parquet-with-sidecars")]
+#[case::json_with_sidecars("v2-checkpoints-json-with-sidecars")]
+#[case::classic_parquet("v2-classic-checkpoint-parquet")]
+fn checkpoint_schema_identity_on_real_v2_tables(#[case] table: &str) -> DeltaResult<()> {
+    use crate::utils::test_utils::load_test_table;
+
+    let (_engine, snapshot, _tempdir) = load_test_table(table)?;
+    let seg = snapshot.log_segment();
+    assert!(
+        seg.checkpoint_version.is_some(),
+        "{table}: expected a checkpoint"
+    );
+
+    if let Some(v2_path) = seg
+        .last_checkpoint_hint_summary()
+        .and_then(|s| s.v2_checkpoint_path)
+    {
+        let selected = &seg
+            .listed
+            .checkpoint_parts
+            .first()
+            .expect("checkpoint present")
+            .filename;
+        // A hint naming a different checkpoint than the one we selected must not be trusted.
+        if &v2_path != selected {
+            assert!(
+                seg.checkpoint_schema().is_none(),
+                "{table}: hint names {v2_path} but segment selected {selected}; must be suppressed"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
@@ -2777,6 +2877,70 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     }
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
+    Ok(())
+}
+
+/// For a V2 (UUID-named) parquet checkpoint, `get_file_actions_schema_and_sidecars` uses the
+/// `_last_checkpoint` hint schema only when the hint names the selected checkpoint; a hint that
+/// names a different same-version V2 checkpoint is ignored and the footer is read instead.
+#[rstest]
+#[case::identity_matches(true)]
+#[case::identity_mismatch(false)]
+#[tokio::test]
+async fn test_get_file_actions_schema_v2_identity_filter(
+    #[case] identity_matches: bool,
+) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let selected = "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet";
+    let other = "00000000000000000001.checkpoint.016ae953-37a9-438e-8683-9a9a4a79a395.parquet";
+
+    // Schema actually written to the selected (leaf, no-sidecar) V2 checkpoint footer.
+    let footer_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    add_checkpoint_to_store(&store, add_batch_simple(footer_schema.clone()), selected).await?;
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let cp_size = get_file_size(&store, &format!("_delta_log/{selected}")).await;
+
+    // A distinct hint schema so we can tell whether the hint or the footer was used.
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
+    let hint_name = if identity_matches { selected } else { other };
+
+    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2 = create_log_path(&commit_v2_path);
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
+            ascending_commit_files: vec![commit_v2.clone()],
+            latest_commit_file: Some(commit_v2),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHintSummary {
+            version: 1,
+            schema: Some(hint_schema.clone()),
+            v2_checkpoint_path: Some(hint_name.to_string()),
+        }),
+    )?;
+
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
+    if identity_matches {
+        assert_eq!(
+            schema, hint_schema,
+            "matching hint identity -> use hint schema"
+        );
+    } else {
+        assert_eq!(
+            schema, footer_schema,
+            "mismatched hint identity -> read footer schema, not the stale hint"
+        );
+    }
+    assert!(sidecars.is_empty(), "leaf V2 checkpoint has no sidecars");
     Ok(())
 }
 

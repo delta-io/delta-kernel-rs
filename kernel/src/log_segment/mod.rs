@@ -262,12 +262,25 @@ impl LogSegment {
     /// this segment's checkpoint parquet.
     ///
     /// Returns `None` if there is no hint, if the hint omitted `checkpointSchema`, if this segment
-    /// has no checkpoint on disk, or if the hint's checkpoint version does not match this segment's
-    /// checkpoint version.
+    /// has no checkpoint on disk, if the hint's checkpoint version does not match this segment's
+    /// checkpoint version, or -- for a V2 hint -- if the hint does not describe the specific
+    /// checkpoint file this segment selected.
     pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
         let m = self.last_checkpoint_metadata.as_ref()?;
         if Some(m.version) != self.checkpoint_version {
             return None;
+        }
+        // A `v2Checkpoint` hint names a specific checkpoint file. Several such checkpoints can
+        // share a version (e.g. concurrent writers), and the segment selects one independently of
+        // the hint, so the hint's schema is only valid when it names the checkpoint we selected --
+        // `checkpoint_parts.first()`, the same part whose footer the schema would otherwise be read
+        // from. A hint without `v2Checkpoint` describes a checkpoint with a deterministic
+        // per-version name, so the version match above is sufficient.
+        if let Some(hint_name) = &m.v2_checkpoint_path {
+            let selected = self.listed.checkpoint_parts.first()?;
+            if &selected.filename != hint_name {
+                return None;
+            }
         }
         m.schema.clone()
     }
