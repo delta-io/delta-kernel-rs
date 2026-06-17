@@ -6,9 +6,11 @@
 //!        legacy multi-part checkpoints.
 //!     3) manifest-level checkpoints, containing references to sidecar files that hold the file
 //!        contents.
-//! When stats are requested, it also resolves how those stats are surfaced (a structured
-//! `add.stats_parsed` struct vs a JSON `add.stats` string). The probe is driven through a
-//! [`PlanExecutor`].
+//! When stats are requested, it also reports whether the checkpoint has compatible parsed stats.
+//! The probe is driven through a [`PlanExecutor`].
+
+// Public surface for the FSR scan builder; no other in-crate caller.
+#![allow(unused)]
 
 use url::Url;
 
@@ -25,49 +27,44 @@ use crate::{DeltaResult, FileMeta};
 
 /// Topology of a snapshot's checkpoint(s).
 ///
-/// The two non-empty shapes differ in where the leaf `add` / `remove` rows live: `Leaf` keeps
-/// them in the checkpoint files themselves; `Manifest` keeps them in sidecar parquet files
+/// The two non-empty shapes differ in where the `add` / `remove` actions live: `Leaf` stores
+/// them in the checkpoint files themselves; `Manifest` stores them in sidecar parquet files
 /// referenced by the checkpoint.
 #[derive(Clone, Debug, PartialEq)]
-pub enum CheckpointShape {
-    /// No checkpoint files: log replay degenerates to commit-only.
+pub(crate) enum CheckpointShape {
+    /// No checkpoint files for this log segment.
     None,
-    /// The checkpoint files ARE the leaves -- `add` / `remove` rows are stored inline. Covers
-    /// classic V1 checkpoints and V2 checkpoints that inline their actions (no sidecars).
+    /// The checkpoint files ARE the leaves -- `add` / `remove` actions are stored inline. Covers
+    /// classic V1 checkpoints, V2 checkpoints that inline their actions (no sidecars), and
+    /// legacy multi-part checkpoints.
     Leaf,
-    /// V2 manifest -- the checkpoint files reference sidecar parquet files that hold the leaf
-    /// `add` / `remove` rows (resolved lazily by the reconciliation plan, not stored here).
+    /// V2 manifest -- the checkpoint files reference sidecar parquet files that hold the
+    /// `add` / `remove` actions.
     Manifest,
 }
 
-/// Stats wiring resolved for a scan that requested stats: the projected stats schema plus
-/// whether the snapshot's checkpoint files surface column stats as a native `add.stats_parsed`
-/// struct (`true`) or as a JSON `add.stats` string (`false`).
+/// Stats wiring for a scan that requested stats.
 #[derive(Clone, Debug, PartialEq)]
-pub struct StatsInfo {
-    /// The requested (projected) stats schema the reconciliation plan should produce.
-    pub schema: SchemaRef,
-    /// `true` iff the snapshot surfaces `add.stats_parsed` compatible with [`Self::schema`] --
-    /// read from the checkpoint footer for a leaf, or a sidecar footer for a manifest.
-    pub has_parsed_stats: bool,
+pub(crate) struct StatsInfo {
+    /// The requested stats schema, carried through unchanged.
+    pub(crate) schema: SchemaRef,
+    /// `true` if the checkpoint has an `add.stats_parsed` struct compatible with [`Self::schema`].
+    pub(crate) has_parsed_stats: bool,
 }
 
-/// Resolved reconciliation shape: checkpoint topology and stats wiring.
+/// A scan's resolved checkpoint topology and stats wiring.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ScanShape {
+pub(crate) struct ScanShape {
     /// What kind of checkpoint the snapshot has.
-    pub checkpoint: CheckpointShape,
-    /// Stats wiring. `None` when the caller didn't request stats; otherwise the projected stats
-    /// schema and whether the checkpoint surfaces it natively.
-    pub stats: Option<StatsInfo>,
+    pub(crate) checkpoint: CheckpointShape,
+    /// Stats wiring, or `None` when the caller didn't request stats.
+    pub(crate) stats: Option<StatsInfo>,
 }
 
 impl ScanShape {
     /// Resolve `snapshot`'s scan shape. Determines the checkpoint topology and, when `stats_schema`
-    /// is `Some`, whether the checkpoint surfaces native parsed stats compatible with it. For a
-    /// leaf the parsed-stats answer comes from the checkpoint footer; for a manifest it comes from
-    /// a sidecar footer.
-    pub fn resolve(
+    /// is `Some`, whether the checkpoint contains parsed stats compatible with it.
+    pub(crate) fn resolve(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
         stats_schema: Option<&SchemaRef>,
@@ -128,15 +125,15 @@ impl ScanShape {
         };
 
         let Some(sidecar) = sidecar else {
-            // A JSON leaf has no footer to probe and surfaces stats only as JSON strings, so its
+            // A JSON leaf has no footer to probe and contains stats only as JSON strings, so its
             // parsed answer stays `false`.
             return Ok(make_info(CheckpointShape::Leaf, leaf_parsed_stats));
         };
 
-        // Manifest: the leaf rows -- and their stats -- live in the sidecars, so the sidecar
-        // footer is authoritative for parsed stats. The `_last_checkpoint` hint describes the
-        // manifest, not the leaves, so we deliberately do NOT consult it. Probe the sidecar only
-        // when stats were requested.
+        // Manifest: the `add` / `remove` actions -- and their stats -- live in the sidecars, so
+        // the sidecar footer is authoritative for parsed stats. The `_last_checkpoint` hint
+        // describes the manifest, not the leaves, so we deliberately do NOT consult it. Probe the
+        // sidecar only when stats were requested.
         let has_parsed_stats = match stats_schema {
             Some(reqd) => {
                 let side_schema = read_footer_schema(exec, sidecar)?;
@@ -158,7 +155,7 @@ fn read_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<Sc
 }
 
 /// Scan the checkpoint `file` and drain its `sidecar` column through [`SidecarVisitor`], resolving
-/// the first reference to a [`FileMeta`] under `log_root`.
+/// the first reference (enough to classify and probe; not a full enumeration) to a [`FileMeta`].
 fn collect_sidecar(
     exec: &dyn PlanExecutor,
     file: FileMeta,
@@ -214,6 +211,9 @@ mod tests {
     /// available. `expect_parsed = None` skips the stats probe (checkpoint-only cases).
     #[rstest]
     #[case::no_checkpoint("app-txn-no-checkpoint", CheckpointShape::None, None)]
+    // No checkpoint, but stats requested: still yields `StatsInfo` with the requested schema and
+    // `has_parsed_stats = false`.
+    #[case::no_checkpoint_with_stats("app-txn-no-checkpoint", CheckpointShape::None, Some(false))]
     #[case::leaf_parquet("with_checkpoint_no_last_checkpoint", CheckpointShape::Leaf, None)]
     #[case::manifest_parquet(
         "v2-checkpoints-parquet-with-sidecars",
