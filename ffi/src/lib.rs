@@ -51,6 +51,8 @@ pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
 #[cfg(feature = "default-engine-base")]
+pub mod rest_engine;
+#[cfg(feature = "default-engine-base")]
 pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 #[cfg(feature = "delta-kernel-unity-catalog")]
