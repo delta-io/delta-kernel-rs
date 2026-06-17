@@ -1,4 +1,4 @@
-//! Utities for reading the `_last_checkpoint` file. Maybe this file should instead go under
+//! Utilities for reading the `_last_checkpoint` file. Maybe this file should instead go under
 //! log_segment module since it should only really be used there? as hint for listing?
 
 use std::collections::HashMap;
@@ -30,8 +30,8 @@ pub(crate) struct LastCheckpointHintSummary {
     /// `None` when the hint file did not include a `checkpointSchema` field.
     pub schema: Option<SchemaRef>,
 
-    /// File name of the V2 checkpoint the hint describes (`v2Checkpoint.path`); see
-    /// [`LastCheckpointHint::v2_checkpoint`]. `None` for V1 / classic checkpoints.
+    /// File name of the V2 checkpoint the hint describes (`v2Checkpoint.path`). `None` for V1 /
+    /// classic checkpoints.
     pub v2_checkpoint_path: Option<String>,
 }
 
