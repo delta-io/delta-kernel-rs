@@ -1229,6 +1229,7 @@ impl TestTableBuilder {
                 self.num_data_files,
                 self.rows_per_file,
                 &self.partition_columns,
+                &self.clustering_columns,
                 v,
             )
             .await?
@@ -1316,13 +1317,15 @@ fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
 /// tables, all rows in a file share the same partition values; for unpartitioned or
 /// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
-/// varying data derived from version and file index.
+/// varying data derived from version and file index. Partition and clustering columns
+/// are never nulled so their values stay well-defined.
 async fn write_data_commit<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &DefaultEngine<E>,
     num_files: usize,
     rows_per_file: usize,
     partition_columns: &[String],
+    clustering_columns: &[String],
     version: u64,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
@@ -1342,12 +1345,14 @@ async fn write_data_commit<E: TaskExecutor>(
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (arrow_field, kernel_field) in arrow_schema.fields().iter().zip(logical_schema.fields())
         {
-            if partition_columns.contains(&kernel_field.name().to_string()) {
+            let name = kernel_field.name();
+            if partition_columns.iter().any(|c| c == name) {
                 continue;
             }
             let data_type = arrow_field.data_type();
             let values = generate_column(data_type, rows_per_file, base);
-            let values = if arrow_field.is_nullable() {
+            let values = if arrow_field.is_nullable() && !clustering_columns.iter().any(|c| c == name)
+            {
                 with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
             } else {
                 values
@@ -2059,6 +2064,49 @@ mod tests {
                     "column '{}' should have {expected_nulls_per_col} nulls, got {null_count}",
                     batch.schema().field(col_idx).name(),
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Partition and clustering columns must never be nulled, even though the data
+    /// generator injects sparse nulls into every other nullable column. Clustered tables
+    /// write through the unpartitioned path, so the clustering case guards against the
+    /// generator treating clustering columns like ordinary data columns.
+    #[rstest::rstest]
+    #[case::partitioned(partitioned())]
+    #[case::clustered(clustered())]
+    fn test_layout_columns_are_never_nulled(#[case] config: DataLayoutConfig) -> DeltaResult<()> {
+        let rows_per_file = NULL_RATE_EVERY_NTH * 3;
+        let layout_columns = config.columns();
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(1))
+            .with_data_layout(config)
+            .with_data(1, rows_per_file)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let expected_nulls_per_col = rows_per_file / NULL_RATE_EVERY_NTH;
+        for batch in &batches {
+            for col_idx in 0..batch.num_columns() {
+                let name = batch.schema().field(col_idx).name().to_string();
+                let null_count = batch.column(col_idx).null_count();
+                if layout_columns.contains(&name) {
+                    assert_eq!(
+                        null_count, 0,
+                        "layout column '{name}' must never be nulled, got {null_count}",
+                    );
+                } else {
+                    assert_eq!(
+                        null_count, expected_nulls_per_col,
+                        "data column '{name}' should have {expected_nulls_per_col} nulls, \
+                         got {null_count}",
+                    );
+                }
             }
         }
         Ok(())
