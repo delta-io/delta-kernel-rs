@@ -196,8 +196,13 @@ pub(crate) struct CommitActionsIterator {
 
 impl CommitActionsIterator {
     /// Build and validate a `CommitAction` for `log_path` (seeded with the iterator's accumulated
-    /// state), and advance the accumulated `(Protocol, Metadata)` to
-    /// this commit's effective values.
+    /// state), then advance that state for the next commit.
+    ///
+    /// Accumulated `(Protocol, Metadata)` only flows forward in ascending order. Walking backward
+    /// can't reconstruct an earlier version's effective state, so descending resets it to `None`.
+    /// Commits below the anchor are validated/timestamped best-effort against only their own
+    /// actions. Another solution is to walk the commit in ascending then reversing in the
+    /// [`CommitOrdering::DescendingOrder`] scenario.
     fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
@@ -210,9 +215,15 @@ impl CommitActionsIterator {
         )
         .map_err(|e| with_version_context(version, e))?;
 
-        if self.commit_ordering == CommitOrdering::AscendingOrder {
-            self.latest_protocol = commit_action.protocol().cloned();
-            self.latest_metadata = commit_action.metadata().cloned();
+        match self.commit_ordering {
+            CommitOrdering::AscendingOrder => {
+                self.latest_protocol = commit_action.protocol().cloned();
+                self.latest_metadata = commit_action.metadata().cloned();
+            }
+            CommitOrdering::DescendingOrder => {
+                self.latest_protocol = None;
+                self.latest_metadata = None;
+            }
         }
         Ok(commit_action)
     }

@@ -12,7 +12,7 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end version
 /// and the commit ordering. [`Self::build`] performs delta-log listing and contiguity
 /// validation.
-// TODO: support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
+// TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
 // `with_max_catalog_version(self, Version)`
 pub struct CommitRangeBuilder {
     table_root: String,
@@ -82,8 +82,7 @@ impl CommitRangeBuilder {
 
         let end_version = end_version.unwrap_or(log_segment.end_version);
 
-        // Avoid misleading error if snapshot-derived range extends past the snapshot version.
-        // Without this you get the error from `validate_number_of_commit_files`.
+        // Snapshot-derived ranges can't extend past the snapshot version.
         if self.snapshot.is_some() && end_version > log_segment.end_version {
             return Err(Error::generic(format!(
                 "end_version ({end_version}) cannot exceed snapshot version ({})",

@@ -7,6 +7,7 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{
     CommitInfo, Metadata, Protocol, COMMIT_INFO_NAME, METADATA_NAME, PROTOCOL_NAME,
 };
+use crate::commit_range::with_version_context;
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
@@ -62,7 +63,7 @@ impl CommitAction {
     /// Construct and fully initialize a [`CommitAction`] for one commit JSON file.
     ///
     /// `seed_protocol` / `seed_metadata` carry the effective `(Protocol, Metadata)` inherited
-    /// from prior commits (or from a start snapshot). This f reads the commit's header
+    /// from prior commits (or from a start snapshot). This reads the commit's header
     /// (`[protocol, metadata, commitInfo]`), overlays any `Protocol` / `Metadata` the commit
     /// carries onto the seed, validates that the kernel can read the resulting configuration,
     /// and resolves the commit timestamp.
@@ -192,8 +193,8 @@ impl CommitAction {
                 };
                 if ict_applies {
                     extracted_ict.ok_or_else(|| {
-                        Error::generic(format!(
-                            "in-commit timestamp enabled but missing in commit v={version}"
+                        with_version_context(version, Error::generic(
+                            "in-commit timestamp is enabled but missing ICT timestamp field in commit"
                         ))
                     })?
                 } else {
