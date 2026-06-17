@@ -1,5 +1,3 @@
-//! FFI bindings for building and inspecting a [`CommitRange`].
-
 use std::sync::Arc;
 
 use delta_kernel::commit_range::CommitRange;
@@ -87,8 +85,8 @@ pub unsafe extern "C" fn commit_range_builder_with_end_version(
     unsafe { builder.as_mut() }.end_version = Some(end_version);
 }
 
-/// Consume the builder and return a [`CommitRange`]. After calling, the builder pointer is _no
-/// longer valid_. The builder is always freed by this call, whether or not it succeeds.
+/// Consume the builder and return a [`CommitRange`]. After calling, the builder pointer is no
+/// longer valid. The builder is always freed by this call, whether or not it succeeds.
 ///
 /// Returns an error if the resolved version range is invalid (start > end), the listed commits
 /// are non-contiguous, or the requested start version is not present.
@@ -98,24 +96,22 @@ pub unsafe extern "C" fn commit_range_builder_with_end_version(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn commit_range_builder_build(
-    mut builder: Handle<MutableFfiCommitRangeBuilder>,
+    builder: Handle<MutableFfiCommitRangeBuilder>,
 ) -> ExternResult<Handle<ExclusiveCommitRange>> {
-    // Clone the engine Arc before consuming the handle so we can still use it for error reporting.
-    let engine_arc = unsafe { builder.as_mut() }.engine.clone();
-    let engine_ref = engine_arc.as_ref();
     let builder_box = unsafe { builder.into_inner() };
-    commit_range_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
+    let engine = builder_box.engine.clone();
+    commit_range_builder_build_impl(*builder_box).into_extern_result(&engine.as_ref())
 }
 
 fn commit_range_builder_build_impl(
     builder: FfiCommitRangeBuilder,
 ) -> DeltaResult<Handle<ExclusiveCommitRange>> {
     let engine = builder.engine.engine();
-    let mut rust_builder = CommitRange::builder_for(builder.table_root, builder.start_version);
+    let mut kernel_builder = CommitRange::builder_for(builder.table_root, builder.start_version);
     if let Some(end_version) = builder.end_version {
-        rust_builder = rust_builder.with_end_version(end_version);
+        kernel_builder = kernel_builder.with_end_version(end_version);
     }
-    let range = rust_builder.build(engine.as_ref())?;
+    let range = kernel_builder.build(engine.as_ref())?;
     Ok(Box::new(range).into())
 }
 
@@ -188,10 +184,10 @@ mod tests {
             ))
         };
         unsafe { commit_range_builder_with_end_version(&mut builder, 1) };
-        let mut range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
+        let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
 
-        assert_eq!(unsafe { range.as_mut() }.start_version(), 0);
-        assert_eq!(unsafe { range.as_mut() }.end_version(), 1);
+        assert_eq!(unsafe { range.as_ref() }.start_version(), 0);
+        assert_eq!(unsafe { range.as_ref() }.end_version(), 1);
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }
