@@ -1,6 +1,6 @@
 //! Plan containers ([`Plan`], [`PlanNode`]) and the [`RefId`] value handle.
 
-pub use super::nodes::NodeKind;
+pub use super::nodes::Operator;
 
 // ============================================================================
 // RefIds and plan nodes
@@ -13,14 +13,14 @@ pub use super::nodes::NodeKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RefId(pub u32);
 
-/// One node in a plan: an operator kind, its input RefIds, and its output RefId.
+/// One node in a plan: an [`Operator`], its input RefIds, and its output RefId.
 ///
-/// `inputs` order is interpreted per [`NodeKind`] (e.g. for `NodeKind::SemiJoin` the
-/// convention is `[probe, build]`). `NodeKind::UnionAll` emits the rows of all inputs
+/// `inputs` order is interpreted per [`Operator`] (e.g. for `Operator::SemiJoin` the
+/// convention is `[probe, build]`). `Operator::UnionAll` emits the rows of all inputs
 /// regardless of input order.
 #[derive(Debug, Clone)]
 pub struct PlanNode {
-    pub kind: NodeKind,
+    pub op: Operator,
     pub inputs: Vec<RefId>,
     pub output: RefId,
 }
@@ -32,9 +32,9 @@ pub struct PlanNode {
 /// A plan: an ordered sequence of [`PlanNode`]s forming a dataflow DAG.
 ///
 /// A [`RefId`] is an opaque value handle naming the output of one plan node. Each
-/// [`PlanNode`] is a triple `(kind, inputs, output)`:
+/// [`PlanNode`] is a triple `(op, inputs, output)`:
 ///
-/// - `kind` ([`NodeKind`]) is the operator: a source like `ScanParquet` or a transform like
+/// - `op` ([`Operator`]) is the operator: a source like `ScanParquet` or a transform like
 ///   `Project`.
 /// - `inputs` is a `Vec<RefId>` naming the upstream values the operator reads from.
 /// - `output` is the RefId the operator produces.
@@ -65,11 +65,11 @@ pub struct PlanNode {
 /// ```text
 /// Plan {
 ///     nodes: vec![
-///         PlanNode { kind: ScanParquet(..), inputs: vec![],                   output: RefId(0) },
-///         PlanNode { kind: ScanParquet(..), inputs: vec![],                   output: RefId(1) },
-///         PlanNode { kind: Filter(..),      inputs: vec![RefId(0)],           output: RefId(2) },
-///         PlanNode { kind: Filter(..),      inputs: vec![RefId(1)],           output: RefId(3) },
-///         PlanNode { kind: UnionAll(..),    inputs: vec![RefId(2), RefId(3)], output: RefId(4) },
+///         PlanNode { op: ScanParquet(..), inputs: vec![],                   output: RefId(0) },
+///         PlanNode { op: ScanParquet(..), inputs: vec![],                   output: RefId(1) },
+///         PlanNode { op: Filter(..),      inputs: vec![RefId(0)],           output: RefId(2) },
+///         PlanNode { op: Filter(..),      inputs: vec![RefId(1)],           output: RefId(3) },
+///         PlanNode { op: UnionAll(..),    inputs: vec![RefId(2), RefId(3)], output: RefId(4) },
 ///     ],
 /// }
 /// ```

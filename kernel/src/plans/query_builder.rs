@@ -4,7 +4,7 @@
 //! it will grow to support multi-node plans. Until then, multi-node [`Plan`]s are
 //! constructed directly via [`Plan`] / [`PlanNode`].
 
-use super::ir::nodes::{NodeKind, ScanFile, ScanJson, ScanParquet};
+use super::ir::nodes::{Operator, ScanFile, ScanJson, ScanParquet};
 use super::ir::plan::{Plan, PlanNode, RefId};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileMeta};
@@ -12,7 +12,7 @@ use crate::{DeltaResult, FileMeta};
 /// Builder for constructing a single-node [`Plan`].
 #[derive(Debug)]
 pub struct QueryPlanBuilder {
-    kind: NodeKind,
+    op: Operator,
 }
 
 impl QueryPlanBuilder {
@@ -21,7 +21,7 @@ impl QueryPlanBuilder {
     /// See [`ScanJson`] for parameter semantics.
     pub fn scan_json(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
         Self {
-            kind: NodeKind::ScanJson(ScanJson {
+            op: Operator::ScanJson(ScanJson {
                 files: files.into_iter().map(ScanFile::from).collect(),
                 file_constant_columns: vec![],
                 schema,
@@ -34,7 +34,7 @@ impl QueryPlanBuilder {
     /// See [`ScanParquet`] for parameter semantics.
     pub fn scan_parquet(files: Vec<FileMeta>, schema: SchemaRef) -> Self {
         Self {
-            kind: NodeKind::ScanParquet(ScanParquet {
+            op: Operator::ScanParquet(ScanParquet {
                 files: files.into_iter().map(ScanFile::from).collect(),
                 file_constant_columns: vec![],
                 schema,
@@ -51,7 +51,7 @@ impl QueryPlanBuilder {
     pub fn build(self) -> DeltaResult<Plan> {
         Ok(Plan {
             nodes: vec![PlanNode {
-                kind: self.kind,
+                op: self.op,
                 inputs: vec![],
                 output: RefId(0),
             }],
@@ -107,18 +107,18 @@ mod tests {
         let result = plan.result();
         let [node] = <[_; 1]>::try_from(plan.nodes).expect("single-node plan");
         assert_eq!(Some(node.output), result);
-        let (NodeKind::ScanJson(ScanJson {
+        let (Operator::ScanJson(ScanJson {
             files: scan_files,
             schema: node_schema,
             ..
         })
-        | NodeKind::ScanParquet(ScanParquet {
+        | Operator::ScanParquet(ScanParquet {
             files: scan_files,
             schema: node_schema,
             ..
-        })) = node.kind
+        })) = node.op
         else {
-            panic!("expected ScanJson / ScanParquet, got {:?}", node.kind);
+            panic!("expected ScanJson / ScanParquet, got {:?}", node.op);
         };
         let scan_metas: Vec<FileMeta> = scan_files.into_iter().map(|f| f.meta).collect();
         assert_eq!(scan_metas, files);
