@@ -194,7 +194,13 @@ jobs:
         run: cargo install critcmp --version 0.1.8
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ steps.pr.outputs.head_sha }}
+          # Check out the integration commit (PR head merged into base) that
+          # GitHub maintains at refs/pull/<N>/merge -- the same ref build.yml
+          # and the test jobs resolve to via their bare checkout. Benchmarking
+          # this measures the PR as it would land, not the raw head. An
+          # unmergeable PR has no maintained merge ref, so the checkout fails
+          # and the job stops (parity with build/test; see SECURITY_MODEL.md).
+          ref: refs/pull/${{ steps.pr.outputs.pr_number }}/merge
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:

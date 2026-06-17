@@ -1,14 +1,16 @@
 # Benchmark workflow security model
 
-Scope: [`benchmark.yml`](workflows/benchmark.yml) (runs bench on PR head) and
+Scope: [`benchmark.yml`](workflows/benchmark.yml) (runs bench on the PR merge
+commit -- PR head merged into base) and
 [`benchmark-post-comment.yml`](workflows/benchmark-post-comment.yml) (posts the
 result comment in base-branch context). Other workflows in this repo may follow
 different patterns -- this document is specific to the benchmark pair.
 
 ## Running untrusted PR code
 
-The `run-benchmark` job in `benchmark.yml` checks out the PR head and runs
-its build + bench harness. To bound what that code can do:
+The `run-benchmark` job in `benchmark.yml` checks out the PR merge commit (PR
+head merged into base) and runs its build + bench harness. To bound what that
+code can do:
 
 - Workflow-level `permissions: {}` is the default; each job opts in to the
   minimum scope it needs. `run-benchmark` declares only `contents: read`,
@@ -16,8 +18,8 @@ its build + bench harness. To bound what that code can do:
   a read-only token from GitHub by default under the `pull_request` event.
 - `actions/checkout` uses `persist-credentials: false` so the token isn't
   left in the local git config after checkout.
-- `cargo install critcmp` runs *before* the PR-head checkout, so the PR's
-  `.cargo/config.toml` cannot redirect the registry for that install.
+- `cargo install critcmp` runs *before* the PR merge-commit checkout, so the
+  PR's `.cargo/config.toml` cannot redirect the registry for that install.
 
 Do not add other secrets or grant write permissions to `run-benchmark`.
 
