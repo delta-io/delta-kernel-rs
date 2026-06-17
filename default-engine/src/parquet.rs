@@ -440,12 +440,10 @@ async fn open_parquet_file(
         }
     };
 
-    let reader_options = reader_options();
-    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options.clone()).await?;
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?;
     let parquet_schema = metadata.schema();
     let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let mut builder =
-        ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options).await?;
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone());
     if let Some(mask) = generate_mask(
         &table_schema,
         parquet_schema,
@@ -520,14 +518,13 @@ impl FileOpener for PresignedUrlOpener {
         Ok(Box::pin(async move {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
-            let reader_options = reader_options();
-            let metadata = ArrowReaderMetadata::load(&reader, reader_options.clone())?;
+            let metadata = ArrowReaderMetadata::load(&reader, reader_options())?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
                 get_requested_indices(&table_schema, parquet_schema)?;
 
             let mut builder =
-                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options)?;
+                ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata.clone());
             if let Some(mask) = generate_mask(
                 &table_schema,
                 parquet_schema,
@@ -573,7 +570,9 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::slice;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use bytes::Bytes;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use delta_kernel::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -585,6 +584,12 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
+    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+    use delta_kernel::object_store::CopyOptions;
+    use delta_kernel::object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result,
+    };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
     use delta_kernel::EngineData;
@@ -605,6 +610,110 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+
+    // A wrapper trait that lets us bound on `ObjectStore` without directly importing it under
+    // arrow-57, which would bring in ambiguous-method errors.
+    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+    trait ObjectStore: delta_kernel::object_store::ObjectStore {}
+    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+    impl<T: delta_kernel::object_store::ObjectStore + ?Sized> ObjectStore for T {}
+    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+    use delta_kernel::object_store::ObjectStore;
+
+    /// Store wrapper counting `get_opts` calls, delegating everything else to `inner`. Footer
+    /// fetches route through `get_range` -> `get_opts` (counted); column-chunk data routes through
+    /// `get_ranges` (delegated, not counted), so the count isolates footer fetches. Only the
+    /// `ObjectStore` methods without defaults are implemented, plus `get_ranges` to keep data reads
+    /// off the counter.
+    #[derive(Debug)]
+    struct GetOptsCountingStore<T: ObjectStore> {
+        inner: T,
+        get_opts_count: AtomicUsize,
+    }
+
+    impl<T: ObjectStore> GetOptsCountingStore<T> {
+        fn new(inner: T) -> Self {
+            Self {
+                inner,
+                get_opts_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_opts_count(&self) -> usize {
+            self.get_opts_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for GetOptsCountingStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GetOptsCountingStore({})", self.get_opts_count())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for GetOptsCountingStore<T> {
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.get_opts_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+        async fn delete(&self, location: &Path) -> Result<()> {
+            self.inner.delete(location).await
+        }
+
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+
+        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
@@ -663,6 +772,57 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_open_parquet_file_fetches_footer_once() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        )).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let url = Url::from_file_path(&path).unwrap();
+        let location = Path::from_url_path(url.path()).unwrap();
+
+        // Baseline: how many `get_opts` calls a single footer load makes (one or more range GETs,
+        // depending on parquet version). The reader builder must not exceed this.
+        let baseline_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
+        let mut reader =
+            ParquetObjectReader::new(baseline_store.clone(), location).with_file_size(file_size);
+        let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options())
+            .await
+            .unwrap();
+        let footer_load_gets = baseline_store.get_opts_count();
+        assert!(
+            footer_load_gets > 0,
+            "footer load should issue at least one GET"
+        );
+        let physical_schema = Arc::new(metadata.schema().clone().try_into_kernel().unwrap());
+
+        // `open_parquet_file` must reuse the loaded footer rather than re-fetch it when building
+        // the reader, so its footer GETs equal a single load, not double.
+        let counting_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+        let stream = open_parquet_file(
+            counting_store.clone(),
+            physical_schema,
+            None,
+            None,
+            DEFAULT_BATCH_SIZE,
+            file_meta,
+        )
+        .await
+        .unwrap();
+        let _batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert_eq!(
+            counting_store.get_opts_count(),
+            footer_load_gets,
+            "footer should be fetched once, not re-fetched when constructing the reader"
+        );
     }
 
     #[tokio::test]
