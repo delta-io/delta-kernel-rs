@@ -471,24 +471,50 @@ impl LogSegmentFiles {
     pub(crate) fn list_commits(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // TODO: plumb through a log_tail provided by our caller
+        debug_assert!(
+            log_tail.iter().all(|entry| entry.is_commit()),
+            "log_tail should only contain commits"
+        );
+        debug_assert!(
+            log_tail
+                .windows(2)
+                .all(|w| w[1].version == w[0].version + 1),
+            "log_tail must be a contiguous ascending run of commit versions"
+        );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter = list_from_storage(storage, log_root, start, end)?;
 
+        let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
         let mut max_published_version: Option<Version> = None;
-
+        // Filesystem commits, skipping any covered by the log_tail.
         for file_result in fs_iter {
             let file = file_result?;
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                should_process_log_file(&file); // warns if 0 bytes
-                max_published_version = max_published_version.max(Some(file.version));
-                listed_commits.push(file);
+            if file.file_type != LogPathFileType::Commit {
+                continue;
             }
+            max_published_version = max_published_version.max(Some(file.version));
+            if log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start) {
+                continue;
+            }
+            should_process_log_file(&file); // warns if 0 bytes
+            listed_commits.push(file);
+        }
+
+        // Log_tail commits, extending the filesystem prefix in ascending order.
+        for file in log_tail {
+            if file.version < start || file.version > end {
+                continue;
+            }
+            if file.file_type == LogPathFileType::Commit {
+                max_published_version = max_published_version.max(Some(file.version));
+            }
+            listed_commits.push(file);
         }
 
         let latest_commit_file = listed_commits.last().cloned();

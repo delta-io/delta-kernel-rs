@@ -1154,10 +1154,113 @@ async fn test_list_commits_zero_byte_commit_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, Some(0), Some(2)).unwrap();
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2))
+            .unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
     assert_eq!(result.ascending_commit_files[2].location.size, 0);
+}
+
+/// `list_commits` merges a caller-provided `log_tail` over the filesystem listing: the log_tail
+/// supersedes filesystem commits at overlapping versions and is clipped to `[start, end]`, while
+/// the published watermark counts only filesystem (published) commits.
+#[rstest]
+// log_tail supersedes filesystem at overlapping versions; filesystem commits still set the
+// watermark.
+#[case::supersedes_filesystem(
+    &[0, 1, 2],
+    &[1, 2],
+    Some(0), Some(2),
+    &[(0, CommitSource::Filesystem), (1, CommitSource::Catalog), (2, CommitSource::Catalog)],
+    Some(2),
+)]
+// staged tail extends the prefix but does not move the published watermark.
+#[case::staged_tail_keeps_watermark(
+    &[0],
+    &[1, 2],
+    Some(0), Some(2),
+    &[(0, CommitSource::Filesystem), (1, CommitSource::Catalog), (2, CommitSource::Catalog)],
+    Some(0),
+)]
+// log_tail entries below `start` are dropped (filesystem v3 superseded by the tail).
+#[case::drops_tail_below_start(
+    &[3],
+    &[2, 3, 4],
+    Some(3), Some(4),
+    &[(3, CommitSource::Catalog), (4, CommitSource::Catalog)],
+    Some(3),
+)]
+// log_tail entries above `end` are dropped.
+#[case::drops_tail_above_end(
+    &[3],
+    &[2, 3, 4],
+    Some(3), Some(3),
+    &[(3, CommitSource::Catalog)],
+    Some(3),
+)]
+#[tokio::test]
+async fn list_commits_merges_log_tail(
+    #[case] filesystem_commits: &[Version],
+    #[case] staged: &[Version],
+    #[case] start: Option<Version>,
+    #[case] end: Option<Version>,
+    #[case] expected: &[(Version, CommitSource)],
+    #[case] expected_max_published: Option<Version>,
+) {
+    let (storage, log_root) = create_storage(
+        filesystem_commits
+            .iter()
+            .map(|v| (*v, LogPathFileType::Commit, CommitSource::Filesystem))
+            .collect(),
+    )
+    .await;
+    let log_tail: Vec<ParsedLogPath> = staged
+        .iter()
+        .map(|v| {
+            make_parsed_log_path_with_source(
+                *v,
+                LogPathFileType::StagedCommit,
+                CommitSource::Catalog,
+            )
+        })
+        .collect();
+
+    let result =
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end).unwrap();
+
+    let commits = &result.ascending_commit_files;
+    assert_eq!(commits.len(), expected.len());
+    for (commit, (version, source)) in commits.iter().zip(expected) {
+        assert_eq!(commit.version, *version);
+        assert_source(commit, *source);
+    }
+    assert_eq!(result.max_published_version, expected_max_published);
+    if let Some((last_version, _)) = expected.last() {
+        assert_eq!(result.latest_commit_file.unwrap().version, *last_version);
+    }
+}
+
+#[tokio::test]
+async fn test_list_commits_keeps_commits_across_checkpoint() {
+    let mut files: Vec<_> = (0..=5)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    files.push((
+        3,
+        LogPathFileType::SinglePartCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    let (storage, log_root) = create_storage(files).await;
+
+    let result =
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5))
+            .unwrap();
+    let versions: Vec<_> = result
+        .ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect();
+    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
 }
 
 // ---------------------------------------------------------------------------

@@ -409,21 +409,30 @@ pub(crate) fn timestamp_to_version(
         _ => {}
     }
 
-    // TODO(#2443): Support staged commits (catalog-managed tables). Staged commits have ICT
-    // (required by catalog-managed), so timestamps are available. However, we currently
-    // rebuild the log segment from storage which doesn't include staged commits. To support
-    // this, we'd need to pass the snapshot's log_tail into the log segment construction.
-    let has_staged_commits = snapshot
+    // Catalog-managed tables carry staged commits that exist only in the snapshot's log_tail,
+    // not on the filesystem. These commits carry ICT, so to support timestamp conversion we pass
+    // the log_tail in for catalog-managed tables.
+    let staged_log_tail: Vec<ParsedLogPath> = snapshot
         .log_segment()
         .listed
         .ascending_commit_files
-        .last() // Use last since a log segment always ends with staged commits from `log_tail`
-        .is_some_and(|c| c.file_type == crate::path::LogPathFileType::StagedCommit);
-    if has_staged_commits {
-        return Err(LogHistoryError::internal_message(
-            "timestamp conversion not yet supported for snapshots with staged commits",
-        ));
-    }
+        .iter()
+        .filter(|c| c.file_type == LogPathFileType::StagedCommit)
+        .cloned()
+        .collect();
+
+    // The staged suffix must be directly adjacent to the published prefix with no version gap.
+    // Otherwise, for_timestamp_conversion's gap-trim would keep only the staged tail and silently
+    // drop the prefix, resolving the wrong version.
+    debug_assert!(
+        snapshot
+            .log_segment()
+            .listed
+            .ascending_commit_files
+            .windows(2)
+            .all(|w| w[1].version == w[0].version + 1),
+        "snapshot commit files must be contiguous for timestamp conversion"
+    );
 
     let listing_limit = match resolved_commit_type {
         HistoryCommitType::Published => None,
@@ -465,6 +474,7 @@ pub(crate) fn timestamp_to_version(
         snapshot.log_segment().log_root.clone(),
         snapshot.version(),
         listing_limit,
+        staged_log_tail,
     )
     .map_err(|e| {
         LogHistoryError::internal("failed to build log segment for timestamp conversion", e)
@@ -1043,6 +1053,7 @@ mod tests {
             snapshot.log_segment().log_root.clone(),
             snapshot.version(),
             None,
+            vec![],
         )
         .unwrap();
         (table, engine, snapshot, log_segment)
@@ -1157,6 +1168,7 @@ mod tests {
             snapshot.log_segment().log_root.clone(),
             snapshot.version(),
             None,
+            vec![],
         )
         .unwrap();
 

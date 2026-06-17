@@ -445,8 +445,13 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        let listed_files =
-            LogSegmentFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
+        let listed_files = LogSegmentFiles::list_commits(
+            storage,
+            &log_root,
+            vec![],
+            Some(start_version),
+            end_version,
+        )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegmentFiles::list_commits`] also checks that there are no gaps between commits.
@@ -471,7 +476,9 @@ impl LogSegment {
     /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
     /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
     /// `limit` specifies the maximum length of the returned log segment. The log segment may be
-    /// shorter than `limit` if there are missing commits.
+    /// shorter than `limit` if there are missing commits. `log_tail` supplies caller-provided
+    /// commits (e.g. catalog-managed staged commits) that take precedence over the filesystem
+    /// listing.
     // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
     pub(crate) fn for_timestamp_conversion(
@@ -479,6 +486,7 @@ impl LogSegment {
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,
+        log_tail: Vec<ParsedLogPath>,
     ) -> DeltaResult<Self> {
         // Compute the version to start listing from.
         let start_from = limit
@@ -492,8 +500,13 @@ impl LogSegment {
 
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
-        let mut listed_commits =
-            LogSegmentFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
+        let mut listed_commits = LogSegmentFiles::list_commits(
+            storage,
+            &log_root,
+            log_tail,
+            start_from,
+            Some(end_version),
+        )?;
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();
