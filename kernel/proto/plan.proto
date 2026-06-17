@@ -1,8 +1,9 @@
 // Proto mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (the Rust IR is the source of truth).
 //
-// A plan is a DAG of plan nodes: `Plan` is a flat list of `PlanNode`s, and each node wires
-// into the DAG by referencing other nodes' `output` RefIds in its `inputs`. RefIds are opaque
-// keys. Field numbers are never reused once published, so the wire stays compatible.
+// A plan is a DAG of plan nodes: `Plan` is a flat list of `PlanNode`s in topological order. A
+// node's output is implicit -- it is the node's own 0-based index in the list -- and each node wires
+// into the DAG by referencing earlier nodes' indices in its `inputs`. Field numbers are never
+// reused once published, so the wire stays compatible.
 
 syntax = "proto3";
 
@@ -10,10 +11,6 @@ package delta.kernel.plan;
 
 import "expressions.proto";
 import "schema.proto";
-
-message RefId {
-  uint32 id = 1;
-}
 
 message FileMeta {
   string location = 1;
@@ -86,9 +83,42 @@ message LoadNode {
   delta.kernel.expressions.ColumnName dv_column = 6;
 }
 
-message MaxByVersionNode {
-  repeated delta.kernel.expressions.Expression group_by = 1;
-  delta.kernel.expressions.ColumnName version_column = 2;
+// One aggregate function application (mirrors `Agg` / `AggOp` in nodes.rs). `value` is the column
+// whose value is emitted; `key` is the comparison column for the `*_by` functions (the row with the
+// least/greatest `key` wins).
+message MinAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message MaxAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message MinByAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+  delta.kernel.expressions.ColumnName key = 2;
+}
+message MaxByAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+  delta.kernel.expressions.ColumnName key = 2;
+}
+
+message AggOp {
+  oneof op {
+    MinAgg min = 1;
+    MaxAgg max = 2;
+    MinByAgg min_by = 3;
+    MaxByAgg max_by = 4;
+  }
+}
+
+message Agg {
+  AggOp op = 1;
+  optional delta.kernel.expressions.Predicate filter = 2;
+  optional string alias = 3;
+}
+
+message AggregateNode {
+  repeated delta.kernel.expressions.ColumnName group_by = 1;
+  repeated Agg aggs = 2;
   delta.kernel.schema.StructType schema = 3;
 }
 
@@ -99,11 +129,11 @@ message SemiJoinNode {
 }
 
 // ============================================================================
-// NodeKind
+// Operator
 // ============================================================================
 
-message NodeKind {
-  oneof kind {
+message Operator {
+  oneof op {
     // Sources (0 inputs)
     ScanParquetNode scan_parquet = 1;
     ScanJsonNode scan_json = 2;
@@ -113,7 +143,7 @@ message NodeKind {
     FilterNode filter = 5;
     UnionAllNode union_all = 6;
     LoadNode load = 7;
-    MaxByVersionNode max_by_version = 8;
+    AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
   }
 }
@@ -123,9 +153,9 @@ message NodeKind {
 // ============================================================================
 
 message PlanNode {
-  NodeKind kind = 1;
-  repeated RefId inputs = 2;
-  RefId output = 3;
+  Operator op = 1;
+  // 0-based indices of the nodes whose outputs this operator reads.
+  repeated uint32 inputs = 2;
 }
 
 // The plan's terminal node is its last entry; the engine streams that node's rows.
