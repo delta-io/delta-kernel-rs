@@ -848,9 +848,10 @@ pub enum DataLayoutConfig {
 
 /// Period for sparse null injection. Data generation emits a null every
 /// `NULL_RATE_EVERY_NTH` rows for each nullable, non-partition column, regardless of
-/// [`DataLayoutConfig`]. The protocol permits null partition values, but the generator
-/// does not produce them: partition and clustering columns are left fully populated to
-/// keep their values well-defined for tests.
+/// [`DataLayoutConfig`]. Clustering columns are nulled like any other data column (kernel
+/// permits null clustering keys). Partition columns are left fully populated: the protocol
+/// permits null partition values, but the generator does not model them, so partition data
+/// stays well-defined and matches the declared partition value.
 pub const NULL_RATE_EVERY_NTH: usize = 3;
 
 impl DataLayoutConfig {
@@ -1230,7 +1231,6 @@ impl TestTableBuilder {
                 self.num_data_files,
                 self.rows_per_file,
                 &self.partition_columns,
-                &self.clustering_columns,
                 v,
             )
             .await?
@@ -1318,15 +1318,15 @@ fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
 /// tables, all rows in a file share the same partition values; for unpartitioned or
 /// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
-/// varying data derived from version and file index. Partition and clustering columns
-/// are never nulled so their values stay well-defined.
+/// varying data derived from version and file index. Partition columns are never nulled
+/// so their data matches the declared partition value; all other nullable columns
+/// (including clustering columns, which kernel permits to be null) get sparse nulls.
 async fn write_data_commit<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &DefaultEngine<E>,
     num_files: usize,
     rows_per_file: usize,
     partition_columns: &[String],
-    clustering_columns: &[String],
     version: u64,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
@@ -1339,7 +1339,6 @@ async fn write_data_commit<E: TaskExecutor>(
         .with_data_change(true);
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
-    let clustering_set: HashSet<&str> = clustering_columns.iter().map(String::as_str).collect();
 
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
@@ -1349,13 +1348,12 @@ async fn write_data_commit<E: TaskExecutor>(
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (arrow_field, kernel_field) in arrow_schema.fields().iter().zip(logical_schema.fields())
         {
-            let name = kernel_field.name().as_str();
-            if partition_set.contains(name) {
+            if partition_set.contains(kernel_field.name().as_str()) {
                 continue;
             }
             let data_type = arrow_field.data_type();
             let values = generate_column(data_type, rows_per_file, base);
-            let values = if arrow_field.is_nullable() && !clustering_set.contains(name) {
+            let values = if arrow_field.is_nullable() {
                 with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
             } else {
                 values
@@ -2072,16 +2070,21 @@ mod tests {
         Ok(())
     }
 
-    /// The generator leaves partition and clustering columns fully populated, even though
-    /// it injects sparse nulls into every other nullable column. Clustered tables write
-    /// through the unpartitioned path, so the clustering case guards against the generator
-    /// treating clustering columns like ordinary data columns.
+    /// Partition columns are never nulled so their data matches the declared partition
+    /// value. Clustering columns are ordinary data columns (kernel permits null clustering
+    /// keys), so they receive the same sparse nulls as any other nullable column -- the
+    /// clustered case guards against accidentally protecting them.
     #[rstest::rstest]
     #[case::partitioned(partitioned())]
     #[case::clustered(clustered())]
-    fn test_layout_columns_are_never_nulled(#[case] config: DataLayoutConfig) -> DeltaResult<()> {
+    fn test_layout_column_null_injection(#[case] config: DataLayoutConfig) -> DeltaResult<()> {
         let rows_per_file = NULL_RATE_EVERY_NTH * 3;
-        let layout_columns = config.columns();
+        // Only partition columns are protected from nulling; clustering columns are not.
+        let protected_columns = if config.is_partitioned() {
+            config.columns()
+        } else {
+            Vec::new()
+        };
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1))
             .with_data_layout(config)
@@ -2098,10 +2101,10 @@ mod tests {
             for col_idx in 0..batch.num_columns() {
                 let name = batch.schema().field(col_idx).name().to_string();
                 let null_count = batch.column(col_idx).null_count();
-                if layout_columns.contains(&name) {
+                if protected_columns.contains(&name) {
                     assert_eq!(
                         null_count, 0,
-                        "layout column '{name}' must never be nulled, got {null_count}",
+                        "partition column '{name}' must never be nulled, got {null_count}",
                     );
                 } else {
                     assert_eq!(
