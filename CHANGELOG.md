@@ -85,7 +85,7 @@
     - `TransactionCommitSuccess` gains a `num_dv_updates: u64` field; callers constructing or
       exhaustively matching it must account for the new field. `ScanType` gains
       `EnumString`/`IntoStaticStr` (plus `Display`/`AsRefStr`, replacing its manual `Display`
-      impl) and `CommitFailureReason` gains `IntoStaticStr`; convert via `.into()`.
+      impl) and `CommitFailureReason` gains `IntoStaticStr`.
 
 ### 🚀 Features / new APIs
 
