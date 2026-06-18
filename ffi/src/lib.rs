@@ -1016,9 +1016,9 @@ pub unsafe extern "C" fn snapshot_timestamp(
 #[repr(C)]
 pub enum FfiHistoryCommitType {
     /// Maps to [`HistoryCommitType::Published`].
-    Published,
+    Published = 0,
     /// Maps to [`HistoryCommitType::Recreatable`].
-    Recreatable,
+    Recreatable = 1,
 }
 
 impl From<FfiHistoryCommitType> for HistoryCommitType {
