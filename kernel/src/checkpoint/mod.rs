@@ -400,7 +400,7 @@ impl CheckpointWriter {
         )?;
         let (output_schema, transform_expr) = build_checkpoint_transform(
             &schema_context.stats_config,
-            &schema_context.checkpoint_base_schema,
+            &read_schema,
             &schema_context.stats_schema,
             schema_context.partition_schema.as_ref(),
         )?;

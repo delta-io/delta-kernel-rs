@@ -79,7 +79,12 @@ impl ArrowFFIData {
     /// `FFI_ArrowArray`/`FFI_ArrowSchema` call their release callbacks).
     pub fn try_from_engine_data(data: Box<dyn EngineData>) -> DeltaResult<Self> {
         let record_batch = data.try_into_record_batch()?;
-        let sa: StructArray = record_batch.into();
+        Self::try_from_record_batch(record_batch)
+    }
+
+    /// Export a `RecordBatch` as Arrow C Data Interface structs.
+    pub fn try_from_record_batch(batch: RecordBatch) -> DeltaResult<Self> {
+        let sa: StructArray = batch.into();
         let array_data: ArrayData = sa.into();
         let array = FFI_ArrowArray::new(&array_data);
         let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
@@ -197,6 +202,12 @@ mod tests {
     fn free_null_is_safe() {
         // Mirrors the convention enforced by `free_scan_metadata_arrow_result`.
         unsafe { free_arrow_ffi_data(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn empty_arrow_ffi_data_carries_no_release_callback() {
+        // The invariant `import_ffi_array` relies on to detect an unpopulated result slot.
+        assert!(ArrowFFIData::empty().array.is_released());
     }
 
     #[test]

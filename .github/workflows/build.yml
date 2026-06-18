@@ -150,6 +150,7 @@ jobs:
   # 1. build/clippy all packages that depend on the kernel with some features enabled:
   #    - acceptance
   #    - test_utils
+  #    - delta_kernel_workloads
   #    - feature_tests
   #    (and examples)
   #    - inspect-table
@@ -235,6 +236,29 @@ jobs:
           output=$(cargo run --profile test --example metrics-tester)
           grep -q 'invalid_field' <<< "$output"
           grep -q 'Invalid uuid' <<< "$output"
+
+  # Fails red on trybuild drift, but kept out of required checks so it never blocks a merge.
+  invalid-handle-code:
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install minimal stable
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: trybuild tests
+        run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
+      - name: notify on failure
+        if: failure()
+        run: |
+          echo "::warning title=invalid_handle_code trybuild tests failed::Check whether the compile_fail expectations need updating for the current rustc, or whether handle.rs/ffi-proc-macros regressed."
+          echo "## invalid_handle_code trybuild tests failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check whether the compile_fail expectations need updating for the current rustc, or whether \`ffi/src/handle.rs\` / \`ffi-proc-macros\` regressed." >> "$GITHUB_STEP_SUMMARY"
 
   ffi_test:
     runs-on: ${{ matrix.os }}

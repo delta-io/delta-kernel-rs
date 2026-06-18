@@ -1,6 +1,6 @@
 //! Plan node operator kinds and their payloads.
 //!
-//! [`NodeKind`] enumerates every operator. Each operator's payload struct is defined
+//! [`Operator`] enumerates every operator. Each operator's payload struct is defined
 //! below.
 
 use strum::Display;
@@ -11,10 +11,10 @@ use crate::schema::SchemaRef;
 use crate::FileMeta;
 
 // ============================================================================
-// NodeKind: enumerates every operator kind
+// Operator: enumerates every operator kind
 // ============================================================================
 
-/// Plan node operator kinds.
+/// Plan node operators.
 ///
 /// Output schemas are stored on the payload struct for operators whose caller
 /// declares them (`ScanParquet`, `ScanJson`, `Values`, `Load`, `Project`,
@@ -24,7 +24,7 @@ use crate::FileMeta;
 /// - `UnionAll` from its inputs' common schema.
 /// - `SemiJoin` from the probe input.
 #[derive(Debug, Clone, Display)]
-pub enum NodeKind {
+pub enum Operator {
     // === Source operators (0 inputs) =========================================
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),

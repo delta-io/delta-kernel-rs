@@ -8,8 +8,8 @@ version = "0.24.0"
 dependencies = [
  "datatest-stable",
  "delta_kernel",
- "delta_kernel_benchmarks",
  "delta_kernel_default_engine",
+ "delta_kernel_workloads",
  "flate2",
  "futures",
  "itertools 0.14.0",
@@ -1256,6 +1256,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test_utils",
  "tokio",
  "tracing",
  "unity-catalog-delta-client-api",
@@ -1321,14 +1322,11 @@ dependencies = [
  "delta-kernel-unity-catalog",
  "delta_kernel",
  "delta_kernel_default_engine",
+ "delta_kernel_workloads",
  "flate2",
- "itertools 0.14.0",
  "object_store 0.12.5",
  "rayon",
- "rstest",
- "serde",
  "serde_json",
- "sqlparser",
  "tar",
  "test_utils",
  "tokio",
@@ -1412,6 +1410,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "delta_kernel_workloads"
+version = "0.24.0"
+dependencies = [
+ "delta_kernel",
+ "itertools 0.14.0",
+ "rstest",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "url",
 ]
 
 [[package]]

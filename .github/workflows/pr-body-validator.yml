@@ -2,7 +2,9 @@ name: Validate PR Body
 
 on:
   pull_request:
-    types: [opened, edited]
+    # synchronize is required: validate-body is a required check, and required checks must
+    # re-report on every new head SHA or the PR blocks on "Expected, waiting for status".
+    types: [opened, edited, reopened, synchronize]
   merge_group:
 
 jobs:

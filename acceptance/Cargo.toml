@@ -17,8 +17,8 @@ release = false
 [features]
 default = ["arrow"]
 arrow = ["arrow-58"]
-arrow-58 = ["delta_kernel/arrow-58", "test_utils/arrow-58"]
-arrow-57 = ["delta_kernel/arrow-57", "test_utils/arrow-57"]
+arrow-58 = ["delta_kernel/arrow-58", "delta_kernel_workloads/arrow-58", "test_utils/arrow-58"]
+arrow-57 = ["delta_kernel/arrow-57", "delta_kernel_workloads/arrow-57", "test_utils/arrow-57"]
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = [
@@ -27,7 +27,7 @@ delta_kernel = { path = "../kernel", features = [
   "prettyprint",
 ] }
 delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"] }
-delta_kernel_benchmarks = { path = "../benchmarks" }
+delta_kernel_workloads = { path = "../workloads" }
 futures = "0.3"
 itertools = "0.14"
 serde = { version = "1", features = ["derive"] }

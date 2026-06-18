@@ -167,6 +167,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         physical_stats_schema: None,
         physical_partition_schema: None,
         physical_stats_columns: HashSet::new(),
+        is_catalog_managed: false,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let (iter, _metrics) = scan_action_iter(

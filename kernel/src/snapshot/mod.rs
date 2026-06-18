@@ -23,7 +23,7 @@ use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
-use crate::metrics::MetricId;
+use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -174,12 +174,12 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %operation_id), skip(engine))]
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
-        operation_id: MetricId,
+        metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Self> {
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -197,7 +197,9 @@ impl Snapshot {
         //              `ProtocolMetadataLoaded` span only fires on the replay branch below.
         let (metadata, protocol) = match crc_at_version.as_deref() {
             Some(c) => (c.metadata.clone(), c.protocol.clone()),
-            None => log_segment.read_protocol_metadata(engine, base_crc.as_ref(), operation_id)?,
+            None => {
+                log_segment.read_protocol_metadata(engine, base_crc.as_ref(), metric_context)?
+            }
         };
 
         let table_configuration =
@@ -313,6 +315,8 @@ impl Snapshot {
     /// here.
     ///
     /// Runs in O(n) over listed log files.
+    ///
+    /// TODO(#2757): Optimize the estimation accuracy.
     pub fn estimated_owned_heap_size_bytes(&self) -> usize {
         self.log_segment.listed.estimated_heap_size_bytes()
             + self.log_segment.log_root.as_str().len()

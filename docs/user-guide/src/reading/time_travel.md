@@ -166,8 +166,8 @@ to `at_version`.
 
 | Function | Returns |
 |----------|---------|
-| `latest_version_as_of(snapshot, engine, timestamp)` | The `Commit` for the latest version with a timestamp at or before `timestamp`. |
-| `first_version_after(snapshot, engine, timestamp)` | The `Commit` for the first version with a timestamp at or after `timestamp`. |
+| `latest_version_as_of(snapshot, engine, timestamp, resolved_commit_type)` | The `Commit` for the latest version with a timestamp at or before `timestamp`. |
+| `first_version_after(snapshot, engine, timestamp, resolved_commit_type)` | The `Commit` for the first version with a timestamp at or after `timestamp`. |
 | `timestamp_range_to_versions(snapshot, engine, start, end)` | A `(start_version, end_version)` pair covering the timestamp range. |
 
 Each helper takes a `Snapshot` reference, which defines the searchable
@@ -176,13 +176,18 @@ the table's full history. `timestamp_range_to_versions` is the most
 common of the three because it translates a `[start_ts, end_ts]` window
 into the version range that change data feed (CDF) queries need to read.
 
+The helper function also take a `resolved_commit_type`, controlling which
+versions are eligible. Pass `HistoryCommitType::Recreatable` to restrict
+the result to versions whose table state you can actually load.
+Pass `HistoryCommitType::Published` to allow any version that still has a commit file.
+
 ```rust,no_run
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::{DeltaResult, Snapshot};
-use delta_kernel::history_manager::latest_version_as_of;
+# use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
@@ -192,7 +197,7 @@ let latest = Snapshot::builder_for(&url).build(&engine)?;
 
 // 2. Resolve a timestamp (Jan 1, 2024 UTC) to a matching commit.
 let timestamp_ms = 1_704_067_200_000;
-let commit = latest_version_as_of(&latest, &engine, timestamp_ms)?;
+let commit = latest_version_as_of(&latest, &engine, timestamp_ms, HistoryCommitType::Recreatable)?;
 
 // 3. Time travel to the resolved version.
 let snapshot = Snapshot::builder_for(&url)

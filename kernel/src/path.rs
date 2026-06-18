@@ -108,6 +108,23 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
     path_segments.any(|p| p == DELTA_LOG_DIR)
 }
 
+/// Returns whether `rel_path`, a path relative to the `_delta_log/` directory, could still be
+/// within the version-named region of a lexicographically sorted log listing.
+///
+/// Every listable log file begins with a 20-digit version, so its first byte is an ASCII digit.
+/// Paths like `_staged_commits/`, `_sidecars/`, and `_last_checkpoint` sort after every
+/// version-named file because `'_'` (0x5F) > `'9'` (0x39), so a sorted listing can stop at the
+/// first relative path whose first byte sorts past `'9'`.
+///
+/// This is a scan bound, not a log-file filter, so it must not require a digit first byte: a
+/// path sorting before `'0'` (e.g. a dot-prefixed `.{version}.json.crc` written by some engines)
+/// can still be followed by version-named files, and stopping there would silently drop them.
+/// Such paths are kept here and discarded by [`ParsedLogPath`] parsing instead. An empty
+/// `rel_path` is conservatively kept.
+pub(crate) fn may_begin_listable_log_path(rel_path: &str) -> bool {
+    rel_path.as_bytes().first().is_none_or(|b| *b <= b'9')
+}
+
 impl<Location: AsUrl> ParsedLogPath<Location> {
     /// Estimated heap size in bytes, best-effort estimate.
     ///
@@ -560,6 +577,23 @@ pub(crate) mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         assert!(url.path().ends_with('/'));
         url
+    }
+
+    #[test]
+    fn test_may_begin_listable_log_path() {
+        // version-named files, and anything sorting before them, keep the scan going
+        assert!(may_begin_listable_log_path("00000000000000000010.json"));
+        assert!(may_begin_listable_log_path(
+            ".00000000000000000010.json.crc"
+        ));
+        assert!(may_begin_listable_log_path(""));
+        // paths sorting past '9' end the version-named region
+        assert!(!may_begin_listable_log_path("_last_checkpoint"));
+        assert!(!may_begin_listable_log_path("_sidecars/3a0d65cd.parquet"));
+        assert!(!may_begin_listable_log_path(
+            "_staged_commits/00000000000000000010.3a0d65cd.json"
+        ));
+        assert!(!may_begin_listable_log_path("Zsentinel"));
     }
 
     #[test]

@@ -44,6 +44,9 @@ pub(crate) struct StateInfo {
     ///
     /// Read-path mirror of `SharedWriteState.stats_columns`.
     pub(crate) physical_stats_columns: HashSet<ColumnName>,
+    /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
+    /// [`TableType`](crate::metrics::TableType) at event construction.
+    pub(crate) is_catalog_managed: bool,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -421,6 +424,7 @@ impl StateInfo {
             physical_stats_schema,
             physical_partition_schema,
             physical_stats_columns,
+            is_catalog_managed: table_configuration.is_catalog_managed(),
         })
     }
 

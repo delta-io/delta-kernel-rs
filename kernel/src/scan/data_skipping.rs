@@ -123,6 +123,10 @@ impl DataSkippingFilter {
     ///   matching `partition_schema`. Typically a `MapToStruct` expression that converts the
     ///   `partitionValues` string map into a typed struct. Only used when `partition_schema` is
     ///   `Some`.
+    /// - `is_add_expr`: Boolean expression that is true for Add rows and false for Remove and other
+    ///   non-file rows (e.g. `path IS NOT NULL` against a transformed batch, or `add.path IS NOT
+    ///   NULL` against a raw action batch). Used to guard partition predicates and opaque-predicate
+    ///   rewrites so non-Add rows are never filtered out.
     /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
     /// - `stats_columns`: Physical leaf paths whose stats are in `stats_schema`. References to
     ///   other data columns fold to NULL (keeping the file). Must line up with `stats_schema` --
@@ -137,6 +141,7 @@ impl DataSkippingFilter {
         stats_expr: ExpressionRef,
         partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
+        is_add_expr: ExpressionRef,
         input_schema: SchemaRef,
         stats_columns: &HashSet<ColumnName>,
         metrics: Option<Arc<ScanMetrics>>,
@@ -161,6 +166,7 @@ impl DataSkippingFilter {
                 stats_expr,
                 partition_schema,
                 partition_expr,
+                is_add_expr,
             )?;
 
         let stats_evaluator = engine
@@ -231,6 +237,7 @@ impl DataSkippingFilter {
         stats_expr: ExpressionRef,
         physical_partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
+        is_add_expr: ExpressionRef,
     ) -> Option<(SchemaRef, ExpressionRef, HashSet<String>)> {
         let partition_columns: HashSet<String> = physical_partition_schema
             .map(|s| s.fields().map(|f| f.name().to_string()).collect())
@@ -242,16 +249,20 @@ impl DataSkippingFilter {
             |ps: &SchemaRef| StructField::nullable("partitionValues_parsed", ps.as_ref().clone());
         let is_add_field = StructField::not_null("is_add", DataType::BOOLEAN);
 
-        // When partition columns are present, include an `is_add` boolean so that partition
-        // predicates can guard against filtering Remove rows. Derived from `path IS NOT NULL`
-        // in the input batch (Add rows have non-null path, Remove/non-file rows have null).
+        // Always include an `is_add` boolean (extracted by the caller-provided `is_add_expr`,
+        // true for Add rows and false for Remove/non-file rows) so that predicates can guard
+        // against filtering Remove rows: partition predicates and opaque-predicate rewrites are
+        // wrapped with `OR(NOT is_add, ...)` (see `guard_for_removes`).
         let unified_schema = match (physical_stats_schema, physical_partition_schema) {
             (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
                 stats_field(stats),
                 partition_field(ps),
                 is_add_field,
             ])),
-            (Some(stats), None) => Arc::new(StructType::new_unchecked([stats_field(stats)])),
+            (Some(stats), None) => Arc::new(StructType::new_unchecked([
+                stats_field(stats),
+                is_add_field,
+            ])),
             (None, Some(ps)) => Arc::new(StructType::new_unchecked([
                 partition_field(ps),
                 is_add_field,
@@ -259,14 +270,12 @@ impl DataSkippingFilter {
             (None, None) => return None,
         };
 
-        let is_add_expr: ExpressionRef = Arc::new(Pred::is_not_null(column_expr!("path")).into());
-
         let unified_expr = match (
             physical_stats_schema.is_some(),
             physical_partition_schema.is_some(),
         ) {
             (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr, is_add_expr])),
-            (true, false) => Arc::new(Expr::struct_from([stats_expr])),
+            (true, false) => Arc::new(Expr::struct_from([stats_expr, is_add_expr])),
             (false, true) => Arc::new(Expr::struct_from([partition_expr, is_add_expr])),
             (false, false) => return None,
         };
@@ -471,10 +480,11 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         self.stats_columns.contains(col)
     }
 
-    /// Wraps a partition predicate with `OR(NOT is_add, pred)` to protect Remove rows from
-    /// being filtered. Remove rows have null add-side partition values, which would cause
-    /// partition predicates to incorrectly evaluate to false. The `is_add` column (derived
-    /// from `path IS NOT NULL`) ensures Removes always pass the partition filter.
+    /// Wraps a predicate with `OR(NOT is_add, pred)` to protect Remove rows from being
+    /// filtered. Used for partition predicates (Remove rows have null add-side partition
+    /// values, which would incorrectly evaluate to false) and for opaque-predicate rewrites
+    /// (op-computed verdicts bypass kernel's null-stats folding). The `is_add` column ensures
+    /// non-Add rows always pass the filter.
     fn guard_for_removes(&self, pred: Pred) -> Pred {
         Pred::or(Pred::not(Pred::from(column_name!("is_add"))), pred)
     }
@@ -610,13 +620,19 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             .map(Pred::literal)
     }
 
+    /// Rewrites an opaque predicate via its `as_data_skipping_predicate`, wrapped with
+    /// `OR(NOT is_add, ...)`. Opaque rewrites may embed op-computed verdicts (e.g. an engine
+    /// callback behind FFI) that bypass kernel's null-stats folding, so kernel itself must
+    /// guarantee that non-Add rows (Removes and other actions, which carry null stats) are never
+    /// filtered -- dropping a Remove from log replay would resurrect a deleted file.
     fn eval_pred_opaque(
         &self,
         op: &OpaquePredicateOpRef,
         exprs: &[Expr],
         inverted: bool,
     ) -> Option<Pred> {
-        op.as_data_skipping_predicate(self, exprs, inverted)
+        let pred = op.as_data_skipping_predicate(self, exprs, inverted)?;
+        Some(self.guard_for_removes(pred))
     }
 
     fn finish_eval_pred_junction(

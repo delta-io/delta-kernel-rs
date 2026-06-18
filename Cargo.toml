@@ -9,6 +9,7 @@ members = [
     "kernel",
     "kernel/examples/*",
     "test-utils",
+    "workloads",
     "feature-tests",
     "mem-test",
     "unity-catalog-delta-rest-client", # WIP: this is an experimental UC client for catalog-managed table work

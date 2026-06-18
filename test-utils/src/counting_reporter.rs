@@ -5,7 +5,7 @@
 //! inspect the counters or call [`CountingReporter::print_summary`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use delta_kernel::metrics::{
     CommitFailureReason, MetricEvent, MetricsReporter, WithMetricsReporterLayer as _,
@@ -371,6 +371,26 @@ impl MetricsReporter for CountingReporter {
     }
 }
 
+/// A [`MetricsReporter`] that retains every [`MetricEvent`] for inspection, for tests that need
+/// to assert on event payloads (not just counts, which [`CountingReporter`] handles).
+#[derive(Debug, Default)]
+pub struct CapturingReporter {
+    events: Mutex<Vec<MetricEvent>>,
+}
+
+impl MetricsReporter for CapturingReporter {
+    fn report(&self, event: MetricEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+impl CapturingReporter {
+    /// All events captured so far, in report order.
+    pub fn events(&self) -> Vec<MetricEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -380,7 +400,7 @@ mod tests {
         CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
         ProtocolMetadataLoadSuccess, SetTransactionLoadSuccess, SnapshotBuildFailure,
         SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
-        TransactionCommitFailure, TransactionCommitSuccess,
+        TableType, TransactionCommitFailure, TransactionCommitSuccess,
     };
 
     use super::*;
@@ -431,6 +451,8 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
             operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: None,
             version: 0,
             duration: dur(),
         }));
@@ -442,6 +464,8 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: None,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
@@ -460,6 +484,8 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: None,
             duration: dur(),
             num_commit_files: 3,
             num_checkpoint_files: 1,
@@ -535,9 +561,12 @@ mod tests {
         reporter.report(MetricEvent::TransactionCommitSuccess(
             TransactionCommitSuccess {
                 operation_id: MetricId::new(),
+                table_type: TableType::PathBased,
+                correlation_id: None,
                 commit_version: 1,
                 num_add_files: 3,
                 num_remove_files: 2,
+                num_dv_updates: 0,
                 add_files_bytes: 600,
                 remove_files_bytes: 150,
                 is_blind_append: false,
@@ -566,6 +595,8 @@ mod tests {
             reporter.report(MetricEvent::TransactionCommitFailure(
                 TransactionCommitFailure {
                     operation_id: MetricId::new(),
+                    table_type: TableType::PathBased,
+                    correlation_id: None,
                     reason,
                 },
             ));
@@ -582,11 +613,15 @@ mod tests {
         reporter.report(MetricEvent::ProtocolMetadataLoadSuccess(
             ProtocolMetadataLoadSuccess {
                 operation_id: MetricId::new(),
+                table_type: TableType::PathBased,
+                correlation_id: None,
                 duration: dur(),
             },
         ));
         reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
             operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: None,
         }));
         assert_eq!(reporter.snapshot_completions.get(), 0);
     }
@@ -608,6 +643,8 @@ mod tests {
         }));
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: None,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,

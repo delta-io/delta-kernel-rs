@@ -4,12 +4,22 @@
 //! span name, and the small set of methods the `tracing` layer in [`crate::metrics::reporter`]
 //! calls to construct and finalize the event. Per-event code is colocated in a single block
 //! per type below.
+//!
+//! Enums carried in event payloads derive the full strum set (`EnumString`, `Display`,
+//! `AsRefStr`, `IntoStaticStr`) with stable serialized names. `IntoStaticStr` in particular
+//! lets connectors convert a value to its `&'static str` metric-label string via `.into()`
+//! instead of maintaining their own variant-to-string `match`.
+//!
+//! Event construction is infallible: a malformed span field warns and falls back to a
+//! default rather than failing the operation being observed.
 
 use std::fmt;
 use std::str::FromStr as _;
+use std::sync::Arc;
 use std::time::Duration;
 
-use strum::{AsRefStr, Display as StrumDisplay, EnumString};
+use delta_kernel_derive::internal_api;
+use strum::{AsRefStr, Display as StrumDisplay, EnumString, IntoStaticStr};
 use tracing::field::{Field, Visit};
 use tracing::span::Attributes;
 use tracing::warn;
@@ -196,9 +206,16 @@ impl MetricEvent {
         if name == "failure_reason" {
             if let Self::TransactionCommitSuccess(e) = self {
                 let operation_id = e.operation_id;
+                let table_type = e.table_type;
+                let correlation_id = e.correlation_id.take();
                 *self = Self::TransactionCommitFailure(TransactionCommitFailure {
                     operation_id,
-                    reason: value.parse().unwrap_or(CommitFailureReason::Error),
+                    table_type,
+                    correlation_id,
+                    reason: value.parse().unwrap_or_else(|e| {
+                        warn!("Invalid failure_reason '{value}' on span: {e}. Using Error.");
+                        CommitFailureReason::Error
+                    }),
                 });
             }
             return Ok(());
@@ -216,18 +233,26 @@ impl MetricEvent {
         match self {
             Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: e.operation_id,
+                table_type: e.table_type,
+                correlation_id: e.correlation_id,
             }),
             Self::ProtocolMetadataLoadSuccess(e) => {
                 Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                     operation_id: e.operation_id,
+                    table_type: e.table_type,
+                    correlation_id: e.correlation_id,
                 })
             }
             Self::SnapshotBuildSuccess(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: e.operation_id,
+                table_type: e.table_type,
+                correlation_id: e.correlation_id,
             }),
             Self::TransactionCommitSuccess(e) => {
                 Self::TransactionCommitFailure(TransactionCommitFailure {
                     operation_id: e.operation_id,
+                    table_type: e.table_type,
+                    correlation_id: e.correlation_id,
                     reason: CommitFailureReason::Error,
                 })
             }
@@ -297,6 +322,10 @@ pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 pub struct LogSegmentLoadSuccess {
     // === Set on span creation ===
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
 
     // === Set during span lifetime ===
     pub num_commit_files: u64,
@@ -316,6 +345,8 @@ impl LogSegmentLoadSuccess {
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
             operation_id: MetricId::from_attrs(attrs),
+            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
+            correlation_id: correlation_id_from_attrs(attrs),
             num_commit_files: 0,
             num_checkpoint_files: 0,
             num_compaction_files: 0,
@@ -353,6 +384,8 @@ impl fmt::Display for LogSegmentLoadSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
+            table_type,
+            correlation_id,
             duration,
             num_commit_files,
             num_checkpoint_files,
@@ -361,9 +394,11 @@ impl fmt::Display for LogSegmentLoadSuccess {
         } = self;
         write!(
             f,
-            "LogSegmentLoadSuccess(id={operation_id}, duration={duration:?}, \
-             commits={num_commit_files}, checkpoints={num_checkpoint_files}, \
-             compactions={num_compaction_files}, has_latest_crc={has_latest_crc_file})"
+            "LogSegmentLoadSuccess(id={operation_id}, table_type={table_type}, \
+             correlation_id={correlation_id:?}, \
+             duration={duration:?}, commits={num_commit_files}, \
+             checkpoints={num_checkpoint_files}, compactions={num_compaction_files}, \
+             has_latest_crc={has_latest_crc_file})"
         )
     }
 }
@@ -372,11 +407,19 @@ impl fmt::Display for LogSegmentLoadSuccess {
 #[derive(Debug, Clone)]
 pub struct LogSegmentLoadFailure {
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
 }
 
 impl fmt::Display for LogSegmentLoadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LogSegmentLoadFailure(id={})", self.operation_id)
+        write!(
+            f,
+            "LogSegmentLoadFailure(id={}, table_type={}, correlation_id={:?})",
+            self.operation_id, self.table_type, self.correlation_id
+        )
     }
 }
 
@@ -391,6 +434,10 @@ pub(crate) const PROTOCOL_METADATA_LOADED_SPAN: &str = "segment.read_metadata";
 pub struct ProtocolMetadataLoadSuccess {
     // === Set on span creation ===
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
 
     // === Set on span close ===
     pub duration: Duration,
@@ -402,6 +449,8 @@ impl ProtocolMetadataLoadSuccess {
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
             operation_id: MetricId::from_attrs(attrs),
+            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
+            correlation_id: correlation_id_from_attrs(attrs),
             duration: Duration::default(),
         }
     }
@@ -415,11 +464,14 @@ impl fmt::Display for ProtocolMetadataLoadSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
+            table_type,
+            correlation_id,
             duration,
         } = self;
         write!(
             f,
-            "ProtocolMetadataLoadSuccess(id={operation_id}, duration={duration:?})"
+            "ProtocolMetadataLoadSuccess(id={operation_id}, table_type={table_type}, \
+             correlation_id={correlation_id:?}, duration={duration:?})"
         )
     }
 }
@@ -428,11 +480,19 @@ impl fmt::Display for ProtocolMetadataLoadSuccess {
 #[derive(Debug, Clone)]
 pub struct ProtocolMetadataLoadFailure {
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
 }
 
 impl fmt::Display for ProtocolMetadataLoadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ProtocolMetadataLoadFailure(id={})", self.operation_id)
+        write!(
+            f,
+            "ProtocolMetadataLoadFailure(id={}, table_type={}, correlation_id={:?})",
+            self.operation_id, self.table_type, self.correlation_id
+        )
     }
 }
 
@@ -447,6 +507,10 @@ pub(crate) const SNAPSHOT_COMPLETED_SPAN: &str = "snap.build";
 pub struct SnapshotBuildSuccess {
     // === Set on span creation ===
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
 
     // === Set during span lifetime ===
     pub version: u64,
@@ -461,6 +525,8 @@ impl SnapshotBuildSuccess {
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
             operation_id: MetricId::from_attrs(attrs),
+            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
+            correlation_id: correlation_id_from_attrs(attrs),
             version: 0,
             duration: Duration::default(),
         }
@@ -483,12 +549,15 @@ impl fmt::Display for SnapshotBuildSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
+            table_type,
+            correlation_id,
             version,
             duration,
         } = self;
         write!(
             f,
-            "SnapshotBuildSuccess(id={operation_id}, version={version}, duration={duration:?})"
+            "SnapshotBuildSuccess(id={operation_id}, table_type={table_type}, \
+             correlation_id={correlation_id:?}, version={version}, duration={duration:?})"
         )
     }
 }
@@ -501,11 +570,19 @@ impl fmt::Display for SnapshotBuildSuccess {
 #[derive(Debug, Clone)]
 pub struct SnapshotBuildFailure {
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
 }
 
 impl fmt::Display for SnapshotBuildFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SnapshotBuildFailure(id={})", self.operation_id)
+        write!(
+            f,
+            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?})",
+            self.operation_id, self.table_type, self.correlation_id
+        )
     }
 }
 
@@ -520,11 +597,16 @@ pub(crate) const TRANSACTION_COMMIT_SPAN: &str = "txn.commit";
 pub struct TransactionCommitSuccess {
     // === Set on span creation ===
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
     pub commit_version: u64,
 
     // === Set during span lifetime ===
     pub num_add_files: u64,
     pub num_remove_files: u64,
+    pub num_dv_updates: u64,
     pub add_files_bytes: u64,
     pub remove_files_bytes: u64,
     pub is_blind_append: bool,
@@ -547,9 +629,12 @@ impl TransactionCommitSuccess {
         attrs.record(&mut v);
         Self {
             operation_id: MetricId::from_attrs(attrs),
+            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
+            correlation_id: correlation_id_from_attrs(attrs),
             commit_version: v.commit_version,
             num_add_files: 0,
             num_remove_files: 0,
+            num_dv_updates: 0,
             add_files_bytes: 0,
             remove_files_bytes: 0,
             is_blind_append: false,
@@ -565,6 +650,7 @@ impl TransactionCommitSuccess {
         match name {
             "num_add_files" => self.num_add_files = value,
             "num_remove_files" => self.num_remove_files = value,
+            "num_dv_updates" => self.num_dv_updates = value,
             "add_files_bytes" => self.add_files_bytes = value,
             "remove_files_bytes" => self.remove_files_bytes = value,
             "prepare_duration_ns" => self.prepare_duration = Duration::from_nanos(value),
@@ -600,9 +686,12 @@ impl fmt::Display for TransactionCommitSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
+            table_type,
+            correlation_id,
             commit_version,
             num_add_files,
             num_remove_files,
+            num_dv_updates,
             add_files_bytes,
             remove_files_bytes,
             is_blind_append,
@@ -614,9 +703,10 @@ impl fmt::Display for TransactionCommitSuccess {
         } = self;
         write!(
             f,
-            "TransactionCommitSuccess(id={operation_id}, version={commit_version}, \
+            "TransactionCommitSuccess(id={operation_id}, table_type={table_type}, \
+             correlation_id={correlation_id:?}, version={commit_version}, \
              total_duration={total_duration:?}, prepare={prepare_duration:?}, committer={committer_duration:?}, \
-             add_files={num_add_files}, remove_files={num_remove_files}, \
+             add_files={num_add_files}, remove_files={num_remove_files}, dv_updates={num_dv_updates}, \
              add_bytes={add_files_bytes}, remove_bytes={remove_files_bytes}, \
              is_blind_append={is_blind_append}, data_change={data_change}, operation={operation:?})"
         )
@@ -627,7 +717,7 @@ impl fmt::Display for TransactionCommitSuccess {
 ///
 /// Serializes to its `snake_case` name for the `failure_reason` span field (e.g.
 /// `RetryableIo` -> `"retryable_io"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum CommitFailureReason {
     /// The commit conflicted with a concurrently committed version.
@@ -643,6 +733,10 @@ pub enum CommitFailureReason {
 #[derive(Debug, Clone)]
 pub struct TransactionCommitFailure {
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
     pub reason: CommitFailureReason,
 }
 
@@ -650,11 +744,14 @@ impl fmt::Display for TransactionCommitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
+            table_type,
+            correlation_id,
             reason,
         } = self;
         write!(
             f,
-            "TransactionCommitFailure(id={operation_id}, reason={reason})"
+            "TransactionCommitFailure(id={operation_id}, table_type={table_type}, \
+             correlation_id={correlation_id:?}, reason={reason})"
         )
     }
 }
@@ -953,35 +1050,118 @@ impl Visit for FileReadAttrs {
 // ====================================================================
 
 /// Identifies which scan execution path produced a scan metadata metrics event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes to the explicit `serialize` name on each variant for the `scan_type` span field
+/// (e.g. `SequentialPhase` -> `"sequential"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
 pub enum ScanType {
     /// Sequential phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    #[strum(serialize = "sequential")]
     SequentialPhase,
     /// Parallel phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    #[strum(serialize = "parallel")]
     ParallelPhase,
     /// Scan metadata from [`crate::scan::Scan::scan_metadata`].
+    #[strum(serialize = "full")]
     Full,
 }
 
 impl ScanType {
-    /// Parse the value of the `scan_type` span field. Unknown values map to `Full`.
-    fn parse(s: &str) -> Self {
-        match s {
-            "sequential" => Self::SequentialPhase,
-            "parallel" => Self::ParallelPhase,
-            _ => Self::Full,
-        }
+    fn parse_lenient(s: &str) -> Self {
+        Self::from_str(s).unwrap_or_else(|e| {
+            warn!("Invalid scan_type '{s}' on span: {e}. Using Full.");
+            Self::Full
+        })
     }
 }
 
-impl fmt::Display for ScanType {
+// ====================================================================
+// SnapshotLoadMetricContext and shared span fields
+// ====================================================================
+
+/// The `is_catalog_managed` bool span field carried by every event that records it. It is the
+/// confirmed protocol value, except on snapshot-load events, which use the requested mode because
+/// the on-disk protocol is not known that early (see `SnapshotBuilder::build`).
+pub(crate) const IS_CATALOG_MANAGED_FIELD: &str = "is_catalog_managed";
+
+/// Whether a table is path-based or catalog-managed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum TableType {
+    /// Loaded without catalog involvement; commits live directly in the Delta log.
+    #[default]
+    PathBased,
+    /// Backed by a managing catalog.
+    CatalogManaged,
+}
+
+impl TableType {
+    #[internal_api]
+    pub(crate) fn from_catalog_managed(is_catalog_managed: bool) -> Self {
+        if is_catalog_managed {
+            Self::CatalogManaged
+        } else {
+            Self::PathBased
+        }
+    }
+
+    pub(crate) fn is_catalog_managed(self) -> bool {
+        self == Self::CatalogManaged
+    }
+}
+
+impl fmt::Display for TableType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::SequentialPhase => "sequential",
-            Self::ParallelPhase => "parallel",
-            Self::Full => "full",
+            Self::PathBased => "path_based",
+            Self::CatalogManaged => "catalog_managed",
         })
     }
+}
+
+/// Operation-scoped values threaded through the snapshot-load chain to label its metric events.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotLoadMetricContext {
+    pub(crate) operation_id: MetricId,
+    pub(crate) correlation_id: Option<Arc<str>>,
+    pub(crate) is_catalog_managed: bool,
+}
+
+pub(crate) fn read_is_catalog_managed(attrs: &Attributes<'_>) -> bool {
+    #[derive(Default)]
+    struct V(bool);
+    impl Visit for V {
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            if field.name() == IS_CATALOG_MANAGED_FIELD {
+                self.0 = value;
+            }
+        }
+        fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+    }
+    let mut v = V::default();
+    attrs.record(&mut v);
+    v.0
+}
+
+/// The `correlation_id` string span field carried by every event that records it. Empty means the
+/// caller did not supply one.
+pub(crate) const CORRELATION_ID_FIELD: &str = "correlation_id";
+
+/// Extract the optional caller-supplied correlation id from span attributes; empty or absent
+/// yields `None`.
+pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<str>> {
+    #[derive(Default)]
+    struct CorrelationIdVisitor(Option<Arc<str>>);
+    impl Visit for CorrelationIdVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == CORRELATION_ID_FIELD && !value.is_empty() {
+                self.0 = Some(value.into());
+            }
+        }
+        fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+    }
+    let mut v = CorrelationIdVisitor::default();
+    attrs.record(&mut v);
+    v.0
 }
 
 /// A `parallel_scan_metadata` scan emits **two** events (one per phase) sharing the same
@@ -991,6 +1171,11 @@ pub struct ScanMetadataCompleted {
     // === Set on span creation ===
     /// Unique ID to correlate this scan with other events.
     pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    /// Whether the scanned table is path-based or catalog-managed.
+    pub table_type: TableType,
     /// Which scan execution path produced this event.
     pub scan_type: ScanType,
     /// Wall-clock time from scan start to iterator exhaustion.
@@ -1023,7 +1208,9 @@ impl ScanMetadataCompleted {
         attrs.record(&mut v);
         Self {
             operation_id: MetricId(v.operation_id),
-            scan_type: ScanType::parse(&v.scan_type),
+            table_type: TableType::from_catalog_managed(v.is_catalog_managed),
+            correlation_id: v.correlation_id,
+            scan_type: ScanType::parse_lenient(&v.scan_type),
             duration: Duration::from_nanos(v.duration_ns),
             num_add_files_seen: v.num_add_files_seen,
             num_active_add_files: v.num_active_add_files,
@@ -1042,6 +1229,8 @@ impl fmt::Display for ScanMetadataCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             operation_id,
+            table_type,
+            correlation_id,
             scan_type,
             duration,
             num_add_files_seen,
@@ -1056,7 +1245,8 @@ impl fmt::Display for ScanMetadataCompleted {
         } = self;
         write!(
             f,
-            "ScanMetadataCompleted(id={operation_id}, scan_type={scan_type}, duration={duration:?}, \
+            "ScanMetadataCompleted(id={operation_id}, table_type={table_type}, \
+             correlation_id={correlation_id:?}, scan_type={scan_type}, duration={duration:?}, \
              add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, \
              active_add_files_bytes={active_add_files_bytes}, \
              remove_files_seen={num_remove_files_seen}, non_file_actions={num_non_file_actions}, \
@@ -1069,6 +1259,8 @@ impl fmt::Display for ScanMetadataCompleted {
 #[derive(Default)]
 struct ScanMetadataCompletedAttrs {
     operation_id: Uuid,
+    is_catalog_managed: bool,
+    correlation_id: Option<Arc<str>>,
     scan_type: String,
     duration_ns: u64,
     num_add_files_seen: u64,
@@ -1083,6 +1275,18 @@ struct ScanMetadataCompletedAttrs {
 }
 
 impl Visit for ScanMetadataCompletedAttrs {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == IS_CATALOG_MANAGED_FIELD {
+            self.is_catalog_managed = value;
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == CORRELATION_ID_FIELD && !value.is_empty() {
+            self.correlation_id = Some(value.into());
+        }
+    }
+
     fn record_u64(&mut self, field: &Field, value: u64) {
         match field.name() {
             "duration_ns" => self.duration_ns = value,
@@ -1318,6 +1522,8 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         ScanMetadataCompleted::SPAN_NAME,
         report = tracing::field::Empty,
         operation_id = %e.operation_id,
+        is_catalog_managed = e.table_type.is_catalog_managed(),
+        correlation_id = e.correlation_id.as_deref().unwrap_or(""),
         scan_type = %e.scan_type,
         duration_ns = e.duration.as_nanos() as u64,
         num_add_files_seen = e.num_add_files_seen,
@@ -1341,9 +1547,12 @@ mod tests {
     fn commit_success(operation_id: MetricId) -> TransactionCommitSuccess {
         TransactionCommitSuccess {
             operation_id,
+            table_type: TableType::PathBased,
+            correlation_id: None,
             commit_version: 1,
             num_add_files: 0,
             num_remove_files: 0,
+            num_dv_updates: 0,
             add_files_bytes: 0,
             remove_files_bytes: 0,
             is_blind_append: false,
@@ -1385,6 +1594,52 @@ mod tests {
     }
 
     #[test]
+    fn record_u64_num_dv_updates_sets_field() {
+        let mut event = MetricEvent::TransactionCommitSuccess(commit_success(MetricId::new()));
+        event.record_u64("num_dv_updates", 7).unwrap();
+        let MetricEvent::TransactionCommitSuccess(success) = event else {
+            panic!("expected TransactionCommitSuccess");
+        };
+        assert_eq!(success.num_dv_updates, 7);
+    }
+
+    #[rstest]
+    #[case::conflict(CommitFailureReason::Conflict, "conflict")]
+    #[case::retryable_io(CommitFailureReason::RetryableIo, "retryable_io")]
+    #[case::error(CommitFailureReason::Error, "error")]
+    fn commit_failure_reason_serializes_to_wire_name_and_parses_back(
+        #[case] reason: CommitFailureReason,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = reason.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(CommitFailureReason::from_str(wire).unwrap(), reason);
+    }
+
+    #[rstest]
+    #[case::sequential(ScanType::SequentialPhase, "sequential")]
+    #[case::parallel(ScanType::ParallelPhase, "parallel")]
+    #[case::full(ScanType::Full, "full")]
+    fn scan_type_serializes_to_wire_name_and_parses_back(
+        #[case] scan_type: ScanType,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = scan_type.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(ScanType::from_str(wire).unwrap(), scan_type);
+    }
+
+    #[rstest]
+    #[case::known("parallel", ScanType::ParallelPhase)]
+    #[case::unknown_defaults_to_full("totally_unknown", ScanType::Full)]
+    fn scan_type_parse_lenient_maps_unknown_to_full(
+        #[case] value: &str,
+        #[case] expected: ScanType,
+    ) {
+        assert_eq!(ScanType::parse_lenient(value), expected);
+    }
+
+    #[test]
     fn into_failure_maps_commit_success_to_error_reason() {
         let id = MetricId::new();
         let failure = MetricEvent::TransactionCommitSuccess(commit_success(id)).into_failure();
@@ -1393,5 +1648,43 @@ mod tests {
         };
         assert_eq!(failure.operation_id, id);
         assert_eq!(failure.reason, CommitFailureReason::Error);
+    }
+
+    #[test]
+    fn record_str_failure_reason_flip_preserves_correlation_id() {
+        let mut success = commit_success(MetricId::new());
+        success.correlation_id = Some("commit-req-1".into());
+        let mut event = MetricEvent::TransactionCommitSuccess(success);
+        event.record_str("failure_reason", "conflict").unwrap();
+        let MetricEvent::TransactionCommitFailure(failure) = event else {
+            panic!("expected TransactionCommitFailure");
+        };
+        assert_eq!(failure.correlation_id.as_deref(), Some("commit-req-1"));
+    }
+
+    #[test]
+    fn into_failure_preserves_correlation_id() {
+        let mut success = commit_success(MetricId::new());
+        success.correlation_id = Some("commit-req-2".into());
+        let MetricEvent::TransactionCommitFailure(failure) =
+            MetricEvent::TransactionCommitSuccess(success).into_failure()
+        else {
+            panic!("expected TransactionCommitFailure");
+        };
+        assert_eq!(failure.correlation_id.as_deref(), Some("commit-req-2"));
+
+        let snapshot = SnapshotBuildSuccess {
+            operation_id: MetricId::new(),
+            table_type: TableType::PathBased,
+            correlation_id: Some("snap-req-3".into()),
+            version: 0,
+            duration: Duration::default(),
+        };
+        let MetricEvent::SnapshotBuildFailure(failure) =
+            MetricEvent::SnapshotBuildSuccess(snapshot).into_failure()
+        else {
+            panic!("expected SnapshotBuildFailure");
+        };
+        assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
     }
 }

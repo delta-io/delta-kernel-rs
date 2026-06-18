@@ -193,6 +193,7 @@ pub struct ScanBuilder {
     logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
     stats: StatsOptions,
+    correlation_id: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -201,6 +202,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
             .field("stats", &self.stats)
+            .field("correlation_id", &self.correlation_id)
             .finish()
     }
 }
@@ -213,6 +215,7 @@ impl ScanBuilder {
             logical_read_schema: None,
             predicate: None,
             stats: StatsOptions::default(),
+            correlation_id: None,
         }
     }
 
@@ -270,6 +273,20 @@ impl ScanBuilder {
         self
     }
 
+    /// Attach an opaque, caller-supplied correlation id for joining this scan's metric events to
+    /// the caller's own request or operation id. An empty id is treated as unset. When unset,
+    /// behavior is unchanged.
+    ///
+    /// Note: like `operation_id`, the correlation id does not currently survive the
+    /// [`Scan::parallel_scan_metadata`] serialization boundary. A [`ParallelState`] reconstructed
+    /// from serialized bytes on a remote worker carries no correlation id (tracked in #2736).
+    ///
+    /// [`ParallelState`]: crate::scan::ParallelState
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -313,6 +330,7 @@ impl ScanBuilder {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
+            correlation_id: self.correlation_id,
         })
     }
 }
@@ -572,6 +590,7 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
+    correlation_id: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for Scan {
@@ -580,6 +599,7 @@ impl std::fmt::Debug for Scan {
             .field("schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
             .field("stats", &self.stats)
+            .field("correlation_id", &self.correlation_id)
             .finish()
     }
 }
@@ -834,6 +854,8 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
         let operation_id = MetricId::new();
+        let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
+        let correlation_id = self.correlation_id.clone();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
@@ -853,7 +875,13 @@ impl Scan {
         };
 
         let on_complete = move || {
-            let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
+            let event = metrics.to_event(
+                operation_id,
+                is_catalog_managed,
+                correlation_id,
+                ScanType::Full,
+                start.elapsed(),
+            );
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
@@ -1015,7 +1043,10 @@ impl Scan {
         let sequential =
             SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
-        Ok(SequentialScanMetadata::new(sequential))
+        Ok(SequentialScanMetadata::new(
+            sequential,
+            self.correlation_id.clone(),
+        ))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
