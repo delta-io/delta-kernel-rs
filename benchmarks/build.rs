@@ -69,11 +69,7 @@ fn build_agent() -> Agent {
         .provider(TlsProvider::NativeTls)
         .root_certs(RootCerts::PlatformVerifier)
         .build();
-    let mut config = Agent::config_builder().tls_config(tls_config);
-    if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
-        let proxy = Proxy::new(&proxy_url).unwrap();
-        config = config.proxy(Some(proxy));
-    }
+    let config = Agent::config_builder().tls_config(tls_config).proxy(Proxy::try_from_env())
     Agent::new_with_config(config.build())
 }
 
