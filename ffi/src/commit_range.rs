@@ -141,6 +141,7 @@ mod tests {
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel_default_engine::DefaultEngineBuilder;
+    use rstest::rstest;
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
@@ -171,10 +172,15 @@ mod tests {
         (engine_to_handle(Arc::new(engine), allocate_err), table_root)
     }
 
+    #[rstest]
+    #[case::with_end_version(Some(2), 2)]
+    #[case::without_end_version(None, 3)]
     #[tokio::test]
-    async fn test_commit_range_builder_for_build_succeeds() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let (engine, table_root) = setup_engine_with_commits(1).await;
+    async fn test_commit_range_builder_build_succeeds(
+        #[case] builder_end_version: Option<Version>,
+        #[case] expected_end_version: Version,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root) = setup_engine_with_commits(3).await;
 
         let mut builder = unsafe {
             ok_or_panic(commit_range_builder_for(
@@ -183,11 +189,16 @@ mod tests {
                 engine.shallow_copy(),
             ))
         };
-        unsafe { commit_range_builder_with_end_version(&mut builder, 1) };
+        if let Some(end_version) = builder_end_version {
+            unsafe { commit_range_builder_with_end_version(&mut builder, end_version) };
+        }
         let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
 
         assert_eq!(unsafe { range.as_ref() }.start_version(), 0);
-        assert_eq!(unsafe { range.as_ref() }.end_version(), 1);
+        assert_eq!(
+            unsafe { range.as_ref() }.end_version(),
+            expected_end_version
+        );
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }
