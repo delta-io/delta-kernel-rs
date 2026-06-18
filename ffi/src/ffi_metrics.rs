@@ -72,10 +72,30 @@ impl From<kernel::CommitFailureReason> for CommitFailureReason {
     }
 }
 
+/// Whether a table is path-based or catalog-managed.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum TableType {
+    PathBased,
+    CatalogManaged,
+}
+
+impl From<kernel::TableType> for TableType {
+    fn from(t: kernel::TableType) -> Self {
+        match t {
+            kernel::TableType::PathBased => Self::PathBased,
+            kernel::TableType::CatalogManaged => Self::CatalogManaged,
+        }
+    }
+}
+
 /// A log segment was loaded.
 #[repr(C)]
 pub struct LogSegmentLoadSuccess {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
     pub duration_ns: u64,
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
@@ -87,12 +107,16 @@ pub struct LogSegmentLoadSuccess {
 #[repr(C)]
 pub struct LogSegmentLoadFailure {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
 }
 
 /// Protocol and metadata actions were read from the log.
 #[repr(C)]
 pub struct ProtocolMetadataLoadSuccess {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
     pub duration_ns: u64,
 }
 
@@ -100,12 +124,16 @@ pub struct ProtocolMetadataLoadSuccess {
 #[repr(C)]
 pub struct ProtocolMetadataLoadFailure {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
 }
 
 /// A snapshot was built successfully.
 #[repr(C)]
 pub struct SnapshotBuildSuccess {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
     pub version: u64,
     pub duration_ns: u64,
 }
@@ -114,16 +142,22 @@ pub struct SnapshotBuildSuccess {
 #[repr(C)]
 pub struct SnapshotBuildFailure {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
 }
 
-/// A transaction was committed successfully. `operation` is a slice into engine-supplied data that
-/// is only valid for the duration of the callback; an empty slice means it was unset.
+/// A transaction was committed successfully. `operation` and `correlation_id` are slices into
+/// engine-supplied data that are only valid for the duration of the callback; an empty slice means
+/// the value was unset.
 #[repr(C)]
 pub struct TransactionCommitSuccess {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
     pub commit_version: u64,
     pub num_add_files: u64,
     pub num_remove_files: u64,
+    pub num_dv_updates: u64,
     pub add_files_bytes: u64,
     pub remove_files_bytes: u64,
     pub is_blind_append: bool,
@@ -139,6 +173,8 @@ pub struct TransactionCommitSuccess {
 #[repr(C)]
 pub struct TransactionCommitFailure {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
     pub reason: CommitFailureReason,
 }
 
@@ -184,6 +220,8 @@ pub struct ParquetReadCompleted {
 #[repr(C)]
 pub struct ScanMetadataCompleted {
     pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
     pub scan_type: ScanType,
     pub duration_ns: u64,
     pub num_add_files_seen: u64,
@@ -246,6 +284,17 @@ pub enum MetricEvent {
     StorageCopyCompleted(StorageCopyCompleted),
 }
 
+/// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
+/// unset. The slice is valid only as long as the source kernel event is alive.
+fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
+    match correlation_id {
+        // Safety: the borrowed str lives as long as the source event, which outlives both the FFI
+        // event and the callback it is passed to.
+        Some(id) => unsafe { KernelStringSlice::new_unsafe(id) },
+        None => KernelStringSlice::empty(),
+    }
+}
+
 impl MetricEvent {
     /// Build an FFI event from a kernel event. Note that this event is only valid as long as the
     /// passed argument is still alive, since we might make `KernelStringSlices` out of some
@@ -256,6 +305,8 @@ impl MetricEvent {
         match event {
             K::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
                 operation_id: e.operation_id.into(),
+                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                table_type: e.table_type.into(),
                 duration_ns: ns(e.duration),
                 num_commit_files: e.num_commit_files,
                 num_checkpoint_files: e.num_checkpoint_files,
@@ -264,25 +315,35 @@ impl MetricEvent {
             }),
             K::LogSegmentLoadFailure(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: e.operation_id.into(),
+                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                table_type: e.table_type.into(),
             }),
             K::ProtocolMetadataLoadSuccess(e) => {
                 Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
                     operation_id: e.operation_id.into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    table_type: e.table_type.into(),
                     duration_ns: ns(e.duration),
                 })
             }
             K::ProtocolMetadataLoadFailure(e) => {
                 Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                     operation_id: e.operation_id.into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    table_type: e.table_type.into(),
                 })
             }
             K::SnapshotBuildSuccess(e) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
                 operation_id: e.operation_id.into(),
+                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                table_type: e.table_type.into(),
                 version: e.version,
                 duration_ns: ns(e.duration),
             }),
             K::SnapshotBuildFailure(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: e.operation_id.into(),
+                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                table_type: e.table_type.into(),
             }),
             K::TransactionCommitSuccess(e) => {
                 let operation = match e.operation.as_ref() {
@@ -291,9 +352,12 @@ impl MetricEvent {
                 };
                 Self::TransactionCommitSuccess(TransactionCommitSuccess {
                     operation_id: e.operation_id.into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    table_type: e.table_type.into(),
                     commit_version: e.commit_version,
                     num_add_files: e.num_add_files,
                     num_remove_files: e.num_remove_files,
+                    num_dv_updates: e.num_dv_updates,
                     add_files_bytes: e.add_files_bytes,
                     remove_files_bytes: e.remove_files_bytes,
                     is_blind_append: e.is_blind_append,
@@ -307,6 +371,8 @@ impl MetricEvent {
             K::TransactionCommitFailure(e) => {
                 Self::TransactionCommitFailure(TransactionCommitFailure {
                     operation_id: e.operation_id.into(),
+                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                    table_type: e.table_type.into(),
                     reason: e.reason.into(),
                 })
             }
@@ -341,6 +407,8 @@ impl MetricEvent {
             }),
             K::ScanMetadataCompleted(e) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
                 operation_id: e.operation_id.into(),
+                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
+                table_type: e.table_type.into(),
                 scan_type: e.scan_type.into(),
                 duration_ns: ns(e.duration),
                 num_add_files_seen: e.num_add_files_seen,
@@ -391,9 +459,12 @@ mod tests {
         let event =
             kernel::MetricEvent::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
                 operation_id: id,
+                correlation_id: Some("req-7".into()),
+                table_type: kernel::TableType::CatalogManaged,
                 commit_version: 7,
                 num_add_files: 2,
                 num_remove_files: 1,
+                num_dv_updates: 4,
                 add_files_bytes: 100,
                 remove_files_bytes: 50,
                 is_blind_append: true,
@@ -408,13 +479,18 @@ mod tests {
                 panic!("expected TransactionCommitSuccess");
             };
             assert_eq!(e.operation_id.bytes, id.as_bytes());
+            assert!(matches!(e.table_type, TableType::CatalogManaged));
             assert_eq!(e.commit_version, 7);
+            assert_eq!(e.num_dv_updates, 4);
             assert_eq!(e.add_files_bytes, 100);
             assert!(e.is_blind_append);
             assert_eq!(e.prepare_duration_ns, 10);
             assert_eq!(e.total_duration_ns, 30);
             let op: &str = unsafe { TryFromStringSlice::try_from_slice(&e.operation).unwrap() };
             assert_eq!(op, "WRITE");
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "req-7");
         });
     }
 
@@ -423,9 +499,12 @@ mod tests {
         let event =
             kernel::MetricEvent::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
                 operation_id: kernel::MetricId::new(),
+                correlation_id: None,
+                table_type: kernel::TableType::PathBased,
                 commit_version: 1,
                 num_add_files: 0,
                 num_remove_files: 0,
+                num_dv_updates: 0,
                 add_files_bytes: 0,
                 remove_files_bytes: 0,
                 is_blind_append: false,
@@ -439,8 +518,12 @@ mod tests {
             let MetricEvent::TransactionCommitSuccess(e) = ffi else {
                 panic!("expected TransactionCommitSuccess");
             };
+            assert!(matches!(e.table_type, TableType::PathBased));
             let op: &str = unsafe { TryFromStringSlice::try_from_slice(&e.operation).unwrap() };
             assert_eq!(op, "");
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "");
         });
     }
 
@@ -450,6 +533,8 @@ mod tests {
         let failure =
             kernel::MetricEvent::TransactionCommitFailure(kernel::TransactionCommitFailure {
                 operation_id: id,
+                correlation_id: Some("req-fail".into()),
+                table_type: kernel::TableType::CatalogManaged,
                 reason: kernel::CommitFailureReason::Conflict,
             });
         with_ffi_event(&failure, |ffi| {
@@ -457,7 +542,11 @@ mod tests {
                 panic!("expected TransactionCommitFailure");
             };
             assert!(matches!(e.reason, CommitFailureReason::Conflict));
+            assert!(matches!(e.table_type, TableType::CatalogManaged));
             assert_eq!(e.operation_id.bytes, id.as_bytes());
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "req-fail");
         });
     }
 
@@ -466,6 +555,8 @@ mod tests {
         let id = kernel::MetricId::new();
         let event = kernel::MetricEvent::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
             operation_id: id,
+            correlation_id: Some("scan-req".into()),
+            table_type: kernel::TableType::CatalogManaged,
             scan_type: kernel::ScanType::ParallelPhase,
             duration: Duration::from_nanos(13),
             num_add_files_seen: 17,
@@ -483,6 +574,10 @@ mod tests {
                 panic!("expected ScanMetadataCompleted");
             };
             assert_eq!(e.operation_id.bytes, id.as_bytes());
+            assert!(matches!(e.table_type, TableType::CatalogManaged));
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "scan-req");
             assert_eq!(
                 discriminant(&e.scan_type),
                 discriminant(&ScanType::ParallelPhase)
@@ -497,6 +592,59 @@ mod tests {
             assert_eq!(e.peak_hash_set_size, 41);
             assert_eq!(e.dedup_visitor_time_ms, 43);
             assert_eq!(e.predicate_eval_time_ms, 47);
+        });
+    }
+
+    #[test]
+    fn from_kernel_log_segment_load_success_carries_correlation_id_and_table_type() {
+        let id = kernel::MetricId::new();
+        let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+            operation_id: id,
+            correlation_id: Some("req-42".into()),
+            table_type: kernel::TableType::CatalogManaged,
+            num_commit_files: 3,
+            num_checkpoint_files: 1,
+            num_compaction_files: 2,
+            has_latest_crc_file: true,
+            duration: Duration::from_nanos(61),
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
+                panic!("expected LogSegmentLoadSuccess");
+            };
+            assert_eq!(e.operation_id.bytes, id.as_bytes());
+            assert!(matches!(e.table_type, TableType::CatalogManaged));
+            assert_eq!(e.duration_ns, 61);
+            assert_eq!(e.num_commit_files, 3);
+            assert_eq!(e.num_checkpoint_files, 1);
+            assert_eq!(e.num_compaction_files, 2);
+            assert!(e.has_latest_crc_file);
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "req-42");
+        });
+    }
+
+    #[test]
+    fn from_kernel_log_segment_load_success_unset_correlation_id_is_empty_slice() {
+        let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+            operation_id: kernel::MetricId::new(),
+            correlation_id: None,
+            table_type: kernel::TableType::PathBased,
+            num_commit_files: 0,
+            num_checkpoint_files: 0,
+            num_compaction_files: 0,
+            has_latest_crc_file: false,
+            duration: Duration::from_nanos(0),
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
+                panic!("expected LogSegmentLoadSuccess");
+            };
+            assert!(matches!(e.table_type, TableType::PathBased));
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "");
         });
     }
 
