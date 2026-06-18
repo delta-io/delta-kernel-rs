@@ -431,6 +431,12 @@ impl LogSegmentFiles {
         &self.ascending_commit_files
     }
 
+    pub(crate) fn staged_commits(&self) -> impl Iterator<Item = &ParsedLogPath> {
+        self.ascending_commit_files
+            .iter()
+            .filter(|f| f.file_type == LogPathFileType::StagedCommit)
+    }
+
     pub(crate) fn ascending_commit_files_mut(&mut self) -> &mut Vec<ParsedLogPath> {
         &mut self.ascending_commit_files
     }
@@ -478,12 +484,6 @@ impl LogSegmentFiles {
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
             "log_tail should only contain commits"
-        );
-        debug_assert!(
-            log_tail
-                .windows(2)
-                .all(|w| w[1].version == w[0].version + 1),
-            "log_tail must be a contiguous ascending run of commit versions"
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);

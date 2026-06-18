@@ -415,9 +415,7 @@ pub(crate) fn timestamp_to_version(
     let staged_log_tail: Vec<ParsedLogPath> = snapshot
         .log_segment()
         .listed
-        .ascending_commit_files
-        .iter()
-        .filter(|c| c.file_type == LogPathFileType::StagedCommit)
+        .staged_commits()
         .cloned()
         .collect();
 

@@ -2341,29 +2341,69 @@ async fn commits_since() {
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 10);
 }
 
+/// A log built from `published` commit versions, `checkpoints`, and catalog-supplied `staged`
+/// commit versions, queried up to `end_version` (optionally bounded by `limit`), expecting
+/// `expected` commit versions in the resulting segment.
+struct TimestampConversionCase {
+    published: &'static [Version],
+    checkpoints: &'static [Version],
+    staged: &'static [Version],
+    end_version: Version,
+    limit: Option<usize>,
+    expected: &'static [Version],
+}
+
 /// `for_timestamp_conversion` returns the latest contiguous run of commit files (no checkpoint
 /// parts), merging any caller-provided `log_tail` over the filesystem listing.
 #[rstest]
 // Filesystem-only (no log_tail):
-#[case::full_range(&[0, 1, 2, 3, 4, 5, 6, 7], &[1, 3, 5], &[], 7, None, &[0, 1, 2, 3, 4, 5, 6, 7])]
-#[case::old_end_version(&[0, 1, 2, 3, 4, 5, 6, 7], &[1, 3, 5], &[], 5, None, &[0, 1, 2, 3, 4, 5])]
-#[case::only_contiguous_ranges(&[0, 1, 2, 3, 5, 6, 7], &[1, 3, 5], &[], 7, None, &[5, 6, 7])]
-#[case::with_limit(&[0, 1, 2, 3, 4, 5, 6, 7], &[1, 3, 5], &[], 7, Some(3), &[5, 6, 7])]
-#[case::with_large_limit(&[0, 1, 2, 3, 4, 5, 6, 7], &[1, 3, 5], &[], 7, Some(20), &[0, 1, 2, 3, 4, 5, 6, 7])]
+#[case::full_range(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: None, expected: &[0, 1, 2, 3, 4, 5, 6, 7],
+})]
+#[case::old_end_version(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 5, limit: None, expected: &[0, 1, 2, 3, 4, 5],
+})]
+#[case::only_contiguous_ranges(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: None, expected: &[5, 6, 7],
+})]
+#[case::with_limit(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: Some(3), expected: &[5, 6, 7],
+})]
+#[case::with_large_limit(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: Some(20), expected: &[0, 1, 2, 3, 4, 5, 6, 7],
+})]
 // Catalog-managed staged commits supplied via the log_tail:
-#[case::log_tail_joins_prefix(&[0, 1], &[], &[2, 3], 3, None, &[0, 1, 2, 3])]
-#[case::log_tail_gap_drops_prefix(&[0], &[], &[2, 3], 3, None, &[2, 3])]
-#[case::log_tail_across_checkpoint(&[0, 1, 2], &[2], &[3, 4], 4, None, &[0, 1, 2, 3, 4])]
-#[case::log_tail_with_limit(&[0, 1, 2, 3], &[], &[4, 5], 5, Some(3), &[3, 4, 5])]
+#[case::log_tail_joins_prefix(TimestampConversionCase {
+    published: &[0, 1], checkpoints: &[], staged: &[2, 3],
+    end_version: 3, limit: None, expected: &[0, 1, 2, 3],
+})]
+#[case::log_tail_gap_drops_prefix(TimestampConversionCase {
+    published: &[0], checkpoints: &[], staged: &[2, 3],
+    end_version: 3, limit: None, expected: &[2, 3],
+})]
+#[case::log_tail_across_checkpoint(TimestampConversionCase {
+    published: &[0, 1, 2], checkpoints: &[2], staged: &[3, 4],
+    end_version: 4, limit: None, expected: &[0, 1, 2, 3, 4],
+})]
+#[case::log_tail_with_limit(TimestampConversionCase {
+    published: &[0, 1, 2, 3], checkpoints: &[], staged: &[4, 5],
+    end_version: 5, limit: Some(3), expected: &[3, 4, 5],
+})]
 #[tokio::test]
-async fn for_timestamp_conversion_cases(
-    #[case] published: &[Version],
-    #[case] checkpoints: &[Version],
-    #[case] staged: &[Version],
-    #[case] end_version: Version,
-    #[case] limit: Option<usize>,
-    #[case] expected: &[Version],
-) {
+async fn for_timestamp_conversion_cases(#[case] case: TimestampConversionCase) {
+    let TimestampConversionCase {
+        published,
+        checkpoints,
+        staged,
+        end_version,
+        limit,
+        expected,
+    } = case;
     let mut paths: Vec<Path> = published
         .iter()
         .map(|v| delta_path_for_version(*v, "json"))

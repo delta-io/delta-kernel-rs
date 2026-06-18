@@ -663,9 +663,7 @@ impl LogSegment {
 
     pub(crate) fn get_unpublished_catalog_commits(&self) -> DeltaResult<Vec<CatalogCommit>> {
         self.listed
-            .ascending_commit_files
-            .iter()
-            .filter(|file| file.file_type == LogPathFileType::StagedCommit)
+            .staged_commits()
             .filter(|file| {
                 self.listed
                     .max_published_version
