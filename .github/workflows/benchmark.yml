@@ -18,6 +18,11 @@
 # as an artifact; that workflow downloads it and posts/updates the PR comment
 # in base-branch context (which has the write scope this workflow lacks under
 # pull_request from a fork).
+#
+# The run-benchmark job fails if any benchmark regresses past the fail
+# threshold in benchmarks/ci/parse_critcmp.py, unless the PR carries the
+# ignore-benchmark-failure label. The comment artifact is uploaded before that
+# gate runs, so the result table still gets posted on a gate failure.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -142,6 +147,18 @@ jobs:
           printf 'head_sha=%s\n' "$HEAD_SHA" >> "$GITHUB_OUTPUT"
           printf 'base_ref=%s\n'  "$BASE_REF"  >> "$GITHUB_OUTPUT"
           printf 'pr_number=%s\n' "$NUM"      >> "$GITHUB_OUTPUT"
+          # Read labels here, in trusted pre-checkout context, so the
+          # regression gate's override decision can't be influenced by PR code
+          # that runs later. Capture into a variable before matching:
+          # `gh ... | grep -q` would let grep close the pipe early and trip
+          # pipefail. On any read error LABELS is empty and the gate stays
+          # enforced.
+          LABELS=$(gh pr view "$NUM" --repo "$REPO" --json labels --jq '.labels[].name' || true)
+          if grep -qx 'ignore-benchmark-failure' <<< "$LABELS"; then
+            printf 'ignore_failure=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'ignore_failure=false\n' >> "$GITHUB_OUTPUT"
+          fi
       - name: Stash PR number for the post-comment workflow
         # Written to /tmp/pr-number.txt and uploaded as its own artifact in
         # the next step. The two-step shape (write then upload) keeps the
@@ -177,7 +194,13 @@ jobs:
         run: cargo install critcmp --version 0.1.8
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ steps.pr.outputs.head_sha }}
+          # Check out the integration commit (PR head merged into base) that
+          # GitHub maintains at refs/pull/<N>/merge -- the same ref build.yml
+          # and the test jobs resolve to via their bare checkout. Benchmarking
+          # this measures the PR as it would land, not the raw head. An
+          # unmergeable PR has no maintained merge ref, so the checkout fails
+          # and the job stops (parity with build/test; see SECURITY_MODEL.md).
+          ref: refs/pull/${{ steps.pr.outputs.pr_number }}/merge
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
@@ -203,14 +226,28 @@ jobs:
           TRIGGER:  ${{ github.event_name == 'issue_comment' && '/bench' || 'auto-push' }}
           BASE_REF: ${{ steps.pr.outputs.base_ref }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BENCH_IGNORE_FAILURE: ${{ steps.pr.outputs.ignore_failure }}
         run: bash benchmarks/ci/run-benchmarks.sh
       - name: Upload bench comment
         # Default `if: success()` -- a bench failure leaves no body to post.
-        # The post-failure-comment workflow doesn't need this artifact; it
-        # uses the separately-uploaded bench-pr-number artifact (or the
-        # workflow_run.head_branch lookup, depending on upstream event) to
-        # learn which PR to post the static failure note on.
+        # Runs before the regression gate below so the artifact exists even
+        # when the gate fails the job.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-comment
           path: /tmp/bench-comment.md
+      - name: Enforce benchmark regression gate
+        # parse_critcmp.py wrote "true" to this file iff some benchmark crossed
+        # its fail threshold. Fail the job on a regression unless the PR opted
+        # out with the ignore-benchmark-failure label (resolved pre-checkout in
+        # the trusted metadata step).
+        env:
+          IGNORE_FAILURE: ${{ steps.pr.outputs.ignore_failure }}
+        run: |
+          set -u
+          REGRESSED=$(tr -d '[:space:]' < /tmp/bench-regression.txt 2>/dev/null || echo false)
+          if [[ "$REGRESSED" == "true" && "$IGNORE_FAILURE" != "true" ]]; then
+            echo "::error::A benchmark regressed by at least 15%. Add the 'ignore-benchmark-failure' label to override this gate." >&2
+            exit 1
+          fi
+          echo "Regression gate passed (regressed=$REGRESSED, ignore_failure=$IGNORE_FAILURE)."

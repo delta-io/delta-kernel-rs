@@ -13,8 +13,8 @@ Before reading this page, make sure you understand
 
 For unpartitioned tables, you create one `WriteContext` and write all data through it.
 For partitioned tables, you create one `WriteContext` per distinct partition value
-combination. Partition values are baked into the `WriteContext` at creation time, not
-passed at write time.
+combination. Partition values are file-constant metadata baked into the `WriteContext`
+at creation time, not data columns passed at write time.
 
 ```text
 Unpartitioned:  1 WriteContext  -->  write all data
@@ -56,7 +56,7 @@ for (partition_values, batch) in partitions {
     // 1. Create a WriteContext for this partition
     let wc = txn.partitioned_write_context(partition_values)?;
 
-    // 2. Write the data (physical schema excludes partition columns)
+    // 2. Write the data (the logical write schema excludes partition columns)
     let data = ArrowEngineData::new(batch);
     let file_metadata = engine.write_parquet(&data, &wc).await?;
 
@@ -88,8 +88,12 @@ Key points:
   Kernel rejects type mismatches.
 - **Case-insensitive keys**: `"YEAR"` matches schema column `"year"`. Kernel normalizes
   to the schema case.
-- **Physical schema**: `wc.physical_schema()` excludes partition columns. Data files
-  contain only the non-partition columns.
+- **No partition columns in your logical data**: your data batches should follow the logical write
+  schema (`wc.logical_schema()`), which excludes partition columns.
+- **Materialization is automatic**: some table features (such as
+  `materializePartitionColumns` and `icebergCompatV3`) require partition values to also be
+  written into the data files as regular columns. Kernel handles this through the
+  logical-to-physical expression.
 
 > [!TIP]
 > To get the partition column names at runtime, call `txn.logical_partition_columns()`.

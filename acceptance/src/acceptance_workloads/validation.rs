@@ -13,7 +13,7 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::DeltaResult;
-use delta_kernel_benchmarks::models::{ReadExpected, SnapshotExpected};
+use delta_kernel_workloads::models::{ReadExpected, SnapshotExpected};
 use itertools::Itertools;
 use tracing::debug;
 

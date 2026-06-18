@@ -3,34 +3,46 @@
 Parse critcmp output and format it as a GitHub-flavoured Markdown comment.
 
 Reads the output of `critcmp base changes` from stdin and writes:
-  1. A summary block listing the largest slowdown, the fastest speedup,
-     and the count of significant slowdowns/speedups.
-  2. A `<details>` block (closed by default) containing the full
-     per-benchmark table with columns: Test | Base | PR | Change.
+  1. The comment's header line, ending with a pass/fail verdict that mirrors
+     the regression-gate outcome (BENCH_IGNORE_FAILURE=true renders the
+     label-override variant).
+  2. A one-line summary of how many benchmarks fell into each tier, ordered
+     fastest to slowest.
+  3. A `<details>` block (closed by default) containing the full
+     per-benchmark table with columns: Test | Change | Base | PR.
+  4. The tier legend as a small-text footer line.
 
-A change is "significant" when it is at least 2x in either direction
-(ratio >= 2.0 for slowdown, ratio <= 0.5 for speedup). The summary includes
-every slowdown and speedup; significant ones get a 🐌/🚀 marker in the
-Change cell.
+Each benchmark is bucketed by its displayed PR/base multiplier into a tier with
+a marker emoji (see the threshold constants). When any benchmark lands in the
+slowest tier, the run records a regression in the file named by
+BENCH_REGRESSION_FILE (if set) so the workflow can fail the job.
 
 Usage:
     critcmp base changes | python3 benchmarks/ci/parse_critcmp.py
 """
+import os
 import re
 import sys
 
-# Significance threshold for slowdowns/speedups (2x in either direction).
-SIGNIFICANCE_THRESHOLD = 2.0
+# Tiers compare the 2-decimal multiplier the table displays ("1.15x slower",
+# "1.15x faster"), so a row's marker always matches its Change cell.
+ROCKET_THRESHOLD = 1.15
+GRAY_THRESHOLD = 1.03
+FAIL_THRESHOLD = 1.15
 
-# Ratios within this of 1.0 count as no change: rendered "1.00x" with no marker
-# and excluded from the summary's slowdown/speedup counts.
-NEUTRAL_THRESHOLD = 1e-3
+# |ratio - 1| within this renders as "1.00x" with no faster/slower suffix
+# (half of the 2-decimal display step).
+NEUTRAL_THRESHOLD = 0.005
 
-# Emoji markers for the Change cell, by side and severity.
-SIGNIFICANT_SLOWDOWN = '🐌'  # ratio >= SIGNIFICANCE_THRESHOLD
-SLIGHT_SLOWDOWN = '🚧'  # 1.0 < ratio < SIGNIFICANCE_THRESHOLD
-SLIGHT_SPEEDUP = '✅'  # 1.0 / SIGNIFICANCE_THRESHOLD < ratio < 1.0
-SIGNIFICANT_SPEEDUP = '🚀'  # ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
+# Tier markers for the Change cell, fastest to slowest.
+ROCKET = '🚀'         # at least 1.15x faster
+GREEN_CHECK = '✅'    # faster or unchanged
+GRAY_CHECK = '☑️'     # at most 1.03x slower
+CONSTRUCTION = '🚧'   # between 1.03x and 1.15x slower
+RED_X = '❌'          # at least 1.15x slower (fails the job)
+
+# Fastest to slowest; drives both the summary order and the legend.
+TIERS = [ROCKET, GREEN_CHECK, GRAY_CHECK, CONSTRUCTION, RED_X]
 
 def to_ms(value, units):
     """Convert a critcmp duration to milliseconds.
@@ -65,7 +77,6 @@ def parse_rows(lines):
       base_display: base duration string or 'N/A'
       chg_display:  changes duration string or 'N/A'
       ratio:        chg_ms / base_ms, or None if either side is missing/zero
-      significant:  bool, False if ratio is None
     """
     rows = []
     for line in lines[2:]:  # skip critcmp header rows
@@ -89,7 +100,6 @@ def parse_rows(lines):
         base_display = base_dur_str or 'N/A'
         chg_display  = chg_dur_str  or 'N/A'
         ratio = None
-        significant = False
 
         if base_dur_str and chg_dur_str:
             base_p = parse_duration(base_dur_str)
@@ -104,17 +114,12 @@ def parse_rows(lines):
                 # benches (sub-nanosecond rounding) as N/A.
                 if base_ms != 0 and chg_ms != 0:
                     ratio = chg_ms / base_ms
-                    significant = (
-                        ratio >= SIGNIFICANCE_THRESHOLD
-                        or ratio <= 1.0 / SIGNIFICANCE_THRESHOLD
-                    )
 
         rows.append({
             'name': name,
             'base_display': base_display,
             'chg_display': chg_display,
             'ratio': ratio,
-            'significant': significant,
         })
     return rows
 
@@ -128,51 +133,60 @@ def format_difference(ratio):
         return f'{ratio:.2f}x slower'
     return f'{1.0 / ratio:.2f}x faster'
 
-def change_emoji(ratio, significant):
-    """Pick an emoji indicator for the Change cell.
-
-    See the module-level emoji constants for the marker assignments. Returns
-    an empty string for ratios near 1.0 or N/A rows.
-    """
-    if ratio is None or abs(ratio - 1.0) < NEUTRAL_THRESHOLD:
+def change_emoji(ratio):
+    """Pick the tier marker for the Change cell from the displayed 2-decimal
+    multiplier. Empty string for N/A rows."""
+    if ratio is None:
         return ''
-    if ratio > 1.0:
-        return SIGNIFICANT_SLOWDOWN if significant else SLIGHT_SLOWDOWN
-    return SIGNIFICANT_SPEEDUP if significant else SLIGHT_SPEEDUP
+    if ratio < 1.0:
+        return ROCKET if round(1.0 / ratio, 2) >= ROCKET_THRESHOLD else GREEN_CHECK
+    shown = round(ratio, 2)
+    if shown <= 1.0:
+        return GREEN_CHECK
+    if shown <= GRAY_THRESHOLD:
+        return GRAY_CHECK
+    if shown < FAIL_THRESHOLD:
+        return CONSTRUCTION
+    return RED_X
+
+def render_verdict(regressed, ignored):
+    """Render the pass/fail verdict shown in the comment's header line,
+    mirroring the job's regression-gate outcome."""
+    mult = f'{FAIL_THRESHOLD:.2f}x'
+    if not regressed:
+        return '✅ Pass'
+    if ignored:
+        return f'⚠️ Pass (≥{mult} slowdown ignored)'
+    return f'❌ Fail (a benchmark is ≥{mult} slower)'
 
 def render_summary(rows):
-    """Render the summary block. The counts and the largest-slowdown/fastest-speedup
-    lines include every slowdown and speedup regardless of the 2x significance
-    threshold; the per-row emoji marker is what distinguishes significant from
-    slight changes.
+    """Render the per-tier counts on one line, fastest to slowest. N/A rows
+    (added/removed benchmarks) are appended only when present."""
+    counts = {tier: 0 for tier in TIERS}
+    na = 0
+    for r in rows:
+        emoji = change_emoji(r['ratio'])
+        if emoji:
+            counts[emoji] += 1
+        else:
+            na += 1
+    parts = [f"{tier} {counts[tier]}" for tier in TIERS]
+    if na:
+        parts.append(f"N/A {na}")
+    return "**Summary:** " + " &nbsp;·&nbsp; ".join(parts)
 
-    Rows within NEUTRAL_THRESHOLD of 1.0 are excluded since they are neither slowdowns
-    nor speedups. N/A rows (ratio is None) are excluded for the same reason.
-    """
-    slow = [r for r in rows if r['ratio'] is not None and r['ratio'] - 1.0 >= NEUTRAL_THRESHOLD]
-    fast = [r for r in rows if r['ratio'] is not None and 1.0 - r['ratio'] >= NEUTRAL_THRESHOLD]
-
-    if slow:
-        worst = max(slow, key=lambda r: r['ratio'])
-        largest_slowdown = f"`{worst['name']}` ({format_difference(worst['ratio'])})"
-    else:
-        largest_slowdown = "no benchmarks slowed down"
-
-    if fast:
-        best = min(fast, key=lambda r: r['ratio'])
-        fastest_speedup = f"`{best['name']}` ({format_difference(best['ratio'])})"
-    else:
-        fastest_speedup = "no benchmarks sped up"
-
-    lines = [
-        "**Summary**",
-        "",
-        f"- Largest slowdown: {largest_slowdown}",
-        f"- Fastest speedup: {fastest_speedup}",
-        f"- Benchmarks slowed down: {len(slow)}",
-        f"- Benchmarks sped up: {len(fast)}",
-    ]
-    return "\n".join(lines)
+def render_legend():
+    """Render the tier legend as a small-text line for the comment footer."""
+    fail = f'{FAIL_THRESHOLD:.2f}x'
+    gray = f'{GRAY_THRESHOLD:.2f}x'
+    rocket = f'{ROCKET_THRESHOLD:.2f}x'
+    return (
+        f"<sub>Legend: {ROCKET} ≥{rocket} faster &nbsp;·&nbsp;"
+        f"{GREEN_CHECK} faster or unchanged &nbsp;·&nbsp;"
+        f"{GRAY_CHECK} ≤{gray} slower &nbsp;·&nbsp;"
+        f"{CONSTRUCTION} {gray}-{fail} slower &nbsp;·&nbsp;"
+        f"{RED_X} ≥{fail} slower</sub>"
+    )
 
 def render_table(rows):
     """Render the per-benchmark table wrapped in a closed-by-default <details> block."""
@@ -180,23 +194,16 @@ def render_table(rows):
     out.append("<details>")
     out.append(f"<summary>Per-benchmark results ({len(rows)} rows)</summary>")
     out.append("")
-    out.append(
-        f"**Legend:** {SIGNIFICANT_SLOWDOWN} ≥ 2x slower &nbsp;·&nbsp;"
-        f"{SLIGHT_SLOWDOWN} < 2x slower &nbsp;·&nbsp;"
-        f"{SLIGHT_SPEEDUP} < 2x faster &nbsp;·&nbsp;"
-        f"{SIGNIFICANT_SPEEDUP} ≥ 2x faster"
-    )
-    out.append("")
-    out.append("| Test | Base         | PR               | Change |")
-    out.append("|------|--------------|------------------|--------|")
+    out.append("| Test | Change | Base         | PR               |")
+    out.append("|------|--------|--------------|------------------|")
     for r in rows:
         name_cell = f"`{r['name']}`" if r['name'] else ''
         difference = format_difference(r['ratio'])
-        emoji = change_emoji(r['ratio'], r['significant'])
+        emoji = change_emoji(r['ratio'])
         # Non-breaking spaces keep the marker and ratio on one line so the
         # Change cell renders without wrapping.
         change_cell = f"{emoji} {difference}".strip().replace(" ", "&nbsp;")
-        out.append(f"| {name_cell} | {r['base_display']} | {r['chg_display']} | {change_cell} |")
+        out.append(f"| {name_cell} | {change_cell} | {r['base_display']} | {r['chg_display']} |")
     out.append("")
     out.append("</details>")
     return "\n".join(out)
@@ -204,9 +211,23 @@ def render_table(rows):
 def main():
     lines = sys.stdin.read().splitlines()
     rows = parse_rows(lines)
+    regressed = any(change_emoji(r['ratio']) == RED_X for r in rows)
+    ignored = os.environ.get('BENCH_IGNORE_FAILURE') == 'true'
+
+    print(f'## Benchmark results: {render_verdict(regressed, ignored)}')
+    print("")
     print(render_summary(rows))
     print("")
     print(render_table(rows))
+    print("")
+    print(render_legend())
+
+    # Record whether any benchmark crossed FAIL_THRESHOLD so the workflow can
+    # fail the job (unless overridden by the ignore-benchmark-failure label).
+    flag_path = os.environ.get('BENCH_REGRESSION_FILE')
+    if flag_path:
+        with open(flag_path, 'w') as f:
+            f.write('true' if regressed else 'false')
 
 if __name__ == "__main__":
     main()

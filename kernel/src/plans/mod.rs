@@ -22,6 +22,17 @@ pub trait PlanExecutor: AsAny {
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult>;
 }
 
+/// The unit type is a trivial [`PlanExecutor`] that rejects every operation. It backs
+/// [`Engine::plan_executor`](crate::Engine::plan_executor)'s default so callers can attempt plan
+/// execution unconditionally and fall back on the resulting error when no real executor exists.
+impl PlanExecutor for () {
+    fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
+        Err(Error::unsupported(
+            "this engine does not provide a PlanExecutor",
+        ))
+    }
+}
+
 /// The result of executing an [`Operation`].
 ///
 /// Each variant describes a different shape of output that a plan can possibly produce.

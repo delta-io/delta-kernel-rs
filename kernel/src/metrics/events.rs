@@ -4,6 +4,14 @@
 //! span name, and the small set of methods the `tracing` layer in [`crate::metrics::reporter`]
 //! calls to construct and finalize the event. Per-event code is colocated in a single block
 //! per type below.
+//!
+//! Enums carried in event payloads derive the full strum set (`EnumString`, `Display`,
+//! `AsRefStr`, `IntoStaticStr`) with stable serialized names. `IntoStaticStr` in particular
+//! lets connectors convert a value to its `&'static str` metric-label string via `.into()`
+//! instead of maintaining their own variant-to-string `match`.
+//!
+//! Event construction is infallible: a malformed span field warns and falls back to a
+//! default rather than failing the operation being observed.
 
 use std::fmt;
 use std::str::FromStr as _;
@@ -11,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use delta_kernel_derive::internal_api;
-use strum::{AsRefStr, Display as StrumDisplay, EnumString};
+use strum::{AsRefStr, Display as StrumDisplay, EnumString, IntoStaticStr};
 use tracing::field::{Field, Visit};
 use tracing::span::Attributes;
 use tracing::warn;
@@ -198,7 +206,10 @@ impl MetricEvent {
                     operation_id,
                     table_type,
                     correlation_id,
-                    reason: value.parse().unwrap_or(CommitFailureReason::Error),
+                    reason: value.parse().unwrap_or_else(|e| {
+                        warn!("Invalid failure_reason '{value}' on span: {e}. Using Error.");
+                        CommitFailureReason::Error
+                    }),
                 });
             }
             return Ok(());
@@ -589,6 +600,7 @@ pub struct TransactionCommitSuccess {
     // === Set during span lifetime ===
     pub num_add_files: u64,
     pub num_remove_files: u64,
+    pub num_dv_updates: u64,
     pub add_files_bytes: u64,
     pub remove_files_bytes: u64,
     pub is_blind_append: bool,
@@ -616,6 +628,7 @@ impl TransactionCommitSuccess {
             commit_version: v.commit_version,
             num_add_files: 0,
             num_remove_files: 0,
+            num_dv_updates: 0,
             add_files_bytes: 0,
             remove_files_bytes: 0,
             is_blind_append: false,
@@ -631,6 +644,7 @@ impl TransactionCommitSuccess {
         match name {
             "num_add_files" => self.num_add_files = value,
             "num_remove_files" => self.num_remove_files = value,
+            "num_dv_updates" => self.num_dv_updates = value,
             "add_files_bytes" => self.add_files_bytes = value,
             "remove_files_bytes" => self.remove_files_bytes = value,
             "prepare_duration_ns" => self.prepare_duration = Duration::from_nanos(value),
@@ -671,6 +685,7 @@ impl fmt::Display for TransactionCommitSuccess {
             commit_version,
             num_add_files,
             num_remove_files,
+            num_dv_updates,
             add_files_bytes,
             remove_files_bytes,
             is_blind_append,
@@ -685,7 +700,7 @@ impl fmt::Display for TransactionCommitSuccess {
             "TransactionCommitSuccess(id={operation_id}, table_type={table_type}, \
              correlation_id={correlation_id:?}, version={commit_version}, \
              total_duration={total_duration:?}, prepare={prepare_duration:?}, committer={committer_duration:?}, \
-             add_files={num_add_files}, remove_files={num_remove_files}, \
+             add_files={num_add_files}, remove_files={num_remove_files}, dv_updates={num_dv_updates}, \
              add_bytes={add_files_bytes}, remove_bytes={remove_files_bytes}, \
              is_blind_append={is_blind_append}, data_change={data_change}, operation={operation:?})"
         )
@@ -696,7 +711,7 @@ impl fmt::Display for TransactionCommitSuccess {
 ///
 /// Serializes to its `snake_case` name for the `failure_reason` span field (e.g.
 /// `RetryableIo` -> `"retryable_io"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum CommitFailureReason {
     /// The commit conflicted with a concurrently committed version.
@@ -1029,33 +1044,27 @@ impl Visit for FileReadAttrs {
 // ====================================================================
 
 /// Identifies which scan execution path produced a scan metadata metrics event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes to the explicit `serialize` name on each variant for the `scan_type` span field
+/// (e.g. `SequentialPhase` -> `"sequential"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
 pub enum ScanType {
     /// Sequential phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    #[strum(serialize = "sequential")]
     SequentialPhase,
     /// Parallel phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    #[strum(serialize = "parallel")]
     ParallelPhase,
     /// Scan metadata from [`crate::scan::Scan::scan_metadata`].
+    #[strum(serialize = "full")]
     Full,
 }
 
 impl ScanType {
-    /// Parse the value of the `scan_type` span field. Unknown values map to `Full`.
-    fn parse(s: &str) -> Self {
-        match s {
-            "sequential" => Self::SequentialPhase,
-            "parallel" => Self::ParallelPhase,
-            _ => Self::Full,
-        }
-    }
-}
-
-impl fmt::Display for ScanType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::SequentialPhase => "sequential",
-            Self::ParallelPhase => "parallel",
-            Self::Full => "full",
+    fn parse_lenient(s: &str) -> Self {
+        Self::from_str(s).unwrap_or_else(|e| {
+            warn!("Invalid scan_type '{s}' on span: {e}. Using Full.");
+            Self::Full
         })
     }
 }
@@ -1195,7 +1204,7 @@ impl ScanMetadataCompleted {
             operation_id: MetricId(v.operation_id),
             table_type: TableType::from_catalog_managed(v.is_catalog_managed),
             correlation_id: v.correlation_id,
-            scan_type: ScanType::parse(&v.scan_type),
+            scan_type: ScanType::parse_lenient(&v.scan_type),
             duration: Duration::from_nanos(v.duration_ns),
             num_add_files_seen: v.num_add_files_seen,
             num_active_add_files: v.num_active_add_files,
@@ -1537,6 +1546,7 @@ mod tests {
             commit_version: 1,
             num_add_files: 0,
             num_remove_files: 0,
+            num_dv_updates: 0,
             add_files_bytes: 0,
             remove_files_bytes: 0,
             is_blind_append: false,
@@ -1575,6 +1585,52 @@ mod tests {
             panic!("expected TransactionCommitSuccess");
         };
         assert_eq!(success.operation.as_deref(), Some("WRITE"));
+    }
+
+    #[test]
+    fn record_u64_num_dv_updates_sets_field() {
+        let mut event = MetricEvent::TransactionCommitSuccess(commit_success(MetricId::new()));
+        event.record_u64("num_dv_updates", 7).unwrap();
+        let MetricEvent::TransactionCommitSuccess(success) = event else {
+            panic!("expected TransactionCommitSuccess");
+        };
+        assert_eq!(success.num_dv_updates, 7);
+    }
+
+    #[rstest]
+    #[case::conflict(CommitFailureReason::Conflict, "conflict")]
+    #[case::retryable_io(CommitFailureReason::RetryableIo, "retryable_io")]
+    #[case::error(CommitFailureReason::Error, "error")]
+    fn commit_failure_reason_serializes_to_wire_name_and_parses_back(
+        #[case] reason: CommitFailureReason,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = reason.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(CommitFailureReason::from_str(wire).unwrap(), reason);
+    }
+
+    #[rstest]
+    #[case::sequential(ScanType::SequentialPhase, "sequential")]
+    #[case::parallel(ScanType::ParallelPhase, "parallel")]
+    #[case::full(ScanType::Full, "full")]
+    fn scan_type_serializes_to_wire_name_and_parses_back(
+        #[case] scan_type: ScanType,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = scan_type.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(ScanType::from_str(wire).unwrap(), scan_type);
+    }
+
+    #[rstest]
+    #[case::known("parallel", ScanType::ParallelPhase)]
+    #[case::unknown_defaults_to_full("totally_unknown", ScanType::Full)]
+    fn scan_type_parse_lenient_maps_unknown_to_full(
+        #[case] value: &str,
+        #[case] expected: ScanType,
+    ) {
+        assert_eq!(ScanType::parse_lenient(value), expected);
     }
 
     #[test]

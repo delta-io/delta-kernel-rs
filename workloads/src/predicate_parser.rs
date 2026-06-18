@@ -1,6 +1,6 @@
 //! Parses SQL WHERE clause expressions into kernel [`KPred`] types.
 //!
-//! Supports a subset of SQL sufficient for benchmark predicates:
+//! Supports a subset of SQL sufficient for workload predicates:
 //! - Binary comparisons: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`
 //! - Null-safe equals: `<=>`
 //! - Logical operators: `AND`, `OR`, `NOT`

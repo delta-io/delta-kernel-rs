@@ -228,6 +228,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
     /// Write `data` as a parquet file using the provided `write_context`.
     ///
+    /// `data` must not contain partition columns. If the table materializes partition columns (e.g.
+    /// `materializePartitionColumns` or `icebergCompatV3`), this function automatically inserts
+    /// them into the data.
+    ///
     /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
     /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
     /// serialization, and logical-to-physical key translation.
