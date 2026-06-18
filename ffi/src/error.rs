@@ -1,12 +1,8 @@
 use delta_kernel::{DeltaResult, Error};
-#[cfg(feature = "declarative-plans")]
 use tracing::warn;
 
-#[cfg(feature = "declarative-plans")]
 use crate::handle::Handle;
-#[cfg(feature = "declarative-plans")]
-use crate::ExclusiveRustString;
-use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
+use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
 
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
@@ -247,7 +243,6 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
 /// The message is an [`ExclusiveRustString`] handle, which means the engine must
 /// downcall to [`allocate_kernel_string`](crate::allocate_kernel_string) to construct it. Kernel
 /// can then take ownership and free it appropriately after receiving the error.
-#[cfg(feature = "declarative-plans")]
 #[repr(C)]
 pub struct EngineExecError {
     // TODO: we re-use KernelError for convenience, but we should ideally split this into a
@@ -265,7 +260,6 @@ pub struct EngineExecError {
 /// The variants are deliberately named `Success`/`Failure` rather than `Ok`/`Err` to avoid a
 /// conflict with [`ExternResult`]. This is due to an issue in cbindgen, where generic types sharing
 /// the same variant names causes failures during monomorphization (<https://github.com/mozilla/cbindgen/issues/1166>).
-#[cfg(feature = "declarative-plans")]
 #[repr(C)]
 pub enum EngineExecResult<T> {
     Success(T),
@@ -276,7 +270,6 @@ pub enum EngineExecResult<T> {
 /// Maps the given KernelError code to the given Error variant. Logs a warning if the associated
 /// error message is non-empty. Useful for mapping kernel errors to error variants that don't
 /// carry a message, but for some reason the engine still provided one.
-#[cfg(feature = "declarative-plans")]
 fn messageless_error(code: KernelError, message: String, error: Error) -> Error {
     if !message.is_empty() {
         warn!("Discarding message for engine execution error ({code:?}): {message}");
@@ -284,7 +277,6 @@ fn messageless_error(code: KernelError, message: String, error: Error) -> Error 
     error
 }
 
-#[cfg(feature = "declarative-plans")]
 impl From<EngineExecError> for Error {
     /// Converts an [`EngineExecError`] into a [`delta_kernel::Error`], translating the
     /// [`KernelError`] code back into its matching kernel error variant and consuming (and thereby
