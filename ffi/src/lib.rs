@@ -54,6 +54,8 @@ use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
 #[cfg(feature = "tracing")]
+pub mod ffi_metrics;
+#[cfg(feature = "tracing")]
 pub mod ffi_tracing;
 pub mod log_path;
 #[cfg(feature = "declarative-plans")]
@@ -145,6 +147,14 @@ impl KernelStringSlice {
         Self {
             ptr: source.as_ptr().cast(),
             len: source.len(),
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    pub(crate) fn empty() -> Self {
+        KernelStringSlice {
+            ptr: NonNull::<u8>::dangling().as_ptr().cast(),
+            len: 0,
         }
     }
 }
