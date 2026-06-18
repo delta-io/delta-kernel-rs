@@ -86,9 +86,38 @@ message LoadNode {
   delta.kernel.expressions.ColumnName dv_column = 6;
 }
 
-message MaxByVersionNode {
-  repeated delta.kernel.expressions.Expression group_by = 1;
-  delta.kernel.expressions.ColumnName version_column = 2;
+message MinAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message MaxAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message MinNonNullByAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+  delta.kernel.expressions.ColumnName key = 2;
+}
+message MaxNonNullByAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+  delta.kernel.expressions.ColumnName key = 2;
+}
+
+message AggOp {
+  oneof op {
+    MinAgg min = 1;
+    MaxAgg max = 2;
+    MinNonNullByAgg min_non_null_by = 3;
+    MaxNonNullByAgg max_non_null_by = 4;
+  }
+}
+
+message Agg {
+  AggOp op = 1;
+  optional string alias = 2;
+}
+
+message AggregateNode {
+  repeated delta.kernel.expressions.ColumnName group_by = 1;
+  repeated Agg aggs = 2;
   delta.kernel.schema.StructType schema = 3;
 }
 
@@ -113,7 +142,7 @@ message Operator {
     FilterNode filter = 5;
     UnionAllNode union_all = 6;
     LoadNode load = 7;
-    MaxByVersionNode max_by_version = 8;
+    AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
   }
 }
