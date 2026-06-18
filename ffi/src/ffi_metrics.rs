@@ -303,136 +303,220 @@ impl MetricEvent {
         use kernel::MetricEvent as K;
         let ns = |d: std::time::Duration| d.as_nanos() as u64;
         match event {
-            K::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
-                operation_id: e.operation_id.into(),
-                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                table_type: e.table_type.into(),
-                duration_ns: ns(e.duration),
-                num_commit_files: e.num_commit_files,
-                num_checkpoint_files: e.num_checkpoint_files,
-                num_compaction_files: e.num_compaction_files,
-                has_latest_crc_file: e.has_latest_crc_file,
+            K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+                operation_id,
+                correlation_id,
+                table_type,
+                num_commit_files,
+                num_checkpoint_files,
+                num_compaction_files,
+                has_latest_crc_file,
+                duration,
+            }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
+                duration_ns: ns(*duration),
+                num_commit_files: *num_commit_files,
+                num_checkpoint_files: *num_checkpoint_files,
+                num_compaction_files: *num_compaction_files,
+                has_latest_crc_file: *has_latest_crc_file,
             }),
-            K::LogSegmentLoadFailure(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
-                operation_id: e.operation_id.into(),
-                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                table_type: e.table_type.into(),
+            K::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
+                operation_id,
+                correlation_id,
+                table_type,
+            }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
             }),
-            K::ProtocolMetadataLoadSuccess(e) => {
-                Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
-                    operation_id: e.operation_id.into(),
-                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                    table_type: e.table_type.into(),
-                    duration_ns: ns(e.duration),
-                })
-            }
-            K::ProtocolMetadataLoadFailure(e) => {
-                Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
-                    operation_id: e.operation_id.into(),
-                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                    table_type: e.table_type.into(),
-                })
-            }
-            K::SnapshotBuildSuccess(e) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
-                operation_id: e.operation_id.into(),
-                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                table_type: e.table_type.into(),
-                version: e.version,
-                duration_ns: ns(e.duration),
+            K::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
+                operation_id,
+                correlation_id,
+                table_type,
+                duration,
+            }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
+                duration_ns: ns(*duration),
             }),
-            K::SnapshotBuildFailure(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
-                operation_id: e.operation_id.into(),
-                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                table_type: e.table_type.into(),
+            K::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+                table_type,
+            }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
             }),
-            K::TransactionCommitSuccess(e) => {
-                let operation = match e.operation.as_ref() {
+            K::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
+                operation_id,
+                correlation_id,
+                table_type,
+                version,
+                duration,
+            }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
+                version: *version,
+                duration_ns: ns(*duration),
+            }),
+            K::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+                operation_id,
+                correlation_id,
+                table_type,
+            }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
+            }),
+            K::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
+                operation_id,
+                correlation_id,
+                table_type,
+                commit_version,
+                num_add_files,
+                num_remove_files,
+                num_dv_updates,
+                add_files_bytes,
+                remove_files_bytes,
+                is_blind_append,
+                data_change,
+                operation,
+                prepare_duration,
+                committer_duration,
+                total_duration,
+            }) => {
+                let operation = match operation.as_ref() {
                     Some(o) => kernel_string_slice!(o),
                     None => KernelStringSlice::empty(),
                 };
                 Self::TransactionCommitSuccess(TransactionCommitSuccess {
-                    operation_id: e.operation_id.into(),
-                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                    table_type: e.table_type.into(),
-                    commit_version: e.commit_version,
-                    num_add_files: e.num_add_files,
-                    num_remove_files: e.num_remove_files,
-                    num_dv_updates: e.num_dv_updates,
-                    add_files_bytes: e.add_files_bytes,
-                    remove_files_bytes: e.remove_files_bytes,
-                    is_blind_append: e.is_blind_append,
-                    data_change: e.data_change,
+                    operation_id: (*operation_id).into(),
+                    correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                    table_type: (*table_type).into(),
+                    commit_version: *commit_version,
+                    num_add_files: *num_add_files,
+                    num_remove_files: *num_remove_files,
+                    num_dv_updates: *num_dv_updates,
+                    add_files_bytes: *add_files_bytes,
+                    remove_files_bytes: *remove_files_bytes,
+                    is_blind_append: *is_blind_append,
+                    data_change: *data_change,
                     operation,
-                    prepare_duration_ns: ns(e.prepare_duration),
-                    committer_duration_ns: ns(e.committer_duration),
-                    total_duration_ns: ns(e.total_duration),
+                    prepare_duration_ns: ns(*prepare_duration),
+                    committer_duration_ns: ns(*committer_duration),
+                    total_duration_ns: ns(*total_duration),
                 })
             }
-            K::TransactionCommitFailure(e) => {
-                Self::TransactionCommitFailure(TransactionCommitFailure {
-                    operation_id: e.operation_id.into(),
-                    correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                    table_type: e.table_type.into(),
-                    reason: e.reason.into(),
-                })
-            }
-            K::DomainMetadataLoadSuccess(e) => {
-                Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
-                    from_cache: e.from_cache,
-                    num_domains_returned: e.num_domains_returned,
-                    duration_ns: ns(e.duration),
-                })
-            }
+            K::TransactionCommitFailure(kernel::TransactionCommitFailure {
+                operation_id,
+                correlation_id,
+                table_type,
+                reason,
+            }) => Self::TransactionCommitFailure(TransactionCommitFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
+                reason: (*reason).into(),
+            }),
+            K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
+                from_cache,
+                num_domains_returned,
+                duration,
+            }) => Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
+                from_cache: *from_cache,
+                num_domains_returned: *num_domains_returned,
+                duration_ns: ns(*duration),
+            }),
             K::DomainMetadataLoadFailure => Self::DomainMetadataLoadFailure,
-            K::SetTransactionLoadSuccess(e) => {
-                Self::SetTransactionLoadSuccess(SetTransactionLoadSuccess {
-                    from_cache: e.from_cache,
-                    found: e.found,
-                    duration_ns: ns(e.duration),
-                })
-            }
+            K::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
+                from_cache,
+                found,
+                duration,
+            }) => Self::SetTransactionLoadSuccess(SetTransactionLoadSuccess {
+                from_cache: *from_cache,
+                found: *found,
+                duration_ns: ns(*duration),
+            }),
             K::SetTransactionLoadFailure => Self::SetTransactionLoadFailure,
-            K::CrcReadSuccess(e) => Self::CrcReadSuccess(CrcReadSuccess {
-                bytes_read: e.bytes_read,
-                duration_ns: ns(e.duration),
+            K::CrcReadSuccess(kernel::CrcReadSuccess {
+                bytes_read,
+                duration,
+            }) => Self::CrcReadSuccess(CrcReadSuccess {
+                bytes_read: *bytes_read,
+                duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
-            K::JsonReadCompleted(e) => Self::JsonReadCompleted(JsonReadCompleted {
-                num_files: e.num_files,
-                bytes_read: e.bytes_read,
+            K::JsonReadCompleted(kernel::JsonReadCompleted {
+                num_files,
+                bytes_read,
+            }) => Self::JsonReadCompleted(JsonReadCompleted {
+                num_files: *num_files,
+                bytes_read: *bytes_read,
             }),
-            K::ParquetReadCompleted(e) => Self::ParquetReadCompleted(ParquetReadCompleted {
-                num_files: e.num_files,
-                bytes_read: e.bytes_read,
+            K::ParquetReadCompleted(kernel::ParquetReadCompleted {
+                num_files,
+                bytes_read,
+            }) => Self::ParquetReadCompleted(ParquetReadCompleted {
+                num_files: *num_files,
+                bytes_read: *bytes_read,
             }),
-            K::ScanMetadataCompleted(e) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
-                operation_id: e.operation_id.into(),
-                correlation_id: correlation_id_slice(e.correlation_id.as_deref()),
-                table_type: e.table_type.into(),
-                scan_type: e.scan_type.into(),
-                duration_ns: ns(e.duration),
-                num_add_files_seen: e.num_add_files_seen,
-                num_active_add_files: e.num_active_add_files,
-                active_add_files_bytes: e.active_add_files_bytes,
-                num_remove_files_seen: e.num_remove_files_seen,
-                num_non_file_actions: e.num_non_file_actions,
-                num_predicate_filtered: e.num_predicate_filtered,
-                peak_hash_set_size: e.peak_hash_set_size as u64, // note usize -> u64 cast
-                dedup_visitor_time_ms: e.dedup_visitor_time_ms,
-                predicate_eval_time_ms: e.predicate_eval_time_ms,
+            K::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
+                operation_id,
+                correlation_id,
+                table_type,
+                scan_type,
+                duration,
+                num_add_files_seen,
+                num_active_add_files,
+                active_add_files_bytes,
+                num_remove_files_seen,
+                num_non_file_actions,
+                num_predicate_filtered,
+                peak_hash_set_size,
+                dedup_visitor_time_ms,
+                predicate_eval_time_ms,
+            }) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
+                scan_type: (*scan_type).into(),
+                duration_ns: ns(*duration),
+                num_add_files_seen: *num_add_files_seen,
+                num_active_add_files: *num_active_add_files,
+                active_add_files_bytes: *active_add_files_bytes,
+                num_remove_files_seen: *num_remove_files_seen,
+                num_non_file_actions: *num_non_file_actions,
+                num_predicate_filtered: *num_predicate_filtered,
+                peak_hash_set_size: *peak_hash_set_size as u64, // note usize -> u64 cast
+                dedup_visitor_time_ms: *dedup_visitor_time_ms,
+                predicate_eval_time_ms: *predicate_eval_time_ms,
             }),
-            K::StorageListCompleted(e) => Self::StorageListCompleted(StorageListCompleted {
-                duration_ns: ns(e.duration),
-                num_files: e.num_files,
+            K::StorageListCompleted(kernel::StorageListCompleted {
+                duration,
+                num_files,
+            }) => Self::StorageListCompleted(StorageListCompleted {
+                duration_ns: ns(*duration),
+                num_files: *num_files,
             }),
-            K::StorageReadCompleted(e) => Self::StorageReadCompleted(StorageReadCompleted {
-                duration_ns: ns(e.duration),
-                num_files: e.num_files,
-                bytes_read: e.bytes_read,
+            K::StorageReadCompleted(kernel::StorageReadCompleted {
+                duration,
+                num_files,
+                bytes_read,
+            }) => Self::StorageReadCompleted(StorageReadCompleted {
+                duration_ns: ns(*duration),
+                num_files: *num_files,
+                bytes_read: *bytes_read,
             }),
-            K::StorageCopyCompleted(e) => Self::StorageCopyCompleted(StorageCopyCompleted {
-                duration_ns: ns(e.duration),
-            }),
+            K::StorageCopyCompleted(kernel::StorageCopyCompleted { duration }) => {
+                Self::StorageCopyCompleted(StorageCopyCompleted {
+                    duration_ns: ns(*duration),
+                })
+            }
         }
     }
 }
