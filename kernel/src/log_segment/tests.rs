@@ -214,21 +214,14 @@ fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
     .unwrap()
 }
 
-/// Build a `log_tail` of staged commits at the given versions (memory:/// table root).
-fn staged_log_tail(versions: &[u64]) -> Vec<ParsedLogPath> {
-    let table_root = Url::parse("memory:///").expect("valid url");
+/// Builds a staged-commit log path (`ParsedLogPath`) for each version: a
+/// `memory:///_delta_log/_staged_commits/<v>.<uuid>.json` entry that parses to
+/// `file_type: StagedCommit`.
+fn staged_commit_log_paths(versions: &[Version]) -> Vec<ParsedLogPath> {
     versions
         .iter()
-        .map(|version| staged_commit_path_for_version(*version))
-        .map(|path| {
-            ParsedLogPath::try_from(FileMeta {
-                location: table_root.join(path.as_ref()).unwrap(),
-                last_modified: 0,
-                size: 100,
-            })
-            .unwrap()
-            .unwrap()
-        })
+        .map(|v| staged_commit_path_for_version(*v))
+        .map(|path| create_log_path_with_size(&format!("memory:///{}", path.as_ref()), 100))
         .collect()
 }
 
@@ -1582,7 +1575,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let staged_commits_log_tail = staged_log_tail(segment.staged_commit_versions);
+    let staged_commits_log_tail = staged_commit_log_paths(segment.staged_commit_versions);
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root.clone(),
@@ -2387,7 +2380,7 @@ async fn for_timestamp_conversion_cases(
         log_root.clone(),
         end_version,
         limit.map(|l| NonZero::new(l).unwrap()),
-        staged_log_tail(staged),
+        staged_commit_log_paths(staged),
     )
     .unwrap();
 

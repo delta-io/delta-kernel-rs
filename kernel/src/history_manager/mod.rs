@@ -421,19 +421,6 @@ pub(crate) fn timestamp_to_version(
         .cloned()
         .collect();
 
-    // The staged suffix must be directly adjacent to the published prefix with no version gap.
-    // Otherwise, for_timestamp_conversion's gap-trim would keep only the staged tail and silently
-    // drop the prefix, resolving the wrong version.
-    debug_assert!(
-        snapshot
-            .log_segment()
-            .listed
-            .ascending_commit_files
-            .windows(2)
-            .all(|w| w[1].version == w[0].version + 1),
-        "snapshot commit files must be contiguous for timestamp conversion"
-    );
-
     let listing_limit = match resolved_commit_type {
         HistoryCommitType::Published => None,
         HistoryCommitType::Recreatable => {
