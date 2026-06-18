@@ -443,8 +443,8 @@ pub struct Load {
 /// ```text
 /// person   | likes_to_eat
 /// ---------+-------------
-///  Charlie | egg
 ///  Bob     | watermelon
+///  Charlie | egg
 ///  Alice   | sushi
 /// ```
 #[derive(Debug, Clone)]
@@ -510,22 +510,22 @@ pub struct Agg {
 }
 
 impl Agg {
-    /// `min(value)`: the least non-null value in each group.
+    /// The least non-null value in each group.
     pub fn min(value: impl Into<ColumnName>) -> Self {
         Self::new(AggOp::Min(Min {
             value: value.into(),
         }))
     }
 
-    /// `max(value)`: the greatest non-null value in each group.
+    /// The greatest non-null value in each group.
     pub fn max(value: impl Into<ColumnName>) -> Self {
         Self::new(AggOp::Max(Max {
             value: value.into(),
         }))
     }
 
-    /// `min_non_null_by(value, key)`: like [`max_non_null_by`](Self::max_non_null_by), but selects
-    /// the `value` from the row with the *least* `key`.
+    /// Like [`max_non_null_by`](Self::max_non_null_by), but selects the `value` from the row with
+    /// the *least* `key`.
     pub fn min_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
         Self::new(AggOp::MinNonNullBy(MinNonNullBy {
             value: value.into(),
@@ -533,14 +533,8 @@ impl Agg {
         }))
     }
 
-    /// Sets the output column name, overriding the default (the value column's name).
-    pub fn alias(mut self, name: impl Into<String>) -> Self {
-        self.alias = Some(name.into());
-        self
-    }
-
-    /// `max_non_null_by(value, key)`: the `value` from the row with the greatest `key`, considering
-    /// only rows where *both* `value` and `key` are non-null.
+    /// The `value` from the row with the greatest `key`, considering only rows where *both* `value`
+    /// and `key` are non-null.
     ///
     /// Equivalent to SQL `max_by(value, key) FILTER (WHERE value IS NOT NULL)`: `max_by` already
     /// ignores NULL keys, and the filter additionally drops NULL values.
@@ -568,6 +562,12 @@ impl Agg {
             value: value.into(),
             key: key.into(),
         }))
+    }
+
+    /// Sets the output column name, overriding the default (the value column's name).
+    pub fn alias(mut self, name: impl Into<String>) -> Self {
+        self.alias = Some(name.into());
+        self
     }
 
     fn new(op: AggOp) -> Self {
