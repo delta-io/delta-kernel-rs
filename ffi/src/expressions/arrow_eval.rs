@@ -570,6 +570,19 @@ mod tests {
     }
 
     #[test]
+    fn starts_with_is_case_sensitive() {
+        // Plain op (no LOWER) matches exactly, so case matters here -- unlike the LOWER variant.
+        let pred = Predicate::arrow_opaque(
+            FfiOpaquePredicateOp::new("STARTS_WITH", callbacks_for(engine_starts_with)),
+            [column_expr!("col"), Expression::literal("foo")],
+        );
+        let batch = batch_with_col(vec![Some("foobar"), Some("FOOBAR")]);
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert!(result.value(0), "foobar starts with foo");
+        assert!(!result.value(1), "FOOBAR does not start with foo");
+    }
+
+    #[test]
     fn inversion_flips_verdicts() {
         let pred = Predicate::arrow_opaque(
             FfiOpaquePredicateOp::new("STARTS_WITH_LOWER", callbacks_for(engine_starts_with_lower)),
