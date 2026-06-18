@@ -86,12 +86,21 @@ void print_metric_id(const char* name, MetricId id) {
          b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
 }
 
+// utility to print out a table type
+void print_table_type(TableType tt) {
+  printf("  table_type:");
+  switch (tt) {
+  case TableTypePathBased: printf(" PathBased,\n"); break;
+  case TableTypeCatalogManaged: printf(" CatalogManaged,\n"); break;
+  }
+}
+
 #define PM_START(name) printf("\nMetric " #name " {\n")
 #define PM_END printf("}\n\n");
 #define PM_ID(s, f) print_metric_id(#f, (s).f)
 #define PM_U64(s, f)   printf("  " #f ": %" PRIu64 ",\n", (uint64_t)(s).f)
 #define PM_BOOL(s, f)  printf("  " #f ": %s,\n", (s).f ? "true" : "false")
-#define PM_SLICE(s, f) printf("  " #f ": %.*s,\n", (int)(s).f.len, (s).f.ptr)
+#define PM_SLICE(s, f) (s.f.len>0?printf("  " #f ": %.*s,\n", (int)(s).f.len, (s).f.ptr):printf("  " #f ": \"\",\n"))
 
 // print out metrics as json(ish) objects
 void print_metric(MetricEvent event) {
@@ -100,6 +109,8 @@ void print_metric(MetricEvent event) {
     PM_START(LogSegmentLoadSuccess);
     LogSegmentLoadSuccess lsls = event.log_segment_load_success;
     PM_ID(lsls, operation_id);
+    PM_SLICE(lsls, correlation_id);
+    print_table_type(lsls.table_type);
     PM_U64(lsls, duration_ns);
     PM_U64(lsls, num_commit_files);
     PM_U64(lsls, num_checkpoint_files);
@@ -112,6 +123,8 @@ void print_metric(MetricEvent event) {
     PM_START(LogSegmentLoadFailure);
     LogSegmentLoadFailure lslf = event.log_segment_load_failure;
     PM_ID(lslf, operation_id);
+    PM_SLICE(lslf, correlation_id);
+    print_table_type(lslf.table_type);
     PM_END;
     return;
 
@@ -119,6 +132,8 @@ void print_metric(MetricEvent event) {
     PM_START(ProtocolMetadataLoadSuccess);
     ProtocolMetadataLoadSuccess pmls = event.protocol_metadata_load_success;
     PM_ID(pmls, operation_id);
+    PM_SLICE(pmls, correlation_id);
+    print_table_type(pmls.table_type);
     PM_U64(pmls, duration_ns);
     PM_END;
     return;
@@ -127,6 +142,8 @@ void print_metric(MetricEvent event) {
     PM_START(ProtocolMetadataLoadFailure);
     ProtocolMetadataLoadFailure pmlf = event.protocol_metadata_load_failure;
     PM_ID(pmlf, operation_id);
+    PM_SLICE(pmlf, correlation_id);
+    print_table_type(pmlf.table_type);
     PM_END;
     return;
 
@@ -134,6 +151,8 @@ void print_metric(MetricEvent event) {
     PM_START(SnapshotBuildSuccess);
     SnapshotBuildSuccess sbs = event.snapshot_build_success;
     PM_ID(sbs, operation_id);
+    PM_SLICE(sbs, correlation_id);
+    print_table_type(sbs.table_type);
     PM_U64(sbs, version);
     PM_U64(sbs, duration_ns);
     PM_END;
@@ -143,6 +162,8 @@ void print_metric(MetricEvent event) {
     PM_START(SnapshotBuildFailure);
     SnapshotBuildFailure slf = event.snapshot_build_failure;
     PM_ID(slf, operation_id);
+    PM_SLICE(slf, correlation_id);
+    print_table_type(slf.table_type);
     PM_END;
     return;
 
@@ -150,9 +171,12 @@ void print_metric(MetricEvent event) {
     PM_START(TransactionCommitSuccess);
     TransactionCommitSuccess tcs = event.transaction_commit_success;
     PM_ID(tcs, operation_id);
+    PM_SLICE(tcs, correlation_id);
+    print_table_type(tcs.table_type);
     PM_U64(tcs, commit_version);
     PM_U64(tcs, num_add_files);
     PM_U64(tcs, num_remove_files);
+    PM_U64(tcs, num_dv_updates);
     PM_U64(tcs, add_files_bytes);
     PM_U64(tcs, remove_files_bytes);
     PM_BOOL(tcs, is_blind_append);
@@ -168,6 +192,8 @@ void print_metric(MetricEvent event) {
     PM_START(TransactionCommitFailure);
     TransactionCommitFailure tcf = event.transaction_commit_failure;
     PM_ID(tcf, operation_id);
+    PM_SLICE(tcf, correlation_id);
+    print_table_type(tcf.table_type);
     printf("  reason:");
     switch (tcf.reason) {
     case CommitFailureReasonConflict: printf(" Conflict,\n"); break;
@@ -238,6 +264,8 @@ void print_metric(MetricEvent event) {
     PM_START(ScanMetadataCompleted);
     ScanMetadataCompleted smc = event.scan_metadata_completed;
     PM_ID(smc, operation_id);
+    PM_SLICE(smc, correlation_id);
+    print_table_type(smc.table_type);
     printf("  scan_type:");
     switch (smc.scan_type) {
     case ScanTypeSequentialPhase: printf(" Sequential Phase,\n"); break;
