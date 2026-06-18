@@ -709,11 +709,11 @@ impl PrimitiveType {
     /// protocol's [partition value serialization] rules. An empty string parses as
     /// [`Scalar::Null`].
     ///
-    /// Timestamp and TimestampNtz accept the space-separated form
-    /// `{year}-{month}-{day} {hour}:{minute}:{second}[.{fraction}]`. Timestamp (only) also
-    /// accepts ISO 8601 / RFC 3339 strings such as `1970-01-01T00:00:00.123456Z`; an explicit
-    /// offset is honored and the value is normalized to UTC. Spec-conformant writers emit only
-    /// the `Z` form, so accepting other offsets is reader leniency.
+    /// Timestamp and TimestampNtz accept the space-separated form `{year}-{month}-{day}
+    /// {hour}:{minute}:{second}[.{fraction}]`. Timestamp (only) also accepts ISO 8601 / RFC 3339
+    /// strings such as `1970-01-01T00:00:00.123456Z`; an explicit offset is honored and the value
+    /// is normalized to UTC. The spec stores timestamp partition values either without a zone
+    /// (interpreted in the writer's local time zone) or adjusted to UTC with a `Z` suffix.
     ///
     /// # Errors
     ///

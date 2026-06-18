@@ -570,10 +570,9 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
 
 // === RFC 3339 offset partition values (#2733) ===
 //
-// A foreign writer can emit a timestamp partition value with a non-UTC RFC 3339 offset
-// (spec-conformant writers emit only the `Z` form). The offset must be honored and the
-// value normalized to UTC. Before the #2733 fix, `2024-06-15T14:30:00+05:00` was read as
-// 14:30 UTC instead of 09:30 UTC, silently inverting partition pruning.
+// A foreign writer can emit a timestamp partition value with a non-UTC RFC 3339 offset. The
+// offset must be honored and the value normalized to UTC, e.g. `2024-06-15T14:30:00+05:00`
+// denotes 09:30 UTC, not 14:30 UTC.
 
 /// Builds a Delta commit body containing a `commitInfo` plus one stats-less Add per
 /// `(path, ts_partition_value)`.
@@ -628,8 +627,7 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     let nine_thirty_utc_us: i64 = 1_718_443_800_000_000; // 2024-06-15T09:30:00Z
     let fourteen_thirty_utc_us: i64 = 1_718_461_800_000_000; // 2024-06-15T14:30:00Z
 
-    // ts == 09:30Z must keep only file_A (its +05:00 value normalized to 09:30 UTC). Before
-    // the fix this kept zero files: file_A's offset was dropped, so it read as 14:30 UTC.
+    // ts == 09:30Z must keep only file_A (its +05:00 value normalized to 09:30 UTC).
     let predicate = Arc::new(Pred::eq(
         column_expr!("ts"),
         Expr::literal(Scalar::Timestamp(nine_thirty_utc_us)),
@@ -639,7 +637,7 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
         1
     );
 
-    // ts == 14:30Z must keep only file_B. Before the fix this kept both files.
+    // ts == 14:30Z must keep only file_B.
     let predicate = Arc::new(Pred::eq(
         column_expr!("ts"),
         Expr::literal(Scalar::Timestamp(fourteen_thirty_utc_us)),
