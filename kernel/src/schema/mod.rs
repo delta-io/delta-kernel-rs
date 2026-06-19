@@ -38,6 +38,94 @@ pub(crate) mod void_utils;
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
+/// Builds a [`StructType`] from a JSON-shaped description that freely mixes literal structure
+/// with interpolated runtime values, in the spirit of [`serde_json::json!`].
+///
+/// # Grammar
+///
+/// ```text
+/// body  := (entry ',')* entry?                 // 0+ comma-separated entries, optional trailing comma
+/// entry := nullability name ':' type           // possibly nullable struct field
+///        | '(' EXPR ')'                        // interpolate one StructField
+///        | '..' '(' EXPR ')'                   // splice an `impl IntoIterator<Item = StructField>`
+/// nullability := 'nullable' | 'not_null'
+/// name  := STR_LITERAL
+///        | IDENT
+///        | '(' EXPR ')'                        // interpolate an `impl Into<String>`
+/// type  := '[' nullability type ']'            // array with possibly-nullable elements
+///        | '{' body '}'                        // nested struct
+///        | '{' type '=>' nullability type '}'  // map with possibly-nullable values
+///        | '(' EXPR ')'                        // interpolate an `impl Into<DataType>`
+///        | IDENT                               // interpolate `DataType::<IDENT>`
+/// ```
+///
+/// # Examples
+///
+/// ```
+/// # use delta_kernel::schema::{schema, DataType, StructField, StructType};
+/// let s = schema! {
+///     not_null "id": LONG,
+///     nullable "name": STRING,
+///     not_null "address": {
+///         nullable "city": STRING,
+///         nullable "zip": STRING,
+///     },
+///     nullable "tags": [ not_null STRING ],            // nullable array with non-null elements
+///     not_null "props": { STRING => nullable STRING }, // non-nullable map with nullable values
+/// };
+/// assert_eq!(s.field("id").unwrap().data_type(), &DataType::LONG);
+/// ```
+///
+/// Runtime values interpolate through the expression forms:
+///
+/// ```
+/// # use delta_kernel::schema::{schema, DataType, StructField};
+/// let data_type = DataType::LONG;
+/// let first = StructField::not_null("y", DataType::INTEGER);
+/// let rest = vec![StructField::nullable("z", DataType::STRING)];
+/// let i = 42;
+/// let s = schema! {
+///     not_null (format!("col_{i}")): (data_type),
+///     (first),
+///     ..(rest),
+/// };
+/// assert_eq!(s.fields().count(), 3);
+/// ```
+///
+/// Field structure is author-controlled, so this builds via [`StructType::new_unchecked`] (no
+/// runtime validation). Statically-detectable duplicate field names -- repeated string
+/// literals or repeated identifiers within the same struct -- are rejected at compile time.
+/// Literals are compared case-insensitively, matching Delta's case-insensitive column-name
+/// rule:
+///
+/// ```compile_fail
+/// # use delta_kernel::schema::schema;
+/// const NAME: &str = "foo";
+/// let s = schema! {
+///     not_null "id": LONG,
+///     nullable "ID": STRING, // duplicate of "id" (case-insensitive) -- compile error
+///     nullable NAME: LONG,
+///     not_null NAME: STRING, // NAME used twice -- compile error
+/// };
+/// ```
+///
+/// Prefer [`try_schema`] when field names are interpolated runtime values that might collide.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::schema;
+/// Sugar for `Arc::new(`[`schema!`](schema)` { ... })`, yielding a [`SchemaRef`]. Convenient
+/// for the `LazyLock<SchemaRef>` statics that pervade the action and stats schemas.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::schema_ref;
+/// Like [`schema`], but validates field names at every level of the schema (each struct,
+/// including nested ones, is built via [`StructType::try_new`] and yields
+/// [`DeltaResult<StructType>`]. Use when field names are runtime values that could duplicate
+/// in ways the macro cannot see.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::try_schema;
+
 /// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
 /// fields, lowered into an output [`StructType`] directly from an input schema via
 /// [`build`](crate::struct_patch::StructPatchBuilder::<StructField>::build).
