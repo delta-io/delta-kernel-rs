@@ -38,7 +38,7 @@
 6. Extract default engine into separate crate ([#2397])
    - The default engine moved to a new `delta_kernel_default_engine` crate. Replace
      `delta_kernel::engine::default::{DefaultEngine, executor::*}` imports with
-     `delta_kernel_default_engine::{DefaultEngine, executor::*}`.
+     `delta_kernel_default_engine::*`.
 7. Add failure metric events ([#2702])
    - `MetricEvent` variants were renamed and split into success/failure pairs:
      `LogSegmentLoaded` -> `LogSegmentLoad{Success,Failure}`,
