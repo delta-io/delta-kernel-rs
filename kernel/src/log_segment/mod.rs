@@ -270,15 +270,22 @@ impl LogSegment {
         if Some(m.version) != self.checkpoint_version {
             return None;
         }
-        // A `v2Checkpoint` hint names a specific checkpoint file. Several such checkpoints can
-        // share a version (e.g. concurrent writers), and the segment selects one independently of
-        // the hint, so the hint's schema is only valid when it names the checkpoint we selected --
-        // `checkpoint_parts.first()`, the same part whose footer the schema would otherwise be read
-        // from. A hint without `v2Checkpoint` describes a checkpoint with a deterministic
-        // per-version name, so the version match above is sufficient.
+        // A checkpoint's identity is more than its version: several checkpoints can share a version
+        // (e.g. concurrent writers), and the segment selects one independently of the hint. The
+        // hint's schema is only valid when the hint describes the checkpoint we selected, so match
+        // the rest of its identity before trusting it.
+        //
+        // - Part count: a multi-part V1 checkpoint is keyed by `(version, numParts)` and its parts
+        //   share a deterministic per-version name, so a matching part count pins the identity.
+        //   `parts` is absent for a single-part / classic checkpoint (hence one part).
+        // - `v2Checkpoint.path`: a V2 checkpoint's file name carries a UUID, so the name must match
+        //   the selected part -- `checkpoint_parts.first()`, the same part whose footer the schema
+        //   would otherwise be read from.
+        if m.parts.unwrap_or(1) != self.listed.checkpoint_parts.len() {
+            return None;
+        }
         if let Some(hint_name) = &m.v2_checkpoint_path {
-            let selected = self.listed.checkpoint_parts.first()?;
-            if &selected.filename != hint_name {
+            if &self.listed.checkpoint_parts.first()?.filename != hint_name {
                 return None;
             }
         }
@@ -388,6 +395,7 @@ impl LogSegment {
                 .as_ref()
                 .map(|hint| LastCheckpointHintSummary {
                     version: hint.version,
+                    parts: hint.parts,
                     schema: hint.checkpoint_schema.clone(),
                     v2_checkpoint_path: hint.v2_checkpoint.as_ref().map(|v2| v2.path.clone()),
                 });

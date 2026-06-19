@@ -28,6 +28,10 @@ pub(crate) struct LastCheckpointHintSummary {
     /// Version of the latest known checkpoint, at the time the hint file was read.
     pub version: Version,
 
+    /// Number of parts the hint's checkpoint was written in (`parts`). `None` for a single-part /
+    /// classic checkpoint. Part of the checkpoint identity for multi-part V1 checkpoints.
+    pub parts: Option<usize>,
+
     /// Schema of the checkpoint file(s), as read from the `_last_checkpoint` hint.
     /// Useful for determining if `stats_parsed` is available for data skipping.
     /// `None` when the hint file did not include a `checkpointSchema` field.

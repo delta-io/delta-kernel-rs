@@ -19,7 +19,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
+use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -2744,6 +2744,7 @@ fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> 
         None,
         Some(LastCheckpointHintSummary {
             version: 1,
+            parts: None,
             schema: Some(hint_schema.clone()),
             v2_checkpoint_path: Some(hint_name.to_string()),
         }),
@@ -2756,6 +2757,62 @@ fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> 
         assert!(
             log_segment.checkpoint_schema().is_none(),
             "hint describing a different same-version V2 checkpoint must not be used"
+        );
+    }
+    Ok(())
+}
+
+/// A multi-part V1 checkpoint is identified by `(version, numParts)`. The hint's schema applies
+/// only when its part count matches the checkpoint the segment selected; a different `parts`
+/// (a same-version checkpoint with a different part count) must be ignored.
+#[rstest]
+#[case::matches(Some(2), true)]
+#[case::wrong_count(Some(1), false)]
+#[case::hint_single_segment_multi(None, false)]
+fn test_checkpoint_schema_v1_multipart_numparts_identity(
+    #[case] hint_parts: Option<usize>,
+    #[case] schema_used: bool,
+) -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
+
+    let part1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
+    let part2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
+    let cp1 = log_root.join(part1)?.to_string();
+    let cp2 = log_root.join(part2)?.to_string();
+
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
+
+    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![
+                create_log_path_with_size(&cp1, 1),
+                create_log_path_with_size(&cp2, 1),
+            ],
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHintSummary {
+            version: 1,
+            parts: hint_parts,
+            schema: Some(hint_schema.clone()),
+            v2_checkpoint_path: None,
+        }),
+    )?;
+
+    assert_eq!(log_segment.checkpoint_version, Some(1));
+    if schema_used {
+        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+    } else {
+        assert!(
+            log_segment.checkpoint_schema().is_none(),
+            "hint with parts={hint_parts:?} must not apply to a 2-part checkpoint"
         );
     }
     Ok(())
@@ -2800,6 +2857,63 @@ fn checkpoint_schema_identity_on_real_v2_tables(#[case] table: &str) -> DeltaRes
             );
         }
     }
+    Ok(())
+}
+
+/// The full `v2Checkpoint` hint parses from real V2 checkpoint tables: identity, sidecar
+/// references, and non-file actions that deserialize into kernel's action structs. Also
+/// cross-checks that the summary the segment retains agrees with the freshly-read hint.
+#[rstest]
+#[case::parquet_sidecars("v2-checkpoints-parquet-with-sidecars")]
+#[case::json_sidecars("v2-checkpoints-json-with-sidecars")]
+#[case::parquet_last_checkpoint("v2-checkpoints-parquet-with-last-checkpoint")]
+#[case::json_last_checkpoint("v2-checkpoints-json-with-last-checkpoint")]
+#[case::classic_parquet("v2-classic-checkpoint-parquet")]
+#[case::classic_json("v2-classic-checkpoint-json")]
+fn parses_real_v2_last_checkpoint(#[case] table: &str) -> DeltaResult<()> {
+    use crate::utils::test_utils::load_test_table;
+
+    let (engine, snapshot, _tempdir) = load_test_table(table)?;
+    let seg = snapshot.log_segment();
+    let hint = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root)?
+        .expect("table has a _last_checkpoint");
+    let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
+
+    assert!(v2.path.contains(".checkpoint."), "{table}: {}", v2.path);
+    assert!(v2.size_in_bytes.is_some_and(|b| b > 0), "{table}: size");
+
+    let sidecars = v2.sidecar_files.as_ref().expect("sidecarFiles present");
+    assert!(!sidecars.is_empty() && sidecars.iter().all(|s| !s.path.is_empty()));
+
+    let actions = v2
+        .non_file_actions
+        .as_ref()
+        .expect("nonFileActions present");
+    assert!(
+        actions.iter().any(|a| a.protocol.is_some()),
+        "{table}: protocol"
+    );
+    assert!(
+        actions.iter().any(|a| a.metadata.is_some()),
+        "{table}: metaData"
+    );
+    assert!(
+        actions.iter().any(|a| a.checkpoint_metadata.is_some()),
+        "{table}: checkpointMetadata"
+    );
+    // Every element decoded to a known action -- none fell through to the unknown-key sentinel.
+    assert!(
+        actions.iter().all(|a| a != &HintAction::default()),
+        "{table}"
+    );
+
+    // The retained summary agrees with the freshly-read hint.
+    let summary = seg.last_checkpoint_hint_summary().expect("summary");
+    assert_eq!(
+        summary.v2_checkpoint_path.as_deref(),
+        Some(v2.path.as_str())
+    );
+    assert_eq!(summary.parts, hint.parts);
     Ok(())
 }
 
@@ -2849,6 +2963,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         None,
         Some(LastCheckpointHintSummary {
             version: hint_version,
+            parts: None,
             schema: Some(hint_schema.clone()),
             v2_checkpoint_path: None,
         }),
@@ -2925,6 +3040,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
         None,
         Some(LastCheckpointHintSummary {
             version: 1,
+            parts: None,
             schema: Some(hint_schema.clone()),
             v2_checkpoint_path: Some(hint_name.to_string()),
         }),
@@ -3013,6 +3129,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         None,
         use_hint.then(|| LastCheckpointHintSummary {
             version: 1,
+            parts: Some(2),
             schema: Some(v1_schema.clone()),
             v2_checkpoint_path: None,
         }),
