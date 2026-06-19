@@ -979,6 +979,7 @@ impl Sidecar {
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.

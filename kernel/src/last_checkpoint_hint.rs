@@ -78,9 +78,9 @@ pub(crate) struct LastCheckpointHint {
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct LastCheckpointV2 {
-    /// Bare file name of the V2 checkpoint this hint describes (a `path.getName()`-style value,
-    /// not a full path), matched against the selected checkpoint part's file name. Several V2
-    /// checkpoints can share a version, so this identifies which one the hint's fields describe.
+    /// Bare file name of the V2 checkpoint this hint describes, matched against the selected
+    /// checkpoint part's file name. Several V2 checkpoints can share a version, so this identifies
+    /// which one the hint's fields describe.
     pub(crate) path: String,
 
     /// Size in bytes of the V2 checkpoint file named by `path`.
@@ -94,16 +94,15 @@ pub(crate) struct LastCheckpointV2 {
     /// Empty/absent for a leaf checkpoint that inlines its file actions.
     pub(crate) sidecar_files: Option<Vec<Sidecar>>,
 
-    /// The checkpoint's non-file actions (protocol, metadata, set-transactions, domain metadata,
-    /// and the checkpoint-metadata marker), letting a reader obtain them without reading the
-    /// checkpoint file.
+    /// The checkpoint's non-file actions (see [`HintAction`]), letting a reader obtain them
+    /// without reading the checkpoint file.
     pub(crate) non_file_actions: Option<Vec<HintAction>>,
 }
 
-/// One element of [`LastCheckpointV2`]'s `non_file_actions` -- the `_last_checkpoint` wire form of
-/// a single non-file action, mirroring the log's single-action layout (at most one field set per
-/// element). Reuses kernel's action structs so the hint yields the same types as log replay.
-/// Unknown action keys are ignored, keeping the hint usable as the protocol gains action types.
+/// One element of [`LastCheckpointV2`]'s `non_file_actions`, reusing kernel's action structs so the
+/// hint yields the same types as log replay. Mirrors the log's single-action layout; an
+/// unrecognized action key parses to an empty element rather than failing, so the hint survives new
+/// action types.
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -257,5 +256,18 @@ mod tests {
         let json = br#"{"version": 5, "size": 10}"#;
         let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
         assert!(hint.v2_checkpoint.is_none());
+    }
+
+    /// A malformed `v2Checkpoint` -- missing the required `path`, or a type-mismatched field --
+    /// fails the whole-hint parse. `try_read` swallows that to `None`, so the reader falls back to
+    /// a footer read rather than trusting a partially-parsed hint.
+    #[test]
+    fn malformed_v2_checkpoint_fails_whole_hint_parse() {
+        let missing_path = br#"{"version": 5, "size": 10, "v2Checkpoint": {"sizeInBytes": 1234}}"#;
+        assert!(serde_json::from_slice::<LastCheckpointHint>(missing_path).is_err());
+
+        let bad_type = br#"{"version": 5, "size": 10,
+            "v2Checkpoint": {"path": "c.parquet", "sizeInBytes": "not-a-number"}}"#;
+        assert!(serde_json::from_slice::<LastCheckpointHint>(bad_type).is_err());
     }
 }
