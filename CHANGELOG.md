@@ -4,6 +4,19 @@
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.24.0...v0.25.0)
 
+> [!IMPORTANT]
+> **The default engine now lives in its own `delta_kernel_default_engine` crate ([#2397]).**
+> Update your `Cargo.toml`:
+>
+> ```toml
+> # before (v0.24.0)
+> delta_kernel = { version = "0.24.0", features = [/* any features you choose */] }
+>
+> # after (v0.25.0)
+> delta_kernel = "0.25.0"
+> delta_kernel_default_engine = { version = "0.25.0", features = [/* any features you choose */] }
+> ```
+
 
 ### 🏗️ Breaking changes
 1. Support void primitive type in schema ([#1858])
@@ -22,66 +35,57 @@
 5. Replace ScanBuilder stats setters with StatsOptions struct ([#2666])
    - `ScanBuilder::with_stats_columns` is removed; pass a `StatsOptions` value to
      `ScanBuilder::with_stats` instead.
-6. Bridge Operation::QueryPlan onto the new IR ([#2637])
-   - Under the `declarative-plans` feature, `QueryPlan`/`QueryPlanNode` are removed from the
-     public exports and `Operation::QueryPlan` now wraps `Plan`. `QueryPlanBuilder::scan_json`
-     and `scan_parquet` drop their `predicate` argument and `build()` returns a `Plan`.
-7. Extract default engine into separate crate ([#2397])
+6. Extract default engine into separate crate ([#2397])
    - The default engine moved to a new `delta_kernel_default_engine` crate. Replace
      `delta_kernel::engine::default::{DefaultEngine, executor::*}` imports with
-     `delta_kernel_default_engine::*`.
-8. Add failure metric events ([#2702])
+     `delta_kernel_default_engine::{DefaultEngine, executor::*}`.
+7. Add failure metric events ([#2702])
    - `MetricEvent` variants were renamed and split into success/failure pairs:
      `LogSegmentLoaded` -> `LogSegmentLoad{Success,Failure}`,
      `ProtocolMetadataLoaded` -> `ProtocolMetadataLoad{Success,Failure}`,
      `SnapshotCompleted` -> `SnapshotBuild{Success,Failure}`, `CrcReadCompleted` ->
      `CrcRead{Success,Failure}`. Success variants' duration field is now `duration` (was
      `total_duration`).
-9. History_manager: add get_earliest_recreatable version method ([#2675])
+8. History_manager: add get_earliest_recreatable version method ([#2675])
    - `LogHistoryError` gains a `NoRecreatableCommit { log_root: Url }` variant. Callers
      exhaustively matching `LogHistoryError` must add an arm for it (or `..`).
-10. Add `Transaction::commit` metric events ([#2719])
-    - `MetricEvent` gains `TransactionCommitSuccess` and `TransactionCommitFailure` variants.
-      Exhaustive matches on `MetricEvent` must handle the new variants.
-11. Introduce struct patch builder ([#2665])
+9. Add `Transaction::commit` metric events ([#2719])
+   - `MetricEvent` gains `TransactionCommitSuccess` and `TransactionCommitFailure` variants.
+     Exhaustive matches on `MetricEvent` must handle the new variants.
+10. Introduce struct patch builder ([#2665])
     - The FFI `EngineExpressionVisitor` struct-patch callbacks changed: `visit_struct_patch_expr`
       now takes `prepended_field_list_id`, `field_patch_list_id`, and `appended_field_list_id`,
       and `visit_field_patch` takes `field_name` by value plus `insertion_expr_list_id`,
       `keep_input: bool`, and `optional: bool` (replacing `is_replace`). Engines implementing
       these callbacks must update their signatures.
-12. Project node takes a single expression instead of a list ([#2727])
-    - Under the `declarative-plans` feature, the `Project` plan node replaces
-      `exprs: Vec<ExpressionRef>` with a single `expr: ExpressionRef`; the proto `ProjectNode`
-      likewise becomes a single `expr`. To migrate, wrap prior per-column expression vectors in
-      `Expression::struct_from([...])`.
-13. Introduce schema struct patching ([#2672])
+11. Introduce schema struct patching ([#2672])
     - `StructType::with_field_{inserted_after,inserted_before,removed,replaced}` are removed;
       use `SchemaStructPatchBuilder` instead. `ExpressionStructPatchBuilder` methods are renamed
       (`with_dropped_field` -> `drop`, `with_replaced_field` -> `replace`,
       `with_inserted_field_after` -> `insert_after`, `with_prepended_field` -> `prepend`,
       `with_appended_field` -> `append`), and `Expression::struct_patch` is now fallible.
-14. Checkpoint writer eagerly creates output schema ([#2726])
+12. Checkpoint writer eagerly creates output schema ([#2726])
     - `Snapshot::create_checkpoint_writer` now takes an `engine: &dyn Engine` argument. Pass
       the engine you already used for checkpointing.
-15. Improve plan execution FFI and error handling ([#2729])
+13. Improve plan execution FFI and error handling ([#2729])
     - Under the `declarative-plans` feature, the `CExecuteOpFn` FFI callback (and the plan-result
       iterator `next` callbacks) no longer return a `CPlanResultWrapper`; they take an `out`
       pointer to write the result into and return `()`. `CPlanResultWrapper`, `PlanResultCleanup`,
       and `engine_error_to_kernel` are removed.
-16. Add recreatable-commit resolution to history manager ([#2714])
+14. Add recreatable-commit resolution to history manager ([#2714])
     - `latest_version_as_of` and `first_version_after` gain a fourth
       `resolved_commit_type: HistoryCommitType` argument. Pass `HistoryCommitType::Recreatable`
       to restrict results to loadable versions, or `HistoryCommitType::Published` to allow any
       version present in the log.
-17. Add `table_type` to snapshot-load and scan metric events ([#2721])
+15. Add `table_type` to snapshot-load and scan metric events ([#2721])
     - The metric-event structs (`LogSegmentLoad*`, `ProtocolMetadataLoad*`, `SnapshotBuild*`,
       `TransactionCommit*`, `ScanMetadataCompleted`) gain a `table_type: TableType` field.
       Callers constructing or exhaustively matching these must account for the new field.
-18. Add caller-supplied correlation id to operation metric events ([#2734])
+16. Add caller-supplied correlation id to operation metric events ([#2734])
     - Those same metric-event structs additionally gain a `correlation_id: Option<Arc<str>>`
       field, and `SnapshotLoadMetricContext` is no longer `Copy`. Callers constructing or
       exhaustively matching these events must account for the new field.
-19. Strum-ify metric label enums (and fix missing dv metric) ([#2732])
+17. Strum-ify metric label enums (and fix missing dv metric) ([#2732])
     - `TransactionCommitSuccess` gains a `num_dv_updates: u64` field; callers constructing or
       exhaustively matching it must account for the new field. `ScanType` gains
       `EnumString`/`IntoStaticStr` (plus `Display`/`AsRefStr`, replacing its manual `Display`
