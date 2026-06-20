@@ -50,7 +50,7 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ArrayType, MapType, StructField, StructType};
+    use crate::schema::{schema, ArrayType, MapType};
 
     #[test]
     fn is_v3_supported_type_accepted_datatypes() {
@@ -78,10 +78,7 @@ mod tests {
         let nested = [
             DataType::from(ArrayType::new(DataType::INTEGER, true)),
             DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
-            DataType::from(StructType::new_unchecked([StructField::nullable(
-                "x",
-                DataType::INTEGER,
-            )])),
+            DataType::from(schema! { nullable "x": INTEGER }),
             DataType::unshredded_variant(),
         ];
         for dt in nested {

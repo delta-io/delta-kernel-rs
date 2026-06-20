@@ -989,7 +989,9 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{
+        schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
         COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
@@ -1001,11 +1003,7 @@ mod tests {
     };
 
     fn test_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]))
+        schema_ref! { not_null "id": INTEGER }
     }
 
     #[test]
@@ -1206,11 +1204,7 @@ mod tests {
     fn test_clustering_column_not_in_schema() {
         use crate::expressions::ColumnName;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1279,47 +1273,25 @@ mod tests {
 
     #[rstest::rstest]
     #[case::variant_top_level(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "v": (DataType::unshredded_variant()) },
         &[TableFeature::VariantType],
     )]
     #[case::variant_nested(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked(vec![StructField::new(
-                    "inner_v",
-                    DataType::unshredded_variant(),
-                    true,
-                )]),
-                true,
-            ),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_v": (DataType::unshredded_variant()) },
+        },
         &[TableFeature::VariantType],
     )]
     #[case::ntz_top_level(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "ts": TIMESTAMP_NTZ },
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::ntz_nested(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked(vec![StructField::new(
-                    "inner_ts",
-                    DataType::TIMESTAMP_NTZ,
-                    true,
-                )]),
-                true,
-            ),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_ts": TIMESTAMP_NTZ },
+        },
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::both_variant_and_ntz(
@@ -1373,32 +1345,19 @@ mod tests {
 
     #[rstest::rstest]
     #[case::all_nullable(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("name", DataType::STRING, true),
-        ])),
+        schema_ref! { nullable "id": INTEGER, nullable "name": STRING },
         false,
     )]
     #[case::top_level_non_null(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "name": STRING },
         true,
     )]
     #[case::nested_non_null(
-        Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]),
-            true,
-        )])),
+        schema_ref! { nullable "parent": { not_null "child": INTEGER } },
         true,
     )]
     #[case::variant_only(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ])),
+        schema_ref! { nullable "id": INTEGER, nullable "v": (DataType::unshredded_variant()) },
         false,
     )]
     fn test_maybe_enable_invariants(#[case] schema: SchemaRef, #[case] expect_invariants: bool) {

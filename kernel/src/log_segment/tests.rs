@@ -32,7 +32,7 @@ use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
     sidecar_batch_with_given_paths_and_sizes,
 };
-use crate::schema::{DataType, StructField, StructType};
+use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
 use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
 };
@@ -2734,13 +2734,11 @@ fn test_log_segment_contiguous_commit_files() {
 /// LogSegment
 #[tokio::test]
 async fn test_checkpoint_schema_propagation_from_hint() {
-    use crate::schema::{StructField, StructType};
-
     // Create a sample schema that would be in _last_checkpoint
-    let sample_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", StructType::new_unchecked([])),
-        StructField::nullable("remove", StructType::new_unchecked([])),
-    ]));
+    let sample_schema: SchemaRef = schema_ref! {
+        nullable "add": {},
+        nullable "remove": {},
+    };
 
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
@@ -2804,10 +2802,9 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
-    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "metadata",
-        StructType::new_unchecked([]),
-    )]));
+    let hint_schema: SchemaRef = schema_ref! {
+        nullable "metadata": {},
+    };
 
     // Build a commit that uses v1 checkpoint and a hint that describes a different schema
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
@@ -2869,27 +2866,19 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
     // Build a V1 checkpoint schema with stats_parsed containing an integer column.
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(
-            MIN_VALUES,
-            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
-        ),
-        StructField::nullable(
-            MAX_VALUES,
-            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
-        ),
-    ]);
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-    let remove_schema =
-        StructType::new_unchecked([StructField::nullable("path", DataType::STRING)]);
-    let v1_schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, add_schema),
-        StructField::nullable(REMOVE_NAME, remove_schema),
-    ]));
+    let v1_schema = schema_ref! {
+        nullable (ADD_NAME): {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                nullable (MIN_VALUES): { nullable "id": LONG },
+                nullable (MAX_VALUES): { nullable "id": LONG },
+            },
+        },
+        nullable (REMOVE_NAME): {
+            nullable "path": STRING,
+        },
+    };
 
     add_checkpoint_to_store(
         &store,
@@ -3053,42 +3042,35 @@ async fn test_max_published_version_checkpoint_only() {
 
 // Helper to create a checkpoint schema with stats_parsed for testing
 fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(
-            MIN_VALUES,
-            StructType::new_unchecked(min_values_fields.clone()),
-        ),
-        StructField::nullable(MAX_VALUES, StructType::new_unchecked(min_values_fields)),
-    ]);
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+    schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                nullable (MIN_VALUES): { ..(min_values_fields.clone()) },
+                nullable (MAX_VALUES): { ..(min_values_fields) },
+            },
+        },
+    }
 }
 
 // Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
 fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
-    StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(MIN_VALUES, StructType::new_unchecked(column_fields.clone())),
-        StructField::nullable(MAX_VALUES, StructType::new_unchecked(column_fields)),
-    ])
+    schema! {
+        nullable (NUM_RECORDS): LONG,
+        nullable (MIN_VALUES): { ..(column_fields.clone()) },
+        nullable (MAX_VALUES): { ..(column_fields) },
+    }
 }
 
 // Helper to create a checkpoint schema without stats_parsed
 fn create_checkpoint_schema_without_stats_parsed() -> StructType {
-    use crate::schema::StructType;
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats", DataType::STRING),
-    ]);
-
-    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+    schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats": STRING,
+        },
+    }
 }
 
 #[test]
@@ -3217,17 +3199,15 @@ fn test_schema_has_compatible_stats_parsed_multiple_columns() {
 #[test]
 fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
     // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        // No minValues or maxValues fields
-    ]);
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+    let checkpoint_schema = schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                // No minValues or maxValues fields
+            },
+        },
+    };
 
     let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
 
@@ -3241,19 +3221,17 @@ fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
 #[test]
 fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        // minValues is a primitive type instead of a Struct
-        StructField::nullable(MIN_VALUES, DataType::STRING),
-        StructField::nullable(MAX_VALUES, DataType::STRING),
-    ]);
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+    let checkpoint_schema = schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                // minValues/maxValues are primitives instead of Structs
+                nullable (MIN_VALUES): STRING,
+                nullable (MAX_VALUES): STRING,
+            },
+        },
+    };
 
     let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
 
@@ -3594,40 +3572,24 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     let engine = SyncEngine::new_with_store(store.clone());
 
     // Build a schema that includes add.partitionValues_parsed.id: integer
-    let partition_parsed_struct =
-        StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
-    let add_struct = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable(
-            "partitionValues",
-            crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::nullable("partitionValues_parsed", partition_parsed_struct),
-        StructField::nullable("size", DataType::LONG),
-        StructField::nullable("modificationTime", DataType::LONG),
-        StructField::nullable("dataChange", DataType::BOOLEAN),
-    ]);
-    let metadata_struct = StructType::new_unchecked([
-        StructField::nullable("id", DataType::STRING),
-        StructField::nullable(
-            "format",
-            StructType::new_unchecked([StructField::nullable("provider", DataType::STRING)]),
-        ),
-        StructField::nullable("schemaString", DataType::STRING),
-        StructField::nullable(
-            "partitionColumns",
-            crate::schema::ArrayType::new(DataType::STRING, false),
-        ),
-        StructField::nullable(
-            "configuration",
-            crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::nullable("createdTime", DataType::LONG),
-    ]);
-    let checkpoint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", add_struct),
-        StructField::nullable("metaData", metadata_struct),
-    ]));
+    let checkpoint_schema: SchemaRef = schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable "partitionValues_parsed": { nullable "id": INTEGER },
+            nullable "size": LONG,
+            nullable "modificationTime": LONG,
+            nullable "dataChange": BOOLEAN,
+        },
+        nullable "metaData": {
+            nullable "id": STRING,
+            nullable "format": { nullable "provider": STRING },
+            nullable "schemaString": STRING,
+            nullable "partitionColumns": [ not_null STRING ],
+            nullable "configuration": { STRING => nullable STRING },
+            nullable "createdTime": LONG,
+        },
+    };
 
     add_checkpoint_to_store(
         &store,
@@ -4296,37 +4258,25 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 #[rstest::rstest]
 #[case::empty_schema(StructType::new_unchecked([]), None)]
 #[case::metadata_field(
-    StructType::new_unchecked([StructField::nullable(
-        METADATA_NAME,
-        StructType::new_unchecked([]),
-    )]),
+    schema! { nullable (METADATA_NAME): {} },
     Some(Arc::new(
         Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
     )),
 )]
 #[case::protocol_field(
-    StructType::new_unchecked([StructField::nullable(
-        PROTOCOL_NAME,
-        StructType::new_unchecked([]),
-    )]),
+    schema! { nullable (PROTOCOL_NAME): {} },
     Some(Arc::new(
         Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
     )),
 )]
 #[case::txn_field(
-    StructType::new_unchecked([StructField::nullable(
-        SET_TRANSACTION_NAME,
-        StructType::new_unchecked([]),
-    )]),
+    schema! { nullable (SET_TRANSACTION_NAME): {} },
     Some(Arc::new(
         Expression::column(ColumnName::new([SET_TRANSACTION_NAME, "appId"])).is_not_null(),
     )),
 )]
 #[case::domain_metadata_field(
-    StructType::new_unchecked([StructField::nullable(
-        DOMAIN_METADATA_NAME,
-        StructType::new_unchecked([]),
-    )]),
+    schema! { nullable (DOMAIN_METADATA_NAME): {} },
     Some(Arc::new(
         Expression::column(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])).is_not_null(),
     )),

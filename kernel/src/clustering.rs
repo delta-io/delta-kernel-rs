@@ -129,7 +129,7 @@ pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<Column
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{DataType, StructField};
+    use crate::schema::{schema, DataType, StructField};
 
     #[rstest::rstest]
     #[case::simple(
@@ -160,10 +160,10 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_valid() {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
         let columns = vec![ColumnName::new(["id"])];
         assert!(validate_clustering_columns(&schema, &columns).is_ok());
     }
@@ -183,18 +183,16 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_nested_valid() {
-        let address_struct = StructType::new_unchecked(vec![
-            StructField::new("city", DataType::STRING, true),
-            StructField::new("zip", DataType::STRING, true),
-        ]);
-        let user_struct = StructType::new_unchecked(vec![
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("address", address_struct, true),
-        ]);
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("user", user_struct, true),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "user": {
+                nullable "name": STRING,
+                nullable "address": {
+                    nullable "city": STRING,
+                    nullable "zip": STRING,
+                },
+            },
+        };
 
         // Nested leaf column with eligible type should succeed
         let columns = vec![ColumnName::new(["user", "address", "city"])];
@@ -203,10 +201,9 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_nested_struct_leaf_rejected() {
-        let inner_struct =
-            StructType::new_unchecked(vec![StructField::new("field", DataType::STRING, false)]);
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("parent", inner_struct, false)]);
+        let schema = schema! {
+            not_null "parent": { not_null "field": STRING },
+        };
 
         // Clustering on an entire struct (not a leaf primitive) should fail
         let columns = vec![ColumnName::new(["parent"])];
@@ -232,10 +229,9 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_nested_path_not_found() {
-        let inner_struct =
-            StructType::new_unchecked(vec![StructField::new("field", DataType::STRING, false)]);
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("parent", inner_struct, false)]);
+        let schema = schema! {
+            not_null "parent": { not_null "field": STRING },
+        };
 
         // Nested field that doesn't exist should fail
         let columns = vec![ColumnName::new(["parent", "nonexistent"])];
@@ -275,19 +271,19 @@ mod tests {
     #[test]
     fn test_validate_clustering_columns_supported_types() {
         // All supported primitive types
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("byte_col", DataType::BYTE, false),
-            StructField::new("short_col", DataType::SHORT, false),
-            StructField::new("int_col", DataType::INTEGER, false),
-            StructField::new("long_col", DataType::LONG, false),
-            StructField::new("float_col", DataType::FLOAT, false),
-            StructField::new("double_col", DataType::DOUBLE, false),
-            StructField::new("date_col", DataType::DATE, false),
-            StructField::new("timestamp_col", DataType::TIMESTAMP, false),
-            StructField::new("timestamp_ntz_col", DataType::TIMESTAMP_NTZ, false),
-            StructField::new("string_col", DataType::STRING, false),
-            StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), false),
-        ]);
+        let schema = schema! {
+            not_null "byte_col": BYTE,
+            not_null "short_col": SHORT,
+            not_null "int_col": INTEGER,
+            not_null "long_col": LONG,
+            not_null "float_col": FLOAT,
+            not_null "double_col": DOUBLE,
+            not_null "date_col": DATE,
+            not_null "timestamp_col": TIMESTAMP,
+            not_null "timestamp_ntz_col": TIMESTAMP_NTZ,
+            not_null "string_col": STRING,
+            not_null "decimal_col": (DataType::decimal(10, 2).unwrap()),
+        };
 
         // Each supported type should be valid for clustering
         for field in schema.fields() {
@@ -303,10 +299,10 @@ mod tests {
     #[test]
     fn test_validate_clustering_columns_unsupported_primitive_types() {
         // Boolean and Binary are primitives but not supported for clustering
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("bool_col", DataType::BOOLEAN, false),
-            StructField::new("binary_col", DataType::BINARY, false),
-        ]);
+        let schema = schema! {
+            not_null "bool_col": BOOLEAN,
+            not_null "binary_col": BINARY,
+        };
 
         for field in schema.fields() {
             let columns = vec![ColumnName::new([field.name()])];
@@ -322,20 +318,11 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_complex_types_rejected() {
-        use crate::schema::{ArrayType, MapType};
-
-        let inner_struct =
-            StructType::new_unchecked(vec![StructField::new("inner", DataType::STRING, false)]);
-
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("struct_col", inner_struct, false),
-            StructField::new("array_col", ArrayType::new(DataType::INTEGER, false), false),
-            StructField::new(
-                "map_col",
-                MapType::new(DataType::STRING, DataType::INTEGER, false),
-                false,
-            ),
-        ]);
+        let schema = schema! {
+            not_null "struct_col": { not_null "inner": STRING },
+            not_null "array_col": [ not_null INTEGER ],
+            not_null "map_col": { STRING => not_null INTEGER },
+        };
 
         for field in schema.fields() {
             let columns = vec![ColumnName::new([field.name()])];
@@ -357,10 +344,9 @@ mod tests {
     #[case::five(5)]
     #[case::ten(10)]
     fn test_validate_clustering_column_count(#[case] num_columns: usize) {
-        let fields: Vec<StructField> = (0..num_columns)
-            .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, false))
-            .collect();
-        let schema = StructType::new_unchecked(fields);
+        let schema = schema! {
+            ..((0..num_columns).map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, false)))
+        };
 
         let columns: Vec<ColumnName> = (0..num_columns)
             .map(|i| ColumnName::new([format!("col{i}")]))

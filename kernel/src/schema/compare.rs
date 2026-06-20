@@ -179,87 +179,53 @@ mod tests {
     use rstest::rstest;
 
     use crate::schema::compare::{Error, SchemaComparison};
-    use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+    use crate::schema::{schema, DataType, PrimitiveType, StructField, StructType};
 
     #[test]
     fn can_read_is_reflexive() {
-        let map_key = StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-        ]);
-        let map_value =
-            StructType::new_unchecked([StructField::new("age", DataType::INTEGER, true)]);
-        let map_type = MapType::new(map_key, map_value, true);
-        let array_type = ArrayType::new(DataType::TIMESTAMP, false);
-        let nested_struct = StructType::new_unchecked([
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
-        ]);
-        let schema = StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("map", map_type, false),
-            StructField::new("array", array_type, false),
-            StructField::new("nested_struct", nested_struct, false),
-        ]);
+        let schema = schema! {
+            not_null "id": LONG,
+            not_null "map": {
+                { not_null "id": LONG, not_null "name": STRING }
+                    => nullable { nullable "age": INTEGER }
+            },
+            not_null "array": [ not_null TIMESTAMP ],
+            not_null "nested_struct": { not_null "name": STRING, nullable "age": INTEGER },
+        };
 
         assert!(schema.can_read_as(&schema).is_ok());
     }
     #[test]
     fn add_nullable_column_to_map_key_and_value() {
-        let existing_map_key = StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
-        let existing_map_value =
-            StructType::new_unchecked([StructField::new("age", DataType::INTEGER, false)]);
-        let existing_schema = StructType::new_unchecked([StructField::new(
-            "map",
-            MapType::new(existing_map_key, existing_map_value, false),
-            false,
-        )]);
+        let existing_schema = schema! {
+            not_null "map": {
+                { not_null "id": LONG, nullable "name": STRING }
+                    => not_null { not_null "age": INTEGER }
+            },
+        };
 
-        let read_map_key = StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("location", DataType::STRING, true),
-        ]);
-        let read_map_value = StructType::new_unchecked([
-            StructField::new("age", DataType::INTEGER, true),
-            StructField::new("years_of_experience", DataType::INTEGER, true),
-        ]);
-        let read_schema = StructType::new_unchecked([StructField::new(
-            "map",
-            MapType::new(read_map_key, read_map_value, false),
-            false,
-        )]);
+        let read_schema = schema! {
+            not_null "map": {
+                { not_null "id": LONG, nullable "name": STRING, nullable "location": STRING }
+                    => not_null { nullable "age": INTEGER, nullable "years_of_experience": INTEGER }
+            },
+        };
 
         assert!(existing_schema.can_read_as(&read_schema).is_ok());
     }
     #[test]
     fn map_value_becomes_non_nullable_fails() {
-        let map_key = StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-        ]);
-        let map_value =
-            StructType::new_unchecked([StructField::new("age", DataType::INTEGER, true)]);
-        let existing_schema = StructType::new_unchecked([StructField::new(
-            "map",
-            MapType::new(map_key, map_value, false),
-            false,
-        )]);
+        let existing_schema = schema! {
+            not_null "map": {
+                { not_null "id": LONG, not_null "name": STRING } => not_null { nullable "age": INTEGER }
+            },
+        };
 
-        let map_key = StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-        ]);
-        let map_value =
-            StructType::new_unchecked([StructField::new("age", DataType::INTEGER, false)]);
-        let read_schema = StructType::new_unchecked([StructField::new(
-            "map",
-            MapType::new(map_key, map_value, false),
-            false,
-        )]);
+        let read_schema = schema! {
+            not_null "map": {
+                { not_null "id": LONG, not_null "name": STRING } => not_null { not_null "age": INTEGER }
+            },
+        };
 
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),

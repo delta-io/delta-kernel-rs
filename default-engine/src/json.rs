@@ -280,7 +280,7 @@ mod tests {
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
         PutOptions, PutPayload, PutResult, Result,
     };
-    use delta_kernel::schema::{DataType as DeltaDataType, Schema, StructField};
+    use delta_kernel::schema::schema_ref;
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
@@ -686,7 +686,6 @@ mod tests {
 
     use std::io::Write;
 
-    use delta_kernel::schema::StructType;
     use delta_kernel::Engine;
     use tempfile::NamedTempFile;
 
@@ -707,8 +706,7 @@ mod tests {
         let _ = tracing_subscriber::fmt().try_init();
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
-        let field = StructField::nullable("name", delta_kernel::schema::DataType::BOOLEAN);
-        let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
+        let schema = schema_ref! { nullable "name": BOOLEAN };
         let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
 
         // Helper to check that we get expected number of errors then stream ends
@@ -826,10 +824,7 @@ mod tests {
                 )),
             );
             let handler = handler.with_buffer_size(*buffer_size);
-            let physical_schema = Arc::new(Schema::new_unchecked(vec![StructField::nullable(
-                "val",
-                DeltaDataType::INTEGER,
-            )]));
+            let physical_schema = schema_ref! { nullable "val": INTEGER };
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
                 .unwrap()

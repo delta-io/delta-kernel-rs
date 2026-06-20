@@ -758,12 +758,23 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
+    fn cm_field(name: &str, id: i64, physical_name: &str, ty: impl Into<DataType>) -> StructField {
+        StructField::nullable(name, ty).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(physical_name.into()),
+            ),
+        ])
+    }
+
     #[test]
     fn request_row_ids() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
@@ -797,11 +808,8 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids_conflicting_row_index_col_name() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "row_indexes_for_row_id_0", /* this will conflict with the first generated name for
-                                         * row indexes */
-            DataType::STRING,
-        )]));
+        // "row_indexes_for_row_id_0" conflicts with the first generated name for row indexes
+        let schema = schema_ref! { nullable "row_indexes_for_row_id_0": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
@@ -835,10 +843,7 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids_and_indexes() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
@@ -875,10 +880,7 @@ pub(crate) mod tests {
 
     #[test]
     fn invalid_rowtracking_config() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         // Row IDs requested but row tracking not enabled → error
         let res = get_state_info(
@@ -929,10 +931,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let read_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let read_schema = schema_ref! { nullable "id": STRING };
         let read_schema = Arc::new(
             read_schema
                 .add_metadata_column("part_col", MetadataColumnSpec::RowId)
@@ -954,22 +953,7 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_read_field() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )
-        .with_metadata(HashMap::<String, MetadataValue>::from([
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                1.into(),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
-                "other".into(),
-            ),
-        ]))]));
+        let schema = schema_ref! { (cm_field("id", 1, "other", DataType::STRING)) };
         let res = get_state_info(
             schema.clone(),
             vec![],
@@ -1115,44 +1099,11 @@ pub(crate) mod tests {
         // Verify that physical_partition_schema uses physical column names when column
         // mapping is enabled. The logical partition column "date" has physical name
         // "col-date-phys", and the schema should reflect the physical name.
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING).with_metadata(HashMap::from([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName
-                        .as_ref()
-                        .to_string(),
-                    MetadataValue::String("col-id-phys".to_string()),
-                ),
-            ])),
-            StructField::nullable("date", DataType::DATE).with_metadata(HashMap::from([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName
-                        .as_ref()
-                        .to_string(),
-                    MetadataValue::String("col-date-phys".to_string()),
-                ),
-            ])),
-            StructField::nullable("value", DataType::LONG).with_metadata(HashMap::from([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                    MetadataValue::Number(3),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName
-                        .as_ref()
-                        .to_string(),
-                    MetadataValue::String("col-value-phys".to_string()),
-                ),
-            ])),
-        ]));
+        let schema = schema_ref! {
+            (cm_field("id", 1, "col-id-phys", DataType::STRING)),
+            (cm_field("date", 2, "col-date-phys", DataType::DATE)),
+            (cm_field("value", 3, "col-value-phys", DataType::LONG)),
+        };
 
         let predicate = Arc::new(column_expr!("date").lt(Expr::literal(100i32)));
 
@@ -1183,40 +1134,11 @@ pub(crate) mod tests {
 
     #[test]
     fn stats_columns_with_column_mapping_uses_physical_names() {
-        let field_a: StructField = serde_json::from_value(serde_json::json!({
-            "name": "col_a",
-            "type": "long",
-            "nullable": true,
-            "metadata": {
-                "delta.columnMapping.id": 1,
-                "delta.columnMapping.physicalName": "phys_a"
-            }
-        }))
-        .unwrap();
-
-        let field_b: StructField = serde_json::from_value(serde_json::json!({
-            "name": "col_b",
-            "type": "long",
-            "nullable": true,
-            "metadata": {
-                "delta.columnMapping.id": 2,
-                "delta.columnMapping.physicalName": "phys_b"
-            }
-        }))
-        .unwrap();
-
-        let field_c: StructField = serde_json::from_value(serde_json::json!({
-            "name": "col_c",
-            "type": "long",
-            "nullable": true,
-            "metadata": {
-                "delta.columnMapping.id": 3,
-                "delta.columnMapping.physicalName": "phys_c"
-            }
-        }))
-        .unwrap();
-
-        let schema = Arc::new(StructType::new_unchecked(vec![field_a, field_b, field_c]));
+        let schema = schema_ref! {
+            (cm_field("col_a", 1, "phys_a", DataType::LONG)),
+            (cm_field("col_b", 2, "phys_b", DataType::LONG)),
+            (cm_field("col_c", 3, "phys_c", DataType::LONG)),
+        };
         let mut props = HashMap::new();
         props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
 

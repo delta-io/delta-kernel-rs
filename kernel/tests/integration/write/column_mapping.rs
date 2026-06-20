@@ -16,7 +16,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, FileMeta, Snapshot};
@@ -357,10 +357,7 @@ async fn test_column_mapping_partitioned_write(
     }
 
     // Write data with partition value
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    let data_schema = schema_ref! { nullable "value": INTEGER };
     let batch = RecordBatch::try_new(
         Arc::new(data_schema.as_ref().try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![1, 2]))],

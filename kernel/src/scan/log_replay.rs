@@ -24,8 +24,8 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
-    ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
-    StructType, ToSchema as _,
+    schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
+    StructField, StructType, ToSchema as _,
 };
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
@@ -614,29 +614,20 @@ pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
-    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    let file_constant_values = StructType::new_unchecked([
-        StructField::nullable("partitionValues", partition_values),
-        StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-        StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-        StructField::nullable(
-            "tags",
-            MapType::new(
-                DataType::STRING,
-                DataType::STRING,
-                /* valueContainsNull */ true,
-            ),
-        ),
-        StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-    ]);
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("size", DataType::LONG),
-        StructField::nullable("modificationTime", DataType::LONG),
-        StructField::nullable("stats", DataType::STRING),
-        StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-        StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
-    ]))
+    schema_ref! {
+        nullable "path": STRING,
+        nullable "size": LONG,
+        nullable "modificationTime": LONG,
+        nullable "stats": STRING,
+        nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
+        nullable FILE_CONSTANT_VALUES_NAME: {
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable BASE_ROW_ID_NAME: LONG,
+            nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+            nullable "tags": { STRING => nullable STRING },
+            nullable CLUSTERING_PROVIDER_NAME: STRING,
+        },
+    }
 });
 
 /// Build the scan row schema with optional `stats_parsed` and `partitionValues_parsed` columns.
@@ -1005,7 +996,9 @@ mod tests {
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
+    use crate::schema::{
+        schema_ref, DataType, MetadataColumnSpec, SchemaRef, StructField, StructType,
+    };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{DeltaResult, Expression as Expr, ExpressionRef};
@@ -1185,11 +1178,7 @@ mod tests {
 
     #[test]
     fn test_row_id_patch() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "value",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema.clone(),
             vec![],
@@ -1423,11 +1412,7 @@ mod tests {
             ColumnMappingMode::Id,
             ColumnMappingMode::Name,
         ] {
-            let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-                "id",
-                DataType::INTEGER,
-                true,
-            )]));
+            let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
             let state_info = Arc::new(StateInfo {
                 logical_schema: schema.clone(),
                 physical_schema: schema,
@@ -1461,11 +1446,7 @@ mod tests {
         // Test edge cases: empty seen_file_keys, no predicate, no transform_spec
         let engine = SyncEngine::new();
         let checkpoint_info = test_checkpoint_info();
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let state_info = Arc::new(StateInfo {
             logical_schema: schema.clone(),
             physical_schema: schema,
@@ -1495,11 +1476,7 @@ mod tests {
     #[test]
     fn test_serialization_round_trips_is_catalog_managed() {
         let engine = SyncEngine::new();
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let state_info = Arc::new(StateInfo {
             logical_schema: schema.clone(),
             physical_schema: schema,
@@ -1542,11 +1519,7 @@ mod tests {
     fn test_serialization_missing_predicate_schema() {
         // Test that missing predicate_schema when predicate exists is detected
         let engine = SyncEngine::new();
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let checkpoint_info = test_checkpoint_info();
         let invalid_internal_state = InternalScanState {
             logical_schema: schema.clone(),
@@ -1577,11 +1550,7 @@ mod tests {
 
     #[test]
     fn deserialize_internal_state_with_extry_fields_fails() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let invalid_internal_state = InternalScanState {
             logical_schema: schema.clone(),
             physical_schema: schema,

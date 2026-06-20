@@ -15,7 +15,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
@@ -404,13 +404,9 @@ async fn test_dv_update_stats_tight_bound(
     #[case] initial_tight_bounds: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Nested schema: a `point` struct with two leaf columns.
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "point",
-        StructType::try_new(vec![
-            StructField::nullable("x", DataType::INTEGER),
-            StructField::nullable("y", DataType::INTEGER),
-        ])?,
-    )])?);
+    let schema = schema_ref! {
+        nullable "point": { nullable "x": INTEGER, nullable "y": INTEGER },
+    };
 
     let temp_dir = tempdir()?;
     let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
