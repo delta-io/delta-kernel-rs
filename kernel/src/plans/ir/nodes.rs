@@ -7,6 +7,7 @@ use strum::Display;
 use url::Url;
 
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
+use crate::plans::kernel_reducers::{KernelReducer, KernelReducerToken, ReducerHandle};
 use crate::schema::SchemaRef;
 use crate::FileMeta;
 
@@ -540,3 +541,50 @@ pub struct SemiJoin {
 /// ```
 #[derive(Debug, Clone)]
 pub struct UnionAll;
+
+// ============================================================================
+// Reducer-drain sink (referenced by `EngineRequest::Reduce`)
+// ============================================================================
+
+/// Template for draining a row stream into a [`KernelReducer`] via [`EngineRequest::Reduce`].
+///
+/// - `initial_state`: cloned per partition via [`DynClone`](dyn_clone::DynClone) into a
+///   [`ReducerHandle`].
+/// - `token`: keys the finished handle returned from the executor and validated at decode time by
+///   the paired [`Extractor`].
+///
+/// [`EngineRequest::Reduce`]: crate::plans::state_machines::framework::state_machine::EngineRequest::Reduce
+/// [`Extractor`]: crate::plans::kernel_reducers::Extractor
+#[derive(Debug, Clone)]
+pub struct ReduceSink {
+    pub initial_state: Box<dyn KernelReducer>,
+    pub token: KernelReducerToken,
+}
+
+impl ReduceSink {
+    /// Construct from a concrete reducer and mint a fresh token from its `kind`.
+    pub fn new<R: KernelReducer + 'static>(state: R) -> Self {
+        let token = KernelReducerToken::new(state.kind());
+        Self {
+            initial_state: Box::new(state),
+            token,
+        }
+    }
+
+    /// Mint a runtime [`ReducerHandle`] for this sink template by cloning the initial state.
+    pub fn new_handle(&self) -> ReducerHandle {
+        ReducerHandle::new(self.token.clone(), self.initial_state.clone())
+    }
+}
+
+// Token identity drives equality: tokens are process-unique by id, and the
+// `initial_state` trait object (`Box<dyn KernelReducer>`) is not `Eq`-able. Two
+// sinks sharing a token were constructed from the same plan node and therefore
+// describe the same reducer.
+impl PartialEq for ReduceSink {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token
+    }
+}
+
+impl Eq for ReduceSink {}
