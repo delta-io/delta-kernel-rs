@@ -990,7 +990,7 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
-        schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{

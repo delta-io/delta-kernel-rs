@@ -154,7 +154,8 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+        StructType,
     };
 
     // === Schema builders for test cases ===

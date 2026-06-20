@@ -1054,7 +1054,8 @@ pub(crate) mod test_utils {
 
     pub(crate) mod column_mapping_physical_name_dedup_fixtures {
         use crate::schema::{
-            ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+            schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+            StructType,
         };
 
         /// Two fields with the same physical name at different physical paths should be accepted.

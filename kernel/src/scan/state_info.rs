@@ -457,7 +457,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol, MAX_VALUES, MIN_VALUES};
     use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
     use crate::utils::test_utils::assert_result_error_with_message;
 

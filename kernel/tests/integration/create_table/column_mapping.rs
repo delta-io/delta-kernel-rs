@@ -463,7 +463,7 @@ fn test_create_clustered_table_nested_with_column_mapping(
     use delta_kernel::expressions::ColumnName;
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = clustering_cm_test_schema()?;
+    let schema = clustering_cm_test_schema();
     let expected_cols: Vec<ColumnName> = col_paths
         .iter()
         .map(|p| ColumnName::new(p.iter().copied()))
