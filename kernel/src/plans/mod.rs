@@ -1,9 +1,12 @@
 //! This module defines the concept of a PlanExecutor and its associated input + output types.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
+pub mod errors;
 pub mod ir;
+pub mod kernel_reducers;
 pub mod proto;
 mod query_builder;
+pub mod state_machines;
 
 use bytes::Bytes;
 pub use ir::{IoOperation, Operation};
