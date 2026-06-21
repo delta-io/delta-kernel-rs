@@ -12,7 +12,7 @@
 //! - [`RestFileApiContract`] -- the REST dialect: path-to-URL mapping, list and write query
 //!   parameters, list-response parsing, and HTTP-status-to-[`ObjectStoreError`] mapping.
 //!
-//! Only the operations Delta needs are implemented (read, list, write, delete); the rest
+//! Only the operations kernel needs are implemented (read, list, write, delete); the rest
 //! return [`ObjectStoreError::NotSupported`].
 
 use std::net::SocketAddr;
@@ -95,15 +95,15 @@ pub fn headers_from_pairs(
     Ok(headers)
 }
 
-/// Safety margin before TTL expiry at which cached headers are re-minted, so a request never
+/// Safety margin before TTL expiry at which cached headers are refreshed, so a request never
 /// races expiry.
 const HEADER_REFRESH_SKEW: Duration = Duration::from_secs(30);
 
-/// An [`AuthHeaderProvider`] that mints headers via a closure returning `(headers, Option<ttl>)`.
-/// `Some(ttl)` caches the headers until [`HEADER_REFRESH_SKEW`] before `ttl` elapses, then
-/// re-mints; `None` re-runs the closure on every request.
+/// An [`AuthHeaderProvider`] that produces headers via a closure returning `(headers,
+/// Option<ttl>)`. `Some(ttl)` caches the headers until [`HEADER_REFRESH_SKEW`] before `ttl`
+/// elapses, then produces fresh ones; `None` re-runs the closure on every request.
 pub struct RefreshingHeaderProvider {
-    mint: Box<dyn Fn() -> ObjectStoreResult<(HeaderMap, Option<Duration>)> + Send + Sync>,
+    produce: Box<dyn Fn() -> ObjectStoreResult<(HeaderMap, Option<Duration>)> + Send + Sync>,
     cached: std::sync::Mutex<Option<(HeaderMap, std::time::Instant)>>,
 }
 
@@ -115,13 +115,13 @@ impl std::fmt::Debug for RefreshingHeaderProvider {
 }
 
 impl RefreshingHeaderProvider {
-    /// Create a provider that calls `mint` to obtain `(headers, ttl)`; see the type docs for how
+    /// Create a provider that calls `produce` to obtain `(headers, ttl)`; see the type docs for how
     /// the optional `ttl` drives caching.
     pub fn new(
-        mint: impl Fn() -> ObjectStoreResult<(HeaderMap, Option<Duration>)> + Send + Sync + 'static,
+        produce: impl Fn() -> ObjectStoreResult<(HeaderMap, Option<Duration>)> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            mint: Box::new(mint),
+            produce: Box::new(produce),
             cached: std::sync::Mutex::new(None),
         }
     }
@@ -129,7 +129,7 @@ impl RefreshingHeaderProvider {
 
 impl AuthHeaderProvider for RefreshingHeaderProvider {
     fn headers(&self) -> ObjectStoreResult<HeaderMap> {
-        // Hold the lock across the (rare) mint for single-flight refresh; recover from a
+        // Hold the lock across the (rare) produce call for single-flight refresh; recover from a
         // poisoned lock rather than panic.
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((headers, deadline)) = cached.as_ref() {
@@ -137,7 +137,7 @@ impl AuthHeaderProvider for RefreshingHeaderProvider {
                 return Ok(headers.clone());
             }
         }
-        let (headers, ttl) = (self.mint)()?;
+        let (headers, ttl) = (self.produce)()?;
         // Skip caching if an absurd TTL overflows `Instant`, rather than panicking.
         *cached = ttl
             .and_then(|ttl| Some((headers.clone(), std::time::Instant::now().checked_add(ttl)?)));
@@ -437,7 +437,7 @@ impl RestObjectStore {
         let mut retry = 0;
         loop {
             let last = retry >= self.max_retries;
-            // Fetch headers per attempt so a refreshable provider can mint a fresh token.
+            // Fetch headers per attempt so a refreshable provider can produce a fresh token.
             let headers = self.headers()?;
             match make(&self.client, headers).send().await {
                 Ok(resp) if !last && resp.status().is_server_error() => {}
@@ -459,15 +459,17 @@ impl RestObjectStore {
     async fn put_create_verified(
         &self,
         path: &str,
-        url: reqwest::Url,
+        url: &str,
+        query: &[(String, String)],
         body: Bytes,
     ) -> ObjectStoreResult<PutResult> {
         let mut retry = 0;
         loop {
-            // Fetch headers per attempt so a refreshable provider can mint a fresh token.
+            // Fetch headers per attempt so a refreshable provider can produce a fresh token.
             match self
                 .client
-                .put(url.clone())
+                .put(url)
+                .query(query)
                 .headers(self.headers()?)
                 .body(body.clone())
                 .send()
@@ -619,20 +621,18 @@ impl RestObjectStore {
                     recursive,
                 );
                 start_from = None;
-                let url = match build_query_url(&url, &query) {
-                    Ok(u) => u,
-                    Err(e) => { yield Err(e); break; }
-                };
                 let response = match store
-                    .send_idempotent(|c, h| c.get(url.clone()).headers(h))
+                    .send_idempotent(|c, h| c.get(url.as_str()).query(&query).headers(h))
                     .await
                 {
                     Ok(r) => r,
                     Err(e) => { yield Err(e); break; }
                 };
                 if let Some(err) = store.contract.map_status(response.status(), &prefix) {
-                    // A missing directory lists as empty rather than erroring.
-                    if !matches!(err, ObjectStoreError::NotFound { .. }) {
+                    // A missing directory lists as empty -- but only on the first page. A NotFound
+                    // mid-pagination (page_token set) means the listing was truncated, so surface it
+                    // rather than silently returning a partial result.
+                    if !matches!(err, ObjectStoreError::NotFound { .. }) || page_token.is_some() {
                         yield Err(err);
                     }
                     break;
@@ -688,17 +688,22 @@ fn get_range_to_header(range: &GetRange) -> String {
     }
 }
 
-/// Parse a `Content-Range: bytes start-end/total` header into `(range, total_size)`, falling
-/// back to `0..fallback_len` / `fallback_len` when parsing fails.
-fn parse_content_range(header: &str, fallback_len: u64) -> (std::ops::Range<u64>, u64) {
-    let inner = header.strip_prefix("bytes ").unwrap_or(header);
-    let (range_part, total_part) = inner.split_once('/').unwrap_or((inner, "*"));
-    let total = total_part.parse::<u64>().unwrap_or(fallback_len);
-    let range = range_part
-        .split_once('-')
-        .and_then(|(s, e)| Some(s.parse::<u64>().ok()?..e.parse::<u64>().ok()?.saturating_add(1)))
-        .unwrap_or(0..fallback_len);
-    (range, total)
+/// Parse a `Content-Range: bytes start-end/total` header into `(range, total_size)`.
+///
+/// Errors on a malformed header rather than guessing, matching `object_store`'s own HTTP client:
+/// a server that sends a partial response with a bogus `Content-Range` should surface as an error,
+/// not silently degrade the reported range/size.
+fn parse_content_range(header: &str) -> ObjectStoreResult<(std::ops::Range<u64>, u64)> {
+    let invalid = || generic_msg(format!("malformed Content-Range header: `{header}`"));
+    let (range_part, total_part) = header
+        .strip_prefix("bytes ")
+        .and_then(|inner| inner.split_once('/'))
+        .ok_or_else(invalid)?;
+    let total = total_part.parse::<u64>().map_err(|_| invalid())?;
+    let (start, end) = range_part.split_once('-').ok_or_else(invalid)?;
+    let start = start.parse::<u64>().map_err(|_| invalid())?;
+    let end = end.parse::<u64>().map_err(|_| invalid())?;
+    Ok((start..end.saturating_add(1), total))
 }
 
 fn generic_err<E: std::error::Error + Send + Sync + 'static>(err: E) -> ObjectStoreError {
@@ -827,19 +832,6 @@ pub fn build_rest_client(opts: &RestClientOptions) -> ObjectStoreResult<Client> 
     builder.build().map_err(generic_err)
 }
 
-/// Parse `base` and append `query` pairs. Uses the `url` crate so we don't need reqwest's
-/// `query` feature.
-fn build_query_url(base: &str, query: &[(String, String)]) -> ObjectStoreResult<reqwest::Url> {
-    let mut url = reqwest::Url::parse(base).map_err(generic_err)?;
-    if !query.is_empty() {
-        let mut pairs = url.query_pairs_mut();
-        for (k, v) in query {
-            pairs.append_pair(k, v);
-        }
-    }
-    Ok(url)
-}
-
 #[async_trait]
 impl ObjectStore for RestObjectStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
@@ -862,11 +854,13 @@ impl ObjectStore for RestObjectStore {
         let (content, headers) = self.get_file(path_str, range_header.as_deref()).await?;
 
         // Derive byte range + total size from Content-Range (partial responses) or the body length.
-        let (range, total_size) = headers
+        let (range, total_size) = match headers
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
-            .map(|cr| parse_content_range(cr, content.len() as u64))
-            .unwrap_or_else(|| (0..content.len() as u64, content.len() as u64));
+        {
+            Some(cr) => parse_content_range(cr)?,
+            None => (0..content.len() as u64, content.len() as u64),
+        };
 
         let last_modified = parse_last_modified(&headers);
         let e_tag = parse_etag(&headers);
@@ -898,19 +892,18 @@ impl ObjectStore for RestObjectStore {
             PutMode::Update(_) => return Err(not_supported("PutMode::Update")),
         };
         let path_str = location.as_ref().trim_end_matches('/');
-        let url = build_query_url(
-            &self.contract.file_url(&self.base_url, path_str),
-            &self.contract.put_query(overwrite),
-        )?;
+        let url = self.contract.file_url(&self.base_url, path_str);
+        let query = self.contract.put_query(overwrite);
         let body: Bytes = payload.into();
         // A non-idempotent PUT is only safe to retry when we can verify the write landed, so the
         // verify path is gated on `Create` + verification enabled.
         if !overwrite && self.verify_on_ambiguous {
-            return self.put_create_verified(path_str, url, body).await;
+            return self.put_create_verified(path_str, &url, &query, body).await;
         }
         let response = self
             .client
-            .put(url)
+            .put(&url)
+            .query(&query)
             .headers(self.headers()?)
             .body(body)
             .send()
@@ -1024,7 +1017,7 @@ mod tests {
 
     use super::*;
 
-    fn token_minter(
+    fn token_producer(
         calls: Arc<AtomicUsize>,
         ttl: Option<std::time::Duration>,
     ) -> RefreshingHeaderProvider {
@@ -1036,11 +1029,11 @@ mod tests {
         })
     }
 
-    /// Without a TTL, [`RefreshingHeaderProvider`] mints on every call -- refreshed per request.
+    /// Without a TTL, [`RefreshingHeaderProvider`] produces on every call -- refreshed per request.
     #[test]
-    fn refreshing_header_provider_without_ttl_mints_each_call() {
+    fn refreshing_header_provider_without_ttl_produces_each_call() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = token_minter(calls.clone(), None);
+        let provider = token_producer(calls.clone(), None);
         let first = provider.headers().unwrap();
         let second = provider.headers().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1052,7 +1045,7 @@ mod tests {
     #[test]
     fn refreshing_header_provider_with_ttl_caches() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = token_minter(calls.clone(), Some(std::time::Duration::from_secs(3600)));
+        let provider = token_producer(calls.clone(), Some(std::time::Duration::from_secs(3600)));
         let first = provider.headers().unwrap();
         let second = provider.headers().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1168,6 +1161,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], b"hello");
+    }
+
+    /// A malformed `Content-Range` surfaces as an error rather than silently degrading the
+    /// reported range/size (matches `object_store`'s own client).
+    #[tokio::test]
+    async fn get_malformed_content_range_yields_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/files/a.txt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-range", "bytes not-a-range")
+                    .set_body_bytes(b"hello".as_slice()),
+            )
+            .mount(&server)
+            .await;
+        let store = store_for(&server, HeaderMap::new());
+        let err = store.get(&Path::from("a.txt")).await.unwrap_err();
+        assert!(
+            matches!(err, ObjectStoreError::Generic { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1310,6 +1325,39 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
         assert!(metas.is_empty());
+    }
+
+    /// A first-page 404 lists as empty, but a 404 *mid-pagination* (page_token set) means the
+    /// listing was truncated -- it must surface as an error, not a silent partial result.
+    #[tokio::test]
+    async fn list_not_found_mid_pagination_yields_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dirs/d"))
+            .and(wiremock::matchers::query_param_is_missing("page_token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"contents":[{"path":"d/1","size":1}],"nextPageToken":"p2"}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/dirs/d"))
+            .and(wiremock::matchers::query_param("page_token", "p2"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let store = store_for(&server, HeaderMap::new());
+        let results: Vec<_> = store.list(Some(&Path::from("d"))).collect::<Vec<_>>().await;
+        // First-page entry is yielded, then the mid-pagination 404 surfaces as an error.
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(
+            matches!(results[1], Err(ObjectStoreError::NotFound { .. })),
+            "got {:?}",
+            results[1]
+        );
     }
 
     /// `list_with_offset` must exclude the offset entry itself even if the backend echoes it
