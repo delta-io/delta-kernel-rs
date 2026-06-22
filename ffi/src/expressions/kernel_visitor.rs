@@ -500,6 +500,7 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                    // No FFI null tag for intervals; the sentinel avoids a new discriminant
                     (Self::NonPrimitive, 0, 0)
                 }
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),

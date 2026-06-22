@@ -774,6 +774,15 @@ mod tests {
         Ok(())
     }
 
+    // Make sure that interval types error gracefully since unsupported
+    #[rstest]
+    #[case(DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::INTERVAL_DAY_TIME)]
+    fn test_interval_type_arrow_conversion_unsupported(#[case] dt: DataType) {
+        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        assert!(matches!(result.unwrap_err(), ArrowError::SchemaError(_)));
+    }
+
     /// Helper visitor to collect all field IDs from a kernel StructType
     #[derive(Default)]
     struct FieldIdCollector {
