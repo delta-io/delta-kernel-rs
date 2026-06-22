@@ -19,34 +19,9 @@ use crate::{DeltaResult, Error, StorageHandler, Version};
 /// the latest checkpoint without a full directory listing.
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
-/// A reduced view of [`LastCheckpointHint`] that [`crate::log_segment::LogSegment`] retains --
-/// just enough to validate and apply the hint without holding every metadata field. If this grows
-/// to be similar in size to `LastCheckpointHint`, we should switch to using it directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct LastCheckpointHintSummary {
-    /// Version of the latest known checkpoint, at the time the hint file was read.
-    pub version: Version,
-
-    /// Number of parts the hint's checkpoint was written in (`parts`). `None` for a single-part /
-    /// classic checkpoint. Part of the checkpoint identity for multi-part V1 checkpoints.
-    pub parts: Option<usize>,
-
-    /// Schema of the checkpoint file(s), as read from the `_last_checkpoint` hint.
-    /// Useful for determining if `stats_parsed` is available for data skipping.
-    /// `None` when the hint file did not include a `checkpointSchema` field.
-    pub schema: Option<SchemaRef>,
-
-    /// File name of the V2 checkpoint the hint describes (`v2Checkpoint.path`). `None` for V1 /
-    /// classic checkpoints.
-    pub v2_checkpoint_path: Option<String>,
-
-    /// Sidecar references carried by the hint's `v2Checkpoint`, if any.
-    pub sidecar_files: Option<Vec<Sidecar>>,
-}
-
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(Default))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct LastCheckpointHint {
@@ -77,7 +52,8 @@ pub(crate) struct LastCheckpointHint {
 /// Carries the V2 checkpoint file's identity and metadata plus the actions a reader would otherwise
 /// read from the checkpoint itself -- its sidecar references and its non-file actions. Absent for
 /// V1 / classic checkpoints.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(Default))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct LastCheckpointV2 {
@@ -102,20 +78,20 @@ pub(crate) struct LastCheckpointV2 {
     pub(crate) non_file_actions: Option<Vec<HintAction>>,
 }
 
-/// One element of [`LastCheckpointV2`]'s `non_file_actions`, reusing kernel's action structs so the
-/// hint yields the same types as log replay. Mirrors the log's single-action layout; an
-/// unrecognized action key parses to an empty element rather than failing, so the hint survives new
-/// action types.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// One element of [`LastCheckpointV2`]'s `non_file_actions`. A log action is exactly one action
+/// type, so this is an externally-tagged enum keyed by the action name, reusing kernel's action
+/// structs to yield the same types as log replay. An unrecognized action key fails the whole-hint
+/// parse; `try_read` swallows that, so the reader falls back to reading the checkpoint.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
-pub(crate) struct HintAction {
+pub(crate) enum HintAction {
     #[serde(rename = "metaData")]
-    pub(crate) metadata: Option<Metadata>,
-    pub(crate) protocol: Option<Protocol>,
-    pub(crate) txn: Option<SetTransaction>,
-    pub(crate) domain_metadata: Option<DomainMetadata>,
-    pub(crate) checkpoint_metadata: Option<CheckpointMetadata>,
+    Metadata(Metadata),
+    Protocol(Protocol),
+    Txn(SetTransaction),
+    DomainMetadata(DomainMetadata),
+    CheckpointMetadata(CheckpointMetadata),
 }
 
 impl LastCheckpointHint {
@@ -207,9 +183,8 @@ mod tests {
         assert_eq!(v2.non_file_actions, None);
     }
 
-    /// A manifest V2 checkpoint hint carries its sidecar references and non-file actions. The
-    /// non-file actions reuse kernel's action structs, and each element sets exactly one action;
-    /// unknown action keys (e.g. a future `commitInfo`) are ignored rather than failing the parse.
+    /// A manifest V2 checkpoint hint carries its sidecar references and non-file actions. Each
+    /// non-file action decodes to exactly one [`HintAction`] variant via its action key.
     #[test]
     fn parses_v2_checkpoint_sidecars_and_non_file_actions() {
         let json = br#"{
@@ -227,8 +202,7 @@ mod tests {
                         "partitionColumns": [], "configuration": {}}},
                     {"txn": {"appId": "app", "version": 1}},
                     {"domainMetadata": {"domain": "d", "configuration": "c", "removed": false}},
-                    {"checkpointMetadata": {"version": 5}},
-                    {"commitInfo": {"timestamp": 123}}
+                    {"checkpointMetadata": {"version": 5}}
                 ]
             }
         }"#;
@@ -241,16 +215,12 @@ mod tests {
         assert_eq!(sidecars[0].size_in_bytes, 42);
 
         let actions = v2.non_file_actions.expect("nonFileActions present");
-        // The unknown `commitInfo` element parses to an all-`None` HintAction rather than erroring.
-        assert_eq!(actions.len(), 6);
-        assert_eq!(
-            actions[0].protocol.as_ref().unwrap().min_reader_version(),
-            3
-        );
-        assert_eq!(actions[1].metadata.as_ref().unwrap().id(), "table-id");
-        assert_eq!(actions[2].txn.as_ref().unwrap().app_id, "app");
-        assert_eq!(actions[4].checkpoint_metadata.as_ref().unwrap().version, 5);
-        assert_eq!(actions[5], HintAction::default());
+        assert_eq!(actions.len(), 5);
+        assert!(matches!(&actions[0], HintAction::Protocol(p) if p.min_reader_version() == 3));
+        assert!(matches!(&actions[1], HintAction::Metadata(m) if m.id() == "table-id"));
+        assert!(matches!(&actions[2], HintAction::Txn(t) if t.app_id == "app"));
+        assert!(matches!(&actions[3], HintAction::DomainMetadata(_)));
+        assert!(matches!(&actions[4], HintAction::CheckpointMetadata(c) if c.version == 5));
     }
 
     /// A `_last_checkpoint` without a `v2Checkpoint` object (V1 / classic) parses to `None`.
