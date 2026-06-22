@@ -40,6 +40,9 @@ pub(crate) struct LastCheckpointHintSummary {
     /// File name of the V2 checkpoint the hint describes (`v2Checkpoint.path`). `None` for V1 /
     /// classic checkpoints.
     pub v2_checkpoint_path: Option<String>,
+
+    /// Sidecar references carried by the hint's `v2Checkpoint`, if any.
+    pub sidecar_files: Option<Vec<Sidecar>>,
 }
 
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
