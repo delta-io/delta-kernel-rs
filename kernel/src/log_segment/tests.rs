@@ -214,6 +214,17 @@ fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
     .unwrap()
 }
 
+/// Builds a staged-commit log path (`ParsedLogPath`) for each version: a
+/// `memory:///_delta_log/_staged_commits/<v>.<uuid>.json` entry that parses to
+/// `file_type: StagedCommit`.
+fn staged_commit_log_paths(versions: &[Version]) -> Vec<ParsedLogPath> {
+    versions
+        .iter()
+        .map(|v| staged_commit_path_for_version(*v))
+        .map(|path| create_log_path_with_size(&format!("memory:///{}", path.as_ref()), 100))
+        .collect()
+}
+
 /// Gets the file size from the store for use in FileMeta
 async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
     let object_meta = store.head(&Path::from(path)).await.unwrap();
@@ -1564,21 +1575,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let table_root = Url::parse("memory:///").expect("valid url");
-    let staged_commits_log_tail: Vec<ParsedLogPath> = segment
-        .staged_commit_versions
-        .iter()
-        .map(|version| staged_commit_path_for_version(*version))
-        .map(|path| {
-            ParsedLogPath::try_from(FileMeta {
-                location: table_root.join(path.as_ref()).unwrap(),
-                last_modified: 0,
-                size: 100,
-            })
-            .unwrap()
-            .unwrap()
-        })
-        .collect();
+    let staged_commits_log_tail = staged_commit_log_paths(segment.staged_commit_versions);
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root.clone(),
@@ -2344,169 +2341,97 @@ async fn commits_since() {
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 10);
 }
 
-#[tokio::test]
-async fn for_timestamp_conversion_gets_commit_range() {
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
-    let commit_files = log_segment.listed.ascending_commit_files;
-    let checkpoint_parts = log_segment.listed.checkpoint_parts;
-
-    assert!(checkpoint_parts.is_empty());
-
-    let versions = commit_files.iter().map(|x| x.version).collect_vec();
-    assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
+/// A log built from `published` commit versions, `checkpoints`, and catalog-supplied `staged`
+/// commit versions, queried up to `end_version` (optionally bounded by `limit`), expecting
+/// `expected` commit versions in the resulting segment.
+struct TimestampConversionCase {
+    published: &'static [Version],
+    checkpoints: &'static [Version],
+    staged: &'static [Version],
+    end_version: Version,
+    limit: Option<usize>,
+    expected: &'static [Version],
 }
 
+/// `for_timestamp_conversion` returns the latest contiguous run of commit files (no checkpoint
+/// parts), merging any caller-provided `log_tail` over the filesystem listing.
+#[rstest]
+// Filesystem-only (no log_tail):
+#[case::full_range(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: None, expected: &[0, 1, 2, 3, 4, 5, 6, 7],
+})]
+#[case::old_end_version(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 5, limit: None, expected: &[0, 1, 2, 3, 4, 5],
+})]
+#[case::only_contiguous_ranges(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: None, expected: &[5, 6, 7],
+})]
+#[case::with_limit(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: Some(3), expected: &[5, 6, 7],
+})]
+#[case::with_large_limit(TimestampConversionCase {
+    published: &[0, 1, 2, 3, 4, 5, 6, 7], checkpoints: &[1, 3, 5], staged: &[],
+    end_version: 7, limit: Some(20), expected: &[0, 1, 2, 3, 4, 5, 6, 7],
+})]
+// Catalog-managed staged commits supplied via the log_tail:
+#[case::log_tail_joins_prefix(TimestampConversionCase {
+    published: &[0, 1], checkpoints: &[], staged: &[2, 3],
+    end_version: 3, limit: None, expected: &[0, 1, 2, 3],
+})]
+#[case::log_tail_gap_drops_prefix(TimestampConversionCase {
+    published: &[0], checkpoints: &[], staged: &[2, 3],
+    end_version: 3, limit: None, expected: &[2, 3],
+})]
+#[case::log_tail_across_checkpoint(TimestampConversionCase {
+    published: &[0, 1, 2], checkpoints: &[2], staged: &[3, 4],
+    end_version: 4, limit: None, expected: &[0, 1, 2, 3, 4],
+})]
+#[case::log_tail_with_limit(TimestampConversionCase {
+    published: &[0, 1, 2, 3], checkpoints: &[], staged: &[4, 5],
+    end_version: 5, limit: Some(3), expected: &[3, 4, 5],
+})]
 #[tokio::test]
-async fn for_timestamp_conversion_with_old_end_version() {
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 5, None).unwrap();
-    let commit_files = log_segment.listed.ascending_commit_files;
-    let checkpoint_parts = log_segment.listed.checkpoint_parts;
-
-    assert!(checkpoint_parts.is_empty());
-
-    let versions = commit_files.iter().map(|x| x.version).collect_vec();
-    assert_eq!(vec![0, 1, 2, 3, 4, 5], versions);
-}
-
-#[tokio::test]
-async fn for_timestamp_conversion_only_contiguous_ranges() {
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            // version 4 is missing
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
-    let commit_files = log_segment.listed.ascending_commit_files;
-    let checkpoint_parts = log_segment.listed.checkpoint_parts;
-
-    assert!(checkpoint_parts.is_empty());
-
-    let versions = commit_files.iter().map(|x| x.version).collect_vec();
-    assert_eq!(vec![5, 6, 7], versions);
-}
-
-#[tokio::test]
-async fn for_timestamp_conversion_with_limit() {
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
+async fn for_timestamp_conversion_cases(#[case] case: TimestampConversionCase) {
+    let TimestampConversionCase {
+        published,
+        checkpoints,
+        staged,
+        end_version,
+        limit,
+        expected,
+    } = case;
+    let mut paths: Vec<Path> = published
+        .iter()
+        .map(|v| delta_path_for_version(*v, "json"))
+        .collect();
+    paths.extend(
+        checkpoints
+            .iter()
+            .map(|v| delta_path_for_version(*v, "checkpoint.parquet")),
+    );
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment = LogSegment::for_timestamp_conversion(
         storage.as_ref(),
         log_root.clone(),
-        7,
-        Some(NonZero::new(3).unwrap()),
+        end_version,
+        limit.map(|l| NonZero::new(l).unwrap()),
+        staged_commit_log_paths(staged),
     )
     .unwrap();
-    let commit_files = log_segment.listed.ascending_commit_files;
-    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
-    assert!(checkpoint_parts.is_empty());
-
-    let versions = commit_files.iter().map(|x| x.version).collect_vec();
-    assert_eq!(vec![5, 6, 7], versions);
-}
-
-#[tokio::test]
-async fn for_timestamp_conversion_with_large_limit() {
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_timestamp_conversion(
-        storage.as_ref(),
-        log_root.clone(),
-        7,
-        Some(NonZero::new(20).unwrap()),
-    )
-    .unwrap();
-    let commit_files = log_segment.listed.ascending_commit_files;
-    let checkpoint_parts = log_segment.listed.checkpoint_parts;
-
-    assert!(checkpoint_parts.is_empty());
-
-    let versions = commit_files.iter().map(|x| x.version).collect_vec();
-    assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
+    assert!(log_segment.listed.checkpoint_parts.is_empty());
+    let versions = log_segment
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|x| x.version)
+        .collect_vec();
+    assert_eq!(expected, versions.as_slice());
 }
 
 #[tokio::test]
@@ -2517,7 +2442,8 @@ async fn for_timestamp_conversion_no_commit_files() {
     )
     .await;
 
-    let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None);
+    let res =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
     assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
 }
 
