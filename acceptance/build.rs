@@ -97,12 +97,11 @@ fn build_agent() -> Agent {
         .provider(TlsProvider::NativeTls)
         .root_certs(RootCerts::PlatformVerifier)
         .build();
-    let mut config = Agent::config_builder().tls_config(tls_config);
-    if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
-        let proxy = Proxy::new(&proxy_url).unwrap();
-        config = config.proxy(Some(proxy));
-    }
-    Agent::new_with_config(config.build())
+    let config = Agent::config_builder()
+        .tls_config(tls_config)
+        .proxy(Proxy::try_from_env())
+        .build();
+    Agent::new_with_config(config)
 }
 
 fn extract_dat_tarball(tarball_data: Vec<u8>) {
