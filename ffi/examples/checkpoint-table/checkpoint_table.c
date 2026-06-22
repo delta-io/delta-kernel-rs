@@ -16,7 +16,7 @@
 // where <sub-flow> is one of:
 //   inline            -- spec = NULL; kernel auto-picks V1/V2 from table protocol.
 //   v2_no_sidecar     -- FfiCheckpointSpec::V2NoSidecar; V2 manifest, no sidecars.
-//   v2_with_sidecars  -- FfiCheckpointSpec::V2WithSidecar { hint = 2 }; V2 + sidecars.
+//   v2_with_sidecars  -- FfiCheckpointSpec::V2WithSidecar { hint = Some(2) }; V2 + sidecars.
 //
 // Demonstrates the checkpoint FFI surface:
 //   - checkpoint_snapshot(snapshot, engine, spec) -> ExternResultFfiCheckpointWriteResult
@@ -39,9 +39,10 @@ static int run_sub_flow(HandleSharedSnapshot snapshot,
   } else if (strcmp(sub_flow, "v2_with_sidecars") == 0) {
     // Pass a small hint (2) so the fixture's handful of file actions splits across
     // multiple sidecars, making the on-disk shape observably different from the
-    // V2-no-sidecar sub-flow.
+    // V2-no-sidecar sub-flow. Pass `Noneusize` instead to use the kernel default hint.
     spec.tag = FfiCheckpointSpecV2WithSidecar;
-    spec.v2_with_sidecar.file_actions_per_sidecar_hint = 2;
+    spec.v2_with_sidecar.file_actions_per_sidecar_hint.tag = Someusize;
+    spec.v2_with_sidecar.file_actions_per_sidecar_hint.some = 2;
     spec_ptr = &spec;
   } else {
     fprintf(stderr, "Unknown sub-flow: %s\n", sub_flow);

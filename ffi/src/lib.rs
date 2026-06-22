@@ -773,55 +773,43 @@ impl FfiCheckpointWriteResult {
 }
 
 /// Checkpoint write configuration for [`checkpoint_snapshot`]. Mirrors the kernel's
-/// [`delta_kernel::checkpoint::CheckpointSpec`] enum across the C ABI.
+/// [`CheckpointSpec`] and [`V2CheckpointConfig`] across the C ABI; see those types for the
+/// authoritative semantics and constraints.
 ///
-/// Pass `NULL` to [`checkpoint_snapshot`] (i.e. `Option<&FfiCheckpointSpec>::None`) to let the
-/// kernel auto-pick V1 or V2 based on the table's protocol features and emit an inline
-/// checkpoint with no sidecars.
+/// Pass `Option<&FfiCheckpointSpec>::None` to [`checkpoint_snapshot`] to let the kernel
+/// auto-pick V1 or V2 based on the table's protocol features.
 ///
 /// cbindgen:prefix-with-name=true
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub enum FfiCheckpointSpec {
-    /// Write a checkpoint following the V1 spec (single-file classic-named parquet, no
-    /// sidecars, no checkpoint metadata). Currently only supported on tables that do NOT
-    /// declare the `v2Checkpoint` feature; tracked at
-    /// <https://github.com/delta-io/delta-kernel-rs/issues/2454>.
+    /// See [`CheckpointSpec::V1`].
     V1,
-    /// Write a V2 checkpoint with all file actions inlined into the manifest (no sidecars).
-    /// Requires the table to declare the `v2Checkpoint` feature; the requirement is verified
-    /// at write time by [`checkpoint_snapshot`].
+    /// See [`V2CheckpointConfig::NoSidecar`].
     V2NoSidecar,
-    /// Write a V2 checkpoint that emits sidecar parquet files.
-    ///
-    /// `file_actions_per_sidecar_hint == 0` selects the kernel default
-    /// ([`delta_kernel::checkpoint::DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`], currently 50,000).
-    /// Non-zero values are passed to the kernel as the suggested upper bound of file actions per
-    /// sidecar parquet.
-    ///
-    /// Requires the table to declare the `v2Checkpoint` feature.
-    ///
-    /// **Known limitation:** the kernel writer currently uses `Uuid::new_v4()` for sidecar
-    /// filenames and `ParquetHandler::write_parquet_file` silently overwrites on collision.
-    /// Tracked upstream at <https://github.com/delta-io/delta-kernel-rs/issues/2503>.
+    /// See [`V2CheckpointConfig::WithSidecar`].
     V2WithSidecar {
-        /// Hint for the kernel sidecar splitter. `0` => use kernel default (50,000).
-        file_actions_per_sidecar_hint: usize,
+        /// See [`V2CheckpointConfig::WithSidecar`]. `None` selects the kernel default hint.
+        file_actions_per_sidecar_hint: OptionalValue<usize>,
     },
 }
 
 impl FfiCheckpointSpec {
-    fn to_kernel(self) -> CheckpointSpec {
+    fn to_kernel(&self) -> CheckpointSpec {
         match self {
             FfiCheckpointSpec::V1 => CheckpointSpec::V1,
             FfiCheckpointSpec::V2NoSidecar => CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
             FfiCheckpointSpec::V2WithSidecar {
                 file_actions_per_sidecar_hint,
             } => {
-                let hint =
-                    (file_actions_per_sidecar_hint != 0).then_some(file_actions_per_sidecar_hint);
+                // Forward the hint verbatim (including `Some(0)`) so the kernel applies the same
+                // validation as a native `V2CheckpointConfig::WithSidecar`; `None` => kernel
+                // default.
+                let file_actions_per_sidecar_hint = match file_actions_per_sidecar_hint {
+                    OptionalValue::Some(hint) => Some(*hint),
+                    OptionalValue::None => None,
+                };
                 CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-                    file_actions_per_sidecar_hint: hint,
+                    file_actions_per_sidecar_hint,
                 })
             }
         }
@@ -1034,10 +1022,9 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 /// Perform a checkpoint write on the given snapshot. Mirrors the kernel's
 /// [`delta_kernel::snapshot::Snapshot::checkpoint`] API across the C ABI.
 ///
-/// Pass `spec = NULL` (i.e. `Option<&FfiCheckpointSpec>::None`) to let the kernel auto-pick V1 or
-/// V2 based on the table's protocol features and emit an inline checkpoint with no sidecars. Pass
-/// a non-null pointer to an [`FfiCheckpointSpec`] to force a specific shape; see the
-/// [`FfiCheckpointSpec`] variants for the available options and their pre-conditions.
+/// Pass `Option<&FfiCheckpointSpec>::None` to let the kernel auto-pick V1 or V2 based on the
+/// table's protocol features and emit an inline checkpoint with no sidecars. Pass `Some(&spec)`
+/// to force a specific shape; see [`FfiCheckpointSpec`] for the available options.
 ///
 /// Returns [`FfiCheckpointWriteResult::Written`] with the post-checkpoint snapshot (whose log
 /// segment records the new checkpoint), or [`FfiCheckpointWriteResult::AlreadyExists`] with the
@@ -2140,9 +2127,9 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
-        // hint = 0 => kernel default (DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT = 50,000).
+        // None => kernel default (DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT = 50,000).
         let spec = FfiCheckpointSpec::V2WithSidecar {
-            file_actions_per_sidecar_hint: 0,
+            file_actions_per_sidecar_hint: OptionalValue::None,
         };
         let result = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -2187,7 +2174,7 @@ mod tests {
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let spec = FfiCheckpointSpec::V2WithSidecar {
-            file_actions_per_sidecar_hint: 2,
+            file_actions_per_sidecar_hint: OptionalValue::Some(2),
         };
         let result = unsafe {
             ok_or_panic(checkpoint_snapshot(

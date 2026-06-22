@@ -3,7 +3,7 @@
 C FFI example for the checkpoint write surface. Demonstrates the
 `checkpoint_snapshot(snapshot, engine, spec)` function and its
 `FfiCheckpointSpec` discriminated union (`V1` / `V2NoSidecar` /
-`V2WithSidecar { file_actions_per_sidecar_hint }`) plus the
+`V2WithSidecar { file_actions_per_sidecar_hint: OptionalValue<usize> }`) plus the
 `FfiCheckpointWriteResult` return type (`Written` / `AlreadyExists`,
 each carrying an owned `Handle<SharedSnapshot>`).
 
@@ -24,10 +24,11 @@ The `<sub-flow>` argument selects one of three demos:
 - `v2_no_sidecar` -- `FfiCheckpointSpec::V2NoSidecar` requests a V2 manifest
   with all file actions inlined (no sidecar files). Requires the table to
   declare the `v2Checkpoint` reader/writer feature.
-- `v2_with_sidecars` -- `FfiCheckpointSpec::V2WithSidecar { hint = 2 }`
-  requests a V2 manifest that emits sidecar parquet files. The hint is the
-  suggested upper bound of file actions per sidecar parquet (the example
-  passes `2` so multiple sidecars are emitted even for the small fixture).
+- `v2_with_sidecars` -- `FfiCheckpointSpec::V2WithSidecar` with
+  `file_actions_per_sidecar_hint = Some(2)` requests a V2 manifest that emits
+  sidecar parquet files. The hint is the suggested upper bound of file actions
+  per sidecar parquet (the example passes `2` so multiple sidecars are emitted
+  even for the small fixture); pass `None` to use the kernel default.
   Requires the table to declare the `v2Checkpoint` feature.
 
 ## Test harness
