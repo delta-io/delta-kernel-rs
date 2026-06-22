@@ -81,17 +81,7 @@ fn verify_checksum(data: &[u8], expected: &str) {
     }
 }
 
-<<<<<<< HEAD
-=======
-/// Build a `ureq` agent that validates TLS against the OS trust store (native-tls) rather than
-/// ureq's default rustls + bundled webpki-roots.
-///
-/// ureq defaults to `RootCerts::WebPki` to resist MITM proxies, but behind a sanctioned
-/// TLS-intercepting corporate proxy the interception CA lives in the system trust store and not
-/// in the Mozilla bundle, so the default backend rejects the chain with `UnknownIssuer`.
-/// `RootCerts::PlatformVerifier` makes native-tls use the system roots (like `curl`). Honors
-/// `HTTPS_PROXY` if set.
->>>>>>> 72cc7707 (add workload checksum verification)
+/// Build a `ureq` agent that validates TLS against the OS trust store (native-tls).
 fn build_agent() -> Agent {
     let tls_config = TlsConfig::builder()
         .provider(TlsProvider::NativeTls)
