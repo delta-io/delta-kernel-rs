@@ -15,7 +15,7 @@ use crate::actions::{
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
@@ -118,7 +118,7 @@ pub(crate) struct LogSegment {
     /// log segment. The hint may describe a different checkpoint version than the one in this
     /// segment. Callers should use explicit getters (such as [`Self::checkpoint_schema`]) rather
     /// than reading this field directly.
-    last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
+    last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
 /// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
@@ -200,7 +200,7 @@ impl LogSegment {
         mut listed_files: LogSegmentFiles,
         log_root: Url,
         end_version: Option<Version>,
-        last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
+        last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> DeltaResult<Self> {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
@@ -270,7 +270,7 @@ impl LogSegment {
     ///   `parts` is absent for a single-part / classic checkpoint (hence one part).
     /// - `v2Checkpoint.path`: a V2 checkpoint's file name carries a UUID, so the name must match
     ///   the selected part -- `checkpoint_parts.first()`, the file the hint's fields describe.
-    fn matched_checkpoint_hint(&self) -> Option<&LastCheckpointHintSummary> {
+    fn matched_checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
         let m = self.last_checkpoint_metadata.as_ref()?;
         if Some(m.version) != self.checkpoint_version {
             return None;
@@ -278,8 +278,8 @@ impl LogSegment {
         if m.parts.unwrap_or(1) != self.listed.checkpoint_parts.len() {
             return None;
         }
-        if let Some(hint_name) = &m.v2_checkpoint_path {
-            if &self.listed.checkpoint_parts.first()?.filename != hint_name {
+        if let Some(v2) = &m.v2_checkpoint {
+            if self.listed.checkpoint_parts.first()?.filename != v2.path {
                 return None;
             }
         }
@@ -290,7 +290,7 @@ impl LogSegment {
     /// checkpoint (see [`Self::matched_checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
     pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
-        self.matched_checkpoint_hint()?.schema.clone()
+        self.matched_checkpoint_hint()?.checkpoint_schema.clone()
     }
 
     /// The hint's sidecar references, when it describes the selected checkpoint (see
@@ -299,14 +299,18 @@ impl LogSegment {
     /// checkpoint whose file actions live in those sidecars.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
     pub(crate) fn checkpoint_sidecars(&self) -> Option<&[Sidecar]> {
-        self.matched_checkpoint_hint()?.sidecar_files.as_deref()
+        self.matched_checkpoint_hint()?
+            .v2_checkpoint
+            .as_ref()?
+            .sidecar_files
+            .as_deref()
     }
 
-    /// Returns a copy of the stored `_last_checkpoint` hint summary.
+    /// Returns a copy of the retained `_last_checkpoint` hint, if one was read.
     ///
     /// Prefer [`Self::checkpoint_schema`] or [`Self::last_checkpoint_version`] when requiring
     /// individual values from the hint.
-    pub(crate) fn last_checkpoint_hint_summary(&self) -> Option<LastCheckpointHintSummary> {
+    pub(crate) fn last_checkpoint_hint(&self) -> Option<LastCheckpointHint> {
         self.last_checkpoint_metadata.clone()
     }
 
@@ -400,20 +404,6 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let last_checkpoint_summary =
-            checkpoint_hint
-                .as_ref()
-                .map(|hint| LastCheckpointHintSummary {
-                    version: hint.version,
-                    parts: hint.parts,
-                    schema: hint.checkpoint_schema.clone(),
-                    v2_checkpoint_path: hint.v2_checkpoint.as_ref().map(|v2| v2.path.clone()),
-                    sidecar_files: hint
-                        .v2_checkpoint
-                        .as_ref()
-                        .and_then(|v2| v2.sidecar_files.clone()),
-                });
-
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present
@@ -421,7 +411,9 @@ impl LogSegment {
 
         // Keep the hint only if it points at or before end_version, or if there is no end_version
         // bound
-        let usable_hint = checkpoint_hint.filter(|cp| end_version.is_none_or(|v| cp.version <= v));
+        let usable_hint = checkpoint_hint
+            .as_ref()
+            .filter(|cp| end_version.is_none_or(|v| cp.version <= v));
 
         // Cases:
         //
@@ -437,7 +429,7 @@ impl LogSegment {
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
             (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                &cp,
+                cp,
                 storage,
                 &log_root,
                 log_tail,
@@ -451,12 +443,7 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        LogSegment::try_new(
-            listed_files,
-            log_root,
-            time_travel_version,
-            last_checkpoint_summary,
-        )
+        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
@@ -643,8 +630,8 @@ impl LogSegment {
             .listed
             .latest_crc_file
             .take_if(|crc| crc.version < checkpoint_version);
-        // TODO(#839): Once CheckpointWriter exposes the output schema, build a
-        // LastCheckpointHintSummary and thread it through here instead of None. Today the
+        // TODO(#839): Once CheckpointWriter exposes the output schema, synthesize a
+        // LastCheckpointHint and thread it through here instead of None. Today the
         // schema is computed inside checkpoint_data() but not returned. With None, the next
         // scan will read the checkpoint parquet footer to determine the schema (e.g.
         // whether stats_parsed or sidecar columns exist).
