@@ -445,10 +445,12 @@ impl LogSegment {
         }
 
         // TODO: compactions?
+        // TODO(#2796): table-changes does not supply a log_tail yet. CDF over a catalog-managed
+        // table will need the catalog's commits passed here to see unbackfilled staged commits.
         let listed_files = LogSegmentFiles::list_commits(
             storage,
             &log_root,
-            vec![],
+            vec![], // log-tail
             Some(start_version),
             end_version,
         )?;

@@ -431,6 +431,7 @@ impl LogSegmentFiles {
         &self.ascending_commit_files
     }
 
+    /// The staged (unpublished) commit files, in ascending version order.
     pub(crate) fn staged_commits(&self) -> impl Iterator<Item = &ParsedLogPath> {
         self.ascending_commit_files
             .iter()
@@ -474,6 +475,10 @@ impl LogSegmentFiles {
 
     /// List all commits between the provided `start_version` (inclusive) and `end_version`
     /// (inclusive). All other types are ignored.
+    ///
+    /// `log_tail` is a contiguous run of commits ending at the table's latest version. It takes
+    /// precedence over the filesystem listing, and is required for catalog-managed tables, whose
+    /// unbackfilled staged commits exist only here.
     pub(crate) fn list_commits(
         storage: &dyn StorageHandler,
         log_root: &Url,
