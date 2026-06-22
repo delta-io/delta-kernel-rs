@@ -37,8 +37,12 @@ tracing = { version = "0.1", default-features = false }
 url = "2"
 
 [build-dependencies]
-ureq = "3.1"
+# native-tls validates against the OS trust store (like curl), so build-script downloads work
+# behind a sanctioned TLS-intercepting corporate proxy whose CA isn't in ureq's bundled
+# webpki-roots. See build.rs `build_agent`.
+ureq = { version = "3.1", default-features = false, features = ["native-tls", "gzip"] }
 flate2 = "1.1"
+sha2 = "0.10"
 tar = "0.4"
 
 [dev-dependencies]
