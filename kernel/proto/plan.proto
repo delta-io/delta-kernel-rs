@@ -101,8 +101,8 @@ message MaxNonNullByAgg {
   delta.kernel.expressions.ColumnName key = 2;
 }
 
-message AggOp {
-  oneof op {
+message AggFn {
+  oneof func {
     MinAgg min = 1;
     MaxAgg max = 2;
     MinNonNullByAgg min_non_null_by = 3;
@@ -111,7 +111,7 @@ message AggOp {
 }
 
 message Agg {
-  AggOp op = 1;
+  AggFn func = 1;
   optional string alias = 2;
 }
 
