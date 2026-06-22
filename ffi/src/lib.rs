@@ -1900,6 +1900,8 @@ mod tests {
         #[case] query: HistoryQueryFn,
         #[case] timestamp: i64,
         #[case] expected: Result<(Version, i64), KernelError>,
+        #[values(FfiHistoryCommitType::Published, FfiHistoryCommitType::Recreatable)]
+        commit_type: FfiHistoryCommitType,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
@@ -1925,7 +1927,7 @@ mod tests {
                 snap.shallow_copy(),
                 engine.shallow_copy(),
                 timestamp,
-                FfiHistoryCommitType::Recreatable,
+                commit_type,
             )
         };
 
