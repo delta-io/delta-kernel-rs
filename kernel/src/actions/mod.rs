@@ -931,7 +931,7 @@ impl SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(ToSchema, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(ToSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Sidecar {

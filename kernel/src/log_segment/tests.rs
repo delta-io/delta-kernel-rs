@@ -2745,6 +2745,7 @@ fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> 
             parts: None,
             schema: Some(hint_schema.clone()),
             v2_checkpoint_path: Some(hint_name.to_string()),
+            sidecar_files: None,
         }),
     )?;
 
@@ -2757,6 +2758,89 @@ fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> 
             "hint describing a different same-version V2 checkpoint must not be used"
         );
     }
+    Ok(())
+}
+
+/// `checkpoint_sidecars()` exposes the hint's sidecar refs through the same identity gate as
+/// `checkpoint_schema()`: only when the hint names the selected checkpoint. A hint describing a
+/// different same-version V2 checkpoint must not leak its sidecars.
+#[rstest]
+#[case::identity_matches(true)]
+#[case::identity_mismatch(false)]
+fn test_checkpoint_sidecars_identity_filter(#[case] identity_matches: bool) -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
+
+    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
+    let other = "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet";
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let hint_name = if identity_matches { selected } else { other };
+
+    let sidecars = vec![Sidecar {
+        path: "sidecar-1.parquet".to_string(),
+        size_in_bytes: 42,
+        modification_time: 1,
+        tags: None,
+    }];
+
+    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHintSummary {
+            version: 1,
+            parts: None,
+            schema: None,
+            v2_checkpoint_path: Some(hint_name.to_string()),
+            sidecar_files: Some(sidecars.clone()),
+        }),
+    )?;
+
+    if identity_matches {
+        assert_eq!(log_segment.checkpoint_sidecars(), Some(sidecars.as_slice()));
+    } else {
+        assert!(
+            log_segment.checkpoint_sidecars().is_none(),
+            "sidecars from a hint describing a different checkpoint must not be exposed"
+        );
+    }
+    Ok(())
+}
+
+/// A matched hint that explicitly lists no sidecars yields `Some(&[])`, not `None` -- the contract
+/// the scan-shape fast path relies on (its `.first()` then falls through rather than treating the
+/// empty list as a leaf). `None` would conflate "no sidecar field" with "explicitly empty".
+#[test]
+fn test_checkpoint_sidecars_empty_list_is_some_empty() -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
+
+    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHintSummary {
+            version: 1,
+            parts: None,
+            schema: None,
+            v2_checkpoint_path: Some(selected.to_string()),
+            sidecar_files: Some(vec![]),
+        }),
+    )?;
+
+    assert_eq!(log_segment.checkpoint_sidecars(), Some([].as_slice()));
     Ok(())
 }
 
@@ -2801,6 +2885,7 @@ fn test_checkpoint_schema_v1_multipart_numparts_identity(
             parts: hint_parts,
             schema: Some(hint_schema.clone()),
             v2_checkpoint_path: None,
+            sidecar_files: None,
         }),
     )?;
 
@@ -2963,6 +3048,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
             parts: None,
             schema: Some(hint_schema.clone()),
             v2_checkpoint_path: None,
+            sidecar_files: None,
         }),
     )?;
 
@@ -3040,6 +3126,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
             parts: None,
             schema: Some(hint_schema.clone()),
             v2_checkpoint_path: Some(hint_name.to_string()),
+            sidecar_files: None,
         }),
     )?;
 
@@ -3121,6 +3208,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
             parts: Some(2),
             schema: Some(v1_schema.clone()),
             v2_checkpoint_path: None,
+            sidecar_files: None,
         }),
     )?;
 

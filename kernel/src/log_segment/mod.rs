@@ -258,29 +258,23 @@ impl LogSegment {
         self.last_checkpoint_metadata.as_ref().map(|m| m.version)
     }
 
-    /// Returns the checkpoint schema from the `_last_checkpoint` hint when it is safe to use for
-    /// this segment's checkpoint parquet.
+    /// Returns the retained `_last_checkpoint` hint, but only when it describes the checkpoint this
+    /// segment actually selected -- so the caller may trust the hint's fields for this checkpoint.
     ///
-    /// Returns `None` if there is no hint, if the hint omitted `checkpointSchema`, if this segment
-    /// has no checkpoint on disk, if the hint's checkpoint version does not match this segment's
-    /// checkpoint version, or -- for a V2 hint -- if the hint does not describe the specific
-    /// checkpoint file this segment selected.
-    pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
+    /// A checkpoint's identity is more than its version: several checkpoints can share a version
+    /// (e.g. concurrent writers), and the segment selects one independently of the hint. So the
+    /// rest of the identity must match before any hint field is trusted:
+    ///
+    /// - Part count: a multi-part V1 checkpoint is keyed by `(version, numParts)` and its parts
+    ///   share a deterministic per-version name, so a matching part count pins the identity.
+    ///   `parts` is absent for a single-part / classic checkpoint (hence one part).
+    /// - `v2Checkpoint.path`: a V2 checkpoint's file name carries a UUID, so the name must match
+    ///   the selected part -- `checkpoint_parts.first()`, the file the hint's fields describe.
+    fn matched_checkpoint_hint(&self) -> Option<&LastCheckpointHintSummary> {
         let m = self.last_checkpoint_metadata.as_ref()?;
         if Some(m.version) != self.checkpoint_version {
             return None;
         }
-        // A checkpoint's identity is more than its version: several checkpoints can share a version
-        // (e.g. concurrent writers), and the segment selects one independently of the hint. The
-        // hint's schema is only valid when the hint describes the checkpoint we selected, so match
-        // the rest of its identity before trusting it.
-        //
-        // - Part count: a multi-part V1 checkpoint is keyed by `(version, numParts)` and its parts
-        //   share a deterministic per-version name, so a matching part count pins the identity.
-        //   `parts` is absent for a single-part / classic checkpoint (hence one part).
-        // - `v2Checkpoint.path`: a V2 checkpoint's file name carries a UUID, so the name must match
-        //   the selected part -- `checkpoint_parts.first()`, the same part whose footer the schema
-        //   would otherwise be read from.
         if m.parts.unwrap_or(1) != self.listed.checkpoint_parts.len() {
             return None;
         }
@@ -289,7 +283,23 @@ impl LogSegment {
                 return None;
             }
         }
-        m.schema.clone()
+        Some(m)
+    }
+
+    /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
+    /// checkpoint (see [`Self::matched_checkpoint_hint`]) and carried a `checkpointSchema`. `None`
+    /// otherwise -- the caller then reads the checkpoint footer instead.
+    pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
+        self.matched_checkpoint_hint()?.schema.clone()
+    }
+
+    /// The hint's sidecar references, when it describes the selected checkpoint (see
+    /// [`Self::matched_checkpoint_hint`]). `None` if there is no matching hint or it omitted
+    /// `sidecarFiles`; `Some(&[])` if the hint listed none. A non-empty slice identifies a manifest
+    /// checkpoint whose file actions live in those sidecars.
+    #[allow(unused)] // consumed by the scan-shape checkpoint classifier
+    pub(crate) fn checkpoint_sidecars(&self) -> Option<&[Sidecar]> {
+        self.matched_checkpoint_hint()?.sidecar_files.as_deref()
     }
 
     /// Returns a copy of the stored `_last_checkpoint` hint summary.
@@ -398,6 +408,10 @@ impl LogSegment {
                     parts: hint.parts,
                     schema: hint.checkpoint_schema.clone(),
                     v2_checkpoint_path: hint.v2_checkpoint.as_ref().map(|v2| v2.path.clone()),
+                    sidecar_files: hint
+                        .v2_checkpoint
+                        .as_ref()
+                        .and_then(|v2| v2.sidecar_files.clone()),
                 });
 
         // The end_version is the time_travel_version, if present
