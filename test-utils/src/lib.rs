@@ -746,21 +746,20 @@ pub fn schema_with_column_defaults(
     schema: &StructType,
     mut column_defaults: HashMap<&str, &str>,
 ) -> DeltaResult<SchemaRef> {
-    let mut augmented_fields = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let augmented = match column_defaults.remove(field.name.as_str()) {
+    let augmented_fields: Vec<_> = schema
+        .fields()
+        .map(|field| match column_defaults.remove(field.name.as_str()) {
             Some(sql) => field.clone().add_metadata([(
                 ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
                 MetadataValue::String(sql.to_string()),
             )]),
             None => field.clone(),
-        };
-        augmented_fields.push(augmented);
-    }
+        })
+        .collect();
     if !column_defaults.is_empty() {
-        let unknown: Vec<&str> = column_defaults.into_keys().collect();
         return Err(Error::generic(format!(
-            "column defaults reference unknown top-level columns: {unknown:?}"
+            "column defaults reference unknown top-level columns: {:?}",
+            column_defaults.into_keys().collect::<Vec<_>>()
         )));
     }
 

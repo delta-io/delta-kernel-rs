@@ -12,10 +12,6 @@
 //! Delta metadata contains today. If the supported SQL surface grows, options include moving
 //! parsing behind the [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 
-// `parse_sql` has no in-crate caller yet; it will be wired up by the column-defaults work
-// (#2630).
-#![allow(dead_code)]
-
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
