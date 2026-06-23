@@ -102,10 +102,11 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   // Snapshot::checkpoint performs async I/O (read commit JSONs + write parquet checkpoint /
-  // sidecars). Calling it from sync C without an explicit executor would hang waiting for one,
-  // because DefaultEngineBuilder's lazy-executor path needs an outer tokio runtime to capture
-  // and there isn't one here. Set a small multithreaded executor (2 workers, default blocking
-  // threads) to drive the engine's async work.
+  // sidecars) and drives it via the engine's task executor with nested `block_on` calls. The
+  // default single-threaded background executor would deadlock on that nesting: its one worker
+  // thread is parked on the outer `block_on`, so the inner task can never be scheduled. Use a
+  // small multithreaded executor (2 workers, default blocking threads) so the nested `block_on`
+  // can make progress.
   set_builder_with_multithreaded_executor(engine_builder_res.ok,
                                           /*worker_threads*/ 2,
                                           /*max_blocking_threads*/ 0);
