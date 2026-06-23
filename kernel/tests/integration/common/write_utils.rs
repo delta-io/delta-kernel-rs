@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+use delta_kernel::actions::deletion_vector_writer::{
+    KernelDeletionVector, StreamingDeletionVectorWriter,
+};
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -17,18 +21,21 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction, WriteContext};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
-use test_utils::{begin_transaction, create_add_files_metadata, create_table, engine_store_setup};
+use test_utils::{
+    begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
+    load_and_begin_transaction,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -427,4 +434,42 @@ pub fn get_scan_files(
         .into_iter()
         .map(|sm| sm.scan_files)
         .collect())
+}
+
+/// Get an unpartitioned write context, used to allocate deletion vector paths.
+pub fn get_write_context(
+    table_url: &Url,
+    engine: &dyn Engine,
+) -> Result<WriteContext, Box<dyn std::error::Error>> {
+    Ok(load_and_begin_transaction(table_url.clone(), engine)?.unpartitioned_write_context()?)
+}
+
+/// Serialize a deletion vector, write it to the object store, and return its descriptor.
+pub async fn write_deletion_vector_to_store(
+    store: &Arc<dyn ObjectStore>,
+    write_context: &WriteContext,
+    dv: KernelDeletionVector,
+    prefix: &str,
+) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {
+    let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
+    let dv_object_path = Path::parse(dv_path.absolute_path()?.path())?;
+
+    let mut dv_buffer = Vec::new();
+    let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_buffer);
+    let dv_write_result = dv_writer.write_deletion_vector(dv)?;
+    dv_writer.finalize()?;
+
+    store.put(&dv_object_path, dv_buffer.into()).await?;
+
+    Ok(dv_write_result.to_descriptor(&dv_path))
+}
+
+/// Begin a transaction set up for deletion vector updates.
+pub fn create_dv_update_transaction(
+    table_url: &Url,
+    engine: &dyn Engine,
+) -> Result<Transaction, Box<dyn std::error::Error>> {
+    Ok(load_and_begin_transaction(table_url.clone(), engine)?
+        .with_engine_info("test engine")
+        .with_operation("DELETE".to_string()))
 }

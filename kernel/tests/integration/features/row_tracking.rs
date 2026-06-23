@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
-use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{Int32Type, Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -18,9 +20,13 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExe
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     begin_transaction, create_default_engine_mt_executor, create_table, engine_store_setup,
-    load_and_begin_transaction, read_scan, test_read,
+    load_and_begin_transaction, read_actions_from_commit, read_add_infos, read_scan, test_read,
 };
 use url::Url;
+
+use crate::common::write_utils::{
+    create_dv_update_transaction, get_scan_files, get_write_context, write_deletion_vector_to_store,
+};
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
@@ -32,19 +38,39 @@ async fn create_row_tracking_table(
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
     Arc<DynObjectStore>,
 )> {
+    create_row_tracking_table_with_features(tmp_dir, table_name, schema, false).await
+}
+
+/// Helper function to create a simple table with row tracking enabled and other features enabled.
+async fn create_row_tracking_table_with_features(
+    tmp_dir: &TempDir,
+    table_name: &str,
+    schema: SchemaRef,
+    enable_dv: bool,
+) -> DeltaResult<(
+    Url,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    Arc<DynObjectStore>,
+)> {
     let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path())
         .map_err(|_| Error::generic("Failed to convert directory path to URL"))?;
     let (store, engine, table_location) = engine_store_setup(table_name, Some(&tmp_test_dir_url));
 
-    // Create table with row tracking feature enabled
+    let mut reader_features = vec![];
+    let mut writer_features = vec!["domainMetadata", "rowTracking"];
+    if enable_dv {
+        reader_features.push("deletionVectors");
+        writer_features.push("deletionVectors");
+    }
+
     let table_url = create_table(
         store.clone(),
         table_location,
         schema,
-        &[],    // no partition columns
-        true,   // use 37 protocol
-        vec![], // no reader features
-        vec!["domainMetadata", "rowTracking"],
+        &[],  // no partition columns
+        true, // use 37 protocol
+        reader_features,
+        writer_features,
     )
     .await
     .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
@@ -90,12 +116,27 @@ async fn setup_number_table(
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
     Arc<DynObjectStore>,
 )> {
+    setup_number_table_with_features(tmp_dir, name, false).await
+}
+
+/// Helper function to create a row-tracking table with a single `number: INTEGER` column and
+/// other features enabled.
+async fn setup_number_table_with_features(
+    tmp_dir: &TempDir,
+    name: &str,
+    enable_dv: bool,
+) -> DeltaResult<(
+    SchemaRef,
+    Url,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    Arc<DynObjectStore>,
+)> {
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
     )])?);
     let (table_url, engine, store) =
-        create_row_tracking_table(tmp_dir, name, schema.clone()).await?;
+        create_row_tracking_table_with_features(tmp_dir, name, schema.clone(), enable_dv).await?;
     Ok((schema, table_url, engine, store))
 }
 
@@ -856,6 +897,110 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
     let mut row_ids = collect_row_ids(&batches);
     row_ids.sort_unstable();
     assert_eq!(row_ids, vec![0, 1, 2], "Row IDs must be sequential from 0");
+
+    Ok(())
+}
+
+/// Collect `(number, row_id)` pairs from a row-id scan, keyed by the `number` data column.
+fn collect_number_to_row_id(batches: &[RecordBatch]) -> HashMap<i32, i64> {
+    let mut map = HashMap::new();
+    for batch in batches {
+        let numbers = batch
+            .column_by_name("number")
+            .expect("number column not found")
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name("row_id")
+            .expect("row_id column not found")
+            .as_primitive::<Int64Type>();
+        for i in 0..batch.num_rows() {
+            map.insert(numbers.value(i), row_ids.value(i));
+        }
+    }
+    map
+}
+
+/// Deletion vector: must not renumber the surviving rows' stable row IDs and not change any row
+/// tracking metadata
+#[tokio::test]
+async fn test_read_row_ids_stable_across_deletion_vector_update(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table_with_features(&tmp_dir, "test_read_row_ids_stable_across_dv", true)
+            .await?;
+
+    // Write a single file with 10 rows: values 100..=109 at physical indexes 0..=9
+    let data = generate_data(
+        schema.clone(),
+        [vec![int32_array((100..110).collect::<Vec<_>>())]],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Snapshot the (value -> row_id) mapping before any deletion. value v sits at physical index
+    // (v - 100), and with baseRowId 0 that is also its row ID.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let before = collect_number_to_row_id(&read_row_id_scan(snapshot.clone(), engine.clone())?);
+    assert_eq!(
+        before,
+        (100..110)
+            .map(|v| (v, (v - 100) as i64))
+            .collect::<HashMap<_, _>>(),
+        "row IDs must equal each row's physical index before deletion"
+    );
+
+    // The original Add's row-tracking fields, to confirm they survive the DV update unchanged.
+    let v1_adds = read_actions_from_commit(&table_url, 1, "add")?;
+    let original_add = &v1_adds[0];
+    let original_base_row_id = original_add["baseRowId"].as_i64();
+    let original_default_row_commit_version = original_add["defaultRowCommitVersion"].as_i64();
+    assert_eq!(original_base_row_id, Some(0));
+    assert_eq!(original_default_row_commit_version, Some(1));
+
+    // Apply a deletion vector that removes the middle rows (physical indexes 4, 5, 6 -> values
+    // 104, 105, 106).
+    let deleted_indexes = [4, 5, 6];
+    let mut dv = KernelDeletionVector::new();
+    dv.add_deleted_row_indexes(deleted_indexes);
+    let write_context = get_write_context(&table_url, engine.as_ref())?;
+    let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
+
+    let file_path = read_add_infos(snapshot.as_ref(), engine.as_ref())?[0]
+        .path
+        .clone();
+    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    txn.update_deletion_vectors(
+        HashMap::from([(file_path, dv_descriptor)]),
+        get_scan_files(snapshot.clone(), engine.as_ref())?
+            .into_iter()
+            .map(Ok),
+    )?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    // Every survivor keeps the exact row ID it had before.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let after = collect_number_to_row_id(&read_row_id_scan(snapshot, engine.clone())?);
+
+    let expected_survivors: HashMap<i32, i64> = (100..110)
+        .filter(|v| !deleted_indexes.contains(&((v - 100) as u64)))
+        .map(|v| (v, (v - 100) as i64))
+        .collect();
+    assert_eq!(
+        after, expected_survivors,
+        "surviving rows must keep their original row IDs (e.g. 7, 8, 9), not be renumbered"
+    );
+
+    // The DV update must preserve the original row-tracking fields on the rewritten Add.
+    let v2_adds = read_actions_from_commit(&table_url, 2, "add")?;
+    let updated_add = &v2_adds[0];
+    assert_eq!(updated_add["baseRowId"].as_i64(), original_base_row_id);
+    assert_eq!(
+        updated_add["defaultRowCommitVersion"].as_i64(),
+        original_default_row_commit_version,
+    );
 
     Ok(())
 }

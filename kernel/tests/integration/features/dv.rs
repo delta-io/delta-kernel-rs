@@ -5,14 +5,11 @@ use std::ops::Add;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::actions::deletion_vector_writer::{
-    KernelDeletionVector, StreamingDeletionVectorWriter,
-};
+use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{BooleanArray, Int64Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{DataType, StructField, StructType};
@@ -26,7 +23,10 @@ use test_utils::{
     read_actions_from_commit, record_batch_to_bytes, IntoArray,
 };
 
-use crate::common::write_utils::resolve_struct_field;
+use crate::common::write_utils::{
+    create_dv_update_transaction, get_scan_files, get_write_context, resolve_struct_field,
+    write_deletion_vector_to_store,
+};
 
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.
@@ -76,64 +76,6 @@ fn test_table_scan(
     let total_rows = count_total_scan_rows(stream)?;
     assert_eq!(total_rows, expected_rows);
     Ok(())
-}
-
-/// Helper to extract scan files from a snapshot
-fn get_scan_files(
-    snapshot: Arc<Snapshot>,
-    engine: &dyn delta_kernel::Engine,
-) -> DeltaResult<Vec<FilteredEngineData>> {
-    let scan = snapshot.scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
-
-    Ok(all_scan_metadata
-        .into_iter()
-        .map(|sm| sm.scan_files)
-        .collect())
-}
-
-/// Helper to get a write context for creating deletion vector paths.
-fn get_write_context(
-    table_url: &url::Url,
-    engine: &dyn delta_kernel::Engine,
-) -> Result<delta_kernel::transaction::WriteContext, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?.unpartitioned_write_context()?)
-}
-
-/// Helper to write a deletion vector to object store and return its descriptor.
-async fn write_deletion_vector_to_store(
-    store: &Arc<dyn delta_kernel::object_store::ObjectStore>,
-    write_context: &delta_kernel::transaction::WriteContext,
-    dv: KernelDeletionVector,
-    prefix: &str,
-) -> Result<
-    delta_kernel::actions::deletion_vector::DeletionVectorDescriptor,
-    Box<dyn std::error::Error>,
-> {
-    use delta_kernel::object_store::path::Path as ObjectStorePath;
-
-    let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
-    let dv_absolute_path = dv_path.absolute_path()?;
-    let dv_object_path = ObjectStorePath::parse(dv_absolute_path.path())?;
-
-    let mut dv_buffer = Vec::new();
-    let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_buffer);
-    let dv_write_result = dv_writer.write_deletion_vector(dv)?;
-    dv_writer.finalize()?;
-
-    store.put(&dv_object_path, dv_buffer.into()).await?;
-
-    Ok(dv_write_result.to_descriptor(&dv_path))
-}
-
-/// Helper to create a transaction for deletion vector updates.
-fn create_dv_update_transaction(
-    table_url: &url::Url,
-    engine: &dyn delta_kernel::Engine,
-) -> Result<delta_kernel::transaction::Transaction, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?
-        .with_engine_info("test engine")
-        .with_operation("DELETE".to_string()))
 }
 
 /// Helper to verify that scan results match expected ids and values (after sorting).
