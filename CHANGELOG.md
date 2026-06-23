@@ -1,5 +1,266 @@
 # Changelog
 
+## [v0.25.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.25.0/) (2026-06-17)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.24.0...v0.25.0)
+
+> [!IMPORTANT]
+> **The default engine now lives in its own `delta_kernel_default_engine` crate ([#2397]).**
+> Update your `Cargo.toml`:
+>
+> ```toml
+> # before (v0.24.0)
+> delta_kernel = { version = "0.24.0", features = [/* any features you choose */] }
+>
+> # after (v0.25.0)
+> delta_kernel = "0.25.0"
+> delta_kernel_default_engine = { version = "0.25.0", features = [/* any features you choose */] }
+> ```
+>
+> Update your `use` statements:
+>
+> ```rust
+> // before (v0.24.0)
+> use delta_kernel::engine::default::DefaultEngine;
+> use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+> use delta_kernel::engine::default::storage::store_from_url;
+>
+> // after (v0.25.0)
+> use delta_kernel_default_engine::DefaultEngine;
+> use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+> use delta_kernel_default_engine::storage::store_from_url;
+> ```
+
+
+### 🏗️ Breaking changes
+1. Support void primitive type in schema ([#1858])
+   - Adds a `Void` variant to the `PrimitiveType` enum (and a `DataType::VOID` constant).
+     Exhaustive matches on `PrimitiveType` must handle the new variant.
+2. Add commit timestamp to the history_manager search result ([#2663])
+   - `latest_version_as_of` and `first_version_after` now return a `CommitAt` instead of a
+     bare `Version`.
+3. Define and use CollectInto trait ([#2699])
+   - `ColumnName::new`/`new_nested`, `Expression::column`, and `Predicate::column` now take
+     `impl CollectInto<..>` instead of `impl IntoIterator<Item = A>`. Existing iterator
+     arguments still work; turbofish-annotated calls must drop the explicit type parameter.
+4. Use type constructors to avoid Box::new and DataType::from boilerplate ([#2700])
+   - `ArrayType::new` now takes `element_type: impl Into<DataType>` instead of `DataType`.
+     A bare `DataType` still works; callers relying on type inference may need an annotation.
+5. Replace ScanBuilder stats setters with StatsOptions struct ([#2666])
+   - `ScanBuilder::with_stats_columns` is removed; pass a `StatsOptions` value to
+     `ScanBuilder::with_stats` instead.
+6. Extract default engine into separate crate ([#2397])
+   - The default engine moved to a new `delta_kernel_default_engine` crate. Replace
+     `delta_kernel::engine::default::{DefaultEngine, executor::*}` imports with
+     `delta_kernel_default_engine::*`.
+7. Add failure metric events ([#2702])
+   - `MetricEvent` variants were renamed and split into success/failure pairs:
+     `LogSegmentLoaded` -> `LogSegmentLoad{Success,Failure}`,
+     `ProtocolMetadataLoaded` -> `ProtocolMetadataLoad{Success,Failure}`,
+     `SnapshotCompleted` -> `SnapshotBuild{Success,Failure}`, `CrcReadCompleted` ->
+     `CrcRead{Success,Failure}`. Success variants' duration field is now `duration` (was
+     `total_duration`).
+8. History_manager: add get_earliest_recreatable version method ([#2675])
+   - `LogHistoryError` gains a `NoRecreatableCommit { log_root: Url }` variant. Callers
+     exhaustively matching `LogHistoryError` must add an arm for it (or `..`).
+9. Add `Transaction::commit` metric events ([#2719])
+   - `MetricEvent` gains `TransactionCommitSuccess` and `TransactionCommitFailure` variants.
+     Exhaustive matches on `MetricEvent` must handle the new variants.
+10. Introduce struct patch builder ([#2665])
+    - The FFI `EngineExpressionVisitor` struct-patch callbacks changed: `visit_struct_patch_expr`
+      now takes `prepended_field_list_id`, `field_patch_list_id`, and `appended_field_list_id`,
+      and `visit_field_patch` takes `field_name` by value plus `insertion_expr_list_id`,
+      `keep_input: bool`, and `optional: bool` (replacing `is_replace`). Engines implementing
+      these callbacks must update their signatures.
+11. Introduce schema struct patching ([#2672])
+    - `StructType::with_field_{inserted_after,inserted_before,removed,replaced}` are removed;
+      use `SchemaStructPatchBuilder` instead. `ExpressionStructPatchBuilder` methods are renamed
+      (`with_dropped_field` -> `drop`, `with_replaced_field` -> `replace`,
+      `with_inserted_field_after` -> `insert_after`, `with_prepended_field` -> `prepend`,
+      `with_appended_field` -> `append`), and `Expression::struct_patch` is now fallible.
+12. Checkpoint writer eagerly creates output schema ([#2726])
+    - `Snapshot::create_checkpoint_writer` now takes an `engine: &dyn Engine` argument. Pass
+      the engine you already used for checkpointing.
+13. Improve plan execution FFI and error handling ([#2729])
+    - Under the `declarative-plans` feature, the `CExecuteOpFn` FFI callback (and the plan-result
+      iterator `next` callbacks) no longer return a `CPlanResultWrapper`; they take an `out`
+      pointer to write the result into and return `()`. `CPlanResultWrapper`, `PlanResultCleanup`,
+      and `engine_error_to_kernel` are removed.
+14. Add recreatable-commit resolution to history manager ([#2714])
+    - `latest_version_as_of` and `first_version_after` gain a fourth
+      `resolved_commit_type: HistoryCommitType` argument. Pass `HistoryCommitType::Recreatable`
+      to restrict results to loadable versions, or `HistoryCommitType::Published` to allow any
+      version present in the log.
+15. Add `table_type` to snapshot-load and scan metric events ([#2721])
+    - The metric-event structs (`LogSegmentLoad*`, `ProtocolMetadataLoad*`, `SnapshotBuild*`,
+      `TransactionCommit*`, `ScanMetadataCompleted`) gain a `table_type: TableType` field.
+      Callers constructing or exhaustively matching these must account for the new field.
+16. Add caller-supplied correlation id to operation metric events ([#2734])
+    - Those same metric-event structs additionally gain a `correlation_id: Option<Arc<str>>`
+      field, and `SnapshotLoadMetricContext` is no longer `Copy`. Callers constructing or
+      exhaustively matching these events must account for the new field.
+17. Strum-ify metric label enums (and fix missing dv metric) ([#2732])
+    - `TransactionCommitSuccess` gains a `num_dv_updates: u64` field; callers constructing or
+      exhaustively matching it must account for the new field. `ScanType` gains
+      `EnumString`/`IntoStaticStr` (plus `Display`/`AsRefStr`, replacing its manual `Display`
+      impl) and `CommitFailureReason` gains `IntoStaticStr`.
+
+### 🚀 Features / new APIs
+
+1. Add MeteredDeltaEngine wrapping engines for storage metrics ([#2623])
+2. Support void primitive type in schema ([#1858])
+3. Add col and lit expression builders ([#2684])
+4. Added get_earliest_delta_file function ([#2582])
+5. Add commit timestamp to the history_manager search result ([#2663])
+6. Define and use CollectInto trait ([#2699])
+7. Add basic plan IR behind declarative-plans feature ([#2613])
+8. Replace ScanBuilder stats setters with StatsOptions struct ([#2666])
+9. Introduce FFI types for plan execution ([#2680])
+10. Add MeteredJsonHandler and MeteredParquetHandler ([#2694])
+11. Use incremental CRC replay in Snapshot construction ([#2678])
+12. Add FFI-backed PlanExecutor impl ([#2685])
+13. Add failure metric events ([#2702])
+14. Support incremental CRC reconstruction on snapshot `builder_from` API ([#2712])
+15. Support local DAT corpus override for acceptance workloads ([#2705])
+16. Add proto wire format for declarative-plans IR ([#2629])
+17. History_manager: add get_earliest_recreatable version method ([#2675])
+18. Add a public history_manager::get_earliest_commit ([#2713])
+19. Add `Transaction::commit` metric events ([#2719])
+20. Introduce struct patch builder ([#2665])
+21. Introduce schema struct patching ([#2672])
+22. Add recreatable-commit resolution to history manager ([#2714])
+23. Add `table_type` to snapshot-load and scan metric events ([#2721])
+24. Define and use a new projection struct patch ([#2730])
+25. Add caller-supplied correlation id to operation metric events ([#2734])
+26. Automatically insert partition columns when needed ([#2715])
+27. Add internal kernel sql parser for literals ([#2670])
+28. Add CommitRange for iterating Delta log actions across a commit range ([#2514])
+
+### 🐛 Bug Fixes
+
+1. Set stats.tightBound to false for DV updates ([#2681])
+2. Specify selection-vector contracts at the engine boundary ([#2728])
+3. Restore CRC-rooted P&M replay removed by #2678 ([#2741])
+4. Strum-ify metric label enums (and fix missing dv metric) ([#2732])
+5. Update benchmark ci to checkout merge head ([#2771])
+
+### 📚 Documentation
+
+1. Add issue for heap size estimation optimize ([#2758])
+
+### ⚡ Performance
+
+1. Incremental CRC speedup (1.4x speed, 2.15x memory) ([#2693])
+2. Terminate log listing before paging through staged commits ([#2738])
+
+### 🚜 Refactor
+
+1. Recompute WriteState on demand instead of trying to memoize it ([#2682])
+2. Update benchmarking ci to run on every push and update output format ([#2691])
+3. Bridge Operation::QueryPlan onto the new IR ([#2637])
+4. Extract default engine into separate crate ([#2397])
+5. Update benchmark output format, update tables ([#2703])
+6. Unify column mapping validations to `MakePhysical` ([#2599])
+7. Project node takes a single expression instead of a list ([#2727])
+8. Checkpoint writer eagerly creates output schema ([#2726])
+9. Eagerly materialize the physical no-partition-schema ([#2743])
+10. Add and use Schema::field_at and friends ([#2744])
+11. Improve plan execution FFI and error handling ([#2729])
+12. Extract workloads crate ([#2761])
+
+### 🧪 Testing
+
+1. Checkpoint should not contain tombstoned domain metadata ([#2365])
+2. Add CRC support to TestTableBuilder via Snapshot::write_checksum ([#2522])
+3. Parsed-stats integration test covering nested structs via table-builder ([#2649])
+4. Addressed failing invalid-handle-code ([#2706])
+5. Non-blocking invalid-handle-code in CI ([#2745])
+6. Inject sparse nulls into table-builder data generation ([#2657])
+
+### ⚙️ Chores/CI
+
+1. Make title validator it run in merge queue ([#2688])
+2. Expose column mapping metadata generators via internal_api ([#2671])
+3. Use type constructors to avoid Box::new and DataType::from boilerplate ([#2700])
+4. Fixup title and body validator actions for merge/workflow ([#2697])
+5. Fix dupliate CI runs ([#2704])
+6. Various improvements ([#2708])
+7. Bump codecov-action to v7.0.0 to fix coverage uploads ([#2711])
+8. Fix flaky metrics deadlock test ([#2716])
+9. Make delta_kernel_default_engine publishable ([#2561])
+10. *(deps)* Bump rustls-webpki from 0.103.10 to 0.103.13 ([#2735])
+11. Run body validator on synchronize and reopened ([#2748])
+12. Fail bench job on 15% regressions and tighten the bench comment ([#2742])
+
+
+[#2688]: https://github.com/delta-io/delta-kernel-rs/pull/2688
+[#2682]: https://github.com/delta-io/delta-kernel-rs/pull/2682
+[#2693]: https://github.com/delta-io/delta-kernel-rs/pull/2693
+[#2623]: https://github.com/delta-io/delta-kernel-rs/pull/2623
+[#1858]: https://github.com/delta-io/delta-kernel-rs/pull/1858
+[#2691]: https://github.com/delta-io/delta-kernel-rs/pull/2691
+[#2365]: https://github.com/delta-io/delta-kernel-rs/pull/2365
+[#2671]: https://github.com/delta-io/delta-kernel-rs/pull/2671
+[#2684]: https://github.com/delta-io/delta-kernel-rs/pull/2684
+[#2582]: https://github.com/delta-io/delta-kernel-rs/pull/2582
+[#2663]: https://github.com/delta-io/delta-kernel-rs/pull/2663
+[#2522]: https://github.com/delta-io/delta-kernel-rs/pull/2522
+[#2699]: https://github.com/delta-io/delta-kernel-rs/pull/2699
+[#2700]: https://github.com/delta-io/delta-kernel-rs/pull/2700
+[#2697]: https://github.com/delta-io/delta-kernel-rs/pull/2697
+[#2613]: https://github.com/delta-io/delta-kernel-rs/pull/2613
+[#2666]: https://github.com/delta-io/delta-kernel-rs/pull/2666
+[#2680]: https://github.com/delta-io/delta-kernel-rs/pull/2680
+[#2694]: https://github.com/delta-io/delta-kernel-rs/pull/2694
+[#2637]: https://github.com/delta-io/delta-kernel-rs/pull/2637
+[#2704]: https://github.com/delta-io/delta-kernel-rs/pull/2704
+[#2397]: https://github.com/delta-io/delta-kernel-rs/pull/2397
+[#2681]: https://github.com/delta-io/delta-kernel-rs/pull/2681
+[#2708]: https://github.com/delta-io/delta-kernel-rs/pull/2708
+[#2711]: https://github.com/delta-io/delta-kernel-rs/pull/2711
+[#2678]: https://github.com/delta-io/delta-kernel-rs/pull/2678
+[#2649]: https://github.com/delta-io/delta-kernel-rs/pull/2649
+[#2685]: https://github.com/delta-io/delta-kernel-rs/pull/2685
+[#2702]: https://github.com/delta-io/delta-kernel-rs/pull/2702
+[#2712]: https://github.com/delta-io/delta-kernel-rs/pull/2712
+[#2716]: https://github.com/delta-io/delta-kernel-rs/pull/2716
+[#2705]: https://github.com/delta-io/delta-kernel-rs/pull/2705
+[#2629]: https://github.com/delta-io/delta-kernel-rs/pull/2629
+[#2703]: https://github.com/delta-io/delta-kernel-rs/pull/2703
+[#2675]: https://github.com/delta-io/delta-kernel-rs/pull/2675
+[#2713]: https://github.com/delta-io/delta-kernel-rs/pull/2713
+[#2719]: https://github.com/delta-io/delta-kernel-rs/pull/2719
+[#2599]: https://github.com/delta-io/delta-kernel-rs/pull/2599
+[#2665]: https://github.com/delta-io/delta-kernel-rs/pull/2665
+[#2727]: https://github.com/delta-io/delta-kernel-rs/pull/2727
+[#2728]: https://github.com/delta-io/delta-kernel-rs/pull/2728
+[#2672]: https://github.com/delta-io/delta-kernel-rs/pull/2672
+[#2726]: https://github.com/delta-io/delta-kernel-rs/pull/2726
+[#2706]: https://github.com/delta-io/delta-kernel-rs/pull/2706
+[#2741]: https://github.com/delta-io/delta-kernel-rs/pull/2741
+[#2561]: https://github.com/delta-io/delta-kernel-rs/pull/2561
+[#2735]: https://github.com/delta-io/delta-kernel-rs/pull/2735
+[#2743]: https://github.com/delta-io/delta-kernel-rs/pull/2743
+[#2744]: https://github.com/delta-io/delta-kernel-rs/pull/2744
+[#2729]: https://github.com/delta-io/delta-kernel-rs/pull/2729
+[#2714]: https://github.com/delta-io/delta-kernel-rs/pull/2714
+[#2721]: https://github.com/delta-io/delta-kernel-rs/pull/2721
+[#2730]: https://github.com/delta-io/delta-kernel-rs/pull/2730
+[#2748]: https://github.com/delta-io/delta-kernel-rs/pull/2748
+[#2738]: https://github.com/delta-io/delta-kernel-rs/pull/2738
+[#2734]: https://github.com/delta-io/delta-kernel-rs/pull/2734
+[#2742]: https://github.com/delta-io/delta-kernel-rs/pull/2742
+[#2715]: https://github.com/delta-io/delta-kernel-rs/pull/2715
+[#2761]: https://github.com/delta-io/delta-kernel-rs/pull/2761
+[#2745]: https://github.com/delta-io/delta-kernel-rs/pull/2745
+[#2670]: https://github.com/delta-io/delta-kernel-rs/pull/2670
+[#2732]: https://github.com/delta-io/delta-kernel-rs/pull/2732
+[#2657]: https://github.com/delta-io/delta-kernel-rs/pull/2657
+[#2758]: https://github.com/delta-io/delta-kernel-rs/pull/2758
+[#2514]: https://github.com/delta-io/delta-kernel-rs/pull/2514
+[#2771]: https://github.com/delta-io/delta-kernel-rs/pull/2771
+
+
 ## [v0.24.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.24.0/) (2026-05-29)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.23.0...v0.24.0)
