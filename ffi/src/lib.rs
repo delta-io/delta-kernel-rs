@@ -1041,12 +1041,11 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     engine: Handle<SharedExternEngine>,
     spec: Option<&FfiCheckpointSpec>,
 ) -> ExternResult<FfiCheckpointWriteResult> {
-    let engine_arc = unsafe { engine.clone_as_arc() };
+    let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let kernel_spec = spec.map(|s| s.to_kernel());
-    let engine_ref: &dyn ExternEngine = engine_arc.as_ref();
     snapshot_ref
-        .checkpoint(engine_arc.engine().as_ref(), kernel_spec.as_ref())
+        .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
         .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
         .into_extern_result(&engine_ref)
 }
