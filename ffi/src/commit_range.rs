@@ -6,6 +6,7 @@ use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
+use crate::engine_funcs::{ExclusiveFileReadResultIterator, FileReadResultIterator};
 use crate::handle::Handle;
 use crate::{
     unwrap_and_parse_path_as_url, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
@@ -214,6 +215,40 @@ pub unsafe extern "C" fn commit_action_timestamp(commit_action: Handle<SharedCom
     commit_action.timestamp()
 }
 
+/// Get an iterator over this commit's action batches, projected to the read schema the commit was
+/// created with. Each batch is the raw actions recorded in the commit JSON, with no column-mapping
+/// translation applied. Issues a fresh read on creation, so the call is fallible.
+///
+/// - `engine`: performs the JSON read and allocates errors.
+///
+/// The caller owns the returned iterator: drain it with [`read_result_next`] and release it with
+/// [`free_read_result_iter`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid commit action and engine handles.
+///
+/// [`read_result_next`]: crate::engine_funcs::read_result_next
+/// [`free_read_result_iter`]: crate::engine_funcs::free_read_result_iter
+#[no_mangle]
+pub unsafe extern "C" fn commit_action_get_actions(
+    commit_action: Handle<SharedCommitAction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveFileReadResultIterator>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let commit_action = unsafe { commit_action.as_ref() };
+    let engine_arc = unsafe { engine.clone_as_arc() };
+    commit_action_get_actions_impl(commit_action, engine_arc).into_extern_result(&engine_ref)
+}
+
+fn commit_action_get_actions_impl(
+    commit_action: &CommitAction,
+    engine: Arc<dyn ExternEngine>,
+) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
+    let actions = commit_action.get_actions(engine.engine().as_ref())?;
+    Ok(FileReadResultIterator::into_handle(actions, engine))
+}
+
 /// Free a [`CommitAction`].
 ///
 /// # Safety
@@ -384,11 +419,16 @@ mod tests {
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
+    use crate::engine_data::engine_data_length;
+    use crate::engine_funcs::{free_read_result_iter, read_result_next};
     use crate::error::KernelError;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, build_snapshot, ok_or_panic,
     };
-    use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
+    use crate::{
+        engine_to_handle, free_engine, free_engine_data, free_snapshot, kernel_string_slice,
+        ExclusiveEngineData,
+    };
 
     /// Build an in-memory engine handle pre-loaded with a metadata-only commit at each version in
     /// `0..=last_version`. Returns `(engine_handle, table_root)`; the caller frees the engine.
@@ -612,6 +652,77 @@ mod tests {
         };
         assert_extern_result_error_with_message(result, KernelError::GenericError, None);
 
+        unsafe { free_commit_range(range) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    /// Context for [`drain_commit_actions`]: the engine handle used to fetch each commit's action
+    /// batches, plus a running total of action rows read across all commits.
+    struct GetActionsCtx {
+        engine: Handle<SharedExternEngine>,
+        total_rows: usize,
+    }
+
+    /// Inner visitor: add one `EngineData` batch's row count to the `usize` accumulator (passed via
+    /// `ctx`), then free the batch.
+    extern "C" fn count_rows(ctx: NullableCvoid, data: Handle<ExclusiveEngineData>) {
+        let total = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut usize) };
+        let mut data = data;
+        *total += unsafe { engine_data_length(&mut data) };
+        unsafe { free_engine_data(data) }
+    }
+
+    /// Outer visitor: read one commit's action batches via [`commit_action_get_actions`],
+    /// accumulating their row count, then free the read-result iterator and the commit action.
+    extern "C" fn drain_commit_actions(ctx: NullableCvoid, action: Handle<SharedCommitAction>) {
+        let ctx = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut GetActionsCtx) };
+        let iter = unsafe {
+            ok_or_panic(commit_action_get_actions(
+                action.shallow_copy(),
+                ctx.engine.shallow_copy(),
+            ))
+        };
+        let rows_ctx = Some(unsafe { NonNull::new_unchecked(&mut ctx.total_rows) }.cast());
+        while unsafe { ok_or_panic(read_result_next(iter.shallow_copy(), rows_ctx, count_rows)) } {}
+        unsafe { free_read_result_iter(iter) }
+        unsafe { free_commit_action(action) }
+    }
+
+    #[tokio::test]
+    async fn test_commit_action_get_actions_yields_action_batches(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root) = setup_engine_with_commits(1).await;
+        let range = unsafe { build_range(table_root, 0, 1, engine.shallow_copy()) };
+
+        let actions = [KernelDeltaAction::Metadata];
+        let iter = unsafe {
+            ok_or_panic(commit_range_commits(
+                range.shallow_copy(),
+                engine.shallow_copy(),
+                actions.as_ptr(),
+                actions.len(),
+            ))
+        };
+
+        let mut ctx = GetActionsCtx {
+            engine: engine.shallow_copy(),
+            total_rows: 0,
+        };
+        let ctx_ptr = Some(unsafe { NonNull::new_unchecked(&mut ctx) }.cast());
+        while unsafe {
+            ok_or_panic(commit_range_commits_next(
+                iter.shallow_copy(),
+                ctx_ptr,
+                drain_commit_actions,
+            ))
+        } {}
+
+        // Each commit file holds three action lines (commitInfo, protocol, metaData) and
+        // `get_actions` yields one row per line, so the two commits (v0, v1) total six rows.
+        assert_eq!(ctx.total_rows, 6);
+
+        unsafe { free_commit_actions_iter(iter) }
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }
         Ok(())
