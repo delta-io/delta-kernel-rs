@@ -228,6 +228,7 @@ message Expression {
     UnaryExpression unary = 6;
     BinaryExpression binary = 7;
     VariadicExpression variadic = 8;
+    // TODO: IfExpression is not yet available in Kernel but will be needed in the future.
     IfExpression if_expr = 9;
     OpaqueExpression opaque = 10;
     ParseJsonExpression parse_json = 11;

@@ -114,7 +114,7 @@ impl From<&FileMeta> for proto_plan::FileMeta {
         proto_plan::FileMeta {
             location: meta.location.to_string(),
             size: meta.size,
-            last_modified: Some(meta.last_modified),
+            last_modified: meta.last_modified,
         }
     }
 }
@@ -424,7 +424,7 @@ impl From<&OpaquePredicate> for proto_expr::OpaquePredicate {
     }
 }
 
-// The proto `Transform` struct mirrors `ExpressionStructPatch`
+// The proto `Transform` struct mirrors `ExpressionStructPatch`.
 impl From<&ExpressionStructPatch> for proto_expr::Transform {
     fn from(patch: &ExpressionStructPatch) -> Self {
         let field_transforms = patch
@@ -697,8 +697,14 @@ mod tests {
 
     use super::operation_to_proto_bytes;
     use crate::expressions::{
-        lit, ArrayData, BinaryExpressionOp, ColumnName, DecimalData, Expression,
-        ExpressionStructPatchBuilder, MapData, Predicate, Scalar, StructData, UnaryExpressionOp,
+        lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
+        OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator, StructData,
+        UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
+    };
+    use crate::kernel_predicates::{
+        DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+        IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
         FileType, Filter, Load, LoadColumnFileMeta, MaxByVersion, Operator, Project, ScanFile,
@@ -707,12 +713,66 @@ mod tests {
     use crate::plans::ir::plan::{Plan, PlanNode, RefId};
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
+        schema as proto_schema,
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, MapType, SchemaRef, StructField, StructType,
+        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
+        StructField, StructType,
     };
-    use crate::FileMeta;
+    use crate::{DeltaResult, FileMeta, FileSlice};
+
+    // === Test helpers ===
+
+    #[derive(Debug, PartialEq)]
+    struct TestOpaqueExprOp;
+
+    impl OpaqueExpressionOp for TestOpaqueExprOp {
+        fn name(&self) -> &str {
+            "test_opaque_expr"
+        }
+        fn eval_expr_scalar(
+            &self,
+            _eval_expr: &ScalarExpressionEvaluator<'_>,
+            _exprs: &[Expression],
+        ) -> DeltaResult<Scalar> {
+            Ok(Scalar::Integer(0))
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct TestOpaquePredOp;
+
+    impl OpaquePredicateOp for TestOpaquePredOp {
+        fn name(&self) -> &str {
+            "test_opaque_pred"
+        }
+        fn eval_pred_scalar(
+            &self,
+            _eval_expr: &ScalarExpressionEvaluator<'_>,
+            _eval_pred: &DirectPredicateEvaluator<'_>,
+            _exprs: &[Expression],
+            _inverted: bool,
+        ) -> DeltaResult<Option<bool>> {
+            Ok(Some(true))
+        }
+        fn eval_as_data_skipping_predicate(
+            &self,
+            _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expression],
+            _inverted: bool,
+        ) -> Option<bool> {
+            None
+        }
+        fn as_data_skipping_predicate(
+            &self,
+            _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expression],
+            _inverted: bool,
+        ) -> Option<Predicate> {
+            None
+        }
+    }
 
     fn sample_file_meta() -> FileMeta {
         FileMeta {
@@ -738,10 +798,43 @@ mod tests {
         io.op.expect("io op present")
     }
 
-    // === IoOperation variants ===
+    fn expr_kind_of(expr: Expression) -> proto_expr::expression::Kind {
+        proto_expr::Expression::from(&expr)
+            .kind
+            .expect("expression kind present")
+    }
+
+    fn pred_kind_of(pred: Predicate) -> proto_expr::predicate::Kind {
+        proto_expr::Predicate::from(&pred)
+            .kind
+            .expect("predicate kind present")
+    }
+
+    fn scalar_value_of(scalar: Scalar) -> proto_expr::scalar::Value {
+        proto_expr::Scalar::from(&scalar)
+            .value
+            .expect("scalar value present")
+    }
+
+    // === Operation / IoOperation ===
+
+    #[rstest]
+    #[case(
+        Operation::IoOperation(IoOperation::head_file(Url::parse("memory:///h").unwrap())),
+        "io"
+    )]
+    #[case(Operation::QueryPlan(Plan { nodes: vec![] }), "query_plan")]
+    fn from_operation(#[case] op: Operation, #[case] expected: &str) {
+        use proto_op::operation::Op;
+        let kind = match decode(&op).op.unwrap() {
+            Op::Io(_) => "io",
+            Op::QueryPlan(_) => "query_plan",
+        };
+        assert_eq!(kind, expected);
+    }
 
     #[test]
-    fn io_file_listing_round_trips() {
+    fn from_io_operation_file_listing() {
         let url = "memory:///table/";
         let op = Operation::IoOperation(IoOperation::file_listing(Url::parse(url).unwrap()));
         let proto_op::io_operation::Op::FileListing(file_listing) = io_op(&op) else {
@@ -751,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn io_read_bytes_round_trips() {
+    fn from_io_operation_read_bytes() {
         let files = vec![
             (Url::parse("memory:///a").unwrap(), Some(0u64..10u64)),
             (Url::parse("memory:///b").unwrap(), None),
@@ -762,14 +855,10 @@ mod tests {
         };
         assert_eq!(read_bytes.files.len(), 2);
         assert_eq!(read_bytes.files[0].url, "memory:///a");
-        assert_eq!(read_bytes.files[0].range_start, Some(0));
-        assert_eq!(read_bytes.files[0].range_end, Some(10));
-        assert_eq!(read_bytes.files[1].range_start, None);
-        assert_eq!(read_bytes.files[1].range_end, None);
     }
 
     #[test]
-    fn io_write_bytes_round_trips() {
+    fn from_io_operation_write_bytes() {
         let op = Operation::IoOperation(IoOperation::write_bytes(
             Url::parse("memory:///out").unwrap(),
             Bytes::from_static(b"hello"),
@@ -784,7 +873,18 @@ mod tests {
     }
 
     #[test]
-    fn io_atomic_copy_round_trips() {
+    fn from_io_operation_head_file() {
+        let op = Operation::IoOperation(IoOperation::head_file(
+            Url::parse("memory:///head").unwrap(),
+        ));
+        let proto_op::io_operation::Op::HeadFile(head_file) = io_op(&op) else {
+            panic!("expected HeadFile");
+        };
+        assert_eq!(head_file.url, "memory:///head");
+    }
+
+    #[test]
+    fn from_io_operation_atomic_copy() {
         let op = Operation::IoOperation(IoOperation::atomic_copy(
             Url::parse("memory:///src").unwrap(),
             Url::parse("memory:///dst").unwrap(),
@@ -797,18 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn io_head_file_round_trips() {
-        let op = Operation::IoOperation(IoOperation::head_file(
-            Url::parse("memory:///head").unwrap(),
-        ));
-        let proto_op::io_operation::Op::HeadFile(head_file) = io_op(&op) else {
-            panic!("expected HeadFile");
-        };
-        assert_eq!(head_file.url, "memory:///head");
-    }
-
-    #[test]
-    fn io_parquet_footer_round_trips() {
+    fn from_io_operation_parquet_footer() {
         let op = Operation::IoOperation(IoOperation::parquet_footer(sample_file_meta()));
         let proto_op::io_operation::Op::ParquetFooter(parquet_footer) = io_op(&op) else {
             panic!("expected ParquetFooter");
@@ -816,13 +905,36 @@ mod tests {
         let file = parquet_footer.file.expect("file meta present");
         assert_eq!(file.location, "memory:///table/part-0.parquet");
         assert_eq!(file.size, 456);
-        assert_eq!(file.last_modified, Some(123));
+        assert_eq!(file.last_modified, 123);
     }
 
-    // === Multi-node plan ===
+    #[rstest]
+    #[case(Some(0u64..10u64), Some(0), Some(10))]
+    #[case(None, None, None)]
+    fn from_file_slice(
+        #[case] range: Option<std::ops::Range<u64>>,
+        #[case] expected_start: Option<u64>,
+        #[case] expected_end: Option<u64>,
+    ) {
+        let slice: FileSlice = (Url::parse("memory:///a").unwrap(), range);
+        let proto = proto_op::FileSlice::from(&slice);
+        assert_eq!(proto.url, "memory:///a");
+        assert_eq!(proto.range_start, expected_start);
+        assert_eq!(proto.range_end, expected_end);
+    }
 
     #[test]
-    fn query_plan_two_nodes_round_trips() {
+    fn from_file_meta() {
+        let proto = proto_plan::FileMeta::from(&sample_file_meta());
+        assert_eq!(proto.location, "memory:///table/part-0.parquet");
+        assert_eq!(proto.size, 456);
+        assert_eq!(proto.last_modified, 123);
+    }
+
+    // === Plan / nodes ===
+
+    #[test]
+    fn from_plan() {
         let schema = Arc::new(
             StructType::try_new(vec![
                 StructField::nullable("id", DataType::INTEGER),
@@ -891,29 +1003,9 @@ mod tests {
         ));
     }
 
-    // === Operator variants ===
-
-    fn operator_kind(op: &Operator) -> &'static str {
-        use proto_plan::operator::Op;
-        match proto_plan::Operator::from(op).op.unwrap() {
-            Op::ScanParquet(_) => "scan_parquet",
-            Op::ScanJson(_) => "scan_json",
-            Op::Values(_) => "values",
-            Op::Project(_) => "project",
-            Op::Filter(_) => "filter",
-            Op::Load(_) => "load",
-            Op::MaxByVersion(_) => "max_by_version",
-            Op::SemiJoin(_) => "semi_join",
-            Op::UnionAll(_) => "union_all",
-        }
-    }
-
-    fn load_column_file_meta() -> LoadColumnFileMeta {
-        LoadColumnFileMeta {
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            num_records_column: ColumnName::new(["num_records"]),
-        }
+    #[test]
+    fn from_ref_id() {
+        assert_eq!(proto_plan::RefId::from(&RefId(7)).id, 7);
     }
 
     #[rstest]
@@ -948,7 +1040,7 @@ mod tests {
             file_type: FileType::Parquet,
             base_url: None,
             file_constant_columns: vec![],
-            file_meta: load_column_file_meta(),
+            file_meta: sample_load_column_file_meta(),
             dv_column: ColumnName::new(["dv"]),
         }),
         "load"
@@ -966,30 +1058,171 @@ mod tests {
         "semi_join"
     )]
     #[case(Operator::UnionAll(UnionAll), "union_all")]
-    fn operator_kind_maps(#[case] op: Operator, #[case] expected: &str) {
-        assert_eq!(operator_kind(&op), expected);
+    fn from_operator(#[case] op: Operator, #[case] expected: &str) {
+        use proto_plan::operator::Op;
+        let kind = match proto_plan::Operator::from(&op).op.unwrap() {
+            Op::ScanParquet(_) => "scan_parquet",
+            Op::ScanJson(_) => "scan_json",
+            Op::Values(_) => "values",
+            Op::Project(_) => "project",
+            Op::Filter(_) => "filter",
+            Op::Load(_) => "load",
+            Op::MaxByVersion(_) => "max_by_version",
+            Op::SemiJoin(_) => "semi_join",
+            Op::UnionAll(_) => "union_all",
+        };
+        assert_eq!(kind, expected);
     }
 
-    // === Expression variants ===
+    #[test]
+    fn from_scan_file() {
+        let scan_file = ScanFile {
+            meta: sample_file_meta(),
+            file_constants: vec![Scalar::Integer(1), Scalar::String("x".into())],
+        };
+        let proto = proto_plan::ScanFile::from(&scan_file);
+        assert!(proto.meta.is_some());
+        assert_eq!(proto.file_constants.len(), 2);
+    }
 
-    fn expr_kind(expr: Expression) -> &'static str {
-        use proto_expr::expression::Kind;
-        match proto_expr::Expression::from(&expr).kind.unwrap() {
-            Kind::Literal(_) => "literal",
-            Kind::Column(_) => "column",
-            Kind::Predicate(_) => "predicate",
-            Kind::StructExpr(_) => "struct_expr",
-            Kind::Transform(_) => "transform",
-            Kind::Unary(_) => "unary",
-            Kind::Binary(_) => "binary",
-            Kind::Variadic(_) => "variadic",
-            Kind::IfExpr(_) => "if_expr",
-            Kind::Opaque(_) => "opaque",
-            Kind::ParseJson(_) => "parse_json",
-            Kind::MapToStruct(_) => "map_to_struct",
-            Kind::Unknown(_) => "unknown",
+    #[test]
+    fn from_scan_parquet() {
+        let node = ScanParquet {
+            files: vec![ScanFile::new(sample_file_meta())],
+            file_constant_columns: vec![ColumnName::new(["c"])],
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::ScanParquetNode::from(&node);
+        assert_eq!(proto.files.len(), 1);
+        assert_eq!(proto.file_constant_columns.len(), 1);
+        assert!(proto.schema.is_some());
+    }
+
+    #[test]
+    fn from_scan_json() {
+        let node = ScanJson {
+            files: vec![ScanFile::new(sample_file_meta())],
+            file_constant_columns: vec![ColumnName::new(["c"])],
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::ScanJsonNode::from(&node);
+        assert_eq!(proto.files.len(), 1);
+        assert_eq!(proto.file_constant_columns.len(), 1);
+        assert!(proto.schema.is_some());
+    }
+
+    #[test]
+    fn from_values() {
+        let node = Values {
+            schema: sample_schema(),
+            rows: vec![vec![Scalar::Integer(1)], vec![Scalar::Integer(2)]],
+        };
+        let proto = proto_plan::ValuesNode::from(&node);
+        assert!(proto.schema.is_some());
+        assert_eq!(proto.rows.len(), 2);
+        assert_eq!(proto.rows[0].values.len(), 1);
+    }
+
+    #[test]
+    fn from_project() {
+        let node = Project {
+            expr: Arc::new(Expression::struct_from([lit(1)])),
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::ProjectNode::from(&node);
+        assert!(proto.expr.is_some());
+        assert!(proto.schema.is_some());
+    }
+
+    #[test]
+    fn from_filter() {
+        let node = Filter {
+            predicate: Arc::new(Predicate::literal(true)),
+        };
+        let proto = proto_plan::FilterNode::from(&node);
+        assert!(proto.predicate.is_some());
+    }
+
+    fn sample_load_column_file_meta() -> LoadColumnFileMeta {
+        LoadColumnFileMeta {
+            path_column: ColumnName::new(["path"]),
+            file_size_column: ColumnName::new(["size"]),
+            num_records_column: ColumnName::new(["num_records"]),
         }
     }
+
+    #[rstest]
+    #[case(
+        FileType::Json,
+        Some(Url::parse("memory:///base/").unwrap()),
+        Some("memory:///base/")
+    )]
+    #[case(FileType::Parquet, None, None)]
+    fn from_load(
+        #[case] file_type: FileType,
+        #[case] base_url: Option<Url>,
+        #[case] expected_base_url: Option<&str>,
+    ) {
+        let node = Load {
+            schema: sample_schema(),
+            file_type,
+            base_url,
+            file_constant_columns: vec![ColumnName::new(["c"])],
+            file_meta: sample_load_column_file_meta(),
+            dv_column: ColumnName::new(["dv"]),
+        };
+        let proto = proto_plan::LoadNode::from(&node);
+        assert!(proto.schema.is_some());
+        assert_eq!(
+            proto.file_type,
+            proto_plan::FileType::from(file_type) as i32
+        );
+        assert_eq!(proto.base_url.as_deref(), expected_base_url);
+        assert_eq!(proto.file_constant_columns.len(), 1);
+        assert!(proto.dv_column.is_some());
+
+        let file_meta = proto.file_meta.expect("file_meta present");
+        assert!(file_meta.path_column.is_some());
+        assert!(file_meta.file_size_column.is_some());
+        assert!(file_meta.num_records_column.is_some());
+    }
+
+    #[test]
+    fn from_max_by_version() {
+        let node = MaxByVersion {
+            group_by: vec![Arc::new(Expression::Column(ColumnName::new(["g"])))],
+            version_column: ColumnName::new(["v"]),
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::MaxByVersionNode::from(&node);
+        assert_eq!(proto.group_by.len(), 1);
+        assert!(proto.version_column.is_some());
+        assert!(proto.schema.is_some());
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn from_semi_join(#[case] inverted: bool) {
+        let node = SemiJoin {
+            inverted,
+            probe_keys: vec![ColumnName::new(["p"])],
+            build_keys: vec![ColumnName::new(["b"])],
+        };
+        let proto = proto_plan::SemiJoinNode::from(&node);
+        assert_eq!(proto.inverted, inverted);
+        assert_eq!(proto.probe_keys.len(), 1);
+        assert_eq!(proto.build_keys.len(), 1);
+    }
+
+    #[rstest]
+    #[case(FileType::Parquet, proto_plan::FileType::Parquet)]
+    #[case(FileType::Json, proto_plan::FileType::Json)]
+    fn from_file_type(#[case] value: FileType, #[case] expected: proto_plan::FileType) {
+        assert_eq!(proto_plan::FileType::from(value) as i32, expected as i32);
+    }
+
+    // === Expressions ===
 
     #[rstest]
     #[case(lit(1), "literal")]
@@ -1005,44 +1238,28 @@ mod tests {
     #[case(Expression::unary(UnaryExpressionOp::ToJson, lit(1)), "unary")]
     #[case(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)), "binary")]
     #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
+    #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
     #[case(Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))), "map_to_struct")]
     #[case(Expression::unknown("x"), "unknown")]
-    fn expression_kind_maps(#[case] expr: Expression, #[case] expected: &str) {
-        assert_eq!(expr_kind(expr), expected);
-    }
-
-    #[test]
-    fn struct_patch_maps_keep_input_to_is_replace_and_preserves_appended() {
-        let patch = ExpressionStructPatchBuilder::new()
-            .replace("a", lit(1))
-            .insert_after("b", lit(2))
-            .append(lit(3))
-            .build()
-            .unwrap();
-
-        let transform = proto_expr::Transform::from(&patch);
-
-        // `replace` drops the input field, so `is_replace` is true.
-        assert!(transform.field_transforms["a"].is_replace);
-        // `insert_after` keeps the input field, so `is_replace` is false.
-        assert!(!transform.field_transforms["b"].is_replace);
-        assert_eq!(transform.appended_fields.len(), 1);
-    }
-
-    // === Predicate variants ===
-
-    fn pred_kind(pred: Predicate) -> &'static str {
-        use proto_expr::predicate::Kind;
-        match proto_expr::Predicate::from(&pred).kind.unwrap() {
-            Kind::BooleanExpression(_) => "boolean_expression",
-            Kind::Not(_) => "not",
+    fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
+        use proto_expr::expression::Kind;
+        let kind = match proto_expr::Expression::from(&expr).kind.unwrap() {
+            Kind::Literal(_) => "literal",
+            Kind::Column(_) => "column",
+            Kind::Predicate(_) => "predicate",
+            Kind::StructExpr(_) => "struct_expr",
+            Kind::Transform(_) => "transform",
             Kind::Unary(_) => "unary",
             Kind::Binary(_) => "binary",
-            Kind::Junction(_) => "junction",
+            Kind::Variadic(_) => "variadic",
+            Kind::IfExpr(_) => "if_expr",
             Kind::Opaque(_) => "opaque",
+            Kind::ParseJson(_) => "parse_json",
+            Kind::MapToStruct(_) => "map_to_struct",
             Kind::Unknown(_) => "unknown",
-        }
+        };
+        assert_eq!(kind, expected);
     }
 
     #[rstest]
@@ -1054,35 +1271,278 @@ mod tests {
         Predicate::and(Predicate::literal(true), Predicate::literal(false)),
         "junction"
     )]
+    #[case(Predicate::opaque(TestOpaquePredOp, [lit(1)]), "opaque")]
     #[case(Predicate::Unknown("x".to_string()), "unknown")]
-    fn predicate_kind_maps(#[case] pred: Predicate, #[case] expected: &str) {
-        assert_eq!(pred_kind(pred), expected);
+    fn from_predicate(#[case] pred: Predicate, #[case] expected: &str) {
+        use proto_expr::predicate::Kind;
+        let kind = match proto_expr::Predicate::from(&pred).kind.unwrap() {
+            Kind::BooleanExpression(_) => "boolean_expression",
+            Kind::Not(_) => "not",
+            Kind::Unary(_) => "unary",
+            Kind::Binary(_) => "binary",
+            Kind::Junction(_) => "junction",
+            Kind::Opaque(_) => "opaque",
+            Kind::Unknown(_) => "unknown",
+        };
+        assert_eq!(kind, expected);
     }
 
-    // === Scalar variants ===
-
-    fn scalar_kind(scalar: Scalar) -> &'static str {
-        use proto_expr::scalar::Value;
-        match proto_expr::Scalar::from(&scalar).value.unwrap() {
-            Value::Integer(_) => "integer",
-            Value::Long(_) => "long",
-            Value::Short(_) => "short",
-            Value::Byte(_) => "byte",
-            Value::Float(_) => "float",
-            Value::Double(_) => "double",
-            Value::String(_) => "string",
-            Value::Boolean(_) => "boolean",
-            Value::Timestamp(_) => "timestamp",
-            Value::TimestampNtz(_) => "timestamp_ntz",
-            Value::Date(_) => "date",
-            Value::Binary(_) => "binary",
-            Value::Decimal(_) => "decimal",
-            Value::Null(_) => "null",
-            Value::Struct(_) => "struct",
-            Value::Array(_) => "array",
-            Value::Map(_) => "map",
-        }
+    #[test]
+    fn from_column_name() {
+        let proto = proto_expr::ColumnName::from(&ColumnName::new(["a", "b", "c"]));
+        assert_eq!(proto.path, vec!["a", "b", "c"]);
     }
+
+    #[test]
+    fn from_struct_expression() {
+        let proto_expr::expression::Kind::StructExpr(plain) =
+            expr_kind_of(Expression::struct_from([lit(1), lit(2)]))
+        else {
+            panic!("expected a struct expression");
+        };
+        assert_eq!(plain.exprs.len(), 2);
+        assert!(plain.nullability_predicate.is_none());
+
+        let proto_expr::expression::Kind::StructExpr(guarded) = expr_kind_of(
+            Expression::struct_with_nullability_from([lit(1)], lit(true)),
+        ) else {
+            panic!("expected a struct expression");
+        };
+        assert_eq!(guarded.exprs.len(), 1);
+        assert!(guarded.nullability_predicate.is_some());
+    }
+
+    #[test]
+    fn from_unary_expression() {
+        let proto_expr::expression::Kind::Unary(unary) =
+            expr_kind_of(Expression::unary(UnaryExpressionOp::ToJson, lit(1)))
+        else {
+            panic!("expected a unary expression");
+        };
+        assert_eq!(unary.op, proto_expr::UnaryExpressionOp::ToJson as i32);
+        assert!(unary.expr.is_some());
+    }
+
+    #[test]
+    fn from_binary_expression() {
+        let proto_expr::expression::Kind::Binary(binary) =
+            expr_kind_of(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)))
+        else {
+            panic!("expected a binary expression");
+        };
+        assert_eq!(binary.op, proto_expr::BinaryExpressionOp::Plus as i32);
+        assert!(binary.left.is_some());
+        assert!(binary.right.is_some());
+    }
+
+    #[test]
+    fn from_variadic_expression() {
+        let proto_expr::expression::Kind::Variadic(variadic) =
+            expr_kind_of(Expression::coalesce([lit(1), lit(2), lit(3)]))
+        else {
+            panic!("expected a variadic expression");
+        };
+        assert_eq!(
+            variadic.op,
+            proto_expr::VariadicExpressionOp::Coalesce as i32
+        );
+        assert_eq!(variadic.exprs.len(), 3);
+    }
+
+    #[test]
+    fn from_opaque_expression() {
+        let proto_expr::expression::Kind::Opaque(opaque) =
+            expr_kind_of(Expression::opaque(TestOpaqueExprOp, [lit(1), lit(2)]))
+        else {
+            panic!("expected an opaque expression");
+        };
+        assert_eq!(opaque.name, "test_opaque_expr");
+        assert_eq!(opaque.exprs.len(), 2);
+    }
+
+    #[test]
+    fn from_parse_json_expression() {
+        let proto_expr::expression::Kind::ParseJson(parse_json) =
+            expr_kind_of(Expression::parse_json(lit("{}"), sample_schema()))
+        else {
+            panic!("expected a parse_json expression");
+        };
+        assert!(parse_json.json_expr.is_some());
+        assert!(parse_json.output_schema.is_some());
+    }
+
+    #[test]
+    fn from_map_to_struct_expression() {
+        let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
+            Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))),
+        ) else {
+            panic!("expected a map_to_struct expression");
+        };
+        assert!(map_to_struct.map_expr.is_some());
+    }
+
+    #[test]
+    fn from_unary_predicate() {
+        let proto_expr::predicate::Kind::Unary(unary) = pred_kind_of(Predicate::is_null(lit(1)))
+        else {
+            panic!("expected a unary predicate");
+        };
+        assert_eq!(unary.op, proto_expr::UnaryPredicateOp::IsNull as i32);
+        assert!(unary.expr.is_some());
+    }
+
+    #[test]
+    fn from_binary_predicate() {
+        let proto_expr::predicate::Kind::Binary(binary) =
+            pred_kind_of(Predicate::gt(lit(1), lit(2)))
+        else {
+            panic!("expected a binary predicate");
+        };
+        assert_eq!(binary.op, proto_expr::BinaryPredicateOp::GreaterThan as i32);
+        assert!(binary.left.is_some());
+        assert!(binary.right.is_some());
+    }
+
+    #[test]
+    fn from_junction_predicate() {
+        let proto_expr::predicate::Kind::Junction(junction) = pred_kind_of(Predicate::and(
+            Predicate::literal(true),
+            Predicate::literal(false),
+        )) else {
+            panic!("expected a junction predicate");
+        };
+        assert_eq!(junction.op, proto_expr::JunctionPredicateOp::And as i32);
+        assert_eq!(junction.preds.len(), 2);
+    }
+
+    #[test]
+    fn from_opaque_predicate() {
+        let proto_expr::predicate::Kind::Opaque(opaque) =
+            pred_kind_of(Predicate::opaque(TestOpaquePredOp, [lit(1), lit(2)]))
+        else {
+            panic!("expected an opaque predicate");
+        };
+        assert_eq!(opaque.name, "test_opaque_pred");
+        assert_eq!(opaque.exprs.len(), 2);
+    }
+
+    #[test]
+    fn from_struct_patch() {
+        let patch = ExpressionStructPatchBuilder::new()
+            .replace("a", lit(1))
+            .insert_after("b", lit(2))
+            .drop_if_exists("c")
+            .prepend(lit(0))
+            .append(lit(3))
+            .build()
+            .unwrap();
+
+        let transform = proto_expr::Transform::from(&patch);
+
+        // `replace` drops the input field, so `is_replace` is true and it is not optional.
+        assert!(transform.field_transforms["a"].is_replace);
+        assert!(!transform.field_transforms["a"].optional);
+        // `insert_after` keeps the input field, so `is_replace` is false.
+        assert!(!transform.field_transforms["b"].is_replace);
+        // `drop_if_exists` drops the input field optionally.
+        assert!(transform.field_transforms["c"].is_replace);
+        assert!(transform.field_transforms["c"].optional);
+        // A top-level transform carries no input path.
+        assert!(transform.input_path.is_none());
+        assert_eq!(transform.prepended_fields.len(), 1);
+        assert_eq!(transform.appended_fields.len(), 1);
+    }
+
+    // === Expression and predicate operators ===
+
+    #[rstest]
+    #[case(UnaryExpressionOp::ToJson, proto_expr::UnaryExpressionOp::ToJson)]
+    fn from_unary_expression_op(
+        #[case] op: UnaryExpressionOp,
+        #[case] expected: proto_expr::UnaryExpressionOp,
+    ) {
+        assert_eq!(
+            proto_expr::UnaryExpressionOp::from(op) as i32,
+            expected as i32
+        );
+    }
+
+    #[rstest]
+    #[case(BinaryExpressionOp::Plus, proto_expr::BinaryExpressionOp::Plus)]
+    #[case(BinaryExpressionOp::Minus, proto_expr::BinaryExpressionOp::Minus)]
+    #[case(BinaryExpressionOp::Multiply, proto_expr::BinaryExpressionOp::Multiply)]
+    #[case(BinaryExpressionOp::Divide, proto_expr::BinaryExpressionOp::Divide)]
+    fn from_binary_expression_op(
+        #[case] op: BinaryExpressionOp,
+        #[case] expected: proto_expr::BinaryExpressionOp,
+    ) {
+        assert_eq!(
+            proto_expr::BinaryExpressionOp::from(op) as i32,
+            expected as i32
+        );
+    }
+
+    #[rstest]
+    #[case(
+        VariadicExpressionOp::Coalesce,
+        proto_expr::VariadicExpressionOp::Coalesce
+    )]
+    #[case(VariadicExpressionOp::Array, proto_expr::VariadicExpressionOp::Array)]
+    fn from_variadic_expression_op(
+        #[case] op: VariadicExpressionOp,
+        #[case] expected: proto_expr::VariadicExpressionOp,
+    ) {
+        assert_eq!(
+            proto_expr::VariadicExpressionOp::from(op) as i32,
+            expected as i32
+        );
+    }
+
+    #[rstest]
+    #[case(UnaryPredicateOp::IsNull, proto_expr::UnaryPredicateOp::IsNull)]
+    fn from_unary_predicate_op(
+        #[case] op: UnaryPredicateOp,
+        #[case] expected: proto_expr::UnaryPredicateOp,
+    ) {
+        assert_eq!(
+            proto_expr::UnaryPredicateOp::from(op) as i32,
+            expected as i32
+        );
+    }
+
+    #[rstest]
+    #[case(BinaryPredicateOp::LessThan, proto_expr::BinaryPredicateOp::LessThan)]
+    #[case(
+        BinaryPredicateOp::GreaterThan,
+        proto_expr::BinaryPredicateOp::GreaterThan
+    )]
+    #[case(BinaryPredicateOp::Equal, proto_expr::BinaryPredicateOp::Equal)]
+    #[case(BinaryPredicateOp::Distinct, proto_expr::BinaryPredicateOp::Distinct)]
+    #[case(BinaryPredicateOp::In, proto_expr::BinaryPredicateOp::In)]
+    fn from_binary_predicate_op(
+        #[case] op: BinaryPredicateOp,
+        #[case] expected: proto_expr::BinaryPredicateOp,
+    ) {
+        assert_eq!(
+            proto_expr::BinaryPredicateOp::from(op) as i32,
+            expected as i32
+        );
+    }
+
+    #[rstest]
+    #[case(JunctionPredicateOp::And, proto_expr::JunctionPredicateOp::And)]
+    #[case(JunctionPredicateOp::Or, proto_expr::JunctionPredicateOp::Or)]
+    fn from_junction_predicate_op(
+        #[case] op: JunctionPredicateOp,
+        #[case] expected: proto_expr::JunctionPredicateOp,
+    ) {
+        assert_eq!(
+            proto_expr::JunctionPredicateOp::from(op) as i32,
+            expected as i32
+        );
+    }
+
+    // === Scalars ===
 
     #[rstest]
     #[case(Scalar::Integer(7), "integer")]
@@ -1127,7 +1587,229 @@ mod tests {
         ),
         "map"
     )]
-    fn scalar_variant_maps(#[case] scalar: Scalar, #[case] expected: &str) {
-        assert_eq!(scalar_kind(scalar), expected);
+    fn from_scalar(#[case] value: Scalar, #[case] expected: &str) {
+        use proto_expr::scalar::Value;
+        let kind = match proto_expr::Scalar::from(&value).value.unwrap() {
+            Value::Integer(_) => "integer",
+            Value::Long(_) => "long",
+            Value::Short(_) => "short",
+            Value::Byte(_) => "byte",
+            Value::Float(_) => "float",
+            Value::Double(_) => "double",
+            Value::String(_) => "string",
+            Value::Boolean(_) => "boolean",
+            Value::Timestamp(_) => "timestamp",
+            Value::TimestampNtz(_) => "timestamp_ntz",
+            Value::Date(_) => "date",
+            Value::Binary(_) => "binary",
+            Value::Decimal(_) => "decimal",
+            Value::Null(_) => "null",
+            Value::Struct(_) => "struct",
+            Value::Array(_) => "array",
+            Value::Map(_) => "map",
+        };
+        assert_eq!(kind, expected);
+    }
+
+    #[test]
+    fn from_decimal_data() {
+        let decimal = DecimalData::try_new(1234i128, DecimalType::try_new(10, 2).unwrap()).unwrap();
+        let proto_expr::scalar::Value::Decimal(decimal) = scalar_value_of(Scalar::Decimal(decimal))
+        else {
+            panic!("expected a decimal scalar");
+        };
+        assert_eq!(decimal.bits, 1234i128.to_be_bytes().to_vec());
+        let decimal_type = decimal.decimal_type.expect("decimal type present");
+        assert_eq!((decimal_type.precision, decimal_type.scale), (10, 2));
+    }
+
+    #[test]
+    fn from_struct_data() {
+        let struct_data = StructData::try_new(
+            vec![StructField::nullable("a", DataType::INTEGER)],
+            vec![Scalar::Integer(1)],
+        )
+        .unwrap();
+        let proto_expr::scalar::Value::Struct(struct_data) =
+            scalar_value_of(Scalar::Struct(struct_data))
+        else {
+            panic!("expected a struct scalar");
+        };
+        assert_eq!(struct_data.fields.len(), 1);
+        assert_eq!(struct_data.values.len(), 1);
+        assert_eq!(struct_data.fields[0].name, "a");
+    }
+
+    #[test]
+    fn from_array_data() {
+        let array_data =
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1, 2, 3]).unwrap();
+        let proto_expr::scalar::Value::Array(array_data) =
+            scalar_value_of(Scalar::Array(array_data))
+        else {
+            panic!("expected an array scalar");
+        };
+        assert!(array_data.array_type.is_some());
+        assert_eq!(array_data.elements.len(), 3);
+    }
+
+    #[test]
+    fn from_map_data() {
+        let map_data = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::INTEGER, false),
+            [("k", 1)],
+        )
+        .unwrap();
+        let proto_expr::scalar::Value::Map(map_data) = scalar_value_of(Scalar::Map(map_data))
+        else {
+            panic!("expected a map scalar");
+        };
+        assert!(map_data.map_type.is_some());
+        assert_eq!(map_data.pairs.len(), 1);
+        assert!(map_data.pairs[0].key.is_some());
+        assert!(map_data.pairs[0].value.is_some());
+    }
+
+    // === Schema ===
+
+    #[rstest]
+    #[case(DataType::INTEGER, "primitive")]
+    #[case(ArrayType::new(DataType::INTEGER, true).into(), "array")]
+    #[case(
+        StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)])
+            .unwrap()
+            .into(),
+        "struct"
+    )]
+    #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
+    #[case(DataType::unshredded_variant(), "variant")]
+    fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
+        use proto_schema::data_type::Kind;
+        let kind = match proto_schema::DataType::from(&value).kind.unwrap() {
+            Kind::Primitive(_) => "primitive",
+            Kind::Array(_) => "array",
+            Kind::Struct(_) => "struct",
+            Kind::Map(_) => "map",
+            Kind::Variant(_) => "variant",
+        };
+        assert_eq!(kind, expected);
+    }
+
+    #[rstest]
+    #[case(PrimitiveType::String, proto_schema::SimplePrimitiveType::String)]
+    #[case(PrimitiveType::Long, proto_schema::SimplePrimitiveType::Long)]
+    #[case(PrimitiveType::Integer, proto_schema::SimplePrimitiveType::Integer)]
+    #[case(PrimitiveType::Short, proto_schema::SimplePrimitiveType::Short)]
+    #[case(PrimitiveType::Byte, proto_schema::SimplePrimitiveType::Byte)]
+    #[case(PrimitiveType::Float, proto_schema::SimplePrimitiveType::Float)]
+    #[case(PrimitiveType::Double, proto_schema::SimplePrimitiveType::Double)]
+    #[case(PrimitiveType::Boolean, proto_schema::SimplePrimitiveType::Boolean)]
+    #[case(PrimitiveType::Binary, proto_schema::SimplePrimitiveType::Binary)]
+    #[case(PrimitiveType::Date, proto_schema::SimplePrimitiveType::Date)]
+    #[case(PrimitiveType::Timestamp, proto_schema::SimplePrimitiveType::Timestamp)]
+    #[case(
+        PrimitiveType::TimestampNtz,
+        proto_schema::SimplePrimitiveType::TimestampNtz
+    )]
+    #[case(PrimitiveType::Void, proto_schema::SimplePrimitiveType::Void)]
+    fn from_primitive_type(
+        #[case] primitive: PrimitiveType,
+        #[case] expected: proto_schema::SimplePrimitiveType,
+    ) {
+        let Some(proto_schema::primitive_type::Kind::Simple(simple)) =
+            proto_schema::PrimitiveType::from(&primitive).kind
+        else {
+            panic!("expected a simple primitive type");
+        };
+        assert_eq!(simple, expected as i32);
+    }
+
+    #[test]
+    fn from_decimal_type() {
+        let primitive = PrimitiveType::decimal(10, 2).unwrap();
+        let Some(proto_schema::primitive_type::Kind::Decimal(decimal)) =
+            proto_schema::PrimitiveType::from(&primitive).kind
+        else {
+            panic!("expected a decimal primitive type");
+        };
+        assert_eq!((decimal.precision, decimal.scale), (10, 2));
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn from_array_type(#[case] contains_null: bool) {
+        let proto =
+            proto_schema::ArrayType::from(&ArrayType::new(DataType::INTEGER, contains_null));
+        assert!(proto.element_type.is_some());
+        assert_eq!(proto.contains_null, contains_null);
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn from_map_type(#[case] value_contains_null: bool) {
+        let proto = proto_schema::MapType::from(&MapType::new(
+            DataType::STRING,
+            DataType::INTEGER,
+            value_contains_null,
+        ));
+        assert!(proto.key_type.is_some());
+        assert!(proto.value_type.is_some());
+        assert_eq!(proto.value_contains_null, value_contains_null);
+    }
+
+    #[test]
+    fn from_struct_type() {
+        let struct_type = StructType::try_new(vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::STRING),
+        ])
+        .unwrap();
+        let proto = proto_schema::StructType::from(&struct_type);
+        assert_eq!(proto.fields.len(), 2);
+        assert!(proto.fields[0].nullable);
+        assert!(!proto.fields[1].nullable);
+    }
+
+    #[test]
+    fn from_struct_field() {
+        let field = StructField::nullable("a", DataType::INTEGER)
+            .with_metadata([("k", MetadataValue::Number(7))]);
+        let proto = proto_schema::StructField::from(&field);
+        assert_eq!(proto.name, "a");
+        assert!(proto.nullable);
+        assert!(proto.data_type.is_some());
+        assert_eq!(
+            proto.metadata["k"].value,
+            Some(proto_schema::metadata_value::Value::Number(7))
+        );
+    }
+
+    #[rstest]
+    #[case(
+        MetadataValue::Number(5),
+        proto_schema::metadata_value::Value::Number(5)
+    )]
+    #[case(
+        MetadataValue::String("s".to_string()),
+        proto_schema::metadata_value::Value::String("s".to_string())
+    )]
+    #[case(
+        MetadataValue::Boolean(true),
+        proto_schema::metadata_value::Value::Boolean(true)
+    )]
+    #[case(
+        MetadataValue::Other(serde_json::json!([1, 2])),
+        proto_schema::metadata_value::Value::OtherJson("[1,2]".to_string())
+    )]
+    fn from_metadata_value(
+        #[case] metadata: MetadataValue,
+        #[case] expected: proto_schema::metadata_value::Value,
+    ) {
+        assert_eq!(
+            proto_schema::MetadataValue::from(&metadata).value.unwrap(),
+            expected
+        );
     }
 }
