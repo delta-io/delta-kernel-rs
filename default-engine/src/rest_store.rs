@@ -36,7 +36,9 @@ use futures::stream::BoxStream;
 #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
 use futures::StreamExt as _;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Certificate, Client, Identity};
+use reqwest::Client;
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
+use reqwest::{Certificate, Identity};
 
 /// Supplies the HTTP headers attached to every request a [`RestObjectStore`] makes.
 ///
@@ -100,7 +102,7 @@ pub fn headers_from_pairs(
 const HEADER_REFRESH_SKEW: Duration = Duration::from_secs(30);
 
 /// An [`AuthHeaderProvider`] that produces headers via a closure returning `(headers,
-/// Option<ttl>)`. `Some(ttl)` caches the headers until [`HEADER_REFRESH_SKEW`] before `ttl`
+/// Option<ttl>)`. `Some(ttl)` caches the headers until a fixed safety margin before `ttl`
 /// elapses, then produces fresh ones; `None` re-runs the closure on every request.
 pub struct RefreshingHeaderProvider {
     produce: Box<dyn Fn() -> ObjectStoreResult<(HeaderMap, Option<Duration>)> + Send + Sync>,
@@ -791,21 +793,73 @@ pub struct RestClientOptions {
     pub timeout_secs: Option<u64>,
 }
 
+// === mTLS configuration ===
+//
+// reqwest's `Identity` is built differently per backend: rustls wants a single PEM bundle
+// (cert followed by key), native-tls takes cert and key as separate PEM buffers. Each `cfg`
+// variant of `build_identity` builds it the way its backend expects.
+
+#[cfg(feature = "rustls")]
+fn build_identity(cert: &str, key: &str) -> ObjectStoreResult<Identity> {
+    let mut bundle = std::fs::read(cert).map_err(generic_err)?;
+    bundle.extend_from_slice(&std::fs::read(key).map_err(generic_err)?);
+    Identity::from_pem(&bundle).map_err(generic_err)
+}
+
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+fn build_identity(cert: &str, key: &str) -> ObjectStoreResult<Identity> {
+    let cert_pem = std::fs::read(cert).map_err(generic_err)?;
+    let key_pem = std::fs::read(key).map_err(generic_err)?;
+    Identity::from_pkcs8_pem(&cert_pem, &key_pem).map_err(generic_err)
+}
+
+// CA-cert read and builder assembly are backend-agnostic, so they live once here.
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
+fn configure_mtls(
+    builder: reqwest::ClientBuilder,
+    cert: &str,
+    key: &str,
+    ca: &str,
+) -> ObjectStoreResult<reqwest::ClientBuilder> {
+    let identity = build_identity(cert, key)?;
+    let ca_cert =
+        Certificate::from_pem(&std::fs::read(ca).map_err(generic_err)?).map_err(generic_err)?;
+    Ok(builder.identity(identity).add_root_certificate(ca_cert))
+}
+
+#[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+fn configure_mtls(
+    _builder: reqwest::ClientBuilder,
+    _cert: &str,
+    _key: &str,
+    _ca: &str,
+) -> ObjectStoreResult<reqwest::ClientBuilder> {
+    Err(generic_msg(
+        "mTLS requires the `rustls` or `native-tls` feature to be enabled",
+    ))
+}
+
 /// Build a [`reqwest::Client`] from [`RestClientOptions`]. Enables mTLS when `cert_path`,
 /// `key_path`, and `ca_path` are all present.
 pub fn build_rest_client(opts: &RestClientOptions) -> ObjectStoreResult<Client> {
-    let mut builder = Client::builder().use_rustls_tls();
+    let mut builder = Client::builder();
+    // Pin the TLS backend when both are compiled in: prefer rustls (the crate's default
+    // feature), since reqwest otherwise defaults to native-tls and would mismatch the
+    // rustls-built identity. native-tls is used only when it is the sole backend.
+    #[cfg(feature = "rustls")]
+    {
+        builder = builder.use_rustls_tls();
+    }
+    #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+    {
+        builder = builder.use_native_tls();
+    }
     if let Some(secs) = opts.timeout_secs {
         builder = builder.timeout(Duration::from_secs(secs));
     }
     match (&opts.cert_path, &opts.key_path, &opts.ca_path) {
         (Some(cert), Some(key), Some(ca)) => {
-            let mut identity_pem = std::fs::read(cert).map_err(generic_err)?;
-            identity_pem.extend_from_slice(&std::fs::read(key).map_err(generic_err)?);
-            let identity = Identity::from_pem(&identity_pem).map_err(generic_err)?;
-            let ca_cert = Certificate::from_pem(&std::fs::read(ca).map_err(generic_err)?)
-                .map_err(generic_err)?;
-            builder = builder.identity(identity).add_root_certificate(ca_cert);
+            builder = configure_mtls(builder, cert, key, ca)?;
         }
         (None, None, None) => {}
         // A partial mTLS config is an error, not a silent fall-through to a plain client.
