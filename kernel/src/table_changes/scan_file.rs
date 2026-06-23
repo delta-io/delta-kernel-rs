@@ -766,7 +766,7 @@ mod tests {
             StructField::nullable("value", DataType::STRING),
         ]));
 
-        // Build a row-tracking-enabled start configuration, matching `CdfMode::RowTracking`. The
+        // Build a row-tracking-enabled start configuration, matching `CdfMode::ReadTime`. The
         // iterator's row-tracking behavior is driven by the mode argument; the feature enablement
         // on this config is not re-checked here unless a commit in the range carries a metadata
         // update (none do). `RowTracking` requires `DomainMetadata` to be supported.
@@ -793,7 +793,7 @@ mod tests {
             log_segment.listed.ascending_commit_files.clone(),
             table_schema,
             None,
-            CdfMode::RowTracking,
+            CdfMode::ReadTime,
         )
         .unwrap();
         let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)

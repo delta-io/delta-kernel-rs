@@ -66,7 +66,7 @@ fn metadata_with_row_tracking(schema: SchemaRef) -> Action {
     )
 }
 
-/// Table config that supports and enables row tracking, for the [`CdfMode::RowTracking`] path.
+/// Table config that supports and enables row tracking, for the [`CdfMode::ReadTime`] path.
 fn get_row_tracking_table_config(table_root: &url::Url) -> TableConfiguration {
     let metadata = Metadata::try_new(
         None,
@@ -101,7 +101,7 @@ fn execute_row_tracking(
         commits,
         end_schema,
         None,
-        CdfMode::RowTracking,
+        CdfMode::ReadTime,
     )?
     .try_collect()
 }
