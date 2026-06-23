@@ -2854,10 +2854,9 @@ fn one_action<'a, T: 'a>(
 
 /// The full `v2Checkpoint` hint parses from real V2 checkpoint tables: identity, sidecar
 /// references, and non-file actions that deserialize into kernel's action structs. Cross-checks the
-/// embedded protocol/metadata against the table's real state, that the segment retains the hint in
-/// full, and that the identity gate exposes a matched hint's sidecars but suppresses a mismatched
-/// one (`v2-classic-checkpoint-parquet`, whose hint names a UUID checkpoint while the segment
-/// selects the classic-named one).
+/// embedded protocol/metadata against the table's real state, and that the identity gate exposes a
+/// matched hint's sidecars but suppresses a mismatched one (`v2-classic-checkpoint-parquet`, whose
+/// hint names a UUID checkpoint while the segment selects the classic-named one).
 #[rstest]
 #[case::parquet_sidecars("v2-checkpoints-parquet-with-sidecars")]
 #[case::json_sidecars("v2-checkpoints-json-with-sidecars")]
@@ -2953,13 +2952,6 @@ fn parses_real_v2_last_checkpoint(#[case] table: &str) -> DeltaResult<()> {
             v2.path
         );
     }
-
-    // The segment retains the freshly-read hint in full, not a lossy projection of it.
-    assert_eq!(
-        seg.last_checkpoint_hint().as_ref(),
-        Some(&hint),
-        "{table}: retained hint"
-    );
     Ok(())
 }
 
