@@ -1769,6 +1769,21 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
+fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
+    let units = s.strip_prefix("interval ")?;
+    let words: Vec<&str> = units.split(" to ").collect();
+    if words.iter().all(|w| matches!(*w, "year" | "month")) {
+        Some(PrimitiveType::IntervalYearMonth)
+    } else if words
+        .iter()
+        .all(|w| matches!(*w, "day" | "hour" | "minute" | "second"))
+    {
+        Some(PrimitiveType::IntervalDayTime)
+    } else {
+        None
+    }
+}
+
 // Custom Deserialize to provide clear error messages for unsupported types.
 // The derived impl would produce: "unknown variant `interval second`, expected one of ..."
 // This impl produces: "Unsupported Delta table type: 'interval second'"
@@ -1793,8 +1808,10 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
             "void" => Ok(PrimitiveType::Void),
-            "interval year to month" => Ok(PrimitiveType::IntervalYearMonth),
-            "interval day to second" => Ok(PrimitiveType::IntervalDayTime),
+            // Accept canonical and narrowed interval spellings
+            s if s.starts_with("interval ") => normalize_interval_type(s).ok_or_else(|| {
+                serde::de::Error::custom(format!("Unsupported Delta table type: '{s}'"))
+            }),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -2458,9 +2475,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case("interval second")]
-    #[case("interval day")]
     #[case("money")]
+    #[case("interval month to day")]
+    #[case("interval year to second")]
+    #[case("interval fortnight")]
     fn test_unsupported_type_error_message(#[case] unsupported_type: &str) {
         let data = format!(
             r#"{{
@@ -2495,6 +2513,12 @@ mod tests {
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
     #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval year", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval day", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to minute", DataType::INTERVAL_DAY_TIME)]
     fn test_primitive_type_deserialization_still_works(
         #[case] type_str: &str,
         #[case] expected_type: DataType,

@@ -505,7 +505,7 @@ mod tests {
                 "provider": "parquet",
                 "options": {}
             },
-            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"interval_col\",\"type\":\"interval second\",\"nullable\":true,\"metadata\":{}}]}",
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"interval_col\",\"type\":\"interval year to second\",\"nullable\":true,\"metadata\":{}}]}",
             "partitionColumns": [],
             "configuration": {},
             "createdTime": 1587968585495i64
@@ -536,7 +536,7 @@ mod tests {
         let err = result.unwrap_err();
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("Unsupported Delta table type: 'interval second'"),
+            err_msg.contains("Unsupported Delta table type: 'interval year to second'"),
             "Expected clear error message about unsupported type, got: {err_msg}"
         );
 
@@ -558,7 +558,7 @@ mod tests {
         let metadata = json!({
             "id": "test-table-id",
             "format": {"provider": "parquet", "options": {}},
-            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"interval second","nullable":true,"metadata":{}}]}"#,
+            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"interval year to second","nullable":true,"metadata":{}}]}"#,
             "partitionColumns": [],
             "configuration": {},
             "createdTime": 1587968585495i64
