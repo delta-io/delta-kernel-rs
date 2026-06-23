@@ -1928,18 +1928,18 @@ mod tests {
 
     // V2 protocol + metadata declaring the `v2Checkpoint` reader+writer feature.
     //
-    // Schema mirrors the standard `METADATA` constant from `test-utils` (two columns: id INT,
-    // val STRING), with no partitions and no extra table properties. Used by every test below
-    // that needs sidecar emission or `set_v2_no_sidecar` to succeed.
+    // Two columns (id INT, val STRING), no partitions, no extra table properties. Used by every
+    // test below that needs sidecar emission or a V2 checkpoint to succeed.
     const V2_CHECKPOINT_PROTOCOL_AND_METADATA: &str = concat!(
         r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["v2Checkpoint"],"writerFeatures":["v2Checkpoint"]}}"#,
         "\n",
         r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
     );
 
-    /// Seed an in-memory table with the standard protocol+metadata at version 0, then append
-    /// `num_add_actions` single-add commits at versions 1..=num_add_actions. Returns the storage
-    async fn seed_classic_table(
+    /// Seed an in-memory table at version 0 from [`test_utils::METADATA`] (its protocol + metadata
+    /// actions, with the leading `commitInfo` stripped), then append `num_add_actions` single-add
+    /// commits at versions 1..=num_add_actions.
+    async fn seed_v1_table(
         storage: &InMemory,
         table_root: &str,
         num_add_actions: usize,
@@ -1962,7 +1962,7 @@ mod tests {
         Ok(())
     }
 
-    /// Like `seed_classic_table` but uses [`V2_CHECKPOINT_PROTOCOL_AND_METADATA`] so the
+    /// Like `seed_v1_table` but uses [`V2_CHECKPOINT_PROTOCOL_AND_METADATA`] so the
     /// table declares the `v2Checkpoint` reader+writer feature.
     async fn seed_v2_table(
         storage: &InMemory,
@@ -2011,61 +2011,47 @@ mod tests {
         }
     }
 
-    // Test 1: classic vanilla (non-V2) table, no setter call. Builder falls through to the
-    // kernel's auto-pick path (V1 since no `v2Checkpoint` feature) and writes a single inline
-    // checkpoint with no `_sidecars/` directory.
+    // Checkpoint sidecar shape is driven by (table kind, spec). Each case writes a checkpoint and
+    // asserts the resulting `_delta_log/_sidecars/` object count.
     //
     // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    #[rstest]
+    // non-V2 table, spec = None => kernel auto-picks V1, inline, no sidecars.
+    #[case::none_spec_v1(false, 2, None, 0)]
+    // V2 table, explicit no-sidecar => V2 manifest with file actions inline.
+    #[case::v2_no_sidecar(true, 2, Some(FfiCheckpointSpec::V2NoSidecar), 0)]
+    // V2 table, default hint (50k) => 3 actions fit in a single sidecar.
+    #[case::v2_default_hint(
+        true,
+        3,
+        Some(FfiCheckpointSpec::V2WithSidecar {
+            file_actions_per_sidecar_hint: OptionalValue::None,
+        }),
+        1
+    )]
+    // V2 table, hint=2 over 8 actions => ceil(8/2)=4 sidecars.
+    #[case::v2_hint_2(
+        true,
+        8,
+        Some(FfiCheckpointSpec::V2WithSidecar {
+            file_actions_per_sidecar_hint: OptionalValue::Some(2),
+        }),
+        4
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_no_setter_writes_inline_checkpoint(
+    async fn test_checkpoint_snapshot_sidecar_shape(
+        #[case] is_v2: bool,
+        #[case] num_add_actions: usize,
+        #[case] spec: Option<FfiCheckpointSpec>,
+        #[case] expected_sidecars: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        seed_classic_table(storage.as_ref(), table_root, 2).await?;
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
-        );
-
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
-
-        let result = unsafe {
-            ok_or_panic(checkpoint_snapshot(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-                None,
-            ))
-        };
-        let written_snap = unwrap_written(result);
-
-        // Inline path: no `_sidecars/` directory should have been created.
-        let sidecar_count =
-            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
-        assert_eq!(sidecar_count, 0);
-
-        unsafe { free_snapshot(written_snap) }
-        unsafe { free_snapshot(snapshot) }
-        unsafe { free_engine(engine) }
-        Ok(())
-    }
-
-    // Test 2: V2-feature table, explicit `set_v2_no_sidecar`. Builder writes a V2 checkpoint
-    // with file actions inline (no `_sidecars/`).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_set_v2_no_sidecar_writes_inline_v2(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        seed_v2_table(storage.as_ref(), table_root, 2).await?;
+        if is_v2 {
+            seed_v2_table(storage.as_ref(), table_root, num_add_actions).await?;
+        } else {
+            seed_v1_table(storage.as_ref(), table_root, num_add_actions).await?;
+        }
 
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
@@ -2081,19 +2067,18 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
-        let spec = FfiCheckpointSpec::V2NoSidecar;
         let result = unsafe {
             ok_or_panic(checkpoint_snapshot(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
-                Some(&spec),
+                spec.as_ref(),
             ))
         };
         let written_snap = unwrap_written(result);
 
         let sidecar_count =
             count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
-        assert_eq!(sidecar_count, 0);
+        assert_eq!(sidecar_count, expected_sidecars);
 
         unsafe { free_snapshot(written_snap) }
         unsafe { free_snapshot(snapshot) }
@@ -2101,10 +2086,10 @@ mod tests {
         Ok(())
     }
 
-    // Test 3: V2-feature table, `set_v2_with_sidecars(0)` (kernel default hint = 50,000).
-    // Small table fits in a single sidecar parquet.
+    // A zero sidecar hint is invalid: the kernel requires `file_actions_per_sidecar_hint > 0`,
+    // surfaced through the FFI as `CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_set_v2_with_sidecars_default_hint(
+    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
@@ -2124,69 +2109,18 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
-        // None => kernel default (DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT = 50,000).
         let spec = FfiCheckpointSpec::V2WithSidecar {
-            file_actions_per_sidecar_hint: OptionalValue::None,
+            file_actions_per_sidecar_hint: OptionalValue::Some(0),
         };
-        let result = unsafe {
-            ok_or_panic(checkpoint_snapshot(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-                Some(&spec),
-            ))
+        let extern_result = unsafe {
+            checkpoint_snapshot(snapshot.shallow_copy(), engine.shallow_copy(), Some(&spec))
         };
-        let written_snap = unwrap_written(result);
-
-        let sidecar_count =
-            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
-        // 3 file actions fit in a single sidecar at the 50k default.
-        assert_eq!(sidecar_count, 1);
-
-        unsafe { free_snapshot(written_snap) }
-        unsafe { free_snapshot(snapshot) }
-        unsafe { free_engine(engine) }
-        Ok(())
-    }
-
-    // Test 4: V2-feature table, 8 adds, explicit hint=2. Expect ceil(8/2)=4 sidecars.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_set_v2_with_sidecars_explicit_hint_2(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        seed_v2_table(storage.as_ref(), table_root, 8).await?;
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
+        assert_extern_result_error_with_message(
+            extern_result,
+            KernelError::CheckpointWriteError,
+            Some("Error writing checkpoint: file_actions_per_sidecar_hint must be greater than 0"),
         );
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
-        let spec = FfiCheckpointSpec::V2WithSidecar {
-            file_actions_per_sidecar_hint: OptionalValue::Some(2),
-        };
-        let result = unsafe {
-            ok_or_panic(checkpoint_snapshot(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-                Some(&spec),
-            ))
-        };
-        let written_snap = unwrap_written(result);
-
-        let sidecar_count =
-            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
-        assert_eq!(sidecar_count, 4); // ceil(8 / 2)
-
-        unsafe { free_snapshot(written_snap) }
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
@@ -2198,7 +2132,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        seed_classic_table(storage.as_ref(), table_root, 1).await?;
+        seed_v1_table(storage.as_ref(), table_root, 1).await?;
 
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
@@ -2229,7 +2163,7 @@ mod tests {
         Ok(())
     }
 
-    // Test 6: write a checkpoint, then call again on the same snapshot version. The FFI
+    // Write a checkpoint, then call again on the same snapshot version. The FFI
     // plumbing for both `Written` and `AlreadyExists` variants must work without error and
     // return a snapshot whose version matches the input.
     //
@@ -2242,7 +2176,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        seed_classic_table(storage.as_ref(), table_root, 2).await?;
+        seed_v1_table(storage.as_ref(), table_root, 2).await?;
 
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
@@ -2294,7 +2228,7 @@ mod tests {
         Ok(())
     }
 
-    // Test 7: the snapshot handle returned by the `Written` variant is usable for downstream
+    // The snapshot handle returned by the `Written` variant is usable for downstream
     // calls (here: `version(returned_snap)` matches input; chained `checkpoint_snapshot`
     // returns `AlreadyExists` since we're still at the same table version).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2302,7 +2236,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        seed_classic_table(storage.as_ref(), table_root, 2).await?;
+        seed_v1_table(storage.as_ref(), table_root, 2).await?;
 
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),

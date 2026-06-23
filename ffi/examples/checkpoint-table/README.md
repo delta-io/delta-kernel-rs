@@ -40,7 +40,3 @@ table by copying one of the kernel-bundled fixtures
 with all pre-existing checkpoint artifacts and `_last_checkpoint` scrubbed),
 runs this binary against it, and diffs the output against the matching
 `expected-data/<sub-flow>.expected` file.
-
-There is no dependency on the `create-table` example binary: the fixture-copy
-strategy produces a deterministic seed corpus for all three sub-flows without
-any prior cargo invocation beyond the FFI cdylib build.
