@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::history_manager::{get_earliest_commit, HistoryCommitType};
+use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
 // `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
@@ -17,7 +17,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot, Version};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::table_builder::{LogState, TestTableBuilder, VersionTarget};
+use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
 use test_utils::{build_snapshot, test_table_setup};
 use url::Url;
 
@@ -108,6 +108,58 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
     let target_max = VersionTarget::AtTimestamp(i64::MAX);
     let snap_max = build_snapshot!(target_max, &table_path, engine.as_ref());
     assert_eq!(snap_max.version(), 4);
+
+    Ok(())
+}
+
+/// Targets a specific commit's timestamp end-to-end through the builder. With ICT enabled the
+/// kernel writes a distinct, monotonic timestamp per commit, so each version's timestamp can be
+/// read back (via a snapshot capped at that version) and time-traveled to via
+/// [`VersionTarget::AtTimestamp`]. Querying a version's exact timestamp resolves to that version;
+/// querying one millisecond earlier resolves to its predecessor. Deterministic without setting
+/// commit timestamps explicitly, since ICT values are derived from the table rather than hardcoded.
+#[test]
+fn test_at_timestamp_targets_specific_commit_via_ict() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_features(FeatureSet::new().ict())
+        .with_log_state(LogState::with_latest_version(4))
+        .build()?;
+    let engine = table.engine();
+    let table_root = table.table_root();
+
+    for v in 0..=4u64 {
+        let capped = Snapshot::builder_for(table_root)
+            .at_version(v)
+            .build(&engine)?;
+        let commit =
+            latest_version_as_of(&capped, &engine, i64::MAX, HistoryCommitType::Recreatable)?;
+        assert_eq!(commit.version, v);
+
+        let at_exact = build_snapshot!(
+            VersionTarget::AtTimestamp(commit.timestamp),
+            table_root,
+            &engine
+        );
+        assert_eq!(
+            at_exact.version(),
+            v,
+            "v{v}'s exact timestamp must resolve to v{v}"
+        );
+
+        if v > 0 {
+            let at_prev = build_snapshot!(
+                VersionTarget::AtTimestamp(commit.timestamp - 1),
+                table_root,
+                &engine
+            );
+            assert_eq!(
+                at_prev.version(),
+                v - 1,
+                "one ms before v{v}'s timestamp must resolve to v{}",
+                v - 1
+            );
+        }
+    }
 
     Ok(())
 }
