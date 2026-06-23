@@ -588,7 +588,7 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             }
             // Millisecond is coarser than the kernel's microsecond logical timestamp, so
             // mapping it onto the logical type is a lossless upscale (values are rescaled
-            // x1000 by the engine on read). Accept it like the microsecond/nanosecond arms.
+            // x1000 by the engine on read).
             ArrowDataType::Timestamp(TimeUnit::Millisecond, None) => Ok(DataType::TIMESTAMP_NTZ),
             ArrowDataType::Timestamp(TimeUnit::Millisecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
