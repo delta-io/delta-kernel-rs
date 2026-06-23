@@ -120,9 +120,7 @@ mod feature_enabled {
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
-    };
+    use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::Snapshot;
     use rstest::rstest;
@@ -215,12 +213,16 @@ mod feature_enabled {
             .expect("c field must exist in loaded schema");
 
         assert_eq!(field.data_type(), &data_type);
-        // TODO(#2630): replace this manual metadata read once StructField::column_default exists.
+        let column_default = field
+            .column_default()
+            .expect("column_default must not error for a valid primitive default")
+            .expect("CURRENT_DEFAULT metadata must be present in the loaded schema");
         assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::CurrentDefault),
-            Some(&MetadataValue::String(default_sql.to_string())),
-            "CURRENT_DEFAULT metadata must round-trip verbatim",
+            column_default.raw_sql(),
+            default_sql,
+            "CURRENT_DEFAULT raw SQL must round-trip verbatim",
         );
+        assert_eq!(column_default.data_type(), &data_type);
 
         Ok(())
     }
