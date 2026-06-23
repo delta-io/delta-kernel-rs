@@ -34,12 +34,8 @@ impl ColumnDefault {
     /// # Errors
     ///
     /// Returns an error when `data_type` is non-primitive (Array, Map, Struct, or Variant) and
-    /// `raw_sql` is not `NULL`. The Delta protocol requires defaults on these types -- in
-    /// particular Variant columns -- to be `NULL`; this is a defense-in-depth check independent of
-    /// the parser.
+    /// `raw_sql` is not `NULL`.
     pub fn new(raw_sql: String, data_type: DataType) -> DeltaResult<Self> {
-        // The protocol only permits NULL defaults on non-primitive types (incl. Variant). Reject
-        // anything else up front rather than silently treating it as unparsable.
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
         if data_type.as_primitive_opt().is_none() && !is_null {
             return Err(Error::generic(format!(
@@ -69,11 +65,6 @@ impl ColumnDefault {
 
     /// Returns `true` when the kernel parsed [`raw_sql`](Self::raw_sql) into a form it can
     /// evaluate, and `false` otherwise.
-    ///
-    /// A cheap, side-effect-free predicate -- it does not require an [`Engine`] -- that lets a
-    /// connector decide upfront whether to resolve the default via [`evaluate`](Self::evaluate)
-    /// (kernel-parsable defaults) or through its own SQL engine acting on
-    /// [`raw_sql`](Self::raw_sql) (everything else).
     pub fn is_kernel_parsable(&self) -> bool {
         self.parsed_sql.is_some()
     }
@@ -216,7 +207,7 @@ mod tests {
 
     #[test]
     fn evaluate_returns_none_for_unparsable_default() {
-        let d = ColumnDefault::new("current_timestamp()".into(), DataType::TIMESTAMP).unwrap();
+        let d = ColumnDefault::new("unparsable_sql()".into(), DataType::TIMESTAMP).unwrap();
         assert!(!d.is_kernel_parsable());
         assert_eq!(d.evaluate(&UnusedEngine).unwrap(), None);
     }
