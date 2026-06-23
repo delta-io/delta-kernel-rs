@@ -167,6 +167,7 @@ message Transform {
   ColumnName input_path = 1;
   map<string, FieldTransform> field_transforms = 2;
   repeated Expression prepended_fields = 3;
+  repeated Expression appended_fields = 4;
 }
 
 // The opaque op carries only its `name()` because the Rust trait object can't be serialised;
