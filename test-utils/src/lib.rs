@@ -172,10 +172,12 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, FileMeta,
+    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, Error, FileMeta,
     FilteredEngineData, LogPath, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
@@ -725,6 +727,40 @@ pub async fn create_table(
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
     Ok(table_path)
+}
+
+/// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level
+/// fields.
+///
+/// `column_defaults` maps `column_name -> default_sql`. The raw SQL is stored verbatim; this
+/// helper does not parse or validate it.
+///
+/// # Errors
+///
+/// Returns an error if `column_defaults` names a column that is not a top-level field of `schema`.
+pub fn schema_with_column_defaults(
+    schema: &StructType,
+    mut column_defaults: HashMap<&str, &str>,
+) -> DeltaResult<SchemaRef> {
+    let mut augmented_fields = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let augmented = match column_defaults.remove(field.name.as_str()) {
+            Some(sql) => field.clone().add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::String(sql.to_string()),
+            )]),
+            None => field.clone(),
+        };
+        augmented_fields.push(augmented);
+    }
+    if !column_defaults.is_empty() {
+        let unknown: Vec<&str> = column_defaults.into_keys().collect();
+        return Err(Error::generic(format!(
+            "column defaults reference unknown top-level columns: {unknown:?}"
+        )));
+    }
+
+    Ok(Arc::new(StructType::try_new(augmented_fields)?))
 }
 
 /// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
