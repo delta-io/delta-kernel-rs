@@ -1005,14 +1005,28 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`StructField::column_default`] -- a malformed `CURRENT_DEFAULT`
-    /// (non-string metadata, or a non-NULL default on a non-primitive type).
+    /// - A column declares a `CURRENT_DEFAULT` but the table does not enable the
+    ///   `allowColumnDefaults` writer feature. The protocol only honors defaults "when enabled", so
+    ///   such metadata is stray and is rejected rather than returned.
+    /// - Propagates any error from [`StructField::column_default`] -- a malformed `CURRENT_DEFAULT`
+    ///   (non-string metadata, or a non-NULL default on a non-primitive type).
     #[cfg(feature = "column-defaults-in-dev")]
     pub fn column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault>> {
+        // The protocol honors `CURRENT_DEFAULT` only "when enabled", so reject stray defaults on a
+        // table without the feature rather than let a connector materialize values it should
+        // ignore.
+        let allow_column_defaults = self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults);
         self.effective_table_config
             .logical_schema()
             .fields()
             .filter_map(|field| match field.column_default() {
+                Ok(Some(_)) if !allow_column_defaults => Some(Err(Error::generic(format!(
+                    "Field '{}' declares a `CURRENT_DEFAULT` but the table does not enable the \
+                     `allowColumnDefaults` writer feature",
+                    field.name()
+                )))),
                 Ok(Some(column_default)) => Some(Ok((field.name().clone(), column_default))),
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
@@ -2101,25 +2115,38 @@ mod tests {
         // crate instances, so kernel schema types don't unify across the `test_utils` boundary.
         // That helper is fine in the integration tests (which link `delta_kernel` exactly once).
 
-        /// Builds a transaction whose effective logical schema is `schema`. The schema is swapped
-        /// onto a real snapshot's table configuration so column-default discovery can be exercised
-        /// without a table that actually carries the `allowColumnDefaults` feature in its protocol.
+        /// Builds a transaction whose effective logical schema is `schema`, with the
+        /// `allowColumnDefaults` writer feature enabled so any declared defaults are honored.
         fn txn_with_schema(schema: StructType) -> Transaction {
+            txn_with_schema_and_writer_features(schema, [TableFeature::AllowColumnDefaults])
+        }
+
+        /// Like [`txn_with_schema`] but with an explicit writer-feature list, so a test can
+        /// exercise a table that does *not* enable `allowColumnDefaults`. The schema and a
+        /// synthetic protocol are swapped onto a real snapshot's table configuration so
+        /// column-default discovery can be exercised without going through `create_table`.
+        fn txn_with_schema_and_writer_features(
+            schema: StructType,
+            writer_features: impl IntoIterator<Item = TableFeature>,
+        ) -> Transaction {
             let (engine, snapshot) = setup_non_dv_table();
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)
                 .unwrap();
-            let schema = Arc::new(schema);
             let metadata = txn
                 .effective_table_config
                 .metadata()
                 .clone()
-                .with_schema(schema.clone())
+                .with_schema(Arc::new(schema))
                 .unwrap();
-            txn.effective_table_config = TableConfiguration::try_new_with_schema(
+            let protocol =
+                Protocol::try_new_modern(TableFeature::EMPTY_LIST, writer_features).unwrap();
+            let version = txn.effective_table_config.version();
+            txn.effective_table_config = TableConfiguration::try_new_from(
                 &txn.effective_table_config,
-                metadata,
-                schema,
+                Some(metadata),
+                Some(protocol),
+                version,
             )
             .unwrap();
             txn
@@ -2185,6 +2212,20 @@ mod tests {
                 .expect_err("non-string CURRENT_DEFAULT must error")
                 .to_string();
             assert!(err.contains("non-string"), "got: {err}");
+        }
+
+        #[test]
+        fn errors_when_default_present_but_feature_not_enabled() {
+            let schema =
+                StructType::try_new(vec![field_with_default("c", DataType::INTEGER, "42")])
+                    .unwrap();
+            let txn = txn_with_schema_and_writer_features(schema, []);
+
+            let err = txn
+                .column_defaults()
+                .expect_err("a column default without the allowColumnDefaults feature must error")
+                .to_string();
+            assert!(err.contains("allowColumnDefaults"), "got: {err}");
         }
     }
 
