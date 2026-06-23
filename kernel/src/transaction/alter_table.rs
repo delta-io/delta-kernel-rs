@@ -71,6 +71,7 @@ impl AlterTableTransaction {
             // now: safe, but misses the true-case optimization delta-spark applies.
             is_blind_append: false,
             dv_matched_files: vec![],
+            num_dv_updates: 0,
             physical_clustering_columns: None,
             _state: PhantomData,
         })

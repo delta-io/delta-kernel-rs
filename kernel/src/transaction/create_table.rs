@@ -171,6 +171,7 @@ impl CreateTableTransaction {
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            num_dv_updates: 0,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })

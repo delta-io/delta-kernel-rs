@@ -98,6 +98,7 @@ impl Transaction {
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            num_dv_updates: 0,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
@@ -335,6 +336,9 @@ impl Transaction {
         }
 
         self.dv_matched_files.extend(matched_files);
+        // matched_dv_files was just validated to equal new_dv_descriptors.len(); both are the
+        // count of files whose DV was updated by this call.
+        self.num_dv_updates += matched_dv_files;
         Ok(())
     }
 
