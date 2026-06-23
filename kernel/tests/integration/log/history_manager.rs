@@ -65,12 +65,11 @@ async fn test_get_earliest_commit(
     Ok(())
 }
 
-/// Verifies that [`VersionTarget::AtTimestamp`] resolves through `build_snapshot!` to the
-/// version `latest_version_as_of` selects for a timestamp. `InMemory` collapses successive
-/// `put` timestamps into a single millisecond, so this writes on the local filesystem and
-/// sets each commit's modification time explicitly to get distinct, monotonic commit
-/// timestamps. Resolution correctness across timestamp/commit-layout combinations is covered
-/// by the `history_manager` unit tests; this is the end-to-end `TestTableBuilder` check.
+/// End-to-end check that [`VersionTarget::AtTimestamp`] resolves through `build_snapshot!`
+/// to the version `latest_version_as_of` selects. Written on the local filesystem with
+/// explicit, distinct per-commit modification times, which the in-memory sweep can't provide
+/// (see `version_at_timestamp_max`). Resolution correctness across layouts is covered by the
+/// `history_manager` unit tests.
 #[test]
 fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
