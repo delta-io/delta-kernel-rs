@@ -4,6 +4,7 @@
 
 use prost::Message;
 
+use super::plan::agg_fn as proto_agg_fn;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -15,8 +16,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    FileType, Filter, Load, LoadColumnFileMeta, MaxByVersion, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, AggFn, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Max, MaxNonNullBy, Min,
+    MinNonNullBy, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode, RefId};
 use crate::plans::{IoOperation, Operation};
@@ -155,7 +156,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
             Operator::Load(n) => Op::Load(n.into()),
-            Operator::MaxByVersion(n) => Op::MaxByVersion(n.into()),
+            Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
@@ -248,13 +249,48 @@ impl From<&LoadColumnFileMeta> for proto_plan::LoadColumnFileMeta {
     }
 }
 
-impl From<&MaxByVersion> for proto_plan::MaxByVersionNode {
-    fn from(node: &MaxByVersion) -> Self {
-        proto_plan::MaxByVersionNode {
-            group_by: convert_expr_vec(&node.group_by),
-            version_column: Some((&node.version_column).into()),
+impl From<&Aggregate> for proto_plan::AggregateNode {
+    fn from(node: &Aggregate) -> Self {
+        proto_plan::AggregateNode {
+            group_by: convert_vec(&node.group_by),
+            aggs: convert_vec(&node.aggs),
             schema: Some(node.schema.as_ref().into()),
         }
+    }
+}
+
+impl From<&Agg> for proto_plan::Agg {
+    fn from(agg: &Agg) -> Self {
+        proto_plan::Agg {
+            func: Some((&agg.func).into()),
+            alias: agg.alias.clone(),
+        }
+    }
+}
+
+impl From<&AggFn> for proto_plan::AggFn {
+    fn from(func: &AggFn) -> Self {
+        let func = match func {
+            AggFn::Min(Min { value }) => proto_agg_fn::Func::Min(proto_plan::MinAgg {
+                value: Some(value.into()),
+            }),
+            AggFn::Max(Max { value }) => proto_agg_fn::Func::Max(proto_plan::MaxAgg {
+                value: Some(value.into()),
+            }),
+            AggFn::MinNonNullBy(MinNonNullBy { value, key }) => {
+                proto_agg_fn::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
+                    value: Some(value.into()),
+                    key: Some(key.into()),
+                })
+            }
+            AggFn::MaxNonNullBy(MaxNonNullBy { value, key }) => {
+                proto_agg_fn::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
+                    value: Some(value.into()),
+                    key: Some(key.into()),
+                })
+            }
+        };
+        proto_plan::AggFn { func: Some(func) }
     }
 }
 
@@ -707,7 +743,7 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        FileType, Filter, Load, LoadColumnFileMeta, MaxByVersion, Operator, Project, ScanFile,
+        Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
         ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode, RefId};
@@ -1046,12 +1082,12 @@ mod tests {
         "load"
     )]
     #[case(
-        Operator::MaxByVersion(MaxByVersion {
+        Operator::Aggregate(Aggregate {
             group_by: vec![],
-            version_column: ColumnName::new(["version"]),
+            aggs: vec![],
             schema: sample_schema(),
         }),
-        "max_by_version"
+        "aggregate"
     )]
     #[case(
         Operator::SemiJoin(SemiJoin { inverted: false, probe_keys: vec![], build_keys: vec![] }),
@@ -1067,7 +1103,7 @@ mod tests {
             Op::Project(_) => "project",
             Op::Filter(_) => "filter",
             Op::Load(_) => "load",
-            Op::MaxByVersion(_) => "max_by_version",
+            Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
             Op::UnionAll(_) => "union_all",
         };
@@ -1188,16 +1224,36 @@ mod tests {
     }
 
     #[test]
-    fn from_max_by_version() {
-        let node = MaxByVersion {
-            group_by: vec![Arc::new(Expression::Column(ColumnName::new(["g"])))],
-            version_column: ColumnName::new(["v"]),
+    fn from_aggregate() {
+        let node = Aggregate {
+            group_by: vec![ColumnName::new(["g"])],
+            aggs: vec![Agg::max(ColumnName::new(["a"])).with_alias("a_max")],
             schema: sample_schema(),
         };
-        let proto = proto_plan::MaxByVersionNode::from(&node);
+        let proto = proto_plan::AggregateNode::from(&node);
         assert_eq!(proto.group_by.len(), 1);
-        assert!(proto.version_column.is_some());
+        assert_eq!(proto.aggs.len(), 1);
+        assert_eq!(proto.aggs[0].alias.as_deref(), Some("a_max"));
+        assert!(proto.aggs[0].func.is_some());
         assert!(proto.schema.is_some());
+    }
+
+    #[rstest]
+    #[case(Agg::min(ColumnName::new(["a"])), "min")]
+    #[case(Agg::max(ColumnName::new(["a"])), "max")]
+    #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
+    #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
+    fn from_agg_fn(#[case] agg: Agg, #[case] expected: &str) {
+        use proto_plan::agg_fn::Func;
+        let proto = proto_plan::Agg::from(&agg);
+        let kind = match proto.func.unwrap().func.unwrap() {
+            Func::Min(_) => "min",
+            Func::Max(_) => "max",
+            Func::MinNonNullBy(_) => "min_non_null_by",
+            Func::MaxNonNullBy(_) => "max_non_null_by",
+        };
+        assert_eq!(kind, expected);
+        assert_eq!(proto.alias, None);
     }
 
     #[rstest]
