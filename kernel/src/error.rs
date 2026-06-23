@@ -215,6 +215,14 @@ pub enum Error {
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
 
+    /// Row tracking (`delta.enableRowTracking`) must be enabled for the entire version range of a
+    /// row-tracking change feed, but it is not enabled at the given version.
+    #[error(
+        "Row tracking (delta.enableRowTracking) must be enabled for the entire row-tracking change \
+         feed range, but it is not enabled at version {0}"
+    )]
+    RowTrackingChangeFeedUnsupported(Version),
+
     #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
     ChangeDataFeedIncompatibleSchema(String, String),
 
@@ -322,6 +330,11 @@ impl Error {
     }
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
+    }
+    /// Creates an [`Error::RowTrackingChangeFeedUnsupported`] for the given version, used when row
+    /// tracking is not enabled at some point in a row-tracking change feed's version range.
+    pub(crate) fn row_tracking_change_feed_unsupported(version: impl Into<Version>) -> Self {
+        Self::RowTrackingChangeFeedUnsupported(version.into())
     }
     pub(crate) fn change_data_feed_incompatible_schema(
         expected: &StructType,

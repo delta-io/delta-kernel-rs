@@ -3,9 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use rstest::rstest;
 use test_utils::LoggingTest;
 
-use super::{table_changes_action_iter, TableChangesScanMetadata};
+use super::{
+    table_changes_action_iter, table_changes_action_iter_with_mode, TableChangesScanMetadata,
+};
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
@@ -16,8 +19,10 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
+use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_properties::ENABLE_ROW_TRACKING;
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
@@ -51,6 +56,54 @@ fn metadata_action(schema: SchemaRef, configuration: HashMap<String, String>) ->
     Action::Metadata(
         Metadata::try_new(None, None, schema.clone(), vec![], 0, configuration).unwrap(),
     )
+}
+
+/// Helper to create a Metadata action with row tracking enabled
+fn metadata_with_row_tracking(schema: SchemaRef) -> Action {
+    metadata_action(
+        schema,
+        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+    )
+}
+
+/// Table config that supports and enables row tracking, for the [`CdfMode::RowTracking`] path.
+fn get_row_tracking_table_config(table_root: &url::Url) -> TableConfiguration {
+    let metadata = Metadata::try_new(
+        None,
+        None,
+        get_schema(),
+        vec![],
+        0,
+        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+    )
+    .unwrap();
+    // RowTracking is a writer feature that requires DomainMetadata support.
+    let protocol = Protocol::try_new_modern(
+        TableFeature::EMPTY_LIST,
+        [TableFeature::RowTracking, TableFeature::DomainMetadata],
+    )
+    .unwrap();
+    TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
+}
+
+/// Runs row-tracking log replay over all commits of `mock_table` against the given end schema.
+fn execute_row_tracking(
+    engine: Arc<dyn Engine>,
+    mock_table: &LocalMockTable,
+    end_schema: SchemaRef,
+) -> DeltaResult<Vec<TableChangesScanMetadata>> {
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)?.into_iter();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_row_tracking_table_config(&table_root_url);
+    table_changes_action_iter_with_mode(
+        engine,
+        &table_config,
+        commits,
+        end_schema,
+        None,
+        CdfMode::RowTracking,
+    )?
+    .try_collect()
 }
 
 /// Helper to create a Metadata action with CDF enabled
@@ -341,6 +394,67 @@ async fn cdf_disabled_midstream() {
         .await;
 
     assert_midstream_failure(engine, &mock_table);
+}
+
+#[tokio::test]
+async fn row_tracking_disabled_midstream_fails() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    // First commit: row tracking enabled.
+    mock_table
+        .commit([metadata_with_row_tracking(get_schema())])
+        .await;
+    // Second commit: row tracking disabled.
+    mock_table
+        .commit([metadata_action(
+            get_schema(),
+            HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "false".to_string())]),
+        )])
+        .await;
+
+    let res = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
+    assert!(
+        matches!(&res, Err(Error::RowTrackingChangeFeedUnsupported(_))),
+        "expected row-tracking-disabled error, got {res:?}"
+    );
+}
+
+/// The row-tracking path allows additive schema evolution (a commit whose schema is readable-as the
+/// end schema) but rejects an incompatible one (a commit carrying a column the end schema lacks).
+#[rstest]
+#[case::additive(["id", "value"].as_slice(), ["id", "value", "year"].as_slice(), true)]
+#[case::incompatible(["id", "value", "year"].as_slice(), ["id", "value"].as_slice(), false)]
+#[tokio::test]
+async fn row_tracking_schema_compatibility(
+    #[case] commit_columns: &[&str],
+    #[case] end_columns: &[&str],
+    #[case] expect_compatible: bool,
+) {
+    let int_schema = |columns: &[&str]| {
+        Arc::new(StructType::new_unchecked(
+            columns
+                .iter()
+                .map(|name| StructField::nullable(*name, DataType::INTEGER)),
+        ))
+    };
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([metadata_with_row_tracking(int_schema(commit_columns))])
+        .await;
+    let res = execute_row_tracking(engine, &mock_table, int_schema(end_columns)).map(|_| ());
+    if expect_compatible {
+        assert!(
+            res.is_ok(),
+            "expected compatible schema to succeed, got {res:?}"
+        );
+    } else {
+        assert!(
+            matches!(&res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
+            "expected incompatible-schema error, got {res:?}"
+        );
+    }
 }
 
 // Test that unsupported protocol features added mid-stream are rejected
@@ -1055,9 +1169,14 @@ async fn file_meta_timestamp() {
     let file_meta_ts = commit.location.last_modified;
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let scanner =
-        LogReplayScanner::try_new(engine.as_ref(), &mut table_config, commit, &get_schema())
-            .unwrap();
+    let scanner = LogReplayScanner::try_new(
+        engine.as_ref(),
+        &mut table_config,
+        commit,
+        &get_schema(),
+        CdfMode::WriteTime,
+    )
+    .unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
 }
 
@@ -1350,9 +1469,14 @@ async fn test_timestamp_with_ict_enabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let scanner =
-        LogReplayScanner::try_new(engine.as_ref(), &mut table_config, commit, &get_schema())
-            .unwrap();
+    let scanner = LogReplayScanner::try_new(
+        engine.as_ref(),
+        &mut table_config,
+        commit,
+        &get_schema(),
+        CdfMode::WriteTime,
+    )
+    .unwrap();
     assert_eq!(scanner.timestamp, 2000);
 }
 
@@ -1401,6 +1525,7 @@ async fn test_timestamp_with_ict_disabled() {
         &mut table_config,
         commit.clone(),
         &get_schema(),
+        CdfMode::WriteTime,
     )
     .unwrap();
     assert_ne!(scanner.timestamp, 2000);
@@ -1453,8 +1578,13 @@ async fn test_timestamp_with_commit_info_not_first() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let result =
-        LogReplayScanner::try_new(engine.as_ref(), &mut table_config, commit, &get_schema());
+    let result = LogReplayScanner::try_new(
+        engine.as_ref(),
+        &mut table_config,
+        commit,
+        &get_schema(),
+        CdfMode::WriteTime,
+    );
 
     // Should error because ICT is enabled but not found in the first action
     assert_result_error_with_message(
