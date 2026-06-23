@@ -1579,7 +1579,7 @@ mod tests {
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::{ObjectStore as _, ObjectStoreExt as _};
+    use delta_kernel::object_store::{DynObjectStore, ObjectStore as _, ObjectStoreExt as _};
     use delta_kernel::schema::StructType;
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;
@@ -2092,11 +2092,11 @@ mod tests {
         r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
     );
 
-    /// Seed an in-memory table at version 0 from [`test_utils::METADATA`] (protocol + metadata,
-    /// plus its leading `commitInfo` which the checkpoint writer ignores), then append
-    /// `num_add_actions` single-add commits at versions 1..=num_add_actions.
+    /// Seed a table at version 0 from [`test_utils::METADATA`] (protocol + metadata, plus its
+    /// leading `commitInfo` which the checkpoint writer ignores), then append `num_add_actions`
+    /// single-add commits at versions 1..=num_add_actions.
     async fn seed_v1_table(
-        storage: &InMemory,
+        storage: &DynObjectStore,
         table_root: &str,
         num_add_actions: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2456,41 +2456,11 @@ mod tests {
             .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
-        // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
-        // add/remove commits.
-        let protocol_and_metadata = METADATA
-            .lines()
-            .skip(1) // skip commitInfo
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Use a temporary runtime for async setup, then drop it before FFI calls
+        // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
+        // built below drives all async work through its own (FFI-configured) executor.
         {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
-                add_commit(
-                    &table_root,
-                    storage.as_ref(),
-                    1,
-                    actions_to_string(vec![
-                        TestAction::Add("file1.parquet".into()),
-                        TestAction::Add("file2.parquet".into()),
-                    ]),
-                )
-                .await?;
-                add_commit(
-                    &table_root,
-                    storage.as_ref(),
-                    2,
-                    actions_to_string(vec![
-                        TestAction::Add("file3.parquet".into()),
-                        TestAction::Remove("file1.parquet".into()),
-                    ]),
-                )
-                .await?;
-                Ok::<_, Box<dyn std::error::Error>>(())
-            })?;
+            rt.block_on(seed_v1_table(storage.as_ref(), table_root, 2))?;
         } // runtime dropped here, before FFI calls
 
         // Build engine using FFI APIs
