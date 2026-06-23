@@ -65,10 +65,10 @@ mod feature_disabled {
             store.clone(),
             table_location,
             schema,
-            &[],
-            true,
-            vec![],
-            vec!["allowColumnDefaults"],
+            &[],                         /* partition_columns */
+            true,                        /* use_37_protocol */
+            vec![],                      /* reader_features */
+            vec!["allowColumnDefaults"], /* writer_features */
         )
         .await?;
 
@@ -120,10 +120,10 @@ mod feature_enabled {
             store.clone(),
             table_location,
             schema.clone(),
-            &[],
-            true,
-            vec![],
-            vec!["allowColumnDefaults"],
+            &[],                         /* partition_columns */
+            true,                        /* use_37_protocol */
+            vec![],                      /* reader_features */
+            vec!["allowColumnDefaults"], /* writer_features */
         )
         .await?;
         let engine = Arc::new(engine);
@@ -176,9 +176,9 @@ mod feature_enabled {
             store,
             table_location,
             schema,
-            &[],
-            true,
-            extra_features.to_vec(),
+            &[],                     /* partition_columns */
+            true,                    /* use_37_protocol */
+            extra_features.to_vec(), /* reader_features */
             writer_features,
         )
         .await?;
@@ -223,6 +223,8 @@ mod feature_enabled {
 
     // TIMESTAMP_NTZ is split out because it needs the orthogonal `timestampNtz` reader+writer
     // feature, unlike every other primitive literal above.
+    //
+    // TODO(#2630): Merge into the parameterized test once create supports column defaults
     #[tokio::test]
     async fn test_create_table_with_timestamp_ntz_column_default_persists_metadata(
     ) -> Result<(), Box<dyn std::error::Error>> {
