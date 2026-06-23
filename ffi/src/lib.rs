@@ -2164,14 +2164,15 @@ mod tests {
         Ok(())
     }
 
-    // Write a checkpoint, then call again on the same snapshot version. The FFI
-    // plumbing for both `Written` and `AlreadyExists` variants must work without error and
-    // return a snapshot whose version matches the input.
+    // Calling `checkpoint_snapshot` twice on the SAME (stale) input snapshot returns `Written`
+    // both times. The `AlreadyExists` short-circuit keys off the snapshot's own log segment
+    // (`checkpoint_version == end_version`), which never updates for the original handle, and the
+    // parquet writer silently overwrites on disk -- so neither call can observe `AlreadyExists`.
+    // Each returned snapshot reports the input version. (The `AlreadyExists` path is covered by
+    // `test_checkpoint_snapshot_written_snapshot_is_usable`, which chains the snapshot returned by
+    // the first checkpoint.)
     //
-    // NOTE: the kernel's checkpoint writer currently overwrites existing checkpoint files
-    // (no upfront `has_checkpoint` short-circuit, unlike `Snapshot::write_checksum`), so
-    // under both InMemory and LocalFileSystem the second call typically returns `Written`.
-    // The test accepts either outcome and asserts the FFI plumbing is sound.
+    // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2194,31 +2195,25 @@ mod tests {
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
-        // First call: extract the returned snapshot (accept either variant).
-        let first = unsafe {
-            ok_or_panic(checkpoint_snapshot(
+        // First call on the original snapshot: writes the checkpoint => `Written`.
+        let first_snap = unsafe {
+            unwrap_written(ok_or_panic(checkpoint_snapshot(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
                 None,
-            ))
-        };
-        let first_snap = match first {
-            FfiCheckpointWriteResult::Written(s) | FfiCheckpointWriteResult::AlreadyExists(s) => s,
+            )))
         };
         let first_version = unsafe { version(first_snap.shallow_copy()) };
         assert_eq!(first_version, input_version);
         unsafe { free_snapshot(first_snap) };
 
-        // Second call on the same input snapshot: must succeed with consistent version.
-        let second = unsafe {
-            ok_or_panic(checkpoint_snapshot(
+        // Second call on the same (stale) input snapshot: overwrites => `Written` again.
+        let second_snap = unsafe {
+            unwrap_written(ok_or_panic(checkpoint_snapshot(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
                 None,
-            ))
-        };
-        let second_snap = match second {
-            FfiCheckpointWriteResult::Written(s) | FfiCheckpointWriteResult::AlreadyExists(s) => s,
+            )))
         };
         let second_version = unsafe { version(second_snap.shallow_copy()) };
         assert_eq!(second_version, input_version);
