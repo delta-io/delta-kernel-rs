@@ -256,7 +256,7 @@ impl TableChanges {
             engine,
             start_version,
             end_version,
-            CdfMode::RowTracking,
+            CdfMode::ReadTime,
         )
     }
 
@@ -394,7 +394,7 @@ impl TableChanges {
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CdfListingFile>>> {
-        if self.mode != CdfMode::RowTracking {
+        if self.mode != CdfMode::ReadTime {
             return Err(Error::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
                  the TableChanges with TableChanges::try_new_row_tracking",
@@ -409,7 +409,7 @@ impl TableChanges {
             commits,
             schema,
             None,
-            CdfMode::RowTracking,
+            CdfMode::ReadTime,
         )?;
         let listing = scan_metadata_to_scan_file(scan_metadata)
             .map(|scan_file| CdfListingFile::try_from_scan_file(scan_file?));

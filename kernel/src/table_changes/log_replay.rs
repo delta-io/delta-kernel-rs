@@ -68,7 +68,7 @@ pub(crate) fn table_changes_action_iter(
 }
 
 /// Like [`table_changes_action_iter`], but selects the change-feed semantics via `mode`. The
-/// row-tracking listing path ([`TableChanges::scan_file_listing`]) uses [`CdfMode::RowTracking`];
+/// row-tracking listing path ([`TableChanges::scan_file_listing`]) uses [`CdfMode::ReadTime`];
 /// the data-reading path uses [`CdfMode::WriteTime`].
 ///
 /// [`TableChanges::scan_file_listing`]: crate::table_changes::TableChanges::scan_file_listing
@@ -250,7 +250,11 @@ impl LogReplayScanner {
                 // (strict equality vs. additive evolution) lives in `CdfMode::schemas_compatible`.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
+                    Error::change_data_feed_incompatible_schema_at_version(
+                        table_schema,
+                        &schema,
+                        commit_file.version
+                    )
                 );
             }
 
