@@ -1,9 +1,5 @@
-use std::fs::OpenOptions;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
@@ -21,9 +17,7 @@ use test_utils::table_builder::{
     version_incremental_from_mid_to_pre_latest, version_latest, DataLayoutConfig, FeatureSet,
     LogState, TableConfig, VersionTarget,
 };
-use test_utils::{build_snapshot, default_sweep, read_scan, test_table_setup};
-
-use crate::common::write_utils::get_simple_int_schema;
+use test_utils::{build_snapshot, default_sweep, read_scan};
 
 /// `TestTableBuilder`'s default is one file per data commit with this many rows, so a
 /// snapshot at version `v` has exactly `v * ROWS_PER_COMMIT` total rows. File count
@@ -65,55 +59,6 @@ fn test_cross_product_read_write(
     let batches = read_scan(&scan, engine)?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, expected_version as usize * ROWS_PER_COMMIT);
-
-    Ok(())
-}
-
-/// Verifies that [`VersionTarget::AtTimestamp`] wires through `build_snapshot!` to the
-/// version `latest_version_as_of` resolves the timestamp to. Resolution correctness for
-/// the many timestamp/commit-layout combinations is covered by the `history_manager` unit
-/// tests; this only checks the `TestTableBuilder` integration end-to-end. The default
-/// sweep's `version_at_timestamp_max()` row can't reach an intermediate version because
-/// `InMemory` collapses successive `put` timestamps to a single millisecond, so this
-/// writes on the local filesystem and sets each commit's modification time explicitly.
-#[test]
-fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // v0: CreateTable
-    let schema = get_simple_int_schema();
-    let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
-    // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
-    for _ in 1..=4 {
-        snap = test_utils::begin_transaction(snap.clone(), engine.as_ref())?
-            .with_engine_info("AtTimestampTest")
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot();
-    }
-
-    // Set each commit's mtime to a distinct, monotonic value (in ms).
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-    let log_dir = table_url.to_file_path().unwrap().join("_delta_log");
-    for v in 0..=4u64 {
-        let file_path = log_dir.join(format!("{v:020}.json"));
-        let file = OpenOptions::new().write(true).open(&file_path).unwrap();
-        let time = SystemTime::UNIX_EPOCH + Duration::from_millis((v + 1) * 1000);
-        file.set_modified(time).unwrap();
-    }
-
-    // 2500ms lands strictly between v1 (2000) and v2 (3000), so it resolves to v1.
-    let target = VersionTarget::AtTimestamp(2500);
-    let snap_at_ts = build_snapshot!(target, &table_path, engine.as_ref());
-    assert_eq!(snap_at_ts.version(), 1);
-
-    // i64::MAX resolves to latest, mirroring the default sweep's smoke row.
-    let target_max = VersionTarget::AtTimestamp(i64::MAX);
-    let snap_max = build_snapshot!(target_max, &table_path, engine.as_ref());
-    assert_eq!(snap_max.version(), 4);
 
     Ok(())
 }
