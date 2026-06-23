@@ -3,24 +3,29 @@
 //! Each test builds a table, attaches a metrics reporter, runs a commit, and asserts the
 //! commit metrics a real connector would observe.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, TransactionCommitSuccess};
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    insert_data, insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt,
+    begin_transaction, insert_data, insert_data_with, install_thread_local_metrics_reporter,
+    test_table_setup_mt,
 };
 use url::Url;
 
 use super::table_type::{create_simple_table, make_committer};
 use super::{measuring_engine, simple_schema};
+use crate::common::write_utils::{create_dv_table_with_files, get_scan_files};
 
 /// Reporter that keeps the last `TransactionCommitSuccess` for field-level assertions.
 #[derive(Debug, Default)]
@@ -183,5 +188,57 @@ async fn commit_success_carries_table_type(#[case] catalog_managed: bool) -> Del
         success.table_type,
         TableType::from_catalog_managed(catalog_managed)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_dv_update_reports_updated_file_count_not_batch_count(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Three files get a new deletion vector in a single update_deletion_vectors call.
+    // num_dv_updates must be the count of updated FILES (3), not the number of scan-metadata
+    // batches they arrive in -- a single batch carrying all three would otherwise report 1.
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+    let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
+    let (_store, engine, table_url, file_paths) =
+        create_dv_table_with_files("dv_metrics_table", schema, file_names).await?;
+
+    let reporter = Arc::new(LastCommitSuccess::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    let mut scan_files = get_scan_files(snapshot, engine.as_ref())?;
+    let dv_map: HashMap<String, DeletionVectorDescriptor> = file_paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let descriptor = DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedRelative,
+                path_or_inline_dv: format!("dv_file_{idx}.bin"),
+                offset: Some(idx as i32 * 10),
+                size_in_bytes: 40 + idx as i32,
+                cardinality: idx as i64 + 1,
+            };
+            (path.to_string(), descriptor)
+        })
+        .collect();
+    txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let success = reporter
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("commit success event");
+    // 3 files were DV-updated in this commit; the metric must report the file count, not the
+    // number of scan-metadata batches they arrived in.
+    assert_eq!(success.num_dv_updates, 3);
     Ok(())
 }

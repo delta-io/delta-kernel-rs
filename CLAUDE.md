@@ -258,9 +258,10 @@ Keep this list updated when new protocol features are added to kernel.
   any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
   `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
   and deadlock on the same lock. In `on_new_span`, no extension lock is held during
-  `attrs.record()`, so direct `warn!()` is safe there. In `on_event` and `on_record`, store
-  warnings in a `pending_warnings: Vec<String>` field on the visitor, take them out after
-  the extensions block closes, and emit via `warn!()` only then. See
+  `attrs.record()`, so direct `warn!()` is safe there. In `on_record`, store warnings in a
+  `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
+  block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
+  warning-eligible work, so it may run under the lock directly.) See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
 
 ## Code Style
