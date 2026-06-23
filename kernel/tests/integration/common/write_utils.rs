@@ -21,7 +21,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt as _};
+use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
@@ -459,7 +459,7 @@ pub async fn write_deletion_vector_to_store(
     let dv_write_result = dv_writer.write_deletion_vector(dv)?;
     dv_writer.finalize()?;
 
-    store.put(&dv_object_path, dv_buffer.into()).await?;
+    ObjectStoreExt::put(store, &dv_object_path, dv_buffer.into()).await?;
 
     Ok(dv_write_result.to_descriptor(&dv_path))
 }
