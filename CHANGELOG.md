@@ -16,6 +16,20 @@
 > delta_kernel = "0.25.0"
 > delta_kernel_default_engine = { version = "0.25.0", features = [/* any features you choose */] }
 > ```
+>
+> Update your `use` statements:
+>
+> ```rust
+> // before (v0.24.0)
+> use delta_kernel::engine::default::DefaultEngine;
+> use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+> use delta_kernel::engine::default::storage::store_from_url;
+>
+> // after (v0.25.0)
+> use delta_kernel_default_engine::DefaultEngine;
+> use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+> use delta_kernel_default_engine::storage::store_from_url;
+> ```
 
 
 ### 🏗️ Breaking changes
