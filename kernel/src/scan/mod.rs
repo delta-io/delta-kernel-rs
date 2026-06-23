@@ -187,6 +187,36 @@ impl StatsOptions {
     }
 }
 
+/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
+/// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
+/// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
+///
+/// When the typed struct is requested, scan metadata output gains a top-level
+/// `partitionValues_parsed` struct column with one typed nullable field per partition column
+/// (physical names, table partition-column order). On non-partitioned tables the column is
+/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
+/// when present, otherwise from parsing the string map.
+#[derive(Clone, Debug, Default)]
+pub struct PartitionValuesOptions {
+    /// Whether to emit the typed `partitionValues_parsed` struct column.
+    pub(crate) parsed_struct: bool,
+}
+
+impl PartitionValuesOptions {
+    /// Raw string map only, no typed struct. Equivalent to [`Default::default`].
+    pub fn string_map_only() -> Self {
+        Self::default()
+    }
+
+    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map. Lets engines
+    /// consume `partitionValues_parsed` directly instead of parsing the string map per row.
+    pub fn with_struct() -> Self {
+        Self {
+            parsed_struct: true,
+        }
+    }
+}
+
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
@@ -195,6 +225,7 @@ pub struct ScanBuilder {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
+    partition_values: PartitionValuesOptions,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -205,6 +236,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("stats", &self.stats)
             .field("correlation_id", &self.correlation_id)
             .field("without_row_transforms", &self.without_row_transforms)
+            .field("partition_values", &self.partition_values)
             .finish()
     }
 }
@@ -219,6 +251,7 @@ impl ScanBuilder {
             stats: StatsOptions::default(),
             correlation_id: None,
             without_row_transforms: false,
+            partition_values: PartitionValuesOptions::default(),
         }
     }
 
@@ -306,6 +339,16 @@ impl ScanBuilder {
         self
     }
 
+    /// Configure partition value output for the scan. See [`PartitionValuesOptions`].
+    ///
+    /// Defaults to [`PartitionValuesOptions::default`] (string map only). Engines that
+    /// consume `partitionValues_parsed` directly should pass
+    /// [`PartitionValuesOptions::with_struct`] to also emit the typed struct column.
+    pub fn with_partition_values(mut self, partition_values: PartitionValuesOptions) -> Self {
+        self.partition_values = partition_values;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -342,6 +385,7 @@ impl ScanBuilder {
             self.snapshot.table_configuration(),
             self.predicate,
             &self.stats,
+            &self.partition_values,
             (), // No classifier, default is for scans
         )?;
 
@@ -354,6 +398,7 @@ impl ScanBuilder {
             state_info: Arc::new(state_info),
             stats: self.stats,
             correlation_id: self.correlation_id,
+            partition_values: self.partition_values,
         })
     }
 }
@@ -614,6 +659,7 @@ pub struct Scan {
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
+    partition_values: PartitionValuesOptions,
 }
 
 impl std::fmt::Debug for Scan {
@@ -638,6 +684,13 @@ impl Scan {
         log_replay::ScanStatsOptions {
             skip_stats: self.skip_stats(),
             synthesize_json: self.stats.synthesize_json,
+        }
+    }
+
+    /// Build the partition-value read options passed to [`ScanLogReplayProcessor`].
+    fn partition_values_options(&self) -> log_replay::ScanPartitionValuesOptions {
+        log_replay::ScanPartitionValuesOptions {
+            parsed_struct: self.partition_values.parsed_struct,
         }
     }
 
@@ -892,6 +945,7 @@ impl Scan {
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
+                    self.partition_values_options(),
                 )?;
                 (Some(it), m)
             }
@@ -1062,6 +1116,7 @@ impl Scan {
             self.state_info.clone(),
             checkpoint_info,
             self.stats_options(),
+            self.partition_values_options(),
         )?;
         let sequential =
             SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
@@ -1194,7 +1249,10 @@ impl Scan {
     }
 }
 
-/// Get the schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.
+/// Get the base schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.
+///
+/// This is the base shape; engines may add trailing `*_parsed` columns by opting in via
+/// [`StatsOptions`] (`stats_parsed`) or [`PartitionValuesOptions`] (`partitionValues_parsed`).
 ///
 /// It is:
 /// ```ignored

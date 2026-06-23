@@ -294,7 +294,9 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, TableType};
-    use crate::scan::log_replay::{ScanLogReplayProcessor, ScanStatsOptions};
+    use crate::scan::log_replay::{
+        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+    };
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
@@ -326,6 +328,7 @@ mod tests {
             state_info,
             CheckpointReadInfo::without_stats_parsed(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let serialized = processor.into_serializable_state().unwrap();
