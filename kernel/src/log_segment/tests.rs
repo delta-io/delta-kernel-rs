@@ -33,6 +33,7 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
+use crate::snapshot::Snapshot;
 use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
 };
@@ -2711,31 +2712,46 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
 }
 
-/// A V2 checkpoint hint's schema is used only when the hint names the checkpoint file the segment
-/// selected. Multiple V2 checkpoints can share a version, so a hint describing a different
-/// same-version V2 checkpoint must be ignored (the version match alone is not enough).
-#[rstest]
-#[case::identity_matches(true)]
-#[case::identity_mismatch(false)]
-fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> DeltaResult<()> {
-    let (_store, log_root) = new_in_memory_store();
+fn synthetic_sidecar() -> Sidecar {
+    Sidecar {
+        path: "sidecar-1.parquet".to_string(),
+        size_in_bytes: 42,
+        modification_time: 1,
+        tags: None,
+    }
+}
 
+/// A V2 hint's fields are trusted only when the hint names the checkpoint file the segment selected
+/// -- several V2 checkpoints can share a version, so a version match alone is not enough.
+/// `checkpoint_schema` and `checkpoint_sidecars` share that identity gate: on a match both surface
+/// the hint's values verbatim (an explicit empty sidecar list as `Some([])`, distinct from absent
+/// -- the contract the scan-shape fast path relies on); on a mismatch both are suppressed.
+#[rstest]
+#[case::matched(true, vec![synthetic_sidecar()], Some(vec![synthetic_sidecar()]))]
+#[case::matched_empty_sidecars(true, vec![], Some(vec![]))]
+#[case::mismatched(false, vec![synthetic_sidecar()], None)]
+fn test_v2_hint_accessors_identity_filter(
+    #[case] hint_names_selected: bool,
+    #[case] hint_sidecars: Vec<Sidecar>,
+    #[case] expected_sidecars: Option<Vec<Sidecar>>,
+) -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
     let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
     let other = "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet";
     let checkpoint_file = log_root.join(selected)?.to_string();
-    let hint_name = if identity_matches { selected } else { other };
+    let hint_name = if hint_names_selected { selected } else { other };
 
     let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
         "metadata",
         StructType::new_unchecked([]),
     )]));
 
-    let commit_v2 = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
-            ascending_commit_files: vec![commit_v2.clone()],
-            latest_commit_file: Some(commit_v2),
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
             ..Default::default()
         },
         log_root,
@@ -2745,6 +2761,7 @@ fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> 
             checkpoint_schema: Some(hint_schema.clone()),
             v2_checkpoint: Some(LastCheckpointV2 {
                 path: hint_name.to_string(),
+                sidecar_files: Some(hint_sidecars),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2752,101 +2769,14 @@ fn test_checkpoint_schema_v2_identity_filter(#[case] identity_matches: bool) -> 
     )?;
 
     assert_eq!(log_segment.checkpoint_version, Some(1));
-    if identity_matches {
-        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
-    } else {
-        assert!(
-            log_segment.checkpoint_schema().is_none(),
-            "hint describing a different same-version V2 checkpoint must not be used"
-        );
-    }
-    Ok(())
-}
-
-/// `checkpoint_sidecars()` exposes the hint's sidecar refs through the same identity gate as
-/// `checkpoint_schema()`: only when the hint names the selected checkpoint. A hint describing a
-/// different same-version V2 checkpoint must not leak its sidecars.
-#[rstest]
-#[case::identity_matches(true)]
-#[case::identity_mismatch(false)]
-fn test_checkpoint_sidecars_identity_filter(#[case] identity_matches: bool) -> DeltaResult<()> {
-    let (_store, log_root) = new_in_memory_store();
-
-    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
-    let other = "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet";
-    let checkpoint_file = log_root.join(selected)?.to_string();
-    let hint_name = if identity_matches { selected } else { other };
-
-    let sidecars = vec![Sidecar {
-        path: "sidecar-1.parquet".to_string(),
-        size_in_bytes: 42,
-        modification_time: 1,
-        tags: None,
-    }];
-
-    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
-    let log_segment = LogSegment::try_new(
-        LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
-            ascending_commit_files: vec![commit.clone()],
-            latest_commit_file: Some(commit),
-            ..Default::default()
-        },
-        log_root,
-        None,
-        Some(LastCheckpointHint {
-            version: 1,
-            v2_checkpoint: Some(LastCheckpointV2 {
-                path: hint_name.to_string(),
-                sidecar_files: Some(sidecars.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-    )?;
-
-    if identity_matches {
-        assert_eq!(log_segment.checkpoint_sidecars(), Some(sidecars.as_slice()));
-    } else {
-        assert!(
-            log_segment.checkpoint_sidecars().is_none(),
-            "sidecars from a hint describing a different checkpoint must not be exposed"
-        );
-    }
-    Ok(())
-}
-
-/// A matched hint that explicitly lists no sidecars yields `Some(&[])`, not `None` -- the contract
-/// the scan-shape fast path relies on (its `.first()` then falls through rather than treating the
-/// empty list as a leaf). `None` would conflate "no sidecar field" with "explicitly empty".
-#[test]
-fn test_checkpoint_sidecars_empty_list_is_some_empty() -> DeltaResult<()> {
-    let (_store, log_root) = new_in_memory_store();
-
-    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
-    let checkpoint_file = log_root.join(selected)?.to_string();
-    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
-    let log_segment = LogSegment::try_new(
-        LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
-            ascending_commit_files: vec![commit.clone()],
-            latest_commit_file: Some(commit),
-            ..Default::default()
-        },
-        log_root,
-        None,
-        Some(LastCheckpointHint {
-            version: 1,
-            v2_checkpoint: Some(LastCheckpointV2 {
-                path: selected.to_string(),
-                sidecar_files: Some(vec![]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-    )?;
-
-    assert_eq!(log_segment.checkpoint_sidecars(), Some([].as_slice()));
+    assert_eq!(
+        log_segment.checkpoint_schema(),
+        hint_names_selected.then(|| hint_schema.clone())
+    );
+    assert_eq!(
+        log_segment.checkpoint_sidecars(),
+        expected_sidecars.as_deref()
+    );
     Ok(())
 }
 
@@ -2906,52 +2836,26 @@ fn test_checkpoint_schema_v1_multipart_numparts_identity(
     Ok(())
 }
 
-/// Exercises the identity filter against real V2 checkpoint fixtures. When a table's
-/// `_last_checkpoint` carries a V2 identity that does NOT name the checkpoint the segment selected,
-/// the hint must be suppressed (not applied to the wrong file). `v2-classic-checkpoint-parquet` is
-/// exactly that case: its `_last_checkpoint` points at a UUID-named checkpoint while the segment
-/// selects the classic-named one, so `checkpoint_schema()` falls back to a footer read.
-#[rstest]
-#[case::parquet_with_last_checkpoint("v2-checkpoints-parquet-with-last-checkpoint")]
-#[case::json_with_last_checkpoint("v2-checkpoints-json-with-last-checkpoint")]
-#[case::parquet_with_sidecars("v2-checkpoints-parquet-with-sidecars")]
-#[case::json_with_sidecars("v2-checkpoints-json-with-sidecars")]
-#[case::classic_parquet("v2-classic-checkpoint-parquet")]
-fn checkpoint_schema_identity_on_real_v2_tables(#[case] table: &str) -> DeltaResult<()> {
-    use crate::utils::test_utils::load_test_table;
-
-    let (_engine, snapshot, _tempdir) = load_test_table(table)?;
-    let seg = snapshot.log_segment();
+/// Returns the single `actions` element matching `extract`, asserting there is exactly one.
+fn one_action<'a, T: 'a>(
+    actions: &'a [HintAction],
+    extract: impl Fn(&'a HintAction) -> Option<&'a T>,
+) -> &'a T {
+    let mut matching = actions.iter().filter_map(extract);
+    let found = matching.next().expect("expected a matching action");
     assert!(
-        seg.checkpoint_version.is_some(),
-        "{table}: expected a checkpoint"
+        matching.next().is_none(),
+        "expected exactly one matching action"
     );
-
-    if let Some(v2_path) = seg
-        .last_checkpoint_hint()
-        .and_then(|h| h.v2_checkpoint)
-        .map(|v2| v2.path)
-    {
-        let selected = &seg
-            .listed
-            .checkpoint_parts
-            .first()
-            .expect("checkpoint present")
-            .filename;
-        // A hint naming a different checkpoint than the one we selected must not be trusted.
-        if &v2_path != selected {
-            assert!(
-                seg.checkpoint_schema().is_none(),
-                "{table}: hint names {v2_path} but segment selected {selected}; must be suppressed"
-            );
-        }
-    }
-    Ok(())
+    found
 }
 
 /// The full `v2Checkpoint` hint parses from real V2 checkpoint tables: identity, sidecar
-/// references, and non-file actions that deserialize into kernel's action structs. Also
-/// cross-checks that the hint the segment retains agrees with the freshly-read one.
+/// references, and non-file actions that deserialize into kernel's action structs. Cross-checks the
+/// embedded protocol/metadata against the table's real state, that the segment retains the hint in
+/// full, and that the identity gate exposes a matched hint's sidecars but suppresses a mismatched
+/// one (`v2-classic-checkpoint-parquet`, whose hint names a UUID checkpoint while the segment
+/// selects the classic-named one).
 #[rstest]
 #[case::parquet_sidecars("v2-checkpoints-parquet-with-sidecars")]
 #[case::json_sidecars("v2-checkpoints-json-with-sidecars")]
@@ -2968,38 +2872,92 @@ fn parses_real_v2_last_checkpoint(#[case] table: &str) -> DeltaResult<()> {
         .expect("table has a _last_checkpoint");
     let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
 
-    assert!(v2.path.contains(".checkpoint."), "{table}: {}", v2.path);
+    // The hint names a real V2 checkpoint file whose name encodes the hint's own version.
+    assert!(
+        v2.path
+            .starts_with(&format!("{:020}.checkpoint.", hint.version)),
+        "{table}: v2 path {} should encode version {}",
+        v2.path,
+        hint.version
+    );
     assert!(v2.size_in_bytes.is_some_and(|b| b > 0), "{table}: size");
 
+    // A manifest checkpoint references at least one `.parquet` sidecar.
     let sidecars = v2.sidecar_files.as_ref().expect("sidecarFiles present");
-    assert!(!sidecars.is_empty() && sidecars.iter().all(|s| !s.path.is_empty()));
+    assert!(!sidecars.is_empty(), "{table}: expected sidecars");
+    assert!(
+        sidecars.iter().all(|s| s.path.ends_with(".parquet")),
+        "{table}: sidecar paths must be .parquet"
+    );
 
+    // A checkpoint carries exactly one protocol, one metadata, and one checkpointMetadata whose
+    // version is this checkpoint's version.
     let actions = v2
         .non_file_actions
         .as_ref()
         .expect("nonFileActions present");
-    assert!(
-        actions.iter().any(|a| matches!(a, HintAction::Protocol(_))),
-        "{table}: protocol"
-    );
-    assert!(
-        actions.iter().any(|a| matches!(a, HintAction::Metadata(_))),
-        "{table}: metaData"
-    );
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, HintAction::CheckpointMetadata(_))),
-        "{table}: checkpointMetadata"
+    let protocol = one_action(actions, |a| match a {
+        HintAction::Protocol(p) => Some(p),
+        _ => None,
+    });
+    let metadata = one_action(actions, |a| match a {
+        HintAction::Metadata(m) => Some(m),
+        _ => None,
+    });
+    let checkpoint_metadata = one_action(actions, |a| match a {
+        HintAction::CheckpointMetadata(c) => Some(c),
+        _ => None,
+    });
+    assert_eq!(
+        checkpoint_metadata.version as u64, hint.version,
+        "{table}: checkpointMetadata.version"
     );
 
-    // The retained hint agrees with the freshly-read one.
-    let retained = seg.last_checkpoint_hint().expect("retained hint");
+    // Gold cross-check: the hint's embedded protocol and metadata equal the table's real ones AT
+    // the checkpoint version, proving the hint faithfully mirrors the checkpoint it describes.
+    let at_checkpoint = Snapshot::builder_for(snapshot.table_configuration().table_root().as_str())
+        .at_version(hint.version)
+        .build(engine.as_ref())?;
+    let tc = at_checkpoint.table_configuration();
     assert_eq!(
-        retained.v2_checkpoint.as_ref().map(|v2| v2.path.as_str()),
-        Some(v2.path.as_str())
+        protocol,
+        tc.protocol(),
+        "{table}: embedded protocol mirrors table"
     );
-    assert_eq!(retained.parts, hint.parts);
+    assert_eq!(
+        metadata,
+        tc.metadata(),
+        "{table}: embedded metadata mirrors table"
+    );
+
+    // Identity gate: a hint naming the selected checkpoint exposes its sidecars through the
+    // accessor; one naming a different same-version checkpoint is fully suppressed.
+    let selected = &seg
+        .listed
+        .checkpoint_parts
+        .first()
+        .expect("checkpoint present")
+        .filename;
+    if &v2.path == selected {
+        assert_eq!(
+            seg.checkpoint_sidecars(),
+            v2.sidecar_files.as_deref(),
+            "{table}: matched hint exposes its sidecars"
+        );
+    } else {
+        assert!(
+            seg.checkpoint_schema().is_none() && seg.checkpoint_sidecars().is_none(),
+            "{table}: mismatched hint ({}) must be suppressed",
+            v2.path
+        );
+    }
+
+    // The segment retains the freshly-read hint in full, not a lossy projection of it.
+    assert_eq!(
+        seg.last_checkpoint_hint().as_ref(),
+        Some(&hint),
+        "{table}: retained hint"
+    );
     Ok(())
 }
 
