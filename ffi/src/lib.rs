@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::history_manager::{
-    get_earliest_commit as kernel_get_earliest_commit, HistoryCommitType,
+    first_version_after as kernel_first_version_after,
+    get_earliest_commit as kernel_get_earliest_commit,
+    latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
 };
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
@@ -1086,6 +1088,87 @@ fn get_earliest_commit_impl(
     )
 }
 
+/// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe
+/// mirror of [`CommitAt`].
+#[repr(C)]
+pub struct FfiCommitAt {
+    /// The commit version.
+    pub version: Version,
+    /// Timestamp (milliseconds since the Unix epoch) associated with this commit. This is the
+    /// commit's in-commit timestamp (ICT) when ICT is enabled, otherwise the commit's file
+    /// modification time.
+    pub timestamp: i64,
+}
+
+impl From<CommitAt> for FfiCommitAt {
+    fn from(commit: CommitAt) -> Self {
+        Self {
+            version: commit.version,
+            timestamp: commit.timestamp,
+        }
+    }
+}
+
+/// Get the latest commit (version and timestamp) within `snapshot`'s version range with a
+/// timestamp at or before `timestamp` (milliseconds since the Unix epoch). `commit_type` selects
+/// whether to return any version present in the log ([`FfiHistoryCommitType::Published`]) or only a
+/// version whose table can be fully reconstructed ([`FfiHistoryCommitType::Recreatable`]).
+///
+/// Returns an error if no version exists at or before `timestamp`,
+/// or when there is an error resolving the commit based on the [`FfiHistoryCommitType`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn latest_version_as_of(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    timestamp: i64,
+    commit_type: FfiHistoryCommitType,
+) -> ExternResult<FfiCommitAt> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    kernel_latest_version_as_of(
+        snapshot,
+        engine_ref.engine().as_ref(),
+        timestamp,
+        commit_type.into(),
+    )
+    .map(FfiCommitAt::from)
+    .into_extern_result(&engine_ref)
+}
+
+/// Get the first commit (version and timestamp) within `snapshot`'s version range with a
+/// timestamp at or after `timestamp` (milliseconds since the Unix epoch). `commit_type` selects
+/// whether to return any version present in the log ([`FfiHistoryCommitType::Published`]) or only a
+/// version whose table can be fully reconstructed ([`FfiHistoryCommitType::Recreatable`]).
+///
+/// Returns an error if no version exists at or after `timestamp`,
+/// or when there is an error resolving the commit based on the [`FfiHistoryCommitType`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn first_version_after(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    timestamp: i64,
+    commit_type: FfiHistoryCommitType,
+) -> ExternResult<FfiCommitAt> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    kernel_first_version_after(
+        snapshot,
+        engine_ref.engine().as_ref(),
+        timestamp,
+        commit_type.into(),
+    )
+    .map(FfiCommitAt::from)
+    .into_extern_result(&engine_ref)
+}
+
 /// Get the logical schema of the specified snapshot
 ///
 /// # Safety
@@ -1431,6 +1514,7 @@ mod tests {
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
         actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
         METADATA, METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
+        TEST_ICT_ENABLEMENT_TIMESTAMP,
     };
     use url::Url;
 
@@ -1779,7 +1863,7 @@ mod tests {
         // create_table with "inCommitTimestamp" in writer_features sets up:
         //   - protocol v3.7 with writerFeatures=["inCommitTimestamp"]
         //   - metadata config: enableInCommitTimestamps=true, enablement version/timestamp
-        //   - commitInfo with inCommitTimestamp=1612345678 (fixed test value)
+        //   - commitInfo with inCommitTimestamp=TEST_ICT_ENABLEMENT_TIMESTAMP
         create_table(
             storage.clone(),
             Url::parse(table_root)?,
@@ -1802,7 +1886,69 @@ mod tests {
                 engine.shallow_copy(),
             ))
         };
-        assert_eq!(ts, 1612345678_i64);
+        assert_eq!(ts, TEST_ICT_ENABLEMENT_TIMESTAMP);
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    type HistoryQueryFn = unsafe extern "C" fn(
+        Handle<SharedSnapshot>,
+        Handle<SharedExternEngine>,
+        i64,
+        FfiHistoryCommitType,
+    ) -> ExternResult<FfiCommitAt>;
+
+    #[rstest]
+    #[case::latest_version_query_at_ict(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
+    #[case::first_version_after_query_at_ict(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
+    #[case::latest_version_query_out_of_range(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP - 1, Err(KernelError::LogHistoryError))]
+    #[case::first_version_after_query_out_of_range(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP + 1, Err(KernelError::LogHistoryError))]
+    #[tokio::test]
+    async fn test_snapshot_version_at_timestamp_cases(
+        #[case] query: HistoryQueryFn,
+        #[case] timestamp: i64,
+        #[case] expected: Result<(Version, i64), KernelError>,
+        #[values(FfiHistoryCommitType::Published, FfiHistoryCommitType::Recreatable)]
+        commit_type: FfiHistoryCommitType,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+
+        create_table(
+            storage.clone(),
+            Url::parse(table_root)?,
+            Arc::new(StructType::try_new([]).unwrap()),
+            &[],
+            true,
+            vec![],
+            vec!["inCommitTimestamp"],
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let result = unsafe {
+            query(
+                snap.shallow_copy(),
+                engine.shallow_copy(),
+                timestamp,
+                commit_type,
+            )
+        };
+
+        match expected {
+            Ok((version, ts)) => {
+                let commit = ok_or_panic(result);
+                assert_eq!(commit.version, version);
+                assert_eq!(commit.timestamp, ts);
+            }
+            Err(kind) => assert_extern_result_error_with_message(result, kind, None),
+        }
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
