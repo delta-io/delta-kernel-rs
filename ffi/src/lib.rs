@@ -1995,10 +1995,12 @@ mod tests {
     /// Count the entries in a given object_store prefix.
     async fn count_objects_with_prefix(storage: &InMemory, prefix: &str) -> usize {
         let prefix_path = Path::from(prefix);
-        match storage.list_with_delimiter(Some(&prefix_path)).await {
-            Ok(result) => result.objects.len(),
-            Err(_) => 0,
-        }
+        storage
+            .list_with_delimiter(Some(&prefix_path))
+            .await
+            .expect("list_with_delimiter should succeed")
+            .objects
+            .len()
     }
 
     /// Extract the `Handle<SharedSnapshot>` from the `Written` variant; panics on
