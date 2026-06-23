@@ -191,11 +191,13 @@ pub(crate) fn stats_column_names(
     columns
 }
 
-/// Strips all field metadata from a schema.
+/// Strips field metadata from every field in a schema, at all levels of nesting (nested
+/// sub-fields are stripped too, not just top-level fields). Field types, names, and nullability
+/// are preserved; only the metadata map is cleared.
 ///
-/// Field metadata describes the logical table column, not the stats values themselves. This
-/// transform strips that metadata, and must be applied to stats schemas to avoid schema possible
-/// mismatches when reading `stats_parsed` from older data since that field metadata could have
+/// Used wherever a derived schema should carry no field metadata. For example, stats schemas must
+/// strip it to avoid possible schema mismatches when reading `stats_parsed` from older data, since
+/// that metadata (which describes the logical table column, not the stats values) could have
 /// changed.
 pub(crate) struct StripFieldMetadataTransform;
 impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
