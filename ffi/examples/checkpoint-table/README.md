@@ -20,7 +20,7 @@ $ ./checkpoint_table /path/to/existing/table <sub-flow>
 The `<sub-flow>` argument selects one of three demos:
 
 - `default` -- pass `spec = NULL`. The kernel auto-picks V1 or V2 from the
-  table's protocol features and writes an inline checkpoint with no sidecars.
+  table's protocol features and writes a single-file checkpoint with no sidecars.
 - `v2_no_sidecar` -- `FfiCheckpointSpec::V2NoSidecar` requests a V2 manifest
   with all file actions inlined (no sidecar files). Requires the table to
   declare the `v2Checkpoint` reader/writer feature.
