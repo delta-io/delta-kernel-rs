@@ -270,7 +270,7 @@ impl LogSegment {
     ///   `parts` is absent for a single-part / classic checkpoint (hence one part).
     /// - `v2Checkpoint.path`: a V2 checkpoint's file name carries a UUID, so the name must match
     ///   the selected part -- `checkpoint_parts.first()`, the file the hint's fields describe.
-    fn matched_checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
+    fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
         let m = self.last_checkpoint_metadata.as_ref()?;
         if Some(m.version) != self.checkpoint_version {
             return None;
@@ -287,19 +287,19 @@ impl LogSegment {
     }
 
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
-    /// checkpoint (see [`Self::matched_checkpoint_hint`]) and carried a `checkpointSchema`. `None`
+    /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
     pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
-        self.matched_checkpoint_hint()?.checkpoint_schema.clone()
+        self.checkpoint_hint()?.checkpoint_schema.clone()
     }
 
     /// The hint's sidecar references, when it describes the selected checkpoint (see
-    /// [`Self::matched_checkpoint_hint`]). `None` if there is no matching hint or it omitted
+    /// [`Self::checkpoint_hint`]). `None` if there is no matching hint or it omitted
     /// `sidecarFiles`; `Some(&[])` if the hint listed none. A non-empty slice identifies a manifest
     /// checkpoint whose file actions live in those sidecars.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
     pub(crate) fn checkpoint_sidecars(&self) -> Option<&[Sidecar]> {
-        self.matched_checkpoint_hint()?
+        self.checkpoint_hint()?
             .v2_checkpoint
             .as_ref()?
             .sidecar_files
