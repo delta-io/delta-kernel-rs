@@ -227,6 +227,8 @@ jobs:
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
         run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: doc tests
+        run: cargo test --locked --workspace --all-features --doc
       - name: trybuild tests
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
