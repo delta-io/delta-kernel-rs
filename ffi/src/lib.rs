@@ -1939,7 +1939,6 @@ mod tests {
 
     /// Seed an in-memory table with the standard protocol+metadata at version 0, then append
     /// `num_add_actions` single-add commits at versions 1..=num_add_actions. Returns the storage
-    /// (which the caller will pass to engine construction).
     async fn seed_classic_table(
         storage: &InMemory,
         table_root: &str,
@@ -1992,9 +1991,7 @@ mod tests {
         Ok(())
     }
 
-    /// Count the entries in a given object_store prefix (used to assert the existence and
-    /// cardinality of `_delta_log/_sidecars/`). Uses `list_with_delimiter` to avoid the
-    /// `futures` crate dependency in test code.
+    /// Count the entries in a given object_store prefix.
     async fn count_objects_with_prefix(storage: &InMemory, prefix: &str) -> usize {
         let prefix_path = Path::from(prefix);
         match storage.list_with_delimiter(Some(&prefix_path)).await {
@@ -2195,8 +2192,7 @@ mod tests {
         Ok(())
     }
 
-    // Test 5: classic (non-V2) table, `set_v2_no_sidecar` => `KernelError::CheckpointWriteError`.
-    // V2 spec requires the `v2Checkpoint` feature; without it, the kernel rejects.
+    // Checkpoint on V1 table with V2 spec => `KernelError::CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
     ) -> Result<(), Box<dyn std::error::Error>> {

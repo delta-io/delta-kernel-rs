@@ -14,7 +14,7 @@
 //   ./checkpoint_table /path/to/existing/table <sub-flow>
 //
 // where <sub-flow> is one of:
-//   inline            -- spec = NULL; kernel auto-picks V1/V2 from table protocol.
+//   default            -- spec = NULL; kernel auto-picks V1/V2 from table protocol.
 //   v2_no_sidecar     -- FfiCheckpointSpec::V2NoSidecar; V2 manifest, no sidecars.
 //   v2_with_sidecars  -- FfiCheckpointSpec::V2WithSidecar { hint = Some(2) }; V2 + sidecars.
 //
