@@ -25,8 +25,8 @@ endif()
 include(CTest)
 set(TestRunner "../../../tests/checkpoint-table-testing/run_test.sh")
 set(ExpectedPath "../../../tests/checkpoint-table-testing/expected-data")
-add_test(NAME checkpoint_table_inline
-         COMMAND ${TestRunner} inline ${ExpectedPath}/inline.expected)
+add_test(NAME checkpoint_table_default
+         COMMAND ${TestRunner} default ${ExpectedPath}/default.expected)
 add_test(NAME checkpoint_table_v2_no_sidecar
          COMMAND ${TestRunner} v2_no_sidecar ${ExpectedPath}/v2_no_sidecar.expected)
 add_test(NAME checkpoint_table_v2_with_sidecars

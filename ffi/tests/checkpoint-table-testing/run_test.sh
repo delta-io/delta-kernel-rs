@@ -10,7 +10,7 @@ set -euxo pipefail
 # ./checkpoint_table against it, then diffs output against the expected file.
 #
 # Fixtures:
-#   inline           -> kernel/tests/data/app-txn-no-checkpoint/    (non-V2, no checkpoint)
+#   default          -> kernel/tests/data/app-txn-no-checkpoint/    (non-V2, no checkpoint)
 #   v2_no_sidecar    -> kernel/tests/data/v2-parquet-sidecars-struct-stats-only/
 #   v2_with_sidecars -> kernel/tests/data/v2-parquet-sidecars-struct-stats-only/
 
@@ -24,7 +24,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 KERNEL_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd -P)
 
 case "$SUB_FLOW" in
-    inline)
+    default)
         FIXTURE="$KERNEL_ROOT/kernel/tests/data/app-txn-no-checkpoint"
         ;;
     v2_no_sidecar|v2_with_sidecars)

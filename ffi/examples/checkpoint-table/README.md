@@ -19,7 +19,7 @@ $ ./checkpoint_table /path/to/existing/table <sub-flow>
 
 The `<sub-flow>` argument selects one of three demos:
 
-- `inline` -- pass `spec = NULL`. The kernel auto-picks V1 or V2 from the
+- `default` -- pass `spec = NULL`. The kernel auto-picks V1 or V2 from the
   table's protocol features and writes an inline checkpoint with no sidecars.
 - `v2_no_sidecar` -- `FfiCheckpointSpec::V2NoSidecar` requests a V2 manifest
   with all file actions inlined (no sidecar files). Requires the table to
@@ -35,7 +35,7 @@ The `<sub-flow>` argument selects one of three demos:
 
 The paired `ffi/tests/checkpoint-table-testing/run_test.sh` seeds a temporary
 table by copying one of the kernel-bundled fixtures
-(`kernel/tests/data/app-txn-no-checkpoint/` for `inline`,
+(`kernel/tests/data/app-txn-no-checkpoint/` for `default`,
 `kernel/tests/data/v2-parquet-sidecars-struct-stats-only/` for the V2 sub-flows
 with all pre-existing checkpoint artifacts and `_last_checkpoint` scrubbed),
 runs this binary against it, and diffs the output against the matching

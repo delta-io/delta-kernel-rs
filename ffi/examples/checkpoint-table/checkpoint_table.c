@@ -30,7 +30,7 @@ static int run_sub_flow(HandleSharedSnapshot snapshot,
   FfiCheckpointSpec spec;
   FfiCheckpointSpec* spec_ptr;
 
-  if (strcmp(sub_flow, "inline") == 0) {
+  if (strcmp(sub_flow, "default") == 0) {
     // Spec = NULL => kernel auto-picks V1 or V2 based on table protocol features.
     spec_ptr = NULL;
   } else if (strcmp(sub_flow, "v2_no_sidecar") == 0) {
@@ -85,7 +85,7 @@ int main(int argc, char* argv[]) {
   if (argc != 3) {
     fprintf(stderr,
             "Usage: %s /path/to/existing/table <sub-flow>\n"
-            "  <sub-flow>: inline | v2_no_sidecar | v2_with_sidecars\n",
+            "  <sub-flow>: default | v2_no_sidecar | v2_with_sidecars\n",
             argv[0]);
     return 1;
   }
