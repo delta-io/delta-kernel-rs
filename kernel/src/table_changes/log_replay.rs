@@ -24,6 +24,7 @@ use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
+use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
@@ -58,6 +59,30 @@ pub(crate) fn table_changes_action_iter(
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    // The data-reading (`execute`) path always uses change-data-file semantics.
+    table_changes_action_iter_with_mode(
+        engine,
+        start_table_configuration,
+        commit_files,
+        table_schema,
+        physical_predicate,
+        CdfMode::WriteTime,
+    )
+}
+
+/// Like [`table_changes_action_iter`], but selects the change-feed semantics via `mode`. The
+/// row-tracking listing path ([`TableChanges::scan_file_listing`]) uses [`CdfMode::RowTracking`];
+/// the data-reading path uses [`CdfMode::WriteTime`].
+///
+/// [`TableChanges::scan_file_listing`]: crate::table_changes::TableChanges::scan_file_listing
+pub(crate) fn table_changes_action_iter_with_mode(
+    engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    table_schema: SchemaRef,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    mode: CdfMode,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     // Stats-eligible columns for the DataSkippingFilter below. Roughly parallels the scan
     // path's `StateInfo::physical_stats_columns`. Clustering columns are deliberately not
@@ -113,6 +138,7 @@ pub(crate) fn table_changes_action_iter(
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
+                mode,
             )?;
             scanner.into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
@@ -128,7 +154,8 @@ pub(crate) fn table_changes_action_iter(
 ///    In this phase, we do the following:
 ///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
 ///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead of
-///       time whether to filter out add/remove actions.
+///       time whether to filter out add/remove actions. In [`CdfMode::ReadTime`] mode `cdc`
+///       actions are ignored entirely (never flagged), so add/remove actions always drive the feed.
 ///     - Constructs the remove deletion vector map from paths belonging to `remove` actions to the
 ///       action's corresponding [`DvInfo`]. This map will be filtered to only contain paths that
 ///       exists in another `add` action _within the same commit_. We store the result in
@@ -202,6 +229,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
+        mode: CdfMode,
     ) -> DeltaResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
 
@@ -241,6 +269,7 @@ impl LogReplayScanner {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
+                mode,
             };
             visitor.visit_rows_of(actions.as_ref())?;
 
@@ -251,11 +280,11 @@ impl LogReplayScanner {
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
-                // Currently, schema compatibility is defined as having equal schema types. In the
-                // future, more permisive schema evolution will be supported.
-                // See: https://github.com/delta-io/delta-kernel-rs/issues/523
+                // Every in-range commit's schema must be compatible with the end (read) schema: the
+                // connector reads the listed files against the end schema. The per-mode policy
+                // (strict equality vs. additive evolution) lives in `CdfMode::schemas_compatible`.
                 require!(
-                    table_schema.as_ref() == &schema,
+                    mode.schemas_compatible(&schema, table_schema.as_ref()),
                     Error::change_data_feed_incompatible_schema(table_schema, &schema)
                 );
             }
@@ -288,19 +317,22 @@ impl LogReplayScanner {
                 );
             }
 
-            // If metadata is updated, check if Change Data Feed is enabled
+            // If metadata is updated, check that the feature the change feed relies on is still
+            // enabled across the range: ChangeDataFeed for the cdc-file path, RowTracking for the
+            // row-tracking path.
             if has_metadata_update {
                 require!(
-                    table_configuration.is_feature_enabled(&TableFeature::ChangeDataFeed),
-                    Error::change_data_feed_unsupported(commit_file.version)
+                    table_configuration.is_feature_enabled(&mode.required_feature()),
+                    mode.feature_disabled_error(commit_file.version)
                 );
             }
 
-            // If protocol is updated, check if Change Data Feed is supported
+            // If protocol is updated, check that reading is still supported. The per-mode error
+            // mapping lives in `CdfMode::protocol_support_error`.
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
+                    .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -408,6 +440,7 @@ struct PreparePhaseVisitor<'a> {
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
+    mode: CdfMode,
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
@@ -478,7 +511,11 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                         .insert(path.to_string(), DvInfo { deletion_vector });
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
-                *self.has_cdc_action = true;
+                // In row-tracking mode we ignore `_change_data` (cdc) files entirely and
+                // reconstruct changes from add/remove actions.
+                if self.mode == CdfMode::WriteTime {
+                    *self.has_cdc_action = true;
+                }
             }
         }
         Ok(())
