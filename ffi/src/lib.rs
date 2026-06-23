@@ -1936,20 +1936,21 @@ mod tests {
         r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
     );
 
-    /// Seed an in-memory table at version 0 from [`test_utils::METADATA`] (its protocol + metadata
-    /// actions, with the leading `commitInfo` stripped), then append `num_add_actions` single-add
-    /// commits at versions 1..=num_add_actions.
+    /// Seed an in-memory table at version 0 from [`test_utils::METADATA`] (protocol + metadata,
+    /// plus its leading `commitInfo` which the checkpoint writer ignores), then append
+    /// `num_add_actions` single-add commits at versions 1..=num_add_actions.
     async fn seed_v1_table(
         storage: &InMemory,
         table_root: &str,
         num_add_actions: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let protocol_and_metadata = METADATA
-            .lines()
-            .skip(1) // skip commitInfo
-            .collect::<Vec<_>>()
-            .join("\n");
-        add_commit(table_root, storage, 0, protocol_and_metadata).await?;
+        add_commit(
+            table_root,
+            storage,
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
         for i in 0..num_add_actions {
             add_commit(
                 table_root,
