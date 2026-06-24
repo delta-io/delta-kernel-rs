@@ -1,0 +1,1 @@
+# inspect_table example
