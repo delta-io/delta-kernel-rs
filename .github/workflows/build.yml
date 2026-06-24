@@ -59,8 +59,17 @@ env:
 # are installed via taiki-e/install-action, which fetches prebuilt binaries.
 
 jobs:
+  # Detect docs-only PRs. Each job below declares `needs: detect_changes` and runs only
+  # `if: needs.detect_changes.outputs.docs_only == 'false'`, so on a docs-only PR it is
+  # skipped while still satisfying its required status check. Logic lives in the shared
+  # detect-changes reusable workflow. See .github/CLAUDE.md.
+  detect_changes:
+    uses: ./.github/workflows/detect-changes.yml
+
   format:
     runs-on: ubuntu-latest
+    needs: detect_changes
+    if: needs.detect_changes.outputs.docs_only == 'false'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install nightly with rustfmt
@@ -74,6 +83,8 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    needs: detect_changes
+    if: needs.detect_changes.outputs.docs_only == 'false'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable and cargo msrv
@@ -95,6 +106,8 @@ jobs:
           cargo msrv --path ffi-proc-macros/ verify --all-features
   msrv-run-tests:
     runs-on: ubuntu-latest
+    needs: detect_changes
+    if: needs.detect_changes.outputs.docs_only == 'false'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable and cargo msrv
@@ -125,6 +138,8 @@ jobs:
           cargo +$(cargo msrv show --output-format minimal) test --doc
   docs:
     runs-on: ubuntu-latest
+    needs: detect_changes
+    if: needs.detect_changes.outputs.docs_only == 'false'
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -162,8 +177,11 @@ jobs:
   #    - delta_kernel_derive
   #    - delta_kernel_ffi
   #    - delta_kernel_ffi_macros
+  # Matrix jobs gate at the STEP level, not the job: a skipped matrix job never expands, so its
+  # per-leg required checks (e.g. `build (ubuntu-latest)`) never report and the PR blocks.
   build:
     runs-on: ${{ matrix.os }}
+    needs: detect_changes
     strategy:
       matrix:
         os:
@@ -182,25 +200,33 @@ jobs:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo clippy --locked --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo clippy --locked --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
       - name: lint without default features - packages which don't depend on kernel with features enabled
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel declarative-plans feature-only build
         run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans
       - name: lint kernel declarative-plans feature-only build
         run: cargo clippy --locked -p delta_kernel --no-default-features --features declarative-plans --tests -- -D warnings
       - name: check kernel builds with default-engine-native-tls
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo build --locked -p feature_tests --features default-engine-native-tls
       - name: test native-tls backend has no crypto provider conflict
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo test --locked -p feature_tests --features default-engine-native-tls
       - name: check kernel builds with default-engine-rustls
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo build --locked -p feature_tests --features default-engine-rustls
       - name: test rustls TLS backend feature-tests
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo test --locked -p feature_tests --features default-engine-rustls
   test:
     runs-on: ${{ matrix.os }}
+    needs: detect_changes
     strategy:
       matrix:
         os:
@@ -226,13 +252,15 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
       - name: doc tests
         run: cargo test --locked --workspace --all-features --doc
       - name: trybuild tests
-        if: steps.filter.outputs.ffi == 'true'
+        if: needs.detect_changes.outputs.docs_only == 'false' && steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
       - name: metrics deadlock test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         shell: bash
         run: |
           output=$(cargo run --profile test --example metrics-tester)
@@ -264,6 +292,7 @@ jobs:
 
   ffi_test:
     runs-on: ${{ matrix.os }}
+    needs: detect_changes
     strategy:
       matrix:
         os:
@@ -276,6 +305,7 @@ jobs:
         with:
           cmake-version: "3.30.x"
       - name: Install arrow-glib-linux
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
               sudo apt update
@@ -292,7 +322,7 @@ jobs:
       # TODO (#2707): This step's cache misses 100% of runs, wasting ~4.5 min per macOS run on a
       #               fresh `brew install`. See the issue for root cause and fix options.
       - name: Install arrow-glib-macOS
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.detect_changes.outputs.docs_only == 'false'
         uses: ./.github/actions/use-homebrew-tools
         with:
           tools: "apache-arrow apache-arrow-glib"
@@ -307,6 +337,7 @@ jobs:
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
       - name: Build kernel
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd acceptance
           cargo build --locked
@@ -315,6 +346,7 @@ jobs:
           cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog
           popd
       - name: build and run read-table test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi/examples/read-table
           mkdir build
@@ -323,6 +355,7 @@ jobs:
           make
           make test
       - name: build and run visit-expression test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi/examples/visit-expression
           mkdir build
@@ -331,6 +364,7 @@ jobs:
           make
           make test
       - name: build and run delta-kernel-unity-catalog-ffi test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi/examples/delta-kernel-unity-catalog-example
           mkdir build
@@ -339,6 +373,7 @@ jobs:
           make
           make test
       - name: build and run create-table test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi/examples/create-table
           mkdir build
@@ -350,6 +385,7 @@ jobs:
       # binary, so create-table must be built first (its build/ dir is preserved by the
       # preceding step and write-table's CMakeLists references it via a relative path).
       - name: build and run write-table test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi/examples/write-table
           mkdir build
@@ -358,6 +394,7 @@ jobs:
           make
           make test
       - name: build update-dv example
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi/examples/update-dv
           mkdir build
@@ -365,6 +402,7 @@ jobs:
           cmake ..
           make
       - name: build and run read-table-changes test
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi/examples/read-table-changes
           mkdir build
@@ -372,15 +410,18 @@ jobs:
           cmake ..
           make
           make test
+  # Step-gated so the matrix expands into `Miri (shard 1/3)` etc.; a job-level skip would not.
   miri:
     name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest
+    needs: detect_changes
     strategy:
       matrix:
         partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Miri
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           rustup toolchain install nightly --component miri
           rustup override set nightly
@@ -391,12 +432,15 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: Test with Miri
+        if: needs.detect_changes.outputs.docs_only == 'false'
         run: |
           pushd ffi
           MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest
+    needs: detect_changes
+    if: needs.detect_changes.outputs.docs_only == 'false'
     env:
       CARGO_TERM_COLOR: always
     steps:

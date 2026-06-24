@@ -40,6 +40,20 @@ status checks (most of `build.yml`). When a path filter skips the whole workflow
 the required checks never report, and the PR stays blocked on "Expected, waiting
 for status" indefinitely. A skipped workflow is not the same as a passing one.
 
+To skip expensive work on docs-only PRs, gate the jobs instead. A workflow contains `jobs:`;
+each job runs on its own runner and contains a sequence of `steps:`. Add a `detect_changes`
+job that `uses: ./.github/workflows/detect-changes.yml`, and have expensive jobs declare
+`needs: detect_changes`. How to gate depends on the job shape:
+
+- **Single (non-matrix) jobs** (`format`, `docs`, ...): gate the whole job with
+  `if: needs.detect_changes.outputs.docs_only == 'false'`. A skipped job reports its name as
+  "skipped", which satisfies the required check of the same name.
+- **Matrix jobs** (`build`, `test`, ...): gate the *steps*, not the job. A job-level skip
+  never expands the matrix, so its per-leg required checks (`build (ubuntu-latest)`, ...)
+  never report and the PR blocks. Keep `needs:`, drop the job `if:`, gate each work step.
+
+See `detect-changes.yml`, `build.yml`, and `run-examples.yml`.
+
 ## Supply chain security: `--locked`
 
 Every `cargo` command in CI that resolves dependencies MUST use `--locked` to
