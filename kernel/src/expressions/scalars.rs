@@ -727,6 +727,23 @@ impl PrimitiveType {
         DataType::Primitive(self.clone())
     }
 
+    /// Parses a date-time string into a UTC [`DateTime`].
+    /// Always accepts the `%Y-%m-%d %H:%M:%S%.f` form. When `with_timezone` is set,
+    /// also accepts ISO 8601 / RFC 3339 strings with an optional timezone offset.
+    fn parse_timestamp(&self, raw: &str, with_timezone: bool) -> Result<DateTime<Utc>, Error> {
+        let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
+        if timestamp.is_err() && with_timezone {
+            // `%+` is chrono's relaxed ISO 8601 / RFC 3339 parser: unlike the stricter
+            // DateTime::parse_from_rfc3339, it also accepts a space or lowercase `t`
+            // separator and colon-less offsets (e.g. `+0530`).
+            // Parse into a `DateTime<FixedOffset>` and convert to UTC so the offset is applied;
+            timestamp = DateTime::parse_from_str(raw, "%+").map(|dt| dt.naive_utc());
+        }
+
+        let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
+        Ok(Utc.from_utc_datetime(&timestamp))
+    }
+
     /// Parses a serialized string into a [`Scalar`] of this primitive type, per the Delta
     /// protocol's [partition value serialization] rules. An empty string parses as
     /// [`Scalar::Null`].
@@ -783,16 +800,8 @@ impl PrimitiveType {
             // side - i.e. timestampNTZ is not adjusted to UTC, this is just so we can
             // (de-)serialize it as a date string.
             TimestampNtz | Timestamp => {
-                let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
-
-                if timestamp.is_err() && *self == Timestamp {
-                    // `%+` is chrono's relaxed ISO 8601 / RFC 3339 parser: unlike the stricter
-                    // DateTime::parse_from_rfc3339, it also accepts a space or lowercase `t`
-                    // separator and colon-less offsets (e.g. `+0530`).
-                    timestamp = DateTime::parse_from_str(raw, "%+").map(|dt| dt.naive_utc());
-                }
-                let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
-                let timestamp = Utc.from_utc_datetime(&timestamp);
+                let with_timezone = *self == Timestamp;
+                let timestamp = self.parse_timestamp(raw, with_timezone)?;
                 let micros = timestamp
                     .signed_duration_since(DateTime::UNIX_EPOCH)
                     .num_microseconds()
@@ -810,14 +819,8 @@ impl PrimitiveType {
             // `1970-01-01T00:00:00.123456789Z`. As with the microsecond variants, the NTZ form
             // is not adjusted to UTC.
             TimestampNanos | TimestampNanosNtz => {
-                let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
-
-                if timestamp.is_err() && *self == TimestampNanos {
-                    // Note: `%+` specifies the ISO 8601 / RFC 3339 format
-                    timestamp = NaiveDateTime::parse_from_str(raw, "%+");
-                }
-                let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
-                let timestamp = Utc.from_utc_datetime(&timestamp);
+                let with_timezone = *self == TimestampNanos;
+                let timestamp = self.parse_timestamp(raw, with_timezone)?;
                 let nanos = timestamp
                     .signed_duration_since(DateTime::UNIX_EPOCH)
                     .num_nanoseconds()
@@ -1191,6 +1194,14 @@ mod tests {
         assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456000);
         assert_timestamp_eq("2011-01-11 13:06:07.123456789", 1294751167123456789);
         assert_timestamp_eq("1970-01-01 00:00:00", 0);
+        assert_timestamp_eq("2024-06-15T14:30:00+00:00", 1718461800000000000); // 14:30:00Z
+        assert_timestamp_eq("2024-06-15T14:30:00+05:00", 1718443800000000000); // 09:30:00Z
+        assert_timestamp_eq("2024-06-15T14:30:00-05:00", 1718479800000000000); // 19:30:00Z
+        assert_timestamp_eq("2024-06-15T14:30:00+05:30", 1718442000000000000); // 09:00:00Z
+        assert_timestamp_eq("2024-06-15T14:30:00+0530", 1718442000000000000); // 09:00:00Z
+        assert_timestamp_eq("2024-06-15 14:30:00+05:00", 1718443800000000000); // space separator
+        assert_timestamp_eq("1971-07-22T03:06:40.678910674+05:00", 48982000678910674);
+        assert_timestamp_eq("1970-01-01T00:00:00+05:00", -18000000000000);
     }
 
     #[cfg(feature = "nanosecond-timestamps")]
