@@ -466,18 +466,23 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
 
 /// Adjusts a max stat value to account for millisecond truncation in JSON-serialized stats.
 /// `stats_parsed` inherits from JSON stats which truncate timestamps to millisecond precision:
-/// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us ensures we never falsely
-/// prune files whose actual max exceeds the truncated value. Non-timestamp values pass through
-/// unchanged.
+/// `stored_max <= actual_max <= stored_max + 999us`. Adding the maximum possible truncation gap
+/// ensures we never falsely prune files whose actual max exceeds the truncated value. The gap is
+/// one millisecond minus one unit, expressed in each type's resolution: 999us for microsecond
+/// timestamps, 999_999ns for nanosecond timestamps. Non-timestamp values pass through unchanged.
 ///
 /// See also [`DataSkippingPredicateCreator::adjust_scalar_for_max_stat_truncation`] in
 /// `scan/data_skipping.rs`, which handles the same truncation issue from the predicate side
-/// (subtracting 999us from the comparison value instead of adding to the stat).
+/// (subtracting the gap from the comparison value instead of adding to the stat).
 #[allow(dead_code)]
 fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(us) => Scalar::Timestamp(us.saturating_add(999)),
         Scalar::TimestampNtz(us) => Scalar::TimestampNtz(us.saturating_add(999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanos(ns) => Scalar::TimestampNanos(ns.saturating_add(999_999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanosNtz(ns) => Scalar::TimestampNanosNtz(ns.saturating_add(999_999)),
         other => other,
     }
 }

@@ -822,6 +822,18 @@ fn checkpoint_filter_timestamp_max_widened() {
         Some(Scalar::TimestampNtz(1199))
     );
 
+    // Nanosecond timestamps are widened by 999_999ns: 200 + 999_999 = 1_000_199.
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_eq!(
+        filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP_NANOS),
+        Some(Scalar::TimestampNanos(1_000_199))
+    );
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_eq!(
+        filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP_NANOS_NTZ),
+        Some(Scalar::TimestampNanosNtz(1_000_199))
+    );
+
     // Non-timestamp types are not widened.
     assert_eq!(
         filter.get_max_stat(&column_name!("x"), &DataType::LONG),
