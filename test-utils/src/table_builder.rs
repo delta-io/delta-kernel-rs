@@ -980,6 +980,15 @@ pub enum VersionTarget {
     AtVersion(u64),
     /// Load at `from`, then incrementally update to latest.
     IncrementalToLatest { from: u64 },
+    /// Load at `from`, then incrementally update to a specific target `to`. Exercises the
+    /// `Snapshot::builder_from(base).at_version(to)` path with `to <= latest`. Requires
+    /// `from <= to`.
+    IncrementalFrom { from: u64, to: u64 },
+    /// Time travel by timestamp: resolves `timestamp` (milliseconds since Unix epoch) to a
+    /// version via [`history_manager::latest_version_as_of`], then loads that version.
+    ///
+    /// [`history_manager::latest_version_as_of`]: delta_kernel::history_manager::latest_version_as_of
+    AtTimestamp(i64),
 }
 
 impl fmt::Display for VersionTarget {
@@ -990,6 +999,10 @@ impl fmt::Display for VersionTarget {
             VersionTarget::IncrementalToLatest { from } => {
                 write!(f, "incremental({from}->latest)")
             }
+            VersionTarget::IncrementalFrom { from, to } => {
+                write!(f, "incremental({from}->{to})")
+            }
+            VersionTarget::AtTimestamp(ts) => write!(f, "at_timestamp({ts})"),
         }
     }
 }
@@ -1002,10 +1015,29 @@ pub fn version_latest() -> VersionTarget {
 pub fn version_at_mid() -> VersionTarget {
     VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION)
 }
-pub fn version_incremental_to_latest() -> VersionTarget {
+pub fn version_incremental_from_mid_to_latest() -> VersionTarget {
     VersionTarget::IncrementalToLatest {
         from: DEFAULT_SWEEP_MID_VERSION,
     }
+}
+/// Incremental update from `mid` to `latest - 1`. The non-latest `to` exercises the
+/// partial-replay path that `version_incremental_from_mid_to_latest()` cannot reach, since
+/// updating to latest is indistinguishable from a non-incremental load.
+pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
+    VersionTarget::IncrementalFrom {
+        from: DEFAULT_SWEEP_MID_VERSION,
+        to: DEFAULT_SWEEP_LATEST_VERSION - 1,
+    }
+}
+/// Timestamp travel using `i64::MAX`, which always resolves to the latest version (every
+/// commit's timestamp is below `i64::MAX`). This is a smoke test that the timestamp
+/// conversion path runs without error across the sweep, not a resolution-correctness
+/// check: `InMemory` collapses successive `put` timestamps to a single millisecond, so the
+/// sweep can't reach an intermediate version. Resolution to an intermediate version is
+/// covered by `test_at_timestamp_resolves_to_intermediate_version`, which sets commit
+/// modification times explicitly on the local filesystem.
+pub fn version_at_timestamp_max() -> VersionTarget {
+    VersionTarget::AtTimestamp(i64::MAX)
 }
 
 // ===========================================================================
@@ -1594,6 +1626,30 @@ macro_rules! build_snapshot {
                     .unwrap();
                 Snapshot::builder_from(base).build($engine).unwrap()
             }
+            $crate::table_builder::VersionTarget::IncrementalFrom { from, to } => {
+                let base = Snapshot::builder_for($table_root)
+                    .at_version(*from)
+                    .build($engine)
+                    .unwrap();
+                Snapshot::builder_from(base)
+                    .at_version(*to)
+                    .build($engine)
+                    .unwrap()
+            }
+            $crate::table_builder::VersionTarget::AtTimestamp(ts) => {
+                let latest = Snapshot::builder_for($table_root).build($engine).unwrap();
+                let commit = ::delta_kernel::history_manager::latest_version_as_of(
+                    &latest,
+                    $engine,
+                    *ts,
+                    ::delta_kernel::history_manager::HistoryCommitType::Recreatable,
+                )
+                .unwrap();
+                Snapshot::builder_for($table_root)
+                    .at_version(commit.version)
+                    .build($engine)
+                    .unwrap()
+            }
         }
     };
 }
@@ -1773,7 +1829,9 @@ mod tests {
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
-            VersionTarget::IncrementalToLatest { from: 1 }
+            VersionTarget::IncrementalToLatest { from: 1 },
+            VersionTarget::IncrementalFrom { from: 1, to: 3 },
+            VersionTarget::AtTimestamp(i64::MAX),
         )]
         version_target: VersionTarget,
     ) {
@@ -1786,7 +1844,12 @@ mod tests {
         );
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
+            VersionTarget::AtTimestamp(ts) if *ts == i64::MAX => 4,
             VersionTarget::AtVersion(v) => *v,
+            VersionTarget::IncrementalFrom { to, .. } => *to,
+            VersionTarget::AtTimestamp(ts) => {
+                panic!("test only uses AtTimestamp(i64::MAX), got {ts}")
+            }
         };
         assert_eq!(snap.version(), expected);
     }
