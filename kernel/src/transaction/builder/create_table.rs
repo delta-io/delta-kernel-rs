@@ -32,10 +32,11 @@ use crate::table_features::{
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
-    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
-    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
-    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS,
+    DATA_SKIPPING_STATS_COLUMNS, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
+    ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
     SET_TRANSACTION_RETENTION_DURATION,
 };
@@ -101,6 +102,10 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // Checkpoint stats format properties
     CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    // Data skipping stats configuration. Neither property enables a feature; both control
+    // the per-file stats schema the writer collects.
+    DATA_SKIPPING_NUM_INDEXED_COLS,
+    DATA_SKIPPING_STATS_COLUMNS,
     // Property-driven feature enablement properties
     ENABLE_DELETION_VECTORS,
     ENABLE_CHANGE_DATA_FEED,
@@ -1100,6 +1105,19 @@ mod tests {
             validated.properties.get(PARQUET_FORMAT_VERSION),
             Some(&"2.12.0".to_string()),
         );
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::num_indexed_cols_cap(DATA_SKIPPING_NUM_INDEXED_COLS, "16")]
+    #[case::num_indexed_cols_all(DATA_SKIPPING_NUM_INDEXED_COLS, "-1")]
+    #[case::stats_columns_multi(DATA_SKIPPING_STATS_COLUMNS, "a,b,c")]
+    #[case::stats_columns_single(DATA_SKIPPING_STATS_COLUMNS, "a")]
+    fn test_data_skipping_properties_accepted(#[case] key: &str, #[case] value: &str) {
+        let properties = HashMap::from([(key.to_string(), value.to_string())]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(validated.properties.get(key), Some(&value.to_string()));
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
     }
