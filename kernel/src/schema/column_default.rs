@@ -9,21 +9,23 @@ use crate::{DeltaResult, Engine, Error};
 ///
 /// The carrier holds the raw SQL string ([`raw_sql`](Self::raw_sql)) and the column's declared
 /// type ([`data_type`](Self::data_type)). On construction the kernel eagerly parses the SQL with
-/// its built-in literal parser and caches the result. Callers check whether that parse succeeded
+/// its built-in SQL parser and caches the result. Callers check whether that parse succeeded
 /// via [`is_kernel_parsable`](Self::is_kernel_parsable) and resolve the default to a [`Scalar`]
 /// via [`evaluate`](Self::evaluate). When the kernel cannot parse the SQL (e.g. a function call
-/// such as `current_timestamp()`), connectors with richer SQL support fall back to evaluating
+/// such as `current_timestamp()`), connectors with richer SQL support may evaluate
 /// [`raw_sql`](Self::raw_sql) themselves.
+///
+/// The declared type is borrowed from the logical schema, which always outlives the carrier.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ColumnDefault {
+pub struct ColumnDefault<'a> {
     raw_sql: String,
-    data_type: DataType,
+    data_type: &'a DataType,
     /// The default parsed as a kernel [`Expression`], or `None` if the kernel's
     /// built-in SQL parser could not parse it.
     parsed_sql: Option<Expression>,
 }
 
-impl ColumnDefault {
+impl<'a> ColumnDefault<'a> {
     /// Build a `ColumnDefault` from a raw SQL string and the column's declared type.
     ///
     /// The kernel attempts to parse `raw_sql` via the built-in SQL parser using `data_type` as the
@@ -34,15 +36,16 @@ impl ColumnDefault {
     /// # Errors
     ///
     /// Returns an error when `data_type` is non-primitive (Array, Map, Struct, or Variant) and
-    /// `raw_sql` is not `NULL`.
-    pub fn new(raw_sql: String, data_type: DataType) -> DeltaResult<Self> {
+    /// `raw_sql` is not `NULL` (case-insensitive).
+    pub fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
+        // Spark only allows a non-primitive column default when it is NULL; match that behavior.
         if data_type.as_primitive_opt().is_none() && !is_null {
             return Err(Error::generic(format!(
                 "column default for non-primitive type {data_type:?} must be NULL, got {raw_sql:?}"
             )));
         }
-        let parsed_sql = parse_sql(&raw_sql, &data_type).ok();
+        let parsed_sql = parse_sql(&raw_sql, data_type).ok();
         Ok(Self {
             raw_sql,
             data_type,
@@ -52,7 +55,7 @@ impl ColumnDefault {
 
     /// The raw SQL expression as stored in the column's metadata.
     ///
-    /// Connectors with a SQL engine richer than the kernel's literal parser can evaluate this
+    /// Connectors with a SQL engine richer than the kernel's SQL parser can evaluate this
     /// directly when [`is_kernel_parsable`](Self::is_kernel_parsable) returns `false`.
     pub fn raw_sql(&self) -> &str {
         &self.raw_sql
@@ -60,7 +63,7 @@ impl ColumnDefault {
 
     /// The declared type of the column whose default this is.
     pub fn data_type(&self) -> &DataType {
-        &self.data_type
+        self.data_type
     }
 
     /// Returns `true` when the kernel parsed [`raw_sql`](Self::raw_sql) into a form it can
@@ -72,8 +75,8 @@ impl ColumnDefault {
     /// Evaluate the parsed default to a [`Scalar`].
     ///
     /// Returns `Ok(None)` when the kernel could not parse [`raw_sql`](Self::raw_sql) (i.e.
-    /// [`is_kernel_parsable`](Self::is_kernel_parsable) is `false`); the caller is expected to
-    /// fall back to its own SQL engine using [`raw_sql`](Self::raw_sql).
+    /// [`is_kernel_parsable`](Self::is_kernel_parsable) is `false`); the caller may fall back to
+    /// its own SQL engine using [`raw_sql`](Self::raw_sql).
     ///
     /// # Errors
     ///
@@ -127,7 +130,8 @@ mod tests {
 
     #[test]
     fn new_parsable_literal_exposes_raw_sql_type_and_evaluates() {
-        let d = ColumnDefault::new("42".into(), DataType::INTEGER).unwrap();
+        let data_type = DataType::INTEGER;
+        let d = ColumnDefault::new("42".into(), &data_type).unwrap();
         assert_eq!(d.raw_sql(), "42");
         assert_eq!(d.data_type(), &DataType::INTEGER);
         assert!(d.is_kernel_parsable());
@@ -140,13 +144,15 @@ mod tests {
 
     #[test]
     fn new_parses_string_and_null_literals() {
-        let s = ColumnDefault::new("'hello'".into(), DataType::STRING).unwrap();
+        let string_ty = DataType::STRING;
+        let s = ColumnDefault::new("'hello'".into(), &string_ty).unwrap();
         assert_eq!(
             s.parsed_sql,
             Some(Expression::literal(Scalar::String("hello".into())))
         );
 
-        let n = ColumnDefault::new("NULL".into(), DataType::INTEGER).unwrap();
+        let int_ty = DataType::INTEGER;
+        let n = ColumnDefault::new("NULL".into(), &int_ty).unwrap();
         assert_eq!(
             n.parsed_sql,
             Some(Expression::literal(Scalar::Null(DataType::INTEGER)))
@@ -167,7 +173,7 @@ mod tests {
         #[case] data_type: DataType,
         #[case] parsable: bool,
     ) {
-        let d = ColumnDefault::new(raw_sql.into(), data_type).unwrap();
+        let d = ColumnDefault::new(raw_sql.into(), &data_type).unwrap();
         assert_eq!(d.is_kernel_parsable(), parsable);
         // A parse failure must not drop the raw SQL -- connectors fall back to it.
         assert_eq!(d.raw_sql(), raw_sql);
@@ -185,7 +191,7 @@ mod tests {
         #[case] data_type: DataType,
         #[case] raw_sql: &str,
     ) {
-        let err = ColumnDefault::new(raw_sql.into(), data_type)
+        let err = ColumnDefault::new(raw_sql.into(), &data_type)
             .expect_err("non-primitive non-NULL default must error")
             .to_string();
         assert!(err.contains("must be NULL"), "got: {err}");
@@ -197,17 +203,18 @@ mod tests {
     #[case::struct_type(struct_ty())]
     #[case::variant(DataType::unshredded_variant())]
     fn new_allows_non_primitive_null_default(#[case] data_type: DataType) {
-        let d = ColumnDefault::new("NULL".into(), data_type.clone()).unwrap();
+        let d = ColumnDefault::new("NULL".into(), &data_type).unwrap();
         assert!(d.is_kernel_parsable());
         assert_eq!(
             d.evaluate(&UnusedEngine).unwrap(),
-            Some(Scalar::Null(data_type))
+            Some(Scalar::Null(data_type.clone()))
         );
     }
 
     #[test]
     fn evaluate_returns_none_for_unparsable_default() {
-        let d = ColumnDefault::new("unparsable_sql()".into(), DataType::TIMESTAMP).unwrap();
+        let data_type = DataType::TIMESTAMP;
+        let d = ColumnDefault::new("unparsable_sql()".into(), &data_type).unwrap();
         assert!(!d.is_kernel_parsable());
         assert_eq!(d.evaluate(&UnusedEngine).unwrap(), None);
     }
@@ -216,9 +223,10 @@ mod tests {
     fn evaluate_errors_on_non_literal_parsed_expression() {
         // The parser only emits literals in normal use; construct a non-literal directly to reach
         // the defensive error arm.
+        let int_ty = DataType::INTEGER;
         let d = ColumnDefault {
             raw_sql: "x".into(),
-            data_type: DataType::INTEGER,
+            data_type: &int_ty,
             parsed_sql: Some(Expression::column(["x"])),
         };
         let err = d
