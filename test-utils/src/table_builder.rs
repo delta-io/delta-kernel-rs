@@ -827,16 +827,18 @@ pub fn stats_columns_reordered() -> TableConfig {
     TableConfig::new().data_skipping_stats_columns(STATS_COLUMNS_BY_NAME.iter().rev().copied())
 }
 
-// === Composers: wrap a data-skipping config with an explicit checkpoint encoding ===
+// === Composers: enable a checkpoint stats encoding on a data-skipping config ===
 
-/// `cfg` plus the JSON checkpoint encoding (`writeStatsAsJson` on, `writeStatsAsStruct` off).
+/// `cfg` with the JSON checkpoint encoding enabled (`writeStatsAsJson`). Leaves the struct
+/// encoding untouched, so composing both helpers writes stats in both encodings.
 pub fn with_json_stats(cfg: TableConfig) -> TableConfig {
-    cfg.write_stats_as_json(true).write_stats_as_struct(false)
+    cfg.write_stats_as_json(true)
 }
 
-/// `cfg` plus the struct checkpoint encoding (`writeStatsAsStruct` on, `writeStatsAsJson` off).
+/// `cfg` with the struct checkpoint encoding enabled (`writeStatsAsStruct`). Leaves the JSON
+/// encoding untouched, so composing both helpers writes stats in both encodings.
 pub fn with_struct_stats(cfg: TableConfig) -> TableConfig {
-    cfg.write_stats_as_json(false).write_stats_as_struct(true)
+    cfg.write_stats_as_struct(true)
 }
 
 // ===========================================================================
