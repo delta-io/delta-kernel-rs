@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
@@ -17,7 +18,7 @@ use test_utils::table_builder::{
     version_incremental_from_mid_to_pre_latest, version_latest, DataLayoutConfig, FeatureSet,
     LogState, TableConfig, VersionTarget,
 };
-use test_utils::{build_snapshot, default_sweep, read_scan};
+use test_utils::{assert_row_ids_unique, build_snapshot, default_sweep, read_scan};
 
 /// `TestTableBuilder`'s default is one file per data commit with this many rows, so a
 /// snapshot at version `v` has exactly `v * ROWS_PER_COMMIT` total rows. File count
@@ -55,10 +56,20 @@ fn test_cross_product_read_write(
     };
     assert_eq!(snap.version(), expected_version);
 
-    let scan = snap.scan_builder().build()?;
-    let batches = read_scan(&scan, engine)?;
+    let scan = snap.clone().scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, expected_version as usize * ROWS_PER_COMMIT);
+
+    if snap.table_properties().enable_row_tracking == Some(true) {
+        let scan_schema = Arc::new(
+            snap.schema()
+                .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
+        );
+        let scan = snap.scan_builder().with_schema(scan_schema).build()?;
+        let batches = read_scan(&scan, engine)?;
+        assert_row_ids_unique(&batches);
+    }
 
     Ok(())
 }

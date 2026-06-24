@@ -143,7 +143,7 @@ define_sweeps! {
         version_at_timestamp_max()
     ),
 }
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
@@ -154,11 +154,13 @@ use delta_kernel::actions::{
     get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
+    RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
+};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
@@ -1170,6 +1172,33 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
             );
         }
     }
+}
+
+/// Collect `row_id` values from scan batches produced with a `MetadataColumnSpec::RowId` schema.
+pub fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("row_id")
+                .expect("row_id column not found in batch")
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Assert every `row_id` across the batches is unique.
+pub fn assert_row_ids_unique(batches: &[RecordBatch]) {
+    let row_ids = collect_row_ids(batches);
+    let unique: HashSet<i64> = row_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        row_ids.len(),
+        "row IDs must be globally unique: found {} duplicate(s) among {} row(s)",
+        row_ids.len() - unique.len(),
+        row_ids.len(),
+    );
 }
 
 /// Creates add file metadata for one or more files without partition values.
