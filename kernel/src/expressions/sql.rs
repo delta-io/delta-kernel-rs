@@ -1,7 +1,7 @@
-//! Parse a SQL string into a kernel [`Expression`] or `Predicate`.
+//! Parse a SQL string into a kernel [`Expression`] or [`Predicate`].
 //!
 //! Delta stores column defaults, generated column definitions, and check constraints as SQL strings
-//! in table metadata. This module turns those strings into kernel `Expression` or `Predicate`
+//! in table metadata. This module turns those strings into kernel [`Expression`] or [`Predicate`]
 //! values so the kernel can interpret them without depending on a full SQL parser.
 //!
 //! The grammar follows the Spark SQL standard: this parser implements a subset of Spark's SQL
