@@ -1011,7 +1011,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// - Propagates any error from [`StructField::column_default`] -- a malformed `CURRENT_DEFAULT`
     ///   (non-string metadata, or a non-NULL default on a non-primitive type).
     #[cfg(feature = "column-defaults-in-dev")]
-    pub fn column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault>> {
+    pub fn column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
         // The protocol honors `CURRENT_DEFAULT` only "when enabled", so reject stray defaults on a
         // table without the feature rather than let a connector materialize values it should
         // ignore.
@@ -1019,7 +1019,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults);
         self.effective_table_config
-            .logical_schema()
+            .logical_schema_ref()
             .fields()
             .filter_map(|field| match field.column_default() {
                 Ok(Some(_)) if !allow_column_defaults => Some(Err(Error::generic(format!(

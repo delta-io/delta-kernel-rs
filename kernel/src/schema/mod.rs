@@ -493,7 +493,7 @@ impl StructField {
     ///   defines `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected
     ///   by [`ColumnDefault::new`] (e.g. a non-NULL default on a non-primitive type).
     #[cfg(feature = "column-defaults-in-dev")]
-    pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault>> {
+    pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
             None => return Ok(None),
             Some(MetadataValue::String(s)) => s.clone(),
@@ -505,7 +505,7 @@ impl StructField {
                 )))
             }
         };
-        ColumnDefault::new(raw_sql, self.data_type.clone()).map(Some)
+        ColumnDefault::new(raw_sql, &self.data_type).map(Some)
     }
 
     /// Validates and extracts pre-existing column-mapping annotations on this field, returning

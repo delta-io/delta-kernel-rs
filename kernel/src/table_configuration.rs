@@ -451,6 +451,14 @@ impl TableConfiguration {
         self.logical_schema.clone()
     }
 
+    /// Borrows this table's logical schema, tied to `&self` (no `Arc` clone).
+    ///
+    /// Use this over [`logical_schema`](Self::logical_schema) when callers need to derive
+    /// `&self`-bound borrows from the schema (e.g. `&DataType` of a field).
+    pub(crate) fn logical_schema_ref(&self) -> &SchemaRef {
+        &self.logical_schema
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
