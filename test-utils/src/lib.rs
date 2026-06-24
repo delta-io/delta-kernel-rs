@@ -134,20 +134,24 @@ define_sweeps! {
         no_checkpoint_stats()
     ),
     // Data layout and stats config are bundled into one axis (rather than crossed) to keep
-    // the default sweep near its ~4k-case budget. Each row pairs a layout with one stats
-    // config; across the six rows every layout, every checkpoint encoding (json, struct,
-    // none), and a spread of data-skipping knobs (numIndexedCols 0/2/-1 and a
-    // dataSkippingStatsColumns list, empty and reordered) each appear. We deliberately give
-    // up the full layout x config cross product: skipping correctness is covered by
-    // predicate-bearing unit tests, so the sweep only needs round-trip coverage that each
-    // pairing writes and reads back.
+    // the default sweep within its ~4k-case budget. The rows cover every (encoding x
+    // data-skipping knob) pairing -- json and struct each crossed with numIndexedCols 0/2/-1
+    // and a dataSkippingStatsColumns list (empty and reordered) -- plus a no-stats row, with
+    // the layout rotated across rows. The sweep only round-trips each pairing (writes then
+    // reads back); it does not assert skipping behavior, which lives in predicate-bearing
+    // unit tests.
     layout_config_values = (
         (unpartitioned(), no_checkpoint_stats()),
         (partitioned(), with_json_stats(num_indexed_cols_zero())),
-        (clustered(), with_struct_stats(num_indexed_cols_narrow())),
-        (unpartitioned(), with_json_stats(num_indexed_cols_all())),
-        (partitioned(), with_struct_stats(stats_columns_empty())),
-        (clustered(), with_json_stats(stats_columns_reordered()))
+        (clustered(), with_struct_stats(num_indexed_cols_zero())),
+        (unpartitioned(), with_json_stats(num_indexed_cols_narrow())),
+        (partitioned(), with_struct_stats(num_indexed_cols_narrow())),
+        (clustered(), with_json_stats(num_indexed_cols_all())),
+        (unpartitioned(), with_struct_stats(num_indexed_cols_all())),
+        (partitioned(), with_json_stats(stats_columns_empty())),
+        (clustered(), with_struct_stats(stats_columns_empty())),
+        (unpartitioned(), with_json_stats(stats_columns_reordered())),
+        (partitioned(), with_struct_stats(stats_columns_reordered()))
     ),
     // `version_at_timestamp_max()` is the only timestamp row; see its docs for why
     // intermediate-version resolution lives in a dedicated test instead.
@@ -1562,8 +1566,8 @@ pub fn get_materialized_row_tracking_column_names(
 /// it bypasses [`read_actions_from_commit`]'s `to_file_path()` requirement.
 ///
 /// Returns an empty map when the commit contains no `metaData` action, or when the
-/// action has an empty/absent `configuration` field. Non-string config values are
-/// silently dropped (the spec requires all configuration entries to be strings).
+/// action has an empty/absent `configuration` field. Errors if any configuration value is
+/// not a string (the spec requires all configuration entries to be strings).
 /// Propagates object-store errors when the commit file is missing or unreadable.
 pub async fn read_metadata_configuration_from_store(
     store: &DynObjectStore,
@@ -1577,12 +1581,9 @@ pub async fn read_metadata_configuration_from_store(
     for line in std::str::from_utf8(&bytes)?.lines() {
         let v: serde_json::Value = serde_json::from_str(line)?;
         if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
-            if let Some(obj) = c.as_object() {
-                for (k, val) in obj {
-                    if let Some(s) = val.as_str() {
-                        config.insert(k.clone(), s.to_string());
-                    }
-                }
+            if c.is_object() {
+                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+                config.extend(entries);
             }
         }
     }
