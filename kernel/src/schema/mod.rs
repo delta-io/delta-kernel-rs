@@ -1770,17 +1770,21 @@ fn serialize_variant<S: serde::Serializer>(
 }
 
 fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
-    let units = s.strip_prefix("interval ")?;
-    let words: Vec<&str> = units.split(" to ").collect();
-    if words.iter().all(|w| matches!(*w, "year" | "month")) {
-        Some(PrimitiveType::IntervalYearMonth)
-    } else if words
-        .iter()
-        .all(|w| matches!(*w, "day" | "hour" | "minute" | "second"))
-    {
-        Some(PrimitiveType::IntervalDayTime)
-    } else {
-        None
+    match s {
+        "interval year" | "interval month" | "interval year to month" => {
+            Some(PrimitiveType::IntervalYearMonth)
+        }
+        "interval day"
+        | "interval hour"
+        | "interval minute"
+        | "interval second"
+        | "interval day to hour"
+        | "interval day to minute"
+        | "interval day to second"
+        | "interval hour to minute"
+        | "interval hour to second"
+        | "interval minute to second" => Some(PrimitiveType::IntervalDayTime),
+        _ => None,
     }
 }
 
@@ -2476,9 +2480,17 @@ mod tests {
 
     #[rstest]
     #[case("money")]
+    #[case("interval fortnight")]
+    // invalid orderings across year-month and day-time
     #[case("interval month to day")]
     #[case("interval year to second")]
-    #[case("interval fortnight")]
+    // invalid orderings within year-month and day-time
+    #[case("interval month to year")]
+    #[case("interval year to year")]
+    #[case("interval second to day")]
+    #[case("interval minute to minute")]
+    // too many fields
+    #[case("interval year to month to year")]
     fn test_unsupported_type_error_message(#[case] unsupported_type: &str) {
         let data = format!(
             r#"{{
@@ -2511,14 +2523,19 @@ mod tests {
     #[case("date", DataType::DATE)]
     #[case("timestamp", DataType::TIMESTAMP)]
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
-    #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
-    #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
     #[case("interval year", DataType::INTERVAL_YEAR_MONTH)]
     #[case("interval month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
     #[case("interval day", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval minute", DataType::INTERVAL_DAY_TIME)]
     #[case("interval second", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval hour to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to hour", DataType::INTERVAL_DAY_TIME)]
     #[case("interval day to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval minute to second", DataType::INTERVAL_DAY_TIME)]
     fn test_primitive_type_deserialization_still_works(
         #[case] type_str: &str,
         #[case] expected_type: DataType,
