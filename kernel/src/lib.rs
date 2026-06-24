@@ -749,6 +749,16 @@ pub trait ParquetHandler: AsAny {
     /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or
     ///    no matching parquet field ID is found, fall back to matching by column name
     ///
+    /// # Type coercion
+    ///
+    /// A matched Parquet column whose physical type differs from the `physical_schema`
+    /// [`StructField`] must be coerced to the requested type. In particular, timestamp columns MUST
+    /// be normalized to the protocol specified microsecond precision: a `TIMESTAMP(MILLIS)` (or
+    /// any other non-microsecond unit) column read into a `TIMESTAMP` / `TIMESTAMP_NTZ` field
+    /// must be rescaled to microseconds (a finer unit such as nanosecond is truncated). The
+    /// default engine does this via `arrow::compute::cast` while reordering columns to the
+    /// requested schema.
+    ///
     /// # Metadata Columns
     ///
     /// The ParquetHandler must support virtual metadata columns that provide additional information
