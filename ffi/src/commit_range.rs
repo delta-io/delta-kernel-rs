@@ -20,7 +20,7 @@ pub struct SharedCommitRange;
 /// Opaque builder for constructing a [`CommitRange`] from a table path.
 ///
 /// Create with [`commit_range_builder_for`]. Optionally pin the end of the range with
-/// [`commit_range_builder_with_end_version`]. Finally, call [`commit_range_builder_build`] to
+/// [`commit_range_builder_set_end_version`]. Finally, call [`commit_range_builder_build`] to
 /// consume the builder and obtain the range. To discard the builder without building, call
 /// [`free_commit_range_builder`].
 pub struct FfiCommitRangeBuilder {
