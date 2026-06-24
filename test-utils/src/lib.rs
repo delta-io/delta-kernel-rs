@@ -133,12 +133,13 @@ define_sweeps! {
         checkpoint_struct_stats(),
         no_checkpoint_stats()
     ),
-    // Data layout and stats config are bundled into one axis (rather than crossed) to keep
-    // the default sweep within its ~4k-case budget. The rows cover every (encoding x
-    // data-skipping knob) pairing -- json and struct each crossed with numIndexedCols 0/2/-1
-    // and a dataSkippingStatsColumns list (empty and reordered) -- plus a no-stats row, with
-    // the layout rotated across rows. The sweep only round-trips each pairing (writes then
-    // reads back); it does not assert skipping behavior, which lives in predicate-bearing
+    // Data layout and stats config share one bundled axis instead of being crossed: the
+    // sweep only round-trips each pairing (no predicate, so the stats config can't change
+    // the row-count assertion), so a full layout x config cross would multiply the case
+    // count without adding coverage. The rows cover every (encoding x data-skipping knob)
+    // pairing -- json and struct each crossed with numIndexedCols 0/2/-1 and a
+    // dataSkippingStatsColumns list (empty and reordered) -- plus a no-stats row, with the
+    // layout rotated across rows. Skipping behavior itself is asserted in predicate-bearing
     // unit tests.
     layout_config_values = (
         (unpartitioned(), no_checkpoint_stats()),
