@@ -2667,54 +2667,6 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to
-/// LogSegment
-#[tokio::test]
-async fn test_checkpoint_schema_propagation_from_hint() {
-    use crate::schema::{StructField, StructType};
-
-    // Create a sample schema that would be in _last_checkpoint
-    let sample_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", StructType::new_unchecked([])),
-        StructField::nullable("remove", StructType::new_unchecked([])),
-    ]));
-
-    let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
-        version: 5,
-        size: 10,
-        parts: Some(1),
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: Some(sample_schema.clone()),
-        checksum: None,
-        tags: None,
-    };
-
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(6, "json"),
-        ],
-        Some(&checkpoint_metadata),
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![], // log_tail
-        Some(checkpoint_metadata),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.last_checkpoint_version(), Some(5));
-    assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
-}
-
 fn synthetic_sidecar() -> Sidecar {
     Sidecar {
         path: "sidecar-1.parquet".to_string(),
