@@ -15,6 +15,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -476,10 +477,104 @@ pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
 #[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableBuilder;
 
-// TODO: Add `create_table_builder_with_data_layout` FFI function to support partitioned and
-// clustered table creation. The kernel's
-// `CreateTableTransactionBuilder::with_data_layout(DataLayout)` supports this but is not yet
-// exposed through FFI.
+/// Collect `num_columns` column-name string slices into owned `String`s.
+///
+/// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
+/// pointer is sound in the empty case.
+///
+/// # Safety
+///
+/// When `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid
+/// [`KernelStringSlice`] values, each backing valid UTF-8 for the duration of the call.
+unsafe fn collect_create_table_columns(
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+) -> DeltaResult<Vec<String>> {
+    if num_columns == 0 {
+        return Ok(Vec::new());
+    }
+    let slices = unsafe { std::slice::from_raw_parts(columns, num_columns) };
+    slices
+        .iter()
+        .map(|slice| {
+            let name: &str = unsafe { TryFromStringSlice::try_from_slice(slice) }?;
+            Ok(name.to_string())
+        })
+        .collect()
+}
+
+/// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// clustering column names (in order). Clustering and partitioning are mutually exclusive; the
+/// last data-layout call wins. Column validation (existence, types, duplicates) happens later at
+/// [`create_table_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// Only top-level columns are supported through this entry point (each slice is one column name);
+/// nested clustering columns must be set on the Rust builder directly.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle, a `columns`/`num_columns` pair that
+/// satisfies [`collect_create_table_columns`], and a valid `engine`. CONSUMES the builder handle
+/// unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_with_clustering_columns(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_builder_with_clustering_columns_impl(builder, columns).into_extern_result(&engine)
+}
+
+fn create_table_builder_with_clustering_columns_impl(
+    builder: CreateTableTransactionBuilder,
+    columns: DeltaResult<Vec<String>>,
+) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    let builder = builder.with_data_layout(DataLayout::clustered(columns?));
+    Ok(Box::new(builder).into())
+}
+
+/// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// partition column names (in order). Clustering and partitioning are mutually exclusive; the last
+/// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
+/// later at [`create_table_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle, a `columns`/`num_columns` pair that
+/// satisfies [`collect_create_table_columns`], and a valid `engine`. CONSUMES the builder handle
+/// unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_with_partition_columns(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_builder_with_partition_columns_impl(builder, columns).into_extern_result(&engine)
+}
+
+fn create_table_builder_with_partition_columns_impl(
+    builder: CreateTableTransactionBuilder,
+    columns: DeltaResult<Vec<String>>,
+) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    let builder = builder.with_data_layout(DataLayout::partitioned(columns?));
+    Ok(Box::new(builder).into())
+}
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
@@ -1568,6 +1663,97 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    /// Reads the v0 commit file (`_delta_log/00..00.json`) of a freshly created table.
+    fn read_v0_commit(tmp_dir: &tempfile::TempDir) -> String {
+        let path = tmp_dir
+            .path()
+            .join("_delta_log")
+            .join("00000000000000000000.json");
+        std::fs::read_to_string(path).expect("v0 commit file should exist")
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_clustering_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        let col = "id";
+        let columns = [kernel_string_slice!(col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        // A clustered create records the `delta.clustering` domain metadata (listing the
+        // clustering columns, JSON-escaped inside the configuration string) and adds the
+        // `clustering` writer feature to the protocol.
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains("delta.clustering"),
+            "missing clustering domain metadata: {log}"
+        );
+        assert!(
+            log.contains("clusteringColumns") && log.contains(r#"[[\"id\"]]"#),
+            "missing clustering columns: {log}"
+        );
+        assert!(
+            log.contains(r#""clustering""#),
+            "missing clustering writer feature: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        // Partitioning requires at least one non-partition column, so partition on `date`
+        // while keeping `id` as data.
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("date", DataType::STRING),
+            ],
+        );
+
+        let col = "date";
+        let columns = [kernel_string_slice!(col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_partition_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        // A partitioned create records the partition columns in the table metadata.
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains(r#""partitionColumns":["date"]"#),
+            "missing partitionColumns in metadata: {log}"
+        );
+
         unsafe { free_engine(engine) };
         Ok(())
     }
