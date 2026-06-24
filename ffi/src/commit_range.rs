@@ -297,7 +297,7 @@ pub struct SharedCommitActionsIterator;
 /// valid [`KernelDeltaAction`] values.
 #[no_mangle]
 pub unsafe extern "C" fn commit_range_commits(
-    commit_range: Handle<ExclusiveCommitRange>,
+    commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
     actions: *const KernelDeltaAction,
     actions_len: usize,
@@ -326,7 +326,7 @@ pub unsafe extern "C" fn commit_range_commits(
 /// valid [`KernelDeltaAction`] values.
 #[no_mangle]
 pub unsafe extern "C" fn commit_range_commits_with_snapshot(
-    commit_range: Handle<ExclusiveCommitRange>,
+    commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
     start_snapshot: Handle<SharedSnapshot>,
     actions: *const KernelDeltaAction,
@@ -457,7 +457,7 @@ mod tests {
         start_version: u64,
         end_version: u64,
         engine: Handle<SharedExternEngine>,
-    ) -> Handle<ExclusiveCommitRange> {
+    ) -> Handle<SharedCommitRange> {
         let mut builder = unsafe {
             ok_or_panic(commit_range_builder_for(
                 kernel_string_slice!(table_root),
@@ -465,7 +465,7 @@ mod tests {
                 engine,
             ))
         };
-        unsafe { commit_range_builder_with_end_version(&mut builder, end_version) };
+        unsafe { commit_range_builder_set_end_version(&mut builder, end_version) };
         unsafe { ok_or_panic(commit_range_builder_build(builder)) }
     }
 
