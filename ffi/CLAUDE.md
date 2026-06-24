@@ -47,6 +47,20 @@ Snapshot builder API (`ffi/src/lib.rs`):
 
 The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
 
+## Commit Range Flow
+
+A `CommitRange` describes a contiguous commits of table. Build one
+via the commit range builder (`ffi/src/commit_range.rs`):
+
+```
+commit_range_builder_for(path, start_version, engine)
+  -> commit_range_builder_set_end_version(builder, end_version)  // optional; else latest version
+  -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
+```
+
+The caller owns the builder and must call either `commit_range_builder_build` or
+`free_commit_range_builder`. Release the range with `free_commit_range`.
+
 ## Write Flow
 
 ```

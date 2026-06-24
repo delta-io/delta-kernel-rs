@@ -11,11 +11,11 @@ use crate::{
     SharedExternEngine,
 };
 
-/// An opaque, exclusive handle owning a [`CommitRange`] produced by
+/// An opaque, shared handle owning a [`CommitRange`] produced by
 /// [`commit_range_builder_build`]. The caller owns the handle and must release it with
 /// [`free_commit_range`].
-#[handle_descriptor(target=CommitRange, mutable=true, sized=true)]
-pub struct ExclusiveCommitRange;
+#[handle_descriptor(target=CommitRange, mutable=false, sized=true)]
+pub struct SharedCommitRange;
 
 /// Opaque builder for constructing a [`CommitRange`] from a table path.
 ///
@@ -78,7 +78,7 @@ pub unsafe extern "C" fn commit_range_builder_for(
 ///
 /// Caller must pass a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn commit_range_builder_with_end_version(
+pub unsafe extern "C" fn commit_range_builder_set_end_version(
     builder: &mut Handle<MutableFfiCommitRangeBuilder>,
     end_version: Version,
 ) {
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn commit_range_builder_with_end_version(
 #[no_mangle]
 pub unsafe extern "C" fn commit_range_builder_build(
     builder: Handle<MutableFfiCommitRangeBuilder>,
-) -> ExternResult<Handle<ExclusiveCommitRange>> {
+) -> ExternResult<Handle<SharedCommitRange>> {
     let builder_box = unsafe { builder.into_inner() };
     let engine = builder_box.engine.clone();
     commit_range_builder_build_impl(*builder_box).into_extern_result(&engine.as_ref())
@@ -105,14 +105,14 @@ pub unsafe extern "C" fn commit_range_builder_build(
 
 fn commit_range_builder_build_impl(
     builder: FfiCommitRangeBuilder,
-) -> DeltaResult<Handle<ExclusiveCommitRange>> {
+) -> DeltaResult<Handle<SharedCommitRange>> {
     let engine = builder.engine.engine();
     let mut kernel_builder = CommitRange::builder_for(builder.table_root, builder.start_version);
     if let Some(end_version) = builder.end_version {
         kernel_builder = kernel_builder.with_end_version(end_version);
     }
     let range = kernel_builder.build(engine.as_ref())?;
-    Ok(Box::new(range).into())
+    Ok(Arc::new(range).into())
 }
 
 /// Free a commit range builder without building a range (e.g. on an error path).
@@ -131,7 +131,7 @@ pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<MutableFfiCom
 ///
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn free_commit_range(commit_range: Handle<ExclusiveCommitRange>) {
+pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRange>) {
     commit_range.drop_handle();
 }
 
@@ -190,7 +190,7 @@ mod tests {
             ))
         };
         if let Some(end_version) = builder_end_version {
-            unsafe { commit_range_builder_with_end_version(&mut builder, end_version) };
+            unsafe { commit_range_builder_set_end_version(&mut builder, end_version) };
         }
         let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
 
@@ -219,6 +219,23 @@ mod tests {
             KernelError::InvalidTableLocationError,
             None,
         );
+
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_free_commit_range_builder() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root) = setup_engine_with_commits(3).await;
+
+        let builder = unsafe {
+            ok_or_panic(commit_range_builder_for(
+                kernel_string_slice!(table_root),
+                0,
+                engine.shallow_copy(),
+            ))
+        };
+        unsafe { free_commit_range_builder(builder) }
 
         unsafe { free_engine(engine) }
         Ok(())
