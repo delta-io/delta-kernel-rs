@@ -31,12 +31,13 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
-    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS,
-    DATA_SKIPPING_STATS_COLUMNS, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
-    ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
+    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
+    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
+    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
     ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
     SET_TRANSACTION_RETENTION_DURATION,
 };
@@ -114,6 +115,14 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     ENABLE_ROW_TRACKING,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
+    // Metadata-only log/checkpoint maintenance configs. These do not enable any table feature;
+    // they are stored verbatim in the table metadata and consumed later by log cleanup /
+    // checkpoint scheduling. Allowed at CREATE so connectors (e.g. AI Gateway / payload logging)
+    // can pin retention at table-creation time.
+    LOG_RETENTION_DURATION,
+    DELETED_FILE_RETENTION_DURATION,
+    ENABLE_EXPIRED_LOG_CLEANUP,
+    CHECKPOINT_INTERVAL,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
@@ -1118,6 +1127,43 @@ mod tests {
         let properties = HashMap::from([(key.to_string(), value.to_string())]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
         assert_eq!(validated.properties.get(key), Some(&value.to_string()));
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_maintenance_properties_accepted() {
+        // Log/checkpoint maintenance configs are metadata-only: accepted at CREATE, stored
+        // verbatim, and enable no table feature.
+        let properties = HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 30 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+            (ENABLE_EXPIRED_LOG_CLEANUP.to_string(), "true".to_string()),
+            (CHECKPOINT_INTERVAL.to_string(), "10".to_string()),
+        ]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(LOG_RETENTION_DURATION),
+            Some(&"interval 30 days".to_string()),
+        );
+        assert_eq!(
+            validated.properties.get(DELETED_FILE_RETENTION_DURATION),
+            Some(&"interval 7 days".to_string()),
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_EXPIRED_LOG_CLEANUP),
+            Some(&"true".to_string()),
+        );
+        assert_eq!(
+            validated.properties.get(CHECKPOINT_INTERVAL),
+            Some(&"10".to_string()),
+        );
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
     }
