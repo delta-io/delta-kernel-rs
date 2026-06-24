@@ -112,6 +112,7 @@ authoritative list and signatures, consult the generated
 | `get_default_engine` | Create an engine from a table path with default options |
 | `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
 | `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
+| `set_builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
 | `free_engine` | Release the engine handle |
 
 **Snapshots**
