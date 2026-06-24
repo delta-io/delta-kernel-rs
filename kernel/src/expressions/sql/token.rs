@@ -22,8 +22,6 @@ type CharStream<'a> = Peekable<Chars<'a>>;
 /// through to either an [`Token::Ident`] or a tokenizer error, both of which the parser rejects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Token {
-    /// A single identifier segment (one component of a column path). Dotted paths are assembled by
-    /// the parser from `Ident (Dot Ident)*`.
     Ident(String),
     /// The raw source text of a literal -- a number, a `'string'` (quotes retained), an `X'..'`
     /// binary, `TRUE`/`FALSE`, `NULL`, or a typed `DATE '...'` / `TIMESTAMP '...'` /

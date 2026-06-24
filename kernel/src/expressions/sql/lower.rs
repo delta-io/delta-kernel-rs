@@ -13,15 +13,13 @@ use crate::expressions::{ColumnName, Expression, Predicate};
 use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
 
-/// Lower a single parsed comparison into a kernel [`Predicate`], resolving each operand against
-/// `schema` exactly once. The comparison must reference at least one column so that a literal
+/// The comparison must reference at least one column so that a literal
 /// operand can be typed from the column on the other side.
 pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult<Predicate> {
     let Comparison { op, left, right } = comparison;
     let left = resolve_operand(left, schema)?;
     let right = resolve_operand(right, schema)?;
-    // A literal is typed from the column on the other side, so at least one operand must be a
-    // column.
+
     let left_type = left.column_type().cloned();
     let right_type = right.column_type().cloned();
     if left_type.is_none() && right_type.is_none() {

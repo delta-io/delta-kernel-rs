@@ -24,17 +24,6 @@ use crate::schema::StructType;
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
 
-// === CHECK-constraint predicate parser ===
-//
-// `parse_sql` (below) turns a single SQL *literal* of a known type into an `Expression`. A CHECK
-// constraint is instead a boolean *predicate* over columns (e.g. `amount > 0`), which the literal
-// parser cannot express. These submodules add the three layers it lacks -- a tokenizer, a
-// single-comparison parser, and a schema-aware lowering pass -- and reuse `parse_sql` to parse the
-// literal leaves.
-//
-// Only one comparison (`operand <op> operand`) is parsed today; richer grammar (`AND`/`OR`/`NOT`,
-// parentheses, `IS [NOT] NULL`) is a follow-up. Anything outside the supported grammar is rejected,
-// which the caller treats as "not kernel-parsable".
 #[cfg(feature = "check-constraints-in-dev")]
 mod lower;
 #[cfg(feature = "check-constraints-in-dev")]
