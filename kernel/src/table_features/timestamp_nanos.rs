@@ -1,7 +1,5 @@
 //! Validation for TIMESTAMP_NANOS and TIMESTAMP_NANOS_NTZ feature support
 
-use std::borrow::Cow;
-
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
@@ -30,21 +28,20 @@ pub(crate) fn validate_timestamp_nanos_feature_support(tc: &TableConfiguration) 
 /// Checks if any column in the schema (including nested structs, arrays, maps) uses
 /// the TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ primitive type.
 pub(crate) fn schema_contains_timestamp_nanos(schema: &Schema) -> bool {
-    let mut uses_timestamp_nanos = UsesTimestampNanos(false);
-    let _ = uses_timestamp_nanos.transform_struct(schema);
-    uses_timestamp_nanos.0
+    UsesTimestampNanos.transform_struct(schema).is_err()
 }
 
-struct UsesTimestampNanos(bool);
+struct UsesTimestampNanos;
 
 impl<'a> SchemaTransform<'a> for UsesTimestampNanos {
-    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+    transform_output_type!(|'a, T| Result<(), ()>);
 
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if *ptype == PrimitiveType::TimestampNanos || *ptype == PrimitiveType::TimestampNanosNtz {
-            self.0 = true;
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
+        match ptype {
+            PrimitiveType::TimestampNanos => Err(()),
+            PrimitiveType::TimestampNanosNtz => Err(()),
+            _ => Ok(()),
         }
-        None
     }
 }
 
