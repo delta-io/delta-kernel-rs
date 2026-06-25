@@ -8,15 +8,16 @@ use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
     all_features_cm_id, all_features_cm_name, checkpoint_at_end, checkpoint_at_end_crc_at_end,
     checkpoint_at_end_no_hint, checkpoint_at_end_no_hint_post_cleanup,
-    checkpoint_at_end_post_cleanup, checkpoint_json_stats, checkpoint_mid,
-    checkpoint_mid_crc_above_mid_post_cleanup, checkpoint_mid_crc_at_end_post_cleanup,
-    checkpoint_mid_crc_at_mid_post_cleanup, checkpoint_mid_no_hint,
-    checkpoint_mid_no_hint_post_cleanup, checkpoint_mid_post_cleanup, checkpoint_struct_stats,
-    clustered, commits_only, crc_at_end, crc_at_mid, no_checkpoint_stats, no_features, partitioned,
-    test_table, two_checkpoints_stale_hint, two_checkpoints_stale_hint_post_cleanup, unpartitioned,
-    version_at_mid, version_at_timestamp_max, version_incremental_from_mid_to_latest,
-    version_incremental_from_mid_to_pre_latest, version_latest, DataLayoutConfig, FeatureSet,
-    LogState, TableConfig, VersionTarget,
+    checkpoint_at_end_post_cleanup, checkpoint_mid, checkpoint_mid_crc_above_mid_post_cleanup,
+    checkpoint_mid_crc_at_end_post_cleanup, checkpoint_mid_crc_at_mid_post_cleanup,
+    checkpoint_mid_no_hint, checkpoint_mid_no_hint_post_cleanup, checkpoint_mid_post_cleanup,
+    clustered, commits_only, crc_at_end, crc_at_mid, no_checkpoint_stats, no_features,
+    num_indexed_cols_all, num_indexed_cols_narrow, num_indexed_cols_zero, partitioned,
+    stats_columns_empty, stats_columns_reordered, test_table, two_checkpoints_stale_hint,
+    two_checkpoints_stale_hint_post_cleanup, unpartitioned, version_at_mid,
+    version_at_timestamp_max, version_incremental_from_mid_to_latest,
+    version_incremental_from_mid_to_pre_latest, version_latest, with_json_stats, with_struct_stats,
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, VersionTarget,
 };
 use test_utils::{assert_row_ids_unique, build_snapshot, default_sweep, read_scan};
 
@@ -25,18 +26,20 @@ use test_utils::{assert_row_ids_unique, build_snapshot, default_sweep, read_scan
 /// per commit isn't asserted because partitioned layouts may emit multiple files.
 const ROWS_PER_COMMIT: usize = 10;
 
-/// `default_sweep` is the canonical `{LogState x FeatureSet x DataLayoutConfig x
-/// TableConfig x VersionTarget}` cross-product defined in `test_utils`. Each
-/// combination expands into its own test runner case. Invoking `test_table` here also
-/// exercises the write path that produces each table state.
+/// `default_sweep` is the canonical `{LogState x FeatureSet x (DataLayoutConfig,
+/// TableConfig) x VersionTarget}` cross-product defined in `test_utils`. Data layout and
+/// stats config share one bundled axis (see `layout_config_values`) rather than being
+/// crossed, to keep the case count within budget. Each combination expands into its own
+/// test runner case. Invoking `test_table` here also exercises the write path that produces
+/// each table state.
 #[apply(default_sweep)]
 fn test_cross_product_read_write(
     log_state: LogState,
     feature_set: FeatureSet,
-    data_layout: DataLayoutConfig,
-    table_config: TableConfig,
+    layout_config: (DataLayoutConfig, TableConfig),
     version_target: VersionTarget,
 ) -> DeltaResult<()> {
+    let (data_layout, table_config) = layout_config;
     let table = test_table(log_state.clone(), feature_set, data_layout, table_config);
     let engine: Arc<dyn Engine> =
         Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());

@@ -713,6 +713,33 @@ impl TableConfig {
         ));
         self
     }
+
+    /// Set `delta.dataSkippingNumIndexedCols` to `n`: stats are capped to the first `n` leaf
+    /// columns. `-1` means all columns; the protocol default when unset is 32.
+    pub fn num_data_skipping_indexed_cols(mut self, n: i64) -> Self {
+        self.table_properties
+            .push(("delta.dataSkippingNumIndexedCols".into(), n.to_string()));
+        self
+    }
+
+    /// Set `delta.dataSkippingStatsColumns` to a comma-separated list of column names.
+    /// Per the Delta spec this takes precedence over `dataSkippingNumIndexedCols`. The
+    /// builder joins names verbatim and does not validate them; entries that don't
+    /// resolve in the active schema are silently skipped by kernel (with a warning).
+    pub fn data_skipping_stats_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let joined = columns
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.table_properties
+            .push(("delta.dataSkippingStatsColumns".into(), joined));
+        self
+    }
 }
 
 impl fmt::Display for TableConfig {
@@ -735,8 +762,20 @@ impl fmt::Display for TableConfig {
     }
 }
 
-// Canonical sweep rows for the TableConfig axis. These toggle only the *checkpoint*
-// stats encoding -- per-commit add-file stats are always written and unaffected.
+// Canonical sweep rows for the `TableConfig` axis. The sweep covers three checkpoint
+// stats encodings plus six data-skipping rows: three count-based (`numIndexedCols`)
+// values and three named-columns (`dataSkippingStatsColumns`) shapes, so each knob
+// varies across the full LogState x FeatureSet x DataLayout x VersionTarget cross
+// product. Per-commit add-file stats are always written and unaffected by the
+// checkpoint format flags.
+
+/// Stats-column names that span the schemas used by [`DataLayoutConfig`]: `int_col`
+/// exists in [`default_schema`], `value` in [`partitioned_schema`] and
+/// [`clustered_schema`]. Kernel silently skips entries that don't exist in the active
+/// schema, so each layout collects stats on whichever entry matches.
+pub(crate) const STATS_COLUMNS_BY_NAME: &[&str] = &["int_col", "value"];
+
+// === Checkpoint stats encoding rows ===
 
 pub fn checkpoint_json_stats() -> TableConfig {
     TableConfig::new()
@@ -750,10 +789,53 @@ pub fn checkpoint_struct_stats() -> TableConfig {
         .write_stats_as_struct(true)
 }
 
+/// Disables both checkpoint stats encodings; per-commit add-file stats are still written.
 pub fn no_checkpoint_stats() -> TableConfig {
     TableConfig::new()
         .write_stats_as_json(false)
         .write_stats_as_struct(false)
+}
+
+// === numIndexedCols rows (count-based data skipping) ===
+
+/// `numIndexedCols = 0`: zero leaf columns get stats.
+pub fn num_indexed_cols_zero() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(0)
+}
+
+/// `numIndexedCols = 2`: cap stats to the first 2 leaf columns.
+pub fn num_indexed_cols_narrow() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(2)
+}
+
+/// `numIndexedCols = -1`: stats on every leaf column.
+pub fn num_indexed_cols_all() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(-1)
+}
+
+// === dataSkippingStatsColumns rows (named-cols data skipping) ===
+
+/// `dataSkippingStatsColumns = []`: named-cols knob set, no columns listed.
+pub fn stats_columns_empty() -> TableConfig {
+    TableConfig::new().data_skipping_stats_columns(std::iter::empty::<&str>())
+}
+
+/// `dataSkippingStatsColumns` listing names that match at least one column in every
+/// `DataLayoutConfig` schema (kernel silently skips entries that don't match), in reverse
+/// schema order to exercise list-order preservation through write + read.
+pub fn stats_columns_reordered() -> TableConfig {
+    TableConfig::new().data_skipping_stats_columns(STATS_COLUMNS_BY_NAME.iter().rev().copied())
+}
+
+// === Composers: enable a checkpoint stats encoding on a data-skipping config ===
+// Each enables only its own encoding, so composing both writes stats in both encodings.
+
+pub fn with_json_stats(cfg: TableConfig) -> TableConfig {
+    cfg.write_stats_as_json(true)
+}
+
+pub fn with_struct_stats(cfg: TableConfig) -> TableConfig {
+    cfg.write_stats_as_struct(true)
 }
 
 // ===========================================================================
@@ -1895,6 +1977,43 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_data_skipping_table_properties_in_metadata() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_table_config(
+                TableConfig::new()
+                    .num_data_skipping_indexed_cols(2)
+                    .data_skipping_stats_columns(["int_col", "long_col"]),
+            )
+            .build()?;
+        let config = read_metadata_configuration(table.store(), 0)?;
+        assert_eq!(
+            config
+                .get("delta.dataSkippingNumIndexedCols")
+                .map(|s| s.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            config
+                .get("delta.dataSkippingStatsColumns")
+                .map(|s| s.as_str()),
+            Some("int_col,long_col")
+        );
+        Ok(())
+    }
+
+    fn read_metadata_configuration(
+        store: &Arc<DynObjectStore>,
+        version: u64,
+    ) -> DeltaResult<std::collections::HashMap<String, String>> {
+        let store = store.clone();
+        block_on_sync(move || async move {
+            crate::read_metadata_configuration_from_store(store.as_ref(), version)
+                .await
+                .map_err(|e| delta_kernel::Error::generic(e.to_string()))
+        })
     }
 
     /// Verifies every common table config builds successfully.

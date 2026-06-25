@@ -56,6 +56,7 @@ macro_rules! define_sweeps {
         feature_set_values = $fs:tt,
         data_layout_values = $dl:tt,
         table_config_values = $tc:tt,
+        layout_config_values = $lc:tt,
         version_target_values = $vt:tt $(,)?
     ) => {
         #[template]
@@ -64,8 +65,7 @@ macro_rules! define_sweeps {
         pub fn default_sweep(
             #[values $ls] log_state: LogState,
             #[values $fs] feature_set: FeatureSet,
-            #[values $dl] data_layout: DataLayoutConfig,
-            #[values $tc] table_config: TableConfig,
+            #[values $lc] layout_config: (DataLayoutConfig, TableConfig),
             #[values $vt] version_target: VersionTarget,
         ) {
         }
@@ -132,6 +132,23 @@ define_sweeps! {
         checkpoint_json_stats(),
         checkpoint_struct_stats(),
         no_checkpoint_stats()
+    ),
+    // Data layout and stats config are bundled into one axis rather than crossed: this
+    // sweep round-trips each pairing with no predicate, so the stats config can't affect
+    // the version or row-count assertions, and crossing the two would add cases without
+    // adding coverage. Skipping behavior is asserted in predicate-bearing unit tests.
+    layout_config_values = (
+        (unpartitioned(), no_checkpoint_stats()),
+        (partitioned(), with_json_stats(num_indexed_cols_zero())),
+        (clustered(), with_struct_stats(num_indexed_cols_zero())),
+        (unpartitioned(), with_json_stats(num_indexed_cols_narrow())),
+        (partitioned(), with_struct_stats(num_indexed_cols_narrow())),
+        (clustered(), with_json_stats(num_indexed_cols_all())),
+        (unpartitioned(), with_struct_stats(num_indexed_cols_all())),
+        (partitioned(), with_json_stats(stats_columns_empty())),
+        (clustered(), with_struct_stats(stats_columns_empty())),
+        (unpartitioned(), with_json_stats(stats_columns_reordered())),
+        (partitioned(), with_struct_stats(stats_columns_reordered()))
     ),
     // `version_at_timestamp_max()` is the only timestamp row; see its docs for why
     // intermediate-version resolution lives in a dedicated test instead.
@@ -1538,6 +1555,35 @@ pub fn get_materialized_row_tracking_column_names(
             .as_str()
             .map(str::to_owned),
     })
+}
+
+/// Reads the `metaData.configuration` map from commit `version` directly through a
+/// [`DynObjectStore`]. Works with any backing store (`file://`, `memory://`, etc.) since
+/// it bypasses [`read_actions_from_commit`]'s `to_file_path()` requirement.
+///
+/// Returns an empty map when the commit contains no `metaData` action, or when the
+/// action has an empty/absent `configuration` field. Errors if any configuration value is
+/// not a string (the spec requires all configuration entries to be strings).
+/// Propagates object-store errors when the commit file is missing or unreadable.
+pub async fn read_metadata_configuration_from_store(
+    store: &DynObjectStore,
+    version: u64,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let path =
+        delta_kernel::object_store::path::Path::from(format!("_delta_log/{version:020}.json"));
+    let get_result = store.get(&path).await?;
+    let bytes = get_result.bytes().await?;
+    let mut config = HashMap::new();
+    for line in std::str::from_utf8(&bytes)?.lines() {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
+            if c.is_object() {
+                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+                config.extend(entries);
+            }
+        }
+    }
+    Ok(config)
 }
 
 /// Removes all scan files from the snapshot, commits the transaction, and returns
