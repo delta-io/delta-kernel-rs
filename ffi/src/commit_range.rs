@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
@@ -137,8 +137,6 @@ pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRang
     commit_range.drop_handle();
 }
 
-// === CommitRange::commits ===
-
 /// FFI-safe mirror of [`DeltaAction`]: the Delta log action kinds a caller can request from
 /// [`commit_range_commits`].
 #[repr(C)]
@@ -174,7 +172,7 @@ impl From<KernelDeltaAction> for DeltaAction {
 }
 
 /// Copy a C array of [`KernelDeltaAction`] into a `Vec<DeltaAction>`. A null pointer or zero
-/// length yields an empty vector (which [`CommitRange::commits`] rejects).
+/// length yields an empty vector.
 ///
 /// # Safety
 ///
@@ -257,19 +255,17 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     commit_action.drop_handle();
 }
 
-/// Boxed iterator over the commits in a range. Each `next` validates the commit and may fail.
 type CommitActionIter = DeltaResultIteratorStatic<CommitAction>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
-/// mutex (so it is safe to share across threads) plus an engine reference for error allocation and
-/// to keep the engine's async runtime alive while iterating.
+/// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
 pub struct FfiCommitActionsIterator {
     data: Mutex<CommitActionIter>,
     engine: Arc<dyn ExternEngine>,
 }
 
 impl FfiCommitActionsIterator {
-    fn lock_iter(&self) -> DeltaResult<std::sync::MutexGuard<'_, CommitActionIter>> {
+    fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
             .map_err(|_| Error::generic("poisoned commit-actions iterator mutex"))
@@ -280,8 +276,7 @@ impl FfiCommitActionsIterator {
 pub struct SharedCommitActionsIterator;
 
 /// Get an iterator over the commits in `commit_range`, yielding one [`CommitAction`] per commit.
-/// Each commit is validated against the protocol/metadata observed in the commits themselves; see
-/// [`commit_range_commits_with_snapshot`] to seed validation from a start snapshot instead.
+/// Use [`commit_range_commits_with_snapshot`] to seed the iterator from a start snapshot instead.
 ///
 /// - `engine`: performs the per-commit JSON reads and allocates errors.
 /// - `actions` / `actions_len`: the action kinds to project into each commit's read schema.
@@ -308,7 +303,7 @@ pub unsafe extern "C" fn commit_range_commits(
         .into_extern_result(&engine_ref)
 }
 
-/// Like [`commit_range_commits`], but seeds protocol/metadata validation from `start_snapshot`.
+/// Like [`commit_range_commits`], but seeds the iterator's protocol/metadata from `start_snapshot`.
 ///
 /// The snapshot's version must match the range's anchor (the start version for ascending ranges,
 /// the end version for descending ranges).
@@ -356,7 +351,7 @@ fn commit_range_commits_impl(
 
 /// Call `engine_visitor` with the next [`CommitAction`] in the range, returning `true` if an item
 /// was yielded and `false` once the iterator is exhausted. The visitor receives a
-/// [`SharedCommitAction`] it must free via [`free_commit_action`]. Per-commit protocol validation
+/// [`SharedCommitAction`] must free via [`free_commit_action`]. Per-commit protocol validation
 /// runs here, so a malformed commit surfaces as an error from this call.
 ///
 /// # Safety
@@ -399,11 +394,10 @@ fn commit_range_commits_next_impl(
 ///
 /// # Safety
 ///
-/// Caller is responsible for (at most once) passing a valid pointer returned by
-/// [`commit_range_commits`].
+/// Caller is responsible for passing a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn free_commit_actions_iter(data: Handle<SharedCommitActionsIterator>) {
-    data.drop_handle();
+pub unsafe extern "C" fn free_commit_actions_iter(iter: Handle<SharedCommitActionsIterator>) {
+    iter.drop_handle();
 }
 
 #[cfg(test)]
@@ -467,21 +461,18 @@ mod tests {
         unsafe { ok_or_panic(commit_range_builder_build(builder)) }
     }
 
-    /// Visitor that reads each commit action's version (also touching the timestamp accessor) into
-    /// the `Vec<u64>` passed via `engine_context`, then frees the handle.
+    /// Engine visitor that reads each commit action's version, then frees the handle.
     extern "C" fn collect_versions(ctx: NullableCvoid, commit_action: Handle<SharedCommitAction>) {
-        let mut versions = unsafe { Box::from_raw(ctx.unwrap().as_ptr() as *mut Vec<u64>) };
+        let versions = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut Vec<u64>) };
         let version = unsafe { commit_action_version(commit_action.shallow_copy()) };
-        let _timestamp = unsafe { commit_action_timestamp(commit_action.shallow_copy()) };
         versions.push(version);
-        Box::leak(versions);
         unsafe { free_commit_action(commit_action) }
     }
 
     /// Drain a commit-actions iterator, returning the versions yielded in order.
     unsafe fn drain_versions(iter: Handle<SharedCommitActionsIterator>) -> Vec<u64> {
-        let versions_ptr = Box::into_raw(Box::new(Vec::<u64>::new()));
-        let ctx = Some(unsafe { NonNull::new_unchecked(versions_ptr) }.cast());
+        let mut versions = Vec::<u64>::new();
+        let ctx = Some(unsafe { NonNull::new_unchecked(&mut versions) }.cast());
         while unsafe {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),
@@ -489,7 +480,7 @@ mod tests {
                 collect_versions,
             ))
         } {}
-        *unsafe { Box::from_raw(versions_ptr) }
+        versions
     }
 
     #[rstest]
@@ -581,55 +572,43 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_commit_range_commits_no_snapshot_yields_each_commit(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, table_root) = setup_engine_with_commits(1).await;
-        let range = unsafe { build_range(table_root, 0, 1, engine.shallow_copy()) };
-
-        let actions = [KernelDeltaAction::Metadata, KernelDeltaAction::Protocol];
-        let iter = unsafe {
-            ok_or_panic(commit_range_commits(
-                range.shallow_copy(),
-                engine.shallow_copy(),
-                actions.as_ptr(),
-                actions.len(),
-            ))
-        };
-        let versions = unsafe { drain_versions(iter.shallow_copy()) };
-        assert_eq!(versions, vec![0, 1]);
-
-        unsafe { free_commit_actions_iter(iter) }
-        unsafe { free_commit_range(range) }
-        unsafe { free_engine(engine) }
-        Ok(())
-    }
-
     #[rstest]
-    #[case::matched_anchor_yields_commit(1, 1, Some(vec![1]))]
-    #[case::mismatched_anchor_errors(0, 0, None)]
+    #[case::no_snapshot_yields_each_commit(false, 0, 1, Some(vec![0, 1]))]
+    #[case::snapshot_matched_anchor_yields_commit(true, 1, 1, Some(vec![1]))]
+    #[case::snapshot_mismatched_anchor_errors(true, 0, 0, None)]
     #[tokio::test]
-    async fn test_commit_range_commits_with_snapshot(
+    async fn test_commit_range_commits(
+        #[case] with_snapshot: bool,
         #[case] range_start: u64,
         #[case] range_end: u64,
         #[case] expected: Option<Vec<u64>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root) = setup_engine_with_commits(1).await;
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
         let range =
             unsafe { build_range(table_root, range_start, range_end, engine.shallow_copy()) };
+        let actions = [KernelDeltaAction::Metadata, KernelDeltaAction::Protocol];
 
-        let actions = [KernelDeltaAction::Metadata];
+        let snapshot = with_snapshot.then(|| unsafe {
+            build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy())
+        });
         let result = unsafe {
-            commit_range_commits_with_snapshot(
-                range.shallow_copy(),
-                engine.shallow_copy(),
-                snapshot.shallow_copy(),
-                actions.as_ptr(),
-                actions.len(),
-            )
+            match &snapshot {
+                Some(snapshot) => commit_range_commits_with_snapshot(
+                    range.shallow_copy(),
+                    engine.shallow_copy(),
+                    snapshot.shallow_copy(),
+                    actions.as_ptr(),
+                    actions.len(),
+                ),
+                None => commit_range_commits(
+                    range.shallow_copy(),
+                    engine.shallow_copy(),
+                    actions.as_ptr(),
+                    actions.len(),
+                ),
+            }
         };
+
         match expected {
             Some(expected_versions) => {
                 let iter = ok_or_panic(result);
@@ -642,7 +621,9 @@ mod tests {
             }
         }
 
-        unsafe { free_snapshot(snapshot) }
+        if let Some(snapshot) = snapshot {
+            unsafe { free_snapshot(snapshot) }
+        }
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }
         Ok(())
@@ -676,8 +657,8 @@ mod tests {
         total_rows: usize,
     }
 
-    /// Inner visitor: add one `EngineData` batch's row count to the `usize` accumulator (passed via
-    /// `ctx`), then free the batch.
+    /// Engine visitor that calculuates `EngineData` batch's row to an accumulator, then free the
+    /// batch.
     extern "C" fn count_rows(ctx: NullableCvoid, data: Handle<ExclusiveEngineData>) {
         let total = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut usize) };
         let mut data = data;
@@ -685,7 +666,7 @@ mod tests {
         unsafe { free_engine_data(data) }
     }
 
-    /// Outer visitor: read one commit's action batches via [`commit_action_get_actions`],
+    /// Engine visitor that read one commit's action batches via [`commit_action_get_actions`],
     /// accumulating their row count, then free the read-result iterator and the commit action.
     extern "C" fn drain_commit_actions(ctx: NullableCvoid, action: Handle<SharedCommitAction>) {
         let ctx = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut GetActionsCtx) };
@@ -730,8 +711,6 @@ mod tests {
             ))
         } {}
 
-        // Each commit file holds three action lines (commitInfo, protocol, metaData) and
-        // `get_actions` yields one row per line, so the two commits (v0, v1) total six rows.
         assert_eq!(ctx.total_rows, 6);
 
         unsafe { free_commit_actions_iter(iter) }
