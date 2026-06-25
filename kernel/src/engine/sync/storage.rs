@@ -99,6 +99,15 @@ impl StorageHandler for SyncStorageHandler {
             size: meta.size,
         })
     }
+
+    fn delete(&self, url: &Url) -> DeltaResult<()> {
+        let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
+        match futures::executor::block_on(store.delete(&path)) {
+            Ok(()) => Ok(()),
+            Err(crate::object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +322,35 @@ mod tests {
             store.get(&path).await.unwrap().bytes().await.unwrap()
         });
         assert_eq!(bytes.as_ref(), b"third");
+    }
+
+    #[tokio::test]
+    async fn delete_store_removes_file() {
+        let store = std::sync::Arc::new(InMemory::new());
+        let storage = SyncStorageHandler::new(Some(store));
+        let url = Url::parse("memory:///file.json").unwrap();
+
+        storage
+            .put(&url, bytes::Bytes::from("hello"), false)
+            .unwrap();
+        storage.delete(&url).unwrap();
+
+        assert!(matches!(
+            storage.head(&url).unwrap_err(),
+            Error::FileNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_is_ok() {
+        let store = std::sync::Arc::new(InMemory::new());
+        let storage = SyncStorageHandler::new(Some(store));
+        let url = Url::parse("memory:///missing.json").unwrap();
+
+        assert!(matches!(
+            storage.head(&url).unwrap_err(),
+            Error::FileNotFound(_)
+        ));
+        storage.delete(&url).unwrap();
     }
 }

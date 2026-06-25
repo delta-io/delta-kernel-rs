@@ -627,6 +627,11 @@ pub trait StorageHandler: AsAny {
     ///
     /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
     fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
+
+    /// Delete the file at the given path.
+    ///
+    /// This operation is idempotent: deleting a path that does not exist returns `Ok(())`.
+    fn delete(&self, path: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
