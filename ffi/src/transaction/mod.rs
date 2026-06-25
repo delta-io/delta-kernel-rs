@@ -480,12 +480,12 @@ pub struct ExclusiveCreateTableBuilder;
 /// Collect `num_columns` column-name string slices into owned `String`s.
 ///
 /// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
-/// pointer is sound in the empty case.
+/// pointer is sound in the empty case. Returns `Err` if any slice is not valid UTF-8.
 ///
 /// # Safety
 ///
 /// When `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid
-/// [`KernelStringSlice`] values, each backing valid UTF-8 for the duration of the call.
+/// [`KernelStringSlice`] values whose backing bytes are readable for the duration of the call.
 unsafe fn collect_create_table_columns(
     columns: *const KernelStringSlice,
     num_columns: usize,
@@ -497,16 +497,15 @@ unsafe fn collect_create_table_columns(
     slices
         .iter()
         .map(|slice| {
-            let name: &str = unsafe { TryFromStringSlice::try_from_slice(slice) }?;
-            Ok(name.to_string())
+            unsafe { TryFromStringSlice::try_from_slice(slice) }.map(|s: &str| s.to_string())
         })
         .collect()
 }
 
 /// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
 /// clustering column names (in order). Clustering and partitioning are mutually exclusive; the
-/// last data-layout call wins. Column validation (existence, types, duplicates) happens later at
-/// [`create_table_builder_build`].
+/// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
+/// happens later at [`create_table_builder_build`].
 ///
 /// This consumes the builder handle and returns a new one. The caller MUST replace their handle
 /// pointer with the returned handle. On error, the old builder handle is consumed and gone --
@@ -530,15 +529,8 @@ pub unsafe extern "C" fn create_table_builder_with_clustering_columns(
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { *builder.into_inner() };
     let columns = unsafe { collect_create_table_columns(columns, num_columns) };
-    create_table_builder_with_clustering_columns_impl(builder, columns).into_extern_result(&engine)
-}
-
-fn create_table_builder_with_clustering_columns_impl(
-    builder: CreateTableTransactionBuilder,
-    columns: DeltaResult<Vec<String>>,
-) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
-    let builder = builder.with_data_layout(DataLayout::clustered(columns?));
-    Ok(Box::new(builder).into())
+    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
+        .into_extern_result(&engine)
 }
 
 /// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
@@ -565,15 +557,18 @@ pub unsafe extern "C" fn create_table_builder_with_partition_columns(
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { *builder.into_inner() };
     let columns = unsafe { collect_create_table_columns(columns, num_columns) };
-    create_table_builder_with_partition_columns_impl(builder, columns).into_extern_result(&engine)
+    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::partitioned))
+        .into_extern_result(&engine)
 }
 
-fn create_table_builder_with_partition_columns_impl(
+/// Shared lowering for the data-layout FFI entry points, extracted from the `unsafe extern`
+/// wrappers so it can be unit-tested. `layout` is a `DeltaResult` so a column-parse failure
+/// short-circuits here, dropping the already-consumed builder rather than producing a layout.
+fn create_table_builder_with_data_layout_impl(
     builder: CreateTableTransactionBuilder,
-    columns: DeltaResult<Vec<String>>,
+    layout: DeltaResult<DataLayout>,
 ) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
-    let builder = builder.with_data_layout(DataLayout::partitioned(columns?));
-    Ok(Box::new(builder).into())
+    Ok(Box::new(builder.with_data_layout(layout?)).into())
 }
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
@@ -1762,6 +1757,117 @@ mod tests {
 
         unsafe { free_engine(engine) };
         Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_multiple_clustering_columns(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        // Two columns: order must be preserved in the serialized clustering domain metadata.
+        let c0 = "id";
+        let c1 = "name";
+        let columns = [kernel_string_slice!(c0), kernel_string_slice!(c1)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains(r#"[[\"id\"],[\"name\"]]"#),
+            "clustering column order not preserved: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_data_layout_last_call_wins() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp_dir = tempdir()?;
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("date", DataType::STRING),
+            ],
+        );
+
+        // Set clustering, then partition: the layouts are mutually exclusive and the last call
+        // wins, so the committed table must be partitioned with no clustering domain metadata.
+        let c_col = "id";
+        let c_cols = [kernel_string_slice!(c_col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                c_cols.as_ptr(),
+                c_cols.len(),
+                engine.shallow_copy(),
+            )
+        });
+        let p_col = "date";
+        let p_cols = [kernel_string_slice!(p_col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_partition_columns(
+                builder,
+                p_cols.as_ptr(),
+                p_cols.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains(r#""partitionColumns":["date"]"#),
+            "partition layout should win: {log}"
+        );
+        assert!(
+            !log.contains("delta.clustering"),
+            "stale clustering layout leaked: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_create_table_columns_empty_is_null_safe() {
+        // num_columns == 0 must short-circuit before from_raw_parts, so a null pointer is sound.
+        let columns = unsafe { collect_create_table_columns(std::ptr::null(), 0) };
+        assert_eq!(columns.unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_with_data_layout_impl_propagates_column_error() {
+        // A column-collection error must short-circuit the shared lowering and drop the consumed
+        // builder, never producing a layout or a dangling handle.
+        let tmp_dir = tempdir().unwrap();
+        let (_table_path, engine, builder_handle) = create_table_builder(
+            &tmp_dir,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let builder = unsafe { *builder_handle.into_inner() };
+        let layout: DeltaResult<DataLayout> = Err(delta_kernel::Error::generic("bad column"));
+        let result = create_table_builder_with_data_layout_impl(builder, layout);
+        assert!(result.is_err());
+        unsafe { free_engine(engine) };
     }
 
     /// CREATE TABLE: the committed transaction must expose a post-commit snapshot at version 0
