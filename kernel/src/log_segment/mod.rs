@@ -112,12 +112,14 @@ pub(crate) struct LogSegment {
     /// The set of log files found during listing.
     pub listed: LogSegmentFiles,
 
-    /// The retained `_last_checkpoint` hint, if one was read when this segment was built. The hint
-    /// may describe a different checkpoint than the one this segment selected, so for validated
-    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_schema`] /
-    /// [`Self::checkpoint_sidecars`] accessors built on it). Read this field directly only when
-    /// the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
+    /// The `_last_checkpoint` hint, retained only when it describes the checkpoint this segment
+    /// selected (see [`LastCheckpointHint::applies_to`]). Dropped at construction otherwise.
+    /// Access via [`Self::checkpoint_hint`].
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
+
+    /// The version the on-disk `_last_checkpoint` pointed at, kept even when the hint was dropped
+    /// from `last_checkpoint_metadata`. Lets the checkpoint writer avoid regressing the hint.
+    last_checkpoint_version: Option<Version>,
 }
 
 /// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
@@ -185,6 +187,7 @@ impl LogSegment {
             checkpoint_version: None,
             log_root,
             last_checkpoint_metadata: None,
+            last_checkpoint_version: None,
             listed: LogSegmentFiles {
                 max_published_version: Some(commit_file.version),
                 latest_commit_file: Some(commit_file.clone()),
@@ -239,11 +242,22 @@ impl LogSegment {
         )?;
         validate_latest_commit_file(&listed_files, effective_version)?;
 
+        // Capture the on-disk hint version before filtering, so the checkpoint writer can avoid
+        // regressing the hint even when it does not describe this segment's checkpoint.
+        let last_checkpoint_version = last_checkpoint_metadata.as_ref().map(|hint| hint.version);
+
+        // Drop the hint unless it describes the checkpoint this segment selected, so its fields
+        // always apply.
+        let last_checkpoint_metadata = last_checkpoint_metadata.filter(|hint| {
+            checkpoint_version.is_some_and(|v| hint.applies_to(v, &listed_files.checkpoint_parts))
+        });
+
         let log_segment = LogSegment {
             end_version: effective_version,
             checkpoint_version,
             log_root,
             last_checkpoint_metadata,
+            last_checkpoint_version,
             listed: listed_files,
         };
 
@@ -252,31 +266,28 @@ impl LogSegment {
         Ok(log_segment)
     }
 
-    /// Returns the checkpoint version from the `_last_checkpoint` hint
+    /// The version the on-disk `_last_checkpoint` hint pointed at, if one was read.
     pub(crate) fn last_checkpoint_version(&self) -> Option<Version> {
-        self.last_checkpoint_metadata.as_ref().map(|m| m.version)
+        self.last_checkpoint_version
     }
 
-    /// The retained `_last_checkpoint` hint, but only when it describes the checkpoint this segment
-    /// selected (see [`LastCheckpointHint::applies_to`]) -- so the caller may trust its fields.
-    fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
-        let version = self.checkpoint_version?;
-        self.last_checkpoint_metadata
-            .as_ref()
-            .filter(|hint| hint.applies_to(version, &self.listed.checkpoint_parts))
+    /// The `_last_checkpoint` hint for this segment, if any. Dropped at construction when it does
+    /// not describe the selected checkpoint, so its fields always apply.
+    #[allow(unused)] // consumed by the scan-shape checkpoint classifier
+    pub(crate) fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
+        self.last_checkpoint_metadata.as_ref()
     }
 
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
-    /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
-    /// otherwise -- the caller then reads the checkpoint footer instead.
+    /// checkpoint and carried a `checkpointSchema`. `None` otherwise -- the caller then reads the
+    /// checkpoint footer instead.
     pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
     }
 
-    /// The hint's sidecar references, when it describes the selected checkpoint (see
-    /// [`Self::checkpoint_hint`]). `None` if there is no matching hint or it omitted
-    /// `sidecarFiles`; `Some(&[])` if the hint listed none. A non-empty slice identifies a manifest
-    /// checkpoint whose file actions live in those sidecars.
+    /// The hint's sidecar references, when it describes the selected checkpoint. `None` if there is
+    /// no matching hint or it omitted `sidecarFiles`; `Some(&[])` if the hint listed none. A
+    /// non-empty slice identifies a manifest checkpoint whose file actions live in those sidecars.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
     pub(crate) fn checkpoint_sidecars(&self) -> Option<&[Sidecar]> {
         self.checkpoint_hint()?
@@ -611,6 +622,7 @@ impl LogSegment {
         // scan will read the checkpoint parquet footer to determine the schema (e.g.
         // whether stats_parsed or sidecar columns exist).
         new_log_segment.last_checkpoint_metadata = None;
+        new_log_segment.last_checkpoint_version = None;
         Ok(new_log_segment)
     }
 
@@ -1105,6 +1117,7 @@ impl LogSegment {
             checkpoint_version: None,
             log_root: self.log_root.clone(),
             last_checkpoint_metadata: None,
+            last_checkpoint_version: None,
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
