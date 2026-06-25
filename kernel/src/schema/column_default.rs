@@ -2,7 +2,7 @@
 
 use crate::expressions::{parse_sql, Expression, Scalar};
 use crate::schema::DataType;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Error};
 
 /// A column-level default value parsed from the `CURRENT_DEFAULT` metadata key of a
 /// [`StructField`](crate::schema::StructField).
@@ -42,7 +42,8 @@ impl<'a> ColumnDefault<'a> {
         // Spark only allows a non-primitive column default when it is NULL; match that behavior.
         if data_type.as_primitive_opt().is_none() && !is_null {
             return Err(Error::generic(format!(
-                "column default for non-primitive type {data_type:?} must be NULL, got {raw_sql:?}"
+                "non-null column default for non-primitive type {data_type:?} is not \
+                 supported, got {raw_sql:?}"
             )));
         }
         let parsed_sql = parse_sql(&raw_sql, data_type).ok();
@@ -82,7 +83,7 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// Returns an error if the parsed default is not a literal (the parser never produces such
     /// expressions, so this is defensive).
-    pub fn evaluate(&self, _engine: &dyn Engine) -> DeltaResult<Option<Scalar>> {
+    pub fn evaluate(&self) -> DeltaResult<Option<Scalar>> {
         let Some(expr) = self.parsed_sql.as_ref() else {
             return Ok(None);
         };
@@ -97,126 +98,109 @@ impl<'a> ColumnDefault<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use rstest::rstest;
 
     use super::*;
     use crate::schema::{ArrayType, MapType, StructField};
-    use crate::{EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-
-    /// A stand-in [`Engine`] whose handlers all panic. [`ColumnDefault::evaluate`] resolves
-    /// literal defaults by AST destructure, so it must never reach a handler.
-    struct UnusedEngine;
-
-    impl Engine for UnusedEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            unimplemented!("evaluate must not touch the engine for literal defaults")
-        }
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            unimplemented!()
-        }
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            unimplemented!()
-        }
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            unimplemented!()
-        }
-    }
 
     fn struct_ty() -> DataType {
         DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
     }
 
-    #[test]
-    fn new_parsable_literal_exposes_raw_sql_type_and_evaluates() {
-        let data_type = DataType::INTEGER;
-        let d = ColumnDefault::new("42".into(), &data_type).unwrap();
-        assert_eq!(d.raw_sql(), "42");
-        assert_eq!(d.data_type(), &DataType::INTEGER);
-        assert!(d.is_kernel_parsable());
-        assert_eq!(d.parsed_sql, Some(Expression::literal(Scalar::Integer(42))));
-        assert_eq!(
-            d.evaluate(&UnusedEngine).unwrap(),
-            Some(Scalar::Integer(42))
-        );
+    fn date_days(year: i32, month: u32, day: u32) -> i32 {
+        let nd = NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        Utc.from_utc_datetime(&nd)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_days() as i32
     }
 
-    #[test]
-    fn new_parses_string_and_null_literals() {
-        let string_ty = DataType::STRING;
-        let s = ColumnDefault::new("'hello'".into(), &string_ty).unwrap();
-        assert_eq!(
-            s.parsed_sql,
-            Some(Expression::literal(Scalar::String("hello".into())))
-        );
-
-        let int_ty = DataType::INTEGER;
-        let n = ColumnDefault::new("NULL".into(), &int_ty).unwrap();
-        assert_eq!(
-            n.parsed_sql,
-            Some(Expression::literal(Scalar::Null(DataType::INTEGER)))
-        );
+    /// Expected outcome of [`ColumnDefault::new`] for one `(raw_sql, data_type)` pair.
+    #[derive(Debug)]
+    enum Expect {
+        /// Parsable; `evaluate` yields this scalar.
+        Parsed(Scalar),
+        /// Parsable `NULL`; `evaluate` yields `Scalar::Null` of the column's type.
+        ParsedNull,
+        /// Not kernel-parsable; `evaluate` yields `None`.
+        Unparsable,
+        /// `new` fails with an error containing this substring.
+        NewErr(&'static str),
     }
 
     #[rstest]
-    #[case::integer("42", DataType::INTEGER, true)]
-    #[case::string("'hello'", DataType::STRING, true)]
-    #[case::boolean("TRUE", DataType::BOOLEAN, true)]
-    #[case::date("DATE '2024-01-01'", DataType::DATE, true)]
-    #[case::null_primitive("NULL", DataType::INTEGER, true)]
-    #[case::function_call("current_timestamp()", DataType::TIMESTAMP, false)]
-    #[case::type_mismatch("'not an int'", DataType::INTEGER, false)]
-    #[case::arithmetic("1 + 1", DataType::INTEGER, false)]
-    fn is_kernel_parsable_reflects_parse_outcome(
-        #[case] raw_sql: &str,
-        #[case] data_type: DataType,
-        #[case] parsable: bool,
-    ) {
-        let d = ColumnDefault::new(raw_sql.into(), &data_type).unwrap();
-        assert_eq!(d.is_kernel_parsable(), parsable);
-        // A parse failure must not drop the raw SQL -- connectors fall back to it.
-        assert_eq!(d.raw_sql(), raw_sql);
-    }
-
-    #[rstest]
-    #[case::array(DataType::from(ArrayType::new(DataType::INTEGER, true)), "ARRAY(1)")]
-    #[case::map(
-        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
-        "MAP('k', 1)"
+    #[case::integer("42", DataType::INTEGER, Expect::Parsed(Scalar::Integer(42)))]
+    #[case::string("'hello'", DataType::STRING, Expect::Parsed(Scalar::String("hello".into())))]
+    #[case::boolean("TRUE", DataType::BOOLEAN, Expect::Parsed(Scalar::Boolean(true)))]
+    #[case::date(
+        "DATE '2024-01-01'",
+        DataType::DATE,
+        Expect::Parsed(Scalar::Date(date_days(2024, 1, 1)))
     )]
-    #[case::struct_type(struct_ty(), "STRUCT(1)")]
-    #[case::variant(DataType::unshredded_variant(), "1")]
-    fn new_rejects_non_primitive_with_non_null_default(
-        #[case] data_type: DataType,
+    #[case::null_primitive("NULL", DataType::INTEGER, Expect::ParsedNull)]
+    #[case::null_array(
+        "NULL",
+        DataType::from(ArrayType::new(DataType::INTEGER, true)),
+        Expect::ParsedNull
+    )]
+    #[case::null_map(
+        "NULL",
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+        Expect::ParsedNull
+    )]
+    #[case::null_struct("NULL", struct_ty(), Expect::ParsedNull)]
+    #[case::null_variant("NULL", DataType::unshredded_variant(), Expect::ParsedNull)]
+    #[case::function_call("current_timestamp()", DataType::TIMESTAMP, Expect::Unparsable)]
+    #[case::type_mismatch("'not an int'", DataType::INTEGER, Expect::Unparsable)]
+    #[case::arithmetic("1 + 1", DataType::INTEGER, Expect::Unparsable)]
+    #[case::non_primitive_array(
+        "ARRAY(1)",
+        DataType::from(ArrayType::new(DataType::INTEGER, true)),
+        Expect::NewErr("not supported")
+    )]
+    #[case::non_primitive_map(
+        "MAP('k', 1)",
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+        Expect::NewErr("not supported")
+    )]
+    #[case::non_primitive_struct("STRUCT(1)", struct_ty(), Expect::NewErr("not supported"))]
+    #[case::non_primitive_variant(
+        "1",
+        DataType::unshredded_variant(),
+        Expect::NewErr("not supported")
+    )]
+    fn column_default_from_new(
         #[case] raw_sql: &str,
+        #[case] data_type: DataType,
+        #[case] expect: Expect,
     ) {
-        let err = ColumnDefault::new(raw_sql.into(), &data_type)
-            .expect_err("non-primitive non-NULL default must error")
-            .to_string();
-        assert!(err.contains("must be NULL"), "got: {err}");
-    }
-
-    #[rstest]
-    #[case::array(DataType::from(ArrayType::new(DataType::INTEGER, true)))]
-    #[case::map(DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)))]
-    #[case::struct_type(struct_ty())]
-    #[case::variant(DataType::unshredded_variant())]
-    fn new_allows_non_primitive_null_default(#[case] data_type: DataType) {
-        let d = ColumnDefault::new("NULL".into(), &data_type).unwrap();
-        assert!(d.is_kernel_parsable());
-        assert_eq!(
-            d.evaluate(&UnusedEngine).unwrap(),
-            Some(Scalar::Null(data_type.clone()))
-        );
-    }
-
-    #[test]
-    fn evaluate_returns_none_for_unparsable_default() {
-        let data_type = DataType::TIMESTAMP;
-        let d = ColumnDefault::new("unparsable_sql()".into(), &data_type).unwrap();
-        assert!(!d.is_kernel_parsable());
-        assert_eq!(d.evaluate(&UnusedEngine).unwrap(), None);
+        match (ColumnDefault::new(raw_sql.into(), &data_type), expect) {
+            (Ok(d), Expect::Parsed(scalar)) => {
+                assert!(d.is_kernel_parsable());
+                assert_eq!(d.evaluate().unwrap(), Some(scalar));
+                assert_eq!(d.raw_sql(), raw_sql);
+                assert_eq!(d.data_type(), &data_type);
+            }
+            (Ok(d), Expect::ParsedNull) => {
+                assert!(d.is_kernel_parsable());
+                assert_eq!(d.evaluate().unwrap(), Some(Scalar::Null(data_type.clone())));
+            }
+            (Ok(d), Expect::Unparsable) => {
+                assert!(!d.is_kernel_parsable());
+                assert_eq!(d.evaluate().unwrap(), None);
+                // A parse failure must not drop the raw SQL -- connectors fall back to it.
+                assert_eq!(d.raw_sql(), raw_sql);
+            }
+            (Err(e), Expect::NewErr(needle)) => {
+                assert!(e.to_string().contains(needle), "got: {e}");
+            }
+            (result, expect) => {
+                panic!("unexpected outcome for {raw_sql:?}: {result:?} vs {expect:?}")
+            }
+        }
     }
 
     #[test]
@@ -230,7 +214,7 @@ mod tests {
             parsed_sql: Some(Expression::column(["x"])),
         };
         let err = d
-            .evaluate(&UnusedEngine)
+            .evaluate()
             .expect_err("non-literal parsed expression must error")
             .to_string();
         assert!(err.contains("non-literal"), "got: {err}");
