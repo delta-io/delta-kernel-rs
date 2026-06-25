@@ -1682,8 +1682,15 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     Void,
+    /// Year-month interval: a signed count of months (ANSI `INTERVAL YEAR TO MONTH` and its
+    /// narrowed `YEAR` / `MONTH` spellings). The serde rename is the `schemaString` type-name
+    /// string -- spelled with spaces, unlike the single-word siblings, so the mapping is not
+    /// self-evident.
     #[serde(rename = "interval year to month")]
     IntervalYearMonth,
+    /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
+    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings). As with the year-month
+    /// variant above, the serde rename is the multi-word `schemaString` type-name string.
     #[serde(rename = "interval day to second")]
     IntervalDayTime,
     #[serde(serialize_with = "serialize_decimal", untagged)]
