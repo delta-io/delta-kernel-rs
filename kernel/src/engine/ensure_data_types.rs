@@ -81,6 +81,9 @@ impl EnsureDataTypes {
             (&DataType::Variant(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
+            // A UDT is physically stored as its `sql_type`, so validate the Arrow type against
+            // that.
+            (DataType::UserDefined(udt), _) => self.ensure_data_types(&udt.sql_type, arrow_type),
             // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
             // excludes Boolean, the string and binary variants, and Null -- even though
             // kernel models all of these as `PrimitiveType` variants. Match them

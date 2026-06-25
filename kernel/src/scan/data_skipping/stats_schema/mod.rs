@@ -10,6 +10,7 @@ pub(crate) use column_filter::StatsConfig;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
+    UserDefinedType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
@@ -339,6 +340,15 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     fn transform_variant(&mut self, vtype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.include_leaf().then_some(Cow::Borrowed(vtype))
     }
+
+    // A UDT is a single opaque leaf (Spark writes no stats for its `sql_type`); do not expand
+    // into per-field stat columns.
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a UserDefinedType,
+    ) -> Option<Cow<'a, UserDefinedType>> {
+        self.include_leaf().then_some(Cow::Borrowed(udt))
+    }
 }
 
 // removes all fields with non eligible data types
@@ -359,6 +369,13 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
         None
     }
     fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+        None
+    }
+    // A UDT is never min/max-eligible (Spark writes no stats for it); exclude it like Array/Map.
+    fn transform_user_defined(
+        &mut self,
+        _: &'a UserDefinedType,
+    ) -> Option<Cow<'a, UserDefinedType>> {
         None
     }
 

@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{ArrayRef, AsArray as _, RecordBatch, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, AsArray as _, Float64Array, Int32Array, RecordBatch, StructArray,
+    TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
@@ -2554,6 +2557,319 @@ async fn read_table_with_void_column() -> Result<(), Box<dyn std::error::Error>>
         ArrowDataType::Null
     );
 
+    Ok(())
+}
+
+// === Spark UserDefinedType (UDT) ===
+// A `udt` column is an engine-specific annotation over a physical `sqlType`. The kernel keeps the
+// annotation in the logical schema (`DataType::UserDefined`), preserves the original JSON verbatim
+// for a faithful round-trip, and reads the column as its physical `sqlType`.
+
+// Scala/Java VectorUDT-shaped: struct sqlType, both `class` and `pyClass`.
+const SCALA_UDT_JSON: &str = r#"{"type":"udt","class":"org.apache.spark.ml.linalg.VectorUDT","pyClass":"pyspark.ml.linalg.VectorUDT","sqlType":{"type":"struct","fields":[{"name":"size","type":"integer","nullable":true,"metadata":{}},{"name":"values","type":{"type":"array","elementType":"double","containsNull":false},"nullable":true,"metadata":{}}]}}"#;
+// Python flavor: no `class`, has `serializedClass`, backed by a primitive sqlType.
+const PYTHON_UDT_JSON: &str =
+    r#"{"type":"udt","pyClass":"x.Y","serializedClass":"AAAA","sqlType":"integer"}"#;
+
+// Builds a `{"metaData":{...}}` commit action whose `schemaString` embeds `fields`. serde handles
+// all string-escaping of the nested schema JSON, so callers pass real JSON values, not escaped
+// text.
+fn udt_metadata_action(fields: serde_json::Value) -> String {
+    let schema_value = serde_json::json!({"type": "struct", "fields": fields});
+    let schema_string = serde_json::to_string(&schema_value).unwrap();
+    serde_json::json!({
+        "metaData": {
+            "id": "test-udt",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema_string,
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495_u64,
+        }
+    })
+    .to_string()
+}
+
+// Loading a UDT table through the default engine keeps the `UserDefined` annotation in the logical
+// schema, and re-serializing it reproduces the original `udt` JSON verbatim (key-order agnostic) --
+// i.e. the annotation survives a full load -> re-serialize cycle through the engine's read path.
+#[rstest::rstest]
+#[case::scala_struct(SCALA_UDT_JSON)]
+#[case::python_primitive(PYTHON_UDT_JSON)]
+#[tokio::test]
+async fn udt_schema_round_trips_through_snapshot_load(
+    #[case] udt_json: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let udt_value: serde_json::Value = serde_json::from_str(udt_json)?;
+    let fields = serde_json::json!([
+        {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+        {"name": "features", "type": udt_value, "nullable": true, "metadata": {}},
+    ]);
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        udt_metadata_action(fields),
+    ];
+
+    let storage = Arc::new(InMemory::new());
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(Url::parse("memory:///")?).build(engine.as_ref())?;
+
+    let field = snapshot
+        .schema()
+        .field("features")
+        .cloned()
+        .expect("features field present");
+    assert!(
+        matches!(field.data_type, DataType::UserDefined(_)),
+        "expected UserDefined, got {:?}",
+        field.data_type
+    );
+
+    let got = serde_json::to_value(&field.data_type)?;
+    let want: serde_json::Value = serde_json::from_str(udt_json)?;
+    assert_eq!(got, want, "udt did not round-trip through snapshot load");
+    Ok(())
+}
+
+// A `udt` nested inside a struct column is preserved at its nested position and round-trips.
+#[tokio::test]
+async fn udt_nested_in_struct_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let udt_value: serde_json::Value = serde_json::from_str(SCALA_UDT_JSON)?;
+    let fields = serde_json::json!([
+        {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+        {
+            "name": "wrapper",
+            "type": {"type": "struct", "fields": [
+                {"name": "vec", "type": udt_value, "nullable": true, "metadata": {}},
+            ]},
+            "nullable": true, "metadata": {},
+        },
+    ]);
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        udt_metadata_action(fields),
+    ];
+
+    let storage = Arc::new(InMemory::new());
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(Url::parse("memory:///")?).build(engine.as_ref())?;
+
+    let schema = snapshot.schema();
+    let DataType::Struct(wrapper) = &schema
+        .field("wrapper")
+        .expect("wrapper field present")
+        .data_type
+    else {
+        panic!("expected wrapper to be a struct");
+    };
+    let vec_field = wrapper.field("vec").expect("vec field present");
+    assert!(
+        matches!(vec_field.data_type, DataType::UserDefined(_)),
+        "expected nested UserDefined, got {:?}",
+        vec_field.data_type
+    );
+
+    let got = serde_json::to_value(&vec_field.data_type)?;
+    let want: serde_json::Value = serde_json::from_str(SCALA_UDT_JSON)?;
+    assert_eq!(got, want, "nested udt did not round-trip");
+    Ok(())
+}
+
+// A UDT column is physically stored as its `sqlType`, so the kernel reads it as that physical type
+// (here `integer`) even though the logical schema keeps the `UserDefined` annotation.
+#[tokio::test]
+async fn read_table_with_udt_column() -> Result<(), Box<dyn std::error::Error>> {
+    // The Parquet file contains an ordinary int column -- the UDT's physical sqlType.
+    let batch = generate_batch(vec![
+        ("id", vec![1, 2, 3].into_array()),
+        ("features", vec![10, 20, 30].into_array()),
+    ])?;
+
+    let udt_value: serde_json::Value = serde_json::from_str(PYTHON_UDT_JSON)?;
+    let fields = serde_json::json!([
+        {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+        {"name": "features", "type": udt_value, "nullable": true, "metadata": {}},
+    ]);
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        udt_metadata_action(fields),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        ),
+    ];
+
+    let storage = Arc::new(InMemory::new());
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(Url::parse("memory:///")?).build(engine.as_ref())?;
+
+    // Logical schema keeps the UDT annotation...
+    assert!(matches!(
+        snapshot
+            .schema()
+            .field("features")
+            .expect("features field present")
+            .data_type,
+        DataType::UserDefined(_)
+    ));
+
+    // ...but the data reads back as the physical sqlType (integer).
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    let result = &batches[0];
+    assert_eq!(result.num_rows(), 3);
+    let features_idx = result.schema().index_of("features")?;
+    assert_eq!(
+        *result.schema().field(features_idx).data_type(),
+        ArrowDataType::Int32
+    );
+    let features = result
+        .column(features_idx)
+        .as_primitive::<delta_kernel::arrow::datatypes::Int32Type>();
+    assert_eq!(features.values(), &[10, 20, 30]);
+    Ok(())
+}
+
+// Scala UDT whose sqlType is a struct of two primitives (a simplified VectorUDT). Exercises the
+// struct-recursion path in get_indices/ensure_data_types that a primitive sqlType does not.
+const STRUCT_UDT_JSON: &str = r#"{"type":"udt","class":"com.example.PointUDT","sqlType":{"type":"struct","fields":[{"name":"size","type":"integer","nullable":true,"metadata":{}},{"name":"value","type":"double","nullable":true,"metadata":{}}]}}"#;
+
+// A UDT whose sqlType is a struct is stored physically as that struct; the kernel reads it as a
+// struct (recursing through the sqlType) even though the logical schema keeps the annotation.
+#[tokio::test]
+async fn read_table_with_struct_sqltype_udt_column() -> Result<(), Box<dyn std::error::Error>> {
+    let size: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let value: ArrayRef = Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5]));
+    let features: ArrayRef = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(ArrowField::new("size", ArrowDataType::Int32, true)),
+            size,
+        ),
+        (
+            Arc::new(ArrowField::new("value", ArrowDataType::Float64, true)),
+            value,
+        ),
+    ]));
+    let batch = generate_batch(vec![
+        ("id", vec![1, 2, 3].into_array()),
+        ("features", features),
+    ])?;
+
+    let udt_value: serde_json::Value = serde_json::from_str(STRUCT_UDT_JSON)?;
+    let fields = serde_json::json!([
+        {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+        {"name": "features", "type": udt_value, "nullable": true, "metadata": {}},
+    ]);
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        udt_metadata_action(fields),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#
+        ),
+    ];
+
+    let storage = Arc::new(InMemory::new());
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(Url::parse("memory:///")?).build(engine.as_ref())?;
+    assert!(matches!(
+        snapshot
+            .schema()
+            .field("features")
+            .expect("features field present")
+            .data_type,
+        DataType::UserDefined(_)
+    ));
+
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    let result = &batches[0];
+    assert_eq!(result.num_rows(), 3);
+    let result_schema = result.schema();
+    let idx = result_schema.index_of("features")?;
+    let ArrowDataType::Struct(inner) = result_schema.field(idx).data_type() else {
+        panic!("features should read as a struct");
+    };
+    assert_eq!(inner.len(), 2);
+    // The nested struct data materializes through the sqlType projection.
+    let features_col = result.column(idx).as_struct();
+    let size_col = features_col
+        .column(0)
+        .as_primitive::<delta_kernel::arrow::datatypes::Int32Type>();
+    assert_eq!(size_col.values(), &[1, 2, 3]);
+    Ok(())
+}
+
+// A column-mapped table with a struct-sqlType UDT column must load: the UDT is a column-mapping
+// leaf, so its sqlType's inner fields carry no physicalName annotations. Regression for
+// `MakePhysical` recursing into the UDT and demanding annotations the inner fields lack (which made
+// every column-mapped table with such a column fail to load).
+#[rstest::rstest]
+#[case::name("name")]
+#[case::id("id")]
+#[tokio::test]
+async fn column_mapped_struct_udt_table_loads(
+    #[case] mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let udt_value: serde_json::Value = serde_json::from_str(STRUCT_UDT_JSON)?;
+    let fields = serde_json::json!([
+        {"name": "id", "type": "integer", "nullable": true,
+         "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-id"}},
+        {"name": "features", "type": udt_value, "nullable": true,
+         "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "col-features"}},
+    ]);
+    let schema_value = serde_json::json!({"type": "struct", "fields": fields});
+    let schema_string = serde_json::to_string(&schema_value)?;
+    let metadata = serde_json::json!({
+        "metaData": {
+            "id": "test-udt-cm",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema_string,
+            "partitionColumns": [],
+            "configuration": {
+                "delta.columnMapping.mode": mode,
+                "delta.columnMapping.maxColumnId": "2",
+            },
+            "createdTime": 1587968585495_u64,
+        }
+    })
+    .to_string();
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}"#.to_string(),
+        metadata,
+    ];
+
+    let storage = Arc::new(InMemory::new());
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+
+    let snapshot = Snapshot::builder_for(Url::parse("memory:///")?).build(engine.as_ref())?;
+    assert!(matches!(
+        snapshot
+            .schema()
+            .field("features")
+            .expect("features field present")
+            .data_type,
+        DataType::UserDefined(_)
+    ));
     Ok(())
 }
 

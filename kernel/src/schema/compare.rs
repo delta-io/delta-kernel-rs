@@ -179,7 +179,26 @@ mod tests {
     use rstest::rstest;
 
     use crate::schema::compare::{Error, SchemaComparison};
-    use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+    use crate::schema::{
+        ArrayType, DataType, MapType, PrimitiveType, StructField, StructType, UserDefinedType,
+    };
+
+    // Two UDTs with the same physical `sql_type` but cosmetically different `raw` JSON (key order
+    // or engine class) must be read-compatible: `raw` is opaque and must not affect type
+    // comparison. Regression for equality being derived over `raw`.
+    #[test]
+    fn udt_equal_sql_type_different_raw_is_compatible() {
+        let udt = |raw: &str| {
+            DataType::UserDefined(UserDefinedType {
+                sql_type: Box::new(DataType::INTEGER),
+                raw: raw.to_string(),
+            })
+        };
+        let a = udt(r#"{"type":"udt","class":"X","sqlType":"integer"}"#);
+        let b = udt(r#"{"type":"udt","sqlType":"integer","pyClass":"x.Y"}"#);
+        assert!(a.can_read_as(&b).is_ok());
+        assert!(b.can_read_as(&a).is_ok());
+    }
 
     #[test]
     fn can_read_is_reflexive() {
