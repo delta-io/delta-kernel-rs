@@ -142,31 +142,31 @@ pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRang
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelDeltaAction {
-    Add = 0,
-    Remove = 1,
-    Metadata = 2,
-    Protocol = 3,
-    CommitInfo = 4,
-    Cdc = 5,
-    DomainMetadata = 6,
-    SetTxn = 7,
-    CheckpointMetadata = 8,
-    Sidecar = 9,
+    AddAction = 0,
+    RemoveAction = 1,
+    MetadataAction = 2,
+    ProtocolAction = 3,
+    CommitInfoAction = 4,
+    CdcAction = 5,
+    DomainMetadataAction = 6,
+    SetTxnAction = 7,
+    CheckpointMetadataAction = 8,
+    SidecarAction = 9,
 }
 
 impl From<KernelDeltaAction> for DeltaAction {
     fn from(value: KernelDeltaAction) -> Self {
         match value {
-            KernelDeltaAction::Add => DeltaAction::Add,
-            KernelDeltaAction::Remove => DeltaAction::Remove,
-            KernelDeltaAction::Metadata => DeltaAction::Metadata,
-            KernelDeltaAction::Protocol => DeltaAction::Protocol,
-            KernelDeltaAction::CommitInfo => DeltaAction::CommitInfo,
-            KernelDeltaAction::Cdc => DeltaAction::Cdc,
-            KernelDeltaAction::DomainMetadata => DeltaAction::DomainMetadata,
-            KernelDeltaAction::SetTxn => DeltaAction::SetTxn,
-            KernelDeltaAction::CheckpointMetadata => DeltaAction::CheckpointMetadata,
-            KernelDeltaAction::Sidecar => DeltaAction::Sidecar,
+            KernelDeltaAction::AddAction => DeltaAction::Add,
+            KernelDeltaAction::RemoveAction => DeltaAction::Remove,
+            KernelDeltaAction::MetadataAction => DeltaAction::Metadata,
+            KernelDeltaAction::ProtocolAction => DeltaAction::Protocol,
+            KernelDeltaAction::CommitInfoAction => DeltaAction::CommitInfo,
+            KernelDeltaAction::CdcAction => DeltaAction::Cdc,
+            KernelDeltaAction::DomainMetadataAction => DeltaAction::DomainMetadata,
+            KernelDeltaAction::SetTxnAction => DeltaAction::SetTxn,
+            KernelDeltaAction::CheckpointMetadataAction => DeltaAction::CheckpointMetadata,
+            KernelDeltaAction::SidecarAction => DeltaAction::Sidecar,
         }
     }
 }
@@ -593,7 +593,10 @@ mod tests {
         let (engine, table_root) = setup_engine_with_commits(1).await;
         let range =
             unsafe { build_range(table_root, range_start, range_end, engine.shallow_copy()) };
-        let actions = [KernelDeltaAction::Metadata, KernelDeltaAction::Protocol];
+        let actions = [
+            KernelDeltaAction::MetadataAction,
+            KernelDeltaAction::ProtocolAction,
+        ];
 
         let snapshot = with_snapshot.then(|| unsafe {
             build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy())
@@ -695,7 +698,7 @@ mod tests {
         let (engine, table_root) = setup_engine_with_commits(1).await;
         let range = unsafe { build_range(table_root, 0, 1, engine.shallow_copy()) };
 
-        let actions = [KernelDeltaAction::Metadata];
+        let actions = [KernelDeltaAction::MetadataAction];
         let iter = unsafe {
             ok_or_panic(commit_range_commits(
                 range.shallow_copy(),
