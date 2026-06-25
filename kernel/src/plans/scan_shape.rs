@@ -94,6 +94,8 @@ impl ScanShape {
                     None => read_footer_schema(exec, first.location.clone())?,
                 };
                 let sidecar = if cp_schema.contains(SIDECAR_NAME) {
+                    // A chekpoint may have sidecar present in its schema without being a manifest.
+                    // To ensure it really is a manifest checkpoint, scan it for sidecars.
                     collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
                 } else {
                     None
@@ -110,16 +112,18 @@ impl ScanShape {
                 sidecar
             }
             FileType::Json => {
+                // It is not possible to know ahead of time if a json checkpoint is a manifets or
+                // leaf-level. Thus, we try to pull out sidecar files.
                 collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
             }
         };
 
         let Some(sidecar) = sidecar else {
-            // JSON leaf: stats are JSON strings only, so parsed stays false.
+            // No sidecar was found in the checkpoint, so it can be treated as a leaf.
             return Ok(make_info(CheckpointShape::Leaf, leaf_parsed_stats));
         };
 
-        // Manifest: actions and stats live in the sidecars, so probe the sidecar footer.
+        // Probe the sidecar footer if stats were requested.
         let has_parsed_stats = sidecar_has_parsed_stats(exec, sidecar, stats_schema)?;
         Ok(make_info(CheckpointShape::Manifest, has_parsed_stats))
     }
