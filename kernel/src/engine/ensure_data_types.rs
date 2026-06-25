@@ -478,6 +478,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ensure_variant_accepts_reversed_field_order() {
+        let arrow_type = variant_arrow_struct([
+            ("value", ArrowDataType::Binary),
+            ("metadata", ArrowDataType::Binary),
+        ]);
+        assert_eq!(
+            ensure_data_types(
+                &DataType::unshredded_variant(),
+                &arrow_type,
+                ValidationMode::Full,
+            )
+            .unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
     #[rstest]
     #[case::wrong_field_names(wrong_field_names_variant_arrow_type(), "missing field")]
     #[case::extra_field_last(
