@@ -78,6 +78,7 @@ struct InternalScanState {
     physical_stats_columns: HashSet<ColumnName>,
     #[serde(default)]
     is_catalog_managed: bool,
+    skip_row_transforms: bool,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -344,6 +345,7 @@ impl ScanLogReplayProcessor {
             physical_partition_schema,
             physical_stats_columns,
             is_catalog_managed,
+            skip_row_transforms,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -364,6 +366,7 @@ impl ScanLogReplayProcessor {
             physical_partition_schema,
             physical_stats_columns,
             is_catalog_managed,
+            skip_row_transforms,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
@@ -422,6 +425,7 @@ impl ScanLogReplayProcessor {
             physical_partition_schema: internal_state.physical_partition_schema,
             physical_stats_columns: internal_state.physical_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
+            skip_row_transforms: internal_state.skip_row_transforms,
         });
 
         Self::new_with_seen_files(
@@ -502,7 +506,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // Partition pruning is handled by DataSkippingFilter in the columnar data skipping phase,
         // so we only need to parse values here for the transform.
         let partition_values = match &self.state_info.transform_spec {
-            Some(transform) if is_add => {
+            Some(transform) if is_add && !self.state_info.skip_row_transforms => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(row, "add.partitionValues")?;
                 parse_partition_values(
@@ -519,25 +523,27 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
-        let base_row_id: Option<i64> =
-            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
-        let patch_expr = self
-            .state_info
-            .transform_spec
-            .as_ref()
-            .map(|transform_spec| {
-                get_transform_expr(
-                    transform_spec,
-                    partition_values,
-                    &self.state_info.physical_schema,
-                    base_row_id,
-                )
-            })
-            .transpose()?;
-        if patch_expr.is_some() {
-            // fill in any needed `None`s for previous rows
-            self.row_transform_exprs.resize_with(row, Default::default);
-            self.row_transform_exprs.push(patch_expr);
+        if !self.state_info.skip_row_transforms {
+            let base_row_id: Option<i64> =
+                getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
+            let patch_expr = self
+                .state_info
+                .transform_spec
+                .as_ref()
+                .map(|transform_spec| {
+                    get_transform_expr(
+                        transform_spec,
+                        partition_values,
+                        &self.state_info.physical_schema,
+                        base_row_id,
+                    )
+                })
+                .transpose()?;
+            if patch_expr.is_some() {
+                // fill in any needed `None`s for previous rows
+                self.row_transform_exprs.resize_with(row, Default::default);
+                self.row_transform_exprs.push(patch_expr);
+            }
         }
         self.metrics.record_active_add_file(size);
         Ok(true)
@@ -1111,6 +1117,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
+            skip_row_transforms: false,
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -1442,6 +1449,7 @@ mod tests {
                 physical_partition_schema: None,
                 physical_stats_columns: HashSet::new(),
                 is_catalog_managed: false,
+                skip_row_transforms: false,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor = ScanLogReplayProcessor::new(
@@ -1480,6 +1488,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
+            skip_row_transforms: false,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1514,6 +1523,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: true,
+            skip_row_transforms: false,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1526,6 +1536,43 @@ mod tests {
         let deserialized =
             ScanLogReplayProcessor::from_serializable_state(&engine, serialized).unwrap();
         assert!(deserialized.is_catalog_managed());
+    }
+
+    #[test]
+    fn test_serialization_round_trips_skip_row_transforms() {
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )]));
+        for skip in [false, true] {
+            let state_info = Arc::new(StateInfo {
+                logical_schema: schema.clone(),
+                physical_schema: schema.clone(),
+                physical_predicate: PhysicalPredicate::None,
+                transform_spec: None,
+                column_mapping_mode: ColumnMappingMode::None,
+                physical_stats_schema: None,
+                physical_partition_schema: None,
+                physical_stats_columns: HashSet::new(),
+                is_catalog_managed: false,
+                skip_row_transforms: skip,
+            });
+            let processor = ScanLogReplayProcessor::new(
+                &engine,
+                state_info,
+                test_checkpoint_info(),
+                ScanStatsOptions::default(),
+            )
+            .unwrap();
+            let deserialized = ScanLogReplayProcessor::from_serializable_state(
+                &engine,
+                processor.into_serializable_state().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(deserialized.state_info.skip_row_transforms, skip);
+        }
     }
 
     #[test]
@@ -1563,6 +1610,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
+            skip_row_transforms: false,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1597,6 +1645,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
+            skip_row_transforms: false,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();

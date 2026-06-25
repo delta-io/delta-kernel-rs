@@ -47,6 +47,12 @@ pub(crate) struct StateInfo {
     /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
     /// [`TableType`](crate::metrics::TableType) at event construction.
     pub(crate) is_catalog_managed: bool,
+    /// When set, log replay does not build per-file transform expressions:
+    /// `parse_partition_values` and `get_transform_expr` are skipped and every
+    /// `ScanMetadata::scan_file_transforms` entry is left `None`. `transform_spec` is retained
+    /// so the scan can still describe the transform structurally. Set by
+    /// [`ScanBuilder::without_row_transforms`](crate::scan::ScanBuilder::without_row_transforms).
+    pub(crate) skip_row_transforms: bool,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -425,6 +431,7 @@ impl StateInfo {
             physical_partition_schema,
             physical_stats_columns,
             is_catalog_managed: table_configuration.is_catalog_managed(),
+            skip_row_transforms: false,
         })
     }
 

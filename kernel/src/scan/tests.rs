@@ -410,6 +410,144 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     );
 }
 
+/// Loads `table`'s v0 snapshot with a [`SyncEngine`], for the `without_row_transforms` tests.
+fn without_transforms_snapshot(table: &str) -> (Arc<SyncEngine>, Arc<Snapshot>) {
+    let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(0)
+        .build(engine.as_ref())
+        .unwrap();
+    (engine, snapshot)
+}
+
+/// A partitioned table and a column-mapped table both build a transform spec.
+/// `without_row_transforms` retains the spec but sets `skip_row_transforms`, so log replay
+/// builds no per-file expressions while the structural transform stays describable.
+#[rstest]
+#[case::partitioned("./tests/data/basic_partitioned/")]
+#[case::column_mapping("./tests/data/partition_cm/name/")]
+fn test_without_row_transforms_retains_spec_and_sets_skip(#[case] table: &str) {
+    let (_engine, snapshot) = without_transforms_snapshot(table);
+
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    assert!(scan.state_info.transform_spec.is_some());
+    assert!(!scan.state_info.skip_row_transforms);
+
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+    assert!(scan.state_info.transform_spec.is_some());
+    assert!(scan.state_info.skip_row_transforms);
+}
+
+/// `scan_metadata` still lists files, and every emitted per-file transform is `None`.
+#[test]
+fn test_without_row_transforms_scan_metadata_emits_no_transforms() {
+    let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+
+    let mut saw_file = false;
+    for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let metadata = metadata.unwrap();
+        assert!(
+            metadata.scan_file_transforms.iter().all(Option::is_none),
+            "every per-file transform must be None under without_row_transforms"
+        );
+        saw_file = true;
+    }
+    assert!(
+        saw_file,
+        "scan_metadata should still list files under without_row_transforms"
+    );
+}
+
+#[test]
+fn test_without_row_transforms_rejects_execute() {
+    let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+    let err = scan
+        .execute(engine)
+        .err()
+        .expect("execute must error when row transforms are skipped");
+    assert!(
+        err.to_string().contains("without_row_transforms"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
+/// build time regardless of `without_row_transforms`.
+#[rstest]
+fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
+    let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("rcv", MetadataColumnSpec::RowCommitVersion)
+            .unwrap(),
+    );
+    let mut builder = snapshot.scan_builder().with_schema(schema);
+    if without_row_transforms {
+        builder = builder.without_row_transforms();
+    }
+    let err = builder
+        .build()
+        .expect_err("row commit version columns are unsupported by scans");
+    assert!(
+        err.to_string()
+            .contains("Row commit versions not supported"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Deletion vectors flow through scan metadata independently of the row transform, so they are
+/// still surfaced under `without_row_transforms` while every per-file transform is `None`.
+#[test]
+fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
+    // The deletion vector is added at the latest version, so load the full table (not v0).
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+
+    fn dv_callback(seen: &mut bool, scan_file: ScanFile) {
+        *seen |= scan_file.dv_info.deletion_vector.is_some();
+    }
+    let mut saw_dv = false;
+    for res in scan.scan_metadata(&engine).unwrap() {
+        let scan_metadata = res.unwrap();
+        assert!(
+            scan_metadata
+                .scan_file_transforms
+                .iter()
+                .all(Option::is_none),
+            "every per-file transform must be None under without_row_transforms"
+        );
+        saw_dv = scan_metadata.visit_scan_files(saw_dv, dv_callback).unwrap();
+    }
+    assert!(
+        saw_dv,
+        "deletion vector info should still be surfaced under without_row_transforms"
+    );
+}
+
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
