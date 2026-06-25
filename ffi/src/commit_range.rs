@@ -415,7 +415,8 @@ mod tests {
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
     use crate::error::KernelError;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, build_snapshot, ok_or_panic,
+        allocate_err, assert_extern_result_error_with_message, assert_timestamp_is_recent,
+        build_snapshot, ok_or_panic,
     };
     use crate::{
         engine_to_handle, free_engine, free_engine_data, free_snapshot, kernel_string_slice,
@@ -461,10 +462,16 @@ mod tests {
         unsafe { ok_or_panic(commit_range_builder_build(builder)) }
     }
 
-    /// Engine visitor that reads each commit action's version, then frees the handle.
-    extern "C" fn collect_versions(ctx: NullableCvoid, commit_action: Handle<SharedCommitAction>) {
+    /// Engine visitor that reads each commit action's version, assert its timestamp is recent,
+    /// then frees the handle.
+    extern "C" fn collect_versions_and_assert_timestamp(
+        ctx: NullableCvoid,
+        commit_action: Handle<SharedCommitAction>,
+    ) {
         let versions = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut Vec<u64>) };
         let version = unsafe { commit_action_version(commit_action.shallow_copy()) };
+        let timestamp = unsafe { commit_action_timestamp(commit_action.shallow_copy()) };
+        assert_timestamp_is_recent(timestamp);
         versions.push(version);
         unsafe { free_commit_action(commit_action) }
     }
@@ -477,7 +484,7 @@ mod tests {
             ok_or_panic(commit_range_commits_next(
                 iter.shallow_copy(),
                 ctx,
-                collect_versions,
+                collect_versions_and_assert_timestamp,
             ))
         } {}
         versions
