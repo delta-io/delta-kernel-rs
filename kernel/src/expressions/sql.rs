@@ -1,24 +1,63 @@
-//! Parse a SQL string into a kernel [`Expression`].
+//! Parse a SQL string into a kernel [`Expression`] or [`Predicate`].
 //!
-//! Delta stores column defaults, check constraints, and generated column definitions as SQL
-//! strings in table metadata. This module turns those strings into kernel [`Expression`] values
-//! so the kernel can interpret them without depending on a full SQL parser.
+//! Delta stores column defaults, generated column definitions, and check constraints as SQL strings
+//! in table metadata. This module turns those strings into kernel [`Expression`] or [`Predicate`]
+//! values so the kernel can interpret them without depending on a full SQL parser.
 //!
 //! The grammar follows the Spark SQL standard: this parser implements a subset of Spark's SQL
 //! grammar rather than defining a kernel-specific dialect, so the forms it accepts match what
 //! Spark reads and writes.
 //!
-//! This is an intentionally light start: a small internal parser covering only the literal forms
-//! Delta metadata contains today. If the supported SQL surface grows, options include moving
-//! parsing behind the [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
+//! This is an intentionally light start, covering only the forms Delta metadata contains today. If
+//! the supported SQL surface grows, options include moving parsing behind the
+//! [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 
 // `parse_sql` has no in-crate caller yet; it will be wired up by the column-defaults work
 // (#2630).
 #![allow(dead_code)]
 
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::expressions::Predicate;
 use crate::expressions::{Expression, Scalar};
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::schema::StructType;
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
+
+#[cfg(feature = "check-constraints-in-dev")]
+mod lower;
+#[cfg(feature = "check-constraints-in-dev")]
+mod parser;
+#[cfg(feature = "check-constraints-in-dev")]
+mod token;
+
+/// Parse a single-comparison CHECK-constraint SQL string into a kernel [`Predicate`], resolving
+/// column references against `schema` and inferring each literal's type from the column it is
+/// compared against.
+///
+/// The supported grammar is exactly one comparison `<operand> <op> <operand>`, where each operand
+/// is a column reference (case-insensitive, dotted paths allowed), a literal, or `NULL`, and
+/// `<op>` is one of `< <= > >= = == != <>`. Literal leaves are parsed by [`parse_sql`], typed from
+/// the column on the other side of the comparison; a comparison must therefore reference at least
+/// one column.
+///
+/// Junctions (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are intentionally out of scope
+/// and surface as errors.
+///
+/// # Errors
+///
+/// Returns an error for any input outside the supported grammar (junctions, functions, arithmetic,
+/// `IN`, `BETWEEN`, ...), for unknown columns, and for type-incompatible literals. Callers treat
+/// that error as the signal that a constraint is *not kernel-parsable*.
+#[cfg(feature = "check-constraints-in-dev")]
+pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
+    let tokens = token::tokenize(sql)?;
+    if tokens.is_empty() {
+        return Err(Error::generic("empty CHECK constraint expression"));
+    }
+    let comparison = parser::parse(tokens)?;
+    lower::lower(&comparison, schema)
+}
 
 /// Parse a SQL string into an [`Expression`] that yields a value of the given [`DataType`]
 /// (e.g. the type of the column whose default is being parsed).
