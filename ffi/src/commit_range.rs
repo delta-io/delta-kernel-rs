@@ -265,12 +265,12 @@ type CommitActionIter = DeltaResultIteratorStatic<CommitAction>;
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation and
 /// to keep the engine's async runtime alive while iterating.
-pub struct CommitActionsIterator {
+pub struct FfiCommitActionsIterator {
     data: Mutex<CommitActionIter>,
     engine: Arc<dyn ExternEngine>,
 }
 
-impl CommitActionsIterator {
+impl FfiCommitActionsIterator {
     fn lock_iter(&self) -> DeltaResult<std::sync::MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
@@ -278,7 +278,7 @@ impl CommitActionsIterator {
     }
 }
 
-#[handle_descriptor(target=CommitActionsIterator, mutable=false, sized=true)]
+#[handle_descriptor(target=FfiCommitActionsIterator, mutable=false, sized=true)]
 pub struct SharedCommitActionsIterator;
 
 /// Get an iterator over the commits in `commit_range`, yielding one [`CommitAction`] per commit.
@@ -349,7 +349,7 @@ fn commit_range_commits_impl(
 ) -> DeltaResult<Handle<SharedCommitActionsIterator>> {
     let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
     let boxed: CommitActionIter = Box::new(inner);
-    let iter = CommitActionsIterator {
+    let iter = FfiCommitActionsIterator {
         data: Mutex::new(boxed),
         engine,
     };
@@ -380,7 +380,7 @@ pub unsafe extern "C" fn commit_range_commits_next(
 }
 
 fn commit_range_commits_next_impl(
-    data: &CommitActionsIterator,
+    data: &FfiCommitActionsIterator,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
