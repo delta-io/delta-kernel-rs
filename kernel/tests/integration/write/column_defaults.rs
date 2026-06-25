@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::DeltaResult;
 use test_utils::{schema_with_column_defaults, test_table_setup};
@@ -40,6 +40,33 @@ fn test_schema_with_column_defaults_errors_on_unknown_column() {
     assert!(
         err.contains("does_not_exist"),
         "error should name the unknown column; got: {err}",
+    );
+}
+
+#[test]
+fn test_schema_with_column_defaults_reports_all_unknown_columns() {
+    let schema = StructType::try_new(vec![StructField::nullable("c", DataType::INTEGER)]).unwrap();
+
+    let err =
+        schema_with_column_defaults(&schema, HashMap::from([("ghost1", "1"), ("ghost2", "2")]))
+            .expect_err("all unknown columns must produce an error")
+            .to_string();
+    assert!(err.contains("ghost1"), "error must name ghost1; got: {err}");
+    assert!(err.contains("ghost2"), "error must name ghost2; got: {err}");
+}
+
+#[test]
+fn test_schema_with_column_defaults_overwrites_existing_default() {
+    let base = StructType::try_new(vec![StructField::nullable("c", DataType::INTEGER)]).unwrap();
+    let with_first = schema_with_column_defaults(&base, HashMap::from([("c", "1")])).unwrap();
+    let with_second =
+        schema_with_column_defaults(&with_first, HashMap::from([("c", "99")])).unwrap();
+
+    let field = with_second.field("c").expect("c field must exist");
+    assert_eq!(
+        field.get_config_value(&ColumnMetadataKey::CurrentDefault),
+        Some(&MetadataValue::String("99".to_string())),
+        "second call must overwrite the first CURRENT_DEFAULT value",
     );
 }
 

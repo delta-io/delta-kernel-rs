@@ -23,6 +23,10 @@ use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+#[cfg(feature = "column-defaults-in-dev")]
+mod column_default;
+#[cfg(feature = "column-defaults-in-dev")]
+pub use column_default::ColumnDefault;
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
