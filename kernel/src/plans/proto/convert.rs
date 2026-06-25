@@ -620,6 +620,10 @@ impl From<&DataType> for proto_schema::DataType {
             DataType::Map(map) => Kind::Map(Box::new(map.as_ref().into())),
             // The proto `VariantType` is intentionally empty: variants are opaque on the wire.
             DataType::Variant(_) => Kind::Variant(proto_schema::VariantType {}),
+            // A UDT has no proto representation of its own. Ship it as its physical `sql_type`,
+            // which is what a plan executor reads; the engine-only annotation is not needed on the
+            // wire.
+            DataType::UserDefined(udt) => return udt.sql_type.as_ref().into(),
         };
         proto_schema::DataType { kind: Some(kind) }
     }

@@ -555,8 +555,12 @@ fn flat_cm_info_for_nested_data_type(
                 map_type.value_contains_null(),
             )))
         }
-        // Primitive and Variant types don't contain nested struct fields - return as-is
-        DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+        // Primitive, Variant, and UserDefined types don't contain nested struct fields - return
+        // as-is. A UDT is an opaque leaf for column mapping (like Variant); its physical sql_type
+        // is not assigned separate column-mapping ids.
+        DataType::Primitive(_) | DataType::Variant(_) | DataType::UserDefined(_) => {
+            Ok(data_type.clone())
+        }
     }
 }
 
@@ -612,7 +616,9 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
                     map_type.value_contains_null(),
                 )))
             }
-            DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+            DataType::Primitive(_) | DataType::Variant(_) | DataType::UserDefined(_) => {
+                Ok(data_type.clone())
+            }
         }
     }
 

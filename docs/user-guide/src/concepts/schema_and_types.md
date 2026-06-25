@@ -104,6 +104,28 @@ with `metadata` and `value` fields (both binary). To create an unshredded varian
 let variant_type = DataType::unshredded_variant();
 ```
 
+#### UserDefinedType (UDT)
+
+A Spark `UserDefinedType` is a compute-engine-specific annotation over a physical type. It is not
+part of the Delta protocol type system. The compute engine (for example, Spark) serializes it in
+the schema as a `udt` object that names the engine's deserialization code and carries a `sqlType`:
+
+```json
+{
+  "type": "udt",
+  "class": "org.apache.spark.ml.linalg.VectorUDT",
+  "sqlType": {"type": "struct", "fields": [/* ... */]}
+}
+```
+
+Kernel can't run the engine code named by `class`/`pyClass`, so it reads the column as its physical
+`sqlType`, which is what's actually stored in Parquet. The logical schema keeps the column as
+`DataType::UserDefined`, and re-serializing the schema preserves the original `udt` annotation.
+
+> [!NOTE]
+> Kernel reads existing UDT columns as their `sqlType`. It does not construct UDT columns, so there
+> is no builder for `DataType::UserDefined`.
+
 ## Schemas
 
 A schema is a `StructType`, an ordered collection of named, typed fields. The type

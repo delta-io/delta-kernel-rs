@@ -340,6 +340,16 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
             &DataType::VOID => call!(visit_void),
+            // A UDT has no FFI representation of its own; present it as its physical sql_type so
+            // engines read the column without needing the (unavailable) engine UDT class.
+            DataType::UserDefined(udt) => visit_schema_item(
+                name,
+                &udt.sql_type,
+                is_nullable,
+                metadata,
+                visitor,
+                sibling_list_id,
+            ),
         }
     }
 

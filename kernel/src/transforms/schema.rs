@@ -1,6 +1,8 @@
 use std::borrow::{Cow, ToOwned};
 
-use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+use crate::schema::{
+    ArrayType, DataType, MapType, PrimitiveType, StructField, StructType, UserDefinedType,
+};
 use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
     Carrier,
@@ -125,6 +127,19 @@ pub trait SchemaTransform<'a> {
         self.recurse_into_struct(stype)
     }
 
+    /// Called for each user-defined type encountered. The provided implementation recurses into
+    /// the physical `sql_type` and rebuilds the [`UserDefinedType`], preserving its `raw` JSON.
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a UserDefinedType,
+    ) -> Self::Output<UserDefinedType> {
+        let child = self.transform(&udt.sql_type);
+        map_owned_or_else(udt, child, |sql_type| UserDefinedType {
+            sql_type: Box::new(sql_type),
+            raw: udt.raw.clone(),
+        })
+    }
+
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Self::Output<DataType> {
@@ -148,6 +163,10 @@ pub trait SchemaTransform<'a> {
             DataType::Variant(stype) => {
                 let child = self.transform_variant(stype);
                 map_owned_or_else(data_type, child, |s| DataType::Variant(Box::new(s)))
+            }
+            DataType::UserDefined(udt) => {
+                let child = self.transform_user_defined(udt);
+                map_owned_or_else(data_type, child, DataType::UserDefined)
             }
         }
     }

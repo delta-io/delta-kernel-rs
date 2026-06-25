@@ -1148,9 +1148,9 @@ impl StructType {
                     Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
                 }
             }
-            // Primitive types cannot contain nested metadata columns and variant types are
-            // validated at creation
-            DataType::Primitive(_) | DataType::Variant(_) => {}
+            // Primitive types cannot contain nested metadata columns; variant and user-defined
+            // types are validated/handled at creation and carry no nested metadata columns.
+            DataType::Primitive(_) | DataType::Variant(_) | DataType::UserDefined(_) => {}
         };
 
         Ok(())
@@ -1423,6 +1423,13 @@ impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
     /// `Variant` are protocol-defined, always non-null, and not user-controlled, so they
     /// must not be treated as user-declared non-null columns.
     fn transform_variant(&mut self, _stype: &'a StructType) -> Result<(), ()> {
+        Ok(())
+    }
+
+    /// Skip recursion into UDT internals. The fields inside a UDT's `sql_type` are engine-defined,
+    /// not user-declared columns, so a non-null inner field (e.g. `VectorUDT`'s `type`) must not be
+    /// reported as a user-declared non-null column.
+    fn transform_user_defined(&mut self, _udt: &'a UserDefinedType) -> Result<(), ()> {
         Ok(())
     }
 
@@ -1767,6 +1774,18 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
+fn serialize_user_defined<S: serde::Serializer>(
+    udt: &UserDefinedType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // Re-emit the original `udt` JSON object so the annotation round-trips value-for-value. The
+    // kernel never originates a UDT (it only captures one during deserialization), so `raw` is
+    // always a conformant `udt` object the engine itself wrote.
+    let value: serde_json::Value =
+        serde_json::from_str(&udt.raw).map_err(serde::ser::Error::custom)?;
+    serde::Serialize::serialize(&value, serializer)
+}
+
 // Custom Deserialize to provide clear error messages for unsupported types.
 // The derived impl would produce: "unknown variant `interval second`, expected one of ..."
 // This impl produces: "Unsupported Delta table type: 'interval second'"
@@ -1865,7 +1884,40 @@ pub enum DataType {
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
     #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
+    /// A Spark `UserDefinedType` (UDT). UDT is not part of the Delta protocol type system; it is
+    /// an engine-specific annotation over a physical `sql_type`. The `class`/`pyClass` fields
+    /// reference engine (JVM/Python) code the kernel cannot run, so the kernel reads the column as
+    /// its physical `sql_type` and preserves the original JSON for faithful re-serialization.
+    #[serde(serialize_with = "serialize_user_defined")]
+    UserDefined(UserDefinedType),
 }
+
+/// A Spark `UserDefinedType` (UDT) column. Spark serializes it as
+/// `{"type":"udt", "class"/"pyClass"/"serializedClass", "sqlType": <type>}`. The kernel cannot run
+/// the engine's (de)serialization class, so it represents the column by its physical `sql_type`
+/// (what is actually stored in Parquet) while preserving the original JSON object in `raw` so the
+/// annotation round-trips faithfully when the schema is re-serialized.
+#[derive(Debug, Clone)]
+pub struct UserDefinedType {
+    /// The physical type backing the UDT, used for all read/scan/Arrow/stats operations.
+    pub sql_type: Box<DataType>,
+
+    /// The original `udt` JSON object, preserved for re-serialization. This round-trips the
+    /// annotation (`class`/`pyClass`/`sqlType`/...) value-for-value; JSON object key order is not
+    /// preserved, which is immaterial since the annotation is opaque to the kernel.
+    pub raw: String,
+}
+
+// Type equality is physical: two UDTs are equal iff their `sql_type`s match. The `raw` annotation
+// (engine class names, JSON key order) does not affect how the column is read, and folding it into
+// equality would make schema-compatibility checks (`DataType::can_read_as`, which compares with
+// `==`) reject cosmetically-different-but-equivalent UDTs.
+impl PartialEq for UserDefinedType {
+    fn eq(&self, other: &Self) -> bool {
+        self.sql_type == other.sql_type
+    }
+}
+impl Eq for UserDefinedType {}
 
 impl From<DecimalType> for PrimitiveType {
     fn from(dtype: DecimalType) -> Self {
@@ -1948,6 +2000,22 @@ impl<'de> serde::Deserialize<'de> for DataType {
                     "map" => MapType::deserialize(value)
                         .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
+                    "udt" => {
+                        // UDT is engine-specific and outside the Delta protocol. Read the column
+                        // as its physical `sqlType`; the `class`/`pyClass` reference engine code
+                        // the kernel cannot run. Preserve the whole object so it round-trips.
+                        let sql_type_value = map.get("sqlType").ok_or_else(|| {
+                            Error::custom("Invalid 'udt' type: missing required 'sqlType' field")
+                        })?;
+                        let sql_type = DataType::deserialize(sql_type_value.clone())
+                            .map_err(|e| Error::custom(e.to_string()))?;
+                        let raw = serde_json::to_string(&value)
+                            .map_err(|e| Error::custom(e.to_string()))?;
+                        Ok(DataType::UserDefined(UserDefinedType {
+                            sql_type: Box::new(sql_type),
+                            raw,
+                        }))
+                    }
                     _ => Err(Error::custom(format!("Unknown complex type: '{type_str}'"))),
                 };
             }
@@ -2087,6 +2155,8 @@ impl Display for DataType {
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
+            // A UDT renders as its physical type, which is how reads materialize the column.
+            DataType::UserDefined(udt) => write!(f, "{}", udt.sql_type),
         }
     }
 }
@@ -2221,6 +2291,17 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         // There is no column mapping metadata inside the struct fields of a variant, so
         // we do not recurse into the variant fields
         Ok(Cow::Borrowed(stype))
+    }
+
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a UserDefinedType,
+    ) -> DeltaResult<Cow<'a, UserDefinedType>> {
+        // A UDT is a column-mapping leaf: the fields inside its `sql_type` carry no
+        // `physicalName`/`id` annotations (they are not user-controlled columns), so we must not
+        // recurse, just as for a variant. Recursing would demand annotations the fields don't have
+        // and fail to load any column-mapped table containing a struct-`sqlType` UDT.
+        Ok(Cow::Borrowed(udt))
     }
 }
 
@@ -3713,6 +3794,56 @@ mod tests {
             Some(MetadataColumnSpec::RowId)
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_udt_roundtrip_and_unwrap() -> DeltaResult<()> {
+        // Scala/Java UDT with a struct sqlType (VectorUDT-shaped).
+        let udt_json = r#"{"type":"udt","class":"org.apache.spark.ml.linalg.VectorUDT","pyClass":"pyspark.ml.linalg.VectorUDT","sqlType":{"type":"struct","fields":[{"name":"size","type":"integer","nullable":true,"metadata":{}},{"name":"values","type":{"type":"array","elementType":"double","containsNull":false},"nullable":true,"metadata":{}}]}}"#;
+
+        let dt: DataType = serde_json::from_str(udt_json)?;
+        let DataType::UserDefined(udt) = &dt else {
+            panic!("expected UserDefined, got {dt:?}");
+        };
+
+        // The physical sql_type is parsed and available for reads.
+        let expected_sql_type: DataType = serde_json::from_str(
+            r#"{"type":"struct","fields":[{"name":"size","type":"integer","nullable":true,"metadata":{}},{"name":"values","type":{"type":"array","elementType":"double","containsNull":false},"nullable":true,"metadata":{}}]}"#,
+        )?;
+        assert_eq!(*udt.sql_type, expected_sql_type);
+
+        // Non-lossy: re-serialization is JSON-equal to the input (key order may differ).
+        let got: serde_json::Value = serde_json::from_str(&serde_json::to_string(&dt)?)?;
+        let want: serde_json::Value = serde_json::from_str(udt_json)?;
+        assert_eq!(got, want, "udt did not round-trip faithfully");
+        Ok(())
+    }
+
+    #[test]
+    fn test_udt_python_flavor_and_primitive_sql_type() -> DeltaResult<()> {
+        // Python UDT (no `class`, has `serializedClass`) backed by a primitive sqlType.
+        let udt_json =
+            r#"{"type":"udt","pyClass":"x.Y","serializedClass":"AAAA","sqlType":"integer"}"#;
+        let dt: DataType = serde_json::from_str(udt_json)?;
+        let DataType::UserDefined(udt) = &dt else {
+            panic!("expected UserDefined, got {dt:?}");
+        };
+        assert_eq!(*udt.sql_type, DataType::INTEGER);
+
+        let got: serde_json::Value = serde_json::from_str(&serde_json::to_string(&dt)?)?;
+        let want: serde_json::Value = serde_json::from_str(udt_json)?;
+        assert_eq!(got, want, "python udt did not round-trip faithfully");
+        Ok(())
+    }
+
+    #[test]
+    fn test_udt_missing_sql_type_errors() {
+        let json = r#"{"type":"udt","class":"X"}"#;
+        let err = serde_json::from_str::<DataType>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("sqlType"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
