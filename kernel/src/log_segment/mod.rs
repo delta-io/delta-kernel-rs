@@ -257,32 +257,13 @@ impl LogSegment {
         self.last_checkpoint_metadata.as_ref().map(|m| m.version)
     }
 
-    /// Returns the retained `_last_checkpoint` hint, but only when it describes the checkpoint this
-    /// segment actually selected -- so the caller may trust the hint's fields for this checkpoint.
-    ///
-    /// A checkpoint's identity is more than its version: several checkpoints can share a version
-    /// (e.g. concurrent writers), and the segment selects one independently of the hint. So the
-    /// rest of the identity must match before any hint field is trusted:
-    ///
-    /// - Part count: a multi-part V1 checkpoint is keyed by `(version, numParts)` and its parts
-    ///   share a deterministic per-version name, so a matching part count pins the identity.
-    ///   `parts` is absent for a single-part / classic checkpoint (hence one part).
-    /// - `v2Checkpoint.path`: a V2 checkpoint's file name carries a UUID, so the name must match
-    ///   the selected part -- `checkpoint_parts.first()`, the file the hint's fields describe.
+    /// The retained `_last_checkpoint` hint, but only when it describes the checkpoint this segment
+    /// selected (see [`LastCheckpointHint::applies_to`]) -- so the caller may trust its fields.
     fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
-        let m = self.last_checkpoint_metadata.as_ref()?;
-        if Some(m.version) != self.checkpoint_version {
-            return None;
-        }
-        if m.parts.unwrap_or(1) != self.listed.checkpoint_parts.len() {
-            return None;
-        }
-        if let Some(v2) = &m.v2_checkpoint {
-            if self.listed.checkpoint_parts.first()?.filename != v2.path {
-                return None;
-            }
-        }
-        Some(m)
+        let version = self.checkpoint_version?;
+        self.last_checkpoint_metadata
+            .as_ref()
+            .filter(|hint| hint.applies_to(version, &self.listed.checkpoint_parts))
     }
 
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
