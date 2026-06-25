@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
@@ -20,7 +19,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -37,7 +36,8 @@ use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_features::TableFeature;
 use crate::utils::test_utils::{
-    assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
+    assert_batch_matches, assert_result_error_with_message, create_log_path,
+    create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
     DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
@@ -201,20 +201,6 @@ async fn write_json_to_store(
         .await?;
 
     Ok(())
-}
-
-fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
-    create_log_path_with_size(path, 0)
-}
-
-fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
-    ParsedLogPath::try_from(FileMeta {
-        location: Url::parse(path).expect("Invalid file URL"),
-        last_modified: 0,
-        size,
-    })
-    .unwrap()
-    .unwrap()
 }
 
 /// Builds a staged-commit log path (`ParsedLogPath`) for each version: a
@@ -2668,7 +2654,39 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-mod checkpoint_hint;
+/// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from
+/// "no applicable hint / no sidecar info" (`None`) -- the empty-vs-absent contract the accessor's
+/// doc promises. Real V2 fixtures only carry non-empty sidecar lists, so this synthetic case is the
+/// only place it is exercised.
+#[test]
+fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
+    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHint {
+            version: 1,
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: selected.to_string(),
+                sidecar_files: Some(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )?;
+
+    assert_eq!(log_segment.checkpoint_sidecars(), Some([].as_slice()));
+    Ok(())
+}
 
 /// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
 /// matches [`LogSegment::checkpoint_version`]. Otherwise the parquet footer is read.
