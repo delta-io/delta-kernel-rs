@@ -57,8 +57,10 @@ pub unsafe extern "C" fn free_partition_value_map(map: Handle<ExclusivePartition
 // names). Re-inserting the same name replaces the previous value. Inserts can fail when the `name`
 // slice is not valid UTF-8 (and, for decimal/null, when the type parameters are invalid), hence the
 // `ExternResult<bool>` return; the engine handle is used to allocate any error. The map handle is
-// borrowed, never consumed, so the caller keeps ownership across inserts. See issue #255 for why
-// these are not macro-generated (cbindgen must see each `extern "C" fn` to emit a header entry).
+// borrowed, never consumed, so the caller keeps ownership across inserts. These are written out
+// per-type rather than macro-generated because cbindgen scans source syntactically and cannot see
+// `extern "C" fn`s produced by macro expansion, so they would be absent from the generated header.
+// See issue #255 for more info.
 
 /// Common insertion path: validate the name, then store the scalar under it. Returns `true` on
 /// success.
