@@ -49,7 +49,8 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
                 chars.next();
             }
             // A `.` starts a number when a digit follows (a leading-dot decimal like `.5`);
-            // otherwise it is a column-path separator. Mirrors the sign arm's lookahead below.
+            // otherwise it is a column-path separator. (The `+`/`-` arm below uses a similar
+            // lookahead, though it also admits a following `.`.)
             '.' => {
                 let mut lookahead = chars.clone();
                 lookahead.next();
@@ -132,11 +133,9 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
             "unterminated string literal in CHECK constraint: {sql}"
         ))
     };
-    let mut out = String::new();
-    match chars.next() {
-        Some('\'') => out.push('\''),
-        _ => return Err(unterminated()),
-    }
+    // The caller guarantees the stream starts with the opening `'`; consume it.
+    chars.next();
+    let mut out = String::from('\'');
     loop {
         match chars.next() {
             Some('\'') => {

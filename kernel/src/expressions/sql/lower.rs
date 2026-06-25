@@ -13,22 +13,56 @@ use crate::expressions::{ColumnName, Expression, Predicate};
 use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
 
-/// The comparison must reference at least one column so that a literal
-/// operand can be typed from the column on the other side.
+/// Lower a parsed [`Comparison`] into a kernel [`Predicate`], resolving each operand against
+/// `schema`. A comparison relates only primitive-typed columns and must reference at least one
+/// column, so a literal operand can be typed from the column on the other side.
 pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult<Predicate> {
     let Comparison { op, left, right } = comparison;
     let left = resolve_operand(left, schema)?;
     let right = resolve_operand(right, schema)?;
-
-    let left_type = left.column_type().cloned();
-    let right_type = right.column_type().cloned();
-    if left_type.is_none() && right_type.is_none() {
-        return Err(Error::generic(
-            "CHECK constraint comparison must reference at least one column",
-        ));
+    // Comparison policy lives here, not in `resolve_operand`: only primitive-typed columns are
+    // comparable (struct/array/map columns have no scalar comparison semantics).
+    for operand in [&left, &right] {
+        if let ResolvedOperand::Column {
+            canonical,
+            data_type,
+        } = operand
+        {
+            if !matches!(data_type, DataType::Primitive(_)) {
+                return Err(Error::generic(format!(
+                    "CHECK constraint can only compare primitive-typed columns, but '{}' has type {data_type:?}",
+                    canonical.join(".")
+                )));
+            }
+        }
     }
-    let left_expr = operand_expression(left, right_type.as_ref())?;
-    let right_expr = operand_expression(right, left_type.as_ref())?;
+    // A literal is typed from the column on the other side, so at least one operand must be a
+    // column.
+    let (left_expr, right_expr) = match (left, right) {
+        (
+            ResolvedOperand::Column { canonical: l, .. },
+            ResolvedOperand::Column { canonical: r, .. },
+        ) => (Expression::column(l), Expression::column(r)),
+        (
+            ResolvedOperand::Column {
+                canonical,
+                data_type,
+            },
+            ResolvedOperand::Literal(raw),
+        ) => (Expression::column(canonical), parse_sql(&raw, &data_type)?),
+        (
+            ResolvedOperand::Literal(raw),
+            ResolvedOperand::Column {
+                canonical,
+                data_type,
+            },
+        ) => (parse_sql(&raw, &data_type)?, Expression::column(canonical)),
+        (ResolvedOperand::Literal(_), ResolvedOperand::Literal(_)) => {
+            return Err(Error::generic(
+                "CHECK constraint comparison must reference at least one column",
+            ))
+        }
+    };
     Ok(match op {
         CmpOp::Eq => Predicate::eq(left_expr, right_expr),
         CmpOp::Ne => Predicate::ne(left_expr, right_expr),
@@ -39,65 +73,30 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
     })
 }
 
-/// A comparison operand after schema resolution: a column (its [`Expression`] and resolved leaf
-/// type) or a not-yet-typed literal (typed later from the column it is compared against).
+/// A comparison operand after schema resolution: a column (its canonical schema-cased path and
+/// resolved leaf type) or a not-yet-typed literal (typed by [`lower`] from the column on the other
+/// side).
 enum ResolvedOperand {
     Column {
-        expr: Expression,
+        canonical: Vec<String>,
         data_type: DataType,
     },
     Literal(String),
 }
 
-impl ResolvedOperand {
-    /// The column's resolved leaf type, or `None` for a literal.
-    fn column_type(&self) -> Option<&DataType> {
-        match self {
-            ResolvedOperand::Column { data_type, .. } => Some(data_type),
-            ResolvedOperand::Literal(_) => None,
-        }
-    }
-}
-
-/// Resolve an operand against `schema`, walking a column path at most once. A column resolves to
-/// its canonical [`Expression`] and leaf type, which must be primitive: struct/array/map columns
-/// have no scalar comparison semantics (and a literal operand is likewise restricted to primitives
-/// by [`parse_sql`]), so a non-primitive column makes the constraint not kernel-parsable. A literal
-/// is carried as raw text and typed later by [`operand_expression`].
+/// Resolve an operand against `schema`, walking a column path at most once: a column yields its
+/// canonical (schema-cased) path and leaf type; a literal is carried as raw text and typed by
+/// [`lower`]. This is pure resolution -- comparison-specific policy (primitive-only operands) lives
+/// in [`lower`], so `resolve_operand` can also resolve non-primitive columns for other callers.
 fn resolve_operand(operand: &Operand, schema: &StructType) -> DeltaResult<ResolvedOperand> {
     match operand {
         Operand::Literal(raw) => Ok(ResolvedOperand::Literal(raw.clone())),
         Operand::Column(path) => {
             let (canonical, data_type) = resolve_column(path, schema)?;
-            if !matches!(data_type, DataType::Primitive(_)) {
-                return Err(Error::generic(format!(
-                    "CHECK constraint can only compare primitive-typed columns, but '{}' has type {data_type:?}",
-                    canonical.join(".")
-                )));
-            }
             Ok(ResolvedOperand::Column {
-                expr: Expression::column(canonical),
+                canonical,
                 data_type,
             })
-        }
-    }
-}
-
-/// Build the kernel [`Expression`] for a resolved operand. A literal is parsed via [`parse_sql`]
-/// against `sibling_type` -- the type of the column on the other side of the comparison.
-fn operand_expression(
-    operand: ResolvedOperand,
-    sibling_type: Option<&DataType>,
-) -> DeltaResult<Expression> {
-    match operand {
-        ResolvedOperand::Column { expr, .. } => Ok(expr),
-        ResolvedOperand::Literal(raw) => {
-            let data_type = sibling_type.ok_or_else(|| {
-                Error::generic(format!(
-                    "cannot type literal '{raw}': a CHECK constraint comparison must reference a column"
-                ))
-            })?;
-            parse_sql(&raw, data_type)
         }
     }
 }
@@ -207,6 +206,20 @@ mod tests {
         "ratio < 1e3",
         Predicate::lt(col("ratio"), Expression::literal(Scalar::Double(1000.0)))
     )]
+    // Signed numbers: a leading sign, and a signed exponent, each stay part of one numeric literal.
+    #[case::negative_literal(
+        "amount = -5",
+        Predicate::eq(col("amount"), Expression::literal(-5i64))
+    )]
+    #[case::signed_exponent(
+        "ratio >= -2e+1",
+        Predicate::ge(col("ratio"), Expression::literal(Scalar::Double(-20.0)))
+    )]
+    // A leading sign immediately followed by a leading-dot decimal stays one numeric literal.
+    #[case::negative_leading_dot_decimal(
+        "ratio > -.5",
+        Predicate::gt(col("ratio"), Expression::literal(Scalar::Double(-0.5)))
+    )]
     // Timestamp typed literals: LTZ (bare `TIMESTAMP` or explicit `TIMESTAMP_LTZ`, both requiring a
     // `Z` suffix) and zoneless `TIMESTAMP_NTZ`.
     #[case::typed_timestamp(
@@ -290,6 +303,8 @@ mod tests {
     #[case::literal_out_of_range_for_column("price = 9999999999")]
     // Malformed input.
     #[case::unterminated_string("name = 'oops")]
+    #[case::bang_without_eq("amount ! 0")]
+    #[case::malformed_dotted_path("nested..inner > 0")]
     #[case::missing_operator("amount price")]
     #[case::trailing_tokens("amount > 0 extra")]
     #[case::operator_only(">")]
