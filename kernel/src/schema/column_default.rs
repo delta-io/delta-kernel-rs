@@ -4,18 +4,16 @@ use crate::expressions::{parse_sql, Expression, Scalar};
 use crate::schema::DataType;
 use crate::{DeltaResult, Error};
 
-/// A column-level default value parsed from the `CURRENT_DEFAULT` metadata key of a
+/// A column-level default parsed from the `CURRENT_DEFAULT` metadata key of a
 /// [`StructField`](crate::schema::StructField).
 ///
-/// The carrier holds the raw SQL string ([`raw_sql`](Self::raw_sql)) and the column's declared
-/// type ([`data_type`](Self::data_type)). On construction the kernel eagerly parses the SQL with
-/// its built-in SQL parser and caches the result. Callers check whether that parse succeeded
-/// via [`is_kernel_parsable`](Self::is_kernel_parsable) and resolve the default to a [`Scalar`]
-/// via [`evaluate`](Self::evaluate). When the kernel cannot parse the SQL (e.g. a function call
-/// such as `current_timestamp()`), connectors with richer SQL support may evaluate
-/// [`raw_sql`](Self::raw_sql) themselves.
+/// Holds the raw SQL and the column's declared type. On construction the kernel parses the SQL
+/// with its built-in parser and caches the result. [`to_scalar`](Self::to_scalar) returns the
+/// parsed [`Scalar`], or `None` when the kernel could not parse the SQL (e.g.
+/// `current_timestamp()`), in which case a connector can evaluate [`raw_sql`](Self::raw_sql)
+/// itself.
 ///
-/// The declared type is borrowed from the logical schema, which always outlives the carrier.
+/// The declared type is borrowed from the logical schema, which outlives the carrier.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefault<'a> {
     raw_sql: String,
@@ -28,16 +26,17 @@ pub struct ColumnDefault<'a> {
 impl<'a> ColumnDefault<'a> {
     /// Build a `ColumnDefault` from a raw SQL string and the column's declared type.
     ///
-    /// The kernel attempts to parse `raw_sql` via the built-in SQL parser using `data_type` as the
-    /// expected target type. A parse failure is **not** an error -- the parsed form is left empty
-    /// and `Ok` is returned -- because not every stored default is a literal the kernel knows how
-    /// to interpret (use [`is_kernel_parsable`](Self::is_kernel_parsable) to check).
+    /// Parses `raw_sql` with the built-in SQL parser, targeting `data_type`. A parse failure is
+    /// not an error: the cached form is left empty and [`to_scalar`](Self::to_scalar) returns
+    /// `None` so the connector can handle the raw SQL.
     ///
     /// # Errors
     ///
     /// Returns an error when `data_type` is non-primitive (Array, Map, Struct, or Variant) and
     /// `raw_sql` is not `NULL` (case-insensitive).
-    pub fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
+    // No production caller yet, remove this allow when that wiring exists.
+    #[allow(unused)]
+    pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
         // Spark only allows a non-primitive column default when it is NULL; match that behavior.
         if data_type.as_primitive_opt().is_none() && !is_null {
@@ -55,9 +54,6 @@ impl<'a> ColumnDefault<'a> {
     }
 
     /// The raw SQL expression as stored in the column's metadata.
-    ///
-    /// Connectors with a SQL engine richer than the kernel's SQL parser can evaluate this
-    /// directly when [`is_kernel_parsable`](Self::is_kernel_parsable) returns `false`.
     pub fn raw_sql(&self) -> &str {
         &self.raw_sql
     }
@@ -67,29 +63,19 @@ impl<'a> ColumnDefault<'a> {
         self.data_type
     }
 
-    /// Returns `true` when the kernel parsed [`raw_sql`](Self::raw_sql) into a form it can
-    /// evaluate, and `false` otherwise.
-    pub fn is_kernel_parsable(&self) -> bool {
-        self.parsed_sql.is_some()
-    }
-
-    /// Evaluate the parsed default to a [`Scalar`].
+    /// The default as a [`Scalar`], or `None` when the kernel could not parse the SQL.
     ///
-    /// Returns `Ok(None)` when the kernel could not parse [`raw_sql`](Self::raw_sql) (i.e.
-    /// [`is_kernel_parsable`](Self::is_kernel_parsable) is `false`); the caller may fall back to
-    /// its own SQL engine using [`raw_sql`](Self::raw_sql).
+    /// On `None` the connector can evaluate [`raw_sql`](Self::raw_sql) with its own SQL engine.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parsed default is not a literal (the parser never produces such
-    /// expressions, so this is defensive).
-    pub fn evaluate(&self) -> DeltaResult<Option<Scalar>> {
-        let Some(expr) = self.parsed_sql.as_ref() else {
-            return Ok(None);
-        };
-        match expr {
-            Expression::Literal(scalar) => Ok(Some(scalar.clone())),
-            other => Err(Error::generic(format!(
+    /// Returns an error if the parsed default is not a literal. The parser only emits literals, so
+    /// this is defensive.
+    pub fn to_scalar(&self) -> DeltaResult<Option<Scalar>> {
+        match &self.parsed_sql {
+            None => Ok(None),
+            Some(Expression::Literal(scalar)) => Ok(Some(scalar.clone())),
+            Some(other) => Err(Error::generic(format!(
                 "kernel cannot evaluate non-literal column default expression: {other:?}"
             ))),
         }
@@ -121,11 +107,11 @@ mod tests {
     /// Expected outcome of [`ColumnDefault::new`] for one `(raw_sql, data_type)` pair.
     #[derive(Debug)]
     enum Expect {
-        /// Parsable; `evaluate` yields this scalar.
+        /// `to_scalar` yields `Some(this)`.
         Parsed(Scalar),
-        /// Parsable `NULL`; `evaluate` yields `Scalar::Null` of the column's type.
+        /// `to_scalar` yields `Some(Scalar::Null)` of the column's type.
         ParsedNull,
-        /// Not kernel-parsable; `evaluate` yields `None`.
+        /// `to_scalar` yields `None`.
         Unparsable,
         /// `new` fails with an error containing this substring.
         NewErr(&'static str),
@@ -179,19 +165,19 @@ mod tests {
     ) {
         match (ColumnDefault::new(raw_sql.into(), &data_type), expect) {
             (Ok(d), Expect::Parsed(scalar)) => {
-                assert!(d.is_kernel_parsable());
-                assert_eq!(d.evaluate().unwrap(), Some(scalar));
                 assert_eq!(d.raw_sql(), raw_sql);
                 assert_eq!(d.data_type(), &data_type);
+                assert_eq!(d.to_scalar().unwrap(), Some(scalar));
             }
             (Ok(d), Expect::ParsedNull) => {
-                assert!(d.is_kernel_parsable());
-                assert_eq!(d.evaluate().unwrap(), Some(Scalar::Null(data_type.clone())));
+                assert_eq!(
+                    d.to_scalar().unwrap(),
+                    Some(Scalar::Null(data_type.clone()))
+                );
             }
             (Ok(d), Expect::Unparsable) => {
-                assert!(!d.is_kernel_parsable());
-                assert_eq!(d.evaluate().unwrap(), None);
-                // A parse failure must not drop the raw SQL -- connectors fall back to it.
+                assert_eq!(d.to_scalar().unwrap(), None);
+                // A parse failure must not drop the raw SQL; connectors fall back to it.
                 assert_eq!(d.raw_sql(), raw_sql);
             }
             (Err(e), Expect::NewErr(needle)) => {
@@ -204,9 +190,9 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_errors_on_non_literal_parsed_expression() {
-        // The parser only emits literals in normal use; construct a non-literal directly to reach
-        // the defensive error arm.
+    fn to_scalar_errors_on_non_literal_parsed_expression() {
+        // The parser only emits literals, so construct a non-literal directly to reach the
+        // defensive error arm.
         let int_ty = DataType::INTEGER;
         let d = ColumnDefault {
             raw_sql: "x".into(),
@@ -214,7 +200,7 @@ mod tests {
             parsed_sql: Some(Expression::column(["x"])),
         };
         let err = d
-            .evaluate()
+            .to_scalar()
             .expect_err("non-literal parsed expression must error")
             .to_string();
         assert!(err.contains("non-literal"), "got: {err}");
