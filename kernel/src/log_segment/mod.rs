@@ -112,13 +112,12 @@ pub(crate) struct LogSegment {
     /// The set of log files found during listing.
     pub listed: LogSegmentFiles,
 
-    /// Metadata from the `_last_checkpoint` hint file.
-    ///
-    /// Note: This is only populated if the hint file was read during creation of this
-    /// log segment. The hint may describe a different checkpoint version than the one in this
-    /// segment. Callers should use explicit getters (such as [`Self::checkpoint_schema`]) rather
-    /// than reading this field directly.
-    last_checkpoint_metadata: Option<LastCheckpointHint>,
+    /// The retained `_last_checkpoint` hint, if one was read when this segment was built. The hint
+    /// may describe a different checkpoint than the one this segment selected, so for validated
+    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_schema`] /
+    /// [`Self::checkpoint_sidecars`] accessors built on it). Read this field directly only when
+    /// the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
+    pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
 /// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
@@ -304,14 +303,6 @@ impl LogSegment {
             .as_ref()?
             .sidecar_files
             .as_deref()
-    }
-
-    /// Returns a copy of the retained `_last_checkpoint` hint, if one was read.
-    ///
-    /// Prefer [`Self::checkpoint_schema`] or [`Self::last_checkpoint_version`] when requiring
-    /// individual values from the hint.
-    pub(crate) fn last_checkpoint_hint(&self) -> Option<LastCheckpointHint> {
-        self.last_checkpoint_metadata.clone()
     }
 
     /// Succinct summary string for logging purposes.
