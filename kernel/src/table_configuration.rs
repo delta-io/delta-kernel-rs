@@ -25,12 +25,12 @@ pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_suppo
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
+    check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
+    get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
-    LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
-    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
-    V3_VALIDATOR,
+    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -104,6 +104,8 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
+    /// The subset of the logical schema that remains after excluding partition columns.
+    logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
     physical_schema: SchemaRef,
     /// The subset of the physical schema that remains after excluding partition columns.
@@ -172,12 +174,12 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
+        let partition_columns: HashSet<&str> = metadata
+            .partition_columns()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let physical_data_schema_without_partition_columns = {
-            let partition_columns: HashSet<&str> = metadata
-                .partition_columns()
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
             let fields = logical_schema
                 .fields()
                 .zip(physical_schema.fields())
@@ -188,9 +190,18 @@ impl TableConfiguration {
             // Safety: subset of an already-valid schema.
             Arc::new(StructType::new_unchecked(fields))
         };
+        let logical_schema_without_partition_columns = {
+            let fields = logical_schema
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name().as_str()))
+                .cloned();
+            // Safety: subset of an already-valid schema.
+            Arc::new(StructType::new_unchecked(fields))
+        };
 
         let table_config = Self {
             logical_schema,
+            logical_schema_without_partition_columns,
             physical_schema,
             physical_data_schema_without_partition_columns,
             metadata,
@@ -382,19 +393,9 @@ impl TableConfiguration {
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
-    /// Returns the logical schema for data columns (excludes partition columns).
-    ///
-    /// Partition columns are excluded because statistics are only collected for data columns
-    /// that are physically stored in the parquet files. Partition values are stored in the
-    /// file path, not in the file content, so they don't have file-level statistics.
-    fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.partition_columns();
-        Arc::new(StructType::new_unchecked(
-            self.logical_schema()
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name()))
-                .cloned(),
-        ))
+    /// Returns the logical schema excluding partition columns.
+    pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
+        self.logical_schema_without_partition_columns.clone()
     }
 
     /// Returns the physical data schema excluding partition columns.
@@ -411,7 +412,7 @@ impl TableConfiguration {
             .data_skipping_stats_columns
             .as_ref()
             .map(|cols| {
-                let logical_schema = self.logical_data_schema();
+                let logical_schema = self.logical_schema_without_partition_columns();
                 let mode = self.column_mapping_mode();
                 cols.iter()
                     .filter_map(|col| {
@@ -598,24 +599,7 @@ impl TableConfiguration {
     /// For table features protocol (v3), returns the explicit reader_features list.
     /// For legacy protocol (v1-2), infers features from the version number.
     fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
-        match self.protocol.min_reader_version() {
-            TABLE_FEATURES_MIN_READER_VERSION => {
-                // Table features reader: use explicit reader_features list
-                self.protocol
-                    .reader_features()
-                    .map(|f| f.to_vec())
-                    .unwrap_or_default()
-            }
-            v if (1..=2).contains(&v) => {
-                // Legacy reader: infer features from version
-                LEGACY_READER_FEATURES
-                    .iter()
-                    .filter(|f| f.is_valid_for_legacy_reader(v))
-                    .cloned()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
+        extract_enabled_reader_features(&self.protocol)
     }
 
     /// Returns all writer features enabled for this table based on protocol version.
@@ -657,20 +641,7 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        require!(
-            self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
-                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
-                self.protocol.min_reader_version()
-            ))
-        );
-        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
-        if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-            return Err(Error::unsupported(format!(
-                "Unsupported minimum reader version {}",
-                self.protocol.min_reader_version()
-            )));
-        }
+        check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
         for feature in self.get_enabled_reader_features() {

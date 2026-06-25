@@ -591,6 +591,15 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            // Millisecond is coarser than the kernel's microsecond logical timestamp, so
+            // mapping it onto the logical type is a lossless upscale (values are rescaled
+            // x1000 by the engine on read).
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, Some(tz))
+                if tz.eq_ignore_ascii_case("utc") =>
+            {
+                Ok(DataType::TIMESTAMP)
+            }
             ArrowDataType::Struct(fields) => DataType::try_struct_type_from_results(
                 fields.iter().map(|field| field.as_ref().try_into_kernel()),
             )
@@ -699,6 +708,22 @@ mod tests {
 
         let kernel_type = DataType::try_from_arrow(&ArrowDataType::Null)?;
         assert_eq!(kernel_type, DataType::Primitive(PrimitiveType::Void));
+
+        Ok(())
+    }
+
+    // Millisecond-precision timestamps (e.g. from externally-written checkpoint stats)
+    // must convert like microsecond/nanosecond: UTC tz -> TIMESTAMP, no tz -> TIMESTAMP_NTZ.
+    #[test]
+    fn test_millisecond_timestamp_conversion() -> DeltaResult<()> {
+        let utc = DataType::try_from_arrow(&ArrowDataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some("UTC".into()),
+        ))?;
+        assert_eq!(utc, DataType::TIMESTAMP);
+
+        let ntz = DataType::try_from_arrow(&ArrowDataType::Timestamp(TimeUnit::Millisecond, None))?;
+        assert_eq!(ntz, DataType::TIMESTAMP_NTZ);
 
         Ok(())
     }

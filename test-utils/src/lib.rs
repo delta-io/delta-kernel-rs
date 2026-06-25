@@ -133,15 +133,17 @@ define_sweeps! {
         checkpoint_struct_stats(),
         no_checkpoint_stats()
     ),
-    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
-    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
+    // `version_at_timestamp_max()` is the only timestamp row; see its docs for why
+    // intermediate-version resolution lives in a dedicated test instead.
     version_target_values = (
         version_latest(),
         version_at_mid(),
-        version_incremental_to_latest()
+        version_incremental_from_mid_to_latest(),
+        version_incremental_from_mid_to_pre_latest(),
+        version_at_timestamp_max()
     ),
 }
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
@@ -152,11 +154,13 @@ use delta_kernel::actions::{
     get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
+    RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
+};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
@@ -172,10 +176,12 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, FileMeta,
+    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, Error, FileMeta,
     FilteredEngineData, LogPath, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
@@ -589,6 +595,10 @@ pub fn engine_store_setup(
     (storage, engine, url)
 }
 
+/// Fixed in-commit timestamp (milliseconds since the Unix epoch) written by [`create_table`] when
+/// the `inCommitTimestamp` writer feature is enabled.
+pub const TEST_ICT_ENABLEMENT_TIMESTAMP: i64 = 1612345678;
+
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 // For property-gated writer features, this helper also writes the corresponding enablement
@@ -649,7 +659,7 @@ pub async fn create_table(
             );
             config.insert(
                 "delta.inCommitTimestampEnablementTimestamp".to_string(),
-                json!("1612345678"),
+                json!(TEST_ICT_ENABLEMENT_TIMESTAMP.to_string()),
             );
         }
         if writer_features.contains(&"changeDataFeed") {
@@ -682,7 +692,7 @@ pub async fn create_table(
     // Add commitInfo with ICT if ICT is enabled
     let commit_info = if writer_features.contains(&"inCommitTimestamp") {
         // When ICT is enabled from version 0, we need to include it in the initial commit
-        let timestamp = 1612345678i64; // Use a fixed timestamp for testing
+        let timestamp = TEST_ICT_ENABLEMENT_TIMESTAMP;
         Some(json!({
             "commitInfo": {
                 "timestamp": timestamp,
@@ -721,6 +731,40 @@ pub async fn create_table(
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
     Ok(table_path)
+}
+
+/// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level
+/// fields.
+///
+/// `column_defaults` maps `column_name -> default_sql`. The raw SQL is stored verbatim; this
+/// helper does not parse or validate it.
+///
+/// # Errors
+///
+/// Returns an error if `column_defaults` names a column that is not a top-level field of `schema`.
+pub fn schema_with_column_defaults(
+    schema: &StructType,
+    mut column_defaults: HashMap<&str, &str>,
+) -> DeltaResult<SchemaRef> {
+    let mut augmented_fields = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let augmented = match column_defaults.remove(field.name.as_str()) {
+            Some(sql) => field.clone().add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::String(sql.to_string()),
+            )]),
+            None => field.clone(),
+        };
+        augmented_fields.push(augmented);
+    }
+    if !column_defaults.is_empty() {
+        let unknown: Vec<&str> = column_defaults.into_keys().collect();
+        return Err(Error::generic(format!(
+            "column defaults reference unknown top-level columns: {unknown:?}"
+        )));
+    }
+
+    Ok(Arc::new(StructType::try_new(augmented_fields)?))
 }
 
 /// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
@@ -1128,6 +1172,33 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
             );
         }
     }
+}
+
+/// Collect `row_id` values from scan batches produced with a `MetadataColumnSpec::RowId` schema.
+pub fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("row_id")
+                .expect("row_id column not found in batch")
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Assert every `row_id` across the batches is unique.
+pub fn assert_row_ids_unique(batches: &[RecordBatch]) {
+    let row_ids = collect_row_ids(batches);
+    let unique: HashSet<i64> = row_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        row_ids.len(),
+        "row IDs must be globally unique: found {} duplicate(s) among {} row(s)",
+        row_ids.len() - unique.len(),
+        row_ids.len(),
+    );
 }
 
 /// Creates add file metadata for one or more files without partition values.

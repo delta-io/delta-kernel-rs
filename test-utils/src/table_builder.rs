@@ -54,10 +54,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
+use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
@@ -834,7 +835,8 @@ pub fn table_configs(
 /// [`FeatureSet`], and [`TableConfig`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataLayoutConfig {
-    /// No special data layout (default schema).
+    /// No partitioning or clustering. Uses an all-primitives schema including a
+    /// nested-struct column.
     Unpartitioned,
     /// Partition by every valid primitive type. Uses [`partitioned_schema`] with all columns
     /// as partition columns.
@@ -843,6 +845,14 @@ pub enum DataLayoutConfig {
     /// clustering-eligible columns. Boolean and Binary are excluded (not stats-eligible).
     ClusteredAllTypes,
 }
+
+/// Period for sparse null injection. Data generation emits a null every
+/// `NULL_RATE_EVERY_NTH` rows for each nullable, non-partition column, regardless of
+/// [`DataLayoutConfig`]. Clustering columns are nulled like any other data column (kernel
+/// permits null clustering keys). Partition columns are left fully populated: the protocol
+/// permits null partition values, but the generator does not model them, so partition data
+/// stays well-defined and matches the declared partition value.
+pub const NULL_RATE_EVERY_NTH: usize = 3;
 
 impl DataLayoutConfig {
     /// The layout column names (partition or clustering) for this config. Returns all
@@ -970,6 +980,15 @@ pub enum VersionTarget {
     AtVersion(u64),
     /// Load at `from`, then incrementally update to latest.
     IncrementalToLatest { from: u64 },
+    /// Load at `from`, then incrementally update to a specific target `to`. Exercises the
+    /// `Snapshot::builder_from(base).at_version(to)` path with `to <= latest`. Requires
+    /// `from <= to`.
+    IncrementalFrom { from: u64, to: u64 },
+    /// Time travel by timestamp: resolves `timestamp` (milliseconds since Unix epoch) to a
+    /// version via [`history_manager::latest_version_as_of`], then loads that version.
+    ///
+    /// [`history_manager::latest_version_as_of`]: delta_kernel::history_manager::latest_version_as_of
+    AtTimestamp(i64),
 }
 
 impl fmt::Display for VersionTarget {
@@ -980,6 +999,10 @@ impl fmt::Display for VersionTarget {
             VersionTarget::IncrementalToLatest { from } => {
                 write!(f, "incremental({from}->latest)")
             }
+            VersionTarget::IncrementalFrom { from, to } => {
+                write!(f, "incremental({from}->{to})")
+            }
+            VersionTarget::AtTimestamp(ts) => write!(f, "at_timestamp({ts})"),
         }
     }
 }
@@ -992,10 +1015,29 @@ pub fn version_latest() -> VersionTarget {
 pub fn version_at_mid() -> VersionTarget {
     VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION)
 }
-pub fn version_incremental_to_latest() -> VersionTarget {
+pub fn version_incremental_from_mid_to_latest() -> VersionTarget {
     VersionTarget::IncrementalToLatest {
         from: DEFAULT_SWEEP_MID_VERSION,
     }
+}
+/// Incremental update from `mid` to `latest - 1`. The non-latest `to` exercises the
+/// partial-replay path that `version_incremental_from_mid_to_latest()` cannot reach, since
+/// updating to latest is indistinguishable from a non-incremental load.
+pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
+    VersionTarget::IncrementalFrom {
+        from: DEFAULT_SWEEP_MID_VERSION,
+        to: DEFAULT_SWEEP_LATEST_VERSION - 1,
+    }
+}
+/// Timestamp travel using `i64::MAX`, which always resolves to the latest version (every
+/// commit's timestamp is below `i64::MAX`). This is a smoke test that the timestamp
+/// conversion path runs without error across the sweep, not a resolution-correctness
+/// check: `InMemory` collapses successive `put` timestamps to a single millisecond, so the
+/// sweep can't reach an intermediate version. Resolution to an intermediate version is
+/// covered by `test_at_timestamp_resolves_to_intermediate_version`, which sets commit
+/// modification times explicitly on the local filesystem.
+pub fn version_at_timestamp_max() -> VersionTarget {
+    VersionTarget::AtTimestamp(i64::MAX)
 }
 
 // ===========================================================================
@@ -1308,7 +1350,9 @@ fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
 /// tables, all rows in a file share the same partition values; for unpartitioned or
 /// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
-/// varying data derived from version and file index.
+/// varying data derived from version and file index. Partition columns are never nulled
+/// so their data matches the declared partition value; all other nullable columns
+/// (including clustering columns, which kernel permits to be null) get sparse nulls.
 async fn write_data_commit<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &DefaultEngine<E>,
@@ -1326,22 +1370,31 @@ async fn write_data_commit<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
+    let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
+
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
         let partition_seed = (version as usize) * 1000 + file_idx * 100;
-        let columns: Vec<ArrayRef> = arrow_schema
-            .fields()
-            .iter()
-            .zip(logical_schema.fields())
-            .map(|(arrow_field, kernel_field)| {
-                if partition_columns.contains(&kernel_field.name().to_string()) {
-                    generate_constant_column(arrow_field.data_type(), rows_per_file, partition_seed)
-                } else {
-                    generate_column(arrow_field.data_type(), rows_per_file, base)
-                }
-            })
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
+        // Data batches must not contain any partition columns.
+        let mut data_fields = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for (arrow_field, kernel_field) in arrow_schema.fields().iter().zip(logical_schema.fields())
+        {
+            if partition_set.contains(kernel_field.name().as_str()) {
+                continue;
+            }
+            let data_type = arrow_field.data_type();
+            let values = generate_column(data_type, rows_per_file, base);
+            let values = if arrow_field.is_nullable() {
+                with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
+            } else {
+                values
+            };
+            columns.push(values);
+            data_fields.push(arrow_field.clone());
+        }
+        let data_arrow_schema = ArrowSchema::new(data_fields);
+        let batch = RecordBatch::try_new(Arc::new(data_arrow_schema), columns)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
@@ -1362,71 +1415,6 @@ async fn write_data_commit<E: TaskExecutor>(
     }
 
     txn.commit(engine)
-}
-
-/// Generate a constant column where all rows have the same value derived from `seed`.
-/// Used for partition columns so the data matches the declared partition values.
-fn generate_constant_column(arrow_type: &ArrowDataType, rows: usize, seed: usize) -> ArrayRef {
-    match arrow_type {
-        ArrowDataType::Boolean => {
-            let v = seed.is_multiple_of(2);
-            Arc::new(BooleanArray::from(vec![v; rows]))
-        }
-        ArrowDataType::Int8 => {
-            let v = (seed % 100) as i8;
-            Arc::new(Int8Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int16 => {
-            let v = (seed % 100) as i16;
-            Arc::new(Int16Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int32 => {
-            let v = (seed % 100) as i32;
-            Arc::new(Int32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int64 => {
-            let v = (seed * 1000) as i64;
-            Arc::new(Int64Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Float32 => {
-            let v = seed as f32 * 0.5;
-            Arc::new(Float32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Float64 => {
-            let v = seed as f64 * 0.25;
-            Arc::new(Float64Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Utf8 => {
-            let v = format!("part_{seed}");
-            Arc::new(StringArray::from(vec![v.as_str(); rows]))
-        }
-        ArrowDataType::Binary => {
-            let v = format!("bin_{seed}").into_bytes();
-            Arc::new(BinaryArray::from(vec![v.as_slice(); rows]))
-        }
-        ArrowDataType::Date32 => {
-            let v = 18000 + seed as i32;
-            Arc::new(Date32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let v = (18000 + seed as i64) * 86_400_000_000;
-            let array = TimestampMicrosecondArray::from(vec![v; rows]);
-            match tz {
-                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
-                None => Arc::new(array),
-            }
-        }
-        ArrowDataType::Decimal128(precision, scale) => {
-            let scale_factor = 10i128.pow(*scale as u32);
-            let v = seed as i128 * scale_factor;
-            Arc::new(
-                Decimal128Array::from(vec![v; rows])
-                    .with_precision_and_scale(*precision, *scale)
-                    .expect("valid decimal"),
-            )
-        }
-        other => panic!("unsupported Arrow type for partition column: {other:?}"),
-    }
 }
 
 /// Generate a single column of data based on its Arrow type.
@@ -1506,12 +1494,36 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
         ArrowDataType::Struct(fields) => {
             let child_arrays: Vec<ArrayRef> = fields
                 .iter()
-                .map(|f| generate_column(f.data_type(), rows, base))
+                .map(|f| {
+                    let child = generate_column(f.data_type(), rows, base);
+                    if f.is_nullable() {
+                        with_sparse_nulls(child, NULL_RATE_EVERY_NTH)
+                    } else {
+                        child
+                    }
+                })
                 .collect();
             Arc::new(StructArray::new(fields.clone(), child_arrays, None))
         }
         other => panic!("unsupported Arrow type in test data generation: {other:?}"),
     }
+}
+
+/// Wrap `array` so that every `every_nth`-th row reads as null. Used by
+/// [`write_data_commit`] to make the default sweep exercise null-aware code paths
+/// (stats null counts, predicate evaluation under null, etc.) uniformly.
+fn with_sparse_nulls(array: ArrayRef, every_nth: usize) -> ArrayRef {
+    assert!(every_nth >= 1, "every_nth must be >= 1");
+    let n = array.len();
+    let valid: Vec<bool> = (0..n).map(|i| !i.is_multiple_of(every_nth)).collect();
+    let null_buffer = NullBuffer::from(valid);
+    let data = array
+        .to_data()
+        .into_builder()
+        .nulls(Some(null_buffer))
+        .build()
+        .expect("rebuilding array with null buffer");
+    delta_kernel::arrow::array::make_array(data)
 }
 
 // ===========================================================================
@@ -1613,6 +1625,30 @@ macro_rules! build_snapshot {
                     .build($engine)
                     .unwrap();
                 Snapshot::builder_from(base).build($engine).unwrap()
+            }
+            $crate::table_builder::VersionTarget::IncrementalFrom { from, to } => {
+                let base = Snapshot::builder_for($table_root)
+                    .at_version(*from)
+                    .build($engine)
+                    .unwrap();
+                Snapshot::builder_from(base)
+                    .at_version(*to)
+                    .build($engine)
+                    .unwrap()
+            }
+            $crate::table_builder::VersionTarget::AtTimestamp(ts) => {
+                let latest = Snapshot::builder_for($table_root).build($engine).unwrap();
+                let commit = ::delta_kernel::history_manager::latest_version_as_of(
+                    &latest,
+                    $engine,
+                    *ts,
+                    ::delta_kernel::history_manager::HistoryCommitType::Recreatable,
+                )
+                .unwrap();
+                Snapshot::builder_for($table_root)
+                    .at_version(commit.version)
+                    .build($engine)
+                    .unwrap()
             }
         }
     };
@@ -1796,7 +1832,9 @@ mod tests {
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
-            VersionTarget::IncrementalToLatest { from: 1 }
+            VersionTarget::IncrementalToLatest { from: 1 },
+            VersionTarget::IncrementalFrom { from: 1, to: 3 },
+            VersionTarget::AtTimestamp(i64::MAX),
         )]
         version_target: VersionTarget,
     ) {
@@ -1809,7 +1847,12 @@ mod tests {
         );
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
+            VersionTarget::AtTimestamp(ts) if *ts == i64::MAX => 4,
             VersionTarget::AtVersion(v) => *v,
+            VersionTarget::IncrementalFrom { to, .. } => *to,
+            VersionTarget::AtTimestamp(ts) => {
+                panic!("test only uses AtTimestamp(i64::MAX), got {ts}")
+            }
         };
         assert_eq!(snap.version(), expected);
     }
@@ -2057,6 +2100,87 @@ mod tests {
         let batches = crate::read_scan(&scan, engine)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
+        Ok(())
+    }
+
+    /// Verifies the data generator injects sparse nulls into every nullable data column.
+    /// Uses `rows_per_file = NULL_RATE_EVERY_NTH * 3` so each file has exactly three null
+    /// rows per column.
+    #[test]
+    fn test_sparse_null_injection_in_generated_data() -> DeltaResult<()> {
+        let rows_per_file = NULL_RATE_EVERY_NTH * 3;
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(1))
+            .with_data(1, rows_per_file)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, rows_per_file);
+        let expected_nulls_per_col = rows_per_file / NULL_RATE_EVERY_NTH;
+        for batch in &batches {
+            for col_idx in 0..batch.num_columns() {
+                let null_count = batch.column(col_idx).null_count();
+                assert_eq!(
+                    null_count,
+                    expected_nulls_per_col,
+                    "column '{}' should have {expected_nulls_per_col} nulls, got {null_count}",
+                    batch.schema().field(col_idx).name(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Partition columns are never nulled so their data matches the declared partition
+    /// value. Clustering columns are ordinary data columns (kernel permits null clustering
+    /// keys), so they receive the same sparse nulls as any other nullable column -- the
+    /// clustered case guards against accidentally protecting them.
+    #[rstest::rstest]
+    #[case::partitioned(partitioned())]
+    #[case::clustered(clustered())]
+    fn test_layout_column_null_injection(#[case] config: DataLayoutConfig) -> DeltaResult<()> {
+        let rows_per_file = NULL_RATE_EVERY_NTH * 3;
+        // Only partition columns are protected from nulling; clustering columns are not.
+        let protected_columns = if config.is_partitioned() {
+            config.columns()
+        } else {
+            Vec::new()
+        };
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(1))
+            .with_data_layout(config)
+            .with_data(1, rows_per_file)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let expected_nulls_per_col = rows_per_file / NULL_RATE_EVERY_NTH;
+        for batch in &batches {
+            for col_idx in 0..batch.num_columns() {
+                let name = batch.schema().field(col_idx).name().to_string();
+                let null_count = batch.column(col_idx).null_count();
+                if protected_columns.contains(&name) {
+                    assert_eq!(
+                        null_count, 0,
+                        "partition column '{name}' must never be nulled, got {null_count}",
+                    );
+                } else {
+                    assert_eq!(
+                        null_count, expected_nulls_per_col,
+                        "data column '{name}' should have {expected_nulls_per_col} nulls, \
+                         got {null_count}",
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

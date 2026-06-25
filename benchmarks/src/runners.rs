@@ -20,17 +20,16 @@ use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::UCKernelClient;
+use delta_kernel_workloads::models::{
+    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
+    TimeTravel,
+};
+use delta_kernel_workloads::predicate_parser::parse_predicate;
 use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
 use unity_catalog_delta_rest_client::{
     ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
 };
 use url::Url;
-
-use crate::models::{
-    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
-    TimeTravel,
-};
-use crate::predicate_parser::parse_predicate;
 
 /// Delta table property indicating catalog-managed support.
 const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
@@ -410,8 +409,11 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 mod tests {
     use std::sync::LazyLock;
 
+    use delta_kernel_workloads::models::{
+        ParallelScan, ReadConfig, ReadSpec, TableInfo, TimeTravel,
+    };
+
     use super::*;
-    use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo, TimeTravel};
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {

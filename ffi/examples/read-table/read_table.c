@@ -63,8 +63,8 @@ void scan_row_callback(
   const Expression* transform,
   const CStringMap* partition_values)
 {
-  (void)mod_time; // not using this at the moment
 #ifndef PRINT_ARROW_DATA
+  (void)mod_time; // only used when PRINT_ARROW_DATA is defined
   (void)transform; // only used when PRINT_ARROW_DATA is defined
 #endif
   struct EngineContext* context = engine_context;
@@ -98,7 +98,7 @@ void scan_row_callback(
   context->partition_values = partition_values;
   print_partition_info(context, partition_values);
 #ifdef PRINT_ARROW_DATA
-  c_read_parquet_file(context, path, selection_vector, transform);
+  c_read_parquet_file(context, path, size, mod_time, selection_vector, transform);
 #endif
   free_bool_slice(selection_vector);
   context->partition_values = NULL;
@@ -371,6 +371,9 @@ int main(int argc, char* argv[])
   enable_event_tracing(tracing_callback, TRACE);
   // we could also do something like this if we want less control over formatting
   // enable_formatted_log_line_tracing(log_line_callback, TRACE, FULL, true, true, false, false);
+
+  // also enable printing metrics
+  enable_metrics_reporting(print_metric);
 #else
   enable_event_tracing(tracing_callback, WARN);
 #endif

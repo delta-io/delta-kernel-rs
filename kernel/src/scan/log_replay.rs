@@ -12,8 +12,8 @@ use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
-    UnaryExpressionOp,
+    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
+    PredicateRef, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -260,6 +260,9 @@ impl ScanLogReplayProcessor {
                 column_expr_ref!("stats_parsed"),
                 partition_schema_for_transform.as_ref(),
                 column_expr_ref!("partitionValues_parsed"),
+                // The transform flattens `add.*` to top-level columns, so `path` is non-null
+                // exactly for Add rows.
+                Arc::new(Predicate::is_not_null(column_expr!("path")).into()),
                 output_schema.clone(),
                 &state_info.physical_stats_columns,
                 Some(metrics.clone()),
@@ -607,6 +610,7 @@ pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersi
 pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static TAGS_NAME: &str = "tags";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
+#[internal_api]
 pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment

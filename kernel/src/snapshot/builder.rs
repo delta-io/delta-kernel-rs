@@ -218,12 +218,17 @@ impl SnapshotBuilder {
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        // Fold the context into the message string rather than passing structured fields: this
+        // `info!` fires inside the `snap.build` metrics span, where any field the
+        // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
+        // warning from the metrics layer.
         info!(
-            target = self.target_version_str(),
-            from_version = ?self.existing_snapshot.as_ref().map(|s| s.version()),
-            log_tail_len = self.log_tail.len(),
-            max_catalog_version = ?self.max_catalog_version,
-            "building snapshot"
+            "building snapshot: target={}, from_version={:?}, log_tail_len={}, \
+             max_catalog_version={:?}",
+            self.target_version_str(),
+            self.existing_snapshot.as_ref().map(|s| s.version()),
+            self.log_tail.len(),
+            self.max_catalog_version
         );
 
         // Destructure self so fields can be moved independently

@@ -7,7 +7,6 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray,
     StructArray,
 };
-use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -28,6 +27,7 @@ use test_utils::{
     load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
+use crate::common::read_utils::read_parquet_file;
 use crate::common::write_utils::{
     get_simple_schema, load_existing_single_file_checkpoint_path, resolve_struct_field,
     simple_id_batch,
@@ -850,19 +850,6 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     );
 
     Ok(())
-}
-
-/// Reads all parquet record batches from a file, concatenating them into a single batch.
-fn read_parquet_file(path: &std::path::Path) -> RecordBatch {
-    let bytes = std::fs::read(path).expect("failed to read parquet file");
-    let bytes = bytes::Bytes::from(bytes);
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .expect("failed to create parquet reader")
-        .build()
-        .expect("failed to build reader");
-    let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
-    let schema = batches[0].schema();
-    concat_batches(&schema, &batches).expect("failed to concat batches")
 }
 
 /// Reads the `_last_checkpoint` JSON file from the table's `_delta_log` directory.

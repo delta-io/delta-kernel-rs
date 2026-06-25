@@ -566,6 +566,7 @@ mod tests {
                 commit_version: 1,
                 num_add_files: 3,
                 num_remove_files: 2,
+                num_dv_updates: 0,
                 add_files_bytes: 600,
                 remove_files_bytes: 150,
                 is_blind_append: false,

@@ -56,6 +56,7 @@ cargo +nightly fmt \
 | `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
 | `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
 | `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
+| `delta_kernel_workloads`                 | `workloads/`                               | Shared workload spec types + SQL predicate parser       |
 | `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
 | `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
 | `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
@@ -132,9 +133,10 @@ directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` ac
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible. See **Common test helpers** below for a curated starter list.
 - **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
-  successful commit and get the `CommittedTransaction`. Do NOT use `match` + `panic!`
-  for this -- `unwrap_committed()` provides a clear error message on failure. Available
-  under `#[cfg(test)]` and the `test-utils` feature.
+  successful commit and get the `CommittedTransaction`. When you only need the resulting
+  snapshot, use `txn.commit(engine)?.unwrap_post_commit_snapshot()` to get the
+  `SnapshotRef` directly. Do NOT use `match` + `panic!` for either -- they provide a clear
+  error message on failure. Available under `#[cfg(test)]` and the `test-utils` feature.
 - **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
   commit JSON when the data is inaccessible via public API (e.g., system domain metadata
   is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`

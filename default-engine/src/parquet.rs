@@ -440,12 +440,10 @@ async fn open_parquet_file(
         }
     };
 
-    let reader_options = reader_options();
-    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options.clone()).await?;
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?;
     let parquet_schema = metadata.schema();
     let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let mut builder =
-        ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options).await?;
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone());
     if let Some(mask) = generate_mask(
         &table_schema,
         parquet_schema,
@@ -520,14 +518,13 @@ impl FileOpener for PresignedUrlOpener {
         Ok(Box::pin(async move {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
-            let reader_options = reader_options();
-            let metadata = ArrowReaderMetadata::load(&reader, reader_options.clone())?;
+            let metadata = ArrowReaderMetadata::load(&reader, reader_options())?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
                 get_requested_indices(&table_schema, parquet_schema)?;
 
             let mut builder =
-                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options)?;
+                ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata.clone());
             if let Some(mask) = generate_mask(
                 &table_schema,
                 parquet_schema,
@@ -573,20 +570,32 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::slice;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use bytes::Bytes;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use delta_kernel::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray,
     };
-    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::arrow::datatypes::{
+        DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit,
+    };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
+    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+    use delta_kernel::object_store::CopyOptions;
+    use delta_kernel::object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result,
+    };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
+    use delta_kernel::schema::{
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
     use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
@@ -605,6 +614,114 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+
+    // A wrapper trait that lets us bound on `ObjectStore` without directly importing it under
+    // arrow-57, which would bring in ambiguous-method errors.
+    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+    trait ObjectStore: delta_kernel::object_store::ObjectStore {}
+    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+    impl<T: delta_kernel::object_store::ObjectStore + ?Sized> ObjectStore for T {}
+    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+    use delta_kernel::object_store::ObjectStore;
+
+    /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
+    /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates
+    /// footer reads.
+    #[derive(Debug)]
+    struct GetOptsCountingStore<T: ObjectStore> {
+        inner: T,
+        get_opts_count: AtomicUsize,
+    }
+
+    impl<T: ObjectStore> GetOptsCountingStore<T> {
+        fn new(inner: T) -> Self {
+            Self {
+                inner,
+                get_opts_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_opts_count(&self) -> usize {
+            self.get_opts_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for GetOptsCountingStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GetOptsCountingStore({})", self.get_opts_count())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for GetOptsCountingStore<T> {
+        // ===== The method we instrument: count footer-fetch GETs =====
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.get_opts_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_opts(location, options).await
+        }
+
+        // ===== Everything else: behavior unchanged, delegate to inner =====
+        // Overridden (not inherited) so column-chunk data reads delegate straight to inner and
+        // stay off the get_opts counter.
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        // ===== Required only by object_store 0.13 (arrow-58) =====
+        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        // ===== Required only by object_store 0.12 (arrow-57) =====
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+        async fn delete(&self, location: &Path) -> Result<()> {
+            self.inner.delete(location).await
+        }
+
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
 
     async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
@@ -666,6 +783,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_open_parquet_file_fetches_footer_once() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        )).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let url = Url::from_file_path(&path).unwrap();
+        let location = Path::from_url_path(url.path()).unwrap();
+
+        // Baseline: how many `get_opts` calls a single footer load makes (one or more range GETs,
+        // depending on parquet version). The reader builder must not exceed this.
+        let baseline_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
+        let mut reader =
+            ParquetObjectReader::new(baseline_store.clone(), location).with_file_size(file_size);
+        let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options())
+            .await
+            .unwrap();
+        let footer_load_gets = baseline_store.get_opts_count();
+        assert!(
+            footer_load_gets > 0,
+            "footer load should issue at least one GET"
+        );
+        let physical_schema = Arc::new(metadata.schema().clone().try_into_kernel().unwrap());
+
+        // `open_parquet_file` must reuse the loaded footer rather than re-fetch it when building
+        // the reader, so its footer GETs equal a single load, not double.
+        let counting_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+        let stream = open_parquet_file(
+            counting_store.clone(),
+            physical_schema,
+            None,
+            None,
+            DEFAULT_BATCH_SIZE,
+            file_meta,
+        )
+        .await
+        .unwrap();
+        let _batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert_eq!(
+            counting_store.get_opts_count(),
+            footer_load_gets,
+            "footer should be fetched once, not re-fetched when constructing the reader"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_parquet_files() {
         let store = Arc::new(LocalFileSystem::new());
 
@@ -703,6 +871,96 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 10);
+    }
+
+    // A Parquet file can physically store TIMESTAMP(MILLIS) (for example, checkpoint stats
+    // written by a non-kernel writer). End to end, the default engine must (a) convert the
+    // millisecond footer schema to the kernel's microsecond TIMESTAMP / TIMESTAMP_NTZ, and
+    // (b) rescale the values to microseconds (x1000) when reading them into that schema.
+    #[tokio::test]
+    async fn test_read_millisecond_timestamps() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("ms_timestamps.parquet");
+
+        // 1700000000123 ms since epoch -> 1_700_000_000_123_000 us.
+        let ms: i64 = 1_700_000_000_123;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "ts_utc",
+                ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "ts_ntz",
+                ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![ms]).with_timezone("UTC"))
+                    as Arc<dyn Array>,
+                Arc::new(TimestampMillisecondArray::from(vec![ms])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&file_path).unwrap(),
+            arrow_schema,
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let file_meta = FileMeta {
+            location: Url::from_file_path(&file_path).unwrap(),
+            last_modified: 0,
+            size: file_size,
+        };
+
+        let handler = DefaultParquetHandler::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+
+        // (a) Footer schema: millisecond timestamps convert to the kernel's microsecond types.
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
+        assert_eq!(
+            footer.schema.field("ts_utc").unwrap().data_type(),
+            &DataType::TIMESTAMP
+        );
+        assert_eq!(
+            footer.schema.field("ts_ntz").unwrap().data_type(),
+            &DataType::TIMESTAMP_NTZ
+        );
+
+        // (b) Data path: values are rescaled ms -> us when read into the microsecond schema.
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(slice::from_ref(&file_meta), footer.schema.clone(), None)
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 1);
+        let expected_us = ms * 1_000;
+        for col_idx in 0..2 {
+            let col = data[0]
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(
+                col.value(0),
+                expected_us,
+                "column {col_idx} should be rescaled to us"
+            );
+        }
     }
 
     #[rstest::rstest]

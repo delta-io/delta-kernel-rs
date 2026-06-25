@@ -2,7 +2,8 @@
 # Benchmark comparison script for pull requests.
 #
 # Called by .github/workflows/benchmark.yml (run-benchmark job) after the repo
-# has been checked out at the PR head. Writes the formatted markdown comparison
+# has been checked out at the PR's merge commit (refs/pull/<N>/merge -- PR head
+# merged into base). Writes the formatted markdown comparison
 # to /tmp/bench-comment.md; the companion benchmark-post-comment.yml workflow
 # downloads it as an artifact and posts the PR comment in base-branch context.
 #
@@ -86,8 +87,11 @@ echo "mem: $(free -m | awk '/^Mem:/ {print $2 " MB total, " $7 " MB available"}'
 echo "==========================="
 
 # ---------------------------------------------------------------------------
-# 3. Benchmark the PR branch (already checked out by the workflow)
+# 3. Benchmark the integration commit (PR head merged into base)
 # ---------------------------------------------------------------------------
+# HEAD is the merge commit checked out by the workflow; capture it so step 5 can
+# restore this tree after the base checkout below.
+MERGE_SHA=$(git rev-parse HEAD)
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER")
 
 # ---------------------------------------------------------------------------
@@ -105,12 +109,14 @@ git checkout FETCH_HEAD
 #    benchmarks/ci/parse_critcmp.py for the format and tier thresholds).
 #      - Parses actual duration values (not rank factors) to compute a ratio
 # ---------------------------------------------------------------------------
-# Step 3 left the working tree on the base branch, so parse_critcmp.py on disk
-# is the base version. Restore the PR-head tree so the comment is formatted by
-# the PR's own formatter (a formatter change is then exercised on the PR that
-# introduces it). Only tracked sources move; the `base`/`changes` criterion
-# baselines live in gitignored benchmarks/target/ and survive the checkout.
-git checkout "$HEAD_SHA"
+# Step 4 left the working tree on the base branch, so parse_critcmp.py on disk
+# is the base version. Restore the merge tree so the comment is formatted by the
+# PR's own formatter (a formatter change is then exercised on the PR that
+# introduces it). The raw PR-head SHA is not reachable in the shallow merge-ref
+# checkout, so restore the merge commit captured in step 3. Only tracked sources
+# move; the `base`/`changes` criterion baselines live in gitignored
+# benchmarks/target/ and survive the checkout.
+git checkout "$MERGE_SHA"
 # Use `critcmp` to compare the criterion output for `base` and `changes`. We use `critcmp` instead of manually
 # parsing criterion outputs because criterion may update its output format. By using `critcmp`, we inherit all
 # updated criterion output parsing.

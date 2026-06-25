@@ -130,6 +130,7 @@ pub enum ColumnMetadataKey {
     ParquetFieldId,
     ParquetFieldNestedIds,
     GenerationExpression,
+    CurrentDefault,
     IdentityStart,
     IdentityStep,
     IdentityHighWaterMark,
@@ -155,6 +156,7 @@ impl AsRef<str> for ColumnMetadataKey {
             // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
             Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
             Self::GenerationExpression => "delta.generationExpression",
+            Self::CurrentDefault => "CURRENT_DEFAULT",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
             Self::IdentityStart => "delta.identity.start",
@@ -4018,6 +4020,14 @@ mod tests {
         assert_eq!(
             ColumnMetadataKey::ParquetFieldId.as_ref(),
             "parquet.field.id"
+        );
+    }
+
+    #[test]
+    fn test_current_default_key_value() {
+        assert_eq!(
+            ColumnMetadataKey::CurrentDefault.as_ref(),
+            "CURRENT_DEFAULT"
         );
     }
 

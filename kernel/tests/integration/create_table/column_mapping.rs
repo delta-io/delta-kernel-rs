@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
@@ -66,7 +66,9 @@ pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
 /// Assert column mapping configuration on a snapshot.
 ///
 /// For `Name` / `Id`: feature supported & enabled, mode matches, `maxColumnId` equals
-/// the recursive field count.
+/// the maximum `delta.columnMapping.id` reachable in the schema. Callers can pre-populate
+/// CM annotations on the input schema, in which case the persisted `maxColumnId` reflects
+/// any preserved IDs (matching Spark/DBR's `assignColumnIdAndPhysicalName`).
 ///
 /// For `None`: mode is `None`, no `maxColumnId`, and no column mapping metadata (IDs or
 /// physical names) on any field. Note: whether `ColumnMapping` appears in the protocol
@@ -92,7 +94,12 @@ pub(super) fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: C
                 "ColumnMapping feature should be enabled"
             );
 
-            let expected_max_id = snapshot.schema().total_struct_fields();
+            let expected_max_id = snapshot
+                .schema()
+                .fields()
+                .flat_map(|f| f.collect_column_mapping_ids())
+                .max()
+                .expect("CM-enabled table must have at least one column mapping id");
             let max_id_str = expected_max_id.to_string();
             let config = table_config.metadata().configuration();
             assert_eq!(
@@ -100,7 +107,7 @@ pub(super) fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: C
                     .get("delta.columnMapping.maxColumnId")
                     .map(|s| s.as_str()),
                 Some(max_id_str.as_str()),
-                "maxColumnId should equal the total number of struct fields ({expected_max_id})"
+                "maxColumnId should equal the largest column mapping id in the schema ({expected_max_id})"
             );
         }
         ColumnMappingMode::None => {
@@ -642,5 +649,162 @@ fn test_create_table_dup_physical_name(
             );
         }
     }
+    Ok(())
+}
+
+// ============================================================================
+// CREATE TABLE accepts pre-populated column mapping metadata (DBR/Spark parity).
+// See https://github.com/delta-io/delta-kernel-rs/issues/2377.
+// ============================================================================
+
+/// Connector-supplied CM metadata survives create -> reload: a complete annotation is kept
+/// verbatim, a lone `id` keeps its value and gets a generated `col-<uuid>` physical name, and
+/// a lone `physicalName` is kept while an id is allocated. `assert_column_mapping_config` also
+/// pins `maxColumnId` to the largest reachable id.
+#[rstest::rstest]
+#[case::complete(
+    fixtures::cm_field("f", 5, "phys-f", DataType::INTEGER),
+    Some(5),
+    Some("phys-f")
+)]
+#[case::id_only(fixtures::cm_field_id_only("f", 7, DataType::INTEGER), Some(7), None)]
+#[case::physical_name_only(
+    fixtures::cm_field_physical_name_only("f", "user-supplied", DataType::INTEGER),
+    None,
+    Some("user-supplied")
+)]
+fn test_create_table_preserves_or_fills_cm_metadata(
+    #[case] field: StructField,
+    #[case] expected_id: Option<i64>,
+    #[case] expected_physical: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![field])?);
+
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+
+    assert_column_mapping_config(&snapshot, ColumnMappingMode::Name);
+    let read_schema = snapshot.schema();
+    let f = read_schema.field("f").unwrap();
+
+    match expected_id {
+        Some(id) => assert_eq!(f.column_mapping_id(), Some(id)),
+        // No id supplied: kernel allocates one.
+        None => assert!(f.column_mapping_id().expect("id must be allocated") > 0),
+    }
+    match expected_physical {
+        Some(phys) => assert_eq!(
+            f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            Some(&MetadataValue::String(phys.to_string()))
+        ),
+        // No physical name supplied: kernel fills `col-<uuid>`.
+        None => match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+            Some(MetadataValue::String(s)) => assert!(s.starts_with("col-")),
+            other => panic!("expected col-<uuid>, got {other:?}"),
+        },
+    }
+
+    Ok(())
+}
+
+/// Sparse preserved ids (1, 5, 100) seed assignment: bare fields get ids strictly above the
+/// preserved max, in field order, and `maxColumnId` (checked by `assert_column_mapping_config`)
+/// lands on the largest assigned id.
+#[test]
+fn test_create_table_sparse_preserved_ids_seed_assignment() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("bare1", DataType::STRING, true),
+        fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER),
+        StructField::new("bare2", DataType::STRING, true),
+        fixtures::cm_field("b", 100, "phys-b", DataType::INTEGER),
+        fixtures::cm_field("c", 5, "phys-c", DataType::INTEGER),
+        StructField::new("bare3", DataType::STRING, true),
+    ])?);
+
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+
+    assert_column_mapping_config(&snapshot, ColumnMappingMode::Name);
+    let read_schema = snapshot.schema();
+
+    // Preserved ids untouched.
+    assert_eq!(read_schema.field("a").unwrap().column_mapping_id(), Some(1));
+    assert_eq!(
+        read_schema.field("b").unwrap().column_mapping_id(),
+        Some(100)
+    );
+    assert_eq!(read_schema.field("c").unwrap().column_mapping_id(), Some(5));
+
+    // Bare fields seed above the preserved max (100), in field order.
+    for (name, expected_id) in [("bare1", 101), ("bare2", 102), ("bare3", 103)] {
+        assert_eq!(
+            read_schema.field(name).unwrap().column_mapping_id(),
+            Some(expected_id),
+            "bare field {name} should get id {expected_id}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Preserved CM metadata under a nested struct is kept verbatim; bare fields elsewhere are
+/// assigned ids strictly above the nested preserved max, in field order.
+#[test]
+fn test_create_table_preserves_preexisting_metadata_in_nested_types() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Nested struct with one fully-annotated leaf preserved at id=42.
+    let nested_struct = StructType::try_new(vec![fixtures::cm_field(
+        "leaf",
+        42,
+        "phys-leaf",
+        DataType::INTEGER,
+    )])?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("bare", DataType::STRING, true),
+        StructField::new("outer", DataType::Struct(Box::new(nested_struct)), true),
+    ])?);
+
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+
+    assert_column_mapping_config(&snapshot, ColumnMappingMode::Name);
+    let read_schema = snapshot.schema();
+
+    // Preserved leaf kept verbatim.
+    let outer = read_schema.field("outer").unwrap();
+    let DataType::Struct(inner) = outer.data_type() else {
+        panic!("outer must remain a struct");
+    };
+    let leaf = inner.field("leaf").unwrap();
+    assert_eq!(leaf.column_mapping_id(), Some(42));
+    assert_eq!(
+        leaf.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+        Some(&MetadataValue::String("phys-leaf".to_string()))
+    );
+
+    // bare and outer seed above the nested preserved max (42), in field order.
+    assert_eq!(
+        read_schema.field("bare").unwrap().column_mapping_id(),
+        Some(43)
+    );
+    assert_eq!(outer.column_mapping_id(), Some(44));
+
     Ok(())
 }

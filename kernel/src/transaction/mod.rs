@@ -358,6 +358,9 @@ impl<S> Transaction<S> {
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
+        // Fields-only event: these feed the `txn.commit` metric via the layer's `on_event`
+        // channel. `num_dv_updates` has no other source (it is not a declared span field and
+        // gets no `span.record` below), so this event must keep its structured fields.
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -946,22 +949,48 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .physical_stats_column_names(self.physical_clustering_columns.as_deref())
     }
 
-    // Generate the logical-to-physical transform expression which must be evaluated on every data
-    // chunk before writing. At the moment, this is a transaction-wide expression.
-    fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
-        // Check if partition columns should be materialized into data files.
-        let should_materialize_partition_columns = self
-            .effective_table_config
-            .should_materialize_partition_columns();
-        // Build a StructPatch expression that drops partition columns from the input
-        // (unless they should be materialized) and drop void columns at all nesting levels.
+    // Generate the logical-to-physical expression which must be evaluated on every data chunk
+    // before writing.
+    fn generate_logical_to_physical(
+        &self,
+        partition_values: Option<&HashMap<String, Scalar>>,
+    ) -> DeltaResult<Expression> {
+        let logical_schema = self.effective_table_config.logical_schema();
         let mut patch = ExpressionStructPatchBuilder::new();
-        if !should_materialize_partition_columns {
-            for col in self.effective_table_config.partition_columns() {
-                patch = patch.drop_if_exists(col);
+        if self
+            .effective_table_config
+            .should_materialize_partition_columns()
+        {
+            let partition_cols: HashSet<&str> = self
+                .effective_table_config
+                .partition_columns()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            // Insert each partition column after the nearest preceding surviving field
+            // (non-partition and non-void), in the order they appear in the logical schema.
+            // This keeps the post-transform data aligned with the physical schema.
+            let mut predecessor: Option<&str> = None;
+            for field in logical_schema.fields() {
+                let name = field.name().as_str();
+                if partition_cols.contains(name) {
+                    let value = partition_values.and_then(|m| m.get(name)).ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "partition column '{name}' missing while building logical-to-physical \
+                             expression"
+                        ))
+                    })?;
+                    let literal = lit(value.clone());
+                    patch = match predecessor {
+                        Some(predecessor) => patch.insert_after(predecessor, literal),
+                        None => patch.prepend(literal),
+                    };
+                } else if *field.data_type() != DataType::VOID {
+                    predecessor = Some(name);
+                }
             }
         }
-        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema());
+        let patch = add_void_stripping(patch, &logical_schema);
         Expression::struct_patch(patch)
     }
 
@@ -988,9 +1017,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let props = table_config.table_properties();
         Ok(Arc::new(SharedWriteState {
             table_root: table_config.table_root().clone(),
-            logical_schema: table_config.logical_schema(),
+            logical_schema: table_config.logical_schema_without_partition_columns(),
             physical_schema: table_config.physical_write_schema(),
-            logical_to_physical: Arc::new(self.generate_logical_to_physical()?),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
             logical_partition_columns: table_config.partition_columns().to_vec(),
@@ -1028,6 +1056,11 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///   column mapping mode. For example, under `ColumnMappingMode::Name`, logical `"year"` might
     ///   become physical `"col-abc-123"` in the `partitionValues` map.
     ///
+    /// - **Partition column materialization**: the returned [`WriteContext`]'s
+    ///   [`logical_to_physical`] expression injects partition columns when the table requires
+    ///   materializing partition columns (e.g. `materializePartitionColumns` or `icebergCompatV3`).
+    ///   The input data fed to that expression must not contain partition columns.
+    ///
     /// The returned [`WriteContext`] also provides a [`write_dir`] that returns the correct
     /// target directory (Hive-style paths when column mapping is off, random prefix when on).
     ///
@@ -1035,6 +1068,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
     ///
     /// [`write_dir`]: WriteContext::write_dir
+    /// [`logical_to_physical`]: WriteContext::logical_to_physical
     pub fn partitioned_write_context(
         &self,
         partition_values: HashMap<String, Scalar>,
@@ -1046,12 +1080,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
             !shared.logical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
         );
-
         // Validate keys (completeness, case normalization) and value types, then return
         // the map re-keyed to schema case.
+        let full_logical_schema = self.effective_table_config.logical_schema();
         let normalized = validate_partition_values(
             &shared.logical_partition_columns,
-            &shared.logical_schema,
+            &full_logical_schema,
             partition_values,
         )?;
 
@@ -1064,8 +1098,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 ))
             })?;
             let value = serialize_partition_value(scalar)?;
-            let physical_name = shared
-                .logical_schema
+            let physical_name = full_logical_schema
                 .field(logical_name)
                 .ok_or_else(|| {
                     Error::internal_error(format!(
@@ -1076,9 +1109,11 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 .to_string();
             serialized.insert(physical_name, value);
         }
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
 
         Ok(WriteContext {
             shared,
+            logical_to_physical,
             physical_partition_values: serialized,
         })
     }
@@ -1095,8 +1130,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
             shared.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
         Ok(WriteContext {
             shared,
+            logical_to_physical,
             physical_partition_values: HashMap::new(),
         })
     }
@@ -1667,17 +1704,22 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    use ::test_utils::get_column;
     use rstest::rstest;
     use url::Url;
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
-    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
-    use crate::arrow::datatypes::Schema as ArrowSchema;
+    use crate::arrow::array::{
+        ArrayRef, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
+    };
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
-    use crate::engine::arrow_conversion::TryIntoArrow;
+    use crate::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
@@ -1689,6 +1731,7 @@ mod tests {
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
+    use crate::transaction::data_layout::DataLayout;
     use crate::utils::test_utils::{
         install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
@@ -2028,7 +2071,8 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_write_context_schemas_exclude_partition_columns(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2044,13 +2088,11 @@ mod tests {
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
-        // Logical schema should include the partition column
+        // Both schemas exclude partition columns.
         assert!(
-            logical_schema.contains("letter"),
-            "Logical schema should contain partition column 'letter'"
+            !logical_schema.contains("letter"),
+            "Logical schema should not contain partition column 'letter'"
         );
-
-        // Physical schema should exclude the partition column
         assert!(
             !physical_schema.contains("letter"),
             "Physical schema should not contain partition column 'letter' (stored in path)"
@@ -2070,12 +2112,11 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
-    /// For partitioned tables, creates a partitioned write context with null values.
-    /// Returns a snapshot and a partitioned write context (with null partition values) for the
-    /// given test table. The table must be partitioned.
+    /// Loads a snapshot from `table_path` and builds a partitioned write context for the given
+    /// partition values. The table must be partitioned.
     fn snapshot_and_partitioned_write_context(
         table_path: &str,
+        partition_values: HashMap<String, Scalar>,
     ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
@@ -2084,20 +2125,7 @@ mod tests {
         let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let partition_cols = txn.logical_partition_columns();
-        assert!(
-            !partition_cols.is_empty(),
-            "expected a partitioned table at {table_path}"
-        );
-        let schema = snapshot.schema();
-        let partition_vals: HashMap<String, Scalar> = partition_cols
-            .iter()
-            .map(|col| {
-                let dt = schema.field(col).unwrap().data_type().clone();
-                (col.clone(), Scalar::Null(dt))
-            })
-            .collect();
-        let wc = txn.partitioned_write_context(partition_vals)?;
+        let wc = txn.partitioned_write_context(partition_values)?;
         Ok((snapshot, wc))
     }
 
@@ -2107,13 +2135,13 @@ mod tests {
         wc: &WriteContext,
         batch: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-        let logical_schema = wc.logical_schema();
+        let input_schema = StructType::try_from_arrow(batch.schema())?;
         let physical_schema = wc.physical_schema();
         let l2p = wc.logical_to_physical();
 
         let handler = ArrowEvaluationHandler;
         let evaluator = handler.new_expression_evaluator(
-            logical_schema.clone(),
+            input_schema.into(),
             l2p,
             physical_schema.clone().into(),
         )?;
@@ -2123,48 +2151,132 @@ mod tests {
         Ok(result.record_batch().clone())
     }
 
-    #[test]
-    fn test_materialize_partition_columns_in_write_context(
+    #[rstest]
+    #[case::not_materialized("./tests/data/basic_partitioned/", false)]
+    #[case::materialized("./tests/data/partitioned_with_materialize_feature/", true)]
+    fn test_partition_columns_materialized_in_logical_to_physical(
+        #[case] table_path: &str,
+        #[case] materialized: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Without materializePartitionColumns, partition column should be dropped
-        let (snap_without, wc_without) =
-            snapshot_and_partitioned_write_context("./tests/data/basic_partitioned/")?;
-        let partition_cols = snap_without.table_configuration().partition_columns();
-        assert_eq!(partition_cols.len(), 1);
-        assert_eq!(partition_cols[0], "letter");
-        assert!(
-            !snap_without
-                .table_configuration()
-                .protocol()
-                .has_table_feature(&TableFeature::MaterializePartitionColumns),
-            "basic_partitioned should not have materializePartitionColumns feature"
-        );
-        let expr_str = format!("{}", wc_without.logical_to_physical());
-        assert!(
-            expr_str.contains("drop letter"),
-            "Partition column 'letter' should be dropped. Expression: {expr_str}"
-        );
-
-        // With materializePartitionColumns, no columns should be dropped (empty patch)
-        let (snap_with, wc_with) = snapshot_and_partitioned_write_context(
-            "./tests/data/partitioned_with_materialize_feature/",
+        let (snapshot, wc) = snapshot_and_partitioned_write_context(
+            table_path,
+            HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
         )?;
-        let partition_cols = snap_with.table_configuration().partition_columns();
-        assert_eq!(partition_cols.len(), 1);
-        assert_eq!(partition_cols[0], "letter");
-        assert!(
-            snap_with
+        assert_eq!(
+            snapshot
                 .table_configuration()
                 .protocol()
                 .has_table_feature(&TableFeature::MaterializePartitionColumns),
-            "partitioned_with_materialize_feature should have materializePartitionColumns feature"
-        );
-        let expr_str = format!("{}", wc_with.logical_to_physical());
-        assert!(
-            !expr_str.contains("drop"),
-            "No columns should be dropped with materializePartitionColumns. Expression: {expr_str}"
+            materialized
         );
 
+        // The input data must exclude the partition column "letter".
+        let input_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("number", ArrowDataType::Int64, true),
+            ArrowField::new("a_float", ArrowDataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![42])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.5])),
+            ],
+        )?;
+        let rb = eval_logical_to_physical(&wc, batch)?;
+
+        let rb_schema = rb.schema();
+        let names: Vec<&str> = rb_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        if materialized {
+            assert_eq!(names, vec!["letter", "number", "a_float"]);
+            assert_eq!(get_column!(rb, "letter", StringArray).value(0), "a");
+        } else {
+            assert_eq!(names, vec!["number", "a_float"]);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::cm_none(ColumnMappingMode::None)]
+    #[case::cm_name(ColumnMappingMode::Name)]
+    #[case::cm_id(ColumnMappingMode::Id)]
+    fn test_materialized_partition_column_insert(
+        #[case] cm_mode: ColumnMappingMode,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cm = match cm_mode {
+            ColumnMappingMode::None => "none",
+            ColumnMappingMode::Name => "name",
+            ColumnMappingMode::Id => "id",
+        };
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        // Logical order: [p1, p2, d1, v(void), p3, p4, d2]; partition cols = p1, p2, p3, p4.
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("p1", DataType::STRING),
+            StructField::nullable("p2", DataType::INTEGER),
+            StructField::nullable("d1", DataType::INTEGER),
+            StructField::nullable("v", DataType::VOID),
+            StructField::nullable("p3", DataType::STRING),
+            StructField::nullable("p4", DataType::INTEGER),
+            StructField::nullable("d2", DataType::INTEGER),
+        ])?);
+        let txn = create_table("memory:///t", schema, "DefaultEngine")
+            .with_data_layout(DataLayout::partitioned(["p1", "p2", "p3", "p4"]))
+            .with_table_properties([
+                ("delta.feature.materializePartitionColumns", "supported"),
+                ("delta.columnMapping.mode", cm),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let wc = txn.partitioned_write_context(HashMap::from([
+            ("p1".to_string(), Scalar::String("aa".into())),
+            ("p2".to_string(), Scalar::Integer(7)),
+            ("p3".to_string(), Scalar::String("cc".into())),
+            ("p4".to_string(), Scalar::Integer(9)),
+        ]))?;
+
+        // Input excludes partition columns but keeps the void column, in logical schema
+        // order: [d1, v, d2].
+        let input_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("d1", ArrowDataType::Int32, true),
+            ArrowField::new("v", ArrowDataType::Null, true),
+            ArrowField::new("d2", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![10])) as ArrayRef,
+                Arc::new(NullArray::new(1)),
+                Arc::new(Int32Array::from(vec![20])),
+            ],
+        )?;
+        let rb = eval_logical_to_physical(&wc, batch)?;
+
+        // With void stripped and partition literals inserted, the output names/order must match
+        // the physical schema exactly.
+        let rb_schema = rb.schema();
+        let names: Vec<&str> = rb_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        let physical_schema = wc.physical_schema();
+        let expected_names: Vec<&str> = physical_schema
+            .fields()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, expected_names);
+
+        // Verify the transformed data.
+        assert_eq!(get_column!(rb, names[0], StringArray).value(0), "aa"); // p1 (prepended)
+        assert_eq!(get_column!(rb, names[1], Int32Array).value(0), 7); // p2 (prepended)
+        assert_eq!(get_column!(rb, names[2], Int32Array).value(0), 10); // d1
+        assert_eq!(get_column!(rb, names[3], StringArray).value(0), "cc"); // p3 (after d1, void skipped)
+        assert_eq!(get_column!(rb, names[4], Int32Array).value(0), 9); // p4 (after d1)
+        assert_eq!(get_column!(rb, names[5], Int32Array).value(0), 20); // d2
         Ok(())
     }
 
@@ -2172,19 +2284,10 @@ mod tests {
     #[test]
     fn test_physical_schema_includes_partition_columns_when_materialized(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from(
+        let (_snapshot, write_context) = snapshot_and_partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
-        ))
-        .unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
-
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let write_context = txn.partitioned_write_context(HashMap::from([(
-            "letter".to_string(),
-            Scalar::String("a".into()),
-        )]))?;
+            HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
+        )?;
         let physical_schema = write_context.physical_schema();
 
         assert!(
@@ -2706,32 +2809,6 @@ mod tests {
     #[case::none_mode(ColumnMappingMode::None)]
     fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> DeltaResult<()> {
         validate_logical_to_physical_transform(mode)
-    }
-
-    #[rstest]
-    #[case::dropped("./tests/data/basic_partitioned/", 2, &[])]
-    #[case::kept("./tests/data/partitioned_with_materialize_feature/", 3, &["letter"])]
-    fn test_partition_column_in_eval_output(
-        #[case] table_path: &str,
-        #[case] expected_cols: usize,
-        #[case] expected_partition_cols: &[&str],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::arrow::array::Float64Array;
-        let (_snap, wc) = snapshot_and_partitioned_write_context(table_path)?;
-        let batch = RecordBatch::try_new(
-            Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
-            vec![
-                Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![42])),
-                Arc::new(Float64Array::from(vec![1.5])),
-            ],
-        )?;
-        let rb = eval_logical_to_physical(&wc, batch)?;
-        assert_eq!(rb.num_columns(), expected_cols);
-        for col in expected_partition_cols {
-            assert!(rb.schema().fields().iter().any(|f| f.name() == *col));
-        }
-        Ok(())
     }
 
     // =========================================================================

@@ -1,0 +1,68 @@
+// Proto mirror of `kernel/src/plans/ir/operation.rs` (the Rust IR is the source of truth).
+
+syntax = "proto3";
+
+package delta.kernel.operation;
+
+import "plan.proto";
+
+// ============================================================================
+// Operation / IoOperation (top-level types)
+// ============================================================================
+
+message Operation {
+  oneof op {
+    IoOperation io = 1;
+    delta.kernel.plan.Plan query_plan = 2;
+  }
+}
+
+message IoOperation {
+  oneof op {
+    FileListing file_listing = 1;
+    ReadBytes read_bytes = 2;
+    WriteBytes write_bytes = 3;
+    HeadFile head_file = 4;
+    AtomicCopy atomic_copy = 5;
+    ParquetFooter parquet_footer = 6;
+  }
+}
+
+// ============================================================================
+// IoOperation payloads
+// ============================================================================
+
+// A file URL plus an optional half-open byte range `[range_start, range_end)`.
+// `range_start` and `range_end` are set together when a range is present (or both absent otherwise).
+message FileSlice {
+  string url = 1;
+  optional uint64 range_start = 2;
+  optional uint64 range_end = 3;
+}
+
+message FileListing {
+  string url = 1;
+}
+
+message ReadBytes {
+  repeated FileSlice files = 1;
+}
+
+message WriteBytes {
+  string url = 1;
+  bytes data = 2;
+  bool overwrite = 3;
+}
+
+message HeadFile {
+  string url = 1;
+}
+
+message AtomicCopy {
+  string source = 1;
+  string destination = 2;
+}
+
+message ParquetFooter {
+  delta.kernel.plan.FileMeta file = 1;
+}

@@ -315,6 +315,8 @@ impl Snapshot {
     /// here.
     ///
     /// Runs in O(n) over listed log files.
+    ///
+    /// TODO(#2757): Optimize the estimation accuracy.
     pub fn estimated_owned_heap_size_bytes(&self) -> usize {
         self.log_segment.listed.estimated_heap_size_bytes()
             + self.log_segment.log_root.as_str().len()
