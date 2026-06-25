@@ -8,6 +8,9 @@ syntax = "proto3";
 
 package delta.kernel.plan;
 
+// Java package for generated bindings. Ignored by prost (Rust codegen).
+option java_package = "io.delta.kernel.proto.plan";
+
 import "expressions.proto";
 import "schema.proto";
 

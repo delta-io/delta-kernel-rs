@@ -4,6 +4,9 @@ syntax = "proto3";
 
 package delta.kernel.schema;
 
+// Java package for generated bindings. Ignored by prost (Rust codegen).
+option java_package = "io.delta.kernel.proto.schema";
+
 // ============================================================================
 // Primitive types
 // ============================================================================
