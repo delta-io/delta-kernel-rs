@@ -527,9 +527,10 @@ unsafe fn collect_create_table_columns(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid builder handle, a `columns`/`num_columns` pair that
-/// satisfies [`collect_create_table_columns`], and a valid `engine`. CONSUMES the builder handle
-/// unconditionally (even on error).
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
 #[no_mangle]
 pub unsafe extern "C" fn create_table_builder_with_clustering_columns(
     builder: Handle<ExclusiveCreateTableBuilder>,
@@ -555,9 +556,10 @@ pub unsafe extern "C" fn create_table_builder_with_clustering_columns(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid builder handle, a `columns`/`num_columns` pair that
-/// satisfies [`collect_create_table_columns`], and a valid `engine`. CONSUMES the builder handle
-/// unconditionally (even on error).
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
 #[no_mangle]
 pub unsafe extern "C" fn create_table_builder_with_partition_columns(
     builder: Handle<ExclusiveCreateTableBuilder>,
