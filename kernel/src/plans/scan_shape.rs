@@ -1,13 +1,6 @@
-//! Resolves a snapshot's checkpoint shape for scanning.
-//!
-//! Probes a snapshot's checkpoint topology, categorizing it into one of:
-//!     1) no checkpoint
-//!     2) leaf-level checkpoints, containing only file contents. This includes single-part and
-//!        legacy multi-part checkpoints.
-//!     3) manifest-level checkpoints, containing references to sidecar files that hold the file
-//!        contents.
-//! When stats are requested, it also reports whether the checkpoint has compatible parsed stats.
-//! The probe is driven through a [`PlanExecutor`].
+//! Resolves a snapshot's checkpoint shape for scanning: no checkpoint, leaf (file actions inline,
+//! including multi-part), or manifest (sidecar references). When stats are requested, also reports
+//! whether the checkpoint has compatible parsed stats. Driven through a [`PlanExecutor`].
 
 // Public surface for the FSR scan builder; no other in-crate caller.
 #![allow(unused)]
@@ -28,20 +21,18 @@ use crate::{DeltaResult, FileMeta};
 /// Topology of a snapshot's checkpoint(s): where the `add` / `remove` actions live.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CheckpointShape {
-    /// No checkpoint files for this log segment.
+    /// No checkpoint files.
     None,
-    /// The checkpoint files hold the `add` / `remove` actions inline. Covers classic V1, inline V2
-    /// (no sidecars), and multi-part V1 checkpoints.
+    /// File actions inline. Classic V1, inline V2, and multi-part V1.
     Leaf,
-    /// V2 manifest: the checkpoint files reference sidecar parquet files holding the `add` /
-    /// `remove` actions.
+    /// V2 manifest: checkpoint references sidecar files holding the file actions.
     Manifest,
 }
 
 /// Stats wiring for a scan that requested stats.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StatsInfo {
-    /// The requested stats schema, carried through unchanged.
+    /// The requested stats schema, unchanged.
     pub(crate) schema: SchemaRef,
     /// `true` if the checkpoint has an `add.stats_parsed` struct compatible with [`Self::schema`].
     pub(crate) has_parsed_stats: bool,
@@ -78,10 +69,8 @@ impl ScanShape {
         let Some(first) = parts.first() else {
             return Ok(make_info(CheckpointShape::None, false));
         };
-        // Fast path: an identity-matched `_last_checkpoint` hint that lists sidecars means a
-        // manifest. Classify it and probe parsed stats from a hint-named sidecar footer, skipping
-        // the checkpoint read. The hint is positive-signal only. An absent or empty list falls
-        // through to reading the checkpoint (it may have been trimmed).
+        // Fast path: a hint listing sidecars means a manifest. Probe stats from a sidecar footer,
+        // skipping the checkpoint read. Positive signal only; an absent/empty list falls through.
         if let Some(sidecar) = seg
             .checkpoint_sidecars()
             .and_then(|sidecars| sidecars.first())
@@ -93,10 +82,9 @@ impl ScanShape {
 
         let file_format = checkpoint_file_type(first);
 
-        // Otherwise classify by the `sidecar` column. A parquet checkpoint whose schema (footer or
-        // hint) lacks the column is a leaf, and that schema is the one probed for parsed stats.
-        // When present, drain it: empty means inline leaf, non-empty means manifest. JSON
-        // checkpoints have no footer schema, so always drain.
+        // Otherwise classify by the `sidecar` column. Parquet without it is a leaf (that schema is
+        // probed for stats); with it, drain: empty is inline leaf, non-empty manifest. JSON always
+        // drains (no footer schema).
         let mut leaf_parsed_stats = false;
         let sidecar = match file_format {
             FileType::Parquet => {
@@ -110,7 +98,7 @@ impl ScanShape {
                 } else {
                     None
                 };
-                // `cp_schema` is the leaf schema here, so probe it for parsed stats when requested.
+                // No sidecar: `cp_schema` is the leaf schema, probe it for stats.
                 if sidecar.is_none() {
                     leaf_parsed_stats = stats_schema.is_some_and(|reqd| {
                         LogSegment::schema_has_compatible_stats_parsed(
@@ -127,13 +115,11 @@ impl ScanShape {
         };
 
         let Some(sidecar) = sidecar else {
-            // A JSON leaf has no footer; its stats live only as JSON strings, so parsed stays
-            // false.
+            // JSON leaf: stats are JSON strings only, so parsed stays false.
             return Ok(make_info(CheckpointShape::Leaf, leaf_parsed_stats));
         };
 
-        // Manifest: file actions and their stats live in the sidecars, so the sidecar footer is
-        // authoritative for parsed stats.
+        // Manifest: actions and stats live in the sidecars, so probe the sidecar footer.
         let has_parsed_stats = sidecar_has_parsed_stats(exec, sidecar, stats_schema)?;
         Ok(make_info(CheckpointShape::Manifest, has_parsed_stats))
     }
@@ -147,10 +133,8 @@ fn read_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<Sc
     Ok(footer.schema)
 }
 
-/// Whether a manifest checkpoint's `sidecar` footer has parsed stats compatible with `stats_schema`
-/// (the sidecars hold the `add` / `remove` actions, so their footer is authoritative). All sidecars
-/// of a checkpoint share one schema, so callers pass the first as representative. Returns `false`
-/// when stats were not requested.
+/// Whether a manifest's `sidecar` footer has parsed stats compatible with `stats_schema`. All
+/// sidecars share one schema, so callers pass the first. `false` when stats were not requested.
 fn sidecar_has_parsed_stats(
     exec: &dyn PlanExecutor,
     sidecar: FileMeta,
@@ -166,8 +150,8 @@ fn sidecar_has_parsed_stats(
     ))
 }
 
-/// Scan the checkpoint `file` and drain its `sidecar` column through [`SidecarVisitor`], resolving
-/// the first reference (enough to classify and probe; not a full enumeration) to a [`FileMeta`].
+/// Drain the checkpoint `file`'s `sidecar` column, resolving the first reference to a [`FileMeta`]
+/// (enough to classify and probe; not a full enumeration).
 fn collect_sidecar(
     exec: &dyn PlanExecutor,
     file: FileMeta,
@@ -195,9 +179,8 @@ fn collect_sidecar(
     }
 }
 
-/// A checkpoint part's scan encoding. The file extension is authoritative: `LogPathFileType` does
-/// not distinguish a JSON from a Parquet `UuidCheckpoint`. V2 checkpoints are JSON or Parquet;
-/// classic and multi-part checkpoints are Parquet.
+/// A checkpoint part's scan encoding, from the extension: `LogPathFileType` does not distinguish a
+/// JSON from a Parquet `UuidCheckpoint`. V2 is JSON or Parquet; classic and multi-part are Parquet.
 fn checkpoint_file_type(part: &ParsedLogPath) -> FileType {
     match part.extension.as_str() {
         "json" => FileType::Json,
@@ -219,8 +202,8 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::load_test_table;
 
-    /// A [`PlanExecutor`] that counts ops by kind and delegates to a real `SyncPlanExecutor`, used
-    /// to assert which I/O the hint fast path actually performs.
+    /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
+    /// performs.
     struct CountingExecutor {
         inner: SyncPlanExecutor,
         query_scans: AtomicUsize,
@@ -326,8 +309,8 @@ mod tests {
         }
     }
 
-    /// Requested stats schema for the `*-struct-stats-only` fixtures (`id: long`, `value: string`):
-    /// `numRecords` plus `minValues` / `maxValues`, so compatibility does real per-column matching.
+    /// Requested stats schema for the `*-struct-stats-only` fixtures (`id: long`, `value: string`),
+    /// so compatibility does real per-column matching.
     fn probe_stats_schema() -> SchemaRef {
         let columns = || {
             StructType::new_unchecked([
@@ -342,9 +325,8 @@ mod tests {
         ]))
     }
 
-    /// The fast path engages for a manifest hint with sidecars: one sidecar footer read, no drain
-    /// (`query_scans == 0`). Result-only assertions would pass via the fallback drain, so this
-    /// guards against the optimization silently not firing.
+    /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards
+    /// against the optimization silently not firing (result-only checks pass via the drain too).
     #[test]
     fn fast_path_skips_checkpoint_drain_when_hint_lists_sidecars() {
         let (_engine, snapshot, _tempdir) =
@@ -367,13 +349,12 @@ mod tests {
         );
     }
 
-    /// A JSON manifest normally fast-paths via its `_last_checkpoint` hint. With the hint removed,
-    /// resolve must drain the `sidecar` column. `query_scans >= 1` proves the drain ran.
+    /// With the hint removed, a JSON manifest must drain the `sidecar` column (`query_scans >= 1`).
     #[test]
     fn resolve_json_manifest_via_drain_without_hint() {
         let (engine, snapshot, _tempdir) =
             load_test_table("v2-checkpoints-json-with-sidecars").unwrap();
-        // Remove the hint so checkpoint_sidecars() is None and resolve must drain.
+        // Remove the hint so resolve must drain.
         let hint = snapshot
             .log_segment()
             .log_root
