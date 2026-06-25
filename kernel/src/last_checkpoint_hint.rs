@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::actions::{
@@ -19,6 +19,10 @@ use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
 /// created for the table. This file is used as a hint for the engine to quickly locate
 /// the latest checkpoint without a full directory listing.
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
+
+/// Per-field cap on a retained hint's `sidecarFiles` / `nonFileActions`.
+const LAST_CHECKPOINT_SIDECARS_THRESHOLD: usize = 30;
+const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
 
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -118,6 +122,39 @@ impl LastCheckpointHint {
                 }
                 None => true,
             }
+    }
+
+    /// Drops `sidecarFiles` / `nonFileActions` over the threshold. Drops the whole field, never
+    /// truncates. Absent means info missing, so this only loses an optimization.
+    pub(crate) fn drop_oversized_fields(mut self) -> Self {
+        if let Some(v2) = &mut self.v2_checkpoint {
+            let version = self.version;
+            if let Some(count) = v2
+                .sidecar_files
+                .as_ref()
+                .map(Vec::len)
+                .filter(|&n| n > LAST_CHECKPOINT_SIDECARS_THRESHOLD)
+            {
+                debug!(
+                    version,
+                    count, "dropping _last_checkpoint sidecarFiles above threshold"
+                );
+                v2.sidecar_files = None;
+            }
+            if let Some(count) = v2
+                .non_file_actions
+                .as_ref()
+                .map(Vec::len)
+                .filter(|&n| n > LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD)
+            {
+                debug!(
+                    version,
+                    count, "dropping _last_checkpoint nonFileActions above threshold"
+                );
+                v2.non_file_actions = None;
+            }
+        }
+        self
     }
 
     /// Returns the path of the `_last_checkpoint` file given the log root of a table.
@@ -315,6 +352,65 @@ mod tests {
             ..Default::default()
         };
         assert!(v1_single.applies_to(1, &[part("00000000000000000001.checkpoint.parquet")]));
+    }
+
+    /// `sidecarFiles` / `nonFileActions` are dropped only when their count exceeds the threshold --
+    /// independently, and the whole field at once (never truncated); within-threshold fields are
+    /// kept verbatim.
+    #[test]
+    fn drops_oversized_embedded_fields() {
+        let sidecar = Sidecar {
+            path: "s.parquet".to_string(),
+            size_in_bytes: 1,
+            modification_time: 0,
+            tags: None,
+        };
+        let action = HintAction::Protocol(Protocol::default());
+        let hint = |sidecars: usize, actions: usize| LastCheckpointHint {
+            version: 1,
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: "cp".to_string(),
+                sidecar_files: Some(vec![sidecar.clone(); sidecars]),
+                non_file_actions: Some(vec![action.clone(); actions]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // At the threshold: both fields kept.
+        let v2 = hint(
+            LAST_CHECKPOINT_SIDECARS_THRESHOLD,
+            LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
+        )
+        .drop_oversized_fields()
+        .v2_checkpoint
+        .unwrap();
+        assert_eq!(
+            v2.sidecar_files.unwrap().len(),
+            LAST_CHECKPOINT_SIDECARS_THRESHOLD
+        );
+        assert_eq!(
+            v2.non_file_actions.unwrap().len(),
+            LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD
+        );
+
+        // Over threshold: each field dropped independently.
+        let v2 = hint(LAST_CHECKPOINT_SIDECARS_THRESHOLD + 1, 5)
+            .drop_oversized_fields()
+            .v2_checkpoint
+            .unwrap();
+        assert!(v2.sidecar_files.is_none(), "oversized sidecarFiles dropped");
+        assert_eq!(v2.non_file_actions.unwrap().len(), 5, "nonFileActions kept");
+
+        let v2 = hint(5, LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD + 1)
+            .drop_oversized_fields()
+            .v2_checkpoint
+            .unwrap();
+        assert_eq!(v2.sidecar_files.unwrap().len(), 5, "sidecarFiles kept");
+        assert!(
+            v2.non_file_actions.is_none(),
+            "oversized nonFileActions dropped"
+        );
     }
 
     /// Returns the single `actions` element matching `extract`, asserting there is exactly one.
