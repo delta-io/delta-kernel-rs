@@ -644,6 +644,8 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::TimestampNtz => Kind::Simple(Simple::TimestampNtz as i32),
             PrimitiveType::Decimal(decimal) => Kind::Decimal((*decimal).into()),
             PrimitiveType::Void => Kind::Simple(Simple::Void as i32),
+            PrimitiveType::IntervalYearMonth => Kind::Simple(Simple::IntervalYearMonth as i32),
+            PrimitiveType::IntervalDayTime => Kind::Simple(Simple::IntervalDayTime as i32),
         };
         proto_schema::PrimitiveType { kind: Some(kind) }
     }
@@ -1758,6 +1760,14 @@ mod tests {
         proto_schema::SimplePrimitiveType::TimestampNtz
     )]
     #[case(PrimitiveType::Void, proto_schema::SimplePrimitiveType::Void)]
+    #[case(
+        PrimitiveType::IntervalYearMonth,
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::IntervalDayTime,
+        proto_schema::SimplePrimitiveType::IntervalDayTime
+    )]
     fn from_primitive_type(
         #[case] primitive: PrimitiveType,
         #[case] expected: proto_schema::SimplePrimitiveType,

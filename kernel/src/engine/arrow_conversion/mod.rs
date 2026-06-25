@@ -369,6 +369,11 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
+                    PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                        Err(ArrowError::SchemaError(format!(
+                            "Interval types are not yet supported in the default engine: {p}"
+                        )))
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -691,7 +696,7 @@ mod tests {
             "name": "void_col",
             "type": "void",
             "nullable": true,
-            "metadata": {} 
+            "metadata": {}
         }
         "#;
 
@@ -792,6 +797,15 @@ mod tests {
             .to_string()
             .contains("Incorrect Variant Schema"));
         Ok(())
+    }
+
+    // Make sure that interval types error gracefully since unsupported
+    #[rstest]
+    #[case(DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::INTERVAL_DAY_TIME)]
+    fn test_interval_type_arrow_conversion_unsupported(#[case] dt: DataType) {
+        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        assert!(matches!(result.unwrap_err(), ArrowError::SchemaError(_)));
     }
 
     /// Helper visitor to collect all field IDs from a kernel StructType
