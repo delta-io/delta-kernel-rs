@@ -78,10 +78,31 @@ impl EnsureDataTypes {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
-            // A variant is physically a struct of binary fields. Validate it like a struct so
-            // that engines may use any Arrow binary representation for its fields.
-            (DataType::Variant(variant_fields), ArrowDataType::Struct(_)) => {
-                self.ensure_data_types(&DataType::Struct(variant_fields.clone()), arrow_type)
+            // A variant is physically `struct<metadata, value>` of binary fields. Accept any Arrow
+            // binary representation for the fields, but require exactly the variant's fields by
+            // name so a shredded layout (extra `typed_value`) cannot pass as an
+            // unshredded variant.
+            (DataType::Variant(variant_fields), ArrowDataType::Struct(arrow_fields)) => {
+                require!(arrow_fields.len() == variant_fields.num_fields(), {
+                    make_arrow_error(format!(
+                        "Variant struct has {} fields, expected {}",
+                        arrow_fields.len(),
+                        variant_fields.num_fields(),
+                    ))
+                });
+                for kernel_field in variant_fields.fields() {
+                    let Some(arrow_field) = arrow_fields
+                        .iter()
+                        .find(|arrow_field| arrow_field.name() == &kernel_field.name)
+                    else {
+                        return Err(make_arrow_error(format!(
+                            "Variant struct is missing field `{}`",
+                            kernel_field.name
+                        )));
+                    };
+                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+                }
+                Ok(DataTypeCompat::Nested)
             }
             (&DataType::Variant(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
@@ -150,14 +171,14 @@ impl EnsureDataTypes {
                         }
                     }
                     ValidationMode::TypesAndNames | ValidationMode::Full => {
-                        // Name-based matching: look up the kernel field for each arrow field by
-                        // name. Arrow fields with no kernel counterpart are ignored. Full mode
-                        // additionally checks nullability and metadata.
+                        // Name-based matching: look up kernel fields by arrow field name.
+                        // Full mode additionally checks nullability and metadata.
+                        let mapped_fields = arrow_fields
+                            .iter()
+                            .filter_map(|f| kernel_fields.field(f.name()));
+
                         let mut found_fields = 0;
-                        for arrow_field in arrow_fields {
-                            let Some(kernel_field) = kernel_fields.field(arrow_field.name()) else {
-                                continue;
-                            };
+                        for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
                             self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
                             self.ensure_data_types(
                                 &kernel_field.data_type,
@@ -416,6 +437,8 @@ mod tests {
         ArrowDataType::Struct(fields.into())
     }
 
+    /// The `metadata`/`value` fields are accepted for any binary representation, in any validation
+    /// mode, regardless of arrow field nullability.
     #[rstest]
     fn ensure_variant_accepts_any_binary_representation(
         #[values(
@@ -425,11 +448,12 @@ mod tests {
         )]
         binary_type: ArrowDataType,
         #[values(ValidationMode::TypesAndNames, ValidationMode::Full)] mode: ValidationMode,
+        #[values(false, true)] nullable: bool,
     ) {
         assert_eq!(
             ensure_data_types(
                 &DataType::unshredded_variant(),
-                &unshredded_variant_arrow_type_with(binary_type, false),
+                &unshredded_variant_arrow_type_with(binary_type, nullable),
                 mode,
             )
             .unwrap(),
@@ -437,24 +461,12 @@ mod tests {
         );
     }
 
-    /// `metadata` and `value` may use different binary representations within the same struct,
-    /// and extra fields (e.g. a shredded `typed_value`) are ignored regardless of their position.
-    #[rstest]
-    #[case::mixed_binary_representations(variant_arrow_struct([
-        ("metadata", ArrowDataType::Binary),
-        ("value", ArrowDataType::LargeBinary),
-    ]))]
-    #[case::extra_field_last(variant_arrow_struct([
-        ("metadata", ArrowDataType::Binary),
-        ("value", ArrowDataType::Binary),
-        ("typed_value", ArrowDataType::Int64),
-    ]))]
-    #[case::extra_field_interleaved(variant_arrow_struct([
-        ("metadata", ArrowDataType::Binary),
-        ("typed_value", ArrowDataType::Int64),
-        ("value", ArrowDataType::Binary),
-    ]))]
-    fn ensure_variant_accepts_extra_and_mixed_fields(#[case] arrow_type: ArrowDataType) {
+    #[test]
+    fn ensure_variant_accepts_mixed_binary_representations() {
+        let arrow_type = variant_arrow_struct([
+            ("metadata", ArrowDataType::Binary),
+            ("value", ArrowDataType::LargeBinary),
+        ]);
         assert_eq!(
             ensure_data_types(
                 &DataType::unshredded_variant(),
@@ -466,29 +478,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ensure_variant_nullable_fields_accepted_without_full_validation() {
-        assert_eq!(
-            ensure_data_types(
-                &DataType::unshredded_variant(),
-                &unshredded_variant_arrow_type_with(ArrowDataType::LargeBinary, true),
-                ValidationMode::TypesAndNames,
-            )
-            .unwrap(),
-            DataTypeCompat::Nested
-        );
-    }
-
     #[rstest]
-    #[case::wrong_field_names(
-        wrong_field_names_variant_arrow_type(),
-        "Missing Struct fields metadata, value"
+    #[case::wrong_field_names(wrong_field_names_variant_arrow_type(), "missing field")]
+    #[case::extra_field_last(
+        variant_arrow_struct([
+            ("metadata", ArrowDataType::Binary),
+            ("value", ArrowDataType::Binary),
+            ("typed_value", ArrowDataType::Int64),
+        ]),
+        "expected 2"
     )]
-    #[case::nullable_fields(
-        unshredded_variant_arrow_type_with(ArrowDataType::LargeBinary, true),
-        "metadata has nullability false in kernel and true in arrow"
+    #[case::extra_field_interleaved(
+        variant_arrow_struct([
+            ("metadata", ArrowDataType::Binary),
+            ("typed_value", ArrowDataType::Int64),
+            ("value", ArrowDataType::Binary),
+        ]),
+        "expected 2"
     )]
-    #[case::not_a_struct(ArrowDataType::Binary, "Incorrect datatype")]
+    #[case::missing_field(
+        variant_arrow_struct([
+            ("metadata", ArrowDataType::Binary),
+            ("typed_value", ArrowDataType::Int64),
+        ]),
+        "missing field"
+    )]
     #[case::non_binary_value(
         variant_arrow_struct([
             ("metadata", ArrowDataType::Binary),
@@ -496,6 +510,7 @@ mod tests {
         ]),
         "Incorrect datatype"
     )]
+    #[case::not_a_struct(ArrowDataType::Binary, "Incorrect datatype")]
     fn ensure_variant_rejects(#[case] arrow_type: ArrowDataType, #[case] expected_err: &str) {
         assert_result_error_with_message(
             ensure_data_types(
