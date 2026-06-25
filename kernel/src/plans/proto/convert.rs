@@ -1,8 +1,4 @@
 //! Conversions from the kernel plan IR into the prost-generated proto wire types.
-//!
-//! [`operation_to_proto_bytes`] is the entry point for serializing a top-level [`Operation`].
-
-use prost::Message;
 
 use super::plan::agg_fn as proto_agg_fn;
 use super::{
@@ -26,11 +22,6 @@ use crate::schema::{
     StructType,
 };
 use crate::{FileMeta, FileSlice};
-
-/// Serializes an [`Operation`] into its proto wire representation.
-pub fn operation_to_proto_bytes(op: &Operation) -> Vec<u8> {
-    proto_op::Operation::from(op).encode_to_vec()
-}
 
 // === Helpers ===
 
@@ -731,7 +722,6 @@ mod tests {
     use rstest::rstest;
     use url::Url;
 
-    use super::operation_to_proto_bytes;
     use crate::expressions::{
         lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
@@ -823,7 +813,7 @@ mod tests {
     }
 
     fn decode(op: &Operation) -> proto_op::Operation {
-        let bytes = operation_to_proto_bytes(op);
+        let bytes = op.to_proto_bytes();
         prost::Message::decode(bytes.as_slice()).expect("decode succeeds")
     }
 

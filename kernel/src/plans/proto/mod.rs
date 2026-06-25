@@ -34,4 +34,3 @@ pub mod operation {
 }
 
 mod convert;
-pub use convert::operation_to_proto_bytes;

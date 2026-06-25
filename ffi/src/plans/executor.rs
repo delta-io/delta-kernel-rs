@@ -2,7 +2,6 @@
 //! execution to happen outside of Rust).
 use std::sync::Arc;
 
-use delta_kernel::plans::proto::operation_to_proto_bytes;
 use delta_kernel::{DeltaResult, Error, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -57,7 +56,7 @@ unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
-        let plan_proto_bytes = operation_to_proto_bytes(&op);
+        let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
         let mut out = EngineExecResult::Uninit;
