@@ -774,9 +774,17 @@ fn validate_extract_table_features_and_properties(
         .collect();
     if !metadata_props.is_empty() {
         let parsed = TableProperties::from(metadata_props.iter().copied());
-        if let Some((key, value)) = parsed.unknown_properties.iter().next() {
+        if !parsed.unknown_properties.is_empty() {
+            // Sort for a deterministic message: `unknown_properties` is a `HashMap`.
+            let mut invalid: Vec<_> = parsed
+                .unknown_properties
+                .iter()
+                .map(|(key, value)| format!("'{value}' for table property '{key}'"))
+                .collect();
+            invalid.sort_unstable();
             return Err(Error::generic(format!(
-                "Invalid value '{value}' for table property '{key}' during CREATE TABLE"
+                "Invalid values during CREATE TABLE: {}",
+                invalid.join("; ")
             )));
         }
     }
@@ -1205,7 +1213,7 @@ mod tests {
             HashMap::from([(CHECKPOINT_INTERVAL.to_string(), "not_a_number".to_string())]);
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Invalid value 'not_a_number' for table property 'delta.checkpointInterval'",
+            "'not_a_number' for table property 'delta.checkpointInterval'",
         );
 
         // A duration missing the `interval` keyword also fails to parse and is rejected.
@@ -1213,7 +1221,19 @@ mod tests {
             HashMap::from([(LOG_RETENTION_DURATION.to_string(), "30 days".to_string())]);
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Invalid value '30 days' for table property 'delta.logRetentionDuration'",
+            "'30 days' for table property 'delta.logRetentionDuration'",
+        );
+
+        // Multiple malformed values are all reported (sorted), not just the first.
+        let properties = HashMap::from([
+            (CHECKPOINT_INTERVAL.to_string(), "not_a_number".to_string()),
+            (LOG_RETENTION_DURATION.to_string(), "30 days".to_string()),
+        ]);
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            "Invalid values during CREATE TABLE: '30 days' for table property \
+             'delta.logRetentionDuration'; 'not_a_number' for table property \
+             'delta.checkpointInterval'",
         );
     }
 
