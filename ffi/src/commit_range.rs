@@ -215,11 +215,9 @@ pub unsafe extern "C" fn commit_action_timestamp(commit_action: Handle<SharedCom
     commit_action.timestamp()
 }
 
-/// Get an iterator over this commit's action batches, projected to the read schema the commit was
-/// created with. Each batch is the raw actions recorded in the commit JSON, with no column-mapping
-/// translation applied. Issues a fresh read on creation, so the call is fallible.
-///
-/// - `engine`: performs the JSON read and allocates errors.
+/// Get an iterator over this commit's action batches, projected to the read schema requested when
+/// the iterator was created (the `actions` passed to [`commit_range_commits`]). Each batch is the
+/// raw actions recorded in the commit JSON, with no column-mapping translation applied.
 ///
 /// The caller owns the returned iterator: drain it with [`read_result_next`] and release it with
 /// [`free_read_result_iter`].
@@ -607,29 +605,43 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::matched_anchor_yields_commit(1, 1, Some(vec![1]))]
+    #[case::mismatched_anchor_errors(0, 0, None)]
     #[tokio::test]
-    async fn test_commit_range_commits_with_snapshot_yields_anchored_commit(
+    async fn test_commit_range_commits_with_snapshot(
+        #[case] range_start: u64,
+        #[case] range_end: u64,
+        #[case] expected: Option<Vec<u64>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root) = setup_engine_with_commits(1).await;
-        // Anchor at the latest version (v=1) and pin the range to [1, 1].
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
-        let range = unsafe { build_range(table_root, 1, 1, engine.shallow_copy()) };
+        let range =
+            unsafe { build_range(table_root, range_start, range_end, engine.shallow_copy()) };
 
         let actions = [KernelDeltaAction::Metadata];
-        let iter = unsafe {
-            ok_or_panic(commit_range_commits_with_snapshot(
+        let result = unsafe {
+            commit_range_commits_with_snapshot(
                 range.shallow_copy(),
                 engine.shallow_copy(),
                 snapshot.shallow_copy(),
                 actions.as_ptr(),
                 actions.len(),
-            ))
+            )
         };
-        let versions = unsafe { drain_versions(iter.shallow_copy()) };
-        assert_eq!(versions, vec![1]);
+        match expected {
+            Some(expected_versions) => {
+                let iter = ok_or_panic(result);
+                let versions = unsafe { drain_versions(iter.shallow_copy()) };
+                assert_eq!(versions, expected_versions);
+                unsafe { free_commit_actions_iter(iter) }
+            }
+            None => {
+                assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+            }
+        }
 
-        unsafe { free_commit_actions_iter(iter) }
         unsafe { free_snapshot(snapshot) }
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }
