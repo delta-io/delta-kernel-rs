@@ -33,9 +33,10 @@ use crate::scan::log_replay::{
 };
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
+use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    ArrayType, DataType, MapType, MetadataColumnSpec, PrimitiveType, Schema, SchemaRef,
+    StructField, StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
@@ -299,8 +300,10 @@ impl ScanBuilder {
     ///
     /// With this set the engine must itself apply every physical-to-logical fixup the transform
     /// would normally perform: partition column injection, column-mapping renames, and generated
-    /// row ids. Deletion vectors are unaffected: they are delivered per file in the scan metadata
-    /// regardless. [`Scan::execute`] returns an error.
+    /// row ids. [`Scan::scan_transform`] describes those fixups structurally so the engine can
+    /// reproduce them without re-deriving Delta read semantics. Deletion vectors are unaffected:
+    /// they are delivered per file in the scan metadata regardless. [`Scan::execute`] returns an
+    /// error.
     pub fn without_row_transforms(mut self) -> Self {
         self.without_row_transforms = true;
         self
@@ -607,6 +610,171 @@ impl HasSelectionVector for ScanMetadata {
     }
 }
 
+/// An engine-agnostic, logical-schema-keyed description of the physical-to-logical scan transform:
+/// one entry per logical output column, in output order. This is the structural counterpart to the
+/// per-file expression in [`ScanMetadata::scan_file_transforms`]. Engines that drive a configured
+/// scan node (rather than evaluating an expression) map each variant directly to their own column
+/// layout. Obtain it via [`Scan::scan_transform`].
+///
+/// The variants mirror the column roles of a declarative-plan `Load` node (data column, file
+/// constant, generated value), describing the same structure over today's [`Scan::scan_metadata`]
+/// output. It is the precursor to serving the transform as a `Load` node directly.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum LoadColumnSpec {
+    /// A column read directly from the data file. `physical_name` is the Parquet column name to
+    /// read; it is the column-mapping physical name in both modes, and equals `logical_name` when
+    /// the table has no column mapping. `field_id` is the field's `delta.columnMapping.id` when
+    /// the table uses column mapping (in either mode), and `None` otherwise. `children`
+    /// carries the nested fields of a struct column (or of the struct reached through an array
+    /// element or map value), each a `Physical` with its own physical name; it is empty for
+    /// leaf columns.
+    #[non_exhaustive]
+    Physical {
+        logical_name: String,
+        physical_name: String,
+        field_id: Option<i64>,
+        children: Vec<LoadColumnSpec>,
+    },
+    /// A partition column, whose value is not stored in the file. `physical_name` is the key the
+    /// per-file partition value is delivered under (`ScanFile.partition_values`); it equals
+    /// `logical_name` when the table has no column mapping. `values_index` is the column's
+    /// position in the table's partition-column order (`partition_columns()`).
+    #[non_exhaustive]
+    Partition {
+        logical_name: String,
+        physical_name: String,
+        values_index: usize,
+    },
+    /// The row-tracking row id: `COALESCE(materialized_column, base_row_id + row_index)`. The
+    /// engine reads `materialized_column` from the data file, takes `base_row_id` from the
+    /// per-file scan metadata, and supplies the row's physical ordinal position within the file
+    /// (before any deletion-vector filtering) as `row_index`.
+    #[non_exhaustive]
+    RowId {
+        logical_name: String,
+        /// Physical column in the data file holding explicitly materialized row ids. It is null
+        /// for rows whose id must be computed as `base_row_id + row_index`.
+        materialized_column: String,
+    },
+    /// A column the engine produces itself rather than reading from the data file (it is not
+    /// stored there). `kind` says which value to materialize.
+    #[non_exhaustive]
+    ReaderGenerated {
+        logical_name: String,
+        kind: ReaderGeneratedColumn,
+    },
+}
+
+/// Which value a [`LoadColumnSpec::ReaderGenerated`] column carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReaderGeneratedColumn {
+    /// The row's physical ordinal position within the file, before deletion-vector filtering.
+    RowIndex,
+    /// The path of the file the row was read from.
+    FilePath,
+}
+
+/// Builds the [`LoadColumnSpec`] descriptor for a scan. Walks `logical_schema` in output order,
+/// classifying each field as a partition value, a row id, or a physical column. Returns `None` for
+/// transforms and columns that have no structural description; see [`Scan::scan_transform`] for the
+/// exact conditions.
+fn describe_scan_transform(
+    transform_spec: Option<&TransformSpec>,
+    logical_schema: &Schema,
+    partition_columns: &[String],
+    column_mapping_mode: ColumnMappingMode,
+) -> Option<Vec<LoadColumnSpec>> {
+    // The materialized row-id column comes only from the spec; the logical schema doesn't carry it.
+    let mut materialized_row_id_column = None;
+    if let Some(transform_spec) = transform_spec {
+        for field_transform in transform_spec {
+            match field_transform {
+                FieldTransformSpec::GenerateRowId { field_name, .. } => {
+                    materialized_row_id_column = Some(field_name.clone());
+                }
+                FieldTransformSpec::MetadataDerivedColumn { .. }
+                | FieldTransformSpec::StaticDrop { .. } => {}
+                FieldTransformSpec::DynamicColumn { .. }
+                | FieldTransformSpec::StaticInsert { .. } => return None,
+            }
+        }
+    }
+
+    let mut columns = Vec::with_capacity(logical_schema.num_fields());
+    for field in logical_schema.fields() {
+        let logical_name = field.name().to_string();
+        let column = if let Some(values_index) = partition_columns
+            .iter()
+            .position(|name| name == field.name())
+        {
+            LoadColumnSpec::Partition {
+                logical_name,
+                physical_name: field.physical_name(column_mapping_mode).to_string(),
+                values_index,
+            }
+        } else {
+            match field.get_metadata_column_spec() {
+                None => describe_physical_column(field, column_mapping_mode),
+                Some(MetadataColumnSpec::RowId) => LoadColumnSpec::RowId {
+                    logical_name,
+                    materialized_column: materialized_row_id_column.clone()?,
+                },
+                Some(MetadataColumnSpec::RowIndex) => LoadColumnSpec::ReaderGenerated {
+                    logical_name,
+                    kind: ReaderGeneratedColumn::RowIndex,
+                },
+                Some(MetadataColumnSpec::FilePath) => LoadColumnSpec::ReaderGenerated {
+                    logical_name,
+                    kind: ReaderGeneratedColumn::FilePath,
+                },
+                // Row commit versions aren't supported by scans (build errors first); guard
+                // defensively since they have no structural description.
+                Some(MetadataColumnSpec::RowCommitVersion) => return None,
+            }
+        };
+        columns.push(column);
+    }
+    Some(columns)
+}
+
+/// Describes a data column as a [`LoadColumnSpec::Physical`], recursing into nested struct fields
+/// (including the struct reached through an array element or map value) so every nested physical
+/// name is carried.
+fn describe_physical_column(
+    field: &StructField,
+    column_mapping_mode: ColumnMappingMode,
+) -> LoadColumnSpec {
+    LoadColumnSpec::Physical {
+        logical_name: field.name().to_string(),
+        physical_name: field.physical_name(column_mapping_mode).to_string(),
+        field_id: (column_mapping_mode != ColumnMappingMode::None)
+            .then(|| field.column_mapping_id())
+            .flatten(),
+        children: physical_children(field.data_type(), column_mapping_mode),
+    }
+}
+
+/// The nested physical columns of `data_type`: a struct's fields, or the fields of the struct
+/// reached through an array element or map value. Empty for primitive and variant leaves.
+fn physical_children(
+    data_type: &DataType,
+    column_mapping_mode: ColumnMappingMode,
+) -> Vec<LoadColumnSpec> {
+    match data_type {
+        DataType::Struct(struct_type) => struct_type
+            .fields()
+            .map(|field| describe_physical_column(field, column_mapping_mode))
+            .collect(),
+        DataType::Array(array_type) => {
+            physical_children(array_type.element_type(), column_mapping_mode)
+        }
+        DataType::Map(map_type) => physical_children(map_type.value_type(), column_mapping_mode),
+        DataType::Primitive(_) | DataType::Variant(_) => Vec::new(),
+    }
+}
+
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -682,6 +850,27 @@ impl Scan {
         } else {
             None
         }
+    }
+
+    /// The physical-to-logical transform as an engine-agnostic, logical-schema-keyed descriptor:
+    /// one [`LoadColumnSpec`] per logical output column, in output order. Engines that assemble
+    /// logical rows from a configured scan node (rather than evaluating the per-file
+    /// [`ScanMetadata::scan_file_transforms`] expression) map this directly to their own column
+    /// layout. Pairs with [`ScanBuilder::without_row_transforms`], which skips building that
+    /// expression.
+    ///
+    /// Returns `None` only when the transform cannot be described structurally, in which case the
+    /// scan must consume the per-file expression instead: a column whose physical-vs-metadata
+    /// nature varies per file (CDF's `_change_type`), an opaque inserted expression, or a
+    /// row-commit-version column (unsupported by scans). Column-mapped (nested included),
+    /// partitioned, row-tracking, and reader-generated metadata columns are all described.
+    pub fn scan_transform(&self) -> Option<Vec<LoadColumnSpec>> {
+        describe_scan_transform(
+            self.state_info.transform_spec.as_deref(),
+            self.logical_schema(),
+            self.snapshot.table_configuration().partition_columns(),
+            self.state_info.column_mapping_mode,
+        )
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles

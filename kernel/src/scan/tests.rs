@@ -532,8 +532,20 @@ fn test_without_row_transforms_rejects_execute() {
     );
 }
 
-/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
-/// build time regardless of `without_row_transforms`.
+/// `without_row_transforms` still exposes the structural descriptor.
+#[test]
+fn test_without_row_transforms_exposes_scan_transform() {
+    let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+    assert!(scan.scan_transform().is_some());
+}
+
+/// Row commit version metadata columns are unsupported by scans (the descriptor has no recipe for
+/// them), so requesting one errors at build time regardless of `without_row_transforms`.
 #[rstest]
 fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
     let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
@@ -554,6 +566,387 @@ fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_trans
         err.to_string()
             .contains("Row commit versions not supported"),
         "unexpected error: {err}"
+    );
+}
+
+// === scan_transform descriptor: describe_scan_transform classification ===
+
+/// Without column mapping, `physical_name` equals `logical_name` and `field_id` is `None`.
+#[test]
+fn test_describe_scan_transform_plain_all_physical() {
+    let schema = StructType::new_unchecked([
+        StructField::nullable("a", DataType::INTEGER),
+        StructField::nullable("b", DataType::STRING),
+    ]);
+    let cols = describe_scan_transform(None, &schema, &[], ColumnMappingMode::None).unwrap();
+    assert_eq!(
+        cols,
+        vec![
+            LoadColumnSpec::Physical {
+                logical_name: "a".into(),
+                physical_name: "a".into(),
+                field_id: None,
+                children: vec![],
+            },
+            LoadColumnSpec::Physical {
+                logical_name: "b".into(),
+                physical_name: "b".into(),
+                field_id: None,
+                children: vec![],
+            },
+        ]
+    );
+}
+
+/// `values_index` is the column's position in `partition_columns`, not its position in the schema.
+#[test]
+fn test_describe_scan_transform_partition_values_index_follows_partition_order() {
+    let schema = StructType::new_unchecked([
+        StructField::nullable("year", DataType::INTEGER),
+        StructField::nullable("region", DataType::STRING),
+        StructField::nullable("value", DataType::INTEGER),
+    ]);
+    let partition_columns = ["region".to_string(), "year".to_string()];
+    let cols = describe_scan_transform(None, &schema, &partition_columns, ColumnMappingMode::None)
+        .unwrap();
+    assert_eq!(
+        cols,
+        vec![
+            LoadColumnSpec::Partition {
+                logical_name: "year".into(),
+                physical_name: "year".into(),
+                values_index: 1
+            },
+            LoadColumnSpec::Partition {
+                logical_name: "region".into(),
+                physical_name: "region".into(),
+                values_index: 0
+            },
+            LoadColumnSpec::Physical {
+                logical_name: "value".into(),
+                physical_name: "value".into(),
+                field_id: None,
+                children: vec![],
+            },
+        ]
+    );
+}
+
+#[test]
+fn test_describe_scan_transform_row_id_carries_materialized_column() {
+    let schema = StructType::new_unchecked([
+        StructField::nullable("id", DataType::LONG),
+        StructField::create_metadata_column("row_id", MetadataColumnSpec::RowId),
+    ]);
+    let spec: TransformSpec = vec![
+        FieldTransformSpec::GenerateRowId {
+            field_name: "_mat_row_id".to_string(),
+            row_index_field_name: "_row_index".to_string(),
+        },
+        FieldTransformSpec::StaticDrop {
+            field_name: "_row_index".to_string(),
+        },
+    ];
+    let cols = describe_scan_transform(Some(&spec), &schema, &[], ColumnMappingMode::None).unwrap();
+    assert_eq!(
+        cols,
+        vec![
+            LoadColumnSpec::Physical {
+                logical_name: "id".into(),
+                physical_name: "id".into(),
+                field_id: None,
+                children: vec![],
+            },
+            LoadColumnSpec::RowId {
+                logical_name: "row_id".into(),
+                materialized_column: "_mat_row_id".into()
+            },
+        ]
+    );
+}
+
+/// CDF's per-file dynamic column and opaque inserted expressions have no structural description.
+#[rstest]
+#[case::dynamic_column(FieldTransformSpec::DynamicColumn {
+    field_index: 0,
+    physical_name: "a".to_string(),
+    insert_after: None,
+})]
+#[case::static_insert(FieldTransformSpec::StaticInsert {
+    insert_after: None,
+    expr: Arc::new(Expr::literal(42)),
+})]
+fn test_describe_scan_transform_fails_closed(#[case] field_transform: FieldTransformSpec) {
+    let schema = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+    let spec: TransformSpec = vec![field_transform];
+    assert!(describe_scan_transform(Some(&spec), &schema, &[], ColumnMappingMode::None).is_none());
+}
+
+/// Row commit versions have no structural description, so the descriptor fails closed.
+#[test]
+fn test_describe_scan_transform_fails_closed_on_row_commit_version_metadata() {
+    let schema = StructType::new_unchecked([StructField::create_metadata_column(
+        "rcv",
+        MetadataColumnSpec::RowCommitVersion,
+    )]);
+    assert!(describe_scan_transform(None, &schema, &[], ColumnMappingMode::None).is_none());
+}
+
+/// Reader-generated columns are classified as `ReaderGenerated` so the engine knows to produce
+/// them itself rather than reading a non-existent file column.
+#[rstest]
+#[case::row_index(MetadataColumnSpec::RowIndex, ReaderGeneratedColumn::RowIndex)]
+#[case::file_path(MetadataColumnSpec::FilePath, ReaderGeneratedColumn::FilePath)]
+fn test_describe_scan_transform_reader_generated_column(
+    #[case] spec: MetadataColumnSpec,
+    #[case] kind: ReaderGeneratedColumn,
+) {
+    let schema = StructType::new_unchecked([StructField::create_metadata_column("meta", spec)]);
+    let cols = describe_scan_transform(None, &schema, &[], ColumnMappingMode::None).unwrap();
+    assert_eq!(
+        cols,
+        vec![LoadColumnSpec::ReaderGenerated {
+            logical_name: "meta".into(),
+            kind
+        }]
+    );
+}
+
+/// A schema of only partition columns yields all-`Partition` entries.
+#[test]
+fn test_describe_scan_transform_partition_only_schema() {
+    let schema = StructType::new_unchecked([
+        StructField::nullable("a", DataType::INTEGER),
+        StructField::nullable("b", DataType::STRING),
+    ]);
+    let partition_columns = ["a".to_string(), "b".to_string()];
+    let cols = describe_scan_transform(None, &schema, &partition_columns, ColumnMappingMode::None)
+        .unwrap();
+    assert_eq!(
+        cols,
+        vec![
+            LoadColumnSpec::Partition {
+                logical_name: "a".into(),
+                physical_name: "a".into(),
+                values_index: 0
+            },
+            LoadColumnSpec::Partition {
+                logical_name: "b".into(),
+                physical_name: "b".into(),
+                values_index: 1
+            },
+        ]
+    );
+}
+
+// === scan_transform descriptor: end-to-end over real tables ===
+
+#[test]
+fn test_scan_transform_partitioned() {
+    let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let cols = snapshot
+        .scan_builder()
+        .build()
+        .unwrap()
+        .scan_transform()
+        .unwrap();
+    assert_eq!(
+        cols,
+        vec![
+            LoadColumnSpec::Partition {
+                logical_name: "letter".into(),
+                physical_name: "letter".into(),
+                values_index: 0
+            },
+            LoadColumnSpec::Physical {
+                logical_name: "number".into(),
+                physical_name: "number".into(),
+                field_id: None,
+                children: vec![],
+            },
+            LoadColumnSpec::Physical {
+                logical_name: "a_float".into(),
+                physical_name: "a_float".into(),
+                field_id: None,
+                children: vec![],
+            },
+        ]
+    );
+}
+
+/// Under column mapping (both modes), physical columns carry their physical name and
+/// `delta.columnMapping.id`; the partition column is classified as a partition but still carries
+/// its physical name (the key its per-file value is delivered under).
+#[rstest]
+#[case::id_mode("./tests/data/partition_cm/id/", ColumnMappingMode::Id)]
+#[case::name_mode("./tests/data/partition_cm/name/", ColumnMappingMode::Name)]
+fn test_scan_transform_column_mapping(#[case] table: &str, #[case] mode: ColumnMappingMode) {
+    let (_engine, snapshot) = without_transforms_snapshot(table);
+    let schema = snapshot.schema();
+    let value_physical = schema
+        .field("value")
+        .unwrap()
+        .physical_name(mode)
+        .to_string();
+    let category_physical = schema
+        .field("category")
+        .unwrap()
+        .physical_name(mode)
+        .to_string();
+    // Column mapping resolves a distinct, non-logical physical name (the `col-<uuid>` form),
+    // independent of the accessor used to build the expected values above.
+    assert_ne!(value_physical, "value");
+    assert!(value_physical.starts_with("col-"));
+    assert!(category_physical.starts_with("col-"));
+
+    let cols = snapshot
+        .scan_builder()
+        .build()
+        .unwrap()
+        .scan_transform()
+        .unwrap();
+    assert_eq!(
+        cols,
+        vec![
+            LoadColumnSpec::Physical {
+                logical_name: "value".into(),
+                physical_name: value_physical,
+                field_id: Some(1),
+                children: vec![],
+            },
+            LoadColumnSpec::Partition {
+                logical_name: "category".into(),
+                physical_name: category_physical,
+                values_index: 0
+            },
+        ]
+    );
+}
+
+#[test]
+fn test_scan_transform_row_tracking() {
+    let (_engine, snapshot) = without_transforms_snapshot("./tests/data/crc-full/");
+    let schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)
+            .unwrap(),
+    );
+    let materialized = snapshot
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .get("delta.rowTracking.materializedRowIdColumnName")
+        .unwrap()
+        .clone();
+    let cols = snapshot
+        .scan_builder()
+        .with_schema(schema)
+        .without_row_transforms()
+        .build()
+        .unwrap()
+        .scan_transform()
+        .unwrap();
+    assert_eq!(
+        cols,
+        vec![
+            LoadColumnSpec::Physical {
+                logical_name: "id".into(),
+                physical_name: "id".into(),
+                field_id: None,
+                children: vec![],
+            },
+            LoadColumnSpec::RowId {
+                logical_name: "row_id".into(),
+                materialized_column: materialized
+            },
+        ]
+    );
+}
+
+/// The descriptor lists exactly the logical output columns, in output order.
+#[rstest]
+#[case("./tests/data/basic_partitioned/")]
+#[case("./tests/data/partition_cm/none/")]
+#[case("./tests/data/partition_cm/id/")]
+#[case("./tests/data/partition_cm/name/")]
+fn test_scan_transform_matches_logical_schema_order(#[case] table: &str) {
+    let (_engine, snapshot) = without_transforms_snapshot(table);
+    let scan = snapshot.scan_builder().build().unwrap();
+    let cols = scan.scan_transform().unwrap();
+    let descriptor_names: Vec<&str> = cols
+        .iter()
+        .map(|c| match c {
+            LoadColumnSpec::Physical { logical_name, .. }
+            | LoadColumnSpec::Partition { logical_name, .. }
+            | LoadColumnSpec::RowId { logical_name, .. }
+            | LoadColumnSpec::ReaderGenerated { logical_name, .. } => logical_name.as_str(),
+        })
+        .collect();
+    let logical_names: Vec<&str> = scan
+        .logical_schema()
+        .fields()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(descriptor_names, logical_names);
+}
+
+/// A nested struct column is described recursively: each nested field carries its own physical
+/// name (here forced to differ from the logical name via a column-mapping annotation).
+#[test]
+fn test_describe_scan_transform_nested_struct_carries_child_physical_names() {
+    let phys_key = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
+    let nested = StructField::nullable("a", DataType::INTEGER).add_metadata([(phys_key, "col-a")]);
+    let outer = StructField::nullable("s", StructType::new_unchecked([nested]))
+        .add_metadata([(phys_key, "col-s")]);
+    let schema = StructType::new_unchecked([outer]);
+    let cols = describe_scan_transform(None, &schema, &[], ColumnMappingMode::Name).unwrap();
+    assert_eq!(
+        cols,
+        vec![LoadColumnSpec::Physical {
+            logical_name: "s".into(),
+            physical_name: "col-s".into(),
+            field_id: None,
+            children: vec![LoadColumnSpec::Physical {
+                logical_name: "a".into(),
+                physical_name: "col-a".into(),
+                field_id: None,
+                children: vec![],
+            }],
+        }]
+    );
+}
+
+/// A row-id column with no `GenerateRowId` in the spec has no materialized column to describe.
+#[test]
+fn test_describe_scan_transform_row_id_without_generate_spec_fails_closed() {
+    let schema = StructType::new_unchecked([StructField::create_metadata_column(
+        "row_id",
+        MetadataColumnSpec::RowId,
+    )]);
+    let spec: TransformSpec = vec![];
+    assert!(describe_scan_transform(Some(&spec), &schema, &[], ColumnMappingMode::None).is_none());
+}
+
+/// A reader-generated metadata column is classified as `ReaderGenerated` end-to-end through the
+/// public `scan_transform()` (not just the free function).
+#[rstest]
+#[case::row_index(MetadataColumnSpec::RowIndex, ReaderGeneratedColumn::RowIndex)]
+#[case::file_path(MetadataColumnSpec::FilePath, ReaderGeneratedColumn::FilePath)]
+fn test_scan_transform_classifies_reader_generated_metadata_column(
+    #[case] spec: MetadataColumnSpec,
+    #[case] kind: ReaderGeneratedColumn,
+) {
+    let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let schema = Arc::new(snapshot.schema().add_metadata_column("m", spec).unwrap());
+    let scan = snapshot.scan_builder().with_schema(schema).build().unwrap();
+    let cols = scan.scan_transform().unwrap();
+    assert_eq!(
+        cols.last(),
+        Some(&LoadColumnSpec::ReaderGenerated {
+            logical_name: "m".into(),
+            kind
+        })
     );
 }
 
