@@ -3,13 +3,16 @@ pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
+#[internal_api]
+pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
-    get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
     validate_column_mapping_id,
 };
 use delta_kernel_derive::internal_api;
+pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -22,9 +25,11 @@ use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{schema_has_invariants, DataType};
 use crate::table_properties::TableProperties;
-use crate::DeltaResult;
+use crate::utils::require;
+use crate::{DeltaResult, Error};
 
 mod column_mapping;
+mod iceberg_compat;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -122,6 +127,11 @@ pub(crate) enum TableFeature {
     ClusteredTable,
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
+    /// Column Default Values.
+    ///
+    /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
+    /// the `column-defaults-in-dev` cargo feature.
+    AllowColumnDefaults,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -821,10 +831,33 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2630): drop the gate once column-defaults is fully supported. CREATE is always blocked
+// (kernel cannot emit column-default metadata at create time yet). With the
+// `column-defaults-in-dev` cargo feature off, data writes and DDL to tables that already list this
+// feature are also blocked because kernel cannot honor column defaults.
+static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "column-defaults-in-dev")]
+    operation_support: OperationSupport {
+        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE),
+        ..OperationSupport::ALL_ALLOWED
+    },
+    #[cfg(not(feature = "column-defaults-in-dev"))]
+    operation_support: OperationSupport {
+        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        read: ReadSupport::NOT_APPLICABLE,
+        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE),
+    },
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     operation_support: OperationSupport {
         read: ReadSupport {
             cdf: OpSupport::ForbiddenIfSupported(msg::NOT_SUPPORTED_FOR_CDF),
@@ -838,7 +871,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     operation_support: OperationSupport {
         read: ReadSupport {
             cdf: OpSupport::ForbiddenIfSupported(msg::NOT_SUPPORTED_FOR_CDF),
@@ -1040,7 +1073,8 @@ impl TableFeature {
             | TableFeature::IcebergCompatV2
             | TableFeature::IcebergCompatV3
             | TableFeature::ClusteredTable
-            | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
+            | TableFeature::MaterializePartitionColumns
+            | TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -1076,6 +1110,7 @@ impl TableFeature {
             TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
+            TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -1158,8 +1193,71 @@ pub(crate) fn format_features(features: &[TableFeature]) -> String {
     format!("[{}]", feature_strings.join(", "))
 }
 
+/// Extract the reader features enabled for `protocol`. For `min_reader_version == 3` returns the
+/// explicit `reader_features` list; for `1..=2` returns the legacy-inferred features.
+pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableFeature> {
+    match protocol.min_reader_version() {
+        TABLE_FEATURES_MIN_READER_VERSION => protocol
+            .reader_features()
+            .map(|f| f.to_vec())
+            .unwrap_or_default(),
+        v if (1..=2).contains(&v) => LEGACY_READER_FEATURES
+            .iter()
+            .filter(|f| f.is_valid_for_legacy_reader(v))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Enforce that `protocol.min_reader_version()` lies within
+/// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
+/// [`Error::InvalidProtocol`]; above the maximum yields [`Error::Unsupported`].
+pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
+    require!(
+        protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
+        Error::InvalidProtocol(format!(
+            "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+            protocol.min_reader_version()
+        ))
+    );
+    if protocol.min_reader_version() > MAX_VALID_READER_VERSION {
+        return Err(Error::unsupported(format!(
+            "Unsupported minimum reader version {}",
+            protocol.min_reader_version()
+        )));
+    }
+    Ok(())
+}
+
+/// Protocol-level check that the kernel can read tables governed by `protocol`.
+///
+/// Unlike [`TableConfiguration::ensure_operation_supported`], this does not require a
+/// [`Metadata`] action or any table properties, so it can only consult the protocol-static read
+/// policy: a reader feature is rejected only when its `read.scan` cell unconditionally forbids the
+/// op ([`OpSupport::ForbiddenIfSupported`]). Enablement- or schema-dependent read policies
+/// ([`OpSupport::ForbiddenIfEnabled`] / [`OpSupport::ForbiddenIf`]) require a full
+/// [`TableConfiguration`] and are not evaluated here.
+///
+/// [`Metadata`]: crate::actions::Metadata
+/// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
+/// [`TableConfiguration::ensure_operation_supported`]: crate::table_configuration::TableConfiguration::ensure_operation_supported
+pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
+    check_reader_version_range(protocol)?;
+
+    for feature in extract_enabled_reader_features(protocol) {
+        if let OpSupport::ForbiddenIfSupported(msg) = feature.info().operation_support.read.scan {
+            return Err(Error::unsupported(format!("Feature '{feature}': {msg}")));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -1196,6 +1294,68 @@ mod tests {
         assert_eq!(&typed_writer, mixed_writer);
     }
 
+    /// Expected outcome of `ensure_table_can_be_read` for a given protocol: either readable,
+    /// or an error of a specific variant.
+    enum ExpectRead {
+        Ok,
+        InvalidProtocol,
+        Unsupported,
+    }
+
+    #[rstest]
+    #[case::reader_version_below_minimum(
+        Protocol::new_unchecked(0, 1, None, None),
+        ExpectRead::InvalidProtocol
+    )]
+    #[case::reader_version_above_maximum(
+        Protocol::new_unchecked(99, 1, None, None),
+        ExpectRead::Unsupported
+    )]
+    #[case::legacy_reader_v1(Protocol::try_new_legacy(1, 1).unwrap(), ExpectRead::Ok)]
+    #[case::legacy_reader_v2(Protocol::try_new_legacy(2, 5).unwrap(), ExpectRead::Ok)]
+    #[case::v3_empty_reader_features(
+        Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![])),
+        ExpectRead::Ok
+    )]
+    #[case::supported_explicit_feature(
+        Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors],
+        )
+        .unwrap(),
+        ExpectRead::Ok
+    )]
+    #[case::unknown_reader_feature(
+        Protocol::try_new_modern(
+            [TableFeature::unknown("notARealFeature")],
+            [TableFeature::unknown("notARealFeature")],
+        )
+        .unwrap(),
+        ExpectRead::Unsupported
+    )]
+    #[case::custom_support_feature(
+        Protocol::try_new_modern(
+            [TableFeature::CatalogManaged],
+            [TableFeature::CatalogManaged],
+        )
+        .unwrap(),
+        ExpectRead::Ok
+    )]
+    fn validate_protocol_for_read(#[case] protocol: Protocol, #[case] expected: ExpectRead) {
+        let result = ensure_table_can_be_read(&protocol);
+        match expected {
+            ExpectRead::Ok => result.expect("protocol must be readable"),
+            ExpectRead::InvalidProtocol => assert!(
+                matches!(result, Err(Error::InvalidProtocol(_))),
+                "expected InvalidProtocol, got: {result:?}"
+            ),
+            ExpectRead::Unsupported => assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "expected Unsupported, got: {result:?}"
+            ),
+        }
+    }
+
     #[test]
     fn test_roundtrip_table_features() {
         use strum::IntoEnumIterator as _;
@@ -1229,6 +1389,7 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 

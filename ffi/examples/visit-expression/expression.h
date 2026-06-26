@@ -59,8 +59,8 @@ enum ExpressionType {
   Literal,
   Unary,
   Column,
-  Transform,
-  FieldTransform,
+  StructPatch,
+  FieldPatch,
   OpaqueExpression,
   OpaquePredicate,
   Unknown,
@@ -70,6 +70,8 @@ enum VariadicType {
   And,
   Or,
   StructExpression,
+  Coalesce,
+  ArrayConstructor,
 };
 enum UnaryType { Not, IsNull };
 typedef struct {
@@ -92,14 +94,17 @@ struct Unary {
   enum UnaryType type;
   ExpressionItemList sub_expr;
 };
-struct TransformExpression {
+struct StructPatchExpression {
   ExpressionItemList input_path;
-  ExpressionItemList field_transforms;
+  ExpressionItemList prepended_fields;
+  ExpressionItemList field_patches;
+  ExpressionItemList appended_fields;
 };
-struct FieldTransform {
+struct FieldPatch {
   char* field_name;
-  ExpressionItemList exprs;
-  bool is_replace;
+  ExpressionItemList insertions;
+  bool keep_input;
+  bool optional;
 };
 struct OpaqueExpression {
   HandleSharedOpaqueExpressionOp op;
@@ -176,6 +181,7 @@ void put_expr_item(void* data, size_t sibling_list_id, void* ref, enum Expressio
 }
 ExpressionItemList get_expr_list(void* data, size_t list_id) {
   ExpressionBuilder* data_ptr = (ExpressionBuilder*)data;
+  assert(list_id != 0);
   assert(list_id < data_ptr->list_count);
   return data_ptr->lists[list_id];
 }
@@ -309,23 +315,17 @@ void visit_expr_variadic(void* data,
 DEFINE_VARIADIC(visit_expr_and, And)
 DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
+DEFINE_VARIADIC(visit_expr_coalesce, Coalesce)
+DEFINE_VARIADIC(visit_expr_array, ArrayConstructor)
 #undef DEFINE_VARIADIC
 
 // Sort by field name, breaking ties by pointer address to ensure stability.
-int transform_op_cmp(const void* a, const void* b) {
-  const struct FieldTransform* op_a = ((ExpressionItem*)a)->ref;
-  const struct FieldTransform* op_b = ((ExpressionItem*)b)->ref;
-  if (op_a->field_name == NULL && op_b->field_name == NULL) {
-    // break tie below
-  } else if (op_a->field_name == NULL) {
-    return -1;
-  } else if (op_b->field_name == NULL) {
-    return 1;
-  } else {
-    int cmp = strcmp(op_a->field_name, op_b->field_name);
-    if (cmp != 0) {
-      return cmp;
-    } // else break tie below
+int patch_op_cmp(const void* a, const void* b) {
+  const struct FieldPatch* op_a = ((ExpressionItem*)a)->ref;
+  const struct FieldPatch* op_b = ((ExpressionItem*)b)->ref;
+  int cmp = strcmp(op_a->field_name, op_b->field_name);
+  if (cmp != 0) {
+    return cmp;
   }
   if (op_a < op_b) {
     return -1;
@@ -336,37 +336,43 @@ int transform_op_cmp(const void* a, const void* b) {
   }
 }
 
-void visit_transform_expr(
+void visit_struct_patch_expr(
     void* data,
     uintptr_t sibling_list_id,
     uintptr_t input_path_list_id,
-    uintptr_t child_list_id)
+    uintptr_t prepended_field_list_id,
+    uintptr_t field_patch_list_id,
+    uintptr_t appended_field_list_id)
 {
-  struct TransformExpression* transform = malloc(sizeof(struct TransformExpression));
-  transform->input_path = get_expr_list(data, input_path_list_id);
-  transform->field_transforms = get_expr_list(data, child_list_id);
+  struct StructPatchExpression* patch = malloc(sizeof(struct StructPatchExpression));
+  patch->input_path = get_expr_list(data, input_path_list_id);
+  patch->prepended_fields = get_expr_list(data, prepended_field_list_id);
+  patch->field_patches = get_expr_list(data, field_patch_list_id);
+  patch->appended_fields = get_expr_list(data, appended_field_list_id);
 
   // stable sort the ops by field name to ensure deterministic output
   qsort(
-      transform->field_transforms.list,
-      transform->field_transforms.len,
+      patch->field_patches.list,
+      patch->field_patches.len,
       sizeof(ExpressionItem),
-      transform_op_cmp);
+      patch_op_cmp);
 
-  put_expr_item(data, sibling_list_id, transform, Transform);
+  put_expr_item(data, sibling_list_id, patch, StructPatch);
 }
-void visit_field_transform(
+void visit_field_patch(
     void* data,
     uintptr_t sibling_list_id,
-    const KernelStringSlice* field_name,
-    uintptr_t child_list_id,
-    bool is_replace)
+    KernelStringSlice field_name,
+    uintptr_t insertion_expr_list_id,
+    bool keep_input,
+    bool optional)
 {
-  struct FieldTransform* field_transform = malloc(sizeof(struct FieldTransform));
-  field_transform->field_name = field_name? allocate_string(*field_name) : NULL;
-  field_transform->exprs = get_expr_list(data, child_list_id);
-  field_transform->is_replace = is_replace;
-  put_expr_item(data, sibling_list_id, field_transform, FieldTransform);
+  struct FieldPatch* field_patch = malloc(sizeof(struct FieldPatch));
+  field_patch->field_name = allocate_string(field_name);
+  field_patch->insertions = get_expr_list(data, insertion_expr_list_id);
+  field_patch->keep_input = keep_input;
+  field_patch->optional = optional;
+  put_expr_item(data, sibling_list_id, field_patch, FieldPatch);
 }
 void visit_opaque_expr(
     void *data,
@@ -470,8 +476,7 @@ uintptr_t make_field_list(void* data, uintptr_t reserve) {
 }
 
 ExpressionItemList construct_expression(SharedExpression* expression) {
-  ExpressionBuilder data = { 0 };
-  make_field_list(&data, 0); // list id 0 is the invalid/missing/empty list
+  ExpressionBuilder data = { .list_count = 1 };
 
   EngineExpressionVisitor visitor = {
     .data = &data,
@@ -508,12 +513,14 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_divide = visit_expr_divide,
     .visit_column = visit_expr_column,
     .visit_struct_expr = visit_expr_struct_expr,
-    .visit_transform_expr = visit_transform_expr,
-    .visit_field_transform = visit_field_transform,
+    .visit_struct_patch_expr = visit_struct_patch_expr,
+    .visit_field_patch = visit_field_patch,
     .visit_opaque_pred = visit_opaque_pred,
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
     .visit_map_to_struct = visit_map_to_struct_expr,
+    .visit_coalesce = visit_expr_coalesce,
+    .visit_array = visit_expr_array,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -522,7 +529,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
 }
 
 ExpressionItemList construct_predicate(SharedPredicate* predicate) {
-  ExpressionBuilder data = { 0 };
+  ExpressionBuilder data = { .list_count = 1 };
   EngineExpressionVisitor visitor = {
     .data = &data,
     .make_field_list = make_field_list,
@@ -561,6 +568,8 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
     .visit_map_to_struct = visit_map_to_struct_expr,
+    .visit_coalesce = visit_expr_coalesce,
+    .visit_array = visit_expr_array,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -583,18 +592,20 @@ void free_expression_item(ExpressionItem ref) {
       free(var);
       break;
     };
-    case Transform: {
-      struct TransformExpression* transform = ref.ref;
-      free_expression_list(transform->input_path);
-      free_expression_list(transform->field_transforms);
-      free(transform);
+    case StructPatch: {
+      struct StructPatchExpression* patch = ref.ref;
+      free_expression_list(patch->input_path);
+      free_expression_list(patch->prepended_fields);
+      free_expression_list(patch->field_patches);
+      free_expression_list(patch->appended_fields);
+      free(patch);
       break;
     }
-    case FieldTransform: {
-      struct FieldTransform* field_transform = ref.ref;
-      free(field_transform->field_name);
-      free_expression_list(field_transform->exprs);
-      free(field_transform);
+    case FieldPatch: {
+      struct FieldPatch* field_patch = ref.ref;
+      free(field_patch->field_name);
+      free_expression_list(field_patch->insertions);
+      free(field_patch);
       break;
     }
     case OpaqueExpression: {

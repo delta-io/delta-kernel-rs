@@ -24,7 +24,7 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::reporter::emit_scan_metadata_completed;
+use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::{
@@ -89,41 +89,120 @@ pub use crate::parallel::parallel_scan_metadata::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
 };
 
-/// Controls how file statistics are handled during a scan.
+/// Engine-facing stats options. Pass to [`ScanBuilder::with_stats`] to declare
+/// what stats data the engine wants in scan metadata output. Two orthogonal axes:
+/// JSON stats (`add.stats`) and struct stats (`add.stats_parsed`).
 ///
-/// This enum determines whether and which statistics columns appear in scan metadata output,
-/// and whether internal data skipping is enabled.
-#[derive(Debug, Clone)]
-pub enum StatsOutputMode {
-    /// Output all table stats columns in `stats_parsed`.
-    AllColumns,
-    /// Output stats for specific columns. An empty list means no stats output, but
-    /// predicate-based data skipping still works internally.
-    Columns(Vec<ColumnName>),
-    /// Skip reading stats entirely. Disables data skipping.
-    Skip,
+/// Most consumers should pick one of the named constructors:
+/// - [`Self::json_only`] (default) -- JSON stats only.
+/// - [`Self::all_struct`] -- all struct stats, no JSON. Cheap path when the engine consumes
+///   `stats_parsed` directly; avoids the per-batch `ToJson` cost.
+/// - [`Self::struct_columns`] -- struct stats projected to a subset of columns, no JSON.
+/// - [`Self::all`] -- both representations.
+/// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
+///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
+#[derive(Clone, Debug)]
+pub struct StatsOptions {
+    /// Whether to surface JSON stats on parsed-stats checkpoints (where the
+    /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
+    /// re-serializes the struct stats into JSON so engines that read JSON stats
+    /// see a populated value; when false, JSON stats are left null on such
+    /// checkpoints and the engine consumes the struct stats directly.
+    ///
+    /// No effect on tables that write JSON stats directly, or on commit JSON --
+    /// the existing JSON is passed through regardless.
+    pub(crate) synthesize_json: bool,
+
+    /// Which struct stats columns to emit in `stats_parsed`.
+    pub(crate) struct_stats: StructStats,
 }
 
-impl Default for StatsOutputMode {
+/// Which struct stats columns appear in `stats_parsed` in scan metadata output.
+#[derive(Clone, Debug)]
+pub enum StructStats {
+    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
+    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
+    /// disables stats reading entirely.
+    None,
+    /// Emit all indexed stats columns.
+    All,
+    /// Emit only the specified stats columns.
+    Columns(Vec<ColumnName>),
+}
+
+impl Default for StatsOptions {
+    /// JSON only, no struct stats.
     fn default() -> Self {
-        StatsOutputMode::Columns(Vec::new())
+        Self {
+            synthesize_json: true,
+            struct_stats: StructStats::None,
+        }
+    }
+}
+
+impl StatsOptions {
+    /// JSON only. Equivalent to [`Default::default`].
+    pub fn json_only() -> Self {
+        Self::default()
+    }
+
+    /// All struct stats, no JSON. Cheap path for engines that consume
+    /// `stats_parsed` directly: avoids the per-batch `ToJson` cost on
+    /// parsed-stats checkpoints.
+    pub fn all_struct() -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::All,
+        }
+    }
+
+    /// Struct stats projected to the specified columns, no JSON. Like
+    /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
+    pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::Columns(cols),
+        }
+    }
+
+    /// Both JSON and struct stats. Pays for both representations.
+    pub fn all() -> Self {
+        Self {
+            synthesize_json: true,
+            struct_stats: StructStats::All,
+        }
+    }
+
+    /// **Disables all stats work**: no stats output, no internal data skipping (even
+    /// when a predicate is set). Kernel reads no stats columns from parquet at all.
+    /// Use when the engine handles its own pruning.
+    ///
+    /// To get internal predicate-based skipping without `stats_parsed` output, use
+    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `All`/`Columns(_)`.
+    pub fn none() -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::None,
+        }
     }
 }
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
-    schema: Option<SchemaRef>,
+    logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
-    stats_output_mode: StatsOutputMode,
+    stats: StatsOptions,
+    correlation_id: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("ScanBuilder")
-            .field("schema", &self.schema)
+            .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
-            .field("stats_output_mode", &self.stats_output_mode)
+            .field("stats", &self.stats)
+            .field("correlation_id", &self.correlation_id)
             .finish()
     }
 }
@@ -133,9 +212,10 @@ impl ScanBuilder {
     pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
         Self {
             snapshot: snapshot.into(),
-            schema: None,
+            logical_read_schema: None,
             predicate: None,
-            stats_output_mode: StatsOutputMode::default(),
+            stats: StatsOptions::default(),
+            correlation_id: None,
         }
     }
 
@@ -146,8 +226,8 @@ impl ScanBuilder {
     ///
     /// [`Schema`]: crate::schema::Schema
     /// [`Snapshot`]: crate::snapshot::Snapshot
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
+    pub fn with_schema(mut self, logical_read_schema: SchemaRef) -> Self {
+        self.logical_read_schema = Some(logical_read_schema);
         self
     }
 
@@ -166,70 +246,44 @@ impl ScanBuilder {
     /// 4` to return a subset of the rows in the scan which satisfy the filter. If `predicate_opt`
     /// is `None`, this is a no-op.
     ///
-    /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
+    /// NOTE: The filtering is best-effort and can produce false positives (rows that should
     /// have been filtered out but were kept).
     ///
-    /// This method can be combined with [`include_all_stats_columns`]. When both are used, the
-    /// kernel performs data skipping internally using the predicate AND outputs parsed
-    /// statistics to the engine via the `stats_parsed` column in scan metadata.
+    /// NOTE: Predicates referencing metadata columns the caller added to the projection via
+    /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
+    /// and will error at build time.
     ///
-    /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
+    /// A predicate alone enables internal data skipping; kernel does not surface stats
+    /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
+    /// also wants stats in the scan metadata output.
+    ///
+    /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
     }
 
-    /// Include all parsed statistics in scan metadata.
+    /// Configure stats output for the scan. See [`StatsOptions`].
     ///
-    /// When enabled, the scan will include a `stats_parsed` column in the scan metadata
-    /// containing pre-parsed file statistics (minValues, maxValues, nullCount, numRecords)
-    /// that integrations can use for their own data skipping logic.
-    ///
-    /// The statistics schema is determined by the table's configuration
-    /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`). In the future,
-    /// a requested columns filter may limit which columns appear in the output without
-    /// affecting the table-level column counting.
-    ///
-    /// This method can be combined with [`with_predicate`]. When both are used, the kernel
-    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
-    /// engine via the `stats_parsed` column in scan metadata.
-    ///
-    /// [`with_predicate`]: ScanBuilder::with_predicate
-    pub fn include_all_stats_columns(mut self) -> Self {
-        self.stats_output_mode = StatsOutputMode::AllColumns;
+    /// Defaults to [`StatsOptions::default`] (JSON only). Engines that consume
+    /// `stats_parsed` directly should pass [`StatsOptions::all_struct`] to skip the
+    /// per-batch `ToJson` synthesis on parsed-stats checkpoints.
+    pub fn with_stats(mut self, stats: StatsOptions) -> Self {
+        self.stats = stats;
         self
     }
 
-    /// Include specific columns in the scan metadata.
+    /// Attach an opaque, caller-supplied correlation id for joining this scan's metric events to
+    /// the caller's own request or operation id. An empty id is treated as unset. When unset,
+    /// behavior is unchanged.
     ///
-    /// When `columns` is non-empty, only those columns' statistics appear in `stats_parsed`.
-    /// When `columns` is empty, no stats are output (equivalent to the default behavior).
+    /// Note: like `operation_id`, the correlation id does not currently survive the
+    /// [`Scan::parallel_scan_metadata`] serialization boundary. A [`ParallelState`] reconstructed
+    /// from serialized bytes on a remote worker carries no correlation id (tracked in #2736).
     ///
-    /// [`with_stats_columns`]: ScanBuilder::with_stats_columns
-    /// [`build`]: ScanBuilder::build
-    pub fn with_stats_columns(mut self, columns: Vec<ColumnName>) -> Self {
-        self.stats_output_mode = StatsOutputMode::Columns(columns);
-        self
-    }
-
-    /// Skip reading file statistics from checkpoint files.
-    ///
-    /// When enabled:
-    /// - Parquet checkpoint reads use column projection to skip the stats column
-    /// - The `stats` field in scan results will be `None`
-    /// - Columnar data skipping is disabled (no stats-based or partition-value-based pruning), but
-    ///   row-level partition filtering still applies
-    ///
-    /// If called after [`include_all_stats_columns`] or [`with_stats_columns`], the last call wins.
-    ///
-    /// Use this when data skipping is handled externally (e.g., by the query engine).
-    ///
-    /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
-    /// [`with_stats_columns`]: ScanBuilder::with_stats_columns
-    pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
-        if skip_stats {
-            self.stats_output_mode = StatsOutputMode::Skip;
-        }
+    /// [`ParallelState`]: crate::scan::ParallelState
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
 
@@ -240,11 +294,14 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
+        // Predicates may reference columns outside self.logical_read_schema, so resolve against the
+        // full table schema
+        let table_schema = self.snapshot.schema();
         // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
         // a transient state, but a scan over zero columns has no way to derive row
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
-        if self.snapshot.schema().num_fields() == 0 {
+        if table_schema.num_fields() == 0 {
             return Err(Error::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
@@ -252,24 +309,28 @@ impl ScanBuilder {
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+        let logical_read_schema = self
+            .logical_read_schema
+            .unwrap_or_else(|| table_schema.clone());
 
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Read(ReadOp::Scan))?;
 
         let state_info = StateInfo::try_new(
-            logical_schema,
+            logical_read_schema,
+            table_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            self.stats_output_mode.clone(),
+            &self.stats,
             (), // No classifier, default is for scans
         )?;
 
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
-            stats_output_mode: self.stats_output_mode,
+            stats: self.stats,
+            correlation_id: self.correlation_id,
         })
     }
 }
@@ -528,7 +589,8 @@ impl HasSelectionVector for ScanMetadata {
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
-    stats_output_mode: StatsOutputMode,
+    stats: StatsOptions,
+    correlation_id: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for Scan {
@@ -536,15 +598,24 @@ impl std::fmt::Debug for Scan {
         f.debug_struct("Scan")
             .field("schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
-            .field("stats_output_mode", &self.stats_output_mode)
+            .field("stats", &self.stats)
+            .field("correlation_id", &self.correlation_id)
             .finish()
     }
 }
 
 impl Scan {
-    /// Whether stats reading is entirely skipped, disabling data skipping.
+    /// Whether stats reading is entirely skipped, disabling internal data skipping.
     fn skip_stats(&self) -> bool {
-        matches!(self.stats_output_mode, StatsOutputMode::Skip)
+        !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
+    }
+
+    /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
+    fn stats_options(&self) -> log_replay::ScanStatsOptions {
+        log_replay::ScanStatsOptions {
+            skip_stats: self.skip_stats(),
+            synthesize_json: self.stats.synthesize_json,
+        }
     }
 
     /// The table's root URL. Any relative paths returned from `scan_data` (or in a callback from
@@ -783,6 +854,8 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
         let operation_id = MetricId::new();
+        let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
+        let correlation_id = self.correlation_id.clone();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
@@ -795,14 +868,20 @@ impl Scan {
                     actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
-                    self.skip_stats(),
+                    self.stats_options(),
                 )?;
                 (Some(it), m)
             }
         };
 
         let on_complete = move || {
-            let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
+            let event = metrics.to_event(
+                operation_id,
+                is_catalog_managed,
+                correlation_id,
+                ScanType::Full,
+                start.elapsed(),
+            );
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
@@ -896,7 +975,7 @@ impl Scan {
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
-    /// # use delta_kernel::engine::default::DefaultEngineBuilder;
+    /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
@@ -959,12 +1038,15 @@ impl Scan {
             engine.as_ref(),
             self.state_info.clone(),
             checkpoint_info,
-            self.skip_stats(),
+            self.stats_options(),
         )?;
         let sequential =
             SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
-        Ok(SequentialScanMetadata::new(sequential))
+        Ok(SequentialScanMetadata::new(
+            sequential,
+            self.correlation_id.clone(),
+        ))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

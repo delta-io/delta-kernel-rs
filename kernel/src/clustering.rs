@@ -76,15 +76,8 @@ pub(crate) fn validate_clustering_columns(
             )));
         }
 
-        // Walk the column path through nested structs and validate the leaf type.
-        // walk_column_fields validates: non-empty path, each field exists, intermediates are
-        // structs.
-        let fields = schema.walk_column_fields(col)?;
-        let leaf_type = fields
-            .last()
-            .ok_or_else(|| Error::generic(format!("Could not resolve column '{col}' in schema")))?
-            .data_type();
-        match leaf_type {
+        let field = schema.field_at(col)?;
+        match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
                 return Err(Error::generic(format!(
@@ -196,11 +189,11 @@ mod tests {
         ]);
         let user_struct = StructType::new_unchecked(vec![
             StructField::new("name", DataType::STRING, true),
-            StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
+            StructField::new("address", address_struct, true),
         ]);
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
-            StructField::new("user", DataType::Struct(Box::new(user_struct)), true),
+            StructField::new("user", user_struct, true),
         ]);
 
         // Nested leaf column with eligible type should succeed
@@ -212,11 +205,8 @@ mod tests {
     fn test_validate_clustering_nested_struct_leaf_rejected() {
         let inner_struct =
             StructType::new_unchecked(vec![StructField::new("field", DataType::STRING, false)]);
-        let schema = StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner_struct)),
-            false,
-        )]);
+        let schema =
+            StructType::new_unchecked(vec![StructField::new("parent", inner_struct, false)]);
 
         // Clustering on an entire struct (not a leaf primitive) should fail
         let columns = vec![ColumnName::new(["parent"])];
@@ -244,11 +234,8 @@ mod tests {
     fn test_validate_clustering_nested_path_not_found() {
         let inner_struct =
             StructType::new_unchecked(vec![StructField::new("field", DataType::STRING, false)]);
-        let schema = StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner_struct)),
-            false,
-        )]);
+        let schema =
+            StructType::new_unchecked(vec![StructField::new("parent", inner_struct, false)]);
 
         // Nested field that doesn't exist should fail
         let columns = vec![ColumnName::new(["parent", "nonexistent"])];
@@ -341,23 +328,11 @@ mod tests {
             StructType::new_unchecked(vec![StructField::new("inner", DataType::STRING, false)]);
 
         let schema = StructType::new_unchecked(vec![
-            StructField::new(
-                "struct_col",
-                DataType::Struct(Box::new(inner_struct)),
-                false,
-            ),
-            StructField::new(
-                "array_col",
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
-                false,
-            ),
+            StructField::new("struct_col", inner_struct, false),
+            StructField::new("array_col", ArrayType::new(DataType::INTEGER, false), false),
             StructField::new(
                 "map_col",
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::INTEGER,
-                    false,
-                ))),
+                MapType::new(DataType::STRING, DataType::INTEGER, false),
                 false,
             ),
         ]);

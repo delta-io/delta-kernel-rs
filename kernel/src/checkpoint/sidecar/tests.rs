@@ -19,8 +19,7 @@ use crate::checkpoint::tests::{
 use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
-use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use crate::engine::default::DefaultEngineBuilder;
+use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
@@ -46,11 +45,7 @@ fn generate_checkpoint_parts(
 ) -> DeltaResult<CheckpointParts> {
     let data_iter = writer.checkpoint_data(engine)?;
     let iter_state = data_iter.state();
-    let output_schema = writer
-        .checkpoint_output_schema
-        .get()
-        .cloned()
-        .expect("checkpoint_output_schema should be set by checkpoint_data");
+    let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
@@ -92,14 +87,9 @@ fn generate_checkpoint_parts(
     })
 }
 
-/// Helper to build a DefaultEngine with multi-thread executor.
-fn new_multi_thread_engine(store: Arc<InMemory>) -> impl Engine {
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    DefaultEngineBuilder::new(store)
-        .with_task_executor(executor)
-        .build()
+/// Helper to build a SyncEngine backed by an in-memory store.
+fn new_sync_engine(store: Arc<InMemory>) -> impl Engine {
+    SyncEngine::new_with_store(store)
 }
 
 struct ExpectedNonFileContent<'a> {
@@ -290,7 +280,7 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,
@@ -317,7 +307,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     let result = generate_checkpoint_parts(&writer, &engine, usize::MAX)?;
 
@@ -353,7 +343,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     // Commit 0: v2 protocol + metadata + 3 adds (mixed batch of file and non-file actions)
     write_commit_to_store(
@@ -395,7 +385,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // hint=3: with DefaultEngine, each commit is one batch. Reconciliation replays
     // in reverse: commit 3 (1 add), commit 2 (2 adds + 1 remove = 3 file rows),
@@ -463,7 +453,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,
@@ -497,7 +487,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // hint=1: each batch exceeds the hint, so each gets its own sidecar.
     let result = generate_checkpoint_parts(&writer, &engine, 1)?;
@@ -533,7 +523,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,
@@ -565,7 +555,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     let data_iter = writer.checkpoint_data(&engine)?;
     let mut all_batches = Vec::new();
@@ -576,10 +566,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
     }
 
     // Validate the checkpoint data schema
-    let schema = writer
-        .checkpoint_output_schema
-        .get()
-        .expect("should be cached after checkpoint_data");
+    let schema = &writer.output_schema;
     let add_field = schema.field(ADD_NAME).expect("schema should have 'add'");
     if let DataType::Struct(ref add_struct) = add_field.data_type {
         assert!(
@@ -648,7 +635,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let engine = new_sync_engine(store.clone());
 
     write_commit_to_store(
         &store,
@@ -662,14 +649,10 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     let data_iter = writer.checkpoint_data(&engine)?;
-    let output_schema = writer
-        .checkpoint_output_schema
-        .get()
-        .cloned()
-        .expect("checkpoint_output_schema should be set by checkpoint_data");
+    let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,

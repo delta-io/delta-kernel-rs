@@ -14,10 +14,6 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
@@ -32,6 +28,10 @@ use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMap
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transforms::{transform_output_type, SchemaTransform};
+use test_utils::delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     add_commit, create_add_files_metadata, into_record_batch, read_add_infos, test_table_setup_mt,
     write_batch_to_table,
@@ -55,11 +55,11 @@ async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
     });
     let schema = StructType::try_new(vec![StructField::nullable(
         "data",
-        DataType::Map(Box::new(MapType::new(
+        MapType::new(
             DataType::INTEGER,
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            ArrayType::new(DataType::INTEGER, true),
             true,
-        ))),
+        ),
     )
     .with_metadata([
         (
@@ -398,35 +398,41 @@ fn complex_nested_data_type() -> DataType {
     let inner_struct = StructType::try_new(vec![
         StructField::nullable(
             "inner_map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            MapType::new(
+                ArrayType::new(DataType::INTEGER, true),
                 DataType::INTEGER,
                 true,
-            ))),
+            ),
         ),
         StructField::nullable("n", DataType::INTEGER),
     ])
     .unwrap();
-    DataType::Map(Box::new(MapType::new(
-        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-        DataType::Struct(Box::new(inner_struct)),
+    DataType::from(MapType::new(
+        ArrayType::new(DataType::INTEGER, true),
+        inner_struct,
         true,
-    )))
+    ))
 }
 
 const ROWS_PER_PARTITION: i32 = 3;
 const PARTITION_REGIONS: &[&str] = &["a", "b"];
 
-/// Build a [`RecordBatch`] with [`ROWS_PER_PARTITION`] rows for the given `region` following the
-/// schema of [`nested_schema_with_all_delta_types`]. `random_seed` is used directly to produce
-/// different values so different calls produce distinguishable rows;
-fn build_partition_batch(random_seed: i32, region: &str) -> RecordBatch {
+/// Build a [`RecordBatch`] with [`ROWS_PER_PARTITION`] rows following the schema of
+/// [`nested_schema_with_all_delta_types`], minus the `region` partition column. `random_seed` is
+/// used directly to produce different values so different calls produce distinguishable rows.
+fn build_data_batch(random_seed: i32) -> RecordBatch {
     let rows = ROWS_PER_PARTITION as usize;
 
-    let schema = nested_schema_with_all_delta_types();
-    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
+    // Data schema excludes the `region` partition column.
+    let data_schema = StructType::try_new(
+        nested_schema_with_all_delta_types()
+            .fields()
+            .filter(|f| f.name() != "region")
+            .cloned(),
+    )
+    .unwrap();
+    let arrow_schema: ArrowSchema = (&data_schema).try_into_arrow().unwrap();
 
-    let region_partition_col: ArrayRef = Arc::new(StringArray::from(vec![region; rows]));
     let int_col: ArrayRef = Arc::new(Int32Array::from(
         (0..ROWS_PER_PARTITION)
             .map(|i| random_seed + i)
@@ -504,7 +510,6 @@ fn build_partition_batch(random_seed: i32, region: &str) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(arrow_schema),
         vec![
-            region_partition_col,
             int_col,
             bool_col,
             byte_col,
@@ -593,7 +598,7 @@ async fn write_partitioned_data(
     let mut snapshot = Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())
         .unwrap();
-    // Defensive sanity check: confirm the table schema matches what `build_partition_batch`
+    // Defensive sanity check: confirm the table schema matches what `build_data_batch`
     // produces. We compare top-level field names rather than full structs for simplicity.
     let actual_schema = snapshot.schema();
     let actual_fields: Vec<&str> = actual_schema.fields().map(|f| f.name().as_str()).collect();
@@ -608,7 +613,7 @@ async fn write_partitioned_data(
     );
 
     for region in PARTITION_REGIONS {
-        let batch = build_partition_batch(random_seed, region);
+        let batch = build_data_batch(random_seed);
         let partition_values =
             HashMap::from([("region".to_string(), Scalar::String(region.to_string()))]);
         snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values)

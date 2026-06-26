@@ -9,8 +9,8 @@ Before reading this page, make sure you understand
 [The Engine Trait](../concepts/engine_trait.md).
 
 > [!NOTE]
-> The storage APIs on this page require one of the `default-engine` feature flags
-> (`default-engine-rustls` or `default-engine-native-tls`).
+> The storage APIs on this page come from the `delta_kernel_default_engine` crate. Add it
+> to your `Cargo.toml` with either the `rustls` or `native-tls` feature.
 > See [Feature Flags](../concepts/feature_flags.md) for details.
 
 Kernel provides several paths to construct an object store, depending on how
@@ -42,11 +42,12 @@ the storage backend from the URL scheme:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # extern crate url;
 # use std::sync::Arc;
 # use url::Url;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::DeltaResult;
 # fn main() -> DeltaResult<()> {
 let url = Url::parse("file:///path/to/table")?;
@@ -63,11 +64,12 @@ To pass provider-specific options (credentials, region, endpoint, etc.), use
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # extern crate url;
 # use std::collections::HashMap;
 # use url::Url;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url_opts;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url_opts;
 # use delta_kernel::DeltaResult;
 # fn main() -> DeltaResult<()> {
 let url = Url::parse("s3://my-bucket/path/to/table")?;
@@ -92,7 +94,7 @@ If you need to support a URL scheme that `object_store` doesn't handle natively 
 
 ```rust,ignore
 use std::sync::Arc;
-use delta_kernel::engine::default::storage::insert_url_handler;
+use delta_kernel_default_engine::storage::insert_url_handler;
 
 insert_url_handler("hdfs", Arc::new(|url, options| {
     // Build your custom ObjectStore from the URL and options
@@ -116,7 +118,7 @@ pass it to the engine builder:
 ```rust,ignore
 use std::sync::Arc;
 use object_store::local::LocalFileSystem;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel_default_engine::DefaultEngine;
 
 let store = Arc::new(LocalFileSystem::new());
 let engine = DefaultEngine::builder(store).build();

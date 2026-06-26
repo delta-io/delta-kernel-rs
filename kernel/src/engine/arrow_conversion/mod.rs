@@ -368,6 +368,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    PrimitiveType::Void => Ok(ArrowDataType::Null),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -554,6 +555,7 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             ArrowDataType::UInt32 => Ok(DataType::INTEGER),
             ArrowDataType::UInt16 => Ok(DataType::SHORT),
             ArrowDataType::UInt8 => Ok(DataType::BYTE),
+            ArrowDataType::Null => Ok(DataType::VOID),
             ArrowDataType::Float32 => Ok(DataType::FLOAT),
             ArrowDataType::Float64 => Ok(DataType::DOUBLE),
             ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
@@ -584,32 +586,41 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            // Millisecond is coarser than the kernel's microsecond logical timestamp, so
+            // mapping it onto the logical type is a lossless upscale (values are rescaled
+            // x1000 by the engine on read).
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, Some(tz))
+                if tz.eq_ignore_ascii_case("utc") =>
+            {
+                Ok(DataType::TIMESTAMP)
+            }
             ArrowDataType::Struct(fields) => DataType::try_struct_type_from_results(
                 fields.iter().map(|field| field.as_ref().try_into_kernel()),
             )
             .map_err(|e| ArrowError::from_external_error(e.into())),
             ArrowDataType::List(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::ListView(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::LargeList(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::LargeListView(field) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
             ArrowDataType::FixedSizeList(field, _) => Ok(ArrayType::new(
-                (*field).data_type().try_into_kernel()?,
+                DataType::try_from_arrow((*field).data_type())?,
                 (*field).is_nullable(),
             )
             .into()),
@@ -668,6 +679,100 @@ mod tests {
             new_metadata.get("description").unwrap(),
             &"hello world".to_owned()
         );
+        Ok(())
+    }
+
+    // Delta tables can have void columns. The kernel should parse them and convert
+    // to Arrow's Null type (and back).
+    #[test]
+    fn test_void_type_roundtrip() -> DeltaResult<()> {
+        let json = r#"
+        {
+            "name": "void_col",
+            "type": "void",
+            "nullable": true,
+            "metadata": {} 
+        }
+        "#;
+
+        let field: crate::schema::StructField = serde_json::from_str(json).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(PrimitiveType::Void));
+
+        let arrow_type = ArrowDataType::try_from_kernel(&field.data_type)?;
+        assert_eq!(arrow_type, ArrowDataType::Null);
+
+        let kernel_type = DataType::try_from_arrow(&ArrowDataType::Null)?;
+        assert_eq!(kernel_type, DataType::Primitive(PrimitiveType::Void));
+
+        Ok(())
+    }
+
+    // Millisecond-precision timestamps (e.g. from externally-written checkpoint stats)
+    // must convert like microsecond/nanosecond: UTC tz -> TIMESTAMP, no tz -> TIMESTAMP_NTZ.
+    #[test]
+    fn test_millisecond_timestamp_conversion() -> DeltaResult<()> {
+        let utc = DataType::try_from_arrow(&ArrowDataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some("UTC".into()),
+        ))?;
+        assert_eq!(utc, DataType::TIMESTAMP);
+
+        let ntz = DataType::try_from_arrow(&ArrowDataType::Timestamp(TimeUnit::Millisecond, None))?;
+        assert_eq!(ntz, DataType::TIMESTAMP_NTZ);
+
+        Ok(())
+    }
+
+    // void is inherently always-null, so nullable=false is semantically contradictory.
+    // We tolerate it on reads (be permissive), and the Arrow conversion still
+    // produces ArrowDataType::Null. The field retains nullable=false as-is — no coercion.
+    #[test]
+    fn test_void_type_not_nullable() -> DeltaResult<()> {
+        let json = r#"
+        {
+            "name": "void_col",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+
+        let field: crate::schema::StructField = serde_json::from_str(json).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(PrimitiveType::Void));
+        assert!(!field.is_nullable());
+
+        // Arrow conversion still works — produces Null type
+        let arrow_field = ArrowField::try_from_kernel(&field)?;
+        assert_eq!(arrow_field.data_type(), &ArrowDataType::Null);
+
+        // Void is always-null by definition, so nullable=false is semantically
+        // contradictory. We tolerate it on reads to avoid breaking existing tables.
+        assert!(!arrow_field.is_nullable());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_void_field_in_struct() -> DeltaResult<()> {
+        // A struct schema with a void column should convert to Arrow with a Null field
+        let schema = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("void_col", DataType::VOID),
+        ])?;
+
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        assert_eq!(arrow_schema.fields().len(), 2);
+        assert_eq!(arrow_schema.field(0).data_type(), &ArrowDataType::Int32);
+        assert_eq!(arrow_schema.field(1).data_type(), &ArrowDataType::Null);
+        assert_eq!(arrow_schema.field(1).name(), "void_col");
+
+        // And back to kernel
+        let kernel_schema = StructType::try_from_arrow(&arrow_schema)?;
+        assert_eq!(
+            kernel_schema.field("void_col").unwrap().data_type,
+            DataType::VOID
+        );
+
         Ok(())
     }
 
@@ -824,7 +929,7 @@ mod tests {
             ColumnMetadataKey::ParquetFieldId.as_ref(),
             MetadataValue::Number(5),
         )])])?;
-        let array_type = ArrayType::new(DataType::Struct(Box::new(array_item_struct)), false);
+        let array_type = ArrayType::new(array_item_struct, false);
 
         // Build map with struct key and struct value (both with field IDs)
         let map_key_struct = StructType::try_new(vec![StructField::new(
@@ -845,11 +950,7 @@ mod tests {
             ColumnMetadataKey::ParquetFieldId.as_ref(),
             MetadataValue::Number(8),
         )])])?;
-        let map_type = MapType::new(
-            DataType::Struct(Box::new(map_key_struct)),
-            DataType::Struct(Box::new(map_value_struct)),
-            false,
-        );
+        let map_type = MapType::new(map_key_struct, map_value_struct, false);
 
         // Build top-level struct
         let top_struct = StructType::try_new(vec![
@@ -857,26 +958,18 @@ mod tests {
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(1),
             )]),
-            StructField::new(
-                "nested_struct",
-                DataType::Struct(Box::new(inner_struct_type)),
-                false,
-            )
-            .with_metadata([(
+            StructField::new("nested_struct", inner_struct_type, false).with_metadata([(
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(2),
             )]),
-            StructField::new("array_field", DataType::Array(Box::new(array_type)), false)
-                .with_metadata([(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(4),
-                )]),
-            StructField::new("map_field", DataType::Map(Box::new(map_type)), false).with_metadata(
-                [(
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                    MetadataValue::Number(6),
-                )],
-            ),
+            StructField::new("array_field", array_type, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(4),
+            )]),
+            StructField::new("map_field", map_type, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(6),
+            )]),
         ])?;
 
         // Convert to Arrow schema

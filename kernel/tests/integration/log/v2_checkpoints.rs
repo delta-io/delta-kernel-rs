@@ -7,14 +7,12 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray,
     StructArray,
 };
-use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
-use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
@@ -23,11 +21,13 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
     begin_transaction, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
     load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
+use crate::common::read_utils::read_parquet_file;
 use crate::common::write_utils::{
     get_simple_schema, load_existing_single_file_checkpoint_path, resolve_struct_field,
     simple_id_batch,
@@ -852,19 +852,6 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Reads all parquet record batches from a file, concatenating them into a single batch.
-fn read_parquet_file(path: &std::path::Path) -> RecordBatch {
-    let bytes = std::fs::read(path).expect("failed to read parquet file");
-    let bytes = bytes::Bytes::from(bytes);
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .expect("failed to create parquet reader")
-        .build()
-        .expect("failed to build reader");
-    let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
-    let schema = batches[0].schema();
-    concat_batches(&schema, &batches).expect("failed to concat batches")
-}
-
 /// Reads the `_last_checkpoint` JSON file from the table's `_delta_log` directory.
 fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
     let path = std::path::Path::new(table_path).join("_delta_log/_last_checkpoint");
@@ -884,7 +871,7 @@ fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
 async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
 ) -> DeltaResult<Arc<Snapshot>> {
     fn make_info_array(names: &[&str]) -> ArrayRef {
         let name_array: ArrayRef = Arc::new(StringArray::from(
@@ -1141,7 +1128,7 @@ fn assert_sidecars_contain_only_file_actions(
 async fn create_partitioned_stats_table<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
@@ -1606,7 +1593,7 @@ fn cross_feature_schema() -> Arc<StructType> {
 async fn build_v2_table_with_feature<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
     features: &[CrossFeature],
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = cross_feature_schema();

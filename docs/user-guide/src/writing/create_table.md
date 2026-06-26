@@ -11,10 +11,11 @@ The `create_table` function returns a builder that you configure and then commit
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::DeltaResult;
@@ -93,10 +94,11 @@ You can set custom application properties on the table:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::DeltaResult;
@@ -128,10 +130,11 @@ layout for queries that filter on the clustering columns:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
@@ -183,10 +186,11 @@ entire directories when filtering on those columns.
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel::committer::FileSystemCommitter;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
@@ -224,12 +228,12 @@ create_table(url.as_str(), schema, "my-app/1.0")
 - **At least one partition column**: if `DataLayout::partitioned(...)` is used, the column
   list cannot be empty.
 
-### Physical vs. logical schema
+### Where partition values live
 
-Partition column values are stored in the directory path rather than inside the data files
-themselves. When you call `WriteContext::physical_schema()`, the returned schema excludes
-partition columns. Your connector writes data files using the physical schema, and Kernel
-reconstructs the full logical schema (including partition values from the path) at read time.
+Partition column values are stored in the `partitionValues` field of each `add` action in
+the transaction log rather than inside the data files, although specific table
+features may additionally materialize them into the data files; see
+[Writing to Partitioned Tables](./partitioned_writes.md).
 
 > [!NOTE]
 > Partitioning and clustering are mutually exclusive. You can call `with_data_layout()` with

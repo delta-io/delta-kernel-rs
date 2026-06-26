@@ -10,7 +10,7 @@
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use tracing::warn;
@@ -21,16 +21,16 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
-use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
+use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name,
+    column_mapping_mode, get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, CreatePath, CreateSupport,
     DataWriteOp, DdlOp, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, OpSupport,
     Operation, ReadOp, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
     MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -71,40 +71,20 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     }
 }
 
-/// Physical schema variants for a table.
-///
-/// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
-/// - `without_partition`: lazily computed variant that excludes partition columns.
-///
-/// Note:
-/// `without_partition` is wrapped in an `Arc` so that the lazily-initialized schema is shared
-/// across clones of this struct (and therefore across clones of [`TableConfiguration`]).  Without
-/// Arc'ing the lock, clones of a [`TableConfiguration`] with an uninitialized schema would clone
-/// the empty `OnceLock`, meaning later schema loads would unnecessarily store independent
-/// copies of the same schema.
-#[derive(Debug, Clone, Eq)]
-struct PhysicalSchemas {
-    full: SchemaRef,
-    without_partition: Arc<OnceLock<SchemaRef>>,
-}
-
-impl PhysicalSchemas {
-    fn new(full: SchemaRef) -> Self {
-        Self {
-            full,
-            without_partition: Arc::new(OnceLock::new()),
+fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> DeltaResult<()> {
+    let mut seen = HashSet::new();
+    for col in metadata.partition_columns() {
+        if !seen.insert(col) {
+            return Err(Error::generic(format!(
+                "Duplicate partition column: '{col}'"
+            )));
         }
+        require!(
+            logical_schema.field(col).is_some(),
+            Error::generic(format!("Partition column '{col}' not found in schema"))
+        );
     }
-}
-
-impl PartialEq for PhysicalSchemas {
-    fn eq(&self, other: &Self) -> bool {
-        // `without_partition` is deterministically derived from `full` and partition columns
-        // (compared via `metadata` in TableConfiguration's PartialEq), so comparing it is
-        // redundant. Two PhysicalSchemas with the same `full` are considered equal even if
-        // one has `without_partition` initialized and the other does not.
-        self.full == other.full
-    }
+    Ok(())
 }
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
@@ -124,7 +104,12 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
-    physical_schemas: PhysicalSchemas,
+    /// The subset of the logical schema that remains after excluding partition columns.
+    logical_schema_without_partition_columns: SchemaRef,
+    /// Physical schema for all columns (field names respect column mapping mode).
+    physical_schema: SchemaRef,
+    /// The subset of the physical schema that remains after excluding partition columns.
+    physical_data_schema_without_partition_columns: SchemaRef,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -189,11 +174,36 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
-        let physical_schemas = PhysicalSchemas::new(physical_schema);
+        let partition_columns: HashSet<&str> = metadata
+            .partition_columns()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let physical_data_schema_without_partition_columns = {
+            let fields = logical_schema
+                .fields()
+                .zip(physical_schema.fields())
+                .filter(|(logical_field, _)| {
+                    !partition_columns.contains(logical_field.name().as_str())
+                })
+                .map(|(_, physical_field)| physical_field.clone());
+            // Safety: subset of an already-valid schema.
+            Arc::new(StructType::new_unchecked(fields))
+        };
+        let logical_schema_without_partition_columns = {
+            let fields = logical_schema
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name().as_str()))
+                .cloned();
+            // Safety: subset of an already-valid schema.
+            Arc::new(StructType::new_unchecked(fields))
+        };
 
         let table_config = Self {
             logical_schema,
-            physical_schemas,
+            logical_schema_without_partition_columns,
+            physical_schema,
+            physical_data_schema_without_partition_columns,
             metadata,
             protocol,
             table_properties,
@@ -202,10 +212,12 @@ impl TableConfiguration {
             version,
         };
 
+        validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
+
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
-        validate_iceberg_compat_v3_no_legacy_nested_id(&table_config)?;
+        validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
         Ok(table_config)
     }
@@ -381,43 +393,14 @@ impl TableConfiguration {
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
-    /// Returns the logical schema for data columns (excludes partition columns).
-    ///
-    /// Partition columns are excluded because statistics are only collected for data columns
-    /// that are physically stored in the parquet files. Partition values are stored in the
-    /// file path, not in the file content, so they don't have file-level statistics.
-    fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.partition_columns();
-        Arc::new(StructType::new_unchecked(
-            self.logical_schema()
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name()))
-                .cloned(),
-        ))
+    /// Returns the logical schema excluding partition columns.
+    pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
+        self.logical_schema_without_partition_columns.clone()
     }
 
     /// Returns the physical data schema excluding partition columns.
     pub(crate) fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
-        self.physical_schemas
-            .without_partition
-            .get_or_init(|| {
-                let partition_columns: HashSet<&str> = self
-                    .partition_columns()
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                // Safety: subset of an already-valid schema.
-                Arc::new(StructType::new_unchecked(
-                    self.logical_schema()
-                        .fields()
-                        .zip(self.physical_schemas.full.fields())
-                        .filter(|(logical_field, _)| {
-                            !partition_columns.contains(logical_field.name().as_str())
-                        })
-                        .map(|(_, physical_field)| physical_field.clone()),
-                ))
-            })
-            .clone()
+        self.physical_data_schema_without_partition_columns.clone()
     }
 
     /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
@@ -429,7 +412,7 @@ impl TableConfiguration {
             .data_skipping_stats_columns
             .as_ref()
             .map(|cols| {
-                let logical_schema = self.logical_data_schema();
+                let logical_schema = self.logical_schema_without_partition_columns();
                 let mode = self.column_mapping_mode();
                 cols.iter()
                     .filter_map(|col| {
@@ -475,7 +458,7 @@ impl TableConfiguration {
     /// physical column names derived from column mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
-        self.physical_schemas.full.clone()
+        self.physical_schema.clone()
     }
 
     /// Whether partition column values must be materialized into data files.
@@ -495,15 +478,17 @@ impl TableConfiguration {
     ///
     /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
-    /// schema with partition columns excluded.
+    /// schema with partition columns excluded. Void columns are always stripped from the
+    /// returned schema, since they are never written to Parquet.
     ///
     /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.should_materialize_partition_columns() {
+        let with_partition_cols = if self.should_materialize_partition_columns() {
             self.physical_schema()
         } else {
             self.physical_data_schema_without_partition_columns()
-        }
+        };
+        strip_void_from_schema(with_partition_cols)
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -1039,6 +1024,52 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn table_configuration_rejects_partition_column_missing_from_schema() {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["missing".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+
+        assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
+    }
+
+    #[test]
+    fn table_configuration_rejects_duplicate_partition_columns() {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("value", DataType::INTEGER),
+            StructField::nullable("part", DataType::STRING),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part".to_string(), "part".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+
+        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
     }
 
     #[test]
@@ -1853,6 +1884,25 @@ mod test {
             .is_ok());
     }
 
+    // A catalog-managed table requires inCommitTimestamp to be enabled.
+    #[rstest]
+    #[case::catalog_managed(
+        TableFeature::CatalogManaged,
+        "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"
+    )]
+    #[case::catalog_owned_preview(
+        TableFeature::CatalogOwnedPreview,
+        "Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled"
+    )]
+    fn test_catalog_managed_requires_in_commit_timestamp(
+        #[case] feature: TableFeature,
+        #[case] expected_error: &str,
+    ) {
+        let config = create_mock_table_config(&[], &[feature]);
+        let result = config.ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append));
+        assert_result_error_with_message(result, expected_error);
+    }
+
     /// Helper to create a schema with column mapping metadata using JSON deserialization
     fn schema_with_column_mapping() -> SchemaRef {
         let field_a: StructField = serde_json::from_str(
@@ -2121,80 +2171,23 @@ mod test {
         );
     }
 
-    /// Verifies that the lazily-computed physical-without-partition schema is shared across
-    /// clones of `TableConfiguration` (both direct clones and the no-P/M version-bump path in
-    /// `try_new_from`), while configurations built from independent or updated metadata each
-    /// get their own `Arc<OnceLock>` and therefore their own schema allocation. This guards
-    /// against the per-version memory amplification seen when callers retain many adjacent
-    /// versions of a wide table.
     #[test]
-    fn test_physical_data_schema_without_partition_columns_is_shared_across_clones() {
-        let base = create_partitioned_table_config_with_column_mapping(
+    fn test_partition_columns_are_logical_under_column_mapping() {
+        let config = create_partitioned_table_config_with_column_mapping(
             partitioned_schema_with_column_mapping(),
             "name",
             vec!["part_a".to_string(), "part_b".to_string()],
             [],
         );
 
-        let clone_direct = base.clone();
-        let clone_bumped = TableConfiguration::try_new_from(&base, None, None, 1).unwrap();
-
-        let schema_from_bumped = clone_bumped.physical_data_schema_without_partition_columns();
-
-        let schema_from_base = base.physical_data_schema_without_partition_columns();
-        let schema_from_direct = clone_direct.physical_data_schema_without_partition_columns();
-        assert!(
-            Arc::ptr_eq(&schema_from_bumped, &schema_from_base),
-            "version-bumped clone and base should share the cached SchemaRef"
-        );
-        assert!(
-            Arc::ptr_eq(&schema_from_bumped, &schema_from_direct),
-            "direct .clone() and base should share the cached SchemaRef"
-        );
-
-        // A separately constructed TableConfiguration with the same logical schema must NOT
-        // share storage -- each construction allocates its own Arc<OnceLock>.
-        let independent = create_partitioned_table_config_with_column_mapping(
-            partitioned_schema_with_column_mapping(),
-            "name",
-            vec!["part_a".to_string(), "part_b".to_string()],
-            [],
-        );
-        let schema_from_independent = independent.physical_data_schema_without_partition_columns();
-        assert_eq!(
-            schema_from_independent.as_ref(),
-            schema_from_base.as_ref(),
-            "independent config should produce an equal schema"
-        );
-        assert!(
-            !Arc::ptr_eq(&schema_from_independent, &schema_from_base),
-            "independent TableConfiguration must not share the cached SchemaRef"
-        );
-
-        // try_new_from that actually changes metadata (here: drop one partition column) must
-        // also build a fresh PhysicalSchemas. The new cached schema differs from the original.
-        let new_schema = partitioned_schema_with_column_mapping();
-        let new_metadata = Metadata::try_new(
-            None,
-            None,
-            new_schema,
-            vec!["part_a".to_string()],
-            0,
-            HashMap::from_iter([(COLUMN_MAPPING_MODE.to_string(), "name".to_string())]),
-        )
-        .unwrap();
-        let updated = TableConfiguration::try_new_from(&base, Some(new_metadata), None, 2).unwrap();
-        let schema_from_updated = updated.physical_data_schema_without_partition_columns();
-        assert!(
-            !Arc::ptr_eq(&schema_from_updated, &schema_from_base),
-            "updated metadata must allocate a fresh OnceLock cell"
-        );
-        assert_ne!(
-            schema_from_updated.as_ref(),
-            schema_from_base.as_ref(),
-            "updated metadata changes which columns are partition columns, so the schemas \
-             must differ"
-        );
+        assert_eq!(config.partition_columns(), ["part_a", "part_b"]);
+        let partition_schema = config
+            .build_partition_values_parsed_schema()
+            .expect("partition schema should be present");
+        assert!(partition_schema.field("phys_part_a").is_some());
+        assert!(partition_schema.field("phys_part_b").is_some());
+        assert!(partition_schema.field("part_a").is_none());
+        assert!(partition_schema.field("part_b").is_none());
     }
 
     #[test]
@@ -2470,6 +2463,49 @@ mod test {
         // physical schema as expected.
         let field_names: Vec<&str> = write_schema.fields().map(|f| f.name.as_str()).collect();
         assert_eq!(field_names, expected_field_names);
+    }
+
+    #[test]
+    fn test_physical_write_schema_strips_void_columns() {
+        // Pins the invariant that `physical_write_schema()` strips void columns from the
+        // returned schema (top level and nested), so callers receive a Parquet-writable
+        // schema without needing to apply `strip_void_from_schema` themselves.
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("v", DataType::VOID),
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("nested_void", DataType::VOID),
+                ]),
+            ),
+        ]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(Vec::<TableFeature>::new()),
+        )
+        .unwrap();
+        let config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+
+        let write_schema = config.physical_write_schema();
+
+        // Top-level void is dropped.
+        let top_names: Vec<&str> = write_schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(top_names, vec!["id", "s"]);
+
+        // Nested void is also dropped, leaving only `a` inside `s`.
+        let s_field = write_schema.field("s").expect("s present after strip");
+        let DataType::Struct(s_inner) = s_field.data_type() else {
+            panic!("s should still be a struct");
+        };
+        let s_names: Vec<&str> = s_inner.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(s_names, vec!["a"]);
     }
 
     #[test]
@@ -2782,6 +2818,9 @@ mod test {
     /// CatalogManaged and CatalogOwnedPreview's `read.cdf` cell must block CDF reads
     /// whenever the feature is in the protocol's reader features. Reads of regular table
     /// data (`Scan`) must still succeed.
+    ///
+    /// Both features require `inCommitTimestamp` to be enabled, so the mock table enables it;
+    /// otherwise the feature-requirement check would fail before the CDF cell is reached.
     #[rstest]
     #[case(TableFeature::CatalogManaged, "Feature 'catalogManaged'")]
     #[case(TableFeature::CatalogOwnedPreview, "Feature 'catalogOwned-preview'")]
@@ -2789,7 +2828,10 @@ mod test {
         #[case] feature: TableFeature,
         #[case] expected_substring: &str,
     ) {
-        let config = create_mock_table_config(&[], &[feature]);
+        let config = create_mock_table_config(
+            &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
+            &[feature, TableFeature::InCommitTimestamp],
+        );
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Read(ReadOp::Cdf)),
             expected_substring,

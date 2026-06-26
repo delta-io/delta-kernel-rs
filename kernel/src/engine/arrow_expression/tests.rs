@@ -286,20 +286,13 @@ fn test_literal_complex_type_array() {
         )
         .unwrap(),
     );
-    let map_type = MapType::new(
-        KernelDataType::STRING,
-        KernelDataType::Array(Box::new(array_type.clone())),
-        true,
-    );
+    let map_type = MapType::new(KernelDataType::STRING, array_type.clone(), true);
     let map_value = Scalar::Map(
         MapData::try_new(
             map_type.clone(),
             [
                 ("array".to_string(), array_value.clone()),
-                (
-                    "null_array".to_string(),
-                    Scalar::Null(array_type.clone().into()),
-                ),
+                ("null_array".to_string(), Scalar::null(array_type.clone())),
             ],
         )
         .unwrap(),
@@ -318,20 +311,20 @@ fn test_literal_complex_type_array() {
             vec![
                 Scalar::Integer(42),
                 array_value,
-                Scalar::Null(array_type.clone().into()),
+                Scalar::null(array_type.clone()),
                 map_value,
-                Scalar::Null(map_type.clone().into()),
+                Scalar::null(map_type.clone()),
             ],
         )
         .unwrap(),
     );
-    let nested_array_type = ArrayType::new(struct_type.clone().into(), true);
+    let nested_array_type = ArrayType::new(struct_type.clone(), true);
     let nested_array_value = Scalar::Array(
         ArrayData::try_new(
             nested_array_type.clone(),
             vec![
                 struct_value.clone(),
-                Scalar::Null(struct_type.clone().into()),
+                Scalar::null(struct_type.clone()),
                 struct_value.clone(),
             ],
         )
@@ -1056,7 +1049,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
-    let null_scalar_map = Scalar::Null(KernelDataType::Map(Box::new(map_type)));
+    let null_scalar_map = Scalar::null(map_type);
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
@@ -1086,10 +1079,10 @@ fn test_apply_schema_column_count_mismatch() {
     ]);
 
     // Create a schema with only 2 fields (mismatch)
-    let schema = KernelDataType::Struct(Box::new(StructType::new_unchecked([
+    let schema = KernelDataType::from(StructType::new_unchecked([
         StructField::not_null("a", KernelDataType::INTEGER),
         StructField::not_null("b", KernelDataType::INTEGER),
-    ])));
+    ]));
 
     let result = apply_schema(&struct_array, &schema);
 
@@ -1281,17 +1274,18 @@ fn mixed_string_kernel_fields() -> [StructField; 3] {
 }
 
 /// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
-/// identity transform branch. The output schema is derived from actual column types, so
+/// empty patch branch. The output schema is derived from actual column types, so
 /// `LargeUtf8` and `Utf8View` columns remain valid even though the kernel type is `STRING`.
 #[test]
 fn test_evaluator_mixed_string_types_identity_transform() {
     let engine_data = ArrowEngineData::new(make_mixed_string_batch());
     let fields = mixed_string_kernel_fields();
     let input_schema = Arc::new(StructType::new_unchecked(fields.clone()));
-    let output_type = KernelDataType::Struct(Box::new(StructType::new_unchecked(fields)));
+    let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
     let handler = ArrowEvaluationHandler;
-    let expression: ExpressionRef = Arc::new(Expression::Transform(Transform::new_top_level()));
+    let expression: ExpressionRef =
+        Arc::new(Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap());
     handler
         .new_expression_evaluator(input_schema, expression, output_type)
         .unwrap()
@@ -1318,7 +1312,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         "st",
         KernelDataType::struct_type_unchecked(fields.clone()),
     )]));
-    let output_type = KernelDataType::Struct(Box::new(StructType::new_unchecked(fields)));
+    let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
     let handler = ArrowEvaluationHandler;
     let expression: ExpressionRef = Arc::new(column_expr!("st"));
@@ -1488,4 +1482,12 @@ fn test_create_many_nested_struct() {
     )
     .unwrap();
     assert_create_many(&[row1, row2], schema, expected);
+}
+
+#[test]
+fn test_void_scalar_to_array() {
+    let scalar = Scalar::Null(KernelDataType::VOID);
+    let array = scalar.to_array(5).unwrap();
+    assert_eq!(array.len(), 5);
+    assert_eq!(*array.data_type(), DataType::Null);
 }

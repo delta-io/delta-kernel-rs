@@ -18,9 +18,10 @@ The easiest way to write a checkpoint is the convenience method on `Snapshot`:
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::engine::default::DefaultEngine;
-# use delta_kernel::engine::default::storage::store_from_url;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::snapshot::CheckpointWriteResult;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn main() -> DeltaResult<()> {
@@ -67,16 +68,16 @@ if let Some(snapshot) = committed.post_commit_snapshot() {
 > [!WARNING]
 > For catalog-managed tables, you must
 > [publish](../catalog_managed/writing.md) the commit before checkpointing.
-> `create_checkpoint_writer()` returns an error if the snapshot is not published.
+> `create_checkpoint_writer(&engine)` returns an error if the snapshot is not published.
 
 ## The custom path: `CheckpointWriter`
 
 If you need control over how the checkpoint file is written, use the lower-level
-`CheckpointWriter` API. `create_checkpoint_writer()` consumes an `Arc<Snapshot>`:
+`CheckpointWriter` API. `create_checkpoint_writer(&engine)` consumes an `Arc<Snapshot>`:
 
 ```rust,ignore
 // 1. Create a CheckpointWriter from a snapshot (consumes the Arc<Snapshot>)
-let writer = snapshot.create_checkpoint_writer()?;
+let writer = snapshot.create_checkpoint_writer(&engine)?;
 
 // 2. Get the path where the checkpoint should be written
 let checkpoint_path = writer.checkpoint_path()?;

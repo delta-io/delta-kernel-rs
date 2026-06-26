@@ -5,8 +5,6 @@ use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
@@ -16,9 +14,11 @@ use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    begin_transaction, create_default_engine_mt_executor, create_table, engine_store_setup,
-    load_and_begin_transaction, read_scan, test_read,
+    begin_transaction, collect_row_ids, create_default_engine_mt_executor, create_table,
+    engine_store_setup, load_and_begin_transaction, read_scan, test_read,
 };
 use url::Url;
 
@@ -821,20 +821,6 @@ fn read_row_id_scan(
     );
     let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
     read_scan(&scan, engine)
-}
-
-/// Collect all `row_id` values from scan results across all batches by column name.
-fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
-    batches
-        .iter()
-        .flat_map(|b| {
-            b.column_by_name("row_id")
-                .expect("row_id column not found in batch")
-                .as_primitive::<Int64Type>()
-                .values()
-                .to_vec()
-        })
-        .collect()
 }
 
 /// Basic read: write one file with 3 rows, verify row IDs are sequential starting from 0.

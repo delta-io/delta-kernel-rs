@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use super::Transaction;
 use crate::actions::{get_log_commit_info_schema, CommitInfo, COMMIT_INFO_NAME};
-use crate::expressions::{MapData, Scalar, Transform};
+use crate::expressions::{MapData, Scalar};
 use crate::schema::{MapType, StructField, StructType, ToSchema};
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
@@ -36,7 +37,7 @@ fn commit_info_literal_exprs(
                         map.into_iter()
                             .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
                     )?),
-                    None => Scalar::Null(DataType::Map(Box::new(op_params_map_type))),
+                    None => Scalar::null(op_params_map_type),
                 },
             )),
         ),
@@ -72,51 +73,39 @@ impl<S> Transaction<S> {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
 
-                // Step 1: Build output schema - all engine fields first, then any kernel-only
-                // fields that are not already present in the engine schema appended at the end.
-                let output_fields: Vec<_> = engine_commit_info_schema
-                    .fields()
-                    .map(|field| kernel_schema.field(field.name()).unwrap_or(field))
-                    .cloned()
-                    .chain(
-                        kernel_schema
-                            .fields()
-                            .filter(|field| !engine_commit_info_schema.contains(field.name()))
-                            .cloned(),
-                    )
-                    .collect();
-
-                let output_schema = StructType::new_unchecked(output_fields);
-
-                // Step 2: Build literal expressions for each CommitInfo field.
+                // Step 1: Build literal expressions for each CommitInfo field.
                 let literal_exprs = commit_info_literal_exprs(kernel_commit_info)?;
 
-                // Step 3: Build Transform. Replacements must be registered before insertions so
-                // that for the last engine field (which may itself be replaced), exprs is ordered
-                // as [replace_expr, insert_exprs...]. The evaluator emits exprs in declaration
-                // order, so the replace value must come first.
-                let last_engine_field = engine_commit_info_schema.field_names().last().cloned();
-                let mut transform = Transform::new_top_level();
-
-                // First pass: replace fields that already exist in the engine schema.
+                // Step 2: Build the output schema and expression patch together. Engine fields
+                // pass through first, overlapping kernel fields are replaced in place, and
+                // kernel-only fields are appended after the last engine field.
+                let mut patch = ProjectionStructPatchBuilder::new(engine_commit_info_schema);
                 for (field_name, expr_ref) in &literal_exprs {
+                    let field = kernel_schema.field(*field_name).ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "CommitInfo schema is missing field '{field_name}'"
+                        ))
+                    })?;
                     if engine_commit_info_schema.contains(*field_name) {
-                        transform = transform.with_replaced_field(*field_name, expr_ref.clone());
+                        patch = patch.replace(*field_name, field.clone(), expr_ref.clone());
                     }
                 }
-                // Second pass: append kernel-only fields after the last engine field.
                 for (field_name, expr_ref) in &literal_exprs {
+                    let field = kernel_schema.field(*field_name).ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "CommitInfo schema is missing field '{field_name}'"
+                        ))
+                    })?;
                     if !engine_commit_info_schema.contains(*field_name) {
-                        transform = transform
-                            .with_inserted_field(last_engine_field.as_deref(), expr_ref.clone());
+                        patch = patch.append(field.clone(), expr_ref.clone());
                     }
                 }
+                let (output_schema, patch) = patch.build()?;
 
-                // Step 4: Wrap the transform in a struct expression so the output matches the
+                // Step 3: Wrap the patch in a struct expression so the output matches the
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
                 // with the None branch which uses `get_log_commit_info_schema()`.
-                let wrapped_expr =
-                    Expression::struct_from([Arc::new(Expression::transform(transform))]);
+                let wrapped_expr = Expression::struct_from([patch]);
                 let wrapped_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
                     COMMIT_INFO_NAME,
                     output_schema,

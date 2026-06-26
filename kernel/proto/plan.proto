@@ -1,0 +1,163 @@
+// Proto mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (the Rust IR is the source of truth).
+//
+// A plan is a DAG of plan nodes: `Plan` is a flat list of `PlanNode`s, and each node wires
+// into the DAG by referencing other nodes' `output` RefIds in its `inputs`. RefIds are opaque
+// keys. Field numbers are never reused once published, so the wire stays compatible.
+
+syntax = "proto3";
+
+package delta.kernel.plan;
+
+import "expressions.proto";
+import "schema.proto";
+
+message RefId {
+  uint32 id = 1;
+}
+
+message FileMeta {
+  string location = 1;
+  uint64 size = 2;
+  optional int64 last_modified = 3;  // milliseconds since epoch
+}
+
+// ============================================================================
+// Source payloads (0 inputs)
+// ============================================================================
+
+message ScanFile {
+  FileMeta meta = 1;
+  repeated delta.kernel.expressions.Scalar file_constants = 2;
+}
+
+message ScanParquetNode {
+  repeated ScanFile files = 1;
+  repeated delta.kernel.expressions.ColumnName file_constant_columns = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
+message ScanJsonNode {
+  repeated ScanFile files = 1;
+  repeated delta.kernel.expressions.ColumnName file_constant_columns = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
+message ValuesRow {
+  repeated delta.kernel.expressions.Scalar values = 1;
+}
+message ValuesNode {
+  delta.kernel.schema.StructType schema = 1;
+  repeated ValuesRow rows = 2;
+}
+
+// ============================================================================
+// Transform payloads (1+ inputs)
+// ============================================================================
+
+message ProjectNode {
+  delta.kernel.expressions.Expression expr = 1;
+  delta.kernel.schema.StructType schema = 2;
+}
+
+message FilterNode {
+  delta.kernel.expressions.Predicate predicate = 1;
+}
+
+message UnionAllNode {}
+
+message LoadColumnFileMeta {
+  delta.kernel.expressions.ColumnName path_column = 1;
+  delta.kernel.expressions.ColumnName file_size_column = 2;
+  delta.kernel.expressions.ColumnName num_records_column = 3;
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_PARQUET = 1;
+  FILE_TYPE_JSON = 2;
+}
+
+message LoadNode {
+  delta.kernel.schema.StructType schema = 1;
+  FileType file_type = 2;
+  optional string base_url = 3;
+  repeated delta.kernel.expressions.ColumnName file_constant_columns = 4;
+  LoadColumnFileMeta file_meta = 5;
+  delta.kernel.expressions.ColumnName dv_column = 6;
+}
+
+message MinAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message MaxAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message MinNonNullByAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+  delta.kernel.expressions.ColumnName key = 2;
+}
+message MaxNonNullByAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+  delta.kernel.expressions.ColumnName key = 2;
+}
+
+message AggFn {
+  oneof func {
+    MinAgg min = 1;
+    MaxAgg max = 2;
+    MinNonNullByAgg min_non_null_by = 3;
+    MaxNonNullByAgg max_non_null_by = 4;
+  }
+}
+
+message Agg {
+  AggFn func = 1;
+  optional string alias = 2;
+}
+
+message AggregateNode {
+  repeated delta.kernel.expressions.ColumnName group_by = 1;
+  repeated Agg aggs = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
+message SemiJoinNode {
+  bool inverted = 1;
+  repeated delta.kernel.expressions.ColumnName probe_keys = 2;
+  repeated delta.kernel.expressions.ColumnName build_keys = 3;
+}
+
+// ============================================================================
+// Operator
+// ============================================================================
+
+message Operator {
+  oneof op {
+    // Sources (0 inputs)
+    ScanParquetNode scan_parquet = 1;
+    ScanJsonNode scan_json = 2;
+    ValuesNode values = 3;
+    // Transforms (1+ inputs)
+    ProjectNode project = 4;
+    FilterNode filter = 5;
+    UnionAllNode union_all = 6;
+    LoadNode load = 7;
+    AggregateNode aggregate = 8;
+    SemiJoinNode semi_join = 9;
+  }
+}
+
+// ============================================================================
+// PlanNode / Plan
+// ============================================================================
+
+message PlanNode {
+  Operator op = 1;
+  repeated RefId inputs = 2;
+  RefId output = 3;
+}
+
+// The plan's terminal node is its last entry; the engine streams that node's rows.
+message Plan {
+  repeated PlanNode nodes = 1;
+}

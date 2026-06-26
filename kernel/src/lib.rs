@@ -88,12 +88,11 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod commit_range;
 pub mod committer;
-// Public under test-utils so integration tests can inspect CRC state via
-// Snapshot::get_current_crc_if_loaded_for_testing.
-#[cfg(feature = "test-utils")]
+#[cfg(feature = "internal-api")]
 pub mod crc;
-#[cfg(not(feature = "test-utils"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -104,9 +103,12 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
+pub mod struct_patch;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -134,10 +136,13 @@ pub mod column_trie;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
+#[cfg(feature = "internal-api")]
+pub mod utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::try_parse_uri;
+pub use utils::{try_parse_uri, CollectInto};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -178,17 +183,19 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, Error};
+pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+#[cfg(feature = "declarative-plans")]
+pub use plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanBuilder};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
-    feature = "arrow-conversion"
+    feature = "default-engine-base",
+    feature = "arrow-conversion",
+    feature = "declarative-plans"
 ))]
 pub mod engine;
 
@@ -205,8 +212,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+pub type FileDataReadResultIterator = DeltaResultIteratorStatic<Box<dyn EngineData>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,9 +674,13 @@ pub trait JsonHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Atomically (!) write a single JSON file. Each row of the input data should be written as a
-    /// new JSON object appended to the file. this write must:
-    /// (1) serialize the data to newline-delimited json (each row is a json object literal)
+    /// Atomically (!) write a single JSON file. Each selected row of the input data must be
+    /// written as a new JSON object appended to the file; rows not selected by a batch's
+    /// selection vector (see [`FilteredEngineData`]) must not be written.
+    /// [`FilteredEngineData::apply_selection_vector`] produces the selected-rows view for
+    /// implementations that do not filter during serialization. This write must:
+    /// (1) serialize the selected rows to newline-delimited json (each row is a json object
+    ///     literal)
     /// (2) write the data to storage atomically (i.e. if the file already exists, fail unless the
     ///     overwrite flag is set)
     ///
@@ -685,15 +695,13 @@ pub trait JsonHandler: AsAny {
     /// # Parameters
     ///
     /// - `path` - URL specifying the location to write the JSON file
-    /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as a
-    ///   new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
-    ///   each row is a JSON object on a single line)
+    /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }
@@ -740,6 +748,16 @@ pub trait ParquetHandler: AsAny {
     ///    field id
     /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or
     ///    no matching parquet field ID is found, fall back to matching by column name
+    ///
+    /// # Type coercion
+    ///
+    /// A matched Parquet column whose physical type differs from the `physical_schema`
+    /// [`StructField`] must be coerced to the requested type. In particular, timestamp columns MUST
+    /// be normalized to the protocol specified microsecond precision: a `TIMESTAMP(MILLIS)` (or
+    /// any other non-microsecond unit) column read into a `TIMESTAMP` / `TIMESTAMP_NTZ` field
+    /// must be rescaled to microseconds (a finer unit such as nanosecond is truncated). The
+    /// default engine does this via `arrow::compute::cast` while reordering columns to the
+    /// requested schema.
     ///
     /// # Metadata Columns
     ///
@@ -899,7 +917,7 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
@@ -956,22 +974,15 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-}
 
-// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with
-// _only_ default-engine-base, so we give a friendly error here.
-#[cfg(all(
-    feature = "default-engine-base",
-    not(any(
-        feature = "default-engine-native-tls",
-        feature = "default-engine-rustls",
-    ))
-))]
-compile_error!(
-    "The default-engine-base feature flag is not meant to be used directly. \
-    Please use either default-engine-native-tls or default-engine-rustls."
-);
+    /// Get the connector provided [`PlanExecutor`].
+    ///
+    /// The default implementation returns a trivial executor that errors on every operation.
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
+        Arc::new(())
+    }
+}
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
 // using doctests to test macros. Specifically, we are testing for failed macro invocations due

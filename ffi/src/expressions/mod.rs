@@ -1,5 +1,8 @@
 //! This module holds functionality for moving expressions across the FFI boundary, both from
 //! engine to kernel, and from kernel to engine.
+//!
+//! This FFI exposes only opaque predicates, not opaque expressions; see the `opaque_eval` module
+//! docs for why (expression-level functions fold into composite opaque predicates).
 use std::ffi::c_void;
 
 use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp};
@@ -11,6 +14,15 @@ use crate::{kernel_string_slice, KernelStringSlice};
 
 pub mod engine_visitor;
 pub mod kernel_visitor;
+
+#[cfg(feature = "default-engine-base")]
+pub mod opaque_eval;
+
+#[cfg(feature = "default-engine-base")]
+mod arrow_eval;
+
+#[cfg(feature = "default-engine-base")]
+pub(crate) use arrow_eval::FfiOpaquePredicateOp;
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
 pub struct SharedExpression;

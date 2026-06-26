@@ -2,7 +2,7 @@
 This test demonstrates the full range of expression types.
 Some types are not yet supported in round-trip reconstruction:
   - Struct/Array/Map literals (nested data structures)
-  - Transform expressions (schema evolution operations)
+  - StructPatch expressions (struct transformation operations)
   - Opaque expressions (custom user-defined expressions)
 
 StructExpression
@@ -35,24 +35,59 @@ StructExpression
           Array
             Short(5)
             Short(0)
-  Transform
-    Column(foo.bar.baz)
-    Prepend
+  StructPatch
+    input_path
+      Column(foo.bar.baz)
+    prepended_fields
       String(prepended)
-    Insert(a)
-      String(first)
-      Transform
-        Drop(gone)
-        Replace(stub)
-          String(replaced)
-        Insert(x)
-          Boolean(1)
-        Insert(y)
-          Boolean(0)
-      String(third)
-    Drop(dropme)
-    Replace(replaceme)
-      Integer(42)
+    field_patches
+      FieldPatch
+        field_name: a
+        insertions
+          String(first)
+          StructPatch
+            field_patches
+              FieldPatch
+                field_name: gone
+                keep_input: false
+                optional: false
+              FieldPatch
+                field_name: stub
+                insertions
+                  String(replaced)
+                keep_input: false
+                optional: false
+              FieldPatch
+                field_name: x
+                insertions
+                  Boolean(1)
+                keep_input: true
+                optional: false
+              FieldPatch
+                field_name: y
+                insertions
+                  Boolean(0)
+                keep_input: true
+                optional: false
+          String(third)
+        keep_input: true
+        optional: false
+      FieldPatch
+        field_name: dropme
+        keep_input: false
+        optional: false
+      FieldPatch
+        field_name: replaceme
+        insertions
+          Integer(42)
+        keep_input: false
+        optional: false
+    appended_fields
+      String(appended)
+  StructPatch
+  StructPatch
+    input_path
+      Column(empty.nested)
   Array
     Short(5)
     Short(0)
@@ -68,6 +103,12 @@ StructExpression
   Unknown(mystery)
   MapToStruct
     Column(pv)
+  Coalesce
+    Column(col)
+    Integer(0)
+  ArrayConstructor
+    Integer(1)
+    Integer(2)
   Divide
     Integer(0)
     Integer(0)

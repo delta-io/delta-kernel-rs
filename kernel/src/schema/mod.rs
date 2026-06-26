@@ -33,9 +33,15 @@ pub mod derive_macro_utils;
 pub(crate) mod derive_macro_utils;
 pub(crate) mod validation;
 pub(crate) mod variant_utils;
+pub(crate) mod void_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
+
+/// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
+/// fields, lowered into an output [`StructType`] directly from an input schema via
+/// [`build`](crate::struct_patch::StructPatchBuilder::<StructField>::build).
+pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<StructField>;
 
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
@@ -124,6 +130,7 @@ pub enum ColumnMetadataKey {
     ParquetFieldId,
     ParquetFieldNestedIds,
     GenerationExpression,
+    CurrentDefault,
     IdentityStart,
     IdentityStep,
     IdentityHighWaterMark,
@@ -149,6 +156,7 @@ impl AsRef<str> for ColumnMetadataKey {
             // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
             Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
             Self::GenerationExpression => "delta.generationExpression",
+            Self::CurrentDefault => "CURRENT_DEFAULT",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
             Self::IdentityStart => "delta.identity.start",
@@ -869,6 +877,29 @@ impl StructType {
         self.fields.get(name.as_ref())
     }
 
+    /// Retrieves the nested field named by the given column path.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    pub fn field_at<'a>(&'a self, col: &ColumnName) -> DeltaResult<&'a StructField> {
+        let mut field = None;
+        self.visit_fields_of_path(col, |f| field = Some(f))?;
+        field.ok_or_else(|| Error::generic("Empty path"))
+    }
+
+    /// Visits all fields along the given column path.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    #[internal_api]
+    pub(crate) fn visit_fields_of_path<'a>(
+        &'a self,
+        col: &ColumnName,
+        visit_field: impl FnMut(&'a StructField),
+    ) -> DeltaResult<()> {
+        self.visit_fields_of_path_by(col, |s, name| s.field(name), visit_field)
+    }
+
     /// Resolves a column path through nested structs, returning references to all
     /// [`StructField`]s along the path. The last element is the leaf field.
     ///
@@ -878,23 +909,25 @@ impl StructType {
     /// Returns an error if the path is empty, a field is not found, or an intermediate
     /// field is not a struct type.
     #[internal_api]
-    pub(crate) fn walk_column_fields<'a>(
+    pub(crate) fn fields_of_path<'a>(
         &'a self,
         col: &ColumnName,
     ) -> DeltaResult<Vec<&'a StructField>> {
-        self.walk_column_fields_by(col, |s, name| s.field(name))
+        let mut result = Vec::with_capacity(col.path().len());
+        self.visit_fields_of_path(col, |f| result.push(f))?;
+        Ok(result)
     }
 
-    /// Helper to walk through nested columns. For each path component in `col`, calls
-    ///                                                                                             
-    /// `find_field(current_struct, component)` to locate the matching field, then descends
-    ///                                                                                             
-    /// into the next nested struct. Returns references to all [`StructField`]s along the path.
-    pub(crate) fn walk_column_fields_by<'a, F>(
+    /// Visits all fields along the given column path, using a caller-provided field name resolver.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    pub(crate) fn visit_fields_of_path_by<'a, F>(
         &'a self,
         col: &ColumnName,
         find_field: F,
-    ) -> DeltaResult<Vec<&'a StructField>>
+        mut visit_field: impl FnMut(&'a StructField),
+    ) -> DeltaResult<()>
     where
         F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
     {
@@ -903,14 +936,13 @@ impl StructType {
             return Err(Error::generic("Column path cannot be empty"));
         }
         let mut current_struct = self;
-        let mut fields = Vec::with_capacity(path.len());
         for (i, field_name) in path.iter().enumerate() {
             let field = find_field(current_struct, field_name).ok_or_else(|| {
                 Error::generic(format!(
                     "Could not resolve column '{col}': field '{field_name}' not found in schema"
                 ))
             })?;
-            fields.push(field);
+            visit_field(field);
             if i < path.len() - 1 {
                 let DataType::Struct(inner) = field.data_type() else {
                     return Err(Error::generic(format!(
@@ -921,7 +953,7 @@ impl StructType {
                 current_struct = inner;
             }
         }
-        Ok(fields)
+        Ok(())
     }
 
     /// Gets the field with the given name and its index.
@@ -1124,79 +1156,6 @@ impl StructType {
         Ok(())
     }
 
-    /// Returns a StructType with `new_field` inserted after the field named `after`.
-    /// If `new_field`  already presents in the schema, an error is returned.
-    /// If `after` is None, `new_field` is appended to the end.
-    /// If `after` is not found, an error is returned.
-    pub fn with_field_inserted_after(
-        mut self,
-        after: Option<&str>,
-        new_field: StructField,
-    ) -> DeltaResult<Self> {
-        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
-        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
-        // for inserting protocol-defined fields (e.g. stats_parsed) where exact-name matching
-        // is sufficient.
-        if self.fields.contains_key(&new_field.name) {
-            return Err(Error::generic(format!(
-                "Field {} already exists",
-                new_field.name
-            )));
-        }
-
-        let insert_index = after
-            .map(|after| {
-                self.fields
-                    .get_index_of(after)
-                    .map(|index| index + 1)
-                    .ok_or_else(|| Error::generic(format!("Field {after} not found")))
-            })
-            .unwrap_or_else(|| Ok(self.fields.len()))?;
-
-        self.fields
-            .insert_before(insert_index, new_field.name.clone(), new_field);
-        Ok(self)
-    }
-
-    /// Returns a StructType with `new_field` inserted before the field named `before`.
-    /// If `new_field` already presents in the schema, an error is returned.
-    /// If `before` is None, `new_field` is inserted at the beginning.
-    /// If `before` is not found, an error is returned.
-    pub fn with_field_inserted_before(
-        mut self,
-        before: Option<&str>,
-        new_field: StructField,
-    ) -> DeltaResult<Self> {
-        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
-        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
-        // for inserting protocol-defined fields where exact-name matching is sufficient.
-        if self.fields.contains_key(&new_field.name) {
-            return Err(Error::generic(format!(
-                "Field {} already exists",
-                new_field.name
-            )));
-        }
-
-        let index_of_before = before
-            .map(|before| {
-                self.fields
-                    .get_index_of(before)
-                    .ok_or_else(|| Error::generic(format!("Field {before} not found")))
-            })
-            .unwrap_or_else(|| Ok(0))?;
-
-        self.fields
-            .insert_before(index_of_before, new_field.name.clone(), new_field);
-        Ok(self)
-    }
-
-    /// Returns a StructType with the named field removed.
-    /// Returns self unchanged if field doesn't exist.
-    pub fn with_field_removed(mut self, name: &str) -> Self {
-        self.fields.shift_remove(name);
-        self
-    }
-
     /// Returns a new [`StructType`] containing only the top-level fields for which `predicate`
     /// returns `true`. This does not recurse into nested [`StructType`] fields.
     pub fn with_fields_filtered(
@@ -1221,22 +1180,6 @@ impl StructType {
         } else {
             Ok(Some(filtered))
         }
-    }
-
-    /// Returns a StructType with the named field replaced.
-    /// Returns an error if field doesn't exist.
-    pub fn with_field_replaced(
-        mut self,
-        name: &str,
-        new_field: StructField,
-    ) -> DeltaResult<StructType> {
-        let replace_field = self
-            .fields
-            .get_mut(name)
-            .ok_or_else(|| Error::generic(format!("Field {name} not found")))?;
-
-        *replace_field = new_field;
-        Ok(self)
     }
 }
 
@@ -1606,10 +1549,10 @@ pub struct ArrayType {
 }
 
 impl ArrayType {
-    pub fn new(element_type: DataType, contains_null: bool) -> Self {
+    pub fn new(element_type: impl Into<DataType>, contains_null: bool) -> Self {
         Self {
             type_name: "array".into(),
-            element_type,
+            element_type: element_type.into(),
             contains_null,
         }
     }
@@ -1740,6 +1683,7 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
+    Void,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
@@ -1846,6 +1790,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "date" => Ok(PrimitiveType::Date),
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            "void" => Ok(PrimitiveType::Void),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1898,6 +1843,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
+            PrimitiveType::Void => write!(f, "void"),
         }
     }
 }
@@ -1994,13 +1940,13 @@ impl<'de> serde::Deserialize<'de> for DataType {
             if let Some(Value::String(type_str)) = map.get("type") {
                 return match type_str.as_str() {
                     "array" => ArrayType::deserialize(value)
-                        .map(|at| DataType::Array(Box::new(at)))
+                        .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
                     "struct" => StructType::deserialize(value)
-                        .map(|st| DataType::Struct(Box::new(st)))
+                        .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
                     "map" => MapType::deserialize(value)
-                        .map(|mt| DataType::Map(Box::new(mt)))
+                        .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
                     _ => Err(Error::custom(format!("Unknown complex type: '{type_str}'"))),
                 };
@@ -2029,6 +1975,7 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
+    pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -2174,7 +2121,7 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
-struct MakePhysical<'a> {
+pub(crate) struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
     logical_path: Vec<&'a str>,
@@ -2186,6 +2133,9 @@ struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
+    /// When `true`, skips the physical-name + metadata rewrite, only validates the column
+    /// mapping annotations.
+    validation_only: bool,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -2194,7 +2144,20 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
+            validation_only: false,
         }
+    }
+
+    /// Walks `schema` and validates its column-mapping annotations.
+    pub(crate) fn validate_schema_column_mapping(
+        mode: ColumnMappingMode,
+        schema: &'a StructType,
+    ) -> DeltaResult<()> {
+        let mut walker = Self {
+            validation_only: true,
+            ..Self::new(mode)
+        };
+        walker.transform_struct(schema).map(|_| ())
     }
 
     fn transform_inner<T>(
@@ -2245,10 +2208,11 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
         self.transform_inner(field.name(), |this| {
             let field = this.recurse_into_struct_field(field)?;
-
+            if this.validation_only {
+                return Ok(field);
+            }
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
             let name = physical_name.to_owned();
-
             Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
         })
     }
@@ -2418,6 +2382,53 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_void() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_void_non_nullable() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+        assert!(!field.nullable);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":false,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_void_display() {
+        assert_eq!(PrimitiveType::Void.to_string(), "void");
+        assert_eq!(DataType::VOID.to_string(), "void");
+    }
+
+    #[test]
     fn test_unshredded_variant() {
         let unshredded_variant_type = DataType::unshredded_variant();
 
@@ -2536,18 +2547,18 @@ mod tests {
     #[rstest]
     #[case(
         r#"{"type": "array", "elementType": "integer", "containsNull": false}"#,
-        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false)))
+        DataType::from(ArrayType::new(DataType::INTEGER, false))
     )]
     #[case(
         r#"{"type": "struct", "fields": [{"name": "a", "type": "integer", "nullable": false, "metadata": {}}, {"name": "b", "type": "string", "nullable": true, "metadata": {}}]}"#,
-        DataType::Struct(Box::new(StructType::new_unchecked([
+        DataType::from(StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::STRING, true),
-        ])))
+        ]))
     )]
     #[case(
         r#"{"type": "map", "keyType": "string", "valueType": "integer", "valueContainsNull": true}"#,
-        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, true)))
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true))
     )]
     #[case("\"string\"", DataType::STRING)]
     #[case("\"long\"", DataType::LONG)]
@@ -2572,7 +2583,7 @@ mod tests {
         let field = StructField::nullable(
             "e",
             ArrayType::new(
-                StructType::new_unchecked([StructField::not_null("d", DataType::INTEGER)]).into(),
+                StructType::new_unchecked([StructField::not_null("d", DataType::INTEGER)]),
                 true,
             ),
         );
@@ -2640,11 +2651,7 @@ mod tests {
         ]);
         let schema = StructType::new_unchecked([
             cm_field("a", 1, DataType::INTEGER),
-            cm_field(
-                "b",
-                2,
-                ArrayType::new(DataType::Struct(Box::new(inner)), true),
-            ),
+            cm_field("b", 2, ArrayType::new(inner, true)),
             cm_field("c", 3, DataType::STRING),
         ]);
         assert_result_error_with_message(
@@ -3603,7 +3610,7 @@ mod tests {
 
         let result = StructType::try_new([
             StructField::nullable("regular_col", DataType::STRING),
-            StructField::nullable("nested", DataType::Struct(Box::new(nested_struct))),
+            StructField::nullable("nested", nested_struct),
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
@@ -3625,11 +3632,11 @@ mod tests {
             .collect(),
             metadata_columns: HashMap::new(),
         };
-        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct)), true);
+        let array_type = ArrayType::new(nested_struct, true);
 
         let result = StructType::try_new([
             StructField::nullable("regular_col", DataType::STRING),
-            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
+            StructField::nullable("array_col", array_type),
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
@@ -3653,20 +3660,12 @@ mod tests {
         };
 
         for map_type in [
-            MapType::new(
-                DataType::Struct(Box::new(nested_struct.clone())),
-                DataType::STRING,
-                true,
-            ),
-            MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(nested_struct)),
-                true,
-            ),
+            MapType::new(nested_struct.clone(), DataType::STRING, true),
+            MapType::new(DataType::STRING, nested_struct, true),
         ] {
             let result = StructType::try_new([
                 StructField::nullable("regular_col", DataType::STRING),
-                StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+                StructField::nullable("map_col", map_type),
             ]);
 
             assert_result_error_with_message(result, "only allowed at the top level");
@@ -3837,16 +3836,12 @@ mod tests {
         let nested_struct = StructType::new_unchecked([
             nested_field_with_metadata,
             StructField::new("x", DataType::DOUBLE, true),
-            StructField::new(
-                "inner_struct",
-                DataType::Struct(Box::new(inner_struct)),
-                false,
-            ),
+            StructField::new("inner_struct", inner_struct, false),
         ]);
-        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
+        let array_type = ArrayType::new(nested_struct.clone(), true);
         let map_type = MapType::new(
-            DataType::Struct(Box::new(nested_struct.clone())),
-            DataType::Struct(Box::new(nested_struct.clone())), // kek
+            nested_struct.clone(),
+            nested_struct.clone(), // kek
             true,
         );
         let fields = vec![
@@ -3854,8 +3849,8 @@ mod tests {
             StructField::new("y", DataType::FLOAT, false),
             StructField::new("z", DataType::LONG, true),
             StructField::new("s", nested_struct.clone(), false),
-            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
-            StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+            StructField::nullable("array_col", array_type),
+            StructField::nullable("map_col", map_type),
             StructField::new("a", DataType::LONG, true),
         ];
 
@@ -3952,205 +3947,29 @@ mod tests {
     }
 
     #[test]
-    fn test_with_field_inserted_empty_struct() {
-        let schema = StructType::try_new([]).unwrap();
-        let schema = schema
-            .with_field_inserted_after(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted should produce a valid schema");
-        assert_eq!(schema.num_fields(), 1);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "age");
-    }
-
-    #[test]
-    fn test_with_field_inserted() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_after(Some("id"), StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted should produce a valid schema");
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "age");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_inserted_append_to_end() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_after(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted should produce a valid schema");
-
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "name");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "age");
-    }
-
-    #[test]
-    fn test_with_field_inserted_after_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_inserted_after(
-            Some("nonexistent"),
-            StructField::new("name", DataType::STRING, true),
+    fn test_current_default_key_value() {
+        assert_eq!(
+            ColumnMetadataKey::CurrentDefault.as_ref(),
+            "CURRENT_DEFAULT"
         );
-        assert!(new_schema.is_err());
-    }
-
-    #[test]
-    fn test_with_field_inserted_after_duplicate_field() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let new_schema = schema.with_field_inserted_after(
-            Some("name"),
-            StructField::new("id", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-        assert_result_error_with_message(new_schema, "Field id already exists");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_before(
-                Some("name"),
-                StructField::new("age", DataType::STRING, true),
-            )
-            .expect("with field inserted before should produce a valid schema");
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "age");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_duplicate_field() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let new_schema = schema.with_field_inserted_before(
-            Some("name"),
-            StructField::new("id", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-        assert_result_error_with_message(new_schema, "Field id already exists");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_at_beginning() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let schema = schema
-            .with_field_inserted_before(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted before should produce a valid schema");
-        assert_eq!(schema.num_fields(), 3);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "age");
-        assert_eq!(schema.field_at_index(1).unwrap().name(), "id");
-        assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_inserted_before(
-            Some("nonexistent"),
-            StructField::new("name", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_empty_struct() {
-        let schema = StructType::try_new([]).unwrap();
-        let schema = schema
-            .with_field_inserted_before(None, StructField::new("age", DataType::STRING, true))
-            .expect("with field inserted before on empty struct should succeed");
-        assert_eq!(schema.num_fields(), 1);
-        assert_eq!(schema.field_at_index(0).unwrap().name(), "age");
-    }
-
-    #[test]
-    fn test_with_field_removed() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_removed("id");
-        assert_eq!(new_schema.num_fields(), 0);
-    }
-
-    #[test]
-    fn test_with_field_removed_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_removed("nonexistent");
-        assert_eq!(new_schema.num_fields(), 1);
-        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "id");
-    }
-
-    #[test]
-    fn test_with_field_replaced() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema
-            .with_field_replaced("id", StructField::new("name", DataType::STRING, true))
-            .unwrap();
-
-        assert_eq!(new_schema.num_fields(), 1);
-        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "name");
-    }
-
-    #[test]
-    fn test_with_field_replaced_non_existent_field() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
-        let new_schema = schema.with_field_replaced(
-            "nonexistent",
-            StructField::new("name", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err(), "Expected error for non-existent field");
     }
 
     /// Schema: { a: { b: { c: double } } } — supports walks at depths 1, 2, and 3.
     fn walk_test_schema() -> StructType {
         let l3 = StructType::new_unchecked([StructField::new("c", DataType::DOUBLE, false)]);
-        let l2 = StructType::new_unchecked([StructField::new(
-            "b",
-            DataType::Struct(Box::new(l3)),
-            false,
-        )]);
-        StructType::new_unchecked([StructField::new("a", DataType::Struct(Box::new(l2)), false)])
+        let l2 = StructType::new_unchecked([StructField::new("b", l3, false)]);
+        StructType::new_unchecked([StructField::new("a", l2, false)])
     }
 
     #[rstest::rstest]
-    #[case::single_level(vec!["a"], vec!["a"], DataType::Struct(Box::new(
-        StructType::new_unchecked([StructField::new("b", DataType::Struct(Box::new(
-            StructType::new_unchecked([StructField::new("c", DataType::DOUBLE, false)])
-        )), false)])
-    )))]
-    #[case::nested_2(vec!["a", "b"], vec!["a", "b"], DataType::Struct(Box::new(
-        StructType::new_unchecked([StructField::new("c", DataType::DOUBLE, false)])
-    )))]
+    #[case::single_level(vec!["a"], vec!["a"], DataType::from(StructType::new_unchecked([
+        StructField::new("b", StructType::new_unchecked([
+            StructField::new("c", DataType::DOUBLE, false)
+        ]), false)
+    ])))]
+    #[case::nested_2(vec!["a", "b"], vec!["a", "b"], DataType::from(StructType::new_unchecked([
+        StructField::new("c", DataType::DOUBLE, false)
+    ])))]
     #[case::nested_3(vec!["a", "b", "c"], vec!["a", "b", "c"], DataType::DOUBLE)]
     #[test]
     fn test_walk_column_fields_happy(
@@ -4160,7 +3979,7 @@ mod tests {
     ) {
         let schema = walk_test_schema();
         let fields = schema
-            .walk_column_fields(&ColumnName::new(col_path.iter().copied()))
+            .fields_of_path(&ColumnName::new(col_path.iter().copied()))
             .unwrap();
         assert_eq!(fields.len(), expected_names.len());
         for (field, name) in fields.iter().zip(expected_names.iter()) {
@@ -4177,7 +3996,7 @@ mod tests {
     #[test]
     fn test_walk_column_fields_error(#[case] col_path: Vec<&str>, #[case] expected_error: &str) {
         let schema = walk_test_schema();
-        let result = schema.walk_column_fields(&ColumnName::new(col_path.iter().copied()));
+        let result = schema.fields_of_path(&ColumnName::new(col_path.iter().copied()));
         assert_result_error_with_message(result, expected_error);
     }
 
@@ -4188,7 +4007,7 @@ mod tests {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("EventDate", DataType::DATE, false),
-            StructField::new("Address", DataType::Struct(Box::new(inner)), false),
+            StructField::new("Address", inner, false),
         ]);
 
         // Mismatched casing -> normalized to schema

@@ -25,7 +25,7 @@ use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{may_begin_listable_log_path, LogPathFileType, ParsedLogPath};
 use crate::{DeltaResult, Error, StorageHandler, Version};
 
 #[cfg(test)]
@@ -59,20 +59,36 @@ pub(crate) struct LogSegmentFiles {
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
 /// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
-/// files (e.g. staged commits, dot-prefixed files), and stopping at `end_version`.
+/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
+/// underlying listing at the first path past the version-named region, so directories like
+/// `_staged_commits/` and `_sidecars/` are never paged through.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
-fn list_from_storage(
+pub(crate) fn list_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
     end_version: Version,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let log_root_str = log_root.to_string();
     let files = storage
         .list_from(&start_from)?
+        // The listing is sorted by full path, so nothing relevant follows the first relative path
+        // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
+        // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
+        // A path that doesn't strip the log_root prefix is kept; parsing discards it.
+        // TODO(#2740): push the bound into the listing request itself.
+        .take_while(move |meta_res| match meta_res {
+            Ok(meta) => meta
+                .location
+                .as_str()
+                .strip_prefix(&log_root_str)
+                .is_none_or(may_begin_listable_log_path),
+            Err(_) => true,
+        })
         .map(|meta| ParsedLogPath::try_from(meta?))
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
@@ -158,7 +174,7 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 /// Compaction and checkpoint files are skipped when empty -- they have fallbacks
 /// (individual commits, older checkpoints). Commit and CRC files are kept even
 /// if empty; the warning ensures the corrupt file is identifiable in logs.
-fn should_process_log_file(file: &ParsedLogPath) -> bool {
+pub(crate) fn should_process_log_file(file: &ParsedLogPath) -> bool {
     if file.location.size > 0 {
         return true;
     }
@@ -415,6 +431,13 @@ impl LogSegmentFiles {
         &self.ascending_commit_files
     }
 
+    /// The staged (unpublished) commit files, in ascending version order.
+    pub(crate) fn staged_commits(&self) -> impl Iterator<Item = &ParsedLogPath> {
+        self.ascending_commit_files
+            .iter()
+            .filter(|f| f.file_type == LogPathFileType::StagedCommit)
+    }
+
     pub(crate) fn ascending_commit_files_mut(&mut self) -> &mut Vec<ParsedLogPath> {
         &mut self.ascending_commit_files
     }
@@ -427,29 +450,76 @@ impl LogSegmentFiles {
         &self.latest_commit_file
     }
 
+    /// Iterator over every listed log path across all fields.
+    pub(crate) fn iter_all_paths(&self) -> impl Iterator<Item = &ParsedLogPath> {
+        self.ascending_commit_files
+            .iter()
+            .chain(&self.ascending_compaction_files)
+            .chain(&self.checkpoint_parts)
+            .chain(&self.latest_crc_file)
+            .chain(&self.latest_commit_file)
+    }
+
+    /// Estimated heap size in bytes, best-effort estimate.
+    pub(crate) fn estimated_heap_size_bytes(&self) -> usize {
+        let vec_buffer_bytes = (self.ascending_commit_files.capacity()
+            + self.ascending_compaction_files.capacity()
+            + self.checkpoint_parts.capacity())
+            * size_of::<ParsedLogPath>();
+        let path_bytes: usize = self
+            .iter_all_paths()
+            .map(ParsedLogPath::estimated_heap_size_bytes)
+            .sum();
+        vec_buffer_bytes + path_bytes
+    }
+
     /// List all commits between the provided `start_version` (inclusive) and `end_version`
     /// (inclusive). All other types are ignored.
+    ///
+    /// `log_tail` is a contiguous run of commits ending at the table's latest version. It takes
+    /// precedence over the filesystem listing, and is required for catalog-managed tables, whose
+    /// unbackfilled staged commits exist only here.
     pub(crate) fn list_commits(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // TODO: plumb through a log_tail provided by our caller
+        debug_assert!(
+            log_tail.iter().all(|entry| entry.is_commit()),
+            "log_tail should only contain commits"
+        );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter = list_from_storage(storage, log_root, start, end)?;
 
+        let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
         let mut max_published_version: Option<Version> = None;
-
+        // Filesystem commits, skipping any covered by the log_tail.
         for file_result in fs_iter {
             let file = file_result?;
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                should_process_log_file(&file); // warns if 0 bytes
-                max_published_version = max_published_version.max(Some(file.version));
-                listed_commits.push(file);
+            if file.file_type != LogPathFileType::Commit {
+                continue;
             }
+            max_published_version = max_published_version.max(Some(file.version));
+            if log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start) {
+                continue;
+            }
+            should_process_log_file(&file); // warns if 0 bytes
+            listed_commits.push(file);
+        }
+
+        // Log_tail commits, extending the filesystem prefix in ascending order.
+        for file in log_tail {
+            if file.version < start || file.version > end {
+                continue;
+            }
+            if file.file_type == LogPathFileType::Commit {
+                max_published_version = max_published_version.max(Some(file.version));
+            }
+            listed_commits.push(file);
         }
 
         let latest_commit_file = listed_commits.last().cloned();

@@ -8,11 +8,11 @@
 //! with [`TestTableBuilder::with_data`] when a test needs specific file/row counts.
 //!
 //! Provides five orthogonal axes for parameterized testing:
-//! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
-//! - [`FeatureSet`] -- which Delta table features are enabled
-//! - [`TableConfig`] -- runtime knobs (e.g. stats format) orthogonal to features
-//! - [`VersionTarget`] -- how the snapshot is loaded (latest, time travel, incremental)
-//! - [`DataLayoutConfig`] -- data layout (unpartitioned, partitioned, clustered)
+//! - [`LogState`]: what log files exist on disk (commits, checkpoints, CRC)
+//! - [`FeatureSet`]: which Delta table features are enabled
+//! - [`DataLayoutConfig`]: data layout (unpartitioned, partitioned, clustered)
+//! - [`TableConfig`]: runtime knobs (e.g. checkpoint stats format)
+//! - [`VersionTarget`]: how the snapshot is loaded (latest, time travel, incremental)
 //!
 //! # Quick start
 //!
@@ -30,11 +30,16 @@
 //!     log_state: LogState,
 //!     #[values(FeatureSet::empty())]
 //!     feature_set: FeatureSet,
+//!     #[values(unpartitioned())]
+//!     data_layout: DataLayoutConfig,
+//!     #[values(checkpoint_json_stats())]
+//!     table_config: TableConfig,
 //!     #[values(VersionTarget::Latest, VersionTarget::IncrementalToLatest { from: 0 })]
 //!     version_target: VersionTarget,
 //! ) {
-//!     let (engine, snap, _table) =
-//!         test_context!(log_state, feature_set, version_target);
+//!     let (engine, snap, _table) = test_context!(
+//!         log_state, feature_set, data_layout, table_config, version_target,
+//!     );
 //!     let scan = snap.scan_builder().build().unwrap();
 //!     // ...
 //! }
@@ -49,29 +54,44 @@ use std::fmt;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
+use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel_default_engine::executor::TaskExecutor;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+
+// ===========================================================================
+// Sweep constants
+// ===========================================================================
+
+/// Latest commit version used by every log state in the
+/// [`default_sweep!`](crate::default_sweep) template.
+pub const DEFAULT_SWEEP_LATEST_VERSION: u64 = 10;
+
+/// Mid version used by the [`default_sweep!`](crate::default_sweep) template for
+/// `AtVersion` and `IncrementalToLatest` targets. Must satisfy
+/// `mid <= DEFAULT_SWEEP_LATEST_VERSION`.
+pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 
 // ===========================================================================
 // Sync/async bridge
@@ -159,7 +179,8 @@ impl fmt::Display for LastCheckpointHintState {
     }
 }
 
-/// Shape of a Delta table's `_delta_log/` directory.
+/// Shape of a Delta table's `_delta_log/` directory: commits, checkpoints, CRC
+/// files, the `_last_checkpoint` hint, and log cleanup.
 #[derive(Clone, Debug)]
 pub struct LogState {
     /// Latest version on the table. Versions `0..=latest_version` exist as
@@ -170,6 +191,9 @@ pub struct LogState {
     checkpoints_at: Vec<u64>,
     /// Format applied to every checkpoint in `checkpoints_at`.
     checkpoint_format: CheckpointFormat,
+    /// Sorted ascending, distinct, all `<= latest_version`. A `.crc` file is
+    /// written at each listed version.
+    crcs_at: Vec<u64>,
     /// If `Some(n)`, log files at versions `< n` are deleted after the table is built.
     cleanup_before: Option<u64>,
     /// State of the `_last_checkpoint` hint file. Defaults to `Present`.
@@ -184,6 +208,7 @@ impl LogState {
             latest_version: n,
             checkpoints_at: Vec::new(),
             checkpoint_format: CheckpointFormat::Default,
+            crcs_at: Vec::new(),
             cleanup_before: None,
             last_checkpoint_hint: LastCheckpointHintState::Present,
         }
@@ -192,6 +217,10 @@ impl LogState {
     /// Add checkpoints at the given versions. Pass `[v]` for a single
     /// checkpoint or `[v1, v2, ...]` for multiple. Each `v` must be
     /// `<= latest_version` and not already present.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any `v > latest_version` or is already present.
     pub fn with_checkpoint_at(mut self, vs: impl IntoIterator<Item = u64>) -> Self {
         for v in vs {
             assert!(
@@ -218,6 +247,31 @@ impl LogState {
             Some(v) => self.with_checkpoint_at([v]),
             None => self,
         }
+    }
+
+    /// Add CRC files at the given versions. Pass `[v]` for a single CRC or
+    /// `[v1, v2, ...]` for multiple. Each `v` must be `<= latest_version` and
+    /// not already present.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any `v > latest_version` or is already present.
+    pub fn with_crc_at(mut self, vs: impl IntoIterator<Item = u64>) -> Self {
+        for v in vs {
+            assert!(
+                v <= self.latest_version,
+                "crc_at ({v}) must be <= latest_version ({})",
+                self.latest_version,
+            );
+            assert!(
+                !self.crcs_at.contains(&v),
+                "crc_at ({v}) already present in {:?}",
+                self.crcs_at,
+            );
+            self.crcs_at.push(v);
+        }
+        self.crcs_at.sort_unstable();
+        self
     }
 
     /// Switch every checkpoint to V2 with sidecars. Pass `None` for the kernel
@@ -252,53 +306,11 @@ impl LogState {
         self
     }
 
-    /// Canonical log shapes for snapshot reader-path tests. Built against a
-    /// 10-version table; each shape exercises a distinct read path.
-    pub fn common() -> Vec<Self> {
-        const N: u64 = 10;
-        vec![
-            // commits-only: pure JSON replay
-            Self::with_latest_version(N),
-            // checkpoint at latest: no JSON tail (relevant for ICT, where the
-            // latest commit's timestamp lives in the checkpoint)
-            Self::with_latest_version(N).with_checkpoint_at([N]),
-            // checkpoint mid-stream: tail-replay over JSON commits after a checkpoint
-            Self::with_latest_version(N).with_checkpoint_at([N - 5]),
-            // multi-checkpoint: newer supersedes older
-            Self::with_latest_version(N).with_checkpoint_at([N - 5, N]),
-            // post-cleanup: log truncated at the mid-stream checkpoint
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5])
-                .with_cleanup_commits_before(N - 5),
-            // mid-stream checkpoint with hint missing: listing fallback discovers it
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5])
-                .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
-            // two checkpoints + stale hint: hint at mid-stream, real latest at end;
-            // reader follows hint, lists forward, recovers actual latest
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5, N])
-                .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
-            // post-cleanup + missing hint: pruned log with no hint, reader lists
-            // forward to find the surviving checkpoint
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5])
-                .with_cleanup_commits_before(N - 5)
-                .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
-            // post-cleanup + stale hint: pruned log where the hint points at the
-            // lowest surviving checkpoint; reader lists forward to discover latest
-            Self::with_latest_version(N)
-                .with_checkpoint_at([N - 5, N])
-                .with_cleanup_commits_before(N - 5)
-                .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
-        ]
-    }
-
     /// Latest version on the table. The total number of commits on disk is
-    /// `latest_version + 1`. (Does not yet account for log cleanup -- a
-    /// post-cleanup state where commits `0..K` have been removed is a
-    /// separate axis tracked in #2526.)
-    pub(crate) fn latest_version(&self) -> u64 {
+    /// `latest_version + 1` (or fewer if
+    /// [`with_cleanup_commits_before`](Self::with_cleanup_commits_before) removed earlier
+    /// versions).
+    pub fn latest_version(&self) -> u64 {
         self.latest_version
     }
 
@@ -312,6 +324,11 @@ impl LogState {
         &self.checkpoint_format
     }
 
+    /// Versions at which CRC files are written, in ascending order.
+    pub(crate) fn crcs_at(&self) -> &[u64] {
+        &self.crcs_at
+    }
+
     /// Version below which commits and checkpoints have been cleaned up, if any.
     pub(crate) fn cleanup_before(&self) -> Option<u64> {
         self.cleanup_before
@@ -321,6 +338,92 @@ impl LogState {
     pub(crate) fn last_checkpoint_hint(&self) -> LastCheckpointHintState {
         self.last_checkpoint_hint
     }
+}
+
+// Canonical sweep rows for the LogState axis. Test case names derive from these
+// function names (e.g. `log_state_1_commits_only__`).
+
+pub fn commits_only() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+}
+
+pub fn checkpoint_at_end() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_LATEST_VERSION])
+}
+
+pub fn checkpoint_at_end_no_hint() -> LogState {
+    checkpoint_at_end().with_last_checkpoint_hint(LastCheckpointHintState::Missing)
+}
+
+pub fn checkpoint_mid() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_MID_VERSION])
+}
+
+pub fn checkpoint_mid_no_hint() -> LogState {
+    checkpoint_mid().with_last_checkpoint_hint(LastCheckpointHintState::Missing)
+}
+
+pub fn two_checkpoints_stale_hint() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_MID_VERSION, DEFAULT_SWEEP_LATEST_VERSION])
+        .with_last_checkpoint_hint(LastCheckpointHintState::Stale)
+}
+
+pub fn crc_at_end() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
+}
+
+pub fn crc_at_mid() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_crc_at([DEFAULT_SWEEP_MID_VERSION])
+}
+
+pub fn checkpoint_at_end_crc_at_end() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_LATEST_VERSION])
+        .with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
+}
+
+// Post-cleanup variants: same shapes as above but with log cleanup applied at MID.
+// Cleanup at MID (not at LATEST) keeps commits MID..=LATEST reachable, so the canonical
+// `at_version(MID)` and `incremental_to_latest { from: MID }` targets still resolve.
+
+pub fn checkpoint_at_end_post_cleanup() -> LogState {
+    LogState::with_latest_version(DEFAULT_SWEEP_LATEST_VERSION)
+        .with_checkpoint_at([DEFAULT_SWEEP_MID_VERSION, DEFAULT_SWEEP_LATEST_VERSION])
+        .with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_at_end_no_hint_post_cleanup() -> LogState {
+    checkpoint_at_end_post_cleanup().with_last_checkpoint_hint(LastCheckpointHintState::Missing)
+}
+
+pub fn checkpoint_mid_post_cleanup() -> LogState {
+    checkpoint_mid().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_mid_no_hint_post_cleanup() -> LogState {
+    checkpoint_mid_no_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn two_checkpoints_stale_hint_post_cleanup() -> LogState {
+    two_checkpoints_stale_hint().with_cleanup_commits_before(DEFAULT_SWEEP_MID_VERSION)
+}
+
+pub fn checkpoint_mid_crc_at_mid_post_cleanup() -> LogState {
+    checkpoint_mid_post_cleanup().with_crc_at([DEFAULT_SWEEP_MID_VERSION])
+}
+
+pub fn checkpoint_mid_crc_above_mid_post_cleanup() -> LogState {
+    // Version 8 lies strictly between MID=5 and LATEST=10.
+    checkpoint_mid_post_cleanup().with_crc_at([8])
+}
+
+pub fn checkpoint_mid_crc_at_end_post_cleanup() -> LogState {
+    checkpoint_mid_post_cleanup().with_crc_at([DEFAULT_SWEEP_LATEST_VERSION])
 }
 
 /// Extract the version from a versioned log file. Returns `None` for unversioned
@@ -370,6 +473,9 @@ impl fmt::Display for LogState {
         write!(f, "v={}", self.latest_version)?;
         for v in &self.checkpoints_at {
             write!(f, "+checkpoint_at({v})")?;
+        }
+        for v in &self.crcs_at {
+            write!(f, "+crc_at({v})")?;
         }
         if let Some(n) = self.cleanup_before {
             write!(f, "+cleanup_before({n})")?;
@@ -496,37 +602,6 @@ impl FeatureSet {
         self
     }
 
-    /// Common feature sets for cross-product testing: empty, one per write-compatible
-    /// feature, and one with all write-compatible features combined. Not the full power
-    /// set -- add specific combos as needed.
-    ///
-    /// `type_widening` is intentionally excluded because kernel errors when writing
-    /// tables with that feature enabled (see `TableFeature::TypeWidening`).
-    pub fn common() -> Vec<Self> {
-        vec![
-            Self::empty(),
-            Self::new().column_mapping("name"),
-            Self::new().ict(),
-            Self::new().v2_checkpoint(),
-            Self::new().deletion_vectors(),
-            Self::new().append_only(),
-            Self::new().change_data_feed(),
-            Self::new().domain_metadata(),
-            Self::new().vacuum_protocol_check(),
-            Self::new().row_tracking(),
-            Self::new()
-                .column_mapping("name")
-                .ict()
-                .v2_checkpoint()
-                .deletion_vectors()
-                .append_only()
-                .change_data_feed()
-                .domain_metadata()
-                .vacuum_protocol_check()
-                .row_tracking(),
-        ]
-    }
-
     /// Returns the table features implied by the properties in this set. Used by tests
     /// to check that each builder method actually enables the right feature.
     pub fn expected_features(&self) -> Vec<TableFeature> {
@@ -574,16 +649,43 @@ impl fmt::Display for FeatureSet {
     }
 }
 
+// Canonical sweep rows for the FeatureSet axis.
+
+pub fn no_features() -> FeatureSet {
+    FeatureSet::empty()
+}
+
+pub fn all_features_cm_id() -> FeatureSet {
+    all_features_base().column_mapping("id")
+}
+
+pub fn all_features_cm_name() -> FeatureSet {
+    all_features_base().column_mapping("name")
+}
+
+fn all_features_base() -> FeatureSet {
+    FeatureSet::new()
+        .deletion_vectors()
+        .row_tracking()
+        .domain_metadata()
+        .ict()
+        .v2_checkpoint()
+        .vacuum_protocol_check()
+        .change_data_feed()
+        .append_only()
+}
+
 // ===========================================================================
 // TableConfig
 // ===========================================================================
 
 /// Table configuration properties that are orthogonal to table features.
 ///
-/// These are pure runtime knobs (e.g. stats format, checkpoint interval) that don't
-/// affect the protocol or enable features. Use as a separate cross-product axis from
-/// [`FeatureSet`] since the two are independent.
-#[derive(Clone, Debug, Default)]
+/// These are pure runtime knobs (stats format, checkpoint interval, file sizing,
+/// etc.) that don't affect the protocol or enable features. Crossed with
+/// [`DataLayoutConfig`] in the sweep so layout shape and write-time properties
+/// vary independently.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TableConfig {
     pub(crate) table_properties: Vec<(String, String)>,
 }
@@ -611,26 +713,6 @@ impl TableConfig {
         ));
         self
     }
-
-    /// Common table configs for cross-product testing: default plus all four stats
-    /// property combos.
-    pub fn common() -> Vec<Self> {
-        vec![
-            Self::new(),
-            Self::new()
-                .write_stats_as_json(true)
-                .write_stats_as_struct(false),
-            Self::new()
-                .write_stats_as_json(false)
-                .write_stats_as_struct(true),
-            Self::new()
-                .write_stats_as_json(true)
-                .write_stats_as_struct(true),
-            Self::new()
-                .write_stats_as_json(false)
-                .write_stats_as_struct(false),
-        ]
-    }
 }
 
 impl fmt::Display for TableConfig {
@@ -653,6 +735,27 @@ impl fmt::Display for TableConfig {
     }
 }
 
+// Canonical sweep rows for the TableConfig axis. These toggle only the *checkpoint*
+// stats encoding -- per-commit add-file stats are always written and unaffected.
+
+pub fn checkpoint_json_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(true)
+        .write_stats_as_struct(false)
+}
+
+pub fn checkpoint_struct_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(false)
+        .write_stats_as_struct(true)
+}
+
+pub fn no_checkpoint_stats() -> TableConfig {
+    TableConfig::new()
+        .write_stats_as_json(false)
+        .write_stats_as_struct(false)
+}
+
 // ===========================================================================
 // rstest_reuse templates
 // ===========================================================================
@@ -672,10 +775,8 @@ impl fmt::Display for TableConfig {
 // fn test_scan(feature_set: FeatureSet, table_config: TableConfig) { ... }
 // ```
 
-/// All common feature sets: empty, one per write-compatible feature, and all combined.
-///
-/// `type_widening` is intentionally excluded because kernel errors when writing tables
-/// with that feature enabled (see [`FeatureSet::common`]).
+/// Empty + one per write-compatible feature + all combined. `type_widening` is
+/// excluded because kernel errors when writing tables with that feature enabled.
 #[rstest_reuse::template]
 #[rstest::rstest]
 pub fn feature_sets(
@@ -726,11 +827,16 @@ pub fn table_configs(
 
 /// Data layout configuration for cross-product testing.
 ///
-/// Designed for rstest `#[values]` parameterization alongside [`LogState`] and
-/// [`FeatureSet`].
+/// Describes only the partitioning/clustering shape of the table. Write-time table
+/// properties (stats format, etc.) live in [`TableConfig`], which is crossed with
+/// this axis independently.
+///
+/// Designed for rstest `#[values]` parameterization alongside [`LogState`],
+/// [`FeatureSet`], and [`TableConfig`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataLayoutConfig {
-    /// No special data layout (default schema).
+    /// No partitioning or clustering. Uses an all-primitives schema including a
+    /// nested-struct column.
     Unpartitioned,
     /// Partition by every valid primitive type. Uses [`partitioned_schema`] with all columns
     /// as partition columns.
@@ -739,6 +845,14 @@ pub enum DataLayoutConfig {
     /// clustering-eligible columns. Boolean and Binary are excluded (not stats-eligible).
     ClusteredAllTypes,
 }
+
+/// Period for sparse null injection. Data generation emits a null every
+/// `NULL_RATE_EVERY_NTH` rows for each nullable, non-partition column, regardless of
+/// [`DataLayoutConfig`]. Clustering columns are nulled like any other data column (kernel
+/// permits null clustering keys). Partition columns are left fully populated: the protocol
+/// permits null partition values, but the generator does not model them, so partition data
+/// stays well-defined and matches the declared partition value.
+pub const NULL_RATE_EVERY_NTH: usize = 3;
 
 impl DataLayoutConfig {
     /// The layout column names (partition or clustering) for this config. Returns all
@@ -767,12 +881,12 @@ impl DataLayoutConfig {
 
     /// Whether this config uses partitioning.
     pub fn is_partitioned(&self) -> bool {
-        *self == DataLayoutConfig::PartitionedAllTypes
+        self == &DataLayoutConfig::PartitionedAllTypes
     }
 
     /// Whether this config uses clustering.
     pub fn is_clustered(&self) -> bool {
-        *self == DataLayoutConfig::ClusteredAllTypes
+        self == &DataLayoutConfig::ClusteredAllTypes
     }
 }
 
@@ -836,6 +950,20 @@ pub fn clustered_schema() -> SchemaRef {
     ]))
 }
 
+// Canonical sweep rows for the DataLayoutConfig axis.
+
+pub fn unpartitioned() -> DataLayoutConfig {
+    DataLayoutConfig::Unpartitioned
+}
+
+pub fn partitioned() -> DataLayoutConfig {
+    DataLayoutConfig::PartitionedAllTypes
+}
+
+pub fn clustered() -> DataLayoutConfig {
+    DataLayoutConfig::ClusteredAllTypes
+}
+
 // ===========================================================================
 // VersionTarget
 // ===========================================================================
@@ -852,6 +980,15 @@ pub enum VersionTarget {
     AtVersion(u64),
     /// Load at `from`, then incrementally update to latest.
     IncrementalToLatest { from: u64 },
+    /// Load at `from`, then incrementally update to a specific target `to`. Exercises the
+    /// `Snapshot::builder_from(base).at_version(to)` path with `to <= latest`. Requires
+    /// `from <= to`.
+    IncrementalFrom { from: u64, to: u64 },
+    /// Time travel by timestamp: resolves `timestamp` (milliseconds since Unix epoch) to a
+    /// version via [`history_manager::latest_version_as_of`], then loads that version.
+    ///
+    /// [`history_manager::latest_version_as_of`]: delta_kernel::history_manager::latest_version_as_of
+    AtTimestamp(i64),
 }
 
 impl fmt::Display for VersionTarget {
@@ -862,8 +999,45 @@ impl fmt::Display for VersionTarget {
             VersionTarget::IncrementalToLatest { from } => {
                 write!(f, "incremental({from}->latest)")
             }
+            VersionTarget::IncrementalFrom { from, to } => {
+                write!(f, "incremental({from}->{to})")
+            }
+            VersionTarget::AtTimestamp(ts) => write!(f, "at_timestamp({ts})"),
         }
     }
+}
+
+// Canonical sweep rows for the VersionTarget axis.
+
+pub fn version_latest() -> VersionTarget {
+    VersionTarget::Latest
+}
+pub fn version_at_mid() -> VersionTarget {
+    VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION)
+}
+pub fn version_incremental_from_mid_to_latest() -> VersionTarget {
+    VersionTarget::IncrementalToLatest {
+        from: DEFAULT_SWEEP_MID_VERSION,
+    }
+}
+/// Incremental update from `mid` to `latest - 1`. The non-latest `to` exercises the
+/// partial-replay path that `version_incremental_from_mid_to_latest()` cannot reach, since
+/// updating to latest is indistinguishable from a non-incremental load.
+pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
+    VersionTarget::IncrementalFrom {
+        from: DEFAULT_SWEEP_MID_VERSION,
+        to: DEFAULT_SWEEP_LATEST_VERSION - 1,
+    }
+}
+/// Timestamp travel using `i64::MAX`, which always resolves to the latest version (every
+/// commit's timestamp is below `i64::MAX`). This is a smoke test that the timestamp
+/// conversion path runs without error across the sweep, not a resolution-correctness
+/// check: `InMemory` collapses successive `put` timestamps to a single millisecond, so the
+/// sweep can't reach an intermediate version. Resolution to an intermediate version is
+/// covered by `test_at_timestamp_resolves_to_intermediate_version`, which sets commit
+/// modification times explicitly on the local filesystem.
+pub fn version_at_timestamp_max() -> VersionTarget {
+    VersionTarget::AtTimestamp(i64::MAX)
 }
 
 // ===========================================================================
@@ -971,14 +1145,11 @@ impl TestTableBuilder {
         self
     }
 
-    /// Apply a [`DataLayoutConfig`], setting the schema and layout columns accordingly.
-    /// This is the recommended way to configure partitioning or clustering -- it sets both
-    /// the schema and columns in one call. Use
-    /// [`with_partition_columns`](Self::with_partition_columns) or
-    /// [`with_clustering_columns`](Self::with_clustering_columns) directly only when you
-    /// need a custom schema with specific columns.
+    /// Apply a [`DataLayoutConfig`], setting the schema and layout columns. Pair with
+    /// [`with_table_config`](Self::with_table_config) to also set write-time properties
+    /// (e.g. stats format); the two axes are independent.
     ///
-    /// For [`DataLayoutConfig::Unpartitioned`], leaves the schema and columns unchanged.
+    /// For `Unpartitioned`, leaves the schema and columns unchanged.
     pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
         let cols = config.columns();
         if cols.is_empty() {
@@ -1071,6 +1242,11 @@ impl TestTableBuilder {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
+
+        let crcs_at = self.log_state.crcs_at();
+        if crcs_at.contains(&0) {
+            write_crc(&snapshot, engine.as_ref())?;
+        }
         if checkpoints_at.contains(&0) {
             snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
             if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
@@ -1091,6 +1267,9 @@ impl TestTableBuilder {
             )
             .await?
             .unwrap_post_commit_snapshot();
+            if crcs_at.contains(&v) {
+                write_crc(&snapshot, engine.as_ref())?;
+            }
             if checkpoints_at.contains(&v) {
                 snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
                 if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
@@ -1154,11 +1333,26 @@ impl TestTableBuilder {
 // Data commit via kernel write path
 // ===========================================================================
 
+/// Write a CRC file via kernel's checksum writer. Builder invariant: the snapshot
+/// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
+/// that version cannot already exist on disk.
+fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
+    let (result, _) = snapshot.write_checksum(engine)?;
+    assert_eq!(
+        result,
+        ChecksumWriteResult::Written,
+        "fresh in-memory table should never have a CRC on disk at this version",
+    );
+    Ok(())
+}
+
 /// Write a data commit using kernel's transaction + write_parquet path.
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
 /// tables, all rows in a file share the same partition values; for unpartitioned or
 /// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
-/// varying data derived from version and file index.
+/// varying data derived from version and file index. Partition columns are never nulled
+/// so their data matches the declared partition value; all other nullable columns
+/// (including clustering columns, which kernel permits to be null) get sparse nulls.
 async fn write_data_commit<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &DefaultEngine<E>,
@@ -1176,22 +1370,31 @@ async fn write_data_commit<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
+    let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
+
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
         let partition_seed = (version as usize) * 1000 + file_idx * 100;
-        let columns: Vec<ArrayRef> = arrow_schema
-            .fields()
-            .iter()
-            .zip(logical_schema.fields())
-            .map(|(arrow_field, kernel_field)| {
-                if partition_columns.contains(&kernel_field.name().to_string()) {
-                    generate_constant_column(arrow_field.data_type(), rows_per_file, partition_seed)
-                } else {
-                    generate_column(arrow_field.data_type(), rows_per_file, base)
-                }
-            })
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
+        // Data batches must not contain any partition columns.
+        let mut data_fields = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for (arrow_field, kernel_field) in arrow_schema.fields().iter().zip(logical_schema.fields())
+        {
+            if partition_set.contains(kernel_field.name().as_str()) {
+                continue;
+            }
+            let data_type = arrow_field.data_type();
+            let values = generate_column(data_type, rows_per_file, base);
+            let values = if arrow_field.is_nullable() {
+                with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
+            } else {
+                values
+            };
+            columns.push(values);
+            data_fields.push(arrow_field.clone());
+        }
+        let data_arrow_schema = ArrowSchema::new(data_fields);
+        let batch = RecordBatch::try_new(Arc::new(data_arrow_schema), columns)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
@@ -1212,71 +1415,6 @@ async fn write_data_commit<E: TaskExecutor>(
     }
 
     txn.commit(engine)
-}
-
-/// Generate a constant column where all rows have the same value derived from `seed`.
-/// Used for partition columns so the data matches the declared partition values.
-fn generate_constant_column(arrow_type: &ArrowDataType, rows: usize, seed: usize) -> ArrayRef {
-    match arrow_type {
-        ArrowDataType::Boolean => {
-            let v = seed.is_multiple_of(2);
-            Arc::new(BooleanArray::from(vec![v; rows]))
-        }
-        ArrowDataType::Int8 => {
-            let v = (seed % 100) as i8;
-            Arc::new(Int8Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int16 => {
-            let v = (seed % 100) as i16;
-            Arc::new(Int16Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int32 => {
-            let v = (seed % 100) as i32;
-            Arc::new(Int32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Int64 => {
-            let v = (seed * 1000) as i64;
-            Arc::new(Int64Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Float32 => {
-            let v = seed as f32 * 0.5;
-            Arc::new(Float32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Float64 => {
-            let v = seed as f64 * 0.25;
-            Arc::new(Float64Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Utf8 => {
-            let v = format!("part_{seed}");
-            Arc::new(StringArray::from(vec![v.as_str(); rows]))
-        }
-        ArrowDataType::Binary => {
-            let v = format!("bin_{seed}").into_bytes();
-            Arc::new(BinaryArray::from(vec![v.as_slice(); rows]))
-        }
-        ArrowDataType::Date32 => {
-            let v = 18000 + seed as i32;
-            Arc::new(Date32Array::from(vec![v; rows]))
-        }
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let v = (18000 + seed as i64) * 86_400_000_000;
-            let array = TimestampMicrosecondArray::from(vec![v; rows]);
-            match tz {
-                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
-                None => Arc::new(array),
-            }
-        }
-        ArrowDataType::Decimal128(precision, scale) => {
-            let scale_factor = 10i128.pow(*scale as u32);
-            let v = seed as i128 * scale_factor;
-            Arc::new(
-                Decimal128Array::from(vec![v; rows])
-                    .with_precision_and_scale(*precision, *scale)
-                    .expect("valid decimal"),
-            )
-        }
-        other => panic!("unsupported Arrow type for partition column: {other:?}"),
-    }
 }
 
 /// Generate a single column of data based on its Arrow type.
@@ -1353,8 +1491,39 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
                     .expect("valid decimal"),
             )
         }
+        ArrowDataType::Struct(fields) => {
+            let child_arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|f| {
+                    let child = generate_column(f.data_type(), rows, base);
+                    if f.is_nullable() {
+                        with_sparse_nulls(child, NULL_RATE_EVERY_NTH)
+                    } else {
+                        child
+                    }
+                })
+                .collect();
+            Arc::new(StructArray::new(fields.clone(), child_arrays, None))
+        }
         other => panic!("unsupported Arrow type in test data generation: {other:?}"),
     }
+}
+
+/// Wrap `array` so that every `every_nth`-th row reads as null. Used by
+/// [`write_data_commit`] to make the default sweep exercise null-aware code paths
+/// (stats null counts, predicate evaluation under null, etc.) uniformly.
+fn with_sparse_nulls(array: ArrayRef, every_nth: usize) -> ArrayRef {
+    assert!(every_nth >= 1, "every_nth must be >= 1");
+    let n = array.len();
+    let valid: Vec<bool> = (0..n).map(|i| !i.is_multiple_of(every_nth)).collect();
+    let null_buffer = NullBuffer::from(valid);
+    let data = array
+        .to_data()
+        .into_builder()
+        .nulls(Some(null_buffer))
+        .build()
+        .expect("rebuilding array with null buffer");
+    delta_kernel::arrow::array::make_array(data)
 }
 
 // ===========================================================================
@@ -1410,12 +1579,20 @@ impl fmt::Display for TestTable {
 // rstest fixtures
 // ===========================================================================
 
-/// Convenience wrapper: build a [`TestTable`] from a `log_state` and `feature_set`.
-/// Used by the `test_context!` macro and available for direct use in tests.
-pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
+/// Convenience wrapper: build a [`TestTable`] from a `log_state`, `feature_set`,
+/// `data_layout`, and `table_config`. Used by the `test_context!` macro and available
+/// for direct use in tests.
+pub fn test_table(
+    log_state: LogState,
+    feature_set: FeatureSet,
+    data_layout: DataLayoutConfig,
+    table_config: TableConfig,
+) -> TestTable {
     TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(feature_set)
+        .with_data_layout(data_layout)
+        .with_table_config(table_config)
         .build()
         .expect("failed to build test table")
 }
@@ -1449,6 +1626,30 @@ macro_rules! build_snapshot {
                     .unwrap();
                 Snapshot::builder_from(base).build($engine).unwrap()
             }
+            $crate::table_builder::VersionTarget::IncrementalFrom { from, to } => {
+                let base = Snapshot::builder_for($table_root)
+                    .at_version(*from)
+                    .build($engine)
+                    .unwrap();
+                Snapshot::builder_from(base)
+                    .at_version(*to)
+                    .build($engine)
+                    .unwrap()
+            }
+            $crate::table_builder::VersionTarget::AtTimestamp(ts) => {
+                let latest = Snapshot::builder_for($table_root).build($engine).unwrap();
+                let commit = ::delta_kernel::history_manager::latest_version_as_of(
+                    &latest,
+                    $engine,
+                    *ts,
+                    ::delta_kernel::history_manager::HistoryCommitType::Recreatable,
+                )
+                .unwrap();
+                Snapshot::builder_for($table_root)
+                    .at_version(commit.version)
+                    .build($engine)
+                    .unwrap()
+            }
         }
     };
 }
@@ -1458,25 +1659,39 @@ macro_rules! build_snapshot {
 /// Expands at the call site so `Snapshot` and the engine type resolve to the caller's crate
 /// types. Returns `(engine, snapshot, table)`.
 ///
-/// The 3-argument form defaults to `DefaultEngine` and requires `DefaultEngineBuilder` to be in
-/// scope at the call site. The 4-argument form takes an explicit engine factory closure
+/// The 5-argument form defaults to `DefaultEngine` and requires `DefaultEngineBuilder` to be in
+/// scope at the call site. The 6-argument form takes an explicit engine factory closure
 /// `Fn(Arc<DynObjectStore>) -> Engine`, useful when the caller cannot construct a
 /// `DefaultEngine` (e.g. kernel-internal unit tests that depend only on `SyncEngine`).
 ///
 /// ```ignore
-/// let (engine, snap, table) = test_context!(log_state, feature_set, version_target);
-/// let (engine, snap, table) = test_context!(log_state, feature_set, version_target,
-///     |store| SyncEngine::new_with_store(store));
+/// let (engine, snap, table) = test_context!(
+///     log_state, feature_set, data_layout, table_config, version_target,
+/// );
+/// let (engine, snap, table) = test_context!(
+///     log_state, feature_set, data_layout, table_config, version_target,
+///     |store| SyncEngine::new_with_store(store),
+/// );
 /// ```
 #[macro_export]
 macro_rules! test_context {
-    ($log_state:expr, $feature_set:expr, $version_target:expr) => {
-        $crate::test_context!($log_state, $feature_set, $version_target, |store| {
-            DefaultEngineBuilder::new(store).build()
-        })
+    ($log_state:expr, $feature_set:expr, $data_layout:expr, $table_config:expr, $version_target:expr $(,)?) => {
+        $crate::test_context!(
+            $log_state,
+            $feature_set,
+            $data_layout,
+            $table_config,
+            $version_target,
+            |store| { DefaultEngineBuilder::new(store).build() }
+        )
     };
-    ($log_state:expr, $feature_set:expr, $version_target:expr, $engine_factory:expr) => {{
-        let table = $crate::table_builder::test_table($log_state, $feature_set);
+    ($log_state:expr, $feature_set:expr, $data_layout:expr, $table_config:expr, $version_target:expr, $engine_factory:expr $(,)?) => {{
+        let table = $crate::table_builder::test_table(
+            $log_state,
+            $feature_set,
+            $data_layout,
+            $table_config,
+        );
         let engine = ($engine_factory)(table.store().clone());
         let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
         (engine, snap, table)
@@ -1537,6 +1752,7 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 Scalar::decimal(bits, dt.precision(), dt.scale())
                     .expect("test seed produced invalid decimal")
             }
+            PrimitiveType::Void => panic!("void type is not a valid partition column"),
         },
         other => panic!("partition columns must be primitive types, got: {other:?}"),
     }
@@ -1547,7 +1763,7 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
 // ===========================================================================
 
 /// Default schema with all Delta primitive types including TimestampNtz
-/// (nested types are a separate concern).
+/// and a nested column type.
 pub(crate) fn default_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
         StructField::new("bool_col", DataType::BOOLEAN, true),
@@ -1563,6 +1779,15 @@ pub(crate) fn default_schema() -> SchemaRef {
         StructField::new("ts_col", DataType::TIMESTAMP, true),
         StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
         StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),
+        StructField::new(
+            "nested_col",
+            DataType::try_struct_type([
+                StructField::nullable("a", DataType::LONG),
+                StructField::nullable("b", DataType::STRING),
+            ])
+            .unwrap(),
+            true,
+        ),
     ]))
 }
 
@@ -1599,17 +1824,32 @@ mod tests {
     fn test_version_targets(
         #[values(LogState::with_latest_version(4))] log_state: LogState,
         #[values(FeatureSet::empty())] feature_set: FeatureSet,
+        #[values(unpartitioned())] data_layout: DataLayoutConfig,
+        #[values(checkpoint_json_stats())] table_config: TableConfig,
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
-            VersionTarget::IncrementalToLatest { from: 1 }
+            VersionTarget::IncrementalToLatest { from: 1 },
+            VersionTarget::IncrementalFrom { from: 1, to: 3 },
+            VersionTarget::AtTimestamp(i64::MAX),
         )]
         version_target: VersionTarget,
     ) {
-        let (_engine, snap, _table) = test_context!(log_state, feature_set, version_target);
+        let (_engine, snap, _table) = test_context!(
+            log_state,
+            feature_set,
+            data_layout,
+            table_config,
+            version_target
+        );
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
+            VersionTarget::AtTimestamp(ts) if *ts == i64::MAX => 4,
             VersionTarget::AtVersion(v) => *v,
+            VersionTarget::IncrementalFrom { to, .. } => *to,
+            VersionTarget::AtTimestamp(ts) => {
+                panic!("test only uses AtTimestamp(i64::MAX), got {ts}")
+            }
         };
         assert_eq!(snap.version(), expected);
     }
@@ -1755,9 +1995,34 @@ mod tests {
             .with_cleanup_commits_before(1)
             .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
     )]
+    #[case::stale_hint_points_at_deleted_checkpoint(
+        LogState::with_latest_version(10)
+            .with_checkpoint_at([5, 8])
+            .with_cleanup_commits_before(8)
+            .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
+    )]
+    #[case::crc_at_v0(LogState::with_latest_version(2).with_crc_at([0]))]
+    #[case::crc_at_v1(LogState::with_latest_version(2).with_crc_at([1]))]
+    #[case::crc_at_latest(LogState::with_latest_version(2).with_crc_at([2]))]
+    #[case::checkpoint_with_later_crc(
+        LogState::with_latest_version(2).with_checkpoint_at([1]).with_crc_at([2]),
+    )]
+    #[case::crc_below_cleanup_is_deleted(
+        LogState::with_latest_version(3)
+            .with_checkpoint_at([2])
+            .with_crc_at([1])
+            .with_cleanup_commits_before(2),
+    )]
+    #[case::crc_at_cleanup_boundary_survives(
+        LogState::with_latest_version(3)
+            .with_checkpoint_at([2])
+            .with_crc_at([2])
+            .with_cleanup_commits_before(2),
+    )]
     fn test_log_state_checkpoint_shapes_land_on_disk(
         #[case] log_state: LogState,
     ) -> DeltaResult<()> {
+        let expected_version = log_state.latest_version();
         let table = TestTableBuilder::new()
             .with_log_state(log_state.clone())
             .build()?;
@@ -1766,7 +2031,7 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(
             snap.version(),
-            2,
+            expected_version,
             "rebuild lost commits for {}",
             table.description(),
         );
@@ -1835,9 +2100,90 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies the data generator injects sparse nulls into every nullable data column.
+    /// Uses `rows_per_file = NULL_RATE_EVERY_NTH * 3` so each file has exactly three null
+    /// rows per column.
+    #[test]
+    fn test_sparse_null_injection_in_generated_data() -> DeltaResult<()> {
+        let rows_per_file = NULL_RATE_EVERY_NTH * 3;
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(1))
+            .with_data(1, rows_per_file)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, rows_per_file);
+        let expected_nulls_per_col = rows_per_file / NULL_RATE_EVERY_NTH;
+        for batch in &batches {
+            for col_idx in 0..batch.num_columns() {
+                let null_count = batch.column(col_idx).null_count();
+                assert_eq!(
+                    null_count,
+                    expected_nulls_per_col,
+                    "column '{}' should have {expected_nulls_per_col} nulls, got {null_count}",
+                    batch.schema().field(col_idx).name(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Partition columns are never nulled so their data matches the declared partition
+    /// value. Clustering columns are ordinary data columns (kernel permits null clustering
+    /// keys), so they receive the same sparse nulls as any other nullable column -- the
+    /// clustered case guards against accidentally protecting them.
     #[rstest::rstest]
-    #[case::partitioned(DataLayoutConfig::PartitionedAllTypes, partitioned_schema())]
-    #[case::clustered(DataLayoutConfig::ClusteredAllTypes, clustered_schema())]
+    #[case::partitioned(partitioned())]
+    #[case::clustered(clustered())]
+    fn test_layout_column_null_injection(#[case] config: DataLayoutConfig) -> DeltaResult<()> {
+        let rows_per_file = NULL_RATE_EVERY_NTH * 3;
+        // Only partition columns are protected from nulling; clustering columns are not.
+        let protected_columns = if config.is_partitioned() {
+            config.columns()
+        } else {
+            Vec::new()
+        };
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(1))
+            .with_data_layout(config)
+            .with_data(1, rows_per_file)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let expected_nulls_per_col = rows_per_file / NULL_RATE_EVERY_NTH;
+        for batch in &batches {
+            for col_idx in 0..batch.num_columns() {
+                let name = batch.schema().field(col_idx).name().to_string();
+                let null_count = batch.column(col_idx).null_count();
+                if protected_columns.contains(&name) {
+                    assert_eq!(
+                        null_count, 0,
+                        "partition column '{name}' must never be nulled, got {null_count}",
+                    );
+                } else {
+                    assert_eq!(
+                        null_count, expected_nulls_per_col,
+                        "data column '{name}' should have {expected_nulls_per_col} nulls, \
+                         got {null_count}",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::partitioned(partitioned(), partitioned_schema())]
+    #[case::clustered(clustered(), clustered_schema())]
     fn test_data_layout_table(
         #[case] config: DataLayoutConfig,
         #[case] expected_schema: SchemaRef,
@@ -1865,7 +2211,8 @@ mod tests {
         // v0=create, v1-v3=data commits, 10 rows each
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(3))
-            .with_data_layout(DataLayoutConfig::ClusteredAllTypes)
+            .with_data_layout(clustered())
+            .with_table_config(checkpoint_struct_stats())
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -1894,6 +2241,22 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_struct_schema_round_trip() -> DeltaResult<()> {
+        let inner = DataType::try_struct_type([StructField::nullable("a", DataType::LONG)])?;
+        let schema: SchemaRef = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("inner", inner),
+        ])?);
+        let table = TestTableBuilder::new()
+            .with_schema(schema.clone())
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.schema(), schema);
+        Ok(())
+    }
+
+    #[test]
     fn test_layout_columns_are_mutually_exclusive() {
         let builder = TestTableBuilder::new()
             .with_partition_columns(["col_a"])
@@ -1912,6 +2275,53 @@ mod tests {
     #[should_panic(expected = "must be <=")]
     fn test_with_checkpoint_at_rejects_above_latest_version() {
         LogState::with_latest_version(2).with_checkpoint_at([3]);
+    }
+
+    #[rstest::rstest]
+    #[case::no_features(FeatureSet::empty(), false)]
+    #[case::v2_checkpoint_feature(FeatureSet::new().v2_checkpoint(), false)]
+    #[case::ict(FeatureSet::new().ict(), true)]
+    fn test_builder_writes_crc_with_correct_content(
+        #[case] features: FeatureSet,
+        #[case] expect_ict: bool,
+    ) -> DeltaResult<()> {
+        let log_state = LogState::with_latest_version(2)
+            .with_checkpoint_at([2])
+            .with_crc_at([2]);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state.clone())
+            .with_features(features)
+            .build()?;
+        assert_log_state_files_on_disk(&table, &log_state)?;
+
+        let crc = read_crc_json(table.store(), 2)?;
+        assert_eq!(
+            crc["numFiles"].as_u64().unwrap(),
+            2,
+            "numFiles should match the 2 data adds emitted at v=1 and v=2",
+        );
+        assert!(
+            crc["tableSizeBytes"].as_u64().unwrap() > 0,
+            "tableSizeBytes should be positive for a table with 2 data files",
+        );
+        assert_eq!(
+            crc["inCommitTimestampOpt"].is_i64(),
+            expect_ict,
+            "inCommitTimestampOpt presence must match the ICT feature flag",
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "must be <= latest_version")]
+    fn test_with_crc_at_rejects_above_latest_version() {
+        LogState::with_latest_version(2).with_crc_at([3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "already present")]
+    fn test_with_crc_at_rejects_duplicate_version() {
+        LogState::with_latest_version(2).with_crc_at([1, 1]);
     }
 
     #[test]
@@ -2018,6 +2428,38 @@ mod tests {
             }
         }
 
+        for &v in log_state.crcs_at() {
+            let crc_name = format!("{v:020}.crc");
+            let surviving = v >= cleanup;
+            let found = entries.iter().any(|name| name == &crc_name);
+            assert_eq!(
+                found,
+                surviving,
+                "CRC at v={v} should be {} for {log_state}: {entries:?}",
+                if surviving { "present" } else { "cleaned up" },
+            );
+            if surviving {
+                let crc = read_crc_json(table.store(), v)?;
+                assert!(
+                    crc["tableSizeBytes"].is_u64(),
+                    "CRC at v={v} missing tableSizeBytes",
+                );
+                assert!(crc["numFiles"].is_u64(), "CRC at v={v} missing numFiles");
+                assert_eq!(
+                    crc["numMetadata"].as_u64(),
+                    Some(1),
+                    "CRC at v={v} must have numMetadata == 1 per spec",
+                );
+                assert_eq!(
+                    crc["numProtocol"].as_u64(),
+                    Some(1),
+                    "CRC at v={v} must have numProtocol == 1 per spec",
+                );
+                assert!(crc["protocol"].is_object(), "CRC at v={v} missing protocol");
+                assert!(crc["metadata"].is_object(), "CRC at v={v} missing metadata");
+            }
+        }
+
         let hint = read_last_checkpoint_hint(table.store())?;
         match log_state.last_checkpoint_hint() {
             LastCheckpointHintState::Present => {
@@ -2051,27 +2493,46 @@ mod tests {
         version: u64,
     }
 
+    /// Read and JSON-parse a file from `store`. Returns `Ok(None)` if absent.
+    async fn try_read_json(
+        store: &DynObjectStore,
+        path: &Path,
+    ) -> DeltaResult<Option<serde_json::Value>> {
+        let bytes = match store.get(path).await {
+            Ok(r) => r.bytes().await.map_err(delta_kernel::Error::from)?,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(delta_kernel::Error::from(e)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| delta_kernel::Error::generic(e.to_string()))
+    }
+
     /// Read and parse the `_last_checkpoint` hint, if present.
     fn read_last_checkpoint_hint(store: &Arc<DynObjectStore>) -> DeltaResult<Option<HintFile>> {
         let store = store.clone();
         block_on_sync(move || async move {
             let path = Path::from("_delta_log/_last_checkpoint");
-            match store.get(&path).await {
-                Ok(get_result) => {
-                    let bytes = get_result
-                        .bytes()
-                        .await
-                        .map_err(delta_kernel::Error::from)?;
-                    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-                        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+            match try_read_json(&store, &path).await? {
+                Some(parsed) => {
                     let version = parsed["version"].as_u64().ok_or_else(|| {
                         delta_kernel::Error::generic("hint missing `version` field")
                     })?;
                     Ok(Some(HintFile { version }))
                 }
-                Err(ObjectStoreError::NotFound { .. }) => Ok(None),
-                Err(e) => Err(delta_kernel::Error::from(e)),
+                None => Ok(None),
             }
+        })
+    }
+
+    /// Read and parse a CRC file at `version`. Errors if the file is absent.
+    fn read_crc_json(store: &Arc<DynObjectStore>, version: u64) -> DeltaResult<serde_json::Value> {
+        let store = store.clone();
+        block_on_sync(move || async move {
+            let path = Path::from(format!("_delta_log/{version:020}.crc"));
+            try_read_json(&store, &path)
+                .await?
+                .ok_or_else(|| delta_kernel::Error::generic(format!("CRC at v={version} missing")))
         })
     }
 

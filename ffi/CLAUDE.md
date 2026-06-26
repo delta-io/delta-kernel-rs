@@ -29,6 +29,8 @@ the caller's memory space.
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
+- `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
+- `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
 
 ## Read Flow
 
@@ -78,6 +80,28 @@ descriptor map and scan iterator are both consumed by `transaction_update_deleti
 descriptor handles are consumed by `dv_descriptor_map_insert` only on success and must be
 freed by the caller on error. DV updates require both the `deletionVectors` reader/writer
 feature and `delta.enableDeletionVectors=true`.
+
+## Tracing & Metrics
+
+Gated behind the `tracing` feature. A single global `tracing` subscriber backs both logging and
+metrics; it is installed lazily the first time any `enable_*` function below is called. The
+subscriber has two reloadable slots: a logging layer (swapped wholesale between event-based and
+log-line formats) and a metrics layer (a fixed `ReportGeneratorLayer` toggled on/off via a
+reloadable level filter).
+
+Logging registration (each re-callable to replace the active callback, format, and level):
+- `enable_event_tracing(callback, max_level)` -- structured `Event`s; the engine formats them
+- `enable_log_line_tracing(callback, max_level)` -- pre-formatted log lines, default options
+- `enable_formatted_log_line_tracing(callback, max_level, format, ansi, with_time, with_level, with_target)`
+  -- pre-formatted log lines with explicit formatting options
+
+Metrics registration:
+- `enable_metrics_reporting(callback)` -- forwards each kernel `MetricEvent` to the callback as a
+  `repr(C)` `MetricEvent` (see `src/ffi_metrics.rs`). Re-calling replaces the callback.
+
+The `MetricEvent` and any `KernelStringSlice` it carries are only valid for the duration of the
+callback. Durations are `u64`, suffixed `_ns` (nanoseconds) or `_ms` (milliseconds). Operation ids
+are the raw 16 bytes of the kernel UUID (`MetricId`).
 
 ## Building
 

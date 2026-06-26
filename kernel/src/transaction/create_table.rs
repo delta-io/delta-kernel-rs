@@ -32,13 +32,13 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::marker::PhantomData;
-use std::sync::OnceLock;
 
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::actions::DomainMetadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
 use crate::transaction::{CreateTable, Transaction};
@@ -101,8 +101,8 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use delta_kernel::transaction::create_table::create_table;
 /// use delta_kernel::schema::{DataType, StructField, StructType};
 /// use delta_kernel::committer::FileSystemCommitter;
-/// use delta_kernel::engine::default::DefaultEngineBuilder;
-/// use delta_kernel::engine::default::storage::store_from_url;
+/// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+/// use test_utils::delta_kernel_default_engine::storage::store_from_url;
 ///
 /// # fn main() -> delta_kernel::DeltaResult<()> {
 /// let schema = Arc::new(StructType::new_unchecked(vec![
@@ -149,9 +149,10 @@ impl CreateTableTransaction {
             path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
-
         Ok(Transaction {
             span,
+            operation_id: MetricId::new(),
+            correlation_id: None,
             read_snapshot_opt: None,
             effective_table_config,
             should_emit_protocol: true,
@@ -171,7 +172,6 @@ impl CreateTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
-            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }

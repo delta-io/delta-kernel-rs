@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{Scan, ScanBuilder, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -32,7 +32,7 @@ pub struct SharedScan;
 pub struct SharedScanMetadata;
 
 /// Boxed scan metadata iterator stored behind [`ScanMetadataIterator`]'s mutex.
-type ScanMetadataIter = Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>;
+type ScanMetadataIter = DeltaResultIteratorStatic<ScanMetadata>;
 
 /// An opaque, exclusive handle owning a [`ScanBuilder`].
 ///

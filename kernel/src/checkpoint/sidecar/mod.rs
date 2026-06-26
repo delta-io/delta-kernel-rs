@@ -5,7 +5,9 @@ use itertools::Itertools;
 use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::filter_by_predicate;
-use crate::expressions::{Expression, Predicate, Scalar, StructData, Transform};
+use crate::expressions::{
+    col, lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
+};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta,
@@ -182,10 +184,7 @@ impl SidecarSplitter {
         // Sidecar projector: select only add/remove columns.
         let file_action_projector = eval_handler.new_expression_evaluator(
             checkpoint_data_schema.clone(),
-            Arc::new(Expression::struct_from([
-                Expression::column([ADD_NAME]),
-                Expression::column([REMOVE_NAME]),
-            ])),
+            Arc::new(Expression::struct_from([col!(ADD_NAME), col!(REMOVE_NAME)])),
             sidecar_output_schema.clone().into(),
         )?;
 
@@ -193,8 +192,8 @@ impl SidecarSplitter {
         let file_actions_null_row_filter = eval_handler.new_predicate_evaluator(
             sidecar_output_schema,
             Arc::new(Predicate::or(
-                Predicate::is_not_null(Expression::column([ADD_NAME])),
-                Predicate::is_not_null(Expression::column([REMOVE_NAME])),
+                Predicate::is_not_null(col!(ADD_NAME)),
+                Predicate::is_not_null(col!(REMOVE_NAME)),
             )),
         )?;
 
@@ -202,21 +201,14 @@ impl SidecarSplitter {
         // same as checkpoint_data_schema (add/remove columns are already nullable).
         let non_file_action_nullifier = eval_handler.new_expression_evaluator(
             checkpoint_data_schema.clone(),
-            Arc::new(Expression::transform(
-                Transform::new_top_level()
-                    .with_replaced_field(
-                        ADD_NAME,
-                        Arc::new(Expression::literal(Scalar::Null(
-                            add_field.data_type.clone(),
-                        ))),
-                    )
-                    .with_replaced_field(
+            Arc::new(Expression::struct_patch(
+                ExpressionStructPatchBuilder::new()
+                    .replace(ADD_NAME, lit(Scalar::Null(add_field.data_type.clone())))
+                    .replace(
                         REMOVE_NAME,
-                        Arc::new(Expression::literal(Scalar::Null(
-                            remove_field.data_type.clone(),
-                        ))),
+                        lit(Scalar::Null(remove_field.data_type.clone())),
                     ),
-            )),
+            )?),
             checkpoint_data_schema.clone().into(),
         )?;
 
@@ -226,7 +218,7 @@ impl SidecarSplitter {
                 checkpoint_data_schema
                     .fields()
                     .filter(|f| f.name != ADD_NAME && f.name != REMOVE_NAME)
-                    .map(|f| Predicate::is_not_null(Expression::column([f.name.as_str()]))),
+                    .map(|f| Predicate::is_not_null(col!(f.name.as_str()))),
             );
             eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
         };

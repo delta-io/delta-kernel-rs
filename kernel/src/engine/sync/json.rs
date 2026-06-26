@@ -15,7 +15,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    JsonHandler, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler {
@@ -70,7 +71,7 @@ impl JsonHandler for SyncJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buf = to_json_bytes(data)?;
@@ -159,8 +160,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn json_handler_file_path_contract() {
-        crate::engine::tests::test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
-    }
+    // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
+    // call them without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn json_handler_file_path_contract() {
+    //     test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
+    // }
 }

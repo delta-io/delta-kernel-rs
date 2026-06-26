@@ -10,7 +10,7 @@ use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
-use crate::scan::{PhysicalPredicate, StatsOutputMode};
+use crate::scan::{PhysicalPredicate, StatsOptions, StructStats};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
@@ -44,6 +44,9 @@ pub(crate) struct StateInfo {
     ///
     /// Read-path mirror of `SharedWriteState.stats_columns`.
     pub(crate) physical_stats_columns: HashSet<ColumnName>,
+    /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
+    /// [`TableType`](crate::metrics::TableType) at event construction.
+    pub(crate) is_catalog_managed: bool,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -110,19 +113,19 @@ fn validate_metadata_columns<'a>(
     Ok(metadata_info)
 }
 
-/// Build data-skipping schemas based on `StatsOutputMode` and `PhysicalPredicate`.
+/// Build data-skipping schemas based on `StructStats` and `PhysicalPredicate`.
 ///
 /// Returns `(physical_stats_schema, physical_partition_schema)`, where:
 /// - `physical_stats_schema` contains data-column stats for `stats_parsed`.
 /// - `physical_partition_schema` contains typed partition values for `partitionValues_parsed`.
 ///
 /// All three arms route through `TableConfiguration::build_expected_stats_schemas`: the
-/// `AllColumns` arm with no `requested_physical_columns` filter, and the two scoped arms
-/// with the union of requested + predicate-referenced columns. That path applies the same
+/// `All` arm with no `requested_physical_columns` filter, and the two scoped arms with
+/// the union of requested + predicate-referenced columns. That path applies the same
 /// `BaseStatsTransform` -> `MinMaxStatsTransform` pipeline writers use, so the read-side
 /// stats schema's shape matches the write-side exactly.
 fn build_data_skipping_schemas(
-    stats_output_mode: &StatsOutputMode,
+    struct_stats: &StructStats,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     table_configuration: &TableConfiguration,
@@ -150,7 +153,7 @@ fn build_data_skipping_schemas(
     // `DataSkippingFilter` needs stats for every column its predicate references. Refs
     // without stats fold to NULL and pruning collapses to "keep every file", even when
     // the caller separately requested stats for some other set of columns via
-    // `StatsOutputMode::Columns`. Union the two so the schema serves both. Unresolvable
+    // `StructStats::Columns`. Union the two so the schema serves both. Unresolvable
     // refs (e.g. a predicate typo) are dropped here.
     let union_to_physical = |requested_logical: &[ColumnName]| -> Vec<ColumnName> {
         let mut union_logical: Vec<ColumnName> = requested_logical.to_vec();
@@ -186,16 +189,16 @@ fn build_data_skipping_schemas(
             .then_some(stats_schema)
     };
 
-    let stats_schema = match (stats_output_mode, physical_predicate) {
+    let stats_schema = match (struct_stats, physical_predicate) {
         // Full table stats schema for stats_parsed.
-        (StatsOutputMode::AllColumns, _) => with_data_cols(
+        (StructStats::All, _) => with_data_cols(
             table_configuration
                 .build_expected_stats_schemas(None, None)?
                 .physical,
         ),
         // Explicit requested columns. Union in predicate refs so the stats schema covers
         // both sources.
-        (StatsOutputMode::Columns(requested_columns), _) if !requested_columns.is_empty() => {
+        (StructStats::Columns(requested_columns), _) if !requested_columns.is_empty() => {
             let requested_physical = union_to_physical(requested_columns);
             with_data_cols(
                 table_configuration
@@ -222,28 +225,35 @@ impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
-    /// `logical_schema` - The logical schema of the scan output, which includes partition columns
+    /// `logical_read_schema` - The logical schema of the scan output
+    /// `table_schema` - The schema against which predicate column references are resolved.
+    /// Must contain every column the predicate may legitimately reference (typically the full
+    /// table schema, or full CDF-extended schema for CDF scans). Currently, we do not carry
+    /// over any metadata columns from the `logical_read_schema` to the `table_schema` (issue
+    /// 2633).
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
-    /// `stats_output_mode` - Controls how file statistics are handled during the scan
+    /// `stats` - Engine-facing stats options. Drives which stats columns appear in scan
+    ///   metadata output and whether the JSON synthesis fallback fires.
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
-        logical_schema: SchemaRef,
+        logical_read_schema: SchemaRef,
+        table_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
-        stats_output_mode: StatsOutputMode,
+        stats: &StatsOptions,
         classifier: C,
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
-        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut transform_spec = Vec::with_capacity(logical_schema.num_fields());
+        let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
+        let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
 
-        let metadata_info = validate_metadata_columns(&logical_schema, table_configuration)?;
+        let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
 
         // Loop over all selected fields and build both the physical schema and transform spec
-        for (index, logical_field) in logical_schema.fields().enumerate() {
+        for (index, logical_field) in logical_read_schema.fields().enumerate() {
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
             {
@@ -269,7 +279,7 @@ impl StateInfo {
                                 // ensure we have a column name that isn't already in our schema
                                 let index_column_name = (0..)
                                     .map(|i| format!("row_indexes_for_row_id_{i}"))
-                                    .find(|name| logical_schema.field(name).is_none())
+                                    .find(|name| logical_read_schema.field(name).is_none())
                                     .ok_or(Error::generic(
                                         "Couldn't generate row index column name",
                                     ))?;
@@ -333,8 +343,9 @@ impl StateInfo {
             .map(|p| p.references().into_iter().cloned().collect())
             .unwrap_or_default();
 
+        // We use table_schema here as predicate can reference columns outside projection.
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &table_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
@@ -349,7 +360,7 @@ impl StateInfo {
             let dropped: Vec<&ColumnName> = predicate_column_names
                 .iter()
                 .filter(|c| {
-                    get_any_level_column_physical_name(&logical_schema, c, column_mapping_mode)
+                    get_any_level_column_physical_name(&table_schema, c, column_mapping_mode)
                         .ok()
                         .is_some_and(|physical| !physical_stats_columns.contains(&physical))
                 })
@@ -390,7 +401,7 @@ impl StateInfo {
         };
 
         let (physical_stats_schema, physical_partition_schema) = build_data_skipping_schemas(
-            &stats_output_mode,
+            &stats.struct_stats,
             &physical_predicate,
             &predicate_column_names,
             table_configuration,
@@ -405,7 +416,7 @@ impl StateInfo {
             };
 
         Ok(StateInfo {
-            logical_schema,
+            logical_schema: logical_read_schema,
             physical_schema,
             physical_predicate,
             transform_spec,
@@ -413,6 +424,7 @@ impl StateInfo {
             physical_stats_schema,
             physical_partition_schema,
             physical_stats_columns,
+            is_catalog_managed: table_configuration.is_catalog_managed(),
         })
     }
 
@@ -474,7 +486,7 @@ pub(crate) mod tests {
             features,
             metadata_configuration,
             metadata_cols,
-            StatsOutputMode::default(),
+            StatsOptions::default(),
         )
     }
 
@@ -485,7 +497,7 @@ pub(crate) mod tests {
         features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-        stats_output_mode: StatsOutputMode,
+        stats: StatsOptions,
     ) -> DeltaResult<StateInfo> {
         let metadata = Metadata::try_new(
             None,
@@ -529,9 +541,10 @@ pub(crate) mod tests {
 
         StateInfo::try_new(
             schema.clone(),
+            table_configuration.logical_schema(),
             &table_configuration,
             predicate,
-            stats_output_mode,
+            &stats,
             (),
         )
     }
@@ -895,17 +908,43 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_partition_column() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let table_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("part_col", DataType::STRING),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            table_schema,
+            vec!["part_col".to_string()],
+            10,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_configuration = TableConfiguration::try_new(
+            metadata,
+            Protocol::try_new_legacy(2, 5).unwrap(),
+            Url::parse("s3://my-table").unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let read_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
         )]));
-        let res = get_state_info(
-            schema.clone(),
-            vec!["part_col".to_string()],
+        let read_schema = Arc::new(
+            read_schema
+                .add_metadata_column("part_col", MetadataColumnSpec::RowId)
+                .expect("Couldn't add metadata col"),
+        );
+        let res = StateInfo::try_new(
+            read_schema,
+            table_configuration.logical_schema(),
+            &table_configuration,
             None,
-            &[], // no table features
-            HashMap::new(),
-            vec![("part_col", MetadataColumnSpec::RowId)],
+            &StatsOptions::default(),
+            (),
         );
         assert_result_error_with_message(
             res,
@@ -961,7 +1000,7 @@ pub(crate) mod tests {
             &[], // no table features
             HashMap::new(),
             vec![],
-            StatsOutputMode::AllColumns,
+            StatsOptions::all(),
         )
         .unwrap();
 
@@ -996,7 +1035,10 @@ pub(crate) mod tests {
             &[],
             HashMap::new(),
             vec![],
-            StatsOutputMode::Columns(vec![column_name!("value")]),
+            StatsOptions {
+                synthesize_json: true,
+                struct_stats: StructStats::Columns(vec![column_name!("value")]),
+            },
         )
         .unwrap();
 
@@ -1039,7 +1081,10 @@ pub(crate) mod tests {
             &[], // no table features
             HashMap::new(),
             vec![],
-            StatsOutputMode::Columns(vec![column_name!("value")]),
+            StatsOptions {
+                synthesize_json: true,
+                struct_stats: StructStats::Columns(vec![column_name!("value")]),
+            },
         )
         .unwrap();
 
@@ -1186,7 +1231,10 @@ pub(crate) mod tests {
             &[],
             props,
             vec![],
-            StatsOutputMode::Columns(vec![column_name!("col_a")]),
+            StatsOptions {
+                synthesize_json: true,
+                struct_stats: StructStats::Columns(vec![column_name!("col_a")]),
+            },
         )
         .unwrap();
 
@@ -1354,10 +1402,10 @@ pub(crate) mod tests {
             StructField::nullable("b", DataType::LONG),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("c", DataType::LONG),
                     StructField::nullable("d", DataType::LONG),
-                ]))),
+                ]),
             ),
         ]));
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
@@ -1413,10 +1461,10 @@ pub(crate) mod tests {
             StructField::nullable("b", DataType::LONG),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("c", DataType::LONG),
                     StructField::nullable("d", DataType::LONG),
-                ]))),
+                ]),
             ),
         ]));
         let predicate = Arc::new(Pred::and(
@@ -1471,10 +1519,10 @@ pub(crate) mod tests {
             StructField::nullable("a", DataType::LONG),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("c", DataType::LONG),
                     StructField::nullable("d", DataType::LONG),
-                ]))),
+                ]),
             ),
         ]));
         let state_info = get_state_info(

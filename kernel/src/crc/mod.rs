@@ -12,14 +12,13 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
-// Allow unreachable_pub because this module is pub when test-utils is enabled
-// but pub(crate) otherwise. The items need to be pub for integration tests.
+// Allow unreachable_pub because this module is pub when internal-api is enabled
+// but pub(crate) otherwise.
 #![allow(unreachable_pub)]
 
 mod delta;
 mod file_size_histogram;
 mod file_stats;
-mod lazy;
 mod reader;
 mod state;
 mod writer;
@@ -31,8 +30,9 @@ pub(crate) use delta::CrcDelta;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
-pub(crate) use file_stats::{is_incremental_safe_operation, FileStatsDelta};
-pub(crate) use lazy::{CrcLoadResult, LazyCrc};
+pub(crate) use file_stats::{is_incremental_safe_operation, size_to_u64, FileStatsDelta};
+pub(crate) use reader::read_crc_file_or_none;
+#[cfg(test)]
 pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,7 @@ use crate::{DeltaResult, Error, Version};
 /// 3. Contain exactly one JSON object with the schema mirrored by `CrcRaw`.
 ///
 /// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
-/// when the `test-utils` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
+/// when the `internal-api` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
 // TODO: rename `Crc` to `CrcState` to align with `FileStatsState`, `SetTransactionState`, etc.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Crc {

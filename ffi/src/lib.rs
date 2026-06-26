@@ -12,6 +12,11 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
+use delta_kernel::history_manager::{
+    first_version_after as kernel_first_version_after,
+    get_earliest_commit as kernel_get_earliest_commit,
+    latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
+};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
@@ -20,7 +25,7 @@ use tracing::debug;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
-    delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
+    delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
     std::collections::HashMap,
 };
 
@@ -51,8 +56,12 @@ use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
 #[cfg(feature = "tracing")]
+pub mod ffi_metrics;
+#[cfg(feature = "tracing")]
 pub mod ffi_tracing;
 pub mod log_path;
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
@@ -142,6 +151,38 @@ impl KernelStringSlice {
             len: source.len(),
         }
     }
+
+    #[cfg(feature = "tracing")]
+    pub(crate) fn empty() -> Self {
+        KernelStringSlice {
+            ptr: NonNull::<u8>::dangling().as_ptr().cast(),
+            len: 0,
+        }
+    }
+}
+
+/// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.
+///
+/// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
+/// must not be retained beyond the foreign function call it was passed into.
+#[repr(C)]
+pub struct KernelBytesSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl KernelBytesSlice {
+    /// Creates a new bytes slice from a source byte slice.
+    ///
+    /// # Safety
+    /// Caller must guarantee that the source will outlive the created KernelBytesSlice.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
+            len: source.len(),
+        }
+    }
 }
 
 /// FFI-safe implementation for Rust's `Option<T>`
@@ -157,6 +198,15 @@ impl<T> From<Option<T>> for OptionalValue<T> {
         match item {
             Some(value) => OptionalValue::Some(value),
             None => OptionalValue::None,
+        }
+    }
+}
+
+impl<T> From<OptionalValue<T>> for Option<T> {
+    fn from(value: OptionalValue<T>) -> Self {
+        match value {
+            OptionalValue::Some(value) => Some(value),
+            OptionalValue::None => None,
         }
     }
 }
@@ -182,6 +232,23 @@ macro_rules! kernel_string_slice {
     }};
 }
 pub(crate) use kernel_string_slice;
+
+/// Similar to [`kernel_string_slice!`](kernel_string_slice), this macro provides a safer way to
+/// construct a KernelBytesSlice.
+///
+/// Refer to [`kernel_string_slice!`](kernel_string_slice) for safety and implementation
+/// notes.
+#[cfg(feature = "declarative-plans")]
+macro_rules! kernel_bytes_slice {
+    ( $source:ident ) => {{
+        fn do_it(b: &[u8]) -> $crate::KernelBytesSlice {
+            unsafe { $crate::KernelBytesSlice::new_unsafe(b) }
+        }
+        do_it(&$source)
+    }};
+}
+#[cfg(feature = "declarative-plans")]
+pub(crate) use kernel_bytes_slice;
 
 trait TryFromStringSlice<'a>: Sized {
     unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;
@@ -653,8 +720,8 @@ fn get_default_engine_impl(
     executor_config: Option<MultithreadedExecutorConfig>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel::engine::default::storage::store_from_url_opts;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel_default_engine::storage::store_from_url_opts;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     let store = store_from_url_opts(&url, options)?;
 
@@ -954,6 +1021,152 @@ pub unsafe extern "C" fn snapshot_timestamp(
     snapshot
         .get_timestamp(engine_ref.engine().as_ref())
         .into_extern_result(&engine_ref)
+}
+
+/// Selects which commit type to return for the history_manager query. FFI-safe mirror of
+/// [`HistoryCommitType`].
+#[repr(C)]
+pub enum FfiHistoryCommitType {
+    /// Maps to [`HistoryCommitType::Published`].
+    Published = 0,
+    /// Maps to [`HistoryCommitType::Recreatable`].
+    Recreatable = 1,
+}
+
+impl From<FfiHistoryCommitType> for HistoryCommitType {
+    fn from(commit_type: FfiHistoryCommitType) -> Self {
+        match commit_type {
+            FfiHistoryCommitType::Published => Self::Published,
+            FfiHistoryCommitType::Recreatable => Self::Recreatable,
+        }
+    }
+}
+
+/// Get the earliest commit version available in the table's `_delta_log/` directory.
+///
+/// # Parameters
+/// - `engine`: engine handle used to list the log directory.
+/// - `log_root`: URL of the table's `_delta_log/` directory (must end with `/`).
+/// - `earliest_ratified_commit_version`: for catalog-managed tables, the earliest version the
+///   catalog has ratified a commit at; pass `OptionalValue::None` for filesystem-only tables.
+/// - `commit_type`: selects the query. [`FfiHistoryCommitType::Published`] returns the earliest
+///   commit; [`FfiHistoryCommitType::Recreatable`] returns the earliest fully reconstructable
+///   version.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid `log_root` string slice and a valid engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_earliest_commit(
+    engine: Handle<SharedExternEngine>,
+    log_root: KernelStringSlice,
+    earliest_ratified_commit_version: OptionalValue<Version>,
+    commit_type: FfiHistoryCommitType,
+) -> ExternResult<Version> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let log_root = unsafe { unwrap_and_parse_path_as_url(log_root) };
+    get_earliest_commit_impl(
+        engine_ref,
+        log_root,
+        earliest_ratified_commit_version,
+        commit_type,
+    )
+    .into_extern_result(&engine_ref)
+}
+
+fn get_earliest_commit_impl(
+    extern_engine: &dyn ExternEngine,
+    log_root: DeltaResult<Url>,
+    earliest_ratified_commit_version: OptionalValue<Version>,
+    commit_type: FfiHistoryCommitType,
+) -> DeltaResult<Version> {
+    kernel_get_earliest_commit(
+        extern_engine.engine().as_ref(),
+        &log_root?,
+        earliest_ratified_commit_version.into(),
+        commit_type.into(),
+    )
+}
+
+/// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe
+/// mirror of [`CommitAt`].
+#[repr(C)]
+pub struct FfiCommitAt {
+    /// The commit version.
+    pub version: Version,
+    /// Timestamp (milliseconds since the Unix epoch) associated with this commit. This is the
+    /// commit's in-commit timestamp (ICT) when ICT is enabled, otherwise the commit's file
+    /// modification time.
+    pub timestamp: i64,
+}
+
+impl From<CommitAt> for FfiCommitAt {
+    fn from(commit: CommitAt) -> Self {
+        Self {
+            version: commit.version,
+            timestamp: commit.timestamp,
+        }
+    }
+}
+
+/// Get the latest commit (version and timestamp) within `snapshot`'s version range with a
+/// timestamp at or before `timestamp` (milliseconds since the Unix epoch). `commit_type` selects
+/// whether to return any version present in the log ([`FfiHistoryCommitType::Published`]) or only a
+/// version whose table can be fully reconstructed ([`FfiHistoryCommitType::Recreatable`]).
+///
+/// Returns an error if no version exists at or before `timestamp`,
+/// or when there is an error resolving the commit based on the [`FfiHistoryCommitType`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn latest_version_as_of(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    timestamp: i64,
+    commit_type: FfiHistoryCommitType,
+) -> ExternResult<FfiCommitAt> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    kernel_latest_version_as_of(
+        snapshot,
+        engine_ref.engine().as_ref(),
+        timestamp,
+        commit_type.into(),
+    )
+    .map(FfiCommitAt::from)
+    .into_extern_result(&engine_ref)
+}
+
+/// Get the first commit (version and timestamp) within `snapshot`'s version range with a
+/// timestamp at or after `timestamp` (milliseconds since the Unix epoch). `commit_type` selects
+/// whether to return any version present in the log ([`FfiHistoryCommitType::Published`]) or only a
+/// version whose table can be fully reconstructed ([`FfiHistoryCommitType::Recreatable`]).
+///
+/// Returns an error if no version exists at or after `timestamp`,
+/// or when there is an error resolving the commit based on the [`FfiHistoryCommitType`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn first_version_after(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    timestamp: i64,
+    commit_type: FfiHistoryCommitType,
+) -> ExternResult<FfiCommitAt> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    kernel_first_version_after(
+        snapshot,
+        engine_ref.engine().as_ref(),
+        timestamp,
+        commit_type.into(),
+    )
+    .map(FfiCommitAt::from)
+    .into_extern_result(&engine_ref)
 }
 
 /// Get the logical schema of the specified snapshot
@@ -1289,18 +1502,19 @@ impl<T> Default for ReferenceSet<T> {
 mod tests {
     use std::collections::HashMap;
 
-    use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::schema::StructType;
+    use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::Value;
     use test_utils::{
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
         actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
         METADATA, METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
+        TEST_ICT_ENABLEMENT_TIMESTAMP,
     };
     use url::Url;
 
@@ -1471,6 +1685,133 @@ mod tests {
         Ok(())
     }
 
+    enum EarliestCommitTableSetupScenario {
+        FilesystemV0Commit,
+        CatalogManagedV0Commit,
+        FilesystemV4CheckpointWithEarliestCommitAtV2,
+        NoCommits,
+    }
+
+    async fn setup_earliest_commit_table(
+        setup: &EarliestCommitTableSetupScenario,
+        table_root: &str,
+    ) -> Handle<SharedExternEngine> {
+        match setup {
+            EarliestCommitTableSetupScenario::FilesystemV0Commit => {
+                let (_, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await.unwrap();
+                unsafe { free_snapshot(snapshot) };
+                engine
+            }
+            EarliestCommitTableSetupScenario::CatalogManagedV0Commit => {
+                let (_, engine, snapshot) = make_catalog_managed_engine_and_v0_snapshot(table_root)
+                    .await
+                    .unwrap();
+                unsafe { free_snapshot(snapshot) };
+                engine
+            }
+            EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2 => {
+                let storage = Arc::new(InMemory::new());
+                for version in 2..=4 {
+                    add_commit(
+                        table_root,
+                        storage.as_ref(),
+                        version,
+                        actions_to_string(vec![TestAction::Metadata]),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let checkpoint_version = 4;
+                let checkpoint =
+                    format!("_delta_log/{:020}.checkpoint.parquet", checkpoint_version);
+                let table_url = Url::parse(table_root).unwrap();
+                let checkpoint_path =
+                    Path::from_url_path(table_url.join(&checkpoint).unwrap().path()).unwrap();
+                storage
+                    .put(&checkpoint_path, "x".to_string().into())
+                    .await
+                    .unwrap();
+                engine_to_handle(
+                    Arc::new(DefaultEngineBuilder::new(storage).build()),
+                    allocate_err,
+                )
+            }
+            EarliestCommitTableSetupScenario::NoCommits => get_default_engine(table_root),
+        }
+    }
+
+    #[rstest]
+    #[case::fs_published(
+        EarliestCommitTableSetupScenario::FilesystemV0Commit,
+        OptionalValue::None,
+        FfiHistoryCommitType::Published,
+        Ok(0)
+    )]
+    #[case::fs_recreatable(
+        EarliestCommitTableSetupScenario::FilesystemV0Commit,
+        OptionalValue::None,
+        FfiHistoryCommitType::Recreatable,
+        Ok(0)
+    )]
+    #[case::cm_ratified_zero(
+        EarliestCommitTableSetupScenario::CatalogManagedV0Commit,
+        OptionalValue::Some(0),
+        FfiHistoryCommitType::Published,
+        Ok(0)
+    )]
+    #[case::cm_with_empty_delta_log(
+        EarliestCommitTableSetupScenario::NoCommits,
+        OptionalValue::Some(0),
+        FfiHistoryCommitType::Published,
+        Err(KernelError::GenericError)
+    )]
+    #[case::empty_log_errors(
+        EarliestCommitTableSetupScenario::NoCommits,
+        OptionalValue::None,
+        FfiHistoryCommitType::Published,
+        Err(KernelError::LogHistoryError)
+    )]
+    #[case::checkpoint_published(
+        EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2,
+        OptionalValue::None,
+        FfiHistoryCommitType::Published,
+        Ok(2)
+    )]
+    #[case::checkpoint_recreatable(
+        EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2,
+        OptionalValue::None,
+        FfiHistoryCommitType::Recreatable,
+        Ok(4)
+    )]
+    #[tokio::test]
+    async fn test_get_earliest_commit_cases(
+        #[case] setup: EarliestCommitTableSetupScenario,
+        #[case] earliest_ratified: OptionalValue<Version>,
+        #[case] commit_type: FfiHistoryCommitType,
+        #[case] expected: Result<Version, KernelError>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///earliest_commit/";
+        let log_root = "memory:///earliest_commit/_delta_log/";
+        let engine = setup_earliest_commit_table(&setup, table_root).await;
+
+        let result = unsafe {
+            get_earliest_commit(
+                engine.shallow_copy(),
+                kernel_string_slice!(log_root),
+                earliest_ratified,
+                commit_type,
+            )
+        };
+
+        match expected {
+            Ok(version) => assert_eq!(ok_or_panic(result), version),
+            Err(kind) => assert_extern_result_error_with_message(result, kind, None),
+        }
+
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
     // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
     // The test will need to refactor to use the helper function.
     #[tokio::test]
@@ -1522,7 +1863,7 @@ mod tests {
         // create_table with "inCommitTimestamp" in writer_features sets up:
         //   - protocol v3.7 with writerFeatures=["inCommitTimestamp"]
         //   - metadata config: enableInCommitTimestamps=true, enablement version/timestamp
-        //   - commitInfo with inCommitTimestamp=1612345678 (fixed test value)
+        //   - commitInfo with inCommitTimestamp=TEST_ICT_ENABLEMENT_TIMESTAMP
         create_table(
             storage.clone(),
             Url::parse(table_root)?,
@@ -1545,7 +1886,69 @@ mod tests {
                 engine.shallow_copy(),
             ))
         };
-        assert_eq!(ts, 1612345678_i64);
+        assert_eq!(ts, TEST_ICT_ENABLEMENT_TIMESTAMP);
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    type HistoryQueryFn = unsafe extern "C" fn(
+        Handle<SharedSnapshot>,
+        Handle<SharedExternEngine>,
+        i64,
+        FfiHistoryCommitType,
+    ) -> ExternResult<FfiCommitAt>;
+
+    #[rstest]
+    #[case::latest_version_query_at_ict(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
+    #[case::first_version_after_query_at_ict(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
+    #[case::latest_version_query_out_of_range(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP - 1, Err(KernelError::LogHistoryError))]
+    #[case::first_version_after_query_out_of_range(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP + 1, Err(KernelError::LogHistoryError))]
+    #[tokio::test]
+    async fn test_snapshot_version_at_timestamp_cases(
+        #[case] query: HistoryQueryFn,
+        #[case] timestamp: i64,
+        #[case] expected: Result<(Version, i64), KernelError>,
+        #[values(FfiHistoryCommitType::Published, FfiHistoryCommitType::Recreatable)]
+        commit_type: FfiHistoryCommitType,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+
+        create_table(
+            storage.clone(),
+            Url::parse(table_root)?,
+            Arc::new(StructType::try_new([]).unwrap()),
+            &[],
+            true,
+            vec![],
+            vec!["inCommitTimestamp"],
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let result = unsafe {
+            query(
+                snap.shallow_copy(),
+                engine.shallow_copy(),
+                timestamp,
+                commit_type,
+            )
+        };
+
+        match expected {
+            Ok((version, ts)) => {
+                let commit = ok_or_panic(result);
+                assert_eq!(commit.version, version);
+                assert_eq!(commit.timestamp, ts);
+            }
+            Err(kind) => assert_extern_result_error_with_message(result, kind, None),
+        }
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }

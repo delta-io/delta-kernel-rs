@@ -2,11 +2,14 @@
 members = [
     "acceptance",
     "benchmarks",
+    "default-engine",
+    "default-engine/test-utils",
     "derive-macros",
     "ffi",
     "kernel",
     "kernel/examples/*",
     "test-utils",
+    "workloads",
     "feature-tests",
     "mem-test",
     "unity-catalog-delta-rest-client", # WIP: this is an experimental UC client for catalog-managed table work
@@ -29,4 +32,4 @@ license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
 rust-version = "1.88"
-version = "0.23.0"
+version = "0.25.0"

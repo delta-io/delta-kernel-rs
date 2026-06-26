@@ -20,7 +20,8 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::MetricId;
+use crate::metrics::events::LOG_SEGMENT_LOADED_SPAN;
+use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::compare::SchemaComparison;
@@ -31,6 +32,7 @@ use crate::{
     StorageHandler, Version,
 };
 
+mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
@@ -217,6 +219,19 @@ impl LogSegment {
                 None
             };
 
+        // A CRC describes the table state at its version, so it can never predate the checkpoint.
+        if let (Some(crc), Some(checkpoint_version)) =
+            (&listed_files.latest_crc_file, checkpoint_version)
+        {
+            require!(
+                crc.version >= checkpoint_version,
+                Error::internal_error(format!(
+                    "CRC file version {} is older than checkpoint version {checkpoint_version}",
+                    crc.version
+                ))
+            );
+        }
+
         validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
@@ -298,13 +313,12 @@ impl LogSegment {
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
-    /// Reports metrics: `LogSegmentLoaded`.
-    // Span name must match `SEGMENT_FOR_SNAPSHOT_SPAN` in `metrics::reporter`.
+    /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[instrument(
-        name = "segment.for_snapshot",
+        name = LOG_SEGMENT_LOADED_SPAN,
         err,
         skip(storage, time_travel_version),
-        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
+        fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(
@@ -312,7 +326,7 @@ impl LogSegment {
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
-        operation_id: MetricId,
+        metric_context: SnapshotLoadMetricContext,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
@@ -431,8 +445,15 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        let listed_files =
-            LogSegmentFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
+        // TODO(#2796): table-changes does not supply a log_tail yet. CDF over a catalog-managed
+        // table will need the catalog's commits passed here to see unbackfilled staged commits.
+        let listed_files = LogSegmentFiles::list_commits(
+            storage,
+            &log_root,
+            vec![], // log-tail
+            Some(start_version),
+            end_version,
+        )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegmentFiles::list_commits`] also checks that there are no gaps between commits.
@@ -457,7 +478,9 @@ impl LogSegment {
     /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
     /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
     /// `limit` specifies the maximum length of the returned log segment. The log segment may be
-    /// shorter than `limit` if there are missing commits.
+    /// shorter than `limit` if there are missing commits. `log_tail` supplies caller-provided
+    /// commits (e.g. catalog-managed staged commits) that take precedence over the filesystem
+    /// listing.
     // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
     pub(crate) fn for_timestamp_conversion(
@@ -465,6 +488,7 @@ impl LogSegment {
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,
+        log_tail: Vec<ParsedLogPath>,
     ) -> DeltaResult<Self> {
         // Compute the version to start listing from.
         let start_from = limit
@@ -478,8 +502,13 @@ impl LogSegment {
 
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
-        let mut listed_commits =
-            LogSegmentFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
+        let mut listed_commits = LogSegmentFiles::list_commits(
+            storage,
+            &log_root,
+            log_tail,
+            start_from,
+            Some(end_version),
+        )?;
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();
@@ -636,9 +665,7 @@ impl LogSegment {
 
     pub(crate) fn get_unpublished_catalog_commits(&self) -> DeltaResult<Vec<CatalogCommit>> {
         self.listed
-            .ascending_commit_files
-            .iter()
-            .filter(|file| file.file_type == LogPathFileType::StagedCommit)
+            .staged_commits()
             .filter(|file| {
                 self.listed
                     .max_published_version
@@ -917,17 +944,11 @@ impl LogSegment {
                 let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
 
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable(
-                        "stats_parsed",
-                        DataType::Struct(Box::new(ss.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
                 }
 
                 if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable(
-                        "partitionValues_parsed",
-                        DataType::Struct(Box::new(ps.clone())),
-                    ));
+                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
                 }
 
                 // Rebuild schema with modified add field
@@ -1067,12 +1088,18 @@ impl LogSegment {
             .try_collect()
     }
 
-    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
-    ///
-    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
-    /// checkpoint files, CRC files, and last checkpoint metadata. Only commits and compactions
-    /// in `(start_v_exclusive, end_version]` are retained.
-    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+    /// Creates a pruned LogSegment of only the commits and compactions in
+    /// `(start_v_exclusive, end_version]`, dropping checkpoint files, CRC files, and
+    /// last-checkpoint metadata.
+    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> Self {
+        // A checkpoint above start_v_exclusive would drop the commits between them, since the
+        // returned segment keeps only (start_v_exclusive, end] and no checkpoint.
+        debug_assert!(
+            self.checkpoint_version
+                .is_none_or(|ckpt| start_v_exclusive >= ckpt),
+            "segment_after_version: start_v_exclusive ({start_v_exclusive}) is below checkpoint {:?}",
+            self.checkpoint_version,
+        );
         let (commits, compactions) =
             self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
         LogSegment {
@@ -1084,31 +1111,6 @@ impl LogSegment {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
                 checkpoint_parts: vec![],
-                latest_crc_file: None,
-                latest_commit_file: None,
-                max_published_version: None,
-            },
-        }
-    }
-
-    /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
-    ///
-    /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
-    /// checkpoint-based replay, so checkpoint files and metadata are preserved. Only commits
-    /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
-    /// needed for this replay path (CRC file, latest commit file) are dropped.
-    pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
-        let (commits, compactions) =
-            self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
-        LogSegment {
-            end_version: self.end_version,
-            checkpoint_version: self.checkpoint_version,
-            log_root: self.log_root.clone(),
-            last_checkpoint_metadata: self.last_checkpoint_metadata.clone(),
-            listed: LogSegmentFiles {
-                ascending_commit_files: commits,
-                ascending_compaction_files: compactions,
-                checkpoint_parts: self.listed.checkpoint_parts.clone(),
                 latest_crc_file: None,
                 latest_commit_file: None,
                 max_published_version: None,
