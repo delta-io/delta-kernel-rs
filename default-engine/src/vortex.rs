@@ -54,7 +54,9 @@ use vortex::array::arrow::{ArrowSessionExt as _, FromArrowArray as _};
 use vortex::array::stream::ArrayStream as _;
 use vortex::array::{ArrayRef as VortexArrayRef, VortexSessionExecute as _};
 use vortex::expr::{root, select};
-use vortex::file::{OpenOptionsSessionExt as _, VortexFile, WriteOptionsSessionExt as _};
+use vortex::file::{
+    OpenOptionsSessionExt as _, VortexFile, WriteOptionsSessionExt as _, WriteStrategyBuilder,
+};
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault as _;
 
@@ -63,6 +65,16 @@ use crate::stats::collect_stats;
 
 /// The filename extension that marks a Delta data file as Vortex-encoded.
 pub(crate) const VORTEX_EXTENSION: &str = ".vortex";
+
+/// Engine-side write tuning for Vortex files. [`Default`] reproduces Vortex's library defaults; the
+/// benchmark harness overrides knobs (currently the layout chunk size) for format-parity testing.
+#[derive(Debug, Clone, Default)]
+pub struct VortexWriteConfig {
+    /// Target rows per layout block (chunk). `None` keeps Vortex's default. Smaller values produce
+    /// more, smaller chunks (hence more read splits); see
+    /// [`WriteStrategyBuilder::with_row_block_size`].
+    pub row_block_size: Option<usize>,
+}
 
 /// Maps a Vortex error into a kernel [`Error`]. Vortex's error type does not implement
 /// `Into<delta_kernel::Error>`, so we stringify at the boundary.
@@ -247,6 +259,7 @@ pub(crate) async fn write_vortex(
     write_dir: &url::Url,
     data: Box<dyn EngineData>,
     stats_columns: &[ColumnName],
+    config: &VortexWriteConfig,
 ) -> DeltaResult<DataFileMetadata> {
     let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
     let record_batch = batch.record_batch();
@@ -254,7 +267,7 @@ pub(crate) async fn write_vortex(
     // Collect statistics before encoding (format-independent, mirrors the Parquet writer).
     let stats = collect_stats(record_batch, stats_columns)?;
 
-    let buffer = encode_vortex(record_batch).await?;
+    let buffer = encode_vortex(record_batch, config).await?;
     let size: u64 = buffer
         .len()
         .try_into()
@@ -284,15 +297,29 @@ pub(crate) async fn write_vortex(
     Ok(DataFileMetadata::new(file_meta, stats))
 }
 
-/// Encodes an Arrow `RecordBatch` into an in-memory Vortex file (full file with footer).
-async fn encode_vortex(record_batch: &RecordBatch) -> DeltaResult<Vec<u8>> {
+/// Encodes an Arrow `RecordBatch` into an in-memory Vortex file (full file with footer), applying
+/// any [`VortexWriteConfig`] tuning.
+async fn encode_vortex(
+    record_batch: &RecordBatch,
+    config: &VortexWriteConfig,
+) -> DeltaResult<Vec<u8>> {
     let session = VortexSession::default();
     // The top-level RecordBatch struct is never null, so `nullable = false` is safe; per-column
     // nullability is derived from the Arrow schema fields by `from_arrow`.
     let vortex_array = VortexArrayRef::from_arrow(record_batch, false).map_err(vortex_err)?;
     let mut buffer: Vec<u8> = Vec::new();
-    session
-        .write_options()
+    let write_options = session.write_options();
+    // Override the layout strategy only when a chunk size is requested; otherwise keep the
+    // defaults.
+    let write_options = match config.row_block_size {
+        Some(size) => write_options.with_strategy(
+            WriteStrategyBuilder::default()
+                .with_row_block_size(size)
+                .build(),
+        ),
+        None => write_options,
+    };
+    write_options
         .write(&mut buffer, vortex_array.to_array_stream())
         .await
         .map_err(vortex_err)?;
@@ -313,7 +340,6 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel_default_engine_test_utils::try_into_record_batch as into_record_batch;
-    use vortex::file::WriteStrategyBuilder;
 
     use super::*;
 
@@ -357,6 +383,7 @@ mod tests {
             &url::Url::parse("memory:///data/").unwrap(),
             data,
             &[],
+            &VortexWriteConfig::default(),
         )
         .await
         .unwrap();
@@ -391,6 +418,7 @@ mod tests {
             &url::Url::parse("memory:///data/").unwrap(),
             data,
             &[],
+            &VortexWriteConfig::default(),
         )
         .await
         .unwrap();
@@ -435,6 +463,7 @@ mod tests {
             &url::Url::parse("memory:///data/").unwrap(),
             data,
             &[],
+            &VortexWriteConfig::default(),
         )
         .await
         .unwrap();
@@ -488,36 +517,27 @@ mod tests {
         assert!(format!("{err}").contains("flat primitive schemas"));
     }
 
-    /// Writes `batch` to a `.vortex` file under `dir` with an explicit `row_block_size` (forcing
-    /// multiple layout chunks for small inputs) and returns its [`FileMeta`].
-    async fn write_chunked_vortex_file(
+    /// Writes `batch` as a `.vortex` file under `dir` with an explicit `row_block_size` (via the
+    /// engine write path) and returns its [`FileMeta`].
+    async fn write_vortex_chunked(
         store: &Arc<DynObjectStore>,
         dir: &str,
         batch: &RecordBatch,
         row_block_size: usize,
     ) -> FileMeta {
-        let session = VortexSession::default();
-        let vortex_array = VortexArrayRef::from_arrow(batch, false).unwrap();
-        let strategy = WriteStrategyBuilder::default()
-            .with_row_block_size(row_block_size)
-            .build();
-        let mut buffer: Vec<u8> = Vec::new();
-        session
-            .write_options()
-            .with_strategy(strategy)
-            .write(&mut buffer, vortex_array.to_array_stream())
-            .await
-            .unwrap();
-        let url = url::Url::parse(dir)
-            .unwrap()
-            .join("chunked.vortex")
-            .unwrap();
-        let size = buffer.len() as u64;
-        store
-            .put(&Path::from_url_path(url.path()).unwrap(), buffer.into())
-            .await
-            .unwrap();
-        FileMeta::new(url, 0, size)
+        let config = VortexWriteConfig {
+            row_block_size: Some(row_block_size),
+        };
+        let meta = write_vortex(
+            store.clone(),
+            &url::Url::parse(dir).unwrap(),
+            Box::new(ArrowEngineData::new(batch.clone())),
+            &[],
+            &config,
+        )
+        .await
+        .unwrap();
+        meta.file_meta().clone()
     }
 
     // A multi-chunk file decodes to more than one batch (one per scan split) and is never collapsed
@@ -542,7 +562,7 @@ mod tests {
         )
         .unwrap();
 
-        let file_meta = write_chunked_vortex_file(&store, "memory:///data/", &batch, 65_536).await;
+        let file_meta = write_vortex_chunked(&store, "memory:///data/", &batch, 65_536).await;
 
         let physical_schema: SchemaRef = Arc::new(schema.as_ref().try_into_kernel().unwrap());
         let read: Vec<RecordBatch> = read_vortex_files(store, vec![file_meta], physical_schema)
@@ -616,6 +636,7 @@ mod tests {
             &url::Url::parse("memory:///data/").unwrap(),
             data,
             &[],
+            &VortexWriteConfig::default(),
         )
         .await
         .unwrap();
@@ -673,6 +694,7 @@ mod tests {
             &url::Url::parse("memory:///data/").unwrap(),
             data,
             &[],
+            &VortexWriteConfig::default(),
         )
         .await
         .unwrap();
@@ -700,5 +722,66 @@ mod tests {
         assert_eq!(out.schema().field(0).name(), "absent");
         assert_eq!(out.column(0).len(), 3);
         assert_eq!(out.column(0).null_count(), 3);
+    }
+
+    // VortexWriteConfig's row_block_size controls layout chunking: every chunk size round-trips to
+    // the same content, and a smaller block size yields at least as many (here, more) read splits.
+    #[tokio::test]
+    async fn test_vortex_write_config_row_block_size_roundtrips_and_affects_splits() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        // High-entropy values so chunking is driven by row_block_size, not compressed away.
+        let values: Vec<i32> = (0..600_000u64)
+            .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as i32)
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(values.clone()))],
+        )
+        .unwrap();
+        let physical_schema: SchemaRef = Arc::new(schema.as_ref().try_into_kernel().unwrap());
+
+        let mut chunk_counts = Vec::new();
+        for row_block_size in [8_192usize, 600_000] {
+            let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+            let meta =
+                write_vortex_chunked(&store, "memory:///data/", &batch, row_block_size).await;
+            let read: Vec<RecordBatch> =
+                read_vortex_files(store, vec![meta], physical_schema.clone())
+                    .await
+                    .unwrap()
+                    .map(into_record_batch)
+                    .try_collect()
+                    .await
+                    .unwrap();
+            let ids: Vec<i32> = read
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(
+                ids, values,
+                "row_block_size {row_block_size} must round-trip"
+            );
+            chunk_counts.push(read.len());
+        }
+
+        assert!(
+            chunk_counts[0] > 1,
+            "small block size should produce multiple chunks: {chunk_counts:?}"
+        );
+        assert!(
+            chunk_counts[0] >= chunk_counts[1],
+            "smaller block size should not produce fewer chunks: {chunk_counts:?}"
+        );
     }
 }

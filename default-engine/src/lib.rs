@@ -263,12 +263,28 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        self.write_vortex_with_config(data, write_context, &vortex::VortexWriteConfig::default())
+            .await
+    }
+
+    /// Like [`Self::write_vortex`] but with explicit [`VortexWriteConfig`] write tuning (e.g.
+    /// layout chunk size), for benchmarking format parity. Default config matches
+    /// [`Self::write_vortex`].
+    ///
+    /// [`VortexWriteConfig`]: vortex::VortexWriteConfig
+    pub async fn write_vortex_with_config(
+        &self,
+        data: &ArrowEngineData,
+        write_context: &WriteContext,
+        config: &vortex::VortexWriteConfig,
+    ) -> DeltaResult<Box<dyn EngineData>> {
         let physical_data = self.logical_to_physical_data(data, write_context)?;
         let file_metadata = vortex::write_vortex(
             self.object_store.clone(),
             &write_context.write_dir(),
             physical_data,
             write_context.stats_columns(),
+            config,
         )
         .await?;
         build_add_file_metadata(file_metadata, write_context)
