@@ -487,11 +487,10 @@ impl StructField {
     /// ([`ColumnMetadataKey::CurrentDefault`]) metadata, if present.
     ///
     /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
-    /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by
-    ///   [`ColumnDefault::new`].
+    /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
     /// - `Err(_)` -- present but malformed: either not a [`MetadataValue::String`] (the protocol
     ///   defines `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected
-    ///   by [`ColumnDefault::new`] (e.g. a non-NULL default on a non-primitive type).
+    ///   by [`ColumnDefault`] (e.g. a non-NULL default on a non-primitive type).
     #[cfg(feature = "column-defaults-in-dev")]
     pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
@@ -4186,7 +4185,7 @@ mod tests {
         fn exposes_default_for_primitive(
             #[case] data_type: DataType,
             #[case] raw_sql: &str,
-            #[case] is_kernel_parsable: bool,
+            #[case] parsable: bool,
         ) {
             let field = field_with_default(data_type.clone(), raw_sql);
             let column_default = field
@@ -4195,7 +4194,7 @@ mod tests {
                 .expect("default must be present");
             assert_eq!(column_default.raw_sql(), raw_sql);
             assert_eq!(column_default.data_type(), &data_type);
-            assert_eq!(column_default.is_kernel_parsable(), is_kernel_parsable);
+            assert_eq!(column_default.to_scalar().unwrap().is_some(), parsable);
         }
 
         #[test]
@@ -4206,7 +4205,7 @@ mod tests {
                 .column_default()
                 .expect_err("non-NULL default on a non-primitive type must error")
                 .to_string();
-            assert!(err.contains("must be NULL"), "got: {err}");
+            assert!(err.contains("not supported"), "got: {err}");
         }
     }
 

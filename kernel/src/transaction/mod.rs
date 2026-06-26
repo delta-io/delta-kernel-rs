@@ -996,9 +996,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns the column default for every top-level column in this table's logical schema that
     /// declares one, keyed by logical column name.
     ///
-    /// Connectors use this to discover which columns have defaults, then
-    /// [`ColumnDefault::evaluate`] each parsable default (or fall back to
-    /// [`ColumnDefault::raw_sql`]) to materialize the column before writing.
+    /// Connectors use this to discover which columns have defaults, then call
+    /// [`ColumnDefault::to_scalar`] on each (or fall back to [`ColumnDefault::raw_sql`] when the
+    /// kernel cannot parse the default) to materialize the column before writing.
     ///
     /// Keys are `String` rather than [`ColumnName`] because column defaults are only supported on
     /// top-level columns, consistent with partition columns.
@@ -2180,11 +2180,11 @@ mod tests {
 
             let parsable = &defaults["parsable"];
             assert_eq!(parsable.raw_sql(), "42");
-            assert!(parsable.is_kernel_parsable());
+            assert!(parsable.to_scalar().unwrap().is_some());
 
             let unparsable = &defaults["unparsable"];
             assert_eq!(unparsable.raw_sql(), "current_timestamp()");
-            assert!(!unparsable.is_kernel_parsable());
+            assert!(unparsable.to_scalar().unwrap().is_none());
         }
 
         #[test]

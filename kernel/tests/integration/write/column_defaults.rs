@@ -300,16 +300,14 @@ mod feature_enabled {
 
         let b = &defaults["b"];
         assert_eq!(b.raw_sql(), "1337");
-        assert!(b.is_kernel_parsable());
-        assert_eq!(b.evaluate(&engine)?, Some(Scalar::Integer(1337)));
+        assert_eq!(b.to_scalar()?, Some(Scalar::Integer(1337)));
 
         let c = &defaults["c"];
         assert_eq!(c.raw_sql(), "current_timestamp()");
-        assert!(!c.is_kernel_parsable());
         assert_eq!(
-            c.evaluate(&engine)?,
+            c.to_scalar()?,
             None,
-            "a non-kernel-parsable default evaluates to None",
+            "a non-kernel-parsable default is not parsed by the kernel",
         );
 
         Ok(())
@@ -346,7 +344,7 @@ mod feature_enabled {
             .column_defaults()
             .expect_err("a non-NULL default on a non-primitive column must error")
             .to_string();
-        assert!(err.contains("must be NULL"), "got: {err}");
+        assert!(err.contains("not supported"), "got: {err}");
 
         Ok(())
     }
