@@ -64,6 +64,7 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
@@ -198,6 +199,9 @@ pub struct LogState {
     cleanup_before: Option<u64>,
     /// State of the `_last_checkpoint` hint file. Defaults to `Present`.
     last_checkpoint_hint: LastCheckpointHintState,
+    /// When set, a trailing commit removes one data file after all data commits, producing
+    /// an add/remove table. The remove lands at `latest_version + 1`.
+    removes_file: bool,
 }
 
 impl LogState {
@@ -211,6 +215,7 @@ impl LogState {
             crcs_at: Vec::new(),
             cleanup_before: None,
             last_checkpoint_hint: LastCheckpointHintState::Present,
+            removes_file: false,
         }
     }
 
@@ -306,12 +311,32 @@ impl LogState {
         self
     }
 
+    /// Append a trailing commit that removes one data file, producing a table with both add
+    /// and remove actions. Reads at the resulting latest version drop that file's rows, while
+    /// time travel to `latest_version` still sees them. The remove commit lands at
+    /// `latest_version + 1`, so it is one beyond [`Self::latest_version`].
+    ///
+    /// When the `deletionVectors` feature is enabled, a future variant will delete via a
+    /// deletion vector here instead of removing the file; the row-count effect is the same.
+    ///
+    /// Requires `latest_version >= 1`. Intended for targeted tests rather than the default
+    /// cross-product sweep, whose uniform row assertion does not model a changed row count.
+    pub fn with_removed_file(mut self) -> Self {
+        self.removes_file = true;
+        self
+    }
+
     /// Latest version on the table. The total number of commits on disk is
     /// `latest_version + 1` (or fewer if
     /// [`with_cleanup_commits_before`](Self::with_cleanup_commits_before) removed earlier
     /// versions).
     pub fn latest_version(&self) -> u64 {
         self.latest_version
+    }
+
+    /// Whether a trailing remove commit is appended after the data commits.
+    pub(crate) fn removes_file(&self) -> bool {
+        self.removes_file
     }
 
     /// Versions at which checkpoints are written, in ascending order.
@@ -464,6 +489,12 @@ fn validate_log_state(log_state: &LogState) {
             log_state.checkpoints_at().len() >= 2,
             "Stale hint requires at least 2 checkpoints (one to be stale relative to); \
              pair with `with_checkpoint_at` at two distinct versions",
+        );
+    }
+    if log_state.removes_file() {
+        assert!(
+            log_state.latest_version() >= 1,
+            "with_removed_file() requires latest_version >= 1 (need a data file to remove)",
         );
     }
 }
@@ -1314,6 +1345,14 @@ impl TestTableBuilder {
             }
         }
 
+        // Trailing remove commit, after all data commits and log maintenance, yields an
+        // add/remove table whose latest version drops one file's rows.
+        if self.log_state.removes_file() {
+            remove_one_data_file(snapshot.clone(), &engine)
+                .await?
+                .unwrap_post_commit_snapshot();
+        }
+
         Ok(TestTable {
             store,
             table_root: table_root.to_string(),
@@ -1414,6 +1453,38 @@ async fn write_data_commit<E: TaskExecutor>(
         txn.add_files(add_files);
     }
 
+    txn.commit(engine)
+}
+
+/// Remove one data file from `snapshot` via a trailing commit, producing an add/remove table.
+/// Selects the first live file from scan metadata; which file does not matter since the builder
+/// writes uniform `rows_per_file`-row files.
+///
+/// This is the extension point for deletion vectors: when the `deletionVectors` feature is
+/// enabled, a future variant attaches a DV here instead of removing the file.
+async fn remove_one_data_file<E: TaskExecutor>(
+    snapshot: Arc<Snapshot>,
+    engine: &DefaultEngine<E>,
+) -> DeltaResult<delta_kernel::transaction::CommitResult> {
+    let scan = snapshot.clone().scan_builder().build()?;
+    let scan_metadata = scan
+        .scan_metadata(engine)?
+        .next()
+        .ok_or_else(|| delta_kernel::Error::generic("no scan metadata to remove from"))??;
+    let (data, mut selection_vector) = scan_metadata.scan_files.into_parts();
+    let mut removed = false;
+    for selected in selection_vector.iter_mut() {
+        if *selected && !removed {
+            removed = true;
+        } else {
+            *selected = false;
+        }
+    }
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_operation("DELETE".to_string())
+        .with_data_change(true);
+    txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
     txn.commit(engine)
 }
 
