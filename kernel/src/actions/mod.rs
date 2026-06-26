@@ -951,7 +951,8 @@ impl SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(ToSchema, Debug, PartialEq)]
+#[derive(ToSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
@@ -997,7 +998,8 @@ impl Sidecar {
 /// specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
