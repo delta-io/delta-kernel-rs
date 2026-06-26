@@ -20,14 +20,14 @@ longer read or write it by accessing the
 transaction log on disk alone. Instead, the
 connector must:
 
-1. **Resolve** the table name to a storage path and table ID via the UC API.
+1. **Load** the table's metadata and inline commits via the UC API. A single
+   `load_table` call returns the storage path, the recent commits that may not
+   yet be published to disk, and the latest catalog version.
 2. **Obtain credentials** from UC to access the table's cloud storage.
-3. **Fetch recent commits** from UC that may not yet be published to disk.
-4. **Commit through UC** rather than writing directly to `_delta_log/`.
+3. **Commit through UC** rather than writing directly to `_delta_log/`.
 
-The UC integration crates handle steps 1 through 4 while Kernel handles
-everything else: log replay, data skipping, schema enforcement, and protocol
-compliance.
+The UC integration crates handle these steps while Kernel handles everything
+else: log replay, data skipping, schema enforcement, and protocol compliance.
 
 ## The three crates
 
@@ -39,67 +39,67 @@ responsibility.
 This crate defines the **API contract** for communicating with Unity Catalog. It
 contains no HTTP code or network dependencies. The key types are:
 
-- **`CommitClient`** trait: commits a new version to a UC-managed table. Your
-  implementation calls the UC commits API to ratify a staged commit.
-- **`GetCommitsClient`** trait: retrieves the list of ratified commits for a
-  table. The response includes each commit's version, file name, size, and the
-  latest ratified table version.
-- **`CommitsRequest`** / **`CommitsResponse`** / **`Commit`**: the request and
-  response models for the commits API.
-- **`CommitRequest`**: the request model for ratifying a single commit.
-- **`TemporaryTableCredentials`** / **`AwsTempCredentials`** / **`Operation`**:
-  credential vending models. `Operation` distinguishes `Read`, `Write`, and
-  `ReadWrite` access.
-- **`InMemoryCommitsClient`**: a test-only implementation (behind the
+- **`UpdateTableClient`** trait: the single trait the Kernel integration layer
+  dispatches through. Its `update_table` method ratifies a staged commit. Your
+  backend implements this trait.
+- **`LoadTableResponse`** / **`Commit`**: the response model for loading a
+  table. `LoadTableResponse` carries the table `metadata`, a list of inline
+  unpublished `commits`, and the `latest_table_version` the catalog knows about.
+- **`UpdateTableRequest`** / **`UpdateTableResponse`**: the request and response
+  models for the commit RPC.
+- **`CreateTableRequest`** / **`CreateTableResponse`**: the request and response
+  models for table creation.
+- **`CredentialsResponse`** / **`Operation`**: credential vending models.
+  `Operation` distinguishes `Read` and `ReadWrite` access.
+- **`InMemoryUpdateTableClient`**: a test-only implementation (behind the
   `test-utils` feature flag) that stores commits in memory. Useful for unit
   testing your connector without a live UC server.
 
 Because this crate is transport-agnostic, you can swap in any backend (REST,
-gRPC, or in-memory) without changing the code that depends on these traits.
+gRPC, or in-memory) without changing the code that depends on the
+`UpdateTableClient` trait.
 
 ### `unity-catalog-delta-rest-client`: HTTP implementation
 
 This crate provides the concrete REST-over-HTTP implementations:
 
-- **`UCClient`**: calls the UC tables API (`get_table`) and the credentials API
-  (`get_credentials`). You use it to resolve a three-part table name like
-  `my_catalog.my_schema.my_table` into a `table_id` and `storage_location`,
-  then obtain temporary cloud credentials scoped to that location.
-- **`UCCommitsRestClient`**: implements both `CommitClient` and
-  `GetCommitsClient` over HTTP. It talks to the UC commits endpoint to fetch
-  ratified commits and to ratify new ones.
+- **`UCClient`**: calls the connector-driven endpoints. `load_table(catalog,
+  schema, table)` returns the table metadata, inline unpublished commits, and
+  the latest catalog version in one call. `get_table_credentials(...)` vends
+  temporary cloud credentials scoped to the table's storage location.
+  `get_config(...)` performs the protocol-version handshake.
+- **`UCUpdateTableRestClient`**: implements the `UpdateTableClient` trait over
+  HTTP. It talks to the UC update-table endpoint to ratify new commits.
 - **`ClientConfig`** / **`ClientConfigBuilder`**: configuration for the HTTP
   clients, including the workspace URL and authentication token.
 
 ### `delta-kernel-unity-catalog`: the Kernel integration layer
 
 This crate connects the UC client layer to Kernel's APIs. It depends on both
-`unity-catalog-delta-client-api` and `delta_kernel`. The key types are:
+`unity-catalog-delta-client-api` and `delta_kernel`. The key items are:
 
-- **`UCKernelClient<C: GetCommitsClient>`**: the main entry point. It wraps any
-  `GetCommitsClient` implementation and provides `load_snapshot()` and
-  `load_snapshot_at()` methods. These methods call `get_commits`, convert the
-  response into a `Vec<LogPath>` log tail, and pass it to
-  `Snapshot::builder_for().with_log_tail()` so Kernel can build a
-  Snapshot that includes unpublished commits.
-- **`UCCommitter<C: CommitClient>`**: implements Kernel's `Committer` trait for
-  UC tables. For version 0 (table creation), it writes `000.json` directly to
-  the published commit path. For all subsequent versions, it writes a staged
-  commit to `_delta_log/_staged_commits/`, then calls the UC commit API to
-  ratify it. The `publish()` method copies ratified staged commits to
-  `_delta_log/` as published commits.
+- **`log_tail_from_commits()`**: converts the inline `commits` from a
+  `LoadTableResponse` into a `Vec<LogPath>` log tail. You pass the result to
+  `Snapshot::builder_for().with_log_tail()` so Kernel can build a Snapshot that
+  includes unpublished commits.
+- **`UCCommitter<C: UpdateTableClient>`**: implements Kernel's `Committer` trait
+  for UC tables. For version 0 (table creation), it writes `000.json` directly
+  to the published commit path. For all subsequent versions, it writes a staged
+  commit to `_delta_log/_staged_commits/`, then calls `update_table` to ratify
+  it. The `publish()` method copies ratified staged commits to `_delta_log/` as
+  published commits.
 - **`get_required_properties_for_disk()`**: returns the table properties you
   must include when creating a UC-managed table (the `catalogManaged` and
   `vacuumProtocolCheck` feature signals, plus the `io.unitycatalog.tableId`).
   Kernel's `create_table()` consumes these as table properties on the version 0
   commit.
-- **`get_final_required_properties_for_uc()`**: extracts the full set of
-  properties from the post-creation Snapshot (feature signals, protocol
-  versions, in-commit timestamp, optional clustering columns) that you send to
-  your UC server's table-registration endpoint to finalize the table.
+- **`build_uc_create_table_request()`**: builds the typed `CreateTableRequest`
+  from the post-creation version 0 Snapshot (schema, partition columns, typed
+  protocol, properties, domain metadata, and the in-commit timestamp) that you
+  send to your UC server's table-registration endpoint to finalize the table.
 
 See [Creating UC Tables](./creating_tables.md) for the end-to-end creation
-flow and how these two utilities fit together.
+flow and how these utilities fit together.
 
 > [!NOTE]
 > `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -115,10 +115,11 @@ UC crates fill those roles:
 
 | Generic concept | UC implementation |
 |-----------------|-------------------|
-| Resolve table name to path + credentials | `UCClient::get_table()` + `UCClient::get_credentials()` |
-| Fetch ratified commits (log tail) | `UCKernelClient::load_snapshot()` via `GetCommitsClient::get_commits()` |
-| Build Snapshot with catalog commits | `UCKernelClient` calls `Snapshot::builder_for().with_log_tail().with_max_catalog_version()` |
-| Commit through catalog | `UCCommitter` implements `Committer`: stages, ratifies via `CommitClient::commit()`, then publishes |
+| Load table (path + commits + version) | `UCClient::load_table()` |
+| Vend storage credentials | `UCClient::get_table_credentials()` |
+| Build log tail from catalog commits | `log_tail_from_commits()` |
+| Build Snapshot with catalog commits | `Snapshot::builder_for().with_log_tail().with_max_catalog_version()` |
+| Commit through catalog | `UCCommitter` implements `Committer`: stages, ratifies via `UpdateTableClient::update_table()`, then publishes |
 | Publish staged commits | `UCCommitter::publish()` copies staged files to `_delta_log/` |
 
 ## Architecture
@@ -130,25 +131,26 @@ connector reads or writes a UC-managed table.
  ┌─────────────────────────────────────────────────────────┐
  │                   Your Connector                        │
  │                                                         │
- │  1. UCClient::get_table("catalog.schema.table")         │
- │  2. UCClient::get_credentials(&table_id, Read)          │
- │  3. UCKernelClient::load_snapshot(&table_id, &uri, ..)  │
- │  4. snapshot.scan_builder().build()?.execute(engine)?    │
+ │  1. UCClient::load_table("cat", "sch", "tbl")           │
+ │  2. UCClient::get_table_credentials(.., Read)           │
+ │  3. log_tail_from_commits(&resp.commits, &table_url)    │
+ │  4. Snapshot::builder_for(url).with_log_tail(..).build()│
+ │  5. snapshot.scan_builder().build()?.execute(engine)?    │
  └──────────┬──────────────┬───────────────────────────────┘
             │              │
             ▼              ▼
  ┌──────────────────┐  ┌───────────────────────────────────┐
  │  unity-catalog-  │  │  delta-kernel-unity-catalog        │
  │  delta-rest-     │  │                                    │
- │  client          │  │  UCKernelClient                    │
- │                  │  │    calls get_commits()              │
- │  UCClient        │  │    converts to Vec<LogPath>        │
- │  UCCommitsRest   │  │    calls Snapshot::builder_for()   │
- │  Client          │  │      .with_log_tail(commits)       │
- │                  │  │      .build(engine)                 │
+ │  client          │  │  log_tail_from_commits()           │
+ │                  │  │    converts commits to Vec<LogPath>│
+ │  UCClient        │  │                                    │
+ │  UCUpdateTable   │  │  UCCommitter                       │
+ │  RestClient      │  │    implements Committer trait       │
+ │                  │  │    calls update_table() to ratify   │
  │  Implements:     │  │                                    │
- │  CommitClient    │  │  UCCommitter                       │
- │  GetCommitsClient│  │    implements Committer trait       │
+ │  UpdateTable     │  │  build_uc_create_table_request()   │
+ │  Client          │  │    builds the v0 CREATE body        │
  └──────┬───────────┘  └──────────┬────────────────────────┘
         │                         │
         ▼                         ▼
@@ -157,15 +159,16 @@ connector reads or writes a UC-managed table.
  │  delta-client-   │  │                                    │
  │  api             │  │  Snapshot, Scan, Transaction        │
  │                  │  │  Committer trait                    │
- │  CommitClient    │  │  LogPath, SnapshotBuilder           │
- │  GetCommitsClient│  │                                    │
- │  (traits)        │  │  Knows nothing about UC.            │
+ │  UpdateTable     │  │  LogPath, SnapshotBuilder           │
+ │  Client (trait)  │  │                                    │
+ │  wire models     │  │  Knows nothing about UC.            │
  └──────────────────┘  └───────────────────────────────────┘
 ```
 
 The diagram shows the steady-state commit flow for an existing table. The
 version 0 commit (table creation) takes a different path: `UCCommitter` writes
-`_delta_log/00000000000000000000.json` directly and skips the UC commits API.
+`_delta_log/00000000000000000000.json` directly and skips the `update_table`
+RPC.
 See [Creating UC Tables](./creating_tables.md) for the full creation flow.
 
 ## Dependencies and feature flags
@@ -179,9 +182,9 @@ unity-catalog-delta-rest-client = { version = "..." }
 ```
 
 Depend on `unity-catalog-delta-client-api` whenever you import types from it
-directly (including `Operation`, `CommitClient`, and `GetCommitsClient`). The
-REST client crate does not re-export these. You also need the client-api crate
-when implementing a custom backend, such as a gRPC client.
+directly (including `Operation` and `UpdateTableClient`). The REST client crate
+does not re-export these. You also need the client-api crate when implementing a
+custom backend, such as a gRPC client.
 
 The `delta-kernel-unity-catalog` crate has the following feature flags:
 
@@ -195,7 +198,7 @@ The `unity-catalog-delta-client-api` crate has one feature flag:
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `test-utils` | No | Enables `InMemoryCommitsClient` for unit testing |
+| `test-utils` | No | Enables `InMemoryUpdateTableClient` for unit testing |
 
 > [!TIP]
 > The `unity-catalog-delta-rest-client` crate also exposes a `test-utils`
@@ -227,13 +230,18 @@ let config = ClientConfig::build(&endpoint, &token)
     .build()?;
 ```
 
-The REST client automatically retries requests that fail with server errors
-(HTTP 5xx) or transient network errors, using linear backoff bounded by
-`retry_base_delay` and `retry_max_delay`. Successful 2xx and client errors
-(HTTP 4xx) are not retried. These retries apply to transport-level failures
-only. Transaction-level conflicts (another writer won the version) must be
-handled by the connector through the `CommitResult::ConflictedTransaction`
-branch. See [Writing to UC Tables](./writing.md) for the full retry model.
+The REST client automatically retries idempotent requests that fail with
+server errors (HTTP 5xx), rate limiting (HTTP 429), or transient network
+errors, using linear backoff bounded by `retry_base_delay` and
+`retry_max_delay`. Successful 2xx and other client errors (HTTP 4xx) are not
+retried, and the non-idempotent commit RPC is never retried. These retries
+apply to transport-level failures only. Transaction-level conflicts (another
+writer won the version) must be handled by the connector through the
+`CommitResult::ConflictedTransaction` branch. See
+[Writing to UC Tables](./writing.md) for the full retry model.
+
+The commit RPC itself goes through `UpdateTableClient::update_table` on the
+`UCUpdateTableRestClient`.
 
 ## When not to use this
 
@@ -251,7 +259,7 @@ extension points.
 
 - [Creating UC Tables](./creating_tables.md): how to create a new UC-managed
   table using `get_required_properties_for_disk` and
-  `get_final_required_properties_for_uc`.
+  `build_uc_create_table_request`.
 - [Reading UC Tables](./reading.md): how to load a Snapshot and read data from
   a UC-managed table.
 - [Writing to UC Tables](./writing.md): how to commit and publish writes through

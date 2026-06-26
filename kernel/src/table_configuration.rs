@@ -147,16 +147,18 @@ impl TableConfiguration {
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
 
-    /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
-    /// and takes a pre-parsed `logical_schema`.
+    /// Like [`try_new`](Self::try_new), but reuses `base`'s table root and version and takes a
+    /// pre-parsed `logical_schema` and an explicit `protocol` (which may differ from `base`'s, e.g.
+    /// when an ALTER promotes the protocol for a property-driven feature).
     pub(crate) fn try_new_with_schema(
         base: &Self,
         metadata: Metadata,
+        protocol: Protocol,
         logical_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         Self::try_new_inner(
             metadata,
-            base.protocol.clone(),
+            protocol,
             base.table_root.clone(),
             base.version,
             logical_schema,

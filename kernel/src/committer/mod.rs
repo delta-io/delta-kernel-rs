@@ -30,7 +30,7 @@ mod filesystem;
 mod publish_types;
 
 pub(crate) use commit_types::CommitProtocolMetadata;
-pub use commit_types::{CommitMetadata, CommitResponse, CommitType};
+pub use commit_types::{CommitMetadata, CommitResponse, CommitType, ProtocolMetadataIntent};
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 

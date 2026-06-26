@@ -1260,6 +1260,8 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "itertools 0.14.0",
+ "reqwest 0.13.2",
+ "rstest",
  "serde",
  "serde_json",
  "tempfile",

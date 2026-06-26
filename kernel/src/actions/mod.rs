@@ -394,6 +394,13 @@ impl Metadata {
         self
     }
 
+    /// Returns a new Metadata with the given configuration entry removed, preserving all other
+    /// configuration entries and metadata fields. A no-op if the key is absent.
+    pub(crate) fn without_configuration_entry(mut self, key: &str) -> Self {
+        self.configuration.remove(key);
+        self
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(
@@ -479,6 +486,7 @@ fn parse_features(
 
 impl Protocol {
     /// Try to create a new modern Protocol instance with the given table feature lists
+    #[internal_api]
     pub(crate) fn try_new_modern(
         reader_features: impl IntoIterator<Item = impl IntoTableFeature>,
         writer_features: impl IntoIterator<Item = impl IntoTableFeature>,
@@ -489,6 +497,35 @@ impl Protocol {
             Some(reader_features),
             Some(writer_features),
         )
+    }
+
+    /// Return a protocol with property-driven features (e.g. `changeDataFeed` from
+    /// `delta.enableChangeDataFeed=true`) enabled on top of this protocol's existing features,
+    /// using `allowed` as the candidate set.
+    ///
+    /// Only feature-based protocols (reader version
+    /// [`TABLE_FEATURES_MIN_READER_VERSION`]/writer version
+    /// [`TABLE_FEATURES_MIN_WRITER_VERSION`]) are promoted; legacy protocols are returned
+    /// unchanged. Returns the same protocol when no new feature is enabled.
+    pub(crate) fn with_property_driven_features(
+        &self,
+        allowed: &[TableFeature],
+        properties: &TableProperties,
+    ) -> DeltaResult<Self> {
+        if self.min_reader_version != TABLE_FEATURES_MIN_READER_VERSION
+            || self.min_writer_version != TABLE_FEATURES_MIN_WRITER_VERSION
+        {
+            return Ok(self.clone());
+        }
+        let mut reader_features = self.reader_features.clone().unwrap_or_default();
+        let mut writer_features = self.writer_features.clone().unwrap_or_default();
+        crate::table_features::auto_enable_property_driven_features(
+            allowed,
+            properties,
+            &mut reader_features,
+            &mut writer_features,
+        );
+        Self::try_new_modern(reader_features, writer_features)
     }
 
     /// Try to create a new legacy Protocol instance with the given reader/writer versions
@@ -1066,6 +1103,7 @@ impl DomainMetadata {
     }
 
     /// Returns `true` if this action is a tombstone (marking domain removal).
+    #[internal_api]
     pub(crate) fn is_removed(&self) -> bool {
         self.removed
     }

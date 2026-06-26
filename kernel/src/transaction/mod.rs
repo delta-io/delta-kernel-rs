@@ -15,6 +15,7 @@ use crate::actions::{
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
+    ProtocolMetadataIntent,
 };
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
@@ -259,6 +260,10 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
+    // Protocol/metadata operations captured by the ALTER TABLE builder, threaded into
+    // CommitMetadata so a committer can read the change directly instead of diffing read vs new
+    // P&M. Empty for all other transaction kinds. See [`ProtocolMetadataIntent`].
+    protocol_metadata_intents: Vec<ProtocolMetadataIntent>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -743,7 +748,8 @@ impl<S> Transaction<S> {
             max_published_version,
             protocol_metadata,
             domain_metadata_changes,
-        ))
+        )
+        .with_protocol_metadata_intents(self.protocol_metadata_intents.clone()))
     }
 
     /// Validate that the transaction is eligible to be marked as a blind append.
@@ -2050,9 +2056,11 @@ mod tests {
             .metadata()
             .clone()
             .with_schema(evolved_schema.clone())?;
+        let evolved_protocol = txn.effective_table_config.protocol().clone();
         txn.effective_table_config = TableConfiguration::try_new_with_schema(
             &txn.effective_table_config,
             evolved_metadata,
+            evolved_protocol,
             evolved_schema,
         )?;
 

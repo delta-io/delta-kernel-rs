@@ -18,6 +18,9 @@ default = ["arrow"]
 arrow = ["arrow-58"]
 arrow-58 = ["delta_kernel/arrow-58"]
 arrow-57 = ["delta_kernel/arrow-57"]
+# Live-server E2E tests. Gated so normal `cargo nextest` never compiles or runs them.
+# Tests additionally skip at runtime when UC_SERVER_URL is unset.
+integration-test = []
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["internal-api"] }
@@ -36,4 +39,8 @@ delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"
 unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client", features = ["test-utils"] }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
 test_utils = { path = "../test-utils" }
+rstest = "0.23"
 tempfile = "3"
+# Only used by the gated live-server CREATE test, which hand-rolls the staging-tables/tables POSTs.
+# Mirrors the rest-client's reqwest config.
+reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "rustls", "system-proxy"] }

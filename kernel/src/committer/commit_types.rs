@@ -4,11 +4,32 @@ use std::collections::HashMap;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
+use crate::expressions::ColumnName;
 use crate::path::LogRoot;
+use crate::schema::StructField;
 use crate::{DeltaResult, Version};
+
+/// A Delta-level protocol/metadata operation captured by the transaction so a committer can read
+/// the change directly instead of diffing read vs new P&M. Covers the full P&M surface: schema
+/// (AddColumn / SetNullable), table properties (SetProperty / UnsetProperty), and protocol-feature
+/// enablement (EnableFeature).
+#[derive(Debug, Clone)]
+pub enum ProtocolMetadataIntent {
+    /// Add a top-level column to the schema.
+    AddColumn { field: StructField },
+    /// Make a (possibly nested) column nullable.
+    SetNullable { column: ColumnName },
+    /// Set a table property in `metaData.configuration`.
+    SetProperty { key: String, value: String },
+    /// Remove a table property from `metaData.configuration`.
+    UnsetProperty { key: String },
+    /// Enable a protocol feature, named as it appears in the reader/writer feature lists.
+    EnableFeature { feature: String },
+}
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -58,9 +79,9 @@ pub(crate) struct CommitProtocolMetadata {
     read_protocol: Option<Protocol>,
     /// Existing table metadata from read snapshot. `None` for create-table.
     read_metadata: Option<Metadata>,
-    /// New protocol being committed. `Some` for create-table and future ALTER TABLE.
+    /// New protocol being committed. `Some` for create-table and ALTER TABLE.
     new_protocol: Option<Protocol>,
-    /// New metadata being committed. `Some` for create-table and future ALTER TABLE.
+    /// New metadata being committed. `Some` for create-table and ALTER TABLE.
     new_metadata: Option<Metadata>,
 }
 
@@ -118,6 +139,8 @@ pub struct CommitMetadata {
     pub(crate) protocol_metadata: CommitProtocolMetadata,
     /// Domain metadata actions in this commit (additions and removals).
     pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
+    /// Protocol/metadata operations captured by the transaction (see [`ProtocolMetadataIntent`]).
+    pub(crate) protocol_metadata_intents: Vec<ProtocolMetadataIntent>,
 }
 
 impl CommitMetadata {
@@ -138,7 +161,17 @@ impl CommitMetadata {
             max_published_version,
             protocol_metadata,
             domain_metadata_changes,
+            protocol_metadata_intents: Vec::new(),
         }
+    }
+
+    /// Sets the protocol/metadata intents captured by the transaction.
+    pub(crate) fn with_protocol_metadata_intents(
+        mut self,
+        intents: Vec<ProtocolMetadataIntent>,
+    ) -> Self {
+        self.protocol_metadata_intents = intents;
+        self
     }
 
     /// The commit path is the absolute path (e.g. s3://bucket/table/_delta_log/{version}.json) to
@@ -185,6 +218,7 @@ impl CommitMetadata {
 
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
     /// TABLE), falling back to the read snapshot's protocol.
+    #[internal_api]
     pub(crate) fn effective_protocol(&self) -> DeltaResult<&Protocol> {
         let pm = &self.protocol_metadata;
         pm.new_protocol
@@ -199,6 +233,7 @@ impl CommitMetadata {
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
     /// TABLE), falling back to the read snapshot's metadata.
+    #[internal_api]
     pub(crate) fn effective_metadata(&self) -> DeltaResult<&Metadata> {
         let pm = &self.protocol_metadata;
         pm.new_metadata
@@ -209,6 +244,44 @@ impl CommitMetadata {
                     "CommitProtocolMetadata should have at least one metadata",
                 )
             })
+    }
+
+    /// Returns the read snapshot's protocol, if any. `None` for create-table commits.
+    #[internal_api]
+    pub(crate) fn read_protocol(&self) -> Option<&Protocol> {
+        self.protocol_metadata.read_protocol.as_ref()
+    }
+
+    /// Returns the new protocol being committed, if any. `Some` for create-table and ALTER TABLE
+    /// commits that change protocol.
+    #[internal_api]
+    pub(crate) fn new_protocol(&self) -> Option<&Protocol> {
+        self.protocol_metadata.new_protocol.as_ref()
+    }
+
+    /// Returns the read snapshot's metadata, if any. `None` for create-table commits.
+    #[internal_api]
+    pub(crate) fn read_metadata(&self) -> Option<&Metadata> {
+        self.protocol_metadata.read_metadata.as_ref()
+    }
+
+    /// Returns the new metadata being committed, if any. `Some` for create-table and ALTER TABLE
+    /// commits that change metadata.
+    #[internal_api]
+    pub(crate) fn new_metadata(&self) -> Option<&Metadata> {
+        self.protocol_metadata.new_metadata.as_ref()
+    }
+
+    /// Returns the domain metadata changes in this commit (both additions and removals).
+    #[internal_api]
+    pub(crate) fn domain_metadata_changes(&self) -> &[DomainMetadata] {
+        &self.domain_metadata_changes
+    }
+
+    /// Returns the protocol/metadata intents captured by the transaction.
+    #[internal_api]
+    pub(crate) fn protocol_metadata_intents(&self) -> &[ProtocolMetadataIntent] {
+        &self.protocol_metadata_intents
     }
 
     /// Check if the effective protocol has a specific writer feature by name.
@@ -284,6 +357,7 @@ impl CommitMetadata {
 
     /// Marks this `CommitMetadata` as having a protocol change. Test-only.
     ///
+    /// Copies the existing protocol into the `new_protocol` field to simulate an ALTER TABLE
     /// that changes the protocol.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_protocol_change(mut self) -> Self {
@@ -312,6 +386,70 @@ impl CommitMetadata {
         self.domain_metadata_changes
             .push(DomainMetadata::new(domain.to_string(), String::new()));
         self
+    }
+
+    /// Sets `new_protocol` to the given payload. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_new_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol_metadata.new_protocol = Some(protocol);
+        self
+    }
+
+    /// Sets `new_metadata` to the given payload. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_new_metadata(mut self, metadata: Metadata) -> Self {
+        self.protocol_metadata.new_metadata = Some(metadata);
+        self
+    }
+
+    /// Sets `read_protocol` (the snapshot's protocol before the commit). Test-only.
+    ///
+    /// Retained for committers that derive updates by diffing the read snapshot's P&M against the
+    /// new P&M; their tests construct a before/after `CommitMetadata`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn replace_read_protocol_for_test(mut self, protocol: Option<Protocol>) -> Self {
+        self.protocol_metadata.read_protocol = protocol;
+        self
+    }
+
+    /// Sets `read_metadata` (the snapshot's metadata before the commit). Test-only.
+    /// See [`Self::replace_read_protocol_for_test`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn replace_read_metadata_for_test(mut self, metadata: Option<Metadata>) -> Self {
+        self.protocol_metadata.read_metadata = metadata;
+        self
+    }
+
+    /// Adds a domain metadata change with the given configuration string. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_domain_change_payload(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.domain_metadata_changes
+            .push(DomainMetadata::new(domain.into(), configuration.into()));
+        self
+    }
+
+    /// Adds a domain metadata removal (tombstone) for the given domain name. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_domain_removal(mut self, domain: &str) -> Self {
+        self.domain_metadata_changes
+            .push(DomainMetadata::remove(domain.to_string(), String::new()));
+        self
+    }
+
+    /// Sets the protocol/metadata intents. Test-only.
+    ///
+    /// Exposes the `pub(crate)` setter to tests in dependent crates (e.g.
+    /// delta-kernel-unity-catalog) under the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_protocol_metadata_intents_for_test(
+        self,
+        intents: Vec<ProtocolMetadataIntent>,
+    ) -> Self {
+        self.with_protocol_metadata_intents(intents)
     }
 }
 

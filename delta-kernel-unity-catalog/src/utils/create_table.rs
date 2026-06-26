@@ -1,42 +1,46 @@
-//! Utilities for Unity Catalog catalog-managed table creation.
+//! Utilities for Unity Catalog catalog-managed table creation under the
+//! UC API.
 //!
-//! These utilities help connectors create UC-managed tables by providing the required properties
-//! for both the Delta log (disk) and the UC server registration.
+//! These helpers produce:
+//!
+//! - the disk-side properties the v0 commit must include ([`get_required_properties_for_disk`]),
+//!   and
+//! - the typed `CreateTableRequest` body the connector sends to the UC `tables` endpoint after the
+//!   v0 commit succeeds ([`build_uc_create_table_request`]).
 //!
 //! # Usage
 //!
 //! ```ignore
-//! // Step 1: Get staging info from UC
-//! let staging_info = my_uc_client.get_staging_table(..);
+//! // Step 1: Allocate UUID + storage via UC `staging-tables` (connector-driven).
+//! let staging = my_uc_client.create_staging_table(..);
 //!
-//! // Step 2: Build and commit the create-table transaction
-//! let disk_props = get_required_properties_for_disk(staging_info.table_id);
+//! // Step 2: Build and commit the create-table transaction.
+//! let disk_props = get_required_properties_for_disk(&staging.table_id);
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0")
 //!     .with_table_properties(disk_props)
 //!     .build(engine, committer);
-//! let result = create_table_txn.commit(engine);
+//! create_table_txn.commit(engine)?;
 //!
-//! // Step 3: Finalize table in UC
+//! // Step 3: Finalize in UC via the typed `tables` endpoint (connector-driven).
 //! let snapshot = /* load post-commit snapshot at version 0 */;
-//! let uc_props = get_final_required_properties_for_uc(&snapshot, engine)?;
-//! my_uc_client.create_table(.., uc_props);
+//! let req = build_uc_create_table_request(&snapshot, engine, "my_table")?;
+//! my_uc_client.create_table(catalog, schema, req);
 //! ```
 
 use std::collections::HashMap;
 
 use delta_kernel::{Engine, Snapshot};
+use unity_catalog_delta_client_api::CreateTableRequest;
 
 use crate::constants::{
-    CATALOG_MANAGED_FEATURE_KEY, FEATURE_SUPPORTED, METASTORE_LAST_COMMIT_TIMESTAMP,
-    METASTORE_LAST_UPDATE_VERSION, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
+    CATALOG_MANAGED_FEATURE_KEY, FEATURE_SUPPORTED, UC_TABLE_ID_KEY,
+    VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
 };
+use crate::conversions::{parse_or_string, to_api_protocol, CLUSTERING_DOMAIN};
 
-/// Returns the table properties that must be written to disk (in `000.json`) for a UC
-/// catalog-managed table creation.
-///
-/// These properties must be persisted in the Delta log so that the table is recognized as
-/// catalog-managed. Note: ICT enablement is handled automatically by kernel's CREATE TABLE
-/// when the `catalogManaged` feature is present.
+/// Properties that must be persisted in `000.json` for a UC catalog-managed
+/// table creation. ICT enablement is handled automatically by kernel's
+/// CREATE TABLE when the `catalogManaged` feature is present.
 pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, String> {
     [
         (CATALOG_MANAGED_FEATURE_KEY, FEATURE_SUPPORTED),
@@ -48,71 +52,79 @@ pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, St
     .collect()
 }
 
-/// Extracts the properties that must be sent to the UC server when finalizing a table creation.
+/// Build the typed `CreateTableRequest` body the connector sends to the UC `tables` endpoint after
+/// the v0 commit succeeds, driving off the post-commit v0 snapshot.
 ///
-/// These properties are derived from the post-commit snapshot (after `000.json` has
-/// been written). The connector should pass these to the UC `create_table` API.
+/// # Errors
 ///
-/// # Properties returned
-///
-/// - All entries from `Metadata.configuration` (includes `io.unitycatalog.tableId`, user props)
-/// - `delta.minReaderVersion` and `delta.minWriterVersion`
-/// - `delta.feature.<name> = "supported"` for every reader and writer table feature
-/// - `delta.lastUpdateVersion` -- the snapshot version
-/// - `delta.lastCommitTimestamp` -- the snapshot's in-commit timestamp (requires ICT enabled)
-/// - `clusteringColumns` -- JSON-serialized clustering columns (if clustering is enabled)
-///
-/// # Clustering columns
-///
-/// Clustering columns are returned as logical column names. When column mapping is enabled,
-/// the physical names stored in domain metadata are converted to logical names using the
-/// table schema.
-pub fn get_final_required_properties_for_uc(
+/// Returns an error if `snapshot` is not at version 0, if the schema can't be serialized, or if the
+/// engine fails to read clustering metadata or the commit timestamp.
+pub fn build_uc_create_table_request(
     snapshot: &Snapshot,
     engine: &dyn Engine,
-) -> delta_kernel::DeltaResult<HashMap<String, String>> {
+    table_name: impl Into<String>,
+) -> delta_kernel::DeltaResult<CreateTableRequest> {
     if snapshot.version() != 0 {
         return Err(delta_kernel::Error::generic(format!(
-            "get_final_required_properties_for_uc is only valid for version 0 (table creation) \
+            "build_uc_create_table_request is only valid for version 0 (table creation) \
              snapshots, but snapshot is at version {}",
             snapshot.version()
         )));
     }
 
-    // Start with metadata configuration (user + delta properties)
-    let mut properties = snapshot.metadata_configuration().clone();
-
-    // Protocol-derived properties (versions + feature signals)
-    properties.extend(snapshot.get_protocol_derived_properties());
-
-    // UC-specific properties
-    properties.insert(
-        METASTORE_LAST_UPDATE_VERSION.to_string(),
-        snapshot.version().to_string(),
-    );
-    let timestamp = snapshot.get_in_commit_timestamp(engine)?.ok_or_else(|| {
-        delta_kernel::Error::generic(
-            "In-commit timestamp is required for UC catalog-managed tables but was not found",
-        )
+    let columns = serde_json::to_value(snapshot.schema().as_ref()).map_err(|e| {
+        delta_kernel::Error::generic(format!("Failed to serialize table schema: {e}"))
     })?;
-    properties.insert(
-        METASTORE_LAST_COMMIT_TIMESTAMP.to_string(),
-        timestamp.to_string(),
-    );
 
-    // Clustering columns as logical names (if present)
+    let table_config = snapshot.table_configuration();
+    let metadata = table_config.metadata();
+    let protocol = table_config.protocol();
+
+    let partition_columns = metadata.partition_columns().to_vec();
+    let properties = metadata.configuration().clone();
+    let typed_protocol = to_api_protocol(protocol);
+
+    // Domain metadata: the CREATE path forwards user domains plus the typed clustering domain
+    // (injected below under its logical-column shape). Internal `delta.*` domains are filtered out
+    // by `get_all_domain_metadata`. The UPDATE path forwards only UC-mirrored domains; see
+    // [`crate::conversions::UC_MIRRORED_DOMAINS`].
+    let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
     if let Some(columns) = snapshot.get_logical_clustering_columns(engine)? {
-        let column_arrays: Vec<Vec<&str>> = columns
+        let arrays: Vec<Vec<&str>> = columns
             .iter()
-            .map(|c| c.path().iter().map(|s| s.as_str()).collect())
+            .map(|c| c.path().iter().map(String::as_str).collect())
             .collect();
-        let json = serde_json::to_string(&column_arrays).map_err(|e| {
-            delta_kernel::Error::generic(format!("Failed to serialize clustering columns: {e}"))
-        })?;
-        properties.insert("clusteringColumns".to_string(), json);
+        domain_metadata.insert(
+            CLUSTERING_DOMAIN.to_string(),
+            serde_json::json!({ "clusteringColumns": arrays }),
+        );
+    }
+    for dm in snapshot.get_all_domain_metadata(engine)? {
+        // Never overwrite the typed clustering shape inserted above, even if a future change to
+        // `get_all_domain_metadata` starts surfacing it.
+        if dm.domain() == CLUSTERING_DOMAIN {
+            continue;
+        }
+        domain_metadata.insert(dm.domain().to_string(), parse_or_string(dm.configuration()));
     }
 
-    Ok(properties)
+    // v0 CREATE flow only handles managed Delta tables; external/iceberg are out of scope.
+    // ICT is active on catalog-managed tables, so in practice this is the in-commit timestamp,
+    // though `get_timestamp` falls back to filesystem mtime if ICT is absent.
+    let last_commit_timestamp_ms = snapshot.get_timestamp(engine)?;
+
+    Ok(CreateTableRequest {
+        name: table_name.into(),
+        storage_location: snapshot.table_root().to_string(),
+        table_type: "MANAGED".to_string(),
+        comment: None,
+        columns,
+        partition_columns,
+        protocol: typed_protocol,
+        properties,
+        domain_metadata,
+        last_commit_timestamp_ms,
+    })
 }
 
 #[cfg(test)]
@@ -139,7 +151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_final_required_properties_for_uc() {
+    async fn test_build_uc_create_table_request() {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_table/";
@@ -151,7 +163,6 @@ mod tests {
             .unwrap(),
         );
 
-        // Create a UC catalog-managed table with clustering
         let disk_props = get_required_properties_for_disk("test-table-id-456");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
@@ -166,88 +177,60 @@ mod tests {
             .build(&engine)
             .unwrap();
         assert_eq!(snapshot.version(), 0);
-        let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
+        let req = build_uc_create_table_request(&snapshot, &engine, "my_table").unwrap();
 
-        // Protocol-derived properties
-        assert_eq!(uc_props["delta.minReaderVersion"], "3");
-        assert_eq!(uc_props["delta.minWriterVersion"], "7");
-        assert_eq!(uc_props["delta.feature.catalogManaged"], "supported");
-        assert_eq!(uc_props["delta.feature.vacuumProtocolCheck"], "supported");
-        assert_eq!(uc_props["delta.feature.inCommitTimestamp"], "supported");
-        assert_eq!(uc_props["delta.feature.clustering"], "supported");
+        // Typed protocol: feature names come through as plain strings.
+        assert_eq!(req.protocol.min_reader_version, 3);
+        assert_eq!(req.protocol.min_writer_version, 7);
+        assert!(req
+            .protocol
+            .reader_features
+            .iter()
+            .any(|f| f == "catalogManaged"));
+        assert!(req
+            .protocol
+            .writer_features
+            .iter()
+            .any(|f| f == "inCommitTimestamp"));
 
-        // Metadata configuration
-        assert_eq!(uc_props["io.unitycatalog.tableId"], "test-table-id-456");
-
-        // UC-specific properties
-        assert_eq!(uc_props["delta.lastUpdateVersion"], "0");
-        let timestamp: i64 = uc_props["delta.lastCommitTimestamp"]
-            .parse()
-            .expect("timestamp should be a valid i64");
-        assert!(
-            timestamp > 0,
-            "ICT timestamp should be non-zero, got {timestamp}"
-        );
-
-        // Clustering columns: serialized as [[col1], [col2]] (array of path arrays)
-        let parsed: Vec<Vec<String>> =
-            serde_json::from_str(&uc_props["clusteringColumns"]).unwrap();
-        assert_eq!(parsed, vec![vec!["region"]]);
-    }
-
-    #[tokio::test]
-    async fn test_clustering_columns_serialization_multiple_and_nested() {
-        let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
-        let table_path = "memory:///test_clustering_ser/";
-        let address_struct = StructType::new_unchecked(vec![
-            StructField::new("city", DataType::STRING, true),
-            StructField::new("zip", DataType::STRING, true),
-        ]);
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, true),
-                StructField::new("region", DataType::STRING, true),
-                StructField::new("address", address_struct, true),
-            ])
-            .unwrap(),
-        );
-
-        use delta_kernel::expressions::ColumnName;
-
-        let disk_props = get_required_properties_for_disk("test-table-id");
-        let _ = create_table(table_path, schema, "Test/1.0")
-            .with_table_properties(disk_props)
-            .with_data_layout(DataLayout::Clustered {
-                columns: vec![
-                    ColumnName::new(["region"]),
-                    ColumnName::new(["address", "city"]),
-                ],
-            })
-            .build(&engine, Box::new(TestCatalogCommitter))
-            .unwrap()
-            .commit(&engine)
-            .unwrap();
-
-        let snapshot = Snapshot::builder_for(table_path)
-            .with_max_catalog_version(0)
-            .build(&engine)
-            .unwrap();
-        let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
-
-        // Clustering columns serialized as array of path arrays:
-        // [["region"], ["address", "city"]]
-        let raw_json = &uc_props["clusteringColumns"];
-        let parsed: Vec<Vec<String>> = serde_json::from_str(raw_json).unwrap();
+        // Raw configuration only; no flattened delta.feature.* etc.
         assert_eq!(
-            parsed,
-            vec![vec!["region"], vec!["address", "city"]],
-            "Raw JSON: {raw_json}"
+            req.properties["io.unitycatalog.tableId"],
+            "test-table-id-456"
+        );
+        assert!(!req.properties.contains_key("delta.feature.catalogManaged"));
+        assert!(!req.properties.contains_key("delta.minReaderVersion"));
+        assert!(!req.properties.contains_key("delta.lastUpdateVersion"));
+
+        // Clustering surfaces under domain_metadata in typed JSON form.
+        let clustering = req
+            .domain_metadata
+            .get("delta.clustering")
+            .expect("clustering domain metadata should be present");
+        let cols = clustering
+            .get("clusteringColumns")
+            .and_then(|v| v.as_array())
+            .expect("clusteringColumns should be a JSON array");
+        assert_eq!(cols.len(), 1);
+
+        // Schema serialized.
+        assert_eq!(
+            req.columns.get("type").and_then(|v| v.as_str()),
+            Some("struct")
+        );
+        assert_eq!(req.name, "my_table");
+        assert!(req.storage_location.contains("test_table"));
+
+        // ICT is enabled on catalog-managed tables, so the v0 timestamp must be a real value.
+        assert!(
+            req.last_commit_timestamp_ms > 0,
+            "expected positive in-commit timestamp, got {}",
+            req.last_commit_timestamp_ms
         );
     }
 
     #[tokio::test]
-    async fn test_get_final_required_properties_for_uc_rejects_non_zero_version() {
+    async fn test_build_uc_create_table_request_rejects_non_zero_version() {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_version_check/";
@@ -255,7 +238,6 @@ mod tests {
             StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
         );
 
-        // Create a table (version 0) and append (version 1)
         let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
@@ -274,15 +256,13 @@ mod tests {
             .unwrap();
         assert!(result.is_committed());
 
-        // Load snapshot at version 1
         let snapshot = Snapshot::builder_for(table_path)
             .with_max_catalog_version(1)
             .build(&engine)
             .unwrap();
         assert_eq!(snapshot.version(), 1);
 
-        // Should fail because version != 0
-        let err = get_final_required_properties_for_uc(&snapshot, &engine).unwrap_err();
+        let err = build_uc_create_table_request(&snapshot, &engine, "x").unwrap_err();
         assert!(
             err.to_string().contains("version 0"),
             "expected version 0 error, got: {err}"
