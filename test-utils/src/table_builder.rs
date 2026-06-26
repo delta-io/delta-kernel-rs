@@ -970,6 +970,17 @@ impl DataLayoutConfig {
     pub fn is_clustered(&self) -> bool {
         self == &DataLayoutConfig::ClusteredAllTypes
     }
+
+    /// A nullable `INTEGER` data column for data-skipping predicate tests. Its values follow
+    /// the generator's `version * 1000 + row` formula, so a `>= n * 1000` predicate prunes
+    /// files from versions below `n`. (`int_col` in the default schema; `value` in
+    /// [`partitioned_schema`] and [`clustered_schema`].)
+    pub fn skipping_column(&self) -> &'static str {
+        match self {
+            DataLayoutConfig::Unpartitioned => "int_col",
+            DataLayoutConfig::PartitionedAllTypes | DataLayoutConfig::ClusteredAllTypes => "value",
+        }
+    }
 }
 
 impl fmt::Display for DataLayoutConfig {

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{Array, Int32Array, RecordBatch};
+use delta_kernel::expressions::{lit, Expression};
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
@@ -17,7 +19,8 @@ use test_utils::table_builder::{
     two_checkpoints_stale_hint_post_cleanup, unpartitioned, version_at_mid,
     version_at_timestamp_max, version_incremental_from_mid_to_latest,
     version_incremental_from_mid_to_pre_latest, version_latest, with_json_stats, with_struct_stats,
-    DataLayoutConfig, FeatureSet, LogState, TableConfig, VersionTarget,
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, VersionTarget,
+    NULL_RATE_EVERY_NTH,
 };
 use test_utils::{assert_row_ids_unique, build_snapshot, default_sweep, read_scan};
 
@@ -25,6 +28,32 @@ use test_utils::{assert_row_ids_unique, build_snapshot, default_sweep, read_scan
 /// snapshot at version `v` has exactly `v * ROWS_PER_COMMIT` total rows. File count
 /// per commit isn't asserted because partitioned layouts may emit multiple files.
 const ROWS_PER_COMMIT: usize = 10;
+
+/// Data-skipping predicate threshold. The generator fills the skipping column with
+/// `version * 1000 + row`, so `>= 2000` keeps versions >= 2; version 1's max (well under
+/// 2000) makes its file prunable by min/max skipping.
+const SKIP_THRESHOLD: i32 = 2000;
+
+/// Counts non-null rows of the `INTEGER` column `col` whose value is `>= threshold`.
+fn count_at_least(batches: &[RecordBatch], col: &str, threshold: i32) -> usize {
+    batches
+        .iter()
+        .map(|batch| {
+            let idx = batch
+                .schema()
+                .index_of(col)
+                .expect("skipping column present in scan output");
+            let array = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("INTEGER column reads back as Int32Array");
+            (0..array.len())
+                .filter(|&i| array.is_valid(i) && array.value(i) >= threshold)
+                .count()
+        })
+        .sum()
+}
 
 /// `default_sweep` is the canonical `{LogState x FeatureSet x (DataLayoutConfig,
 /// TableConfig) x VersionTarget}` cross-product defined in `test_utils`. Data layout and
@@ -40,6 +69,7 @@ fn test_cross_product_read_write(
     version_target: VersionTarget,
 ) -> DeltaResult<()> {
     let (data_layout, table_config) = layout_config;
+    let skip_col = data_layout.skipping_column();
     let table = test_table(log_state.clone(), feature_set, data_layout, table_config);
     let engine: Arc<dyn Engine> =
         Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
@@ -64,6 +94,29 @@ fn test_cross_product_read_write(
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, expected_version as usize * ROWS_PER_COMMIT);
 
+    // Min/max data-skipping predicate on the integer column. Data skipping is file-level, not
+    // row-level, so the scan may return extra rows from files it kept; residual-filtering the
+    // result here asserts skipping is *sound* (no row satisfying the predicate is dropped)
+    // uniformly across stats configs. Matching rows live only in versions >= 2, whose files
+    // are never validly skippable, so the matching count is fixed regardless of whether
+    // version 1 was pruned.
+    let predicate = Arc::new(Expression::column([skip_col]).ge(lit(SKIP_THRESHOLD)));
+    let filtered_scan = snap
+        .clone()
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()?;
+    let filtered_batches = read_scan(&filtered_scan, engine.clone())?;
+    let nulls_per_file = (0..ROWS_PER_COMMIT)
+        .filter(|i| i % NULL_RATE_EVERY_NTH == 0)
+        .count();
+    let matching_versions = expected_version.saturating_sub(1) as usize;
+    assert_eq!(
+        count_at_least(&filtered_batches, skip_col, SKIP_THRESHOLD),
+        matching_versions * (ROWS_PER_COMMIT - nulls_per_file),
+        "data skipping dropped rows that satisfy the predicate",
+    );
+
     if snap.table_properties().enable_row_tracking == Some(true) {
         let scan_schema = Arc::new(
             snap.schema()
@@ -73,6 +126,36 @@ fn test_cross_product_read_write(
         let batches = read_scan(&scan, engine)?;
         assert_row_ids_unique(&batches);
     }
+
+    Ok(())
+}
+
+/// Effectiveness companion to the sweep's soundness assertion: with stats on the predicate
+/// column, a `>= SKIP_THRESHOLD` predicate must actually prune the version-1 file via min/max
+/// data skipping (whereas the sweep only proves skipping never drops a matching row). Counts
+/// the files surviving `scan_metadata` rather than rows, since skipping is file-level.
+#[test]
+fn test_data_skipping_prunes_files() -> DeltaResult<()> {
+    // `num_indexed_cols_all` writes stats for every leaf column, so `int_col` is indexed.
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(3))
+        .with_table_config(num_indexed_cols_all())
+        .build()?;
+    let engine: Arc<dyn Engine> =
+        Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+    let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+
+    // v1 = [1000, 1009], v2 = [2000, 2009], v3 = [3000, 3009]. `int_col >= 2000` excludes v1.
+    let predicate = Arc::new(Expression::column(["int_col"]).ge(lit(SKIP_THRESHOLD)));
+    let scan = snap.scan_builder().with_predicate(predicate).build()?;
+    let mut files = 0usize;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        files = scan_metadata?.visit_scan_files(files, |count, _| *count += 1)?;
+    }
+    assert_eq!(
+        files, 2,
+        "version-1 file should be pruned by min/max skipping"
+    );
 
     Ok(())
 }
