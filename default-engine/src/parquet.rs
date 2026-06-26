@@ -66,6 +66,13 @@ impl DataFileMetadata {
         &self.file_meta.location
     }
 
+    /// Returns the [`FileMeta`] describing the written file (path, size, modification time).
+    /// Used by Vortex round-trip tests that read back a just-written file.
+    #[cfg(test)]
+    pub(crate) fn file_meta(&self) -> &FileMeta {
+        &self.file_meta
+    }
+
     /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the schema
     /// returned by [`Transaction::add_files_schema`].
     ///
@@ -250,6 +257,18 @@ async fn read_parquet_files_impl(
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
+    }
+
+    // Per-file format dispatch: the scan path calls this with exactly one file per call, so
+    // branching on the extension here cleanly supports mixed Parquet+Vortex tables. `.vortex` files
+    // route to the Vortex reader; everything else takes the Parquet path below.
+    // SAFETY: we did the is_empty check above, so files[0] is valid.
+    if files[0]
+        .location
+        .path()
+        .ends_with(crate::vortex::VORTEX_EXTENSION)
+    {
+        return crate::vortex::read_vortex_files(store, files, physical_schema).await;
     }
 
     let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);

@@ -28,6 +28,9 @@ tokio = { version = "1.47", features = ["rt-multi-thread"] }
 tracing = { version = "0.1", features = ["log"] }
 url = "2"
 uuid = { version = "1.18.0", features = ["v4"] }
+# Vortex alternate file-format support (hackathon POC). Pinned to a release whose arrow major
+# (58.3) matches kernel's active arrow-58 feature so RecordBatch/ArrayRef types unify.
+vortex = { version = "=0.75.0", features = ["tokio"] }
 
 [features]
 default = ["arrow", "rustls"]

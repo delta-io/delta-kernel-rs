@@ -34,6 +34,7 @@ pub mod json;
 pub mod parquet;
 pub mod stats;
 pub mod storage;
+pub mod vortex;
 
 /// Converts a Stream-producing future to a synchronous iterator.
 ///
@@ -243,6 +244,44 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        let physical_data = self.logical_to_physical_data(data, write_context)?;
+        self.raw_parquet
+            .write_parquet_file(physical_data, write_context)
+            .await
+    }
+
+    /// Write `data` as a Vortex file (alternate file-format POC) using the provided
+    /// `write_context`, returning Add action metadata ready for [`Transaction::add_files`].
+    ///
+    /// Behaves like [`Self::write_parquet`] but encodes the data as a `.vortex` file. The format is
+    /// discriminated purely by the filename extension; no protocol change is involved. See the
+    /// [`vortex`] module for the reader contract and POC limitations.
+    ///
+    /// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
+    pub async fn write_vortex(
+        &self,
+        data: &ArrowEngineData,
+        write_context: &WriteContext,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let physical_data = self.logical_to_physical_data(data, write_context)?;
+        let file_metadata = vortex::write_vortex(
+            self.object_store.clone(),
+            &write_context.write_dir(),
+            physical_data,
+            write_context.stats_columns(),
+        )
+        .await?;
+        build_add_file_metadata(file_metadata, write_context)
+    }
+
+    /// Applies the `write_context`'s logical-to-physical transform to `data`, producing the
+    /// physical [`EngineData`] to encode. Shared by [`Self::write_parquet`] and
+    /// [`Self::write_vortex`].
+    fn logical_to_physical_data(
+        &self,
+        data: &ArrowEngineData,
+        write_context: &WriteContext,
+    ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.physical_schema();
@@ -251,10 +290,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             transform.clone(),
             output_schema.clone().into(),
         )?;
-        let physical_data = logical_to_physical_expr.evaluate(data)?;
-        self.raw_parquet
-            .write_parquet_file(physical_data, write_context)
-            .await
+        logical_to_physical_expr.evaluate(data)
     }
 }
 
