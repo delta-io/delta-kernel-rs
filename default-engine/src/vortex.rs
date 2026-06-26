@@ -19,8 +19,8 @@
 //! ([`get_requested_indices`] + [`fixup_parquet_read`]). That gives us, for free: exact columns in
 //! schema order, all-NULL backfill for missing nullable columns (error on missing non-nullable),
 //! and `Cast` transforms that normalize logical types (notably timestamp unit -> microseconds).
-//! Row order is preserved and batches are never merged across file boundaries (one
-//! [`ArrowEngineData`] per file).
+//! Row order is preserved; each file is streamed one [`ArrowEngineData`] per Vortex scan split,
+//! and batches are never merged across file boundaries.
 //!
 //! ## POC limitations
 //!
@@ -45,7 +45,6 @@ use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 use vortex::array::arrow::{ArrowSessionExt as _, FromArrowArray as _};
-use vortex::array::stream::ArrayStreamExt as _;
 use vortex::array::{ArrayRef as VortexArrayRef, VortexSessionExecute as _};
 use vortex::file::{OpenOptionsSessionExt as _, WriteOptionsSessionExt as _};
 use vortex::session::VortexSession;
@@ -96,10 +95,7 @@ pub(crate) async fn read_vortex_files(
     let file_futures = files.into_iter().map(move |file| {
         let store = store.clone();
         let physical_schema = physical_schema.clone();
-        async move {
-            let batch = decode_vortex_file(store, physical_schema, file).await?;
-            Ok::<_, Error>(stream::once(async { Ok(batch) }))
-        }
+        async move { decode_vortex_file(store, physical_schema, file).await }
     });
     let result_stream = stream::iter(file_futures)
         .buffered(super::DEFAULT_BUFFER_SIZE)
@@ -109,40 +105,47 @@ pub(crate) async fn read_vortex_files(
     Ok(Box::pin(result_stream))
 }
 
-/// Decodes a single `.vortex` file to one Arrow batch and reconciles it to `physical_schema`.
+/// Decodes a single `.vortex` file into a stream of Arrow batches (one per Vortex scan split), each
+/// reconciled to `physical_schema`.
+///
+/// Streaming chunk-by-chunk bounds peak memory and mirrors the Parquet reader's per-batch shape.
+/// Chunks keep their in-file order and are never merged across files.
 async fn decode_vortex_file(
     store: Arc<DynObjectStore>,
     physical_schema: SchemaRef,
     file: FileMeta,
-) -> DeltaResult<ArrowEngineData> {
+) -> DeltaResult<BoxStream<'static, DeltaResult<ArrowEngineData>>> {
     let file_location = file.location.to_string();
     let path = Path::from_url_path(file.location.path())?;
     let bytes = store.get(&path).await?.bytes().await?;
 
     let session = VortexSession::default();
-    // `open_buffer` is synchronous (no I/O runtime); the scan stream decode is async. `read_all`
-    // yields a single array (a ChunkedArray if the file has multiple chunks), and `execute_arrow`
-    // canonicalizes it to one contiguous Arrow array -- in-file row order preserved.
-    let array = session
+    // `open_buffer` is synchronous (no I/O runtime); the scan decode is async. `into_array_stream`
+    // yields one array per scan split (vs `read_all`, which collapses them into a single array), so
+    // we decode and reconcile chunk-by-chunk to bound peak memory. The stream is `'static`, so the
+    // opened file need not be held alive separately.
+    let array_stream = session
         .open_options()
         .open_buffer(bytes.to_vec())
         .map_err(vortex_err)?
         .scan()
         .map_err(vortex_err)?
         .into_array_stream()
-        .map_err(vortex_err)?
-        .read_all()
-        .await
         .map_err(vortex_err)?;
 
     let mut ctx = session.create_execution_ctx();
-    let arrow_array = session
-        .arrow()
-        .execute_arrow(array, None, &mut ctx)
-        .map_err(vortex_err)?;
-    let batch = RecordBatch::from(arrow_array.as_struct());
+    let batches = array_stream.map(move |array| {
+        // `execute_arrow` canonicalizes each chunk to one contiguous Arrow array (in-file row order
+        // preserved); reconciliation then aligns it to `physical_schema`.
+        let arrow_array = session
+            .arrow()
+            .execute_arrow(array.map_err(vortex_err)?, None, &mut ctx)
+            .map_err(vortex_err)?;
+        let batch = RecordBatch::from(arrow_array.as_struct());
+        reconcile_to_schema(batch, &physical_schema, &file_location)
+    });
 
-    reconcile_to_schema(batch, &physical_schema, &file_location)
+    Ok(Box::pin(batches))
 }
 
 /// Reconciles a decoded Arrow batch (the file's physical columns, in file order) to the requested
@@ -246,6 +249,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel_default_engine_test_utils::try_into_record_batch as into_record_batch;
+    use vortex::file::WriteStrategyBuilder;
 
     use super::*;
 
@@ -436,5 +440,89 @@ mod tests {
             .err()
             .expect("nested schema should be rejected");
         assert!(format!("{err}").contains("flat primitive schemas"));
+    }
+
+    /// Writes `batch` to a `.vortex` file under `dir` with an explicit `row_block_size` (forcing
+    /// multiple layout chunks for small inputs) and returns its [`FileMeta`].
+    async fn write_chunked_vortex_file(
+        store: &Arc<DynObjectStore>,
+        dir: &str,
+        batch: &RecordBatch,
+        row_block_size: usize,
+    ) -> FileMeta {
+        let session = VortexSession::default();
+        let vortex_array = VortexArrayRef::from_arrow(batch, false).unwrap();
+        let strategy = WriteStrategyBuilder::default()
+            .with_row_block_size(row_block_size)
+            .build();
+        let mut buffer: Vec<u8> = Vec::new();
+        session
+            .write_options()
+            .with_strategy(strategy)
+            .write(&mut buffer, vortex_array.to_array_stream())
+            .await
+            .unwrap();
+        let url = url::Url::parse(dir)
+            .unwrap()
+            .join("chunked.vortex")
+            .unwrap();
+        let size = buffer.len() as u64;
+        store
+            .put(&Path::from_url_path(url.path()).unwrap(), buffer.into())
+            .await
+            .unwrap();
+        FileMeta::new(url, 0, size)
+    }
+
+    // A multi-chunk file decodes to more than one batch (one per scan split) and is never collapsed
+    // into a single array; concatenating the batches reproduces the input rows in order.
+    #[tokio::test]
+    async fn test_vortex_read_streams_multiple_chunks_in_order() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        // High-entropy values (a multiplicative hash of the index) so the column does not compress
+        // away to a single tiny block; with enough volume Vortex's layout splits into multiple
+        // chunks that the reader must stream separately.
+        let values: Vec<i32> = (0..600_000u64)
+            .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as i32)
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(values.clone()))],
+        )
+        .unwrap();
+
+        let file_meta = write_chunked_vortex_file(&store, "memory:///data/", &batch, 65_536).await;
+
+        let physical_schema: SchemaRef = Arc::new(schema.as_ref().try_into_kernel().unwrap());
+        let read: Vec<RecordBatch> = read_vortex_files(store, vec![file_meta], physical_schema)
+            .await
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert!(
+            read.len() > 1,
+            "expected multiple chunks from a chunked file, got {}",
+            read.len()
+        );
+        let ids: Vec<i32> = read
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, values);
     }
 }
