@@ -120,8 +120,7 @@ async fn setup_number_table(
 }
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column and
-/// additional features enabled. See [`create_row_tracking_table_with_features`] for how the
-/// feature lists map onto reader/writer feature sets.
+/// additional features enabled.
 async fn setup_number_table_with_features(
     tmp_dir: &TempDir,
     name: &str,
