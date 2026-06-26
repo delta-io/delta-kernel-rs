@@ -455,6 +455,7 @@ impl TableConfiguration {
     ///
     /// Use this over [`logical_schema`](Self::logical_schema) when callers need to derive
     /// `&self`-bound borrows from the schema (e.g. `&DataType` of a field).
+    #[cfg(feature = "column-defaults-in-dev")]
     pub(crate) fn logical_schema_ref(&self) -> &SchemaRef {
         &self.logical_schema
     }
