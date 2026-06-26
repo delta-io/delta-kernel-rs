@@ -12,7 +12,7 @@ use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{ensure_table_can_be_read, Operation};
+use crate::table_features::{ensure_table_can_be_read, Operation, ReadOp};
 use crate::{DeltaResult, Engine, Error, FileDataReadResultIterator, Version};
 
 /// A Delta log action kind.
@@ -210,7 +210,9 @@ impl CommitAction {
     /// (present iff both protocol and metadata are known at this commit).
     fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> DeltaResult<()> {
         match (table_config, &self.protocol) {
-            (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
+            (Some(table_config), _) => {
+                table_config.ensure_operation_supported(Operation::Read(ReadOp::Scan))
+            }
             (None, Some(protocol)) => ensure_table_can_be_read(protocol),
             (None, None) => Ok(()),
         }

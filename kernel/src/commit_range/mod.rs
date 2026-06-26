@@ -62,7 +62,7 @@ use crate::actions::{
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::Operation;
+use crate::table_features::{Operation, ReadOp};
 use crate::{DeltaResult, Engine, Error, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
@@ -121,8 +121,8 @@ impl CommitRange {
     /// translation is applied.
     ///
     /// This is operation-agnostic: requesting [`DeltaAction::Cdc`] returns the raw `cdc` action
-    /// records and does NOT impose change-data-feed support (`Operation::Cdf`). It does not
-    /// materialize a change data feed.
+    /// records and does NOT impose change-data-feed support (`Operation::Read(ReadOp::Cdf)`). It
+    /// does not materialize a change data feed.
     ///
     /// Returns `Err` if `actions` is empty or contains duplicate kinds, or if `start_snapshot`
     /// belongs to a different table, its version does not match the range anchor, or its table
@@ -157,7 +157,7 @@ impl CommitRange {
                     )));
                 }
                 let table_config = snapshot.table_configuration();
-                table_config.ensure_operation_supported(Operation::Scan)?;
+                table_config.ensure_operation_supported(Operation::Read(ReadOp::Scan))?;
                 (
                     Some(table_config.protocol().clone()),
                     Some(table_config.metadata().clone()),

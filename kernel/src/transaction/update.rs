@@ -33,7 +33,7 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{DataWriteOp, Operation, TableFeature};
 use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
@@ -58,10 +58,11 @@ impl Transaction {
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
-        // important! before writing to the table we must check it is supported
+        // Fail fast on writer features that block any data write. The commit-time op-specific
+        // re-check happens in `commit()` once the op shape is known.
         read_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Write)?;
+            .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))?;
 
         // Read clustering columns from snapshot (returns None if clustering not enabled)
         let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;

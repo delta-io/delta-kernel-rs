@@ -44,7 +44,7 @@ use crate::schema::{
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::TableFeature;
+use crate::table_features::{DataWriteOp, Operation, TableFeature};
 use crate::utils::require;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
@@ -367,12 +367,6 @@ impl<S> Transaction<S> {
             num_dv_updates = self.dv_matched_files.len(),
         );
 
-        // Some table features don't yet support removeFiles. Reject here.
-        if !self.remove_files_metadata.is_empty() {
-            self.effective_table_config
-                .validate_feature_support_for_remove()?;
-        }
-
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -393,36 +387,20 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
 
+        // CREATE TABLE handles its own gating via
+        // `TableConfiguration::ensure_create_supported` in `CreateTableTransactionBuilder::build`.
+        // This also blocks add+remove-in-one-transaction when CDF is enabled: such a commit
+        // classifies as `DataWriteOp::Dml`, which the ChangeDataFeed feature forbids while enabled.
+        if !self.is_create_table() {
+            self.effective_table_config
+                .ensure_operation_supported(Operation::DataWrite(self.classify_data_write_op()))?;
+        }
+
         // Validate that the schema supports data writes when files are being added.
         // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
         // Reads and metadata-only commits are always allowed.
         if !self.add_files_metadata.is_empty() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
-        }
-
-        // CDF check only applies to existing tables (not create table)
-        // If there are add and remove files with data change in the same transaction, we block it.
-        // This is because kernel does not yet have a way to discern DML operations. For DML
-        // operations that perform updates on rows, ChangeDataFeed requires that a `cdc` file be
-        // written to the delta log.
-        if !self.is_create_table()
-            && !self.add_files_metadata.is_empty()
-            && !self.remove_files_metadata.is_empty()
-            && self.data_change
-        {
-            let cdf_enabled = self
-                .effective_table_config
-                .table_properties()
-                .enable_change_data_feed
-                .unwrap_or(false);
-            require!(
-                !cdf_enabled,
-                Error::generic(
-                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
-                     This would require writing CDC files for DML operations, which is not yet supported. \
-                     Consider using separate transactions: one to add files, another to remove files."
-                )
-            );
         }
 
         // Validate clustering column stats if ClusteredTable feature is enabled
@@ -817,6 +795,36 @@ impl<S> Transaction<S> {
             "CREATE TABLE operation should not have a read snapshot"
         );
         self.read_snapshot_opt.is_none()
+    }
+
+    /// Classifies this transaction as one of [`DataWriteOp::Append`], [`DataWriteOp::Dml`], or
+    /// [`DataWriteOp::Maintenance`] based on the staged file actions and the `data_change` flag.
+    ///
+    /// Three reachable buckets:
+    /// - `Append`: pure add-only commits, or commits with no file actions at all (e.g.
+    ///   `SetTransaction`-only or `DomainMetadata`-only). These have no remove-shaped or
+    ///   data-changing effect, so feature gates that care about remove preservation or row-data
+    ///   stability are not relevant.
+    /// - `Dml`: any commit that stages explicit remove file actions with `data_change=true`. Covers
+    ///   DELETE, UPDATE, MERGE.
+    /// - `Maintenance`: any commit that stages explicit remove file actions with
+    ///   `data_change=false`. Covers OPTIMIZE / ZORDER compaction, stats updates that rewrite add
+    ///   files, row-id / row-commit-version backfill, and any other data-preserving file rewrite.
+    ///
+    /// **DV-only updates are intentionally classified as `Append`** even though they produce
+    /// remove+add action pairs at commit time. The DV-update path (`update_deletion_vectors`)
+    /// preserves `baseRowId` and `defaultRowCommitVersion` on the new add by construction,
+    /// so it is safe under row tracking. CDF correctness for DV updates is a separate gap
+    /// kernel does not currently address (#TODO); the matrix does not block this path.
+    fn classify_data_write_op(&self) -> DataWriteOp {
+        let has_adds = !self.add_files_metadata.is_empty();
+        let has_removes = !self.remove_files_metadata.is_empty();
+        match (has_adds || has_removes, has_removes, self.data_change) {
+            (false, _, _) => DataWriteOp::Append, // no file actions (or DV-only)
+            (true, false, _) => DataWriteOp::Append, // add-only, data_change irrelevant
+            (true, true, true) => DataWriteOp::Dml, // UPDATE / DELETE / MERGE
+            (true, true, false) => DataWriteOp::Maintenance, // OPTIMIZE-shape
+        }
     }
 
     /// True iff this transaction stages any data-file action (add, remove, or DV update).
@@ -2581,6 +2589,53 @@ mod tests {
         txn.dv_matched_files.push(dv_data);
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    /// `classify_data_write_op` truth table. The classifier is the source of truth for
+    /// which gating cell fires on `Transaction::commit`, so the eight reachable input
+    /// shapes deserve direct coverage independent of any feature-level gate.
+    #[rstest]
+    // No file actions: metadata-only commit, classifies as Append.
+    #[case::no_actions_dc(false, false, false, true, DataWriteOp::Append)]
+    #[case::no_actions_no_dc(false, false, false, false, DataWriteOp::Append)]
+    // Adds only: classifies as Append (data_change irrelevant for gating).
+    #[case::adds_only_dc(true, false, false, true, DataWriteOp::Append)]
+    #[case::adds_only_no_dc(true, false, false, false, DataWriteOp::Append)]
+    // Removes (or DV updates) staged: Dml when data_change=true, Maintenance otherwise.
+    #[case::removes_dc(false, true, false, true, DataWriteOp::Dml)]
+    #[case::removes_no_dc(false, true, false, false, DataWriteOp::Maintenance)]
+    #[case::adds_and_removes_dc(true, true, false, true, DataWriteOp::Dml)]
+    #[case::adds_and_removes_no_dc(true, true, false, false, DataWriteOp::Maintenance)]
+    // DV updates are intentionally classified as Append; see `classify_data_write_op` doc.
+    #[case::dv_only_dc(false, false, true, true, DataWriteOp::Append)]
+    #[case::dv_only_no_dc(false, false, true, false, DataWriteOp::Append)]
+    #[case::adds_and_dv_dc(true, false, true, true, DataWriteOp::Append)]
+    fn test_classify_data_write_op(
+        #[case] has_adds: bool,
+        #[case] has_removes: bool,
+        #[case] has_dv_updates: bool,
+        #[case] data_change: bool,
+        #[case] expected: DataWriteOp,
+    ) -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn.set_data_change(data_change);
+        if has_adds {
+            add_dummy_file(&mut txn);
+        }
+        if has_removes {
+            let remove_data = FilteredEngineData::with_all_rows_selected(
+                string_array_to_engine_data(StringArray::from(vec!["remove"])),
+            );
+            txn.remove_files(remove_data);
+        }
+        if has_dv_updates {
+            let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
+                StringArray::from(vec!["dv"]),
+            ));
+            txn.dv_matched_files.push(dv_data);
+        }
+        assert_eq!(txn.classify_data_write_op(), expected);
         Ok(())
     }
 

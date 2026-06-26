@@ -531,7 +531,8 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 #[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true)]
 // ReaderWriter features (EnabledIf -- feature signal alone does not enable)
 #[case("deletionVectors", TableFeature::DeletionVectors, true, false)]
-#[case("typeWidening", TableFeature::TypeWidening, true, false)]
+// `typeWidening` cannot be enabled at create time (kernel cannot write to such tables);
+// see `test_create_table_rejects_unsupported_feature_signals` for the rejection assertion.
 // WriterOnly features (EnabledIf -- feature signal alone does not enable)
 #[case("appendOnly", TableFeature::AppendOnly, false, false)]
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
@@ -588,6 +589,106 @@ fn test_create_table_with_feature_signal(
     Ok(())
 }
 
+/// Kernel cannot write to tables with certain features (`typeWidening`, `checkConstraints`,
+/// `generatedColumns`, `identityColumns`, `icebergCompatV1`, `icebergCompatV2`,
+/// `catalogOwned-preview`). Accepting the corresponding `delta.feature.*=supported` signal at
+/// create time would produce an immediately-unwritable table; the signal is rejected up front.
+#[rstest]
+#[case::feature_signal_type_widening(
+    "delta.feature.typeWidening",
+    "supported",
+    "cannot be enabled at table create time"
+)]
+#[case::feature_signal_type_widening_preview(
+    "delta.feature.typeWidening-preview",
+    "supported",
+    "cannot be enabled at table create time"
+)]
+#[case::feature_signal_check_constraints(
+    "delta.feature.checkConstraints",
+    "supported",
+    "cannot be enabled at table create time"
+)]
+#[case::feature_signal_generated_columns(
+    "delta.feature.generatedColumns",
+    "supported",
+    "cannot be enabled at table create time"
+)]
+#[case::feature_signal_identity_columns(
+    "delta.feature.identityColumns",
+    "supported",
+    "cannot be enabled at table create time"
+)]
+#[case::feature_signal_iceberg_compat_v1(
+    "delta.feature.icebergCompatV1",
+    "supported",
+    "cannot be enabled at table create time"
+)]
+#[case::feature_signal_iceberg_compat_v2(
+    "delta.feature.icebergCompatV2",
+    "supported",
+    "cannot be enabled at table create time"
+)]
+#[case::feature_signal_catalog_owned_preview(
+    "delta.feature.catalogOwned-preview",
+    "supported",
+    "deprecated for CREATE TABLE; use 'catalogManaged' instead"
+)]
+#[case::enablement_property_type_widening(
+    "delta.enableTypeWidening",
+    "true",
+    "cannot be enabled at table create time"
+)]
+fn test_create_table_rejects_unsupported_feature_signals(
+    #[case] property: &str,
+    #[case] value: &str,
+    #[case] expected_substring: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let result = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([(property, value)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(result, expected_substring);
+
+    Ok(())
+}
+
+/// Some features can only land in protocol via kernel inference (schema-implied or
+/// `with_data_layout`). An explicit `delta.feature.*=supported` signal must be rejected with
+/// a message pointing to the correct inference mechanism.
+#[rstest]
+#[case::feature_signal_timestamp_ntz("delta.feature.timestampNtz", "enabled by schema column type")]
+#[case::feature_signal_variant_type("delta.feature.variantType", "enabled by schema column type")]
+#[case::feature_signal_variant_type_preview(
+    "delta.feature.variantType-preview",
+    "enabled by schema column type"
+)]
+#[case::feature_signal_variant_shredding(
+    "delta.feature.variantShredding",
+    "enabled by schema column type"
+)]
+#[case::feature_signal_variant_shredding_preview(
+    "delta.feature.variantShredding-preview",
+    "enabled by schema column type"
+)]
+#[case::feature_signal_clustering("delta.feature.clustering", "with_data_layout")]
+fn test_create_table_rejects_kernel_inference_only_feature_signals(
+    #[case] property: &str,
+    #[case] expected_substring: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let result = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([(property, "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(result, expected_substring);
+
+    Ok(())
+}
+
 #[rstest]
 fn test_create_table_with_checkpoint_stats_properties(
     #[values(true, false)] write_stats_as_json: bool,
@@ -620,7 +721,8 @@ fn test_create_table_with_checkpoint_stats_properties(
 #[rstest]
 // ReaderWriter features
 #[case("delta.enableDeletionVectors", TableFeature::DeletionVectors, true)]
-#[case("delta.enableTypeWidening", TableFeature::TypeWidening, true)]
+// `delta.enableTypeWidening=true` is rejected at create time; see
+// `test_create_table_rejects_unsupported_feature_signals`.
 // WriterOnly features
 #[case("delta.enableChangeDataFeed", TableFeature::ChangeDataFeed, false)]
 #[case("delta.appendOnly", TableFeature::AppendOnly, false)]

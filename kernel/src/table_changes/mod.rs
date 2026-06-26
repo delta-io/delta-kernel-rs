@@ -41,7 +41,7 @@ use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{Operation, ReadOp, TableFeature};
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
@@ -155,7 +155,7 @@ impl TableChanges {
             .build(engine)?;
         start_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Cdf)?;
+            .ensure_operation_supported(Operation::Read(ReadOp::Cdf))?;
 
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
@@ -165,7 +165,7 @@ impl TableChanges {
         };
         end_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Cdf)?;
+            .ensure_operation_supported(Operation::Read(ReadOp::Cdf))?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is

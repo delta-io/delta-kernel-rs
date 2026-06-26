@@ -844,8 +844,16 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
     Ok(())
 }
 
+/// IcebergCompatV3's `ddl` cells must block every ALTER sub-op (today: AddColumn and
+/// SetNullable). The `Operation::Ddl(DdlOp::*)` gate fires per-op, so each variant gets a
+/// case to confirm the dispatcher routes the cell correctly for every DdlOp.
+#[rstest::rstest]
+#[case::add_column(AlterCase::AddColumn)]
+#[case::set_nullable(AlterCase::SetNullable)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
+async fn alter_blocked_when_iceberg_compat_v3_enabled(
+    #[case] alter: AlterCase,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -854,18 +862,29 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         &[("delta.enableIcebergCompatV3", "true")],
     )?;
 
-    let msg = snapshot
-        .alter_table()
-        .add_column(StructField::nullable("new_col", DataType::STRING))
+    let builder = snapshot.alter_table();
+    let builder = match alter {
+        AlterCase::AddColumn => {
+            builder.add_column(StructField::nullable("new_col", DataType::STRING))
+        }
+        AlterCase::SetNullable => builder.set_nullable(column_name!("id")),
+    };
+    let msg = builder
         .build(engine.as_ref(), committer())
         .unwrap_err()
         .to_string();
     assert!(
-        msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
-        "unexpected error: {msg}",
+        msg.contains("ALTER TABLE not yet supported on icebergCompatV3-enabled tables"),
+        "{alter:?}: unexpected error: {msg}",
     );
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AlterCase {
+    AddColumn,
+    SetNullable,
 }
 
 // ============================================================================
