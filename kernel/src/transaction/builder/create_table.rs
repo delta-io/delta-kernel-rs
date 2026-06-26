@@ -90,11 +90,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergCompatV3,
 ];
 
-/// Delta properties allowed to be set during CREATE TABLE.
-///
-/// This list will expand as more features are supported.
-/// The allow list will be deprecated once auto feature enablement is implemented
-/// like the Java Kernel.
+/// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
+/// key not present here is rejected.
 const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // ColumnMapping mode property: triggers column mapping transform
     COLUMN_MAPPING_MODE,
@@ -120,19 +117,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
-];
-
-/// Metadata-only maintenance configs allowed during CREATE TABLE.
-///
-/// Unlike [`ALLOWED_DELTA_PROPERTIES`], these enable no table feature: they are stored verbatim in
-/// the table metadata and consumed later by log cleanup / checkpoint scheduling. They live in a
-/// separate list because their lifecycle is independent of feature auto-enablement -- when the
-/// feature allow-list is eventually deprecated (see above), these must remain accepted so
-/// connectors can still pin retention at table-creation time.
-///
-/// Their values ARE validated at CREATE (see [`validate_extract_table_features_and_properties`]),
-/// because nothing downstream re-checks them.
-const ALLOWED_METADATA_PROPERTIES: &[&str] = &[
+    // Log/checkpoint maintenance configs: stored verbatim, consumed by log cleanup / checkpoint
+    // scheduling.
     LOG_RETENTION_DURATION,
     DELETED_FILE_RETENTION_DURATION,
     ENABLE_EXPIRED_LOG_CLEANUP,
@@ -750,41 +736,13 @@ fn validate_extract_table_features_and_properties(
         }
     }
 
-    // Validate remaining delta.* properties against the allow lists
+    // Validate remaining delta.* properties against the allow list
     for key in properties.keys() {
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
-            && !ALLOWED_METADATA_PROPERTIES.contains(&key.as_str())
         {
             return Err(Error::generic(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
-            )));
-        }
-    }
-
-    // Value-validate metadata-only maintenance configs. Feature-enablement properties have their
-    // values checked downstream during feature auto-enablement, but these do not: a malformed value
-    // is silently dropped into `unknown_properties` by `TableProperties` parsing (losing the
-    // operator's setting) and can be rejected by other engines (e.g. delta-spark) on read. Reject
-    // it here so the committed metadata always round-trips.
-    let metadata_props: Vec<(&str, &str)> = properties
-        .iter()
-        .filter(|(k, _)| ALLOWED_METADATA_PROPERTIES.contains(&k.as_str()))
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    if !metadata_props.is_empty() {
-        let parsed = TableProperties::from(metadata_props.iter().copied());
-        if !parsed.unknown_properties.is_empty() {
-            // Sort for a deterministic message: `unknown_properties` is a `HashMap`.
-            let mut invalid: Vec<_> = parsed
-                .unknown_properties
-                .iter()
-                .map(|(key, value)| format!("'{value}' for table property '{key}'"))
-                .collect();
-            invalid.sort_unstable();
-            return Err(Error::generic(format!(
-                "Invalid values during CREATE TABLE: {}",
-                invalid.join("; ")
             )));
         }
     }
@@ -1203,38 +1161,6 @@ mod tests {
         );
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
-    }
-
-    #[test]
-    fn test_metadata_maintenance_property_invalid_value_rejected() {
-        // A malformed maintenance value must be rejected at CREATE, not silently dropped: a
-        // non-positive-int checkpoint interval does not parse, so it would otherwise vanish.
-        let properties =
-            HashMap::from([(CHECKPOINT_INTERVAL.to_string(), "not_a_number".to_string())]);
-        assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
-            "'not_a_number' for table property 'delta.checkpointInterval'",
-        );
-
-        // A duration missing the `interval` keyword also fails to parse and is rejected.
-        let properties =
-            HashMap::from([(LOG_RETENTION_DURATION.to_string(), "30 days".to_string())]);
-        assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
-            "'30 days' for table property 'delta.logRetentionDuration'",
-        );
-
-        // Multiple malformed values are all reported (sorted), not just the first.
-        let properties = HashMap::from([
-            (CHECKPOINT_INTERVAL.to_string(), "not_a_number".to_string()),
-            (LOG_RETENTION_DURATION.to_string(), "30 days".to_string()),
-        ]);
-        assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
-            "Invalid values during CREATE TABLE: '30 days' for table property \
-             'delta.logRetentionDuration'; 'not_a_number' for table property \
-             'delta.checkpointInterval'",
-        );
     }
 
     #[test]
