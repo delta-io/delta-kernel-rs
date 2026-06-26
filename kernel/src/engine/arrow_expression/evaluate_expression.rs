@@ -1926,7 +1926,6 @@ mod tests {
         )
         .unwrap();
 
-        // The binary representation is preserved.
         assert_eq!(result.data_type(), &variant_arrow_type);
     }
 
