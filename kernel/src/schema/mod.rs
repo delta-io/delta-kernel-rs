@@ -763,7 +763,8 @@ impl StructType {
         self.fields.contains_key(name.as_ref())
     }
 
-    /// Converts this [`StructType`] into a [`DataType::Struct`] for use as an expression output type.
+    /// Converts this [`StructType`] into a [`DataType::Struct`] for use as an expression output
+    /// type.
     // TODO: expensive deep clone of the schema
     pub(crate) fn as_output_data_type(&self) -> DataType {
         DataType::Struct(Box::new(self.clone()))

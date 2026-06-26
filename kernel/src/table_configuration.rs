@@ -22,7 +22,9 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
+use crate::schema::{
+    schema_has_invariants, LogicalSchema, LogicalSchemaRef, SchemaRef, StructField, StructType,
+};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
@@ -78,17 +80,21 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
 /// Physical schema variants for a table.
 ///
 /// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
-/// - `without_partition`: lazily computed variant that excludes partition columns.
+/// - `write`: eagerly computed write schema; includes or excludes partition columns depending on
+///   whether partition column materialization is enabled.
+/// - `without_partition`: lazily computed variant that excludes partition columns (used for stats).
 #[derive(Debug, Clone, Eq)]
 struct PhysicalSchemas {
     full: SchemaRef,
+    write: SchemaRef,
     without_partition: OnceLock<SchemaRef>,
 }
 
 impl PhysicalSchemas {
-    fn new(full: SchemaRef) -> Self {
+    fn new(full: SchemaRef, write: SchemaRef) -> Self {
         Self {
             full,
+            write,
             without_partition: OnceLock::new(),
         }
     }
@@ -96,10 +102,9 @@ impl PhysicalSchemas {
 
 impl PartialEq for PhysicalSchemas {
     fn eq(&self, other: &Self) -> bool {
-        // `without_partition` is deterministically derived from `full` and partition columns
-        // (compared via `metadata` in TableConfiguration's PartialEq), so comparing it is
-        // redundant. Two PhysicalSchemas with the same `full` are considered equal even if
-        // one has `without_partition` initialized and the other does not.
+        // `write` and `without_partition` are deterministically derived from `full`, partition
+        // columns, and protocol features (all compared via other fields in TableConfiguration's
+        // PartialEq), so comparing them is redundant.
         self.full == other.full
     }
 }
@@ -119,8 +124,8 @@ impl PartialEq for PhysicalSchemas {
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
-    /// Logical schema: field names are the user-facing (logical) column names.
-    logical_schema: SchemaRef,
+    /// Logical schema bundled with column mapping mode, partition columns, and row tracking info.
+    logical_schema_ref: LogicalSchemaRef,
     physical_schemas: PhysicalSchemas,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
@@ -185,11 +190,39 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
-        let physical_schemas = PhysicalSchemas::new(physical_schema);
+        let partition_columns = metadata.partition_columns().to_vec();
+        let materialized_row_id_col = table_properties
+            .enable_row_tracking
+            .filter(|&b| b)
+            .and_then(|_| table_properties.materialized_row_id_column_name.clone());
+        let logical_schema_ref = Arc::new(LogicalSchema::new_from_parts(
+            logical_schema,
+            column_mapping_mode,
+            partition_columns,
+            materialized_row_id_col,
+        ));
+
+        let physical_schema = Arc::new(
+            logical_schema_ref
+                .raw_schema()
+                .make_physical(column_mapping_mode)?,
+        );
+
+        // Inline should_materialize_partition_columns: both MaterializePartitionColumns and
+        // IcebergCompatV3 are WriterOnly features with no legacy version, so they require
+        // writer_version >= 7 (table features protocol). MaterializePartitionColumns is
+        // AlwaysIfSupported; IcebergCompatV3 is gated on the enable_iceberg_compat_v3 property.
+        let should_materialize = protocol.writer_features().is_some_and(|wf| {
+            wf.contains(&TableFeature::MaterializePartitionColumns)
+                || (wf.contains(&TableFeature::IcebergCompatV3)
+                    && table_properties.enable_iceberg_compat_v3 == Some(true))
+        });
+        let write_schema = logical_schema_ref.compute_write_physical_schema(should_materialize)?;
+
+        let physical_schemas = PhysicalSchemas::new(physical_schema, write_schema);
 
         let table_config = Self {
-            logical_schema,
+            logical_schema_ref,
             physical_schemas,
             metadata,
             protocol,
@@ -464,7 +497,16 @@ impl TableConfiguration {
     /// The logical schema ([`SchemaRef`]) of this table at this version.
     #[internal_api]
     pub(crate) fn logical_schema(&self) -> SchemaRef {
-        self.logical_schema.clone()
+        self.logical_schema_ref.raw_schema().clone()
+    }
+
+    /// The [`LogicalSchemaRef`] of this table at this version.
+    ///
+    /// Prefer this over [`logical_schema`](Self::logical_schema) when the caller needs the full
+    /// bundled type (column mapping mode, partition columns, etc.) rather than just the raw schema.
+    #[internal_api]
+    pub(crate) fn logical_schema_ref(&self) -> &LogicalSchemaRef {
+        &self.logical_schema_ref
     }
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.
@@ -494,15 +536,11 @@ impl TableConfiguration {
     ///
     /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
-    /// schema with partition columns excluded.
+    /// schema with partition columns excluded. The result is eagerly cached at construction time.
     ///
     /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.should_materialize_partition_columns() {
-            self.physical_schema()
-        } else {
-            self.physical_data_schema_without_partition_columns()
-        }
+        self.physical_schemas.write.clone()
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -723,7 +761,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && schema_has_invariants(self.logical_schema.as_ref())
+            && schema_has_invariants(self.logical_schema_ref.raw_schema().as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",

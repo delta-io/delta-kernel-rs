@@ -8,11 +8,9 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::TransformSpec;
-use crate::scan::PhysicalPredicate;
-use crate::scan::StatsOutputMode;
-use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef};
+use crate::scan::{PhysicalPredicate, StatsOutputMode};
+use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
-
 use crate::{DeltaResult, PredicateRef};
 
 /// All the state needed to process a scan.
@@ -29,6 +27,10 @@ pub(crate) struct StateInfo {
     /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
     pub(crate) physical_stats_schema: Option<SchemaRef>,
+    /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`.
+    /// Fields use physical column names (for column mapping). Only present when the table has
+    /// partition columns AND a predicate references those columns.
+    pub(crate) physical_partition_schema: Option<SchemaRef>,
     /// Logical stats schema for the file statistics. When `stats_columns` is requested,
     /// the engine receives stats with physical column names (for column mapping). This
     /// logical schema maps those stats back to the table's logical column names.
@@ -66,6 +68,26 @@ impl StateInfo {
         let physical_predicate = match predicate {
             Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema)?,
             None => PhysicalPredicate::None,
+        };
+
+        // Compute physical partition schema filtered to predicate-referenced partition columns.
+        // Forces all fields nullable (map lookup can return null).
+        let physical_partition_schema = match &physical_predicate {
+            PhysicalPredicate::Some(_, ref_schema) => {
+                if let Some(tps) = logical_schema.physical_partition_schema() {
+                    ref_schema
+                        .with_fields_filtered_nonempty(|f| tps.field(f.name()).is_some())?
+                        .map(|ps| {
+                            let nullable_fields = ps
+                                .fields()
+                                .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
+                            Arc::new(StructType::new_unchecked(nullable_fields))
+                        })
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
 
         // Build stats schemas based on StatsOutputMode:
@@ -114,8 +136,19 @@ impl StateInfo {
                 // Columns(empty) or Skip with a physical predicate -- build stats directly
                 // from the physical predicate's referenced schema for internal data skipping
                 // only (no logical schema needed for output).
+                // Predicate-only mode: split referenced columns into data columns (get min/max
+                // stats) and partition columns (get exact values via partition pruning). Exclude
+                // partition columns from data stats to avoid double-handling.
                 (_, PhysicalPredicate::Some(_, ref_schema)) => {
-                    (build_stats_schema(ref_schema), None)
+                    let data_stats = ref_schema
+                        .with_fields_filtered_nonempty(|f| {
+                            physical_partition_schema
+                                .as_ref()
+                                .is_none_or(|ps| ps.field(f.name()).is_none())
+                        })?
+                        .as_ref()
+                        .and_then(build_stats_schema);
+                    (data_stats, None)
                 }
                 // No stats output and no predicate
                 (_, _) => (None, None),
@@ -127,6 +160,7 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
             physical_stats_schema,
+            physical_partition_schema,
             logical_stats_schema,
         })
     }
@@ -853,4 +887,65 @@ pub(crate) mod tests {
     }
 
     use crate::StructField;
+
+    #[test]
+    fn partition_schema_uses_physical_names_with_column_mapping() {
+        // Verify that physical_partition_schema uses physical column names when column
+        // mapping is active and a predicate references a partition column.
+        let field_a: StructField = serde_json::from_value(serde_json::json!({
+            "name": "col_a",
+            "type": "long",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 1,
+                "delta.columnMapping.physicalName": "phys_a"
+            }
+        }))
+        .unwrap();
+
+        let field_b: StructField = serde_json::from_value(serde_json::json!({
+            "name": "col_b",
+            "type": "long",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 2,
+                "delta.columnMapping.physicalName": "phys_b"
+            }
+        }))
+        .unwrap();
+
+        let schema = Arc::new(StructType::new_unchecked(vec![field_a, field_b]));
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
+        // Predicate references col_b (logical), which maps to phys_b (physical).
+        // col_b is declared as a partition column.
+        let predicate = Arc::new(column_expr!("col_b").gt(Expr::literal(5i64)));
+
+        let state_info = get_state_info(
+            schema,
+            vec!["col_b".to_string()],
+            Some(predicate),
+            &[],
+            props,
+            vec![],
+        )
+        .unwrap();
+
+        let partition_schema = state_info
+            .physical_partition_schema
+            .as_ref()
+            .expect("should have physical_partition_schema with predicate + partition columns");
+        assert_eq!(partition_schema.num_fields(), 1);
+        let field = partition_schema.fields().next().unwrap();
+        assert_eq!(
+            field.name(),
+            "phys_b",
+            "partition schema should use physical name"
+        );
+        assert!(
+            field.is_nullable(),
+            "partition schema fields should be nullable"
+        );
+    }
 }

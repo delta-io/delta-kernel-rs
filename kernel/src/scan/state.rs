@@ -102,7 +102,7 @@ pub fn transform_to_logical(
             .new_expression_evaluator(
                 physical_schema.clone(),
                 transform,
-                logical_schema.as_output_data_type(), // TODO: expensive deep clone per file
+                logical_schema.as_output_data_type(),
             )?
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),

@@ -740,10 +740,7 @@ impl Scan {
                     .physical_stats_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
-                self.state_info
-                    .logical_schema
-                    .physical_partition_schema()
-                    .as_deref(),
+                self.state_info.physical_partition_schema.as_deref(),
             )
     }
 

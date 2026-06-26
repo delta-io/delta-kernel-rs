@@ -23,9 +23,9 @@ use crate::log_replay::{
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
-use crate::schema::ToSchema as _;
 use crate::schema::{
     ColumnNamesAndTypes, DataType, LogicalSchemaRef, MapType, SchemaRef, StructField, StructType,
+    ToSchema as _,
 };
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -41,6 +41,9 @@ struct InternalScanState {
     transform_spec: Option<Arc<TransformSpec>>,
     /// Physical stats schema for reading/parsing stats from checkpoint files
     physical_stats_schema: Option<SchemaRef>,
+    /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
+    #[serde(default)]
+    physical_partition_schema: Option<SchemaRef>,
     #[serde(default)]
     skip_stats: bool,
     /// Logical stats schema for mapping physical stats column names back to logical names
@@ -48,7 +51,7 @@ struct InternalScanState {
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
-/// defualt serde serialization, or through custom serialization in the engine.
+/// default serde serialization, or through custom serialization in the engine.
 ///
 /// This struct contains all the information needed to reconstruct a `ScanLogReplayProcessor`
 /// on remote compute nodes, enabling distributed log replay processing.
@@ -121,9 +124,6 @@ pub struct ScanLogReplayProcessor {
     seen_file_keys: HashSet<FileActionKey>,
     /// Skip reading file statistics.
     skip_stats: bool,
-    /// Whether checkpoint batches have compatible `partitionValues_parsed` columns.
-    #[allow(unused)]
-    has_partition_values_parsed: bool,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
@@ -202,7 +202,7 @@ impl ScanLogReplayProcessor {
         let partition_schema = if skip_stats {
             None
         } else {
-            state_info.logical_schema.physical_partition_schema()
+            state_info.physical_partition_schema.clone()
         };
 
         let output_schema = scan_row_schema_with_stats_parsed(
@@ -259,7 +259,6 @@ impl ScanLogReplayProcessor {
                 output_schema.into(),
             )?,
             seen_file_keys,
-            has_partition_values_parsed,
             state_info,
             skip_stats,
             checkpoint_info,
@@ -298,6 +297,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec,
             physical_stats_schema,
+            physical_partition_schema,
             logical_stats_schema,
         } = self.state_info.as_ref().clone();
 
@@ -314,6 +314,7 @@ impl ScanLogReplayProcessor {
             transform_spec,
             predicate_schema,
             physical_stats_schema,
+            physical_partition_schema,
             skip_stats: self.skip_stats,
             logical_stats_schema,
         };
@@ -370,6 +371,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec: internal_state.transform_spec,
             physical_stats_schema: internal_state.physical_stats_schema,
+            physical_partition_schema: internal_state.physical_partition_schema,
             logical_stats_schema: internal_state.logical_stats_schema,
         });
 
@@ -459,8 +461,9 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             self.metrics.incr_remove_files_seen()
         };
 
-        // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
-        // tracking pruned files. Removes don't get pruned and we'll still have to track them.
+        // Apply partition pruning (to adds only) before deduplication, so that we don't waste
+        // memory tracking pruned files. Removes don't get pruned and we'll still have to
+        // track them.
         //
         // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
         // removes), because they are needed to suppress earlier incompatible adds we might
@@ -651,8 +654,8 @@ fn scan_row_schema_with_stats_parsed(
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
-/// - `partition_schema`: Schema of typed partition columns, or None if no partition value output
-///   is needed.
+/// - `partition_schema`: Schema of typed partition columns, or None if no partition value output is
+///   needed.
 /// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed
 ///   column.
 ///
@@ -950,8 +953,9 @@ mod tests {
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
-    use crate::schema::MetadataColumnSpec;
-    use crate::schema::{DataType, LogicalSchema, SchemaRef, StructField, StructType};
+    use crate::schema::{
+        DataType, LogicalSchema, MetadataColumnSpec, SchemaRef, StructField, StructType,
+    };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{DeltaResult, Expression as Expr, ExpressionRef};
@@ -1052,6 +1056,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             physical_stats_schema: None,
+            physical_partition_schema: None,
             logical_stats_schema: None,
         });
         let (iter, _metrics) = scan_action_iter(
@@ -1251,6 +1256,17 @@ mod tests {
             deserialized.state_info.logical_schema.column_mapping_mode(),
             state_info.logical_schema.column_mapping_mode()
         );
+        assert_eq!(
+            deserialized.state_info.logical_schema.partition_columns(),
+            state_info.logical_schema.partition_columns()
+        );
+        assert_eq!(
+            deserialized
+                .state_info
+                .logical_schema
+                .materialized_row_id_col(),
+            state_info.logical_schema.materialized_row_id_col()
+        );
 
         // Verify all file keys are preserved with their DV info
         assert_eq!(deserialized.seen_file_keys.len(), 3);
@@ -1379,6 +1395,7 @@ mod tests {
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
                 physical_stats_schema: None,
+                physical_partition_schema: None,
                 logical_stats_schema: None,
             });
             let checkpoint_info = test_checkpoint_info();
@@ -1413,6 +1430,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             physical_stats_schema: None,
+            physical_partition_schema: None,
             logical_stats_schema: None,
         });
         let processor =
@@ -1456,6 +1474,7 @@ mod tests {
             predicate_schema: None, // Missing!
             transform_spec: None,
             physical_stats_schema: None,
+            physical_partition_schema: None,
             skip_stats: false,
             logical_stats_schema: None,
         };
@@ -1487,6 +1506,7 @@ mod tests {
             predicate_schema: None,
             transform_spec: None,
             physical_stats_schema: None,
+            physical_partition_schema: None,
             skip_stats: false,
             logical_stats_schema: None,
         };

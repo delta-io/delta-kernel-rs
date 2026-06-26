@@ -185,6 +185,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             physical_stats_schema: None,
+            physical_partition_schema: None,
             logical_stats_schema: None,
         }
     }
@@ -405,6 +406,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             physical_stats_schema: None,
+            physical_partition_schema: None,
             logical_stats_schema: None,
         };
 
