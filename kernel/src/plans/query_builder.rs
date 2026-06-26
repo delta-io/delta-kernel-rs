@@ -5,7 +5,7 @@
 //! constructed directly via [`Plan`] / [`PlanNode`].
 
 use super::ir::nodes::{Operator, ScanFile, ScanJson, ScanParquet};
-use super::ir::plan::{Plan, PlanNode, RefId};
+use super::ir::plan::{Plan, PlanNode};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileMeta};
 
@@ -42,7 +42,7 @@ impl QueryPlanBuilder {
         }
     }
 
-    /// Consume the builder and produce a [`Plan`] with a single node whose output is `RefId(0)`.
+    /// Consume the builder and produce a [`Plan`] with a single node (at index 0).
     ///
     /// # Errors
     ///
@@ -53,7 +53,6 @@ impl QueryPlanBuilder {
             nodes: vec![PlanNode {
                 op: self.op,
                 inputs: vec![],
-                output: RefId(0),
             }],
         })
     }
@@ -104,9 +103,7 @@ mod tests {
         .build()
         .unwrap();
 
-        let result = plan.result();
         let [node] = <[_; 1]>::try_from(plan.nodes).expect("single-node plan");
-        assert_eq!(Some(node.output), result);
         let (Operator::ScanJson(ScanJson {
             files: scan_files,
             schema: node_schema,

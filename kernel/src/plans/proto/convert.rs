@@ -15,7 +15,7 @@ use crate::plans::ir::nodes::{
     Agg, AggFn, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Max, MaxNonNullBy, Min,
     MinNonNullBy, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
 };
-use crate::plans::ir::plan::{Plan, PlanNode, RefId};
+use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
@@ -125,15 +125,8 @@ impl From<&PlanNode> for proto_plan::PlanNode {
     fn from(node: &PlanNode) -> Self {
         proto_plan::PlanNode {
             op: Some((&node.op).into()),
-            inputs: convert_vec(&node.inputs),
-            output: Some((&node.output).into()),
+            inputs: node.inputs.iter().map(|&i| i as u32).collect(),
         }
-    }
-}
-
-impl From<&RefId> for proto_plan::RefId {
-    fn from(ref_id: &RefId) -> Self {
-        proto_plan::RefId { id: ref_id.0 }
     }
 }
 
@@ -738,7 +731,7 @@ mod tests {
         Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
         ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
     };
-    use crate::plans::ir::plan::{Plan, PlanNode, RefId};
+    use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
         schema as proto_schema,
@@ -979,7 +972,6 @@ mod tests {
                         schema: schema.clone(),
                     }),
                     inputs: vec![],
-                    output: RefId(0),
                 },
                 PlanNode {
                     op: Operator::Filter(Filter {
@@ -988,8 +980,7 @@ mod tests {
                             lit(5i32),
                         )),
                     }),
-                    inputs: vec![RefId(0)],
-                    output: RefId(1),
+                    inputs: vec![0],
                 },
             ],
         };
@@ -1000,9 +991,8 @@ mod tests {
         };
         assert_eq!(plan.nodes.len(), 2);
 
-        // Source node: ScanParquet, output RefId(0), no inputs.
+        // Source node: ScanParquet at index 0, no inputs.
         let source = &plan.nodes[0];
-        assert_eq!(source.output.as_ref().unwrap().id, 0);
         assert!(source.inputs.is_empty());
         let Some(proto_plan::operator::Op::ScanParquet(scan)) = &source.op.as_ref().unwrap().op
         else {
@@ -1011,11 +1001,10 @@ mod tests {
         assert_eq!(scan.files.len(), 1);
         assert_eq!(scan.schema.as_ref().unwrap().fields.len(), 2);
 
-        // Filter node: consumes RefId(0), emits RefId(1), carries a `id > 5` binary predicate.
+        // Filter node at index 1: consumes node 0, carries a `id > 5` binary predicate.
         let filter_node = &plan.nodes[1];
-        assert_eq!(filter_node.output.as_ref().unwrap().id, 1);
         assert_eq!(filter_node.inputs.len(), 1);
-        assert_eq!(filter_node.inputs[0].id, 0);
+        assert_eq!(filter_node.inputs[0], 0);
         let Some(proto_plan::operator::Op::Filter(filter)) = &filter_node.op.as_ref().unwrap().op
         else {
             panic!("expected Filter");
@@ -1029,11 +1018,6 @@ mod tests {
             binary.left.as_ref().unwrap().kind,
             Some(proto_expr::expression::Kind::Column(_))
         ));
-    }
-
-    #[test]
-    fn from_ref_id() {
-        assert_eq!(proto_plan::RefId::from(&RefId(7)).id, 7);
     }
 
     #[rstest]

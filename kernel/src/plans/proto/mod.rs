@@ -9,7 +9,7 @@
 //! - [`expressions`] -- mirror of `kernel/src/expressions/mod.rs` and `scalars.rs` (`Expression`,
 //!   `Predicate`, `Scalar`, `ColumnName`, ...).
 //! - [`plan`] -- mirror of `kernel/src/plans/ir/{plan,nodes}.rs` (`Plan`, `PlanNode`, `Operator`,
-//!   `RefId`, per-variant payload messages).
+//!   per-variant payload messages).
 //! - [`operation`] -- mirror of `kernel/src/plans/ir/operation.rs` (`Operation`, `IoOperation`, and
 //!   the I/O payload messages).
 
