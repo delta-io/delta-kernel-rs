@@ -436,14 +436,6 @@ pub fn get_scan_files(
         .collect())
 }
 
-/// Get an unpartitioned write context, used to allocate deletion vector paths.
-pub fn get_write_context(
-    table_url: &Url,
-    engine: &dyn Engine,
-) -> Result<WriteContext, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?.unpartitioned_write_context()?)
-}
-
 /// Serialize a deletion vector, write it to the object store, and return its descriptor.
 pub async fn write_deletion_vector_to_store(
     store: &Arc<dyn ObjectStore>,
