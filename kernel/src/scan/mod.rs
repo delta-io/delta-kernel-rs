@@ -38,7 +38,7 @@ use crate::schema::{
     ToSchema as _,
 };
 use crate::table_features::Operation;
-use crate::transforms::ExpressionTransform;
+use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::IteratorExt;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
@@ -326,8 +326,10 @@ struct PrefixColumns {
 }
 
 impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
+        Cow::Owned(self.prefix.join(name))
     }
 }
 
@@ -335,6 +337,8 @@ struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
 impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // NOTE: We already verified all column references. But if the map probe ever did fail, the
     // transform would just delete any expression(s) that reference the invalid column.
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
@@ -775,7 +779,7 @@ impl Scan {
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),
         };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
+        let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
     }
 

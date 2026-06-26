@@ -264,6 +264,12 @@ impl FileMeta {
             size,
         }
     }
+
+    /// Casts `size` to `i64`. Errors if `size` exceeds `i64::MAX`.
+    pub(crate) fn size_as_i64(&self) -> DeltaResult<i64> {
+        i64::try_from(self.size)
+            .map_err(|_| Error::generic(format!("file size {} exceeds i64::MAX", self.size)))
+    }
 }
 
 /// Extension trait that makes it easier to work with traits objects that implement [`Any`],
@@ -943,3 +949,30 @@ compile_error!(
 // also be added. https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
 #[cfg(doctest)]
 mod doctests;
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::zero(0, Some(0))]
+    #[case::one(1, Some(1))]
+    #[case::i64_max(i64::MAX as u64, Some(i64::MAX))]
+    #[case::just_over_i64_max(i64::MAX as u64 + 1, None)]
+    #[case::u64_max(u64::MAX, None)]
+    /// Tests `FileMeta::size_as_i64` for both success (size fits in i64) and error (size exceeds
+    /// i64::MAX) paths.
+    fn test_file_meta_size_as_i64(#[case] size: u64, #[case] expected: Option<i64>) {
+        let meta = FileMeta::new(Url::parse("file:///x").unwrap(), 0, size);
+        match expected {
+            Some(v) => assert_eq!(meta.size_as_i64().unwrap(), v),
+            None => assert!(meta
+                .size_as_i64()
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds i64::MAX")),
+        }
+    }
+}

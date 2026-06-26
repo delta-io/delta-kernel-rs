@@ -17,7 +17,7 @@ use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use crate::{DeltaResult, Error};
+use crate::{transform_output_type, DeltaResult, Error};
 
 // Private helper for predicate-driven schema traversal.
 // Walks the logical schema to find referenced leaf columns, tracking
@@ -30,6 +30,8 @@ struct GetReferencedFields<'a> {
     column_mapping_mode: ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         // Delta column names are case-insensitive: match all predicate references that
         // case-insensitively match this schema column. We resolve all of them in one visit

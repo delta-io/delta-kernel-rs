@@ -132,7 +132,7 @@ all returned batches -- the engine may split a single file across multiple batch
   `column_expr!` macro
 - `kernel/src/transforms/` -- generic recursive transforms (`ExpressionTransform`,
   `SchemaTransform`)
-- `kernel/src/checkpoint/` -- checkpoint writing (V1 and V2 single-file classic-named)
+- `kernel/src/checkpoint/` -- classic-named checkpoint writing (V1; V2 with or without sidecars)
 - `kernel/src/table_configuration.rs` -- table metadata, properties, feature management
 - `kernel/src/table_features/` -- protocol feature definitions, `TableFeature` enum
 - `kernel/src/table_properties.rs` -- table property parsing (delta.appendOnly, etc.)

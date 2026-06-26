@@ -229,7 +229,7 @@ async fn test_write_stats_for_complex_type_columns(
 
     // Optionally checkpoint to verify stats survive the checkpoint round-trip
     let scan_snapshot = if use_checkpoint {
-        snapshot2.checkpoint(engine.as_ref())?;
+        snapshot2.checkpoint(engine.as_ref(), None)?;
         Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
     } else {
         snapshot2

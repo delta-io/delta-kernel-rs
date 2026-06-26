@@ -20,6 +20,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::CommitResult;
@@ -31,6 +32,42 @@ use uuid::Uuid;
 
 /// Deterministic placeholder for test commit JSON comparisons.
 pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Single-column nullable `id: int` schema.
+pub fn get_simple_schema() -> SchemaRef {
+    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap())
+}
+
+/// Builds a `RecordBatch` matching [`get_simple_schema`] from a vector of `id` values.
+pub fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(values))],
+    )
+    .unwrap()
+}
+
+/// Finds the single checkpoint parquet file in `_delta_log` for the given version.
+///
+/// Recognizes V1 single-part, V2 classic-named, and V2 UUID-named variants. Does NOT support
+/// V1 multi-part checkpoints.
+pub fn load_existing_single_file_checkpoint_path(
+    table_path: &str,
+    version: u64,
+) -> std::path::PathBuf {
+    let log_dir = std::path::Path::new(table_path).join("_delta_log");
+    for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
+        let entry = entry.unwrap();
+        let url = Url::from_file_path(entry.path()).expect("entry path to url");
+        let Some(parsed) = ParsedLogPath::try_from(url).expect("parse log path") else {
+            continue;
+        };
+        if parsed.is_checkpoint() && parsed.version == version {
+            return entry.path();
+        }
+    }
+    panic!("checkpoint parquet file not found for version {version} in {log_dir:?}");
+}
 
 /// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
 /// or `None` if the field has no `field_id` set.

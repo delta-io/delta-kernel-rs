@@ -976,7 +976,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
     // deadlock that occurs with TokioBackgroundExecutor during checkpoint's lazy I/O.
     let mt_engine = create_default_engine_mt_executor(&table_url)?;
     let snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
-    snapshot.checkpoint(mt_engine.as_ref())?;
+    snapshot.checkpoint(mt_engine.as_ref(), None)?;
 
     // Fresh snapshot loaded from the checkpoint must return the same row IDs.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;

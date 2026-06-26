@@ -872,7 +872,9 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::FeatureType;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V1, PARQUET_FORMAT_VERSION};
+    use crate::table_properties::{
+        ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
+    };
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
@@ -987,6 +989,13 @@ mod tests {
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
+        );
+
+        let mut properties = HashMap::new();
+        properties.insert(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string());
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            "Setting delta property 'delta.enableIcebergCompatV3' is not supported",
         );
 
         // Feature signals for features not in ALLOWED_DELTA_FEATURES are rejected

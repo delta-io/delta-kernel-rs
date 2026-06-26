@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, Int32Array, StructArray, TimestampMicrosecondArray,
+    new_null_array, ArrayRef, BinaryArray, Int32Array, StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -16,11 +16,13 @@ use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{Engine, Error as KernelError, Snapshot};
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup, test_read};
+use test_utils::{create_table, engine_store_setup, test_read, test_table_setup};
 use url::Url;
 
 #[tokio::test]
@@ -461,6 +463,90 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
     assert!(matches!(res,
         Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+
+    Ok(())
+}
+
+// =============================================================================
+// NOT NULL data column tests (default engine)
+// =============================================================================
+//
+// These tests validate data-column nullability on the default engine. Kernel preserves
+// `nullable: false` in the connector-facing schema and relies on the engine to reject
+// nulls before writing.
+
+/// Verifies the default-engine NOT NULL contract for non-partition columns
+/// across a representative set of primitive types. The contract:
+///
+/// 1. `nullable: false` propagates from kernel's logical schema through the connector-facing
+///    physical schema and into the Arrow schema engines build batches against.
+/// 2. Constructing the Arrow batch an engine would hand to the kernel write API with a null in the
+///    NOT NULL column fails at batch construction, before the engine is invoked.
+///
+/// See [#2465](https://github.com/delta-io/delta-kernel-rs/issues/2465).
+#[rstest]
+#[case::integer(DataType::INTEGER)]
+#[case::long(DataType::LONG)]
+#[case::string(DataType::STRING)]
+#[case::binary(DataType::BINARY)]
+#[case::boolean(DataType::BOOLEAN)]
+#[case::timestamp(DataType::TIMESTAMP)]
+#[case::decimal(DataType::decimal(10, 2).unwrap())]
+#[tokio::test]
+async fn test_not_null_data_column_rejects_null_in_batch(
+    #[case] data_type: DataType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Create a table with a NOT NULL column.
+    let schema = Arc::new(StructType::try_new(vec![StructField::not_null(
+        "c",
+        data_type.clone(),
+    )])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    // The non-null schema auto-enables the `invariants` writer feature.
+    assert!(
+        snapshot
+            .table_configuration()
+            .protocol()
+            .writer_features()
+            .is_some_and(|f| f.contains(&delta_kernel::table_features::TableFeature::Invariants)),
+        "non-null schema must auto-enable the `invariants` writer feature",
+    );
+
+    let write_context = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine")
+        .unpartitioned_write_context()?;
+
+    // Use the connector-facing physical schema (not the logical one); the logical schema
+    // would hide bugs in the logical->physical mapping that engines hit in production.
+    let physical = write_context.physical_schema();
+    let physical_field = physical
+        .field("c")
+        .expect("physical schema must contain column 'c'");
+    assert!(
+        !physical_field.nullable,
+        "physical schema must preserve `nullable: false` for column 'c'",
+    );
+    let arrow_schema: delta_kernel::arrow::datatypes::Schema =
+        physical.as_ref().try_into_arrow()?;
+    assert!(
+        !arrow_schema.field(0).is_nullable(),
+        "Arrow conversion of physical schema must preserve `nullable: false`",
+    );
+
+    let arrow_type = arrow_schema.field(0).data_type().clone();
+    let result = RecordBatch::try_new(Arc::new(arrow_schema), vec![new_null_array(&arrow_type, 1)]);
+    assert!(
+        result.is_err(),
+        "batch construction should reject null in NOT NULL column ({data_type:?}); got: {result:?}",
+    );
 
     Ok(())
 }

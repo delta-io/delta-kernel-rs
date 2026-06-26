@@ -1,6 +1,5 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use crate::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
-use crate::transforms::ExpressionTransform;
+use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
@@ -642,7 +641,7 @@ impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
-        let _ = references.transform_expr(self);
+        references.transform_expr(self);
         references.0
     }
 
@@ -807,7 +806,7 @@ impl Predicate {
     /// Returns a set of columns referenced by this predicate.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
-        let _ = references.transform_pred(self);
+        references.transform_pred(self);
         references.0
     }
 
@@ -1175,9 +1174,10 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 struct GetColumnReferences<'a>(HashSet<&'a ColumnName>);
 
 impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+    transform_output_type!(|'a, T| ());
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) {
         self.0.insert(name);
-        Some(Cow::Borrowed(name))
     }
 }
 
