@@ -19,6 +19,9 @@
 //! ([`get_requested_indices`] + [`fixup_parquet_read`]). That gives us, for free: exact columns in
 //! schema order, all-NULL backfill for missing nullable columns (error on missing non-nullable),
 //! and `Cast` transforms that normalize logical types (notably timestamp unit -> microseconds).
+//! STRING/BINARY columns are decoded to their offset-based `Utf8`/`Binary` Arrow forms (rather than
+//! Vortex's default `Utf8View`) via the `execute_arrow` target field, matching what the requested
+//! schema implies.
 //! Row order is preserved; each file is streamed one [`ArrowEngineData`] per Vortex scan split,
 //! and batches are never merged across file boundaries.
 //!
@@ -36,6 +39,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Fields};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{fixup_parquet_read, get_requested_indices};
 use delta_kernel::expressions::ColumnName;
@@ -47,6 +51,7 @@ use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 use vortex::array::arrow::{ArrowSessionExt as _, FromArrowArray as _};
+use vortex::array::stream::ArrayStream as _;
 use vortex::array::{ArrayRef as VortexArrayRef, VortexSessionExecute as _};
 use vortex::expr::{root, select};
 use vortex::file::{OpenOptionsSessionExt as _, VortexFile, WriteOptionsSessionExt as _};
@@ -145,13 +150,25 @@ async fn decode_vortex_file(
     // is `'static`, so the opened file need not be held alive separately.
     let array_stream = scan.into_array_stream().map_err(vortex_err)?;
 
+    // Decode STRING/BINARY columns to their offset-based `Utf8`/`Binary` Arrow forms (Vortex would
+    // otherwise emit `Utf8View`), matching the encoding `physical_schema` implies. The target is
+    // built from the file's (post-projection) dtype, so non-string leaves keep their decoded type
+    // and any type-widening cast stays in reconciliation.
+    let target = {
+        let field = session
+            .arrow()
+            .to_arrow_field("", array_stream.dtype())
+            .map_err(vortex_err)?;
+        coerce_string_width(&field)
+    };
+
     let mut ctx = session.create_execution_ctx();
     let batches = array_stream.map(move |array| {
         // `execute_arrow` canonicalizes each chunk to one contiguous Arrow array (in-file row order
         // preserved); reconciliation then aligns it to `physical_schema`.
         let arrow_array = session
             .arrow()
-            .execute_arrow(array.map_err(vortex_err)?, None, &mut ctx)
+            .execute_arrow(array.map_err(vortex_err)?, Some(&target), &mut ctx)
             .map_err(vortex_err)?;
         let batch = RecordBatch::from(arrow_array.as_struct());
         reconcile_to_schema(batch, &physical_schema, &file_location)
@@ -173,6 +190,26 @@ fn projection_columns<'a>(file: &VortexFile, physical_schema: &'a SchemaRef) -> 
         .map(|f| f.name().as_str())
         .filter(|name| present.contains(name))
         .collect()
+}
+
+/// Rewrites view/large string and binary leaves of an Arrow field to their offset-based `Utf8` /
+/// `Binary` forms, recursing into structs. Used to build the `execute_arrow` target so decoded
+/// columns match the Arrow encoding `physical_schema` implies; other leaves are left untouched so
+/// type-widening casts stay in reconciliation.
+fn coerce_string_width(field: &Field) -> Field {
+    let data_type = match field.data_type() {
+        ArrowDataType::Utf8View | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8,
+        ArrowDataType::BinaryView | ArrowDataType::LargeBinary => ArrowDataType::Binary,
+        ArrowDataType::Struct(children) => {
+            let coerced: Fields = children
+                .iter()
+                .map(|child| Arc::new(coerce_string_width(child.as_ref())))
+                .collect();
+            ArrowDataType::Struct(coerced)
+        }
+        other => other.clone(),
+    };
+    Field::new(field.name(), data_type, field.is_nullable()).with_metadata(field.metadata().clone())
 }
 
 /// Reconciles a decoded Arrow batch (the file's physical columns, in file order) to the requested
@@ -336,27 +373,9 @@ mod tests {
                 .unwrap();
 
         assert_eq!(read.len(), 1);
-        // Vortex decodes STRING columns as Utf8View, which kernel accepts as a valid physical
-        // STRING representation (string-width normalization is an explicit reader-contract punt).
-        // Cast back to the input's Utf8 encoding to compare logical content.
-        let normalized = cast_to_schema(&read[0], &batch.schema());
-        assert_eq!(normalized, batch);
-    }
-
-    /// Casts every column of `batch` to the types in `target` (rebuilding under `target`'s schema),
-    /// so logical content can be compared across physical-encoding differences (e.g. Utf8View vs
-    /// Utf8).
-    fn cast_to_schema(
-        batch: &RecordBatch,
-        target: &Arc<delta_kernel::arrow::datatypes::Schema>,
-    ) -> RecordBatch {
-        let columns = batch
-            .columns()
-            .iter()
-            .zip(target.fields())
-            .map(|(col, field)| delta_kernel::arrow::compute::cast(col, field.data_type()).unwrap())
-            .collect();
-        RecordBatch::try_new(target.clone(), columns).unwrap()
+        // STRING columns are normalized to Utf8 (not Utf8View), so the read-back batch matches the
+        // input exactly -- no cast needed.
+        assert_eq!(read[0], batch);
     }
 
     // A subset+reorder projection: request only [ts, id] (dropping `name` and swapping order). The
