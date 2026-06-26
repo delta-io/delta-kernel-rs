@@ -1,5 +1,5 @@
-mod commits;
 mod uc_client;
+mod update_table;
 
-pub use commits::UCCommitsRestClient;
 pub use uc_client::UCClient;
+pub use update_table::UCUpdateTableRestClient;

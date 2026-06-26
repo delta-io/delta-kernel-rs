@@ -34,10 +34,6 @@ pub enum Error {
     /// The client configuration is invalid.
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
-
-    /// All retry attempts have been exhausted.
-    #[error("Max retries exceeded")]
-    MaxRetriesExceeded,
 }
 
 /// A type alias for [`Result`] using [`enum@Error`].
@@ -83,12 +79,6 @@ mod tests {
 
     #[test]
     fn from_error_maps_rest_only_variants_to_generic() {
-        let api_err = unity_catalog_delta_client_api::Error::from(Error::MaxRetriesExceeded);
-        assert!(
-            matches!(api_err, unity_catalog_delta_client_api::Error::Generic(ref msg) if msg == "Max retries exceeded"),
-            "unexpected: {api_err:?}"
-        );
-
         let api_err =
             unity_catalog_delta_client_api::Error::from(Error::InvalidConfiguration("bad".into()));
         assert!(

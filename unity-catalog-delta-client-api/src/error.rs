@@ -23,6 +23,10 @@ pub enum Error {
     #[error("Authentication failed")]
     AuthenticationFailed,
 
+    /// The commit conflicted with a concurrent write (another writer won the version).
+    #[error("Commit conflict")]
+    CommitConflict,
+
     /// A generic error with a descriptive message.
     #[error("{0}")]
     Generic(String),

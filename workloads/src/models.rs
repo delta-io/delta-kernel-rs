@@ -58,8 +58,8 @@ pub struct TableInfo {
     pub table_path: Option<Url>,
     /// Info needed to access a UC-managed table via credential vending.
     /// When present, the engine is set up with UC-vended credentials instead of local/S3 access.
-    /// Whether to use `UCKernelClient` (catalog-managed) or standard snapshot builder is
-    /// determined by the `delta.feature.catalogManaged` property.
+    /// Whether the table is catalog-managed (commits coordinated via the catalog) or read via the
+    /// standard snapshot builder is determined by the `delta.feature.catalogManaged` property.
     /// Mutually exclusive with `table_path`.
     /// TODO(#2303): Create an enum type that ensures table_path and catalog_info are mutually
     /// exclusive

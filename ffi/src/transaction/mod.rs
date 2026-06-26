@@ -1305,10 +1305,16 @@ mod tests {
 
             let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
             let table_id = "test_id";
+            let catalog = "test_catalog";
+            let schema = "test_schema";
+            let table_name = "test_table";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };

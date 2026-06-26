@@ -4,15 +4,52 @@ use url::Url;
 
 use crate::error::Result;
 
-#[derive(Debug, Clone)]
+/// Default `User-Agent` identifying this client. Some catalogs require a specific `User-Agent`
+/// value and reject others; override via [`ClientConfigBuilder::with_user_agent`] when your
+/// catalog expects a particular value.
+fn default_user_agent() -> String {
+    format!(
+        "Delta/{v} delta-kernel-rs/{v}",
+        v = env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Connection configuration for the Unity Catalog REST client.
+#[derive(Clone)]
 pub struct ClientConfig {
+    /// Base workspace URL with the `/api/2.1/unity-catalog/` path stamped on.
     pub workspace_url: Url,
+    /// Bearer token used to authenticate requests.
     pub token: String,
+    /// `User-Agent` header value sent on every request.
+    pub user_agent: String,
+    /// Overall request timeout.
     pub timeout: Duration,
+    /// Connection-establishment timeout.
     pub connect_timeout: Duration,
+    /// Maximum number of retries for retryable requests.
     pub max_retries: u32,
+    /// Base delay for linear backoff: the nth retry waits `retry_base_delay * n`, clamped to
+    /// `retry_max_delay`.
     pub retry_base_delay: Duration,
+    /// Upper bound on the backoff delay between retries.
     pub retry_max_delay: Duration,
+}
+
+// Manual Debug to avoid leaking the bearer token.
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("workspace_url", &self.workspace_url)
+            .field("token", &"***")
+            .field("user_agent", &self.user_agent)
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_retries", &self.max_retries)
+            .field("retry_base_delay", &self.retry_base_delay)
+            .field("retry_max_delay", &self.retry_max_delay)
+            .finish()
+    }
 }
 
 impl ClientConfig {
@@ -36,6 +73,7 @@ impl ClientConfig {
         Ok(Self {
             workspace_url,
             token: token.into(),
+            user_agent: default_user_agent(),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             max_retries: 3,
@@ -44,14 +82,17 @@ impl ClientConfig {
         })
     }
 
+    /// Start building a [`ClientConfig`] for `workspace`, authenticating with `token`.
     pub fn build(workspace: impl Into<String>, token: impl Into<String>) -> ClientConfigBuilder {
         ClientConfigBuilder::new(workspace, token)
     }
 }
 
+/// Builder for [`ClientConfig`]. Created via [`ClientConfig::build`].
 pub struct ClientConfigBuilder {
     workspace: String,
     token: String,
+    user_agent: String,
     timeout: Duration,
     connect_timeout: Duration,
     max_retries: u32,
@@ -64,6 +105,7 @@ impl ClientConfigBuilder {
         Self {
             workspace: workspace.into(),
             token: token.into(),
+            user_agent: default_user_agent(),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             max_retries: 3,
@@ -72,29 +114,41 @@ impl ClientConfigBuilder {
         }
     }
 
+    /// Override the `User-Agent` header with the value the catalog expects for your connector.
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Set the overall request timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
+    /// Set the connection-establishment timeout.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
+    /// Set the maximum number of retries for retryable requests.
     pub fn with_max_retries(mut self, retries: u32) -> Self {
         self.max_retries = retries;
         self
     }
 
+    /// Set the linear-backoff delays: the nth retry waits `base * n`, clamped to `max`.
     pub fn with_retry_delays(mut self, base: Duration, max: Duration) -> Self {
         self.retry_base_delay = base;
         self.retry_max_delay = max;
         self
     }
 
+    /// Build the [`ClientConfig`], normalizing the workspace URL. Errors if the URL is invalid.
     pub fn build(self) -> Result<ClientConfig> {
         let mut config = ClientConfig::new(self.workspace, self.token)?;
+        config.user_agent = self.user_agent;
         config.timeout = self.timeout;
         config.connect_timeout = self.connect_timeout;
         config.max_retries = self.max_retries;
@@ -138,5 +192,34 @@ mod tests {
             .as_str()
             .contains("api/2.1/unity-catalog"));
         assert_eq!(config.token, "token");
+    }
+
+    #[test]
+    fn default_user_agent_is_honest_identifier() {
+        let config = ClientConfig::new("example.com", "token").unwrap();
+        assert!(config.user_agent.starts_with("Delta/"));
+        assert!(config.user_agent.contains("delta-kernel-rs"));
+    }
+
+    #[test]
+    fn debug_redacts_bearer_token() {
+        let config = ClientConfig::build("example.com", "super-secret-token")
+            .build()
+            .unwrap();
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("super-secret-token"),
+            "token leaked: {debug}"
+        );
+        assert!(debug.contains("***"), "redaction marker missing: {debug}");
+    }
+
+    #[test]
+    fn with_user_agent_overrides_default() {
+        let config = ClientConfig::build("example.com", "token")
+            .with_user_agent("Delta/9 Spark/9")
+            .build()
+            .unwrap();
+        assert_eq!(config.user_agent, "Delta/9 Spark/9");
     }
 }

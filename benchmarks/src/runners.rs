@@ -5,8 +5,9 @@
 //! Results are discarded for benchmarking purposes.
 //!
 //! Engine and snapshot construction is handled based on `TableInfo`:
-//! - UC tables (`catalog_info`): UC-vended credentials; catalog-managed tables use
-//!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
+//! - UC tables (`catalog_info`): UC-vended credentials; catalog-managed tables build their snapshot
+//!   from a fetched `LoadTableResponse` via `log_tail_from_commits` + the standard snapshot
+//!   builder, others use the standard snapshot builder
 //! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
@@ -19,20 +20,33 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Stat
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel_unity_catalog::UCKernelClient;
+use delta_kernel_unity_catalog::log_tail_from_commits;
 use delta_kernel_workloads::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
     TimeTravel,
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
-use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
-use unity_catalog_delta_rest_client::{
-    ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
-};
+use unity_catalog_delta_client_api::{Error as UcApiError, LoadTableResponse, Operation};
+use unity_catalog_delta_rest_client::{ClientConfig, Error as UcRestError, UCClient};
 use url::Url;
 
-/// Delta table property indicating catalog-managed support.
-const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
+/// True when `load_table` reports the table carries the `catalogManaged` feature. Catalog-managed
+/// tables build their snapshot from inline commits via `log_tail_from_commits`; others use the
+/// standard snapshot builder.
+fn is_catalog_managed(resp: &LoadTableResponse) -> bool {
+    resp.metadata
+        .properties
+        .contains_key("delta.feature.catalogManaged")
+}
+
+/// Split a UC fully-qualified `catalog.schema.table` into its three parts.
+fn split_fqn(fqn: &str) -> Result<(&str, &str, &str), Box<dyn std::error::Error>> {
+    let mut parts = fqn.splitn(3, '.');
+    let catalog = parts.next().ok_or("missing catalog in table name")?;
+    let schema = parts.next().ok_or("missing schema in table name")?;
+    let table = parts.next().ok_or("missing table in table name")?;
+    Ok((catalog, schema, table))
+}
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
@@ -54,13 +68,15 @@ fn build_engine(
 /// Determines how a snapshot is loaded. Built once at setup via [`resolve_snapshot_strategy`],
 /// then used by runners to construct snapshots.
 enum SnapshotStrategy {
-    /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
+    /// Standard snapshot builder (local, S3, or non-catalog-managed UC tables).
     Standard { url: Url },
-    /// Catalog-managed table: snapshot loaded via `UCKernelClient::load_snapshot`.
+    /// Catalog-managed table: snapshot built from a fetched `LoadTableResponse`
+    /// by converting the inline commits to a log tail via
+    /// `log_tail_from_commits` and feeding them to the snapshot builder.
+    /// Time travel is not exercised in this path: `load_table` returns the
+    /// latest version's commits and we don't refetch per-version.
     CatalogManaged {
-        table_id: String,
-        table_uri: String,
-        commits_client: Box<UCCommitsRestClient>,
+        load_table_response: Box<LoadTableResponse>,
     },
 }
 
@@ -69,7 +85,7 @@ impl SnapshotStrategy {
     fn load_snapshot(
         &self,
         engine: &dyn Engine,
-        runtime: &tokio::runtime::Runtime,
+        _runtime: &tokio::runtime::Runtime,
         time_travel: Option<&TimeTravel>,
     ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
         match self {
@@ -81,21 +97,21 @@ impl SnapshotStrategy {
                 Ok(builder.build(engine)?)
             }
             SnapshotStrategy::CatalogManaged {
-                table_id,
-                table_uri,
-                commits_client,
+                load_table_response,
             } => {
-                let catalog = UCKernelClient::new(commits_client.as_ref());
-                let result = match time_travel {
-                    Some(tt) => {
-                        let version = tt.as_version()?;
-                        runtime.block_on(
-                            catalog.load_snapshot_at(table_id, table_uri, version, engine),
-                        )
-                    }
-                    None => runtime.block_on(catalog.load_snapshot(table_id, table_uri, engine)),
-                };
-                result.map_err(|e| format!("Catalog snapshot failed: {e}").into())
+                let table_url = Url::parse(&load_table_response.metadata.location)
+                    .map_err(|e| format!("Catalog snapshot failed: {e}"))?;
+                let log_tail = log_tail_from_commits(&load_table_response.commits, &table_url)
+                    .map_err(|e| format!("Catalog snapshot failed: {e}"))?;
+                let max_catalog_version: u64 = load_table_response
+                    .latest_table_version
+                    .unwrap_or(0)
+                    .try_into()
+                    .map_err(|e| format!("Catalog snapshot failed: {e}"))?;
+                Ok(Snapshot::builder_for(table_url)
+                    .with_log_tail(log_tail)
+                    .with_max_catalog_version(max_catalog_version)
+                    .build(engine)?)
             }
         }
     }
@@ -104,8 +120,8 @@ impl SnapshotStrategy {
 /// Resolves engine credentials and snapshot strategy from a [`TableInfo`].
 ///
 /// For UC-managed tables (`catalog_info` is present), credentials are vended via
-/// `UCClient`. The `delta.feature.catalogManaged` property then determines whether to use
-/// `UCKernelClient` (catalog-managed) or the standard snapshot builder.
+/// `UCClient`. Catalog-managed tables build their snapshot from the inline commits in the
+/// `load_table` response; other tables use the standard snapshot builder.
 ///
 /// For non-UC tables, the engine is built from env vars (`AWS_*` for S3, local filesystem
 /// otherwise).
@@ -125,47 +141,52 @@ fn resolve_snapshot_strategy(
     let config = ClientConfig::build(&endpoint, &token).build()?;
     let client = UCClient::new(config.clone())?;
 
-    let result: Result<_, UcRestError> = runtime.block_on(async {
-        let table = client.get_table(&cm.table_name).await?;
-        let creds = client
-            .get_credentials(&table.table_id, Operation::Read)
-            .await?;
-        let aws = creds
-            .aws_temp_credentials
-            .ok_or(UcApiError::UnsupportedOperation(
-                // TODO(#2305): support non-AWS credential types
-                "Credential vending returned no AWS credentials".into(),
-            ))?;
-        Ok((
-            table.table_id,
-            table.storage_location,
-            table.properties,
-            aws,
-        ))
-    });
-    let (table_id, table_uri, uc_properties, aws) = result?;
+    let (catalog, schema, table) = split_fqn(&cm.table_name)?;
 
-    let table_url = Url::parse(&table_uri)?;
+    let result: Result<_, UcRestError> = runtime.block_on(async {
+        let resp = client.load_table(catalog, schema, table).await?;
+        let creds = client
+            .get_table_credentials(catalog, schema, table, Operation::Read)
+            .await?;
+        let storage = creds.storage_credentials.into_iter().next().ok_or(
+            UcApiError::UnsupportedOperation(
+                "Credential vending returned no storage credentials".into(),
+            ),
+        )?;
+        Ok((resp, storage))
+    });
+    let (load_table_resp, storage) = result?;
+
+    let table_url = Url::parse(&load_table_resp.metadata.location)?;
     let region = std::env::var("AWS_REGION").map_err(|_| "AWS_REGION required")?;
+    // TODO(#2305): support non-AWS credential types
+    let access_key = storage
+        .config
+        .get("s3.access-key-id")
+        .ok_or("missing s3.access-key-id in vended credentials")?
+        .clone();
+    let secret_key = storage
+        .config
+        .get("s3.secret-access-key")
+        .ok_or("missing s3.secret-access-key in vended credentials")?
+        .clone();
+    let session_token = storage
+        .config
+        .get("s3.session-token")
+        .ok_or("missing s3.session-token in vended credentials")?
+        .clone();
     let options = [
         ("region", region.as_str()),
-        ("access_key_id", aws.access_key_id.as_str()),
-        ("secret_access_key", aws.secret_access_key.as_str()),
-        ("session_token", aws.session_token.as_str()),
+        ("access_key_id", access_key.as_str()),
+        ("secret_access_key", secret_key.as_str()),
+        ("session_token", session_token.as_str()),
     ];
     let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, options)?;
     let engine = build_engine(store.into(), runtime);
 
-    let is_catalog_managed = uc_properties
-        .get(CATALOG_MANAGED_PROPERTY)
-        .is_some_and(|v| v == "supported");
-
-    let strategy = if is_catalog_managed {
-        let commits_client = Box::new(UCCommitsRestClient::new(config)?);
+    let strategy = if is_catalog_managed(&load_table_resp) {
         SnapshotStrategy::CatalogManaged {
-            table_id,
-            table_uri,
-            commits_client,
+            load_table_response: Box::new(load_table_resp),
         }
     } else {
         SnapshotStrategy::Standard { url: table_url }
