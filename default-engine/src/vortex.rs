@@ -27,10 +27,12 @@
 //! Only flat (top-level primitive) schemas are supported on read. Kernel's projection mask uses
 //! flattened *leaf* indices, which only coincide with top-level column indices when the schema has
 //! no nested struct/list/map columns. Nested schemas are rejected rather than silently
-//! mis-projected (see `ensure_flat_schema`). Predicate/projection pushdown, deletion vectors, row
-//! indexes, and column mapping are all punted -- safe given the locked POC table shape (column
-//! mapping None, no deletion vectors, no row tracking).
+//! mis-projected (see `ensure_flat_schema`). Column projection is pushed down into the Vortex scan
+//! (only requested columns are decoded); predicate pushdown, deletion vectors, row indexes, and
+//! column mapping are all punted -- safe given the locked POC table shape (column mapping None, no
+//! deletion vectors, no row tracking).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
@@ -46,7 +48,8 @@ use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 use vortex::array::arrow::{ArrowSessionExt as _, FromArrowArray as _};
 use vortex::array::{ArrayRef as VortexArrayRef, VortexSessionExecute as _};
-use vortex::file::{OpenOptionsSessionExt as _, WriteOptionsSessionExt as _};
+use vortex::expr::{root, select};
+use vortex::file::{OpenOptionsSessionExt as _, VortexFile, WriteOptionsSessionExt as _};
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault as _;
 
@@ -120,18 +123,27 @@ async fn decode_vortex_file(
     let bytes = store.get(&path).await?.bytes().await?;
 
     let session = VortexSession::default();
-    // `open_buffer` is synchronous (no I/O runtime); the scan decode is async. `into_array_stream`
-    // yields one array per scan split (vs `read_all`, which collapses them into a single array), so
-    // we decode and reconcile chunk-by-chunk to bound peak memory. The stream is `'static`, so the
-    // opened file need not be held alive separately.
-    let array_stream = session
+    // `open_buffer` is synchronous (no I/O runtime); the scan decode is async.
+    let file = session
         .open_options()
         .open_buffer(bytes.to_vec())
-        .map_err(vortex_err)?
-        .scan()
-        .map_err(vortex_err)?
-        .into_array_stream()
         .map_err(vortex_err)?;
+
+    // Projection pushdown: decode only the file columns the scan requests. We intersect the
+    // requested columns with the file's actual fields (Vortex `select` errors on unknown names);
+    // reconciliation still reorders, backfills missing nullable columns, and casts afterward, all
+    // by name. When no requested column is present (e.g. all-missing -> all-NULL backfill) we skip
+    // projection: an empty projection is invalid, and reconciliation still needs the file's rows.
+    let projection = projection_columns(&file, &physical_schema);
+    let mut scan = file.scan().map_err(vortex_err)?;
+    if !projection.is_empty() {
+        scan = scan.with_projection(select(projection, root()));
+    }
+
+    // `into_array_stream` yields one array per scan split (vs `read_all`, which collapses them into
+    // a single array), so we decode and reconcile chunk-by-chunk to bound peak memory. The stream
+    // is `'static`, so the opened file need not be held alive separately.
+    let array_stream = scan.into_array_stream().map_err(vortex_err)?;
 
     let mut ctx = session.create_execution_ctx();
     let batches = array_stream.map(move |array| {
@@ -146,6 +158,21 @@ async fn decode_vortex_file(
     });
 
     Ok(Box::pin(batches))
+}
+
+/// Returns the `physical_schema` column names that are present in `file`, in requested order, for
+/// projection pushdown. Empty when `file` exposes no struct fields or none of the requested columns
+/// exist -- the caller then skips pushdown and lets reconciliation backfill.
+fn projection_columns<'a>(file: &VortexFile, physical_schema: &'a SchemaRef) -> Vec<&'a str> {
+    let Some(file_fields) = file.dtype().as_struct_fields_opt() else {
+        return Vec::new();
+    };
+    let present: HashSet<&str> = file_fields.names().iter().map(|n| n.as_ref()).collect();
+    physical_schema
+        .fields()
+        .map(|f| f.name().as_str())
+        .filter(|name| present.contains(name))
+        .collect()
 }
 
 /// Reconciles a decoded Arrow batch (the file's physical columns, in file order) to the requested
@@ -240,7 +267,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::arrow::array::{
-        Array, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+        Array, ArrayRef, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
     };
     use delta_kernel::arrow::datatypes::{
         DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit,
@@ -524,5 +551,135 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, values);
+    }
+
+    /// Builds an `n_cols`-column Int32 batch named `c0..c{n_cols}`; cell value is `col*100 + row`.
+    fn wide_int_batch(n_cols: usize, n_rows: i32) -> RecordBatch {
+        let fields: Vec<Field> = (0..n_cols)
+            .map(|c| Field::new(format!("c{c}"), ArrowDataType::Int32, false))
+            .collect();
+        let columns: Vec<ArrayRef> = (0..n_cols)
+            .map(|c| {
+                let values: Vec<i32> = (0..n_rows).map(|r| c as i32 * 100 + r).collect();
+                Arc::new(Int32Array::from(values)) as ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap()
+    }
+
+    /// Re-opens a just-written `.vortex` file from the store (so tests can inspect the scan/dtype
+    /// directly, like the production reader does).
+    async fn open_vortex(store: &Arc<DynObjectStore>, location: &url::Url) -> VortexFile {
+        let bytes = store
+            .get(&Path::from_url_path(location.path()).unwrap())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        VortexSession::default()
+            .open_options()
+            .open_buffer(bytes.to_vec())
+            .unwrap()
+    }
+
+    // Projection pushdown decodes only the requested columns (verified via the post-projection scan
+    // dtype), in requested order, and the end-to-end read returns just those columns with correct
+    // values.
+    #[tokio::test]
+    async fn test_vortex_pushdown_decodes_only_requested_columns() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let batch = wide_int_batch(10, 3);
+
+        let data = Box::new(ArrowEngineData::new(batch.clone()));
+        let meta = write_vortex(
+            store.clone(),
+            &url::Url::parse("memory:///data/").unwrap(),
+            data,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Request two columns, reordered: c7 then c3.
+        let requested: SchemaRef = Arc::new(
+            StructType::try_new(vec![
+                StructField::not_null("c7", DataType::INTEGER),
+                StructField::not_null("c3", DataType::INTEGER),
+            ])
+            .unwrap(),
+        );
+
+        // Pushdown selects exactly the requested columns present in the file, in requested order...
+        let file = open_vortex(&store, meta.location()).await;
+        assert_eq!(projection_columns(&file, &requested), vec!["c7", "c3"]);
+        // ...and the scan decodes only those two columns (not all ten).
+        let scan = file
+            .scan()
+            .unwrap()
+            .with_projection(select(vec!["c7", "c3"], root()));
+        let decoded = scan.dtype().unwrap();
+        assert_eq!(decoded.as_struct_fields_opt().unwrap().names().len(), 2);
+
+        let read: Vec<RecordBatch> =
+            read_vortex_files(store, vec![meta.file_meta().clone()], requested)
+                .await
+                .unwrap()
+                .map(into_record_batch)
+                .try_collect()
+                .await
+                .unwrap();
+
+        assert_eq!(read.len(), 1);
+        let out = &read[0];
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.schema().field(0).name(), "c7");
+        assert_eq!(out.schema().field(1).name(), "c3");
+        let c7 = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let c3 = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(c7.values(), &[700, 701, 702]);
+        assert_eq!(c3.values(), &[300, 301, 302]);
+    }
+
+    // When no requested column exists in the file, pushdown is skipped (empty projection) and
+    // reconciliation backfills the absent column as all-NULL with the file's row count.
+    #[tokio::test]
+    async fn test_vortex_pushdown_empty_projection_backfills_all_missing() {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let batch = sample_batch();
+
+        let data = Box::new(ArrowEngineData::new(batch.clone()));
+        let meta = write_vortex(
+            store.clone(),
+            &url::Url::parse("memory:///data/").unwrap(),
+            data,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let requested: SchemaRef = Arc::new(
+            StructType::try_new(vec![StructField::nullable("absent", DataType::STRING)]).unwrap(),
+        );
+
+        let file = open_vortex(&store, meta.location()).await;
+        assert!(projection_columns(&file, &requested).is_empty());
+        drop(file);
+
+        let read: Vec<RecordBatch> =
+            read_vortex_files(store, vec![meta.file_meta().clone()], requested)
+                .await
+                .unwrap()
+                .map(into_record_batch)
+                .try_collect()
+                .await
+                .unwrap();
+
+        assert_eq!(read.len(), 1);
+        let out = &read[0];
+        assert_eq!(out.num_columns(), 1);
+        assert_eq!(out.schema().field(0).name(), "absent");
+        assert_eq!(out.column(0).len(), 3);
+        assert_eq!(out.column(0).null_count(), 3);
     }
 }
