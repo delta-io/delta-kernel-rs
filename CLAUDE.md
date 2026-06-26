@@ -74,9 +74,10 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
-- `column-defaults-in-dev` -- column defaults write support (experimental, in development).
-  Gates `KernelSupport::Supported` for the `allowColumnDefaults` writer feature; with the
-  cargo feature off, writes to tables listing this feature are blocked.
+- `column-defaults-in-dev` -- column defaults support (experimental, in development). Gates
+  `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
+  listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
+  carrier type and the SQL literal parser (`parse_sql`).
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -133,9 +134,10 @@ directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` ac
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible. See **Common test helpers** below for a curated starter list.
 - **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
-  successful commit and get the `CommittedTransaction`. Do NOT use `match` + `panic!`
-  for this -- `unwrap_committed()` provides a clear error message on failure. Available
-  under `#[cfg(test)]` and the `test-utils` feature.
+  successful commit and get the `CommittedTransaction`. When you only need the resulting
+  snapshot, use `txn.commit(engine)?.unwrap_post_commit_snapshot()` to get the
+  `SnapshotRef` directly. Do NOT use `match` + `panic!` for either -- they provide a clear
+  error message on failure. Available under `#[cfg(test)]` and the `test-utils` feature.
 - **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
   commit JSON when the data is inaccessible via public API (e.g., system domain metadata
   is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`

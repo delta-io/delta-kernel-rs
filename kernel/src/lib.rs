@@ -88,6 +88,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod commit_range;
 pub mod committer;
 #[cfg(feature = "internal-api")]
 pub mod crc;
@@ -748,6 +749,16 @@ pub trait ParquetHandler: AsAny {
     /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or
     ///    no matching parquet field ID is found, fall back to matching by column name
     ///
+    /// # Type coercion
+    ///
+    /// A matched Parquet column whose physical type differs from the `physical_schema`
+    /// [`StructField`] must be coerced to the requested type. In particular, timestamp columns MUST
+    /// be normalized to the protocol specified microsecond precision: a `TIMESTAMP(MILLIS)` (or
+    /// any other non-microsecond unit) column read into a `TIMESTAMP` / `TIMESTAMP_NTZ` field
+    /// must be rescaled to microseconds (a finer unit such as nanosecond is truncated). The
+    /// default engine does this via `arrow::compute::cast` while reordering columns to the
+    /// requested schema.
+    ///
     /// # Metadata Columns
     ///
     /// The ParquetHandler must support virtual metadata columns that provide additional information
@@ -966,11 +977,10 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`PlanExecutor`].
     ///
-    /// The default implementation panics for now because the feature is still under development.
+    /// The default implementation returns a trivial executor that errors on every operation.
     #[cfg(feature = "declarative-plans")]
-    #[allow(clippy::panic)]
     fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
-        unimplemented!("this engine does not provide a PlanExecutor")
+        Arc::new(())
     }
 }
 

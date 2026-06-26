@@ -16,6 +16,7 @@ use crate::kernel_predicates::{
 };
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::parquet::arrow::ArrowWriter;
+use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::FileReader;
 use crate::parquet::file::serialized_reader::SerializedFileReader;
@@ -455,6 +456,30 @@ fn test_get_stat_values() {
                 .unwrap()
         )
     );
+}
+
+// Intervals are unsupported for skipping under any footer encoding, so extraction returns None.
+#[test]
+fn test_interval_skipping_unsupported_for_any_footer_stats() {
+    let interval_flba = FixedLenByteArray::from(ByteArray::from(vec![0u8; 12]));
+    let variants = [
+        Statistics::int32(Some(0), Some(1), None, Some(0), false),
+        Statistics::int64(Some(0), Some(1), None, Some(0), false),
+        Statistics::fixed_len_byte_array(
+            Some(interval_flba.clone()),
+            Some(interval_flba),
+            None,
+            Some(0),
+            false,
+        ),
+    ];
+    for dt in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
+        for stats in &variants {
+            // Call the extractor directly: the fixture has no interval column for get_min_stat
+            assert_eq!(extract_min_scalar(&dt, stats), None);
+            assert_eq!(extract_max_scalar(&dt, stats), None);
+        }
+    }
 }
 
 /// Wraps an Int64 leaf array in nested StructArrays matching the given column path.

@@ -17,7 +17,12 @@ fn main() {
 #[cfg(feature = "declarative-plans")]
 fn compile_proto_definitions() {
     let proto_dir = "proto";
-    let proto_files = ["schema.proto", "expressions.proto", "plan.proto"];
+    let proto_files = [
+        "schema.proto",
+        "expressions.proto",
+        "plan.proto",
+        "operation.proto",
+    ];
 
     for file in &proto_files {
         println!("cargo:rerun-if-changed={proto_dir}/{file}");
