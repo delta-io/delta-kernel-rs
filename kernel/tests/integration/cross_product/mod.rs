@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, Int32Array, RecordBatch};
-use delta_kernel::expressions::{lit, Expression};
+use delta_kernel::expressions::{lit, Expression, PredicateRef};
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
@@ -130,12 +130,31 @@ fn test_cross_product_read_write(
     Ok(())
 }
 
+/// Counts the files surviving data skipping for `predicate`. Skipping is file-level, so this
+/// reflects effectiveness (how many files the predicate pruned), unlike the sweep's
+/// row-level soundness check.
+fn count_scan_files(
+    snap: &Arc<Snapshot>,
+    engine: &dyn Engine,
+    predicate: PredicateRef,
+) -> DeltaResult<usize> {
+    let scan = snap
+        .clone()
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()?;
+    let mut files = 0usize;
+    for scan_metadata in scan.scan_metadata(engine)? {
+        files = scan_metadata?.visit_scan_files(files, |count, _| *count += 1)?;
+    }
+    Ok(files)
+}
+
 /// Effectiveness companion to the sweep's soundness assertion: with stats on the predicate
 /// column, a `>= SKIP_THRESHOLD` predicate must actually prune the version-1 file via min/max
-/// data skipping (whereas the sweep only proves skipping never drops a matching row). Counts
-/// the files surviving `scan_metadata` rather than rows, since skipping is file-level.
+/// data skipping (whereas the sweep only proves skipping never drops a matching row).
 #[test]
-fn test_data_skipping_prunes_files() -> DeltaResult<()> {
+fn test_min_max_skipping_prunes_files() -> DeltaResult<()> {
     // `num_indexed_cols_all` writes stats for every leaf column, so `int_col` is indexed.
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(3))
@@ -147,15 +166,33 @@ fn test_data_skipping_prunes_files() -> DeltaResult<()> {
 
     // v1 = [1000, 1009], v2 = [2000, 2009], v3 = [3000, 3009]. `int_col >= 2000` excludes v1.
     let predicate = Arc::new(Expression::column(["int_col"]).ge(lit(SKIP_THRESHOLD)));
-    let scan = snap.scan_builder().with_predicate(predicate).build()?;
-    let mut files = 0usize;
-    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
-        files = scan_metadata?.visit_scan_files(files, |count, _| *count += 1)?;
-    }
+    let files = count_scan_files(&snap, engine.as_ref(), predicate)?;
     assert_eq!(
         files, 2,
         "version-1 file should be pruned by min/max skipping"
     );
+
+    Ok(())
+}
+
+/// Partition pruning effectiveness: a predicate on a partition column prunes files whose
+/// partition value can't match, using the Add action's partition values rather than min/max
+/// stats. Independent of `numIndexedCols`, since partition values are always present.
+#[test]
+fn test_partition_pruning_skips_files() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(3))
+        .with_data_layout(partitioned())
+        .build()?;
+    let engine: Arc<dyn Engine> =
+        Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+    let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+
+    // The `part_long` partition value is `version * 1_000_000` (v1=1M, v2=2M, v3=3M), so
+    // `part_long >= 2_000_000` prunes version 1's partition.
+    let predicate = Arc::new(Expression::column(["part_long"]).ge(lit(2_000_000i64)));
+    let files = count_scan_files(&snap, engine.as_ref(), predicate)?;
+    assert_eq!(files, 2, "version-1 partition should be pruned");
 
     Ok(())
 }
