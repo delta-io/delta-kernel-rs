@@ -20,7 +20,7 @@ use test_utils::table_builder::{
     version_at_timestamp_max, version_incremental_from_mid_to_latest,
     version_incremental_from_mid_to_pre_latest, version_latest, with_json_stats, with_struct_stats,
     DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, VersionTarget,
-    NULL_RATE_EVERY_NTH,
+    NULL_RATE_EVERY_NTH, NULL_SKIP_COLUMN,
 };
 use test_utils::{assert_row_ids_unique, build_snapshot, default_sweep, read_scan};
 
@@ -193,6 +193,30 @@ fn test_partition_pruning_skips_files() -> DeltaResult<()> {
     let predicate = Arc::new(Expression::column(["part_long"]).ge(lit(2_000_000i64)));
     let files = count_scan_files(&snap, engine.as_ref(), predicate)?;
     assert_eq!(files, 2, "version-1 partition should be pruned");
+
+    Ok(())
+}
+
+/// Null-count skipping effectiveness: `NULL_SKIP_COLUMN` is all-null in version 1 and fully
+/// populated afterward, so `IS NOT NULL` prunes version 1's file using its null-count stat,
+/// independent of min/max bounds.
+#[test]
+fn test_null_count_skipping_prunes_files() -> DeltaResult<()> {
+    // `num_indexed_cols_all` writes stats (including null counts) for every leaf column.
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(3))
+        .with_table_config(num_indexed_cols_all())
+        .build()?;
+    let engine: Arc<dyn Engine> =
+        Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+    let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+
+    let predicate = Arc::new(Expression::column([NULL_SKIP_COLUMN]).is_not_null());
+    let files = count_scan_files(&snap, engine.as_ref(), predicate)?;
+    assert_eq!(
+        files, 2,
+        "version-1 all-null file should be pruned by null-count skipping"
+    );
 
     Ok(())
 }

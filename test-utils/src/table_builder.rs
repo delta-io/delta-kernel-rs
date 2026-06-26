@@ -54,9 +54,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch,
+    StringArray, StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
@@ -1473,15 +1473,26 @@ async fn write_data_commit<E: TaskExecutor>(
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (arrow_field, kernel_field) in arrow_schema.fields().iter().zip(logical_schema.fields())
         {
-            if partition_set.contains(kernel_field.name().as_str()) {
+            let name = kernel_field.name().as_str();
+            if partition_set.contains(name) {
                 continue;
             }
             let data_type = arrow_field.data_type();
-            let values = generate_column(data_type, rows_per_file, base);
-            let values = if arrow_field.is_nullable() {
-                with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
+            let values = if name == NULL_SKIP_COLUMN {
+                // All-null in the first data version, fully populated afterward, so null-count
+                // skipping has one prunable file per predicate direction.
+                if version == 1 {
+                    new_null_array(data_type, rows_per_file)
+                } else {
+                    generate_column(data_type, rows_per_file, base)
+                }
             } else {
-                values
+                let values = generate_column(data_type, rows_per_file, base);
+                if arrow_field.is_nullable() {
+                    with_sparse_nulls(values, NULL_RATE_EVERY_NTH)
+                } else {
+                    values
+                }
             };
             columns.push(values);
             data_fields.push(arrow_field.clone());
@@ -1858,6 +1869,12 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
 // Helpers: schema
 // ===========================================================================
 
+/// Name of the default-schema column the generator fills as all-null in the first data
+/// version and fully populated afterward (no sparse nulls). With one all-null file and the
+/// rest fully populated, null-count data skipping can prune by version: `IS NOT NULL` prunes
+/// version 1, `IS NULL` prunes the later versions.
+pub const NULL_SKIP_COLUMN: &str = "null_skip_col";
+
 /// Default schema with all Delta primitive types including TimestampNtz
 /// and a nested column type.
 pub(crate) fn default_schema() -> SchemaRef {
@@ -1884,6 +1901,7 @@ pub(crate) fn default_schema() -> SchemaRef {
             .unwrap(),
             true,
         ),
+        StructField::nullable(NULL_SKIP_COLUMN, DataType::LONG),
     ]))
 }
 
@@ -2253,13 +2271,19 @@ mod tests {
         assert_eq!(total_rows, rows_per_file);
         let expected_nulls_per_col = rows_per_file / NULL_RATE_EVERY_NTH;
         for batch in &batches {
+            let schema = batch.schema();
             for col_idx in 0..batch.num_columns() {
+                let name = schema.field(col_idx).name();
                 let null_count = batch.column(col_idx).null_count();
+                // `NULL_SKIP_COLUMN` is all-null in version 1 rather than sparsely nulled.
+                let expected = if name == NULL_SKIP_COLUMN {
+                    batch.num_rows()
+                } else {
+                    expected_nulls_per_col
+                };
                 assert_eq!(
-                    null_count,
-                    expected_nulls_per_col,
-                    "column '{}' should have {expected_nulls_per_col} nulls, got {null_count}",
-                    batch.schema().field(col_idx).name(),
+                    null_count, expected,
+                    "column '{name}' should have {expected} nulls, got {null_count}",
                 );
             }
         }
