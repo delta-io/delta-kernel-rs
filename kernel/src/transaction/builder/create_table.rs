@@ -766,6 +766,7 @@ pub struct CreateTableTransactionBuilder {
     engine_info: String,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
+    correlation_id: Option<Arc<str>>,
 }
 
 impl CreateTableTransactionBuilder {
@@ -780,6 +781,7 @@ impl CreateTableTransactionBuilder {
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
+            correlation_id: None,
         }
     }
 
@@ -864,6 +866,13 @@ impl CreateTableTransactionBuilder {
     /// ```
     pub fn with_data_layout(mut self, layout: DataLayout) -> Self {
         self.data_layout = layout;
+        self
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
+    /// metric events to the caller's own request or operation id. An empty id is treated as unset.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
 
@@ -985,6 +994,7 @@ impl CreateTableTransactionBuilder {
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
+            self.correlation_id,
         )
     }
 }
