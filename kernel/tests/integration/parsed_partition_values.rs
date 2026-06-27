@@ -3,8 +3,9 @@
 use delta_kernel::arrow::array::{Array, BooleanArray, RecordBatch, StructArray};
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::PartitionValuesOptions;
-use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -58,11 +59,22 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
         version_latest(),
     );
 
+    let schema = snapshot.schema();
     let scan = snapshot
         .scan_builder()
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()
         .unwrap();
+
+    // Resolve the physical name kernel uses for a partition column under the active mapping mode.
+    let physical_name = |logical: &str| -> String {
+        get_any_level_column_physical_name(schema.as_ref(), &ColumnName::new([logical]), cm_mode)
+            .unwrap()
+            .into_inner()
+            .into_iter()
+            .next()
+            .unwrap()
+    };
 
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(&engine)
@@ -103,6 +115,17 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
                 field.null_count(),
                 0,
                 "partition value unexpectedly null (cm={cm_str}, native_checkpoint={native_checkpoint})"
+            );
+        }
+
+        // The struct must be keyed by physical name. Under Id/Name mapping the physical name
+        // differs from the logical name, so a logical-keyed struct would fail this lookup.
+        for logical in ["part_int", "part_string"] {
+            let phys = physical_name(logical);
+            assert!(
+                pv_parsed.column_by_name(&phys).is_some(),
+                "partitionValues_parsed should key {logical} by physical name {phys} \
+                 (cm={cm_str}, native_checkpoint={native_checkpoint})"
             );
         }
 
