@@ -1538,41 +1538,39 @@ mod tests {
         assert!(deserialized.is_catalog_managed());
     }
 
-    #[test]
-    fn test_serialization_round_trips_skip_row_transforms() {
+    #[rstest]
+    fn test_serialization_round_trips_skip_row_transforms(#[values(false, true)] skip: bool) {
         let engine = SyncEngine::new();
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
             "id",
             DataType::INTEGER,
             true,
         )]));
-        for skip in [false, true] {
-            let state_info = Arc::new(StateInfo {
-                logical_schema: schema.clone(),
-                physical_schema: schema.clone(),
-                physical_predicate: PhysicalPredicate::None,
-                transform_spec: None,
-                column_mapping_mode: ColumnMappingMode::None,
-                physical_stats_schema: None,
-                physical_partition_schema: None,
-                physical_stats_columns: HashSet::new(),
-                is_catalog_managed: false,
-                skip_row_transforms: skip,
-            });
-            let processor = ScanLogReplayProcessor::new(
-                &engine,
-                state_info,
-                test_checkpoint_info(),
-                ScanStatsOptions::default(),
-            )
-            .unwrap();
-            let deserialized = ScanLogReplayProcessor::from_serializable_state(
-                &engine,
-                processor.into_serializable_state().unwrap(),
-            )
-            .unwrap();
-            assert_eq!(deserialized.state_info.skip_row_transforms, skip);
-        }
+        let state_info = Arc::new(StateInfo {
+            logical_schema: schema.clone(),
+            physical_schema: schema.clone(),
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: skip,
+        });
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+        )
+        .unwrap();
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deserialized.state_info.skip_row_transforms, skip);
     }
 
     #[test]

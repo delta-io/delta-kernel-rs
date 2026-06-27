@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ::test_utils::get_column;
+use ::test_utils::{get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
 
@@ -444,9 +444,11 @@ fn test_without_row_transforms_retains_spec_and_sets_skip(#[case] table: &str) {
     assert!(scan.state_info.skip_row_transforms);
 }
 
-/// `scan_metadata` still lists files, and every emitted per-file transform is `None`.
+/// Under `without_row_transforms`, `scan_metadata` still lists files and surfaces the partition
+/// values a connector needs to reconstruct rows itself, while every per-file transform is `None`.
+/// Deletion vectors are covered by the sibling test.
 #[test]
-fn test_without_row_transforms_scan_metadata_emits_no_transforms() {
+fn test_without_row_transforms_scan_metadata_lists_files_with_partition_values() {
     let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
     let scan = snapshot
         .scan_builder()
@@ -454,8 +456,51 @@ fn test_without_row_transforms_scan_metadata_emits_no_transforms() {
         .build()
         .unwrap();
 
-    let mut saw_file = false;
+    // (saw a file, saw non-empty partition values)
+    fn collect(acc: &mut (bool, bool), scan_file: ScanFile) {
+        acc.0 = true;
+        acc.1 |= !scan_file.partition_values.is_empty();
+    }
+    let mut acc = (false, false);
     for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let metadata = metadata.unwrap();
+        assert!(
+            metadata.scan_file_transforms.iter().all(Option::is_none),
+            "every per-file transform must be None under without_row_transforms"
+        );
+        acc = metadata.visit_scan_files(acc, collect).unwrap();
+    }
+    let (saw_file, saw_partition_values) = acc;
+    assert!(
+        saw_file,
+        "scan_metadata should still list files under without_row_transforms"
+    );
+    assert!(
+        saw_partition_values,
+        "partition values must still be surfaced so the connector can inject them itself"
+    );
+}
+
+/// Column mapping also builds a per-file transform (the physical-to-logical rename). Under
+/// `without_row_transforms`, `scan_metadata` still lists a column-mapped table's files with every
+/// per-file transform `None`, leaving the rename to the connector.
+#[test]
+fn test_without_row_transforms_scan_metadata_lists_files_column_mapping() {
+    let table = "table-with-columnmapping-mode-name";
+    let tempdir = load_test_data("tests/golden_data", table).unwrap();
+    // Golden tables extract to `<name>/delta/` (with a sibling `expected/`).
+    let table_path = tempdir.path().join(table).join("delta");
+    let url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+
+    let mut saw_file = false;
+    for metadata in scan.scan_metadata(&engine).unwrap() {
         let metadata = metadata.unwrap();
         assert!(
             metadata.scan_file_transforms.iter().all(Option::is_none),
@@ -465,7 +510,7 @@ fn test_without_row_transforms_scan_metadata_emits_no_transforms() {
     }
     assert!(
         saw_file,
-        "scan_metadata should still list files under without_row_transforms"
+        "scan_metadata should list the column-mapped table's files under without_row_transforms"
     );
 }
 
