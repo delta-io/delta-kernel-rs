@@ -319,6 +319,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: true,
+            skip_row_transforms: false,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,

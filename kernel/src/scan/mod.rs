@@ -194,6 +194,7 @@ pub struct ScanBuilder {
     predicate: Option<PredicateRef>,
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
+    without_row_transforms: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -203,6 +204,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("predicate", &self.predicate)
             .field("stats", &self.stats)
             .field("correlation_id", &self.correlation_id)
+            .field("without_row_transforms", &self.without_row_transforms)
             .finish()
     }
 }
@@ -216,6 +218,7 @@ impl ScanBuilder {
             predicate: None,
             stats: StatsOptions::default(),
             correlation_id: None,
+            without_row_transforms: false,
         }
     }
 
@@ -287,6 +290,22 @@ impl ScanBuilder {
         self
     }
 
+    /// Declare that the engine will reconstruct logical rows itself and will not consume
+    /// [`ScanMetadata::scan_file_transforms`].
+    ///
+    /// The kernel then skips building the per-file transform expressions and the per-row
+    /// partition-value parse done only to build them. The returned `scan_file_transforms` is left
+    /// empty (each row's transform is `None`); use [`Scan::scan_metadata`] for listing.
+    ///
+    /// With this set the engine must itself apply every physical-to-logical fixup the transform
+    /// would normally perform: partition column injection, column-mapping renames, and generated
+    /// row ids. Deletion vectors are unaffected: they are delivered per file in the scan metadata
+    /// regardless. [`Scan::execute`] returns an error.
+    pub fn without_row_transforms(mut self) -> Self {
+        self.without_row_transforms = true;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -317,7 +336,7 @@ impl ScanBuilder {
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        let state_info = StateInfo::try_new(
+        let mut state_info = StateInfo::try_new(
             logical_read_schema,
             table_schema,
             self.snapshot.table_configuration(),
@@ -325,6 +344,10 @@ impl ScanBuilder {
             &self.stats,
             (), // No classifier, default is for scans
         )?;
+
+        // Retain the transform spec but skip building per-file expressions, which also skips the
+        // per-row partition-value parse done only to build them.
+        state_info.skip_row_transforms = self.without_row_transforms;
 
         Ok(Scan {
             snapshot: self.snapshot,
@@ -1053,12 +1076,23 @@ impl Scan {
     /// the data for the query. Each [`EngineData`] in the resultant iterator is a portion of the
     /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
     /// they can have more control over the execution of the scan.
+    ///
+    /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
+    /// [`Scan::scan_metadata`] instead.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+        if self.state_info.skip_row_transforms {
+            return Err(Error::unsupported(
+                "Scan::execute is not supported when the scan was built with \
+                 without_row_transforms; use scan_metadata for listing and read data with your \
+                 own reader",
+            ));
+        }
+
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
             batches.push(file);
         }

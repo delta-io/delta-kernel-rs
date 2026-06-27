@@ -66,22 +66,32 @@ fn scan_metadata_benchmark(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("scan_metadata");
     group.sample_size(SCAN_METADATA_BENCH_SAMPLE_SIZE);
-    group.bench_function("scan_metadata", |b| {
-        b.iter(|| {
-            let scan = snapshot
-                .clone() // arc
-                .scan_builder()
-                .build()
-                .expect("Failed to build scan");
-            let metadata_iter = scan
-                .scan_metadata(engine.as_ref())
-                .expect("Failed to get scan metadata");
-            // kernel scans are lazy, we must consume iterator to do the work we want to test
-            for result in metadata_iter {
-                result.expect("Failed to process scan metadata");
-            }
-        })
-    });
+    // Benchmark both the default path (kernel builds a per-file transform expression for this
+    // partitioned table) and the `without_row_transforms` opt-out (which skips that build and the
+    // per-row partition-value parse that feeds it).
+    for without_row_transforms in [false, true] {
+        let id = if without_row_transforms {
+            "scan_metadata_without_row_transforms"
+        } else {
+            "scan_metadata"
+        };
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let mut builder = snapshot.clone().scan_builder();
+                if without_row_transforms {
+                    builder = builder.without_row_transforms();
+                }
+                let scan = builder.build().expect("Failed to build scan");
+                let metadata_iter = scan
+                    .scan_metadata(engine.as_ref())
+                    .expect("Failed to get scan metadata");
+                // kernel scans are lazy, we must consume iterator to do the work we want to test
+                for result in metadata_iter {
+                    result.expect("Failed to process scan metadata");
+                }
+            })
+        });
+    }
     group.finish();
 }
 
