@@ -229,6 +229,14 @@ pub enum Scalar {
     Short(i16),
     /// 8bit integer
     Byte(i8),
+    /// 8bit unsigned integer
+    Uint8(u8),
+    /// 16bit unsigned integer
+    Uint16(u16),
+    /// 32bit unsigned integer
+    Uint32(u32),
+    /// 64bit unsigned integer
+    Uint64(u64),
     /// 32bit floating point
     Float(f32),
     /// 64bit floating point
@@ -264,6 +272,10 @@ impl Scalar {
             Self::Long(_) => DataType::LONG,
             Self::Short(_) => DataType::SHORT,
             Self::Byte(_) => DataType::BYTE,
+            Self::Uint8(_) => DataType::UINT8,
+            Self::Uint16(_) => DataType::UINT16,
+            Self::Uint32(_) => DataType::UINT32,
+            Self::Uint64(_) => DataType::UINT64,
             Self::Float(_) => DataType::FLOAT,
             Self::Double(_) => DataType::DOUBLE,
             Self::String(_) => DataType::STRING,
@@ -321,6 +333,10 @@ impl Scalar {
             (Long(a), Long(b)) => Long(a.checked_add(*b)?),
             (Short(a), Short(b)) => Short(a.checked_add(*b)?),
             (Byte(a), Byte(b)) => Byte(a.checked_add(*b)?),
+            (Uint8(a), Uint8(b)) => Uint8(a.checked_add(*b)?),
+            (Uint16(a), Uint16(b)) => Uint16(a.checked_add(*b)?),
+            (Uint32(a), Uint32(b)) => Uint32(a.checked_add(*b)?),
+            (Uint64(a), Uint64(b)) => Uint64(a.checked_add(*b)?),
             _ => return None,
         };
         Some(result)
@@ -334,6 +350,10 @@ impl Scalar {
             (Long(a), Long(b)) => Long(a.checked_sub(*b)?),
             (Short(a), Short(b)) => Short(a.checked_sub(*b)?),
             (Byte(a), Byte(b)) => Byte(a.checked_sub(*b)?),
+            (Uint8(a), Uint8(b)) => Uint8(a.checked_sub(*b)?),
+            (Uint16(a), Uint16(b)) => Uint16(a.checked_sub(*b)?),
+            (Uint32(a), Uint32(b)) => Uint32(a.checked_sub(*b)?),
+            (Uint64(a), Uint64(b)) => Uint64(a.checked_sub(*b)?),
             _ => return None,
         };
         Some(result)
@@ -347,6 +367,10 @@ impl Scalar {
             (Long(a), Long(b)) => Long(a.checked_mul(*b)?),
             (Short(a), Short(b)) => Short(a.checked_mul(*b)?),
             (Byte(a), Byte(b)) => Byte(a.checked_mul(*b)?),
+            (Uint8(a), Uint8(b)) => Uint8(a.checked_mul(*b)?),
+            (Uint16(a), Uint16(b)) => Uint16(a.checked_mul(*b)?),
+            (Uint32(a), Uint32(b)) => Uint32(a.checked_mul(*b)?),
+            (Uint64(a), Uint64(b)) => Uint64(a.checked_mul(*b)?),
             _ => return None,
         };
         Some(result)
@@ -360,6 +384,10 @@ impl Scalar {
             (Long(a), Long(b)) => Long(a.checked_div(*b)?),
             (Short(a), Short(b)) => Short(a.checked_div(*b)?),
             (Byte(a), Byte(b)) => Byte(a.checked_div(*b)?),
+            (Uint8(a), Uint8(b)) => Uint8(a.checked_div(*b)?),
+            (Uint16(a), Uint16(b)) => Uint16(a.checked_div(*b)?),
+            (Uint32(a), Uint32(b)) => Uint32(a.checked_div(*b)?),
+            (Uint64(a), Uint64(b)) => Uint64(a.checked_div(*b)?),
             _ => return None,
         };
         Some(result)
@@ -373,6 +401,10 @@ impl Display for Scalar {
             Self::Long(i) => write!(f, "{i}"),
             Self::Short(i) => write!(f, "{i}"),
             Self::Byte(i) => write!(f, "{i}"),
+            Self::Uint8(u) => write!(f, "{u}"),
+            Self::Uint16(u) => write!(f, "{u}"),
+            Self::Uint32(u) => write!(f, "{u}"),
+            Self::Uint64(u) => write!(f, "{u}"),
             Self::Float(fl) => write!(f, "{fl}"),
             Self::Double(fl) => write!(f, "{fl}"),
             Self::String(s) => write!(f, "'{s}'"),
@@ -484,6 +516,14 @@ impl Scalar {
             (Short(_), _) => None,
             (Byte(a), Byte(b)) => a.partial_cmp(b),
             (Byte(_), _) => None,
+            (Uint8(a), Uint8(b)) => a.partial_cmp(b),
+            (Uint8(_), _) => None,
+            (Uint16(a), Uint16(b)) => a.partial_cmp(b),
+            (Uint16(_), _) => None,
+            (Uint32(a), Uint32(b)) => a.partial_cmp(b),
+            (Uint32(_), _) => None,
+            (Uint64(a), Uint64(b)) => a.partial_cmp(b),
+            (Uint64(_), _) => None,
             (Float(a), Float(b)) => a.partial_cmp(b),
             (Float(_), _) => None,
             (Double(a), Double(b)) => a.partial_cmp(b),
@@ -534,6 +574,30 @@ impl From<i32> for Scalar {
 impl From<i64> for Scalar {
     fn from(i: i64) -> Self {
         Self::Long(i)
+    }
+}
+
+impl From<u8> for Scalar {
+    fn from(i: u8) -> Self {
+        Self::Uint8(i)
+    }
+}
+
+impl From<u16> for Scalar {
+    fn from(i: u16) -> Self {
+        Self::Uint16(i)
+    }
+}
+
+impl From<u32> for Scalar {
+    fn from(i: u32) -> Self {
+        Self::Uint32(i)
+    }
+}
+
+impl From<u64> for Scalar {
+    fn from(i: u64) -> Self {
+        Self::Uint64(i)
     }
 }
 
@@ -741,6 +805,10 @@ impl PrimitiveType {
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
             Float => self.parse_str_as_scalar(raw, Scalar::Float),
             Double => self.parse_str_as_scalar(raw, Scalar::Double),
+            Uint8 => self.parse_str_as_scalar(raw, Scalar::Uint8),
+            Uint16 => self.parse_str_as_scalar(raw, Scalar::Uint16),
+            Uint32 => self.parse_str_as_scalar(raw, Scalar::Uint32),
+            Uint64 => self.parse_str_as_scalar(raw, Scalar::Uint64),
             Void => Err(self.parse_error(raw)),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
@@ -1171,6 +1239,30 @@ mod tests {
     #[case::normalization_overflow(PrimitiveType::Timestamp, "-262143-01-01T00:00:00+05:00")]
     fn test_timestamp_parse_fails(#[case] p_type: PrimitiveType, #[case] raw: &str) {
         assert!(p_type.parse_scalar(raw).is_err());
+    }
+
+    #[test]
+    fn unsigned_scalar_basics_and_unsigned_ordering() {
+        use crate::expressions::Scalar;
+        use crate::schema::DataType;
+        assert_eq!(
+            Scalar::Uint64(18446744073709551615).data_type(),
+            DataType::UINT64
+        );
+        assert_eq!(Scalar::Uint8(255).to_string(), "255");
+        // CRITICAL: unsigned ordering -- u64::MAX must be GREATER than 0 (not signed -1 < 0)
+        assert_eq!(
+            Scalar::Uint64(18446744073709551615).logical_partial_cmp(&Scalar::Uint64(0)),
+            Some(std::cmp::Ordering::Greater)
+        );
+        let s: Scalar = 255u8.into();
+        assert_eq!(s, Scalar::Uint8(255));
+        assert_eq!(
+            PrimitiveType::Uint64
+                .parse_scalar("18446744073709551615")
+                .unwrap(),
+            Scalar::Uint64(18446744073709551615)
+        );
     }
 
     #[test]

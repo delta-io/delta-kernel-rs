@@ -509,6 +509,13 @@ impl NullTypeTag {
                     // No FFI null tag for intervals; the sentinel avoids a new discriminant
                     (Self::NonPrimitive, 0, 0)
                 }
+                PrimitiveType::Uint8
+                | PrimitiveType::Uint16
+                | PrimitiveType::Uint32
+                | PrimitiveType::Uint64 => {
+                    // No FFI null tag for unsigned integers; the sentinel avoids a new discriminant
+                    (Self::NonPrimitive, 0, 0)
+                }
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this

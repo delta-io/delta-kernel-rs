@@ -344,6 +344,13 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 // TODO(#2811): add visit_interval_* callbacks; skipping silently drops the column
                 tracing::warn!("Skipping unsupported interval field '{name}' in FFI schema visit");
             }
+            &DataType::UINT8 | &DataType::UINT16 | &DataType::UINT32 | &DataType::UINT64 => {
+                // No visit_uint* callbacks yet (adding them is a C ABI change); skip rather than
+                // mapping to a signed callback, which would misrepresent the column type.
+                tracing::warn!(
+                    "Skipping unsupported unsigned integer field '{name}' in FFI schema visit"
+                );
+            }
         }
     }
 

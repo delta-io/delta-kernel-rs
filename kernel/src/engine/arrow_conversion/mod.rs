@@ -347,6 +347,10 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::Integer => Ok(ArrowDataType::Int32),
                     PrimitiveType::Short => Ok(ArrowDataType::Int16),
                     PrimitiveType::Byte => Ok(ArrowDataType::Int8),
+                    PrimitiveType::Uint8 => Ok(ArrowDataType::UInt8),
+                    PrimitiveType::Uint16 => Ok(ArrowDataType::UInt16),
+                    PrimitiveType::Uint32 => Ok(ArrowDataType::UInt32),
+                    PrimitiveType::Uint64 => Ok(ArrowDataType::UInt64),
                     PrimitiveType::Float => Ok(ArrowDataType::Float32),
                     PrimitiveType::Double => Ok(ArrowDataType::Float64),
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
@@ -556,10 +560,10 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             ArrowDataType::Int32 => Ok(DataType::INTEGER),
             ArrowDataType::Int16 => Ok(DataType::SHORT),
             ArrowDataType::Int8 => Ok(DataType::BYTE),
-            ArrowDataType::UInt64 => Ok(DataType::LONG), // undocumented type
-            ArrowDataType::UInt32 => Ok(DataType::INTEGER),
-            ArrowDataType::UInt16 => Ok(DataType::SHORT),
-            ArrowDataType::UInt8 => Ok(DataType::BYTE),
+            ArrowDataType::UInt64 => Ok(DataType::UINT64),
+            ArrowDataType::UInt32 => Ok(DataType::UINT32),
+            ArrowDataType::UInt16 => Ok(DataType::UINT16),
+            ArrowDataType::UInt8 => Ok(DataType::UINT8),
             ArrowDataType::Null => Ok(DataType::VOID),
             ArrowDataType::Float32 => Ok(DataType::FLOAT),
             ArrowDataType::Float64 => Ok(DataType::DOUBLE),
@@ -1163,5 +1167,21 @@ mod tests {
             ArrowField::new("element", ArrowDataType::Int32, true)
                 .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())].into()),
         )
+    }
+
+    #[test]
+    fn unsigned_kernel_arrow_roundtrip() {
+        for (k, a) in [
+            (PrimitiveType::Uint8, ArrowDataType::UInt8),
+            (PrimitiveType::Uint16, ArrowDataType::UInt16),
+            (PrimitiveType::Uint32, ArrowDataType::UInt32),
+            (PrimitiveType::Uint64, ArrowDataType::UInt64),
+        ] {
+            let kdt = DataType::Primitive(k.clone());
+            let arrow = ArrowDataType::try_from_kernel(&kdt).unwrap();
+            assert_eq!(arrow, a, "kernel->arrow for {k:?}");
+            let back = DataType::try_from_arrow(&a).unwrap();
+            assert_eq!(back, kdt, "arrow->kernel for {a:?}");
+        }
     }
 }

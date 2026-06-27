@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int16Type, Int32Type,
-    Int64Type, Int8Type, TimestampMicrosecondType,
+    Int64Type, Int8Type, TimestampMicrosecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
@@ -473,6 +473,30 @@ impl ArrowEngineData {
                     .map(|a| a as _)
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("long")
+            }
+            &DataType::UINT8 => {
+                debug!("Pushing uint8 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<UInt8Type>()
+                    .map(|a| a as _)
+                    .ok_or("uint8")
+            }
+            &DataType::UINT16 => {
+                debug!("Pushing uint16 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<UInt16Type>()
+                    .map(|a| a as _)
+                    .ok_or("uint16")
+            }
+            &DataType::UINT32 => {
+                debug!("Pushing uint32 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<UInt32Type>()
+                    .map(|a| a as _)
+                    .ok_or("uint32")
+            }
+            &DataType::UINT64 => {
+                debug!("Pushing uint64 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<UInt64Type>()
+                    .map(|a| a as _)
+                    .ok_or("uint64")
             }
             &DataType::FLOAT => {
                 debug!("Pushing float array for {}", ColumnName::new(path));
