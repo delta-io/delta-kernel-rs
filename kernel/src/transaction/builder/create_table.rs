@@ -25,10 +25,10 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    assign_column_mapping_metadata, find_max_column_id_in_schema,
-    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, ColumnMappingMode, EnablementCheck, FeatureType, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
+    find_max_column_id_in_schema, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
+    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -51,7 +51,7 @@ use crate::{DeltaResult, Engine, Error, StorageHandler};
 ///
 /// Feature signals (`delta.feature.X=supported`) are validated against this list.
 /// Only features in this list can be enabled via feature signals.
-const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
+pub(crate) const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // DomainMetadata is required for clustering and other system domain operations
     TableFeature::DomainMetadata,
     // ColumnMapping enables column mapping (name/id mode)
@@ -91,8 +91,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
 ];
 
 /// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
-/// key not present here is rejected.
-const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
+/// key not present here is rejected. ALTER TABLE reuses this list to validate `delta.*` keys.
+pub(crate) const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // ColumnMapping mode property: triggers column mapping transform
     COLUMN_MAPPING_MODE,
     // InCommitTimestamp enablement property: triggers ICT auto-enablement
@@ -191,34 +191,6 @@ impl ValidatedTableProperties {
     /// Returns `true` iff `properties[key] == "true"`.
     fn is_property_true(&self, key: &str) -> bool {
         self.properties.get(key).map(String::as_str) == Some("true")
-    }
-}
-
-/// Adds a feature to the appropriate reader/writer feature lists based on its type.
-///
-/// - ReaderWriter features are added to both reader and writer lists
-/// - Writer and Unknown features are added only to the writer list
-///
-/// This function is idempotent - it won't add duplicate features.
-fn add_feature_to_lists(
-    feature: TableFeature,
-    reader_features: &mut Vec<TableFeature>,
-    writer_features: &mut Vec<TableFeature>,
-) {
-    match feature.feature_type() {
-        FeatureType::ReaderWriter => {
-            if !reader_features.contains(&feature) {
-                reader_features.push(feature.clone());
-            }
-            if !writer_features.contains(&feature) {
-                writer_features.push(feature);
-            }
-        }
-        FeatureType::WriterOnly | FeatureType::Unknown => {
-            if !writer_features.contains(&feature) {
-                writer_features.push(feature);
-            }
-        }
     }
 }
 
@@ -436,30 +408,16 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
     }
 }
 
-/// Auto-enables allowed features whose [`EnablementCheck::EnabledIf`] check is satisfied by the
-/// table properties. Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they
-/// don't require property-driven enablement.
+/// Auto-enables allowed property-driven features from the table properties (see
+/// [`auto_enable_property_driven_features`]).
 fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
     let table_properties = TableProperties::from(validated.properties.iter());
-    for feature in ALLOWED_DELTA_FEATURES {
-        if let EnablementCheck::EnabledIf(check) = feature.info().enablement_check {
-            if check(&table_properties) {
-                add_feature_to_lists(
-                    feature.clone(),
-                    &mut validated.reader_features,
-                    &mut validated.writer_features,
-                );
-                // RowTracking requires DomainMetadata as a dependency
-                if *feature == TableFeature::RowTracking {
-                    add_feature_to_lists(
-                        TableFeature::DomainMetadata,
-                        &mut validated.reader_features,
-                        &mut validated.writer_features,
-                    );
-                }
-            }
-        }
-    }
+    auto_enable_property_driven_features(
+        ALLOWED_DELTA_FEATURES,
+        &table_properties,
+        &mut validated.reader_features,
+        &mut validated.writer_features,
+    );
 }
 
 /// Sets materialized column name properties when row tracking is enabled.

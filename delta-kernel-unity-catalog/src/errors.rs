@@ -34,10 +34,3 @@ pub(crate) fn upgrade_downgrade_unsupported(direction: &str) -> DeltaError {
         "Table {direction} is not yet supported by the UCCommitter"
     ))
 }
-
-pub(crate) fn alter_table_unsupported(what: &str) -> DeltaError {
-    DeltaError::generic(format!(
-        "UCCommitter does not support commits that change the table {what}. \
-         ALTER TABLE is not supported for catalog-managed tables."
-    ))
-}

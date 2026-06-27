@@ -18,8 +18,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
-    test_table_setup_mt, write_batch_to_table,
+    column_mapping_fixtures as fixtures, create_table_and_load_snapshot, read_actions_from_commit,
+    test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -840,6 +840,311 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
     assert!(
         msg.contains("column mapping") || msg.contains("columnMapping"),
         "error should mention column mapping, got: {msg}"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Table property tests
+// ============================================================================
+
+/// Reads a table property from a freshly-reloaded snapshot's metadata configuration.
+fn table_property(snap: &Snapshot, key: &str) -> Option<String> {
+    snap.table_configuration()
+        .metadata()
+        .configuration()
+        .get(key)
+        .cloned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_table_property_persists_in_evolved_metadata() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    snapshot
+        .alter_table()
+        .set_table_property("user.team", "delta")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    assert_eq!(
+        table_property(&reloaded, "user.team"),
+        Some("delta".to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unset_table_property_removes_entry() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("user.team", "delta")],
+    )?;
+    assert_eq!(
+        table_property(&snapshot, "user.team"),
+        Some("delta".to_string())
+    );
+
+    snapshot
+        .alter_table()
+        .unset_table_property("user.team")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    assert_eq!(table_property(&reloaded, "user.team"), None);
+    Ok(())
+}
+
+/// Setting then unsetting the same key in one ALTER yields the unset (last write wins), so the key
+/// is absent from the evolved metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_then_unset_same_key_in_one_alter_removes_entry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    snapshot
+        .alter_table()
+        .set_table_property("user.k", "v")
+        .unset_table_property("user.k")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    assert_eq!(table_property(&reloaded, "user.k"), None);
+    Ok(())
+}
+
+/// Unsetting then setting the same key in one ALTER yields the set (last write wins).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unset_then_set_same_key_in_one_alter_keeps_value() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("user.k", "old")],
+    )?;
+
+    snapshot
+        .alter_table()
+        .unset_table_property("user.k")
+        .set_table_property("user.k", "new")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    assert_eq!(table_property(&reloaded, "user.k"), Some("new".to_string()));
+    Ok(())
+}
+
+/// A property change that auto-enables a protocol feature (`delta.enableChangeDataFeed=true` ->
+/// `changeDataFeed`) must evolve the protocol: the feature appears in the reloaded protocol's
+/// writer features AND the commit JSON carries a `protocol` action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_property_enabling_feature_evolves_protocol() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    // Create a feature-based (3/7) table via deletionVectors so the ALTER can promote the protocol.
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.enableDeletionVectors", "true")],
+    )?;
+    let writer_features_before: HashSet<String> = snapshot
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .into_iter()
+        .flatten()
+        .map(|f| f.as_ref().to_string())
+        .collect();
+    assert!(!writer_features_before.contains("changeDataFeed"));
+
+    let committed = snapshot
+        .alter_table()
+        .set_table_property("delta.enableChangeDataFeed", "true")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let alter_version = committed.commit_version();
+
+    let reloaded = Snapshot::builder_for(table_path.clone()).build(engine.as_ref())?;
+    let writer_features_after: HashSet<String> = reloaded
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .into_iter()
+        .flatten()
+        .map(|f| f.as_ref().to_string())
+        .collect();
+    assert!(
+        writer_features_after.contains("changeDataFeed"),
+        "evolved protocol must list changeDataFeed, got {writer_features_after:?}"
+    );
+
+    // The ALTER commit must contain a protocol action (not just metadata).
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let protocols = read_actions_from_commit(&table_url, alter_version, "protocol")?;
+    assert_eq!(
+        protocols.len(),
+        1,
+        "feature-enabling ALTER must emit exactly one protocol action"
+    );
+    Ok(())
+}
+
+/// ALTER TABLE validates `delta.*` Set ops. Keys requiring create-time transforms
+/// (`delta.columnMapping.mode`, ...) and unknown `delta.*` keys are rejected; allowed `delta.*`
+/// keys and user keys succeed. Validation occurs before the property reaches the metadata.
+#[rstest]
+#[case::denied_column_mapping("delta.columnMapping.mode", "name", true)]
+#[case::denied_row_tracking("delta.enableRowTracking", "true", true)]
+#[case::denied_iceberg_compat_v3("delta.enableIcebergCompatV3", "true", true)]
+#[case::denied_in_commit_timestamps("delta.enableInCommitTimestamps", "true", true)]
+#[case::unknown_delta_key("delta.foo", "bar", true)]
+#[case::allowed_delta_key("delta.logRetentionDuration", "interval 7 days", false)]
+#[case::user_key("user.x", "y", false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_table_property_validates_delta_keys(
+    #[case] key: &str,
+    #[case] value: &str,
+    #[case] expect_error: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    // (3,7) table so an allowed feature-enablement key would be promotable; the cases here are
+    // about key validation, not protocol level.
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.enableDeletionVectors", "true")],
+    )?;
+
+    let result = snapshot
+        .alter_table()
+        .set_table_property(key, value)
+        .build(engine.as_ref(), committer());
+
+    if expect_error {
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains(key) && msg.contains("ALTER TABLE"),
+            "expected ALTER-TABLE rejection mentioning {key}, got: {msg}"
+        );
+    } else {
+        result?.commit(engine.as_ref())?.unwrap_committed();
+        let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+        assert_eq!(table_property(&reloaded, key), Some(value.to_string()));
+    }
+    Ok(())
+}
+
+/// On a legacy (1,1) protocol table that cannot record table features, enabling a feature via a
+/// property (`delta.enableChangeDataFeed=true`) is rejected rather than silently leaving the
+/// protocol inconsistent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_feature_property_on_legacy_protocol_errors() -> Result<(), Box<dyn std::error::Error>>
+{
+    let tmp = tempfile::tempdir()?;
+    let tmp_url = url::Url::from_directory_path(tmp.path())
+        .map_err(|_| delta_kernel::Error::generic("bad temp path"))?;
+    let (store, engine, table_location) =
+        test_utils::engine_store_setup("legacy_alter_feature", Some(&tmp_url));
+    // use_37_protocol = false -> a (1,1) legacy protocol that cannot hold table features.
+    let table_url = test_utils::create_table(
+        store,
+        table_location,
+        simple_schema(),
+        &[],
+        false,
+        vec![],
+        vec![],
+    )
+    .await?;
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    let msg = snapshot
+        .alter_table()
+        .set_table_property("delta.enableChangeDataFeed", "true")
+        .build(engine.as_ref(), committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("requires a (3,7) table-features protocol"),
+        "unexpected error: {msg}"
+    );
+    Ok(())
+}
+
+/// On a legacy (1,1) table whose configuration ALREADY carries a feature-enabling property
+/// (`delta.appendOnly=true`), an ALTER that sets an unrelated `user.*` property must succeed: the
+/// carried-over property is not something this ALTER enables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_unrelated_property_on_legacy_protocol_with_existing_feature_prop_succeeds(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, engine, table_location) =
+        test_utils::engine_store_setup("legacy_alter_existing_prop", None);
+    let engine = Arc::new(engine);
+
+    let schema = serde_json::to_string(&simple_schema())?;
+    let commit = serde_json::json!([
+        { "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } },
+        { "metaData": {
+            "id": "legacy-existing-prop",
+            "format": { "provider": "parquet", "options": {} },
+            "schemaString": schema,
+            "partitionColumns": [],
+            "configuration": { "delta.appendOnly": "true" },
+            "createdTime": 1677811175819u64,
+        }},
+    ])
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    test_utils::add_commit(table_location.as_str(), store.as_ref(), 0, commit).await?;
+
+    let snapshot = Snapshot::builder_for(table_location.clone()).build(engine.as_ref())?;
+    let protocol = snapshot.table_configuration().protocol();
+    assert!(
+        protocol.min_reader_version() == 1 && protocol.min_writer_version() == 2,
+        "fixture must be a legacy protocol"
+    );
+
+    snapshot
+        .alter_table()
+        .set_table_property("user.foo", "bar")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_location).build(engine.as_ref())?;
+    assert_eq!(
+        table_property(&reloaded, "user.foo"),
+        Some("bar".to_string())
+    );
+    assert_eq!(
+        table_property(&reloaded, "delta.appendOnly"),
+        Some("true".to_string())
     );
     Ok(())
 }

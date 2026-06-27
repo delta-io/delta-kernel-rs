@@ -58,7 +58,7 @@ cargo +nightly fmt \
 | `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
 | `delta_kernel_workloads`                 | `workloads/`                               | Shared workload spec types + SQL predicate parser       |
 | `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
-| `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
+| `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCCommitter, create-table helpers) |
 | `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
 | `unity-catalog-delta-rest-client`        | `unity-catalog-delta-rest-client/`         | Unity Catalog REST client                               |
 

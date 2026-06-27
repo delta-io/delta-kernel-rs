@@ -3,10 +3,10 @@
 <!-- Page type: How-to -->
 <!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-rest-client -->
 
-To read a Unity Catalog-managed Delta table, you resolve the table name through
-the UC REST API, fetch temporary storage credentials, load a Snapshot through
-the `UCKernelClient`, and then build a Scan exactly as you would for a
-filesystem-managed table.
+To read a Unity Catalog-managed Delta table, you load the table's metadata and
+inline commits through the UC REST API, fetch temporary storage credentials,
+build a Snapshot from those commits, and then build a Scan exactly as you would
+for a filesystem-managed table.
 
 Before reading this page, make sure you understand
 [Catalog-Managed Tables](../catalog_managed/overview.md) and the
@@ -37,42 +37,36 @@ to link against the system's TLS implementation. You need
 `unity-catalog-delta-client-api` directly to import types like `Operation`, since
 the REST client crate does not re-export them.
 
-## Step 1: Build the UC clients
+## Step 1: Build the UC client
 
-The UC integration uses two clients that share a `ClientConfig`:
-
-- `UCClient` handles table resolution (`get_table`) and credential vending
-  (`get_credentials`).
-- `UCCommitsRestClient` implements the `GetCommitsClient` trait, which
-  `UCKernelClient` uses to fetch ratified commits from the catalog.
+The read path uses a single `UCClient`, built from a `ClientConfig`:
 
 ```rust,ignore
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCCommitsRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 
 let config = ClientConfig::build(&endpoint, &token).build()?;
-let uc_client = UCClient::new(config.clone())?;
-let commits_client = UCCommitsRestClient::new(config)?;
+let uc_client = UCClient::new(config)?;
 ```
 
 The `endpoint` is your UC workspace URL (e.g. `"my-workspace.cloud.databricks.com"`),
 and `token` is a valid authentication token.
 
-## Step 2: Resolve the table name
+## Step 2: Load the table
 
-Call `get_table` with the three-level table name to get the table's storage
-location and table ID. The `table_id` identifies the table in UC's commits API,
-and the `storage_location` points to the table's root directory in cloud
-storage.
+Call `load_table` with the catalog, schema, and table names. A single call
+returns the table's metadata, any inline unpublished commits, and the latest
+catalog-known version.
 
 ```rust,ignore
-let table_info = uc_client.get_table("my_catalog.my_schema.my_table").await?;
-let table_id = &table_info.table_id;
-let table_uri = &table_info.storage_location;
+let resp = uc_client.load_table("my_catalog", "my_schema", "my_table").await?;
+let table_uri = &resp.metadata.location;
+let latest_version = resp.latest_table_version.unwrap_or_default() as u64;
 ```
 
-The `TablesResponse` also includes metadata like `catalog_name`, `schema_name`,
-`data_source_format`, and `table_type`. You can verify the table is a Delta
-table by calling `table_info.is_delta_table()`.
+`resp.metadata.location` points to the table's root directory in cloud storage.
+`resp.commits` holds the inline unpublished commits used to build the log tail
+in Step 5, and `resp.latest_table_version` is the highest version the catalog
+knows about.
 
 ## Step 3: Fetch temporary credentials
 
@@ -82,28 +76,24 @@ location. For a read operation, request `Operation::Read`:
 ```rust,ignore
 use unity_catalog_delta_client_api::Operation;
 
-let creds = uc_client.get_credentials(table_id, Operation::Read).await?;
+let creds = uc_client
+    .get_table_credentials("my_catalog", "my_schema", "my_table", Operation::Read)
+    .await?;
+let cred = creds.storage_credentials.into_iter().next()
+    .ok_or("No storage credentials in response")?;
 ```
 
-The returned `TemporaryTableCredentials` contains cloud-provider-specific
-credentials. For AWS, extract the temporary credentials:
-
-```rust,ignore
-let aws_creds = creds.aws_temp_credentials
-    .ok_or("No AWS temporary credentials in response")?;
-```
+The returned `CredentialsResponse` holds a list of `StorageCredential` entries.
+Each entry carries a storage `prefix` it applies to and a `config` map of
+provider-specific keys (for AWS, `s3.access-key-id`, `s3.secret-access-key`, and
+`s3.session-token`).
 
 > [!WARNING]
-> Vended credentials expire. The `TemporaryTableCredentials` struct provides
-> `expiration_time`, `is_expired()`, and `time_until_expiry()` to check
-> validity. If your scan takes longer than the credential lifetime, you need to
-> refresh credentials and rebuild the Engine before continuing. See
+> Vended credentials expire. `StorageCredential` provides `expiration_time_ms`,
+> `is_expired()`, and `time_until_expiry()` to check validity. If your scan
+> takes longer than the credential lifetime, refresh credentials and rebuild the
+> Engine before continuing. See
 > [Credential refresh](#credential-refresh-for-long-running-operations) below.
-
-> [!NOTE]
-> Today `TemporaryTableCredentials` only exposes `aws_temp_credentials`. Azure
-> and GCP credential vending are tracked in
-> [delta-io/delta-kernel-rs#2434](https://github.com/delta-io/delta-kernel-rs/issues/2434).
 
 ## Step 4: Build an Engine with vended credentials
 
@@ -118,9 +108,9 @@ use delta_kernel::object_store;
 let table_url = url::Url::parse(table_uri)?;
 let options = [
     ("region", "us-west-2"),
-    ("access_key_id", &aws_creds.access_key_id),
-    ("secret_access_key", &aws_creds.secret_access_key),
-    ("session_token", &aws_creds.session_token),
+    ("access_key_id", &cred.config["s3.access-key-id"]),
+    ("secret_access_key", &cred.config["s3.secret-access-key"]),
+    ("session_token", &cred.config["s3.session-token"]),
 ];
 let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
 let engine = DefaultEngineBuilder::new(store.into()).build();
@@ -130,30 +120,27 @@ The `.into()` converts the `Box<dyn ObjectStore>` returned by `parse_url_opts`
 into the `Arc<dyn ObjectStore>` that `DefaultEngineBuilder::new` expects. Set
 the `region` to match the bucket's actual AWS region.
 
-## Step 5: Load a Snapshot through UCKernelClient
+## Step 5: Build a Snapshot from the inline commits
 
-`UCKernelClient` wraps a `GetCommitsClient` and handles the full snapshot
-loading flow: it calls the UC commits API to get the latest ratified commits,
-translates them into `LogPath` entries, and builds a
-[Snapshot](../catalog_managed/reading.md) with the log tail.
+Convert the inline commits from Step 2 into a log tail with
+`log_tail_from_commits`, then pass it to `Snapshot::builder_for` along with the
+latest catalog version. Kernel uses the log tail to build a
+[Snapshot](../catalog_managed/reading.md) that includes commits not yet
+published to `_delta_log/`.
 
 ```rust,ignore
-use delta_kernel_unity_catalog::UCKernelClient;
+use delta_kernel::Snapshot;
+use delta_kernel_unity_catalog::log_tail_from_commits;
 
-let catalog = UCKernelClient::new(&commits_client);
-let snapshot = catalog.load_snapshot(table_id, table_uri, &engine).await?;
+let table_url = url::Url::parse(table_uri)?;
+let log_tail = log_tail_from_commits(&resp.commits, &table_url)?;
+let snapshot = Snapshot::builder_for(table_url)
+    .with_log_tail(log_tail)
+    .with_max_catalog_version(latest_version)
+    .build(&engine)?;
 
 println!("Table version: {}", snapshot.version());
 ```
-
-To read a specific version, use `load_snapshot_at`:
-
-```rust,ignore
-let snapshot = catalog.load_snapshot_at(table_id, table_uri, 5, &engine).await?;
-```
-
-The requested version must not exceed the latest version the catalog has
-ratified. If it does, `load_snapshot_at` returns an error.
 
 ## Step 6: Build and execute a Scan
 
@@ -182,40 +169,45 @@ use std::sync::Arc;
 
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel::object_store;
-use delta_kernel_unity_catalog::UCKernelClient;
+use delta_kernel::Snapshot;
+use delta_kernel_unity_catalog::log_tail_from_commits;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCCommitsRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Build UC clients
+    // 1. Build the UC client
     let config = ClientConfig::build(&endpoint, &token).build()?;
-    let uc_client = UCClient::new(config.clone())?;
-    let commits_client = UCCommitsRestClient::new(config)?;
+    let uc_client = UCClient::new(config)?;
 
-    // 2. Resolve the table name
-    let table_info = uc_client.get_table("my_catalog.my_schema.my_table").await?;
-    let table_id = &table_info.table_id;
-    let table_uri = &table_info.storage_location;
+    // 2. Load the table (metadata + inline commits + latest version)
+    let resp = uc_client.load_table("my_catalog", "my_schema", "my_table").await?;
+    let table_uri = &resp.metadata.location;
+    let latest_version = resp.latest_table_version.unwrap_or_default() as u64;
 
     // 3. Fetch temporary credentials
-    let creds = uc_client.get_credentials(table_id, Operation::Read).await?;
-    let aws_creds = creds.aws_temp_credentials
-        .ok_or("No AWS temporary credentials")?;
+    let creds = uc_client
+        .get_table_credentials("my_catalog", "my_schema", "my_table", Operation::Read)
+        .await?;
+    let cred = creds.storage_credentials.into_iter().next()
+        .ok_or("No storage credentials")?;
 
     // 4. Build an Engine with the vended credentials
     let table_url = url::Url::parse(table_uri)?;
     let (store, _) = object_store::parse_url_opts(&table_url, [
         ("region", "us-west-2"),
-        ("access_key_id", &aws_creds.access_key_id),
-        ("secret_access_key", &aws_creds.secret_access_key),
-        ("session_token", &aws_creds.session_token),
+        ("access_key_id", &cred.config["s3.access-key-id"]),
+        ("secret_access_key", &cred.config["s3.secret-access-key"]),
+        ("session_token", &cred.config["s3.session-token"]),
     ])?;
     let engine = DefaultEngineBuilder::new(store.into()).build();
 
-    // 5. Load the Snapshot via UCKernelClient
-    let catalog = UCKernelClient::new(&commits_client);
-    let snapshot = catalog.load_snapshot(table_id, table_uri, &engine).await?;
+    // 5. Build the Snapshot from the inline commits
+    let log_tail = log_tail_from_commits(&resp.commits, &table_url)?;
+    let snapshot = Snapshot::builder_for(table_url)
+        .with_log_tail(log_tail)
+        .with_max_catalog_version(latest_version)
+        .build(&engine)?;
     println!("Loaded table at version {}", snapshot.version());
 
     // 6. Build and execute the Scan
@@ -233,10 +225,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 UC vends temporary credentials with a limited lifetime. For short-lived scans,
 you don't need to worry about expiration. For long-running operations (large
-table scans, streaming reads), check `creds.is_expired()` or
-`creds.time_until_expiry()` before starting a new phase of work.
+table scans, streaming reads), check `cred.is_expired()` or
+`cred.time_until_expiry()` before starting a new phase of work.
 
-If credentials have expired, call `get_credentials` again and rebuild the
+If credentials have expired, call `get_table_credentials` again and rebuild the
 Engine with the fresh credentials before continuing. Kernel does not manage
 credential lifecycle for you.
 

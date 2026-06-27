@@ -1,4 +1,4 @@
-//! FFI hooks that enable constructing a CommitClient.
+//! FFI hooks that enable constructing a UpdateTableClient.
 
 use std::sync::Arc;
 
@@ -14,7 +14,9 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel_unity_catalog::UCCommitter;
 use tracing::debug;
 use unity_catalog_delta_client_api::{
-    CommitClient, CommitRequest as ClientCommitRequest, Result as ApiResult,
+    Result as ApiResult, Update as ClientUpdate, UpdateTableClient,
+    UpdateTableRequest as ClientUpdateTableRequest,
+    UpdateTableResponse as ClientUpdateTableResponse,
 };
 
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
@@ -46,7 +48,13 @@ pub struct CommitRequest {
 }
 
 /// The callback that will be called when the client wants to commit. Return `None` on success, or
-/// `Some("error description")` if an error occured.
+/// `Some(error)` if an error occurred.
+///
+/// # Safety
+///
+/// The `Some(...)` payload MUST be a `Handle<ExclusiveRustString>` produced by kernel's
+/// string-allocation FFI (e.g. `allocate_string`); kernel reclaims it via `Box::from_raw`. A
+/// null pointer or a handle from any other allocator is undefined behavior.
 // Note, it doesn't make sense to return an ExternResult here because that can't hold the string
 // error msg
 pub type CCommit = extern "C" fn(
@@ -64,40 +72,90 @@ pub struct FfiUCCommitClient {
 unsafe impl Send for FfiUCCommitClient {}
 unsafe impl Sync for FfiUCCommitClient {}
 
-impl CommitClient for FfiUCCommitClient {
+impl UpdateTableClient for FfiUCCommitClient {
     /// Commit a new version to the table.
-    async fn commit(&self, request: ClientCommitRequest) -> ApiResult<()> {
-        let table_id = request.table_id;
-        let table_uri = request.table_uri;
+    ///
+    /// Translates from the typed `requirements + updates`
+    /// `ClientUpdateTableRequest` into the FFI's flat C layout: `table_id` is
+    /// extracted from `AssertTableUuid`, `commit_info` from `AddCommit`,
+    /// `latest_backfilled_version` from `SetLatestBackfilledVersion`. The
+    /// `table_uri` field of the C layout is unused under the API and is
+    /// passed as the empty string. The `metadata` / `protocol` fields stay
+    /// `None`; any ALTER TABLE update the flat layout cannot carry is an error.
+    async fn update_table(
+        &self,
+        request: ClientUpdateTableRequest,
+    ) -> ApiResult<ClientUpdateTableResponse> {
+        // Pull the table id out of the requirements list. Kernel's UCCommitter
+        // always emits one assert-table-uuid; if it isn't there, fail loudly.
+        let table_id = request
+            .table_uuid()
+            .ok_or_else(|| {
+                unity_catalog_delta_client_api::Error::UnsupportedOperation(
+                    "FFI UC commit client requires an assert-table-uuid requirement".to_string(),
+                )
+            })?
+            .to_string();
+        let table_uri = String::new();
 
-        // there is a subtle issue here where we need to ensure that the string we use to refer to
-        // the commit_info.file_name stays in scope until _after_ the callback returns, so that the
-        // KernelStringSlice remains valid. This means we can't get clever with
-        // request.commit_info.map to build an Option<Commit>. Rather we just use a closure to hold
-        // the common code and call it from a scope where the string remains valid until after the
-        // closure finishes
+        // Error on any ALTER TABLE update the flat C layout cannot carry; dropping it would leave
+        // the staged commit file and the catalog out of sync.
+        let mut latest_backfilled: Option<i64> = None;
+        for update in &request.updates {
+            match update {
+                ClientUpdate::AddCommit { .. } => {}
+                ClientUpdate::SetLatestBackfilledVersion {
+                    latest_published_version,
+                } => {
+                    latest_backfilled = Some(*latest_published_version);
+                }
+                ClientUpdate::SetProperties { .. }
+                | ClientUpdate::RemoveProperties { .. }
+                | ClientUpdate::SetColumns { .. }
+                | ClientUpdate::SetTableComment { .. }
+                | ClientUpdate::SetPartitionColumns { .. }
+                | ClientUpdate::UpdateMetadataSnapshotVersion { .. }
+                | ClientUpdate::SetProtocol { .. }
+                | ClientUpdate::SetDomainMetadata { .. }
+                | ClientUpdate::RemoveDomainMetadata { .. } => {
+                    return Err(unity_catalog_delta_client_api::Error::UnsupportedOperation(
+                        "FFI UC commit client cannot forward ALTER TABLE updates (protocol, \
+                         properties, columns, or domain metadata)"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        let add_commit = request.add_commit().cloned();
+        // A backfill-only request carries no AddCommit, so there is no committed version to report.
+        let committed_version = add_commit.as_ref().map(|c| c.version);
 
-        let send_request = |commit_info| -> ApiResult<()> {
+        // The file-name `String` must outlive the callback so the KernelStringSlice pointing into
+        // it stays valid for the duration of the call.
+        let send_request = |commit_info| -> ApiResult<ClientUpdateTableResponse> {
             let c_commit_request = CommitRequest {
                 table_id: kernel_string_slice!(table_id),
                 table_uri: kernel_string_slice!(table_uri),
                 commit_info,
-                latest_backfilled_version: request.latest_backfilled_version.into(),
+                latest_backfilled_version: latest_backfilled.into(),
                 metadata: None.into(),
                 protocol: None.into(),
             };
 
             match (self.commit_callback)(self.context, c_commit_request) {
                 OptionalValue::Some(e) => {
-                    let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
-                    let s: String = *boxed_str; // move back onto the stack
+                    let boxed_str = unsafe { e.into_inner() };
+                    let s: String = *boxed_str;
                     Err(unity_catalog_delta_client_api::Error::Generic(s))
                 }
-                OptionalValue::None => Ok(()),
+                OptionalValue::None => Ok(ClientUpdateTableResponse {
+                    committed_version,
+                    etag: None,
+                }),
             }
         };
 
-        if let Some(client_commit_info) = request.commit_info {
+        if let Some(client_commit_info) = add_commit {
             let file_name = client_commit_info.file_name;
             let commit_info = Some(Commit {
                 version: client_commit_info.version,
@@ -149,11 +207,11 @@ pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUC
 
 // we need our own struct here because we want to override the calls to enter the tokio runtime
 // before calling into the standard committer
-struct FfiUCCommitter<C: CommitClient> {
+struct FfiUCCommitter<C: UpdateTableClient> {
     inner: UCCommitter<C>,
 }
 
-impl<C: CommitClient + 'static> Committer for FfiUCCommitter<C> {
+impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
@@ -200,25 +258,41 @@ impl<C: CommitClient + 'static> Committer for FfiUCCommitter<C> {
 /// # Safety
 ///
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
-///  calling [`get_uc_commit_client`], a valid KernelStringSlice as the table_id, and a valid error
-///  function pointer.
+///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
+///  `schema`, and `table_name`, and a valid error function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitClient>,
     table_id: KernelStringSlice,
+    catalog: KernelStringSlice,
+    schema: KernelStringSlice,
+    table_name: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    get_uc_committer_impl(commit_client, table_id).into_extern_result(&error_fn)
+    get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name)
+        .into_extern_result(&error_fn)
 }
 
 fn get_uc_committer_impl(
     commit_client: Handle<SharedFfiUCCommitClient>,
     table_id: KernelStringSlice,
+    catalog: KernelStringSlice,
+    schema: KernelStringSlice,
+    table_name: KernelStringSlice,
 ) -> DeltaResult<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitClient> = unsafe { commit_client.clone_as_arc() };
     let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
+    let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }?;
+    let schema_str: String = unsafe { TryFromStringSlice::try_from_slice(&schema) }?;
+    let table_name_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_name) }?;
     let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
-        inner: UCCommitter::new(client, table_id_str),
+        inner: UCCommitter::new(
+            client,
+            table_id_str,
+            catalog_str,
+            schema_str,
+            table_name_str,
+        ),
     });
     Ok(committer.into())
 }
@@ -242,7 +316,10 @@ pub(crate) mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use unity_catalog_delta_client_api::{Commit as ClientCommit, Error as ApiError};
+    use unity_catalog_delta_client_api::{
+        Commit as ClientCommit, Error as ApiError, Requirement as ApiRequirement,
+        Update as ApiUpdate,
+    };
 
     use super::*;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic};
@@ -317,6 +394,26 @@ pub(crate) mod tests {
         unsafe { free_uc_commit_client(client) };
     }
 
+    fn make_ffi_test_request(file_name: &str) -> ClientUpdateTableRequest {
+        ClientUpdateTableRequest::new(
+            "test_catalog",
+            "test_schema",
+            "test_table",
+            vec![ApiRequirement::AssertTableUuid {
+                uuid: "test_table_id".to_string(),
+            }],
+            vec![ApiUpdate::AddCommit {
+                commit: ClientCommit {
+                    version: 10,
+                    timestamp: 2000000000,
+                    file_name: file_name.to_string(),
+                    file_size: 1024,
+                    file_modification_timestamp: 2000000100,
+                },
+            }],
+        )
+    }
+
     #[tokio::test]
     async fn test_ffi_uc_commit_client_commit_success() {
         let context = get_test_context(false);
@@ -325,22 +422,9 @@ pub(crate) mod tests {
 
         let client_arc: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
 
-        let request = ClientCommitRequest {
-            table_id: "test_table_id".to_string(),
-            table_uri: "s3://bucket/path".to_string(),
-            commit_info: Some(ClientCommit {
-                version: 10,
-                timestamp: 2000000000,
-                file_name: "_staged_commits/00000000000000000010.uuid.json".to_string(),
-                file_size: 1024,
-                file_modification_timestamp: 2000000100,
-            }),
-            latest_backfilled_version: None,
-            metadata: None,
-            protocol: None,
-        };
+        let request = make_ffi_test_request("_staged_commits/00000000000000000010.uuid.json");
 
-        let result: ApiResult<()> = client_arc.commit(request).await;
+        let result: ApiResult<ClientUpdateTableResponse> = client_arc.update_table(request).await;
 
         assert!(result.is_ok());
 
@@ -349,7 +433,8 @@ pub(crate) mod tests {
         assert!(context.commit_called);
         let (table_id, table_uri) = context.last_commit_request.unwrap();
         assert_eq!(table_id, "test_table_id");
-        assert_eq!(table_uri, "s3://bucket/path");
+        // table_uri is unused under the UC API; it comes through as empty.
+        assert_eq!(table_uri, "");
         assert_eq!(
             context.last_staged_filename.unwrap(),
             "_staged_commits/00000000000000000010.uuid.json"
@@ -366,22 +451,9 @@ pub(crate) mod tests {
 
         let client_arc: Arc<FfiUCCommitClient> = unsafe { client.clone_as_arc() };
 
-        let request = ClientCommitRequest {
-            table_id: "test_table_id".to_string(),
-            table_uri: "s3://bucket/path".to_string(),
-            commit_info: Some(ClientCommit {
-                version: 10,
-                timestamp: 2000000000,
-                file_name: "00000000000000000010.uuid.json".to_string(),
-                file_size: 1024,
-                file_modification_timestamp: 2000000100,
-            }),
-            latest_backfilled_version: None,
-            metadata: None,
-            protocol: None,
-        };
+        let request = make_ffi_test_request("00000000000000000010.uuid.json");
 
-        let result: ApiResult<()> = client_arc.commit(request).await;
+        let result: ApiResult<ClientUpdateTableResponse> = client_arc.update_table(request).await;
 
         assert!(result.is_err());
 
@@ -403,10 +475,16 @@ pub(crate) mod tests {
         let client = unsafe { get_uc_commit_client(None, test_commit_callback) };
 
         let table_id = "test_table_id";
+        let catalog = "test_catalog";
+        let schema = "test_schema";
+        let table_name = "test_table";
         let committer = unsafe {
             ok_or_panic(get_uc_committer(
                 client.shallow_copy(),
                 kernel_string_slice!(table_id),
+                kernel_string_slice!(catalog),
+                kernel_string_slice!(schema),
+                kernel_string_slice!(table_name),
                 allocate_err,
             ))
         };

@@ -1,22 +1,26 @@
-//! REST client implementation for Unity Catalog Delta APIs.
+//! REST client implementations for the Unity Catalog Delta APIs.
 //!
-//! This crate provides HTTP-based implementations of the traits defined in
-//! [`unity_catalog_delta_client_api`].
+//! Two REST structs:
+//!
+//! - [`UCClient`] holds concrete (non-trait) HTTP methods for the connector-driven endpoints
+//!   (`load_table`, credentials, `/config`).
+//! - [`UCUpdateTableRestClient`] implements the [`UpdateTableClient`] trait against `update_table`
+//!   so kernel-uc's `UCCommitter` can dispatch through it.
+//!
+//! [`UpdateTableClient`]: unity_catalog_delta_client_api::UpdateTableClient
 //!
 //! # Example
 //!
 //! ```no_run
-//! use unity_catalog_delta_client_api::{CommitsRequest, GetCommitsClient};
-//! use unity_catalog_delta_rest_client::{ClientConfig, UCCommitsRestClient};
+//! use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let config = ClientConfig::build("uc.awesome.org", "your-token").build()?;
-//!     let client = UCCommitsRestClient::new(config)?;
+//!     let client = UCClient::new(config)?;
 //!
-//!     let request = CommitsRequest::new("table-id", "table-uri");
-//!     let commits = client.get_commits(request).await?;
-//!
+//!     let resp = client.load_table("main", "default", "my_table").await?;
+//!     println!("table id: {}", resp.metadata.table_uuid);
 //!     Ok(())
 //! }
 //! ```
@@ -30,6 +34,6 @@ pub mod models;
 #[cfg(test)]
 mod tests;
 
-pub use clients::{UCClient, UCCommitsRestClient};
+pub use clients::{UCClient, UCUpdateTableRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};

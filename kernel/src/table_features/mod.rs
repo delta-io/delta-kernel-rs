@@ -765,7 +765,8 @@ impl TableFeature {
 /// blanket impl `TryFrom<&str>` that `From<&str> for TableFeature` would trigger.
 ///
 /// Parsing is infallible: the `Unknown` default variant catches any unrecognized feature name. If
-/// https://github.com/Peternator7/strum/pull/432 merges, use impl From for TableFeature instead.
+/// <https://github.com/Peternator7/strum/pull/432> merges, use impl From for TableFeature instead.
+#[internal_api]
 pub(crate) trait IntoTableFeature {
     fn into_table_feature(self) -> TableFeature;
 }
@@ -816,6 +817,59 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
             .cloned()
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
+/// Reader-writer features go in both lists; writer-only (and unknown) features go in writer only.
+pub(crate) fn add_feature_to_lists(
+    feature: TableFeature,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    match feature.feature_type() {
+        FeatureType::ReaderWriter => {
+            if !reader_features.contains(&feature) {
+                reader_features.push(feature.clone());
+            }
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+        FeatureType::WriterOnly | FeatureType::Unknown => {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+    }
+}
+
+/// Enable each `allowed` feature whose [`EnablementCheck::EnabledIf`] check is satisfied by
+/// `props`, appending it to `reader_features`/`writer_features` (deduplicated). Features with
+/// [`EnablementCheck::AlwaysIfSupported`] are skipped since they need no property-driven
+/// enablement. `RowTracking` additionally pulls in its `DomainMetadata` dependency.
+///
+/// Shared by the CREATE and ALTER paths so property-to-feature promotion stays consistent.
+pub(crate) fn auto_enable_property_driven_features(
+    allowed: &[TableFeature],
+    props: &TableProperties,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    for feature in allowed {
+        if let EnablementCheck::EnabledIf(check) = feature.info().enablement_check {
+            if check(props) {
+                add_feature_to_lists(feature.clone(), reader_features, writer_features);
+                // RowTracking requires DomainMetadata as a dependency.
+                if *feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        reader_features,
+                        writer_features,
+                    );
+                }
+            }
+        }
     }
 }
 

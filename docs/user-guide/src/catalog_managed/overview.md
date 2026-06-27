@@ -174,11 +174,13 @@ The following pseudocode shows how a catalog client typically integrates with
 Kernel for reading. The exact API calls depend on your catalog.
 
 ```rust,ignore
-// 1. Resolve table name through catalog API
-//    catalog_client.get_table("catalog.schema.table") -> table_id, path, credentials
+// 1. Load the table through the catalog API. A single call typically returns
+//    the table metadata (path), recent commits, and the latest version.
+//    catalog_client.load_table("catalog", "schema", "table")
+//        -> path, commits, max_version
 
-// 2. Get ratified commits from catalog
-//    catalog_client.get_commits(table_id) -> commits, max_version
+// 2. Get credentials for the table's cloud storage
+//    catalog_client.get_credentials(...) -> credentials
 
 // 3. Convert catalog response to LogPath entries. If your catalog returns
 //    (version, uuid, ...) tuples, format the filename as {version:020}.{uuid}.json

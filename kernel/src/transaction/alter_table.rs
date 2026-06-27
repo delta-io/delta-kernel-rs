@@ -8,7 +8,7 @@
 
 use std::marker::PhantomData;
 
-use crate::committer::Committer;
+use crate::committer::{Committer, ProtocolMetadataIntent};
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
@@ -34,10 +34,20 @@ impl AlterTableTransaction {
     /// commit versioning and post-commit snapshots.
     ///
     /// This is typically called via `AlterTableTransactionBuilder::build()` rather than directly.
+    ///
+    /// `intents` are the protocol/metadata operations captured by the builder, threaded into the
+    /// commit so a committer can read the change directly instead of diffing read vs new P&M.
+    ///
+    /// `emit_protocol` must be true when the evolved protocol differs from the read snapshot's
+    /// protocol (e.g. a property change auto-enabled a feature). It controls both emitting the
+    /// Protocol action into the commit and populating `new_protocol` on the `CommitMetadata`, which
+    /// a catalog committer needs to forward the protocol change.
     pub(crate) fn try_new_alter_table(
         read_snapshot: SnapshotRef,
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
+        intents: Vec<ProtocolMetadataIntent>,
+        emit_protocol: bool,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
@@ -52,7 +62,7 @@ impl AlterTableTransaction {
             correlation_id: None,
             read_snapshot_opt: Some(read_snapshot),
             effective_table_config,
-            should_emit_protocol: false,
+            should_emit_protocol: emit_protocol,
             should_emit_metadata: true,
             committer,
             operation: Some("ALTER TABLE".to_string()),
@@ -72,6 +82,7 @@ impl AlterTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: None,
+            protocol_metadata_intents: intents,
             _state: PhantomData,
         })
     }
