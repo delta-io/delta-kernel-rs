@@ -2253,6 +2253,43 @@ mod tests {
     }
 
     #[test]
+    fn test_map_to_struct_ignores_undeclared_key() {
+        // A partition map can carry a key for a column the current schema no longer declares
+        // (a dropped or repartitioned column). MapToStruct projects only the declared output
+        // fields and ignores undeclared keys rather than erroring on them.
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.keys().append_value("created_at"); // dropped partition column, not in schema
+        builder.values().append_value("2024-01-15");
+        builder.append(true).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::nullable("region", DataType::STRING)]);
+        let result_type = DataType::from(output_schema);
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        // Only the declared `region` field is emitted; the undeclared `created_at` key is ignored.
+        assert_eq!(structs.num_columns(), 1);
+        let regions = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(regions.value(0), "us");
+    }
+
+    #[test]
     fn test_map_to_struct_parse_error() {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("count");

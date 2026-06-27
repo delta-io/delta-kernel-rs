@@ -143,7 +143,9 @@ mod tests {
         AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
     };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::scan::log_replay::{ScanLogReplayProcessor, ScanStatsOptions};
+    use crate::scan::log_replay::{
+        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+    };
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::StatsOptions;
@@ -210,6 +212,7 @@ mod tests {
             checkpoint_info,
             seen_file_keys,
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
     }
 

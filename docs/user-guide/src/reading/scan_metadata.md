@@ -246,6 +246,45 @@ If the scan has no predicate, this returns `None`.
 > physical predicate, and the `ScanFile` data together. Workers need all four to read files
 > correctly.
 
+## Typed partition values
+
+Kernel reads each file's partition values from the Delta log and exposes them on its
+`ScanFile` as a raw string map. Kernel's `transform_to_logical` could materialize them as
+typed columns. If your connector assembles output rows itself instead of using that transform,
+it parses the string map per file.
+
+To have Kernel hand you the typed values directly, opt in with `with_partition_values`:
+
+```rust,no_run
+# extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
+# use std::sync::Arc;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::scan::PartitionValuesOptions;
+# use delta_kernel::{DeltaResult, Snapshot};
+# fn example() -> DeltaResult<()> {
+# let url = delta_kernel::try_parse_uri("/tmp/table")?;
+# let store = store_from_url(&url)?;
+# let engine = DefaultEngine::builder(store).build();
+# let snapshot = Snapshot::builder_for(url).build(&engine)?;
+let scan = snapshot
+    .scan_builder()
+    .with_partition_values(PartitionValuesOptions::with_struct())
+    .build()?;
+# Ok(())
+# }
+```
+
+Scan metadata output then gains a top-level `partitionValues_parsed` column with one typed,
+nullable field per partition column (by physical name). You read it as a typed column instead
+of parsing the string map per file. The raw string map is still present, so this option only
+adds the typed column.
+
+> [!TIP]
+> When the checkpoint already stores typed partition values, Kernel reads that column directly
+> and skips parsing entirely.
+
 ## What's next
 
 - [Column Selection](./column_selection.md): projecting specific columns

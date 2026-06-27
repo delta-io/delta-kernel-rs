@@ -53,6 +53,14 @@ impl Default for ScanStatsOptions {
     }
 }
 
+/// Read-time partition value toggles consumed by [`ScanLogReplayProcessor`].
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ScanPartitionValuesOptions {
+    /// Emit the typed `partitionValues_parsed` struct column in scan metadata output,
+    /// independent of any predicate.
+    pub(crate) parsed_struct: bool,
+}
+
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -67,6 +75,8 @@ struct InternalScanState {
     physical_stats_schema: Option<SchemaRef>,
     #[serde(default)]
     stats_options: ScanStatsOptions,
+    #[serde(default)]
+    partition_values_options: ScanPartitionValuesOptions,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
     /// Physical leaf paths which are expected to have stats collected. Carried alongside
@@ -156,6 +166,8 @@ pub struct ScanLogReplayProcessor {
     seen_file_keys: HashSet<FileActionKey>,
     /// Read-time stats options.
     stats_options: ScanStatsOptions,
+    /// Read-time partition value options.
+    partition_values_options: ScanPartitionValuesOptions,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
@@ -179,6 +191,7 @@ impl ScanLogReplayProcessor {
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
         stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
@@ -187,6 +200,7 @@ impl ScanLogReplayProcessor {
             checkpoint_info,
             HashSet::with_capacity(dedup_capacity),
             stats_options,
+            partition_values_options,
         )
     }
 
@@ -201,12 +215,15 @@ impl ScanLogReplayProcessor {
     /// - `checkpoint_info`: Information about checkpoint reading for stats optimization
     /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
     /// - `stats_options`: Read-time stats options (see [`ScanStatsOptions`])
+    /// - `partition_values_options`: Read-time partition value options (see
+    ///   [`ScanPartitionValuesOptions`])
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
         stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
@@ -230,14 +247,22 @@ impl ScanLogReplayProcessor {
 
         // When skip_stats is enabled, disable both data column skipping and partition pruning.
         // Both rely on the same DataSkippingFilter columnar pass, so they are controlled together.
-        let (stats_schema_for_transform, partition_schema_for_transform) = if skip_stats {
-            (None, None)
+        let stats_schema_for_transform = if skip_stats {
+            None
         } else {
-            (
-                state_info.physical_stats_schema.clone(),
-                state_info.physical_partition_schema.clone(),
-            )
+            state_info.physical_stats_schema.clone()
         };
+
+        // The partition schema feeds two consumers: the DataSkippingFilter (predicate
+        // pruning, disabled by skip_stats together with stats) and the engine-facing
+        // `partitionValues_parsed` output column (requested via `parsed_struct`, independent
+        // of skip_stats). Either consumer keeps the transform emitting the column.
+        let partition_schema_for_transform =
+            if partition_values_options.parsed_struct || !skip_stats {
+                state_info.physical_partition_schema.clone()
+            } else {
+                None
+            };
 
         let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
@@ -301,6 +326,7 @@ impl ScanLogReplayProcessor {
             seen_file_keys,
             state_info,
             stats_options,
+            partition_values_options,
             checkpoint_info,
             metrics,
         })
@@ -363,6 +389,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             stats_options: self.stats_options,
+            partition_values_options: self.partition_values_options,
             physical_partition_schema,
             physical_stats_columns,
             is_catalog_managed,
@@ -434,6 +461,7 @@ impl ScanLogReplayProcessor {
             state.checkpoint_info,
             state.seen_file_keys,
             internal_state.stats_options,
+            internal_state.partition_values_options,
         )
     }
 }
@@ -580,7 +608,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
-            (&names[..7], &types[..7])
+            let add_count = ScanLogReplayProcessor::REMOVE_PATH_INDEX;
+            (&names[..add_count], &types[..add_count])
         }
     }
 
@@ -649,11 +678,14 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     ]))
 });
 
-/// Build the scan row schema with optional `stats_parsed` and `partitionValues_parsed` columns.
+/// Build the scan-row schema, appending the opt-in typed `stats_parsed` / `partitionValues_parsed`
+/// columns when requested.
 ///
-/// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
-/// When `partition_schema` is provided, adds a `partitionValues_parsed` struct column with that
-/// schema.
+/// These typed columns are appended at the top level (siblings of `fileConstantValues`) rather than
+/// nested inside it. This mirrors `stats_parsed`, keeps `fileConstantValues` a fixed shape
+/// regardless of the engine's options, and keeps data-skipping paths uniform:
+/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. The checkpoint source
+/// is also `add.partitionValues_parsed`, a sibling of `add.stats_parsed`.
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
@@ -750,7 +782,8 @@ fn get_add_transform_expr(
         fields.push(Arc::new(stats_parsed_expr));
     }
 
-    // Add partitionValues_parsed when partition columns are needed for data skipping
+    // Add partitionValues_parsed when partition columns are needed for data skipping or for the
+    // engine-facing typed output column.
     if partition_schema.is_some() {
         let pv_parsed_expr = if has_partition_values_parsed {
             // Checkpoint has partitionValues_parsed column - read directly
@@ -972,12 +1005,18 @@ pub(crate) fn scan_action_iter(
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
+    partition_values_options: ScanPartitionValuesOptions,
 ) -> DeltaResult<(
     impl Iterator<Item = DeltaResult<ScanMetadata>>,
     Arc<ScanMetrics>,
 )> {
-    let processor =
-        ScanLogReplayProcessor::new(engine, state_info, checkpoint_info, stats_options)?;
+    let processor = ScanLogReplayProcessor::new(
+        engine,
+        state_info,
+        checkpoint_info,
+        stats_options,
+        partition_values_options,
+    )?;
     let metrics = processor.metrics.clone();
     Ok((processor.process_actions_iter(action_iter), metrics))
 }
@@ -991,7 +1030,7 @@ mod tests {
 
     use super::{
         get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanStatsOptions, SerializableScanState,
+        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
@@ -1127,6 +1166,7 @@ mod tests {
             state_info,
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         for res in iter {
@@ -1155,6 +1195,7 @@ mod tests {
             Arc::new(state_info),
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1241,6 +1282,7 @@ mod tests {
             Arc::new(state_info),
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1286,6 +1328,7 @@ mod tests {
             Arc::new(get_simple_state_info(schema.clone(), vec![]).unwrap()),
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1358,6 +1401,7 @@ mod tests {
             state_info.clone(),
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1415,6 +1459,7 @@ mod tests {
             state_info.clone(),
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1457,6 +1502,7 @@ mod tests {
                 state_info,
                 checkpoint_info.clone(),
                 ScanStatsOptions::default(),
+                ScanPartitionValuesOptions::default(),
             )
             .unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1495,6 +1541,7 @@ mod tests {
             state_info,
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let serialized = processor.into_serializable_state().unwrap();
@@ -1530,6 +1577,7 @@ mod tests {
             state_info,
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let serialized = processor.into_serializable_state().unwrap();
@@ -1563,6 +1611,7 @@ mod tests {
             state_info,
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1605,6 +1654,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             stats_options: ScanStatsOptions::default(),
+            partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
@@ -1640,6 +1690,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             stats_options: ScanStatsOptions::default(),
+            partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
@@ -1712,6 +1763,7 @@ mod tests {
                 skip_stats: true,
                 ..Default::default()
             },
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1802,6 +1854,7 @@ mod tests {
             Arc::new(state_info),
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
