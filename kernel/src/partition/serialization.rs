@@ -87,6 +87,10 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Short(v) => Ok(Some(v.to_string())),
         Scalar::Integer(v) => Ok(Some(v.to_string())),
         Scalar::Long(v) => Ok(Some(v.to_string())),
+        Scalar::Uint8(v) => Ok(Some(v.to_string())),
+        Scalar::Uint16(v) => Ok(Some(v.to_string())),
+        Scalar::Uint32(v) => Ok(Some(v.to_string())),
+        Scalar::Uint64(v) => Ok(Some(v.to_string())),
         Scalar::Float(v) => Ok(Some(format_f32(*v))),
         Scalar::Double(v) => Ok(Some(format_f64(*v))),
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
@@ -326,6 +330,28 @@ mod tests {
         assert_eq!(
             serialize_partition_value(&input).unwrap(),
             Some(expected.to_string())
+        );
+    }
+
+    /// Unsigned integer partition values round-trip: serialize -> parse_scalar -> compare.
+    /// Covers the full width per type, including u64::MAX which overflows i64.
+    #[rstest]
+    #[case::uint8_zero(Scalar::Uint8(0), PrimitiveType::Uint8)]
+    #[case::uint8_max(Scalar::Uint8(u8::MAX), PrimitiveType::Uint8)]
+    #[case::uint16_max(Scalar::Uint16(u16::MAX), PrimitiveType::Uint16)]
+    #[case::uint32_max(Scalar::Uint32(u32::MAX), PrimitiveType::Uint32)]
+    #[case::uint64_max(Scalar::Uint64(u64::MAX), PrimitiveType::Uint64)]
+    fn test_unsigned_partition_value_roundtrip(
+        #[case] input: Scalar,
+        #[case] primitive_type: PrimitiveType,
+    ) {
+        let serialized = serialize_partition_value(&input)
+            .unwrap()
+            .expect("non-null unsigned value should serialize to Some");
+        let parsed = primitive_type.parse_scalar(&serialized).unwrap();
+        assert_eq!(
+            input, parsed,
+            "roundtrip failed: serialized as '{serialized}'"
         );
     }
 
