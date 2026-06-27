@@ -1611,6 +1611,7 @@ mod tests {
             state_info,
             test_checkpoint_info(),
             ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
