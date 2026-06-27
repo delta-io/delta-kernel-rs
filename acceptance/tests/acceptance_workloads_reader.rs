@@ -174,7 +174,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "void_007_void_with_backticks/specs/void_007_void_with_backticks_read_all",
         ],
     ),
-    // Partitioned interval columns need a Scalar::Interval to materialize, not yet supported.
+    // partition values need Scalar::Interval; not yet supported
     (
         "Interval partition values not supported (needs Scalar::Interval)",
         &["intv_003_interval_partitioned/specs/intv_003_interval_partitioned_read_all"],

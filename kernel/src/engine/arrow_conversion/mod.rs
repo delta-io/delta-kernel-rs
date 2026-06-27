@@ -709,6 +709,18 @@ mod tests {
         Ok(())
     }
 
+    // Asserts forward direction of Interval column mapping (year-month/day-time to Int32/Int64)
+    #[rstest]
+    #[case(DataType::INTERVAL_YEAR_MONTH, ArrowDataType::Int32)]
+    #[case(DataType::INTERVAL_DAY_TIME, ArrowDataType::Int64)]
+    fn test_interval_type_arrow_conversion(
+        #[case] kernel_type: DataType,
+        #[case] expected: ArrowDataType,
+    ) -> DeltaResult<()> {
+        assert_eq!(ArrowDataType::try_from_kernel(&kernel_type)?, expected);
+        Ok(())
+    }
+
     // Millisecond-precision timestamps (e.g. from externally-written checkpoint stats)
     // must convert like microsecond/nanosecond: UTC tz -> TIMESTAMP, no tz -> TIMESTAMP_NTZ.
     #[test]
@@ -794,15 +806,6 @@ mod tests {
             .to_string()
             .contains("Incorrect Variant Schema"));
         Ok(())
-    }
-
-    // Make sure that interval types error gracefully since unsupported
-    #[rstest]
-    #[case(DataType::INTERVAL_YEAR_MONTH)]
-    #[case(DataType::INTERVAL_DAY_TIME)]
-    fn test_interval_type_arrow_conversion_unsupported(#[case] dt: DataType) {
-        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
-        assert!(matches!(result.unwrap_err(), ArrowError::SchemaError(_)));
     }
 
     /// Helper visitor to collect all field IDs from a kernel StructType
