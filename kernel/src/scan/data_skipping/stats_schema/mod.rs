@@ -387,6 +387,10 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
             | &PrimitiveType::Short
             | &PrimitiveType::Integer
             | &PrimitiveType::Long
+            | &PrimitiveType::Uint8
+            | &PrimitiveType::Uint16
+            | &PrimitiveType::Uint32
+            | &PrimitiveType::Uint64
             | &PrimitiveType::Float
             | &PrimitiveType::Double
             | &PrimitiveType::Date
