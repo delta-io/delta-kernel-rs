@@ -350,6 +350,9 @@ impl<S> Transaction<S> {
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
+        // Fields-only event: these feed the `txn.commit` metric via the layer's `on_event`
+        // channel. `num_dv_updates` has no other source (it is not a declared span field and
+        // gets no `span.record` below), so this event must keep its structured fields.
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),

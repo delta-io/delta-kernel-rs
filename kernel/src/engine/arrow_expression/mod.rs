@@ -213,6 +213,11 @@ impl Scalar {
                     "Variant is not supported as scalar yet.",
                 ));
             }
+            DataType::INTERVAL_YEAR_MONTH | DataType::INTERVAL_DAY_TIME => {
+                return Err(Error::unsupported(
+                    "Interval is not supported as scalar yet.",
+                ));
+            }
         }
         Ok(())
     }

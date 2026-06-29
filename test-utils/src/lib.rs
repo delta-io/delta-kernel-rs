@@ -56,6 +56,7 @@ macro_rules! define_sweeps {
         feature_set_values = $fs:tt,
         data_layout_values = $dl:tt,
         table_config_values = $tc:tt,
+        layout_config_values = $lc:tt,
         version_target_values = $vt:tt $(,)?
     ) => {
         #[template]
@@ -64,8 +65,7 @@ macro_rules! define_sweeps {
         pub fn default_sweep(
             #[values $ls] log_state: LogState,
             #[values $fs] feature_set: FeatureSet,
-            #[values $dl] data_layout: DataLayoutConfig,
-            #[values $tc] table_config: TableConfig,
+            #[values $lc] layout_config: (DataLayoutConfig, TableConfig),
             #[values $vt] version_target: VersionTarget,
         ) {
         }
@@ -133,15 +133,34 @@ define_sweeps! {
         checkpoint_struct_stats(),
         no_checkpoint_stats()
     ),
-    // TODO: ICT read assertions (needs pub get_in_commit_timestamp) + AtTimestamp
-    //       VersionTarget (timestamp time travel via history_manager::latest_version_as_of).
+    // Data layout and stats config are bundled into one axis rather than crossed: this
+    // sweep round-trips each pairing with no predicate, so the stats config can't affect
+    // the version or row-count assertions, and crossing the two would add cases without
+    // adding coverage. Skipping behavior is asserted in predicate-bearing unit tests.
+    layout_config_values = (
+        (unpartitioned(), no_checkpoint_stats()),
+        (partitioned(), with_json_stats(num_indexed_cols_zero())),
+        (clustered(), with_struct_stats(num_indexed_cols_zero())),
+        (unpartitioned(), with_json_stats(num_indexed_cols_narrow())),
+        (partitioned(), with_struct_stats(num_indexed_cols_narrow())),
+        (clustered(), with_json_stats(num_indexed_cols_all())),
+        (unpartitioned(), with_struct_stats(num_indexed_cols_all())),
+        (partitioned(), with_json_stats(stats_columns_empty())),
+        (clustered(), with_struct_stats(stats_columns_empty())),
+        (unpartitioned(), with_json_stats(stats_columns_reordered())),
+        (partitioned(), with_struct_stats(stats_columns_reordered()))
+    ),
+    // `version_at_timestamp_max()` is the only timestamp row; see its docs for why
+    // intermediate-version resolution lives in a dedicated test instead.
     version_target_values = (
         version_latest(),
         version_at_mid(),
-        version_incremental_to_latest()
+        version_incremental_from_mid_to_latest(),
+        version_incremental_from_mid_to_pre_latest(),
+        version_at_timestamp_max()
     ),
 }
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
@@ -152,11 +171,13 @@ use delta_kernel::actions::{
     get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
+    RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
+};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
@@ -172,10 +193,12 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, FileMeta,
+    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, Error, FileMeta,
     FilteredEngineData, LogPath, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
@@ -589,6 +612,10 @@ pub fn engine_store_setup(
     (storage, engine, url)
 }
 
+/// Fixed in-commit timestamp (milliseconds since the Unix epoch) written by [`create_table`] when
+/// the `inCommitTimestamp` writer feature is enabled.
+pub const TEST_ICT_ENABLEMENT_TIMESTAMP: i64 = 1612345678;
+
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 // For property-gated writer features, this helper also writes the corresponding enablement
@@ -649,7 +676,7 @@ pub async fn create_table(
             );
             config.insert(
                 "delta.inCommitTimestampEnablementTimestamp".to_string(),
-                json!("1612345678"),
+                json!(TEST_ICT_ENABLEMENT_TIMESTAMP.to_string()),
             );
         }
         if writer_features.contains(&"changeDataFeed") {
@@ -682,7 +709,7 @@ pub async fn create_table(
     // Add commitInfo with ICT if ICT is enabled
     let commit_info = if writer_features.contains(&"inCommitTimestamp") {
         // When ICT is enabled from version 0, we need to include it in the initial commit
-        let timestamp = 1612345678i64; // Use a fixed timestamp for testing
+        let timestamp = TEST_ICT_ENABLEMENT_TIMESTAMP;
         Some(json!({
             "commitInfo": {
                 "timestamp": timestamp,
@@ -721,6 +748,39 @@ pub async fn create_table(
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
     Ok(table_path)
+}
+
+/// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level
+/// fields.
+///
+/// `column_defaults` maps `column_name -> default_sql`. The raw SQL is stored verbatim; this
+/// helper does not parse or validate it.
+///
+/// # Errors
+///
+/// Returns an error if `column_defaults` names a column that is not a top-level field of `schema`.
+pub fn schema_with_column_defaults(
+    schema: &StructType,
+    mut column_defaults: HashMap<&str, &str>,
+) -> DeltaResult<SchemaRef> {
+    let augmented_fields: Vec<_> = schema
+        .fields()
+        .map(|field| match column_defaults.remove(field.name.as_str()) {
+            Some(sql) => field.clone().add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::String(sql.to_string()),
+            )]),
+            None => field.clone(),
+        })
+        .collect();
+    if !column_defaults.is_empty() {
+        return Err(Error::generic(format!(
+            "column defaults reference unknown top-level columns: {:?}",
+            column_defaults.into_keys().collect::<Vec<_>>()
+        )));
+    }
+
+    Ok(Arc::new(StructType::try_new(augmented_fields)?))
 }
 
 /// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
@@ -1130,6 +1190,33 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
     }
 }
 
+/// Collect `row_id` values from scan batches produced with a `MetadataColumnSpec::RowId` schema.
+pub fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("row_id")
+                .expect("row_id column not found in batch")
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Assert every `row_id` across the batches is unique.
+pub fn assert_row_ids_unique(batches: &[RecordBatch]) {
+    let row_ids = collect_row_ids(batches);
+    let unique: HashSet<i64> = row_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        row_ids.len(),
+        "row IDs must be globally unique: found {} duplicate(s) among {} row(s)",
+        row_ids.len() - unique.len(),
+        row_ids.len(),
+    );
+}
+
 /// Creates add file metadata for one or more files without partition values.
 ///
 /// Each tuple contains `(file_path, file_size, mod_time, num_records)`. `num_records` is
@@ -1468,6 +1555,35 @@ pub fn get_materialized_row_tracking_column_names(
             .as_str()
             .map(str::to_owned),
     })
+}
+
+/// Reads the `metaData.configuration` map from commit `version` directly through a
+/// [`DynObjectStore`]. Works with any backing store (`file://`, `memory://`, etc.) since
+/// it bypasses [`read_actions_from_commit`]'s `to_file_path()` requirement.
+///
+/// Returns an empty map when the commit contains no `metaData` action, or when the
+/// action has an empty/absent `configuration` field. Errors if any configuration value is
+/// not a string (the spec requires all configuration entries to be strings).
+/// Propagates object-store errors when the commit file is missing or unreadable.
+pub async fn read_metadata_configuration_from_store(
+    store: &DynObjectStore,
+    version: u64,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let path =
+        delta_kernel::object_store::path::Path::from(format!("_delta_log/{version:020}.json"));
+    let get_result = store.get(&path).await?;
+    let bytes = get_result.bytes().await?;
+    let mut config = HashMap::new();
+    for line in std::str::from_utf8(&bytes)?.lines() {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
+            if c.is_object() {
+                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+                config.extend(entries);
+            }
+        }
+    }
+    Ok(config)
 }
 
 /// Removes all scan files from the snapshot, commits the transaction, and returns

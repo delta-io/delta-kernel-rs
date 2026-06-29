@@ -31,11 +31,13 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
-    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
-    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
-    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
+    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
+    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
+    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
     SET_TRANSACTION_RETENTION_DURATION,
 };
@@ -88,11 +90,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergCompatV3,
 ];
 
-/// Delta properties allowed to be set during CREATE TABLE.
-///
-/// This list will expand as more features are supported.
-/// The allow list will be deprecated once auto feature enablement is implemented
-/// like the Java Kernel.
+/// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
+/// key not present here is rejected.
 const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // ColumnMapping mode property: triggers column mapping transform
     COLUMN_MAPPING_MODE,
@@ -101,6 +100,10 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // Checkpoint stats format properties
     CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    // Data skipping stats configuration. Neither property enables a feature; both control
+    // the per-file stats schema the writer collects.
+    DATA_SKIPPING_NUM_INDEXED_COLS,
+    DATA_SKIPPING_STATS_COLUMNS,
     // Property-driven feature enablement properties
     ENABLE_DELETION_VECTORS,
     ENABLE_CHANGE_DATA_FEED,
@@ -114,6 +117,12 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
+    // Log/checkpoint maintenance configs: stored verbatim, consumed by log cleanup / checkpoint
+    // scheduling.
+    LOG_RETENTION_DURATION,
+    DELETED_FILE_RETENTION_DURATION,
+    ENABLE_EXPIRED_LOG_CLEANUP,
+    CHECKPOINT_INTERVAL,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -727,7 +736,7 @@ fn validate_extract_table_features_and_properties(
         }
     }
 
-    // Validate remaining delta.* properties against allow list
+    // Validate remaining delta.* properties against the allow list
     for key in properties.keys() {
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
@@ -1097,6 +1106,56 @@ mod tests {
         assert_eq!(
             validated.properties.get(PARQUET_FORMAT_VERSION),
             Some(&"2.12.0".to_string()),
+        );
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::num_indexed_cols_cap(DATA_SKIPPING_NUM_INDEXED_COLS, "16")]
+    #[case::num_indexed_cols_all(DATA_SKIPPING_NUM_INDEXED_COLS, "-1")]
+    #[case::stats_columns_multi(DATA_SKIPPING_STATS_COLUMNS, "a,b,c")]
+    #[case::stats_columns_single(DATA_SKIPPING_STATS_COLUMNS, "a")]
+    fn test_data_skipping_properties_accepted(#[case] key: &str, #[case] value: &str) {
+        let properties = HashMap::from([(key.to_string(), value.to_string())]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(validated.properties.get(key), Some(&value.to_string()));
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_maintenance_properties_accepted() {
+        // Log/checkpoint maintenance configs are metadata-only: accepted at CREATE, stored
+        // verbatim, and enable no table feature.
+        let properties = HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 30 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+            (ENABLE_EXPIRED_LOG_CLEANUP.to_string(), "true".to_string()),
+            (CHECKPOINT_INTERVAL.to_string(), "10".to_string()),
+        ]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(LOG_RETENTION_DURATION),
+            Some(&"interval 30 days".to_string()),
+        );
+        assert_eq!(
+            validated.properties.get(DELETED_FILE_RETENTION_DURATION),
+            Some(&"interval 7 days".to_string()),
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_EXPIRED_LOG_CLEANUP),
+            Some(&"true".to_string()),
+        );
+        assert_eq!(
+            validated.properties.get(CHECKPOINT_INTERVAL),
+            Some(&"10".to_string()),
         );
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());

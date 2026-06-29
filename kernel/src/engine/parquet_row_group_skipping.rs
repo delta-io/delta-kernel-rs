@@ -194,6 +194,7 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
+        (IntervalYearMonth | IntervalDayTime, _) => return None,
         (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::FixedLenByteArray(b)) => {
@@ -240,6 +241,7 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
+        (IntervalYearMonth | IntervalDayTime, _) => return None,
         (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
         (Decimal(d), Statistics::FixedLenByteArray(b)) => {

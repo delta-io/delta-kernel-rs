@@ -42,10 +42,9 @@ fn try_create_from_parquet(
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let reader_options = reader_options();
-    let metadata = ArrowReaderMetadata::load(&data, reader_options.clone())?;
+    let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
     let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(data, reader_options)?;
+    let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(data, metadata.clone());
     let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
