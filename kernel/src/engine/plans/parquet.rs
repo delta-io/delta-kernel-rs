@@ -33,9 +33,6 @@ impl ParquetHandler for PlanBasedParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
         let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?.build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
@@ -139,17 +136,18 @@ mod tests {
         );
     }
 
-    /// No files -> an absent plan -> an empty data iterator (no rows, no error).
+    /// No files -> an absent plan -> a zero-row result (no rows, no error).
     #[test]
     fn test_read_parquet_files_empty_is_empty() {
         let schema: SchemaRef = Arc::new(
             StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
         );
-        let count = make_handler()
+        let rows: usize = make_handler()
             .read_parquet_files(&[], schema, None)
             .unwrap()
-            .count();
-        assert_eq!(count, 0);
+            .map(|batch| batch.unwrap().len())
+            .sum();
+        assert_eq!(rows, 0);
     }
 
     // TODO(#2618): Restore once `PlanBasedParquetHandler` moves to delta_kernel_default_engine

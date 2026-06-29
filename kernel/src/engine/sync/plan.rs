@@ -13,12 +13,18 @@ use bytes::Bytes;
 use super::json::SyncJsonHandler;
 use super::parquet::SyncParquetHandler;
 use super::storage::SyncStorageHandler;
+use crate::arrow::array::{Array, ArrayRef, RecordBatch};
+use crate::arrow::compute::concat;
+use crate::engine::arrow_conversion::TryIntoArrow as _;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::expressions::Scalar;
 use crate::object_store::DynObjectStore;
-use crate::plans::ir::nodes::{Operator, ScanJson, ScanParquet};
+use crate::plans::ir::nodes::{Operator, ScanJson, ScanParquet, Values};
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::{
-    DeltaResult, Error, FileMeta, JsonHandler as _, ParquetHandler as _, StorageHandler as _,
+    DeltaResult, EngineData, Error, FileMeta, JsonHandler as _, ParquetHandler as _,
+    StorageHandler as _,
 };
 
 /// A synchronous, test-only [`PlanExecutor`] that delegates to [`SyncStorageHandler`],
@@ -117,8 +123,13 @@ impl SyncPlanExecutor {
                 let iter = self.parquet.read_parquet_files(&files, schema, None)?;
                 Ok(PlanResult::Data(iter))
             }
+            Operator::Values(values) => {
+                let data = values_to_engine_data(values)?;
+                Ok(PlanResult::Data(Box::new(std::iter::once(Ok(data)))))
+            }
             other => Err(Error::generic(format!(
-                "SyncPlanExecutor only supports ScanJson / ScanParquet, got Operator::{other}",
+                "SyncPlanExecutor only supports ScanJson / ScanParquet / Values, got \
+                 Operator::{other}",
             ))),
         }
     }
@@ -133,4 +144,27 @@ fn into_single_node_plan(plan: Plan) -> DeltaResult<PlanNode> {
         ))
     })?;
     Ok(node)
+}
+
+/// Materialize a [`Values`] node's literal rows into [`EngineData`]. Each column concatenates one
+/// single-row array per row onto a zero-row seed, so any row count works -- including the empty
+/// relation [`PlanBuilder::build`] produces for an absent input.
+///
+/// [`PlanBuilder::build`]: crate::plans::PlanBuilder::build
+fn values_to_engine_data(values: Values) -> DeltaResult<Box<dyn EngineData>> {
+    let Values { schema, rows } = values;
+    let columns: Vec<ArrayRef> = schema
+        .fields()
+        .enumerate()
+        .map(|(col, field)| {
+            let mut parts = vec![Scalar::Null(field.data_type().clone()).to_array(0)?];
+            for row in &rows {
+                parts.push(row[col].to_array(1)?);
+            }
+            let parts: Vec<&dyn Array> = parts.iter().map(AsRef::as_ref).collect();
+            Ok(concat(&parts)?)
+        })
+        .collect::<DeltaResult<_>>()?;
+    let batch = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), columns)?;
+    Ok(Box::new(ArrowEngineData::new(batch)))
 }

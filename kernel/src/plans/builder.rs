@@ -1,11 +1,14 @@
 //! Fluent builder for declarative [`Plan`]s: a source, chained transforms, then
-//! [`PlanBuilder::build`]. Each transform consumes `self` and returns a new builder; clone a
-//! builder (cheap) to feed it into more than one transform. Validating methods return
-//! [`DeltaResult`] and surface errors at the call site.
+//! [`PlanBuilder::build`] / [`PlanBuilder::build_opt`]. Each transform consumes `self` and returns
+//! a new builder; clone a builder (cheap) to feed it into more than one transform. Validating
+//! methods return [`DeltaResult`] and surface errors at the call site.
 //!
-//! A source with no rows (e.g. a scan over no files) is the *absent* relation. Transforms over an
-//! absent relation may themselves collapse to absent. For example, a union drops absent arms, an
-//! anti-join with an absent build becomes its probe unchanged, etc.
+//! A source with no rows (e.g. a scan over no files) is the *absent* relation -- uninhabited, but
+//! it still carries its output schema. Transforms validate against that schema as usual and
+//! propagate absence (a union drops absent arms, an anti-join with an absent build forwards its
+//! probe, etc.). [`build`](PlanBuilder::build) materializes an absent relation as an empty
+//! [`Values`] node, so it always yields a runnable plan; [`build_opt`](PlanBuilder::build_opt)
+//! yields `None` for it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,17 +23,6 @@ use crate::schema::SchemaRef;
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{DeltaResult, Error};
 
-/// Bind the present node of `$builder`, or early-return [`Ok`] of the absent relation -- the
-/// absorbing-state guard at the head of every transform.
-macro_rules! get_if_present {
-    ($builder:expr) => {
-        match $builder.0 {
-            Some(node) => node,
-            None => return Ok(PlanBuilder::ABSENT),
-        }
-    };
-}
-
 /// One node of a plan DAG: an operator, its inputs, and its output schema. Node identity is the
 /// `Arc`'s address ([`PlanBuilder::build`] dedups shared subgraphs by pointer). Inputs are always
 /// present nodes -- combinators drop or forward an absent input.
@@ -43,18 +35,21 @@ struct BuilderNode {
 
 type BuilderNodeRef = Arc<BuilderNode>;
 
-/// A [`Plan`] under construction: a present node, or `None` for the *absent* (uninhabited,
-/// schemaless) relation used to prune provably-empty branches.
+/// A present node, or the *absent* (uninhabited) relation, which still carries its output schema.
+#[derive(Clone, Debug)]
+enum PlanBuilderRoot {
+    Present(BuilderNodeRef),
+    Absent(SchemaRef),
+}
+
+/// A [`Plan`] under construction. See the module docs.
 #[derive(Clone, Debug)]
 #[must_use]
-pub struct PlanBuilder(Option<BuilderNodeRef>);
+pub struct PlanBuilder(PlanBuilderRoot);
 
 impl PlanBuilder {
-    /// The uninhabited relation.
-    const ABSENT: PlanBuilder = PlanBuilder(None);
-
     fn node(op: impl Into<Operator>, inputs: Vec<BuilderNodeRef>, schema: SchemaRef) -> Self {
-        PlanBuilder(Some(Arc::new(BuilderNode {
+        PlanBuilder(PlanBuilderRoot::Present(Arc::new(BuilderNode {
             op: op.into(),
             inputs,
             schema,
@@ -63,7 +58,20 @@ impl PlanBuilder {
 
     /// Rewrap an existing node -- used where a combinator forwards an input unchanged.
     fn from_node(node: BuilderNodeRef) -> Self {
-        PlanBuilder(Some(node))
+        PlanBuilder(PlanBuilderRoot::Present(node))
+    }
+
+    /// The uninhabited relation over `schema`.
+    fn absent(schema: SchemaRef) -> Self {
+        PlanBuilder(PlanBuilderRoot::Absent(schema))
+    }
+
+    /// The output schema of this relation -- carried whether present or absent.
+    fn schema(&self) -> &SchemaRef {
+        match &self.0 {
+            PlanBuilderRoot::Present(node) => &node.schema,
+            PlanBuilderRoot::Absent(schema) => schema,
+        }
     }
 
     /// A Parquet scan source over `files` producing rows matching `schema`.
@@ -109,9 +117,9 @@ impl PlanBuilder {
         )
     }
 
-    /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Yields the
-    /// absent relation for an empty file set, else the source node that
-    /// `build` constructs from the normalized files, file-constant columns, and schema.
+    /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Yields the absent relation for
+    /// an empty file set, else the source node that `build` constructs from the normalized files,
+    /// file-constant columns, and schema.
     fn scan_source<O: Into<Operator>>(
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
@@ -132,20 +140,20 @@ impl PlanBuilder {
         }
         check_columns_resolve(&schema, &cols, "scan file_constant_columns")?;
         if files.is_empty() {
-            return Ok(Self::ABSENT);
+            return Ok(Self::absent(schema));
         }
         let node = build(files, cols, Arc::clone(&schema));
         Ok(Self::node(node, vec![], schema))
     }
 
-    /// Inline literal rows. See [`Values`] for the row encoding. Empty `rows` yields the
-    /// absent relation.
+    /// Inline literal rows. See [`Values`] for the row encoding. Empty `rows` yields the absent
+    /// relation.
     ///
     /// Produces an error when any row's width differs from `schema`'s top-level field count.
     pub fn values(schema: impl Into<SchemaRef>, rows: Vec<Vec<Scalar>>) -> DeltaResult<Self> {
         let schema = schema.into();
         if rows.is_empty() {
-            return Ok(Self::ABSENT);
+            return Ok(Self::absent(schema));
         }
         let width = schema.fields().count();
         for (i, row) in rows.iter().enumerate() {
@@ -167,11 +175,15 @@ impl PlanBuilder {
     ///
     /// Produces an error when `predicate` references a column absent from the input schema.
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> DeltaResult<Self> {
-        let node = get_if_present!(self);
         let predicate = predicate.into();
-        check_columns_resolve(&node.schema, predicate.references(), "filter")?;
-        let schema = Arc::clone(&node.schema);
-        Ok(Self::node(Filter { predicate }, vec![node], schema))
+        check_columns_resolve(self.schema(), predicate.references(), "filter")?;
+        match self.0 {
+            PlanBuilderRoot::Present(node) => {
+                let schema = Arc::clone(&node.schema);
+                Ok(Self::node(Filter { predicate }, vec![node], schema))
+            }
+            PlanBuilderRoot::Absent(schema) => Ok(Self::absent(schema)),
+        }
     }
 
     /// Project `self` through `expr` into rows of the caller-declared `schema`. `expr` must be a
@@ -187,15 +199,19 @@ impl PlanBuilder {
         expr: impl Into<ExpressionRef>,
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        let input = get_if_present!(self);
-        let schema = schema.into();
+        let out = schema.into();
         let expr = expr.into();
-        check_columns_resolve(&input.schema, expr.references(), "project")?;
-        let node = Project {
-            expr,
-            schema: Arc::clone(&schema),
-        };
-        Ok(Self::node(node, vec![input], schema))
+        check_columns_resolve(self.schema(), expr.references(), "project")?;
+        match self.0 {
+            PlanBuilderRoot::Present(node) => {
+                let project = Project {
+                    expr,
+                    schema: Arc::clone(&out),
+                };
+                Ok(Self::node(project, vec![node], out))
+            }
+            PlanBuilderRoot::Absent(_) => Ok(Self::absent(out)),
+        }
     }
 
     /// Project `self` by editing its columns. `edit` receives a [`ProjectionStructPatchBuilder`]
@@ -208,13 +224,17 @@ impl PlanBuilder {
         self,
         edit: impl FnOnce(ProjectionStructPatchBuilder<'_>) -> ProjectionStructPatchBuilder<'_>,
     ) -> DeltaResult<Self> {
-        let input = get_if_present!(self);
-        let (schema, expr) = edit(ProjectionStructPatchBuilder::new(&input.schema)).build()?;
-        let node = Project {
-            expr,
-            schema: Arc::clone(&schema),
-        };
-        Ok(Self::node(node, vec![input], schema))
+        let (out, expr) = edit(ProjectionStructPatchBuilder::new(self.schema())).build()?;
+        match self.0 {
+            PlanBuilderRoot::Present(node) => {
+                let project = Project {
+                    expr,
+                    schema: Arc::clone(&out),
+                };
+                Ok(Self::node(project, vec![node], out))
+            }
+            PlanBuilderRoot::Absent(_) => Ok(Self::absent(out)),
+        }
     }
 
     /// Read data files named by `self`'s rows. Output schema is `load.schema`. See [`Load`].
@@ -223,18 +243,16 @@ impl PlanBuilder {
     /// or a `file_constant_columns` entry is absent from the input (its broadcast source) or from
     /// `load.schema` (the output).
     pub fn load(self, load: Load) -> DeltaResult<Self> {
-        let node = get_if_present!(self);
-        let input = &node.schema;
         let meta = [
             &load.file_meta.path_column,
             &load.file_meta.file_size_column,
             &load.file_meta.num_records_column,
             &load.dv_column,
         ];
-        check_columns_resolve(input, meta, "load")?;
+        check_columns_resolve(self.schema(), meta, "load")?;
         // File-constant columns are sourced upstream and emitted in the output, so check both.
         check_columns_resolve(
-            input,
+            self.schema(),
             &load.file_constant_columns,
             "load file_constant source",
         )?;
@@ -243,41 +261,44 @@ impl PlanBuilder {
             &load.file_constant_columns,
             "load file_constant",
         )?;
-        let schema = Arc::clone(&load.schema);
-        Ok(Self::node(load, vec![node], schema))
+        let out = Arc::clone(&load.schema);
+        match self.0 {
+            PlanBuilderRoot::Present(node) => Ok(Self::node(load, vec![node], out)),
+            PlanBuilderRoot::Absent(_) => Ok(Self::absent(out)),
+        }
     }
 
     /// Aggregate `self` into `aggregate` (build one with [`Aggregate::group_by`]). The output
     /// schema is the group keys followed by the aggregate columns. See [`Aggregate`].
     ///
-    /// Over an absent input the result is group-arity dependent, since the
-    /// `aggregate` carries its own output schema: a **grouped** aggregate yields zero groups and so
-    /// is absent; a **global** aggregate (no group keys) still yields one row -- each aggregate's
-    /// value over the empty multiset, which is NULL for every aggregate function -- materialized as
-    /// a one-row [`Values`] source.
+    /// Over an absent input the result is group-arity dependent: a **grouped** aggregate yields
+    /// zero groups and so is absent; a **global** aggregate (no group keys) still yields one
+    /// row -- each aggregate's value over the empty multiset, which is NULL for every aggregate
+    /// function -- materialized as a one-row [`Values`] source.
     ///
     /// Produces an error when building `aggregate` fails: a group key or an aggregate's operand
     /// column is absent from its input schema, or two output columns would share a name.
     pub fn aggregate(self, aggregate: impl TryInto<Aggregate, Error = Error>) -> DeltaResult<Self> {
         let aggregate = aggregate.try_into()?;
         let schema = Arc::clone(&aggregate.schema);
-        let input = match self.0 {
-            Some(input) => input,
-            // Grouped aggregate over the empty relation: zero groups, hence absent. Global
-            // aggregate: one row, NULL per output column (the empty-multiset value of every
+        match self.0 {
+            PlanBuilderRoot::Present(node) => Ok(Self::node(aggregate, vec![node], schema)),
+            // Grouped aggregate over the empty relation: zero groups, hence absent.
+            PlanBuilderRoot::Absent(_) if !aggregate.group_by.is_empty() => {
+                Ok(Self::absent(schema))
+            }
+            // Global aggregate: one row, NULL per output column (the empty-multiset value of every
             // aggregate function), materialized as a one-row Values source.
-            None if !aggregate.group_by.is_empty() => return Ok(Self::ABSENT),
-            None => {
+            PlanBuilderRoot::Absent(_) => {
                 let row =
                     Vec::from_iter(schema.fields().map(|f| Scalar::null(f.data_type().clone())));
                 let node = Values {
                     schema: Arc::clone(&schema),
                     rows: vec![row],
                 };
-                return Ok(Self::node(node, vec![], schema));
+                Ok(Self::node(node, vec![], schema))
             }
-        };
-        Ok(Self::node(aggregate, vec![input], schema))
+        }
     }
 
     /// Semi join: emit the `self` (probe) rows that have a match in `build` on the join keys.
@@ -314,19 +335,6 @@ impl PlanBuilder {
         probe_keys: impl IntoIterator<Item = ColumnName>,
         build_keys: impl IntoIterator<Item = ColumnName>,
     ) -> DeltaResult<Self> {
-        let probe = get_if_present!(self);
-        let build = match build.0 {
-            Some(build) => build,
-            None => {
-                return Ok(if inverted {
-                    // Set difference with an absent relation produces the probe unchanged
-                    Self::from_node(probe)
-                } else {
-                    // Set intersection with an absent relation produces an absent relation
-                    Self::ABSENT
-                });
-            }
-        };
         let probe_keys = Vec::from_iter(probe_keys);
         let build_keys = Vec::from_iter(build_keys);
         if probe_keys.len() != build_keys.len() {
@@ -336,8 +344,20 @@ impl PlanBuilder {
                 build_keys.len(),
             )));
         }
-        check_columns_resolve(&probe.schema, &probe_keys, "join probe")?;
-        check_columns_resolve(&build.schema, &build_keys, "join build")?;
+        check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
+        check_columns_resolve(build.schema(), &build_keys, "join build")?;
+        // Uninhabited probe always produces an uninhabited result.
+        let probe = match self.0 {
+            PlanBuilderRoot::Present(probe) => probe,
+            PlanBuilderRoot::Absent(schema) => return Ok(Self::absent(schema)),
+        };
+        let build = match build.0 {
+            PlanBuilderRoot::Present(build) => build,
+            // An absent build matches nothing: a semi join is then absent; an anti join, which
+            // subtracts nothing, forwards the probe.
+            PlanBuilderRoot::Absent(_) if inverted => return Ok(Self::from_node(probe)),
+            PlanBuilderRoot::Absent(_) => return Ok(Self::absent(Arc::clone(&probe.schema))),
+        };
         let node = SemiJoin {
             inverted,
             probe_keys,
@@ -347,69 +367,86 @@ impl PlanBuilder {
         Ok(Self::node(node, vec![probe, build], schema))
     }
 
-    /// Unordered bag union of `inputs`. All present inputs must share the same schema; absent
-    /// inputs are dropped, and a lone present input is forwarded unchanged.
+    /// Unordered bag union of `inputs`. All inputs must share the same schema; absent inputs are
+    /// dropped, and a lone present input is forwarded unchanged.
     ///
-    /// Produces an error when two present inputs have differing schemas.
+    /// Produces an error when `inputs` is empty, or two inputs have differing schemas.
     pub fn union_all(inputs: impl IntoIterator<Item = PlanBuilder>) -> DeltaResult<Self> {
-        let mut present = Vec::from_iter(inputs.into_iter().filter_map(|b| b.0));
-        if present.windows(2).any(|w| w[0].schema != w[1].schema) {
-            return Err(Error::generic(
-                "union_all: a present input has a schema differing from the first",
-            ));
+        let inputs = Vec::from_iter(inputs);
+        let Some(schema) = inputs.first().map(|b| Arc::clone(b.schema())) else {
+            return Err(Error::generic("union_all: requires at least one input"));
+        };
+        if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
+            return Err(Error::generic(format!(
+                "union_all: input {i} has a schema differing from input 0"
+            )));
         }
+        let mut present = Vec::from_iter(inputs.into_iter().filter_map(|b| match b.0 {
+            PlanBuilderRoot::Present(node) => Some(node),
+            PlanBuilderRoot::Absent(_) => None,
+        }));
         Ok(match present.len() {
-            0 => Self::ABSENT,
+            0 => Self::absent(schema),
             1 => Self::from_node(present.swap_remove(0)),
-            _ => {
-                let schema = Arc::clone(&present[0].schema);
-                Self::node(UnionAll, present, schema)
-            }
+            _ => Self::node(UnionAll, present, schema),
         })
     }
 
-    /// The output schema of this relation, or `None` if it is absent (which carries no schema).
-    #[cfg(test)]
-    fn schema(&self) -> Option<&SchemaRef> {
-        self.0.as_ref().map(|node| &node.schema)
+    /// Linearize the DAG reachable from `self` into a [`Plan`]. An absent relation builds to a
+    /// single empty [`Values`] node carrying its schema, so the result is always a runnable plan.
+    pub fn build(&self) -> DeltaResult<Plan> {
+        Ok(match &self.0 {
+            PlanBuilderRoot::Present(root) => linearize(root),
+            PlanBuilderRoot::Absent(schema) => Plan {
+                nodes: vec![PlanNode {
+                    op: Values {
+                        schema: Arc::clone(schema),
+                        rows: Vec::new(),
+                    }
+                    .into(),
+                    inputs: Vec::new(),
+                }],
+            },
+        })
     }
 
-    /// Linearize the DAG reachable from `self` into a [`Plan`].
-    ///
-    /// A post-order walk emits each node after its inputs (topological order), so `self` -- the
-    /// terminal -- is the last node. A node is identified by its index in [`Plan::nodes`]; shared
-    /// subgraphs are emitted once (a node reached again reuses its first-assigned index), and nodes
-    /// unreachable from `self` are dropped.
-    ///
-    /// Produces an error when `self` is absent -- an empty relation has no plan to build.
-    pub fn build(&self) -> DeltaResult<Plan> {
-        let Some(root) = &self.0 else {
-            return Err(Error::generic("cannot build an absent (empty) plan"));
-        };
-        // Recursive post-order; `emitted` maps a node's address to its index, deduping shared
-        // subgraphs. The address is a stable identity while the DAG holds the `Arc` alive.
-        fn emit(
-            node: &BuilderNodeRef,
-            nodes: &mut Vec<PlanNode>,
-            emitted: &mut HashMap<*const BuilderNode, usize>,
-        ) -> usize {
-            let key = Arc::as_ptr(node);
-            if let Some(&index) = emitted.get(&key) {
-                return index;
-            }
-            let inputs = Vec::from_iter(node.inputs.iter().map(|i| emit(i, nodes, emitted)));
-            let index = nodes.len();
-            nodes.push(PlanNode {
-                op: node.op.clone(),
-                inputs,
-            });
-            emitted.insert(key, index);
-            index
-        }
-        let mut nodes = Vec::new();
-        emit(root, &mut nodes, &mut HashMap::new());
-        Ok(Plan { nodes })
+    /// Like [`Self::build`], but yields `None` for an absent relation instead of an empty plan.
+    pub fn build_opt(&self) -> DeltaResult<Option<Plan>> {
+        Ok(match &self.0 {
+            PlanBuilderRoot::Present(root) => Some(linearize(root)),
+            PlanBuilderRoot::Absent(_) => None,
+        })
     }
+}
+
+/// Linearize the DAG rooted at `root` into a [`Plan`]. A post-order walk emits each node after its
+/// inputs (topological order), so `root` -- the terminal -- is the last node. A node is identified
+/// by its index in [`Plan::nodes`]; shared subgraphs are emitted once (a node reached again reuses
+/// its first-assigned index), and nodes unreachable from `root` are dropped.
+fn linearize(root: &BuilderNodeRef) -> Plan {
+    // `emitted` maps a node's address to its index, deduping shared subgraphs. The address is a
+    // stable identity while the DAG holds the `Arc` alive.
+    fn emit(
+        node: &BuilderNodeRef,
+        nodes: &mut Vec<PlanNode>,
+        emitted: &mut HashMap<*const BuilderNode, usize>,
+    ) -> usize {
+        let key = Arc::as_ptr(node);
+        if let Some(&index) = emitted.get(&key) {
+            return index;
+        }
+        let inputs = Vec::from_iter(node.inputs.iter().map(|i| emit(i, nodes, emitted)));
+        let index = nodes.len();
+        nodes.push(PlanNode {
+            op: node.op.clone(),
+            inputs,
+        });
+        emitted.insert(key, index);
+        index
+    }
+    let mut nodes = Vec::new();
+    emit(root, &mut nodes, &mut HashMap::new());
+    Plan { nodes }
 }
 
 /// Error if any of `cols` fails to resolve against `schema` (nested paths supported).
@@ -468,8 +505,7 @@ mod tests {
         PlanBuilder::values(schema, vec![row]).unwrap()
     }
 
-    /// The absent (uninhabited) relation: an empty scan. Its schema is irrelevant (absent ignores
-    /// it).
+    /// The absent (uninhabited) relation over `id_schema`: an empty scan.
     fn absent_src() -> PlanBuilder {
         PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], id_schema()).unwrap()
     }
@@ -489,10 +525,10 @@ mod tests {
         }
     }
 
-    /// Build `builder` (which must be present) and assert its nodes match `expected` one-for-one in
-    /// order, each described by its `(inputs, op)`: the indices of the nodes it references and its
-    /// operator [tag](op_tag). A node is identified by its index in `nodes`. Returns the built
-    /// [`Plan`] for further inspection.
+    /// Build `builder` and assert its nodes match `expected` one-for-one in order, each described
+    /// by its `(inputs, op)`: the indices of the nodes it references and its operator
+    /// [tag](op_tag). A node is identified by its index in `nodes`. Returns the built [`Plan`]
+    /// for further inspection.
     fn assert_plan(builder: PlanBuilder, expected: &[(&[usize], &str)]) -> Plan {
         let plan = builder.build().unwrap();
         assert_eq!(plan.nodes.len(), expected.len(), "node count");
@@ -507,7 +543,7 @@ mod tests {
     #[test]
     fn source_builds_single_node() {
         let src = scan(id_schema());
-        assert_eq!(src.schema(), Some(&id_schema()));
+        assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
     }
 
@@ -537,7 +573,7 @@ mod tests {
             &["part"],
             part_schema(),
         )?;
-        assert_eq!(parquet.schema(), Some(&part_schema()));
+        assert_eq!(parquet.schema(), &part_schema());
         let plan = assert_plan(parquet, &[(&[], "scan_parquet")]);
         let Operator::ScanParquet(node) = &plan.nodes[0].op else {
             panic!("expected ScanParquet");
@@ -561,7 +597,7 @@ mod tests {
     #[test]
     fn filter_preserves_schema() -> DeltaResult<()> {
         let filtered = vals(id_schema()).filter(col!("id").is_not_null())?;
-        assert_eq!(filtered.schema(), Some(&id_schema()));
+        assert_eq!(filtered.schema(), &id_schema());
         Ok(())
     }
 
@@ -660,8 +696,8 @@ mod tests {
 
     // === Absent (uninhabited) relation =======================================
 
-    /// Empty sources and transforms over an absent input all collapse to the absent relation: it is
-    /// schemaless, and building it errors.
+    /// Empty sources and transforms over an absent input all collapse to the absent relation, which
+    /// `build_opt` reports as `None`.
     #[rstest::rstest]
     #[case::empty_parquet(PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_json(PlanBuilder::scan_json(Vec::<FileMeta>::new(), &[], id_schema()))]
@@ -671,12 +707,25 @@ mod tests {
     #[case::grouped_aggregate(absent_src().aggregate(
         Aggregate::group_by(part_schema(), [column_name!("id")]).max(column_name!("part"))))]
     #[case::semi_join(
-        vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("x")]))]
+        vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("id")]))]
     #[case::union_all_of_absent(PlanBuilder::union_all([absent_src(), absent_src()]))]
     fn collapses_to_absent(#[case] builder: DeltaResult<PlanBuilder>) -> DeltaResult<()> {
-        let builder = builder?;
-        assert!(builder.schema().is_none()); // absent is schemaless
-        assert!(builder.build().is_err()); // and has no plan to build
+        assert!(builder?.build_opt()?.is_none()); // absent has no plan to run
+        Ok(())
+    }
+
+    /// An absent relation still carries its schema, and `build` materializes it as an empty
+    /// `Values` node.
+    #[test]
+    fn absent_carries_schema_and_builds_empty_values() -> DeltaResult<()> {
+        let absent = absent_src();
+        assert_eq!(absent.schema(), &id_schema());
+        let plan = assert_plan(absent, &[(&[], "values")]);
+        let Operator::Values(values) = &plan.nodes[0].op else {
+            panic!("expected Values");
+        };
+        assert!(values.rows.is_empty());
+        assert_eq!(values.schema, id_schema());
         Ok(())
     }
 
@@ -694,8 +743,11 @@ mod tests {
     /// An anti join with an absent build forwards its probe unchanged: it subtracts nothing.
     #[test]
     fn anti_join_over_absent_build_forwards_probe() -> DeltaResult<()> {
-        let anti =
-            vals(id_schema()).anti_join(absent_src(), [column_name!("id")], [column_name!("x")])?;
+        let anti = vals(id_schema()).anti_join(
+            absent_src(),
+            [column_name!("id")],
+            [column_name!("id")],
+        )?;
         assert_plan(anti, &[(&[], "values")]);
         Ok(())
     }
@@ -708,7 +760,7 @@ mod tests {
             Aggregate::group_by(part_schema(), [column_name!("id")])
                 .max_non_null_by(column_name!("part"), column_name!("id")),
         )?;
-        assert_eq!(agg.schema(), Some(&part_schema()));
+        assert_eq!(agg.schema(), &part_schema());
         assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
         Ok(())
     }
@@ -735,7 +787,7 @@ mod tests {
         let agg = vals(part_schema()).aggregate(
             Aggregate::group_by(part_schema(), Vec::<ColumnName>::new()).max(column_name!("part")),
         )?;
-        let schema = agg.schema().unwrap();
+        let schema = agg.schema();
         assert_eq!(schema.fields().count(), 1);
         assert!(schema.field("part").is_some());
         let plan = assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
@@ -744,12 +796,6 @@ mod tests {
         };
         assert!(node.group_by.is_empty());
         Ok(())
-    }
-
-    /// `schema()` on an absent builder is `None` -- absent carries no schema.
-    #[test]
-    fn absent_has_no_schema() {
-        assert!(absent_src().schema().is_none());
     }
 
     /// `{ outer: { a, b }, c }` -- a nested schema for exercising `project_patch`.
@@ -791,7 +837,7 @@ mod tests {
             ),
             StructField::nullable("d", DataType::LONG),
         ]));
-        assert_eq!(patched.schema(), Some(&expected));
+        assert_eq!(patched.schema(), &expected);
         assert_plan(patched, &[(&[], "values"), (&[0], "project")]);
         Ok(())
     }
@@ -814,7 +860,7 @@ mod tests {
     fn project_records_declared_schema() -> DeltaResult<()> {
         let out = x_schema();
         let p = vals(id_schema()).project(Expression::struct_from([col!("id")]), out.clone())?;
-        assert_eq!(p.schema(), Some(&out));
+        assert_eq!(p.schema(), &out);
         assert_plan(p, &[(&[], "values"), (&[0], "project")]);
         Ok(())
     }
@@ -832,7 +878,7 @@ mod tests {
         } else {
             probe.semi_join(build, [column_name!("id")], [column_name!("x")])?
         };
-        assert_eq!(joined.schema(), Some(&id_schema()));
+        assert_eq!(joined.schema(), &id_schema());
 
         let plan = assert_plan(
             joined,
@@ -883,7 +929,7 @@ mod tests {
     fn load_sets_output_schema_and_records_input() -> DeltaResult<()> {
         let out = load_output_schema();
         let loaded = vals(load_input_schema()).load(load_node(out.clone()))?;
-        assert_eq!(loaded.schema(), Some(&out));
+        assert_eq!(loaded.schema(), &out);
         assert_plan(loaded, &[(&[], "values"), (&[0], "load")]);
         Ok(())
     }
@@ -921,6 +967,7 @@ mod tests {
     // union
     #[case::union_schema_disagrees("differing",
         || PlanBuilder::union_all([vals(id_schema()), vals(x_schema())]))]
+    #[case::union_empty("at least one input", || PlanBuilder::union_all([]))]
     // semi-join keys
     #[case::join_unknown_probe_key("join probe: column `nope`",
         || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("nope")], [column_name!("x")]))]
