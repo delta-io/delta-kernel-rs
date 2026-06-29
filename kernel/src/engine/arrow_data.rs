@@ -505,7 +505,7 @@ impl ArrowEngineData {
                 debug!("Pushing timestamp array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<TimestampNanosecondType>()
                     .map(|a| a as _)
-                    .ok_or("timestamp")
+                    .ok_or("timestamp_nanos")
             }
             DataType::Primitive(PrimitiveType::Decimal(_)) => {
                 debug!("Pushing decimal array for {}", ColumnName::new(path));

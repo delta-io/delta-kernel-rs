@@ -185,7 +185,8 @@ pub struct EngineSchemaVisitor {
         metadata: &CStringMap,
     ),
 
-    /// Visit a `timestamp` with no timezone belonging to the list identified by `sibling_list_id`.
+    /// Visit a microsecond `timestamp` with no timezone belonging to the list identified by
+    /// `sibling_list_id`.
     pub visit_timestamp_ntz: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,

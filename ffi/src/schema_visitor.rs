@@ -891,6 +891,7 @@ mod tests {
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
+        assert_eq!(fields.len(), all_columns.len());
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -911,7 +912,6 @@ mod tests {
             #[cfg(feature = "nanosecond-timestamps")]
             ("col_timestamp_nanos_ntz", PrimitiveType::TimestampNanosNtz),
         ];
-        assert_eq!(fields.len(), primitive_field_expectations.len() + 5);
 
         for (index, (expected_name, expected_type)) in
             primitive_field_expectations.iter().enumerate()
