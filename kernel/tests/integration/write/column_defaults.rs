@@ -265,8 +265,12 @@ mod feature_enabled {
         .await
     }
 
+    #[rstest]
+    #[case::all_data_columns(&[])]
+    #[case::default_on_partition_column(&["b"])]
     #[tokio::test]
     async fn test_transaction_column_defaults_exposes_all_top_level_defaults(
+        #[case] partition_columns: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
         // `a`: no default, `b`: kernel-parsable default, `c`: non-kernel-parsable default.
         let base = StructType::try_new(vec![
@@ -284,7 +288,7 @@ mod feature_enabled {
             store,
             table_location,
             schema,
-            &[],                         /* partition_columns */
+            partition_columns,
             true,                        /* use_37_protocol */
             vec![],                      /* reader_features */
             vec!["allowColumnDefaults"], /* writer_features */

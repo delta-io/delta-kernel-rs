@@ -1012,26 +1012,24 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///   (non-string metadata, or a non-NULL default on a non-primitive type).
     #[cfg(feature = "column-defaults-in-dev")]
     pub fn column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
-        // The protocol honors `CURRENT_DEFAULT` only "when enabled", so reject stray defaults on a
-        // table without the feature rather than let a connector materialize values it should
-        // ignore.
         let allow_column_defaults = self
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults);
-        self.effective_table_config
-            .logical_schema_ref()
-            .fields()
-            .filter_map(|field| match field.column_default() {
-                Ok(Some(_)) if !allow_column_defaults => Some(Err(Error::generic(format!(
+        let mut defaults = HashMap::new();
+        for field in self.effective_table_config.logical_schema_ref().fields() {
+            let Some(column_default) = field.column_default()? else {
+                continue;
+            };
+            if !allow_column_defaults {
+                return Err(Error::generic(format!(
                     "Field '{}' declares a `CURRENT_DEFAULT` but the table does not enable the \
                      `allowColumnDefaults` writer feature",
                     field.name()
-                )))),
-                Ok(Some(column_default)) => Some(Ok((field.name().clone(), column_default))),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect()
+                )));
+            }
+            defaults.insert(field.name().clone(), column_default);
+        }
+        Ok(defaults)
     }
 
     /// Validates that the table's logical schema supports data writes.
