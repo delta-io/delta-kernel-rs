@@ -387,10 +387,11 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
 
-        // CREATE TABLE handles its own gating via
-        // `TableConfiguration::ensure_create_supported` in `CreateTableTransactionBuilder::build`.
-        // This also blocks add+remove-in-one-transaction when CDF is enabled: such a commit
-        // classifies as `DataWriteOp::Dml`, which the ChangeDataFeed feature forbids while enabled.
+        // CREATE TABLE gates its user-opted features against each feature's `ddl.create_table`
+        // cell in `CreateTableTransactionBuilder::build`, so it is skipped here.
+        // This data-write gate also blocks add+remove-in-one-transaction when CDF is enabled:
+        // such a commit classifies as `DataWriteOp::DmlRemove`, which the ChangeDataFeed feature
+        // forbids while enabled.
         if !self.is_create_table() {
             self.effective_table_config
                 .ensure_operation_supported(Operation::DataWrite(self.classify_data_write_op()))?;
@@ -797,16 +798,17 @@ impl<S> Transaction<S> {
         self.read_snapshot_opt.is_none()
     }
 
-    /// Classifies this transaction as one of [`DataWriteOp::Append`], [`DataWriteOp::Dml`], or
-    /// [`DataWriteOp::Maintenance`] based on the staged file actions and the `data_change` flag.
+    /// Classifies this transaction as one of [`DataWriteOp::Append`], [`DataWriteOp::DmlRemove`],
+    /// or [`DataWriteOp::Maintenance`] based on the staged file actions and the `data_change`
+    /// flag.
     ///
     /// Three reachable buckets:
     /// - `Append`: pure add-only commits, or commits with no file actions at all (e.g.
     ///   `SetTransaction`-only or `DomainMetadata`-only). These have no remove-shaped or
     ///   data-changing effect, so feature gates that care about remove preservation or row-data
     ///   stability are not relevant.
-    /// - `Dml`: any commit that stages explicit remove file actions with `data_change=true`. Covers
-    ///   DELETE, UPDATE, MERGE.
+    /// - `DmlRemove`: any commit that stages explicit remove file actions with `data_change=true`.
+    ///   Covers DELETE, UPDATE, MERGE.
     /// - `Maintenance`: any commit that stages explicit remove file actions with
     ///   `data_change=false`. Covers OPTIMIZE / ZORDER compaction, stats updates that rewrite add
     ///   files, row-id / row-commit-version backfill, and any other data-preserving file rewrite.
@@ -822,7 +824,7 @@ impl<S> Transaction<S> {
         match (has_adds || has_removes, has_removes, self.data_change) {
             (false, _, _) => DataWriteOp::Append, // no file actions (or DV-only)
             (true, false, _) => DataWriteOp::Append, // add-only, data_change irrelevant
-            (true, true, true) => DataWriteOp::Dml, // UPDATE / DELETE / MERGE
+            (true, true, true) => DataWriteOp::DmlRemove, // UPDATE / DELETE / MERGE
             (true, true, false) => DataWriteOp::Maintenance, // OPTIMIZE-shape
         }
     }
@@ -2602,10 +2604,10 @@ mod tests {
     // Adds only: classifies as Append (data_change irrelevant for gating).
     #[case::adds_only_dc(true, false, false, true, DataWriteOp::Append)]
     #[case::adds_only_no_dc(true, false, false, false, DataWriteOp::Append)]
-    // Removes (or DV updates) staged: Dml when data_change=true, Maintenance otherwise.
-    #[case::removes_dc(false, true, false, true, DataWriteOp::Dml)]
+    // Removes (or DV updates) staged: DmlRemove when data_change=true, Maintenance otherwise.
+    #[case::removes_dc(false, true, false, true, DataWriteOp::DmlRemove)]
     #[case::removes_no_dc(false, true, false, false, DataWriteOp::Maintenance)]
-    #[case::adds_and_removes_dc(true, true, false, true, DataWriteOp::Dml)]
+    #[case::adds_and_removes_dc(true, true, false, true, DataWriteOp::DmlRemove)]
     #[case::adds_and_removes_no_dc(true, true, false, false, DataWriteOp::Maintenance)]
     // DV updates are intentionally classified as Append; see `classify_data_write_op` doc.
     #[case::dv_only_dc(false, false, true, true, DataWriteOp::Append)]

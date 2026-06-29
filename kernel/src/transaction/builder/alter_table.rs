@@ -160,8 +160,8 @@ impl AlterTableTransactionBuilder<Modifying> {
         // protocol must also re-check this on the evolved `TableConfiguration`.
         //
         // Gate every queued schema operation. Today AddColumn and SetNullable share matrix
-        // cells on every feature, but future per-DDL-op divergence (e.g. when DropColumn
-        // lands) must not be silently skipped.
+        // cells on every feature, but future per-DDL-op divergence (when a new ALTER op lands)
+        // must not be silently skipped.
         let mut seen_ddl_ops = HashSet::new();
         for op in &self.operations {
             let ddl_op = match op {

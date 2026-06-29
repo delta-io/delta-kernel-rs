@@ -28,8 +28,9 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, find_max_column_id_in_schema,
     get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, ColumnMappingMode, CreatePath, EnablementCheck, FeatureType,
-    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    schema_contains_timestamp_ntz, ColumnMappingMode, EnablementCheck, FeatureType, OpAllowedCtx,
+    ProtocolImplement, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
@@ -134,13 +135,6 @@ struct ValidatedTableProperties {
     reader_features: Vec<TableFeature>,
     /// Writer features extracted from feature signals (for all features)
     writer_features: Vec<TableFeature>,
-    /// Features the user explicitly opted into. Includes:
-    ///   - Each `delta.feature.X=supported` signal.
-    ///   - Each feature whose property the user set and which therefore auto-enables (e.g.
-    ///     `delta.enableRowTracking=true` opts the user into `rowTracking`).
-    ///
-    /// Schema-driven, layout-driven, and dependency-cascade additions are NOT included.
-    user_opt_in: HashSet<TableFeature>,
 }
 
 impl ValidatedTableProperties {
@@ -397,26 +391,18 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
 /// Features with [`EnablementCheck::AlwaysIfSupported`] are skipped: they have no
 /// property-driven enablement story.
 ///
-/// A feature is recorded in `user_opt_in` only when its enablement-check is satisfied by the
-/// `user_provided_properties` snapshot. If the check passes against the current properties
-/// but NOT against the user snapshot, the feature was added by an earlier kernel-driven
-/// dependency cascade (e.g. `delta.enableIcebergCompatV3=true` setting `enableRowTracking`)
-/// and is therefore kernel inference, not user opt-in.
-fn maybe_auto_enable_property_driven_features(
-    validated: &mut ValidatedTableProperties,
-    user_provided_properties: &HashMap<String, String>,
-) {
+/// Property-driven enablement is not gated against the create cell: every feature reachable here
+/// has a `delta.*` enablement property whitelisted in [`ALLOWED_DELTA_PROPERTIES`], and those all
+/// map to create-supported features. The explicit `delta.feature.X=supported` opt-in path is
+/// gated separately in [`validate_extract_table_features_and_properties`].
+fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
     let current_properties = TableProperties::from(validated.properties.iter());
-    let user_properties = TableProperties::from(user_provided_properties.iter());
     for feature in TableFeature::iter() {
         let EnablementCheck::EnabledIf(check) = feature.info().enablement_check else {
             continue;
         };
         if !check(&current_properties) {
             continue;
-        }
-        if check(&user_properties) {
-            validated.user_opt_in.insert(feature.clone());
         }
         let needs_domain_metadata = feature == TableFeature::RowTracking;
         add_feature_to_lists(
@@ -646,9 +632,8 @@ fn maybe_apply_column_mapping_for_table_create(
 /// Validates and transforms table properties for CREATE TABLE.
 ///
 /// This function:
-/// 1. Records each `delta.feature.X=supported` signal into `user_opt_in`; per-feature
-///    rejection happens later in `CreateTableTransactionBuilder::build` via
-///    [`TableConfiguration::ensure_create_supported`](crate::table_configuration::TableConfiguration::ensure_create_supported).
+/// 1. Gates each `delta.feature.X=supported` signal against the feature's `ddl.create_table` cell,
+///    rejecting features that are not user-creatable (e.g. inference-only or unsupported).
 /// 2. Validates delta properties (`delta.*`) against `ALLOWED_DELTA_PROPERTIES`
 /// 3. Removes feature signals from properties (they shouldn't be stored in metadata)
 /// 4. Extracts reader/writer features from feature signals
@@ -665,7 +650,6 @@ fn validate_extract_table_features_and_properties(
 ) -> DeltaResult<ValidatedTableProperties> {
     let mut reader_features = Vec::new();
     let mut writer_features = Vec::new();
-    let mut user_opt_in = HashSet::new();
 
     // Partition properties into feature signals and regular properties
     // Feature signals (delta.feature.X=supported) are processed but not stored in metadata
@@ -674,9 +658,11 @@ fn validate_extract_table_features_and_properties(
         .into_iter()
         .partition(|(k, _)| k.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX));
 
-    // Process and validate feature signals. We accept each signal here; the actual policy
-    // check against `CreateSupport` runs once the full set of features is known, after all
-    // auto-enable passes, in `CreateTableTransactionBuilder::build`.
+    // Process and validate feature signals. Each `delta.feature.X=supported` signal is a
+    // user-originated opt-in, so it is gated here against the feature's `ddl.create_table` cell:
+    // a feature that is not creatable (e.g. kernel-inference-only or unsupported) is rejected.
+    // Kernel-inferred features (schema-driven, layout-driven, dependency cascades) never flow
+    // through this loop and are therefore not gated.
     for (key, value) in &feature_signals {
         // Safe: we partitioned for keys starting with this prefix above
         let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) else {
@@ -695,15 +681,33 @@ fn validate_extract_table_features_and_properties(
             .parse()
             .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
 
-        // Record that the user explicitly opted in to this feature.
-        user_opt_in.insert(feature.clone());
+        // Gate the user opt-in: reject features that cannot be created via an explicit signal.
+        // No `TableConfiguration` exists yet, so a `Partial` create cell is evaluated against the
+        // raw properties. `NotImplemented { blocks: true }` (capability absent) and a `Partial`
+        // check that fails (e.g. kernel-inference-only features, whose explicit signal is never
+        // honored) are both rejected.
+        let ctx = OpAllowedCtx::UnvalidatedProperties(&properties);
+        match feature.info().operation_support.ddl.create_table {
+            ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: description,
+            } => {
+                return Err(Error::unsupported(format!(
+                    "Feature '{feature}': {description}"
+                )));
+            }
+            ProtocolImplement::Partial(check, description) if !check(&ctx) => {
+                return Err(Error::unsupported(format!(
+                    "Feature '{feature}': {description}"
+                )));
+            }
+            _ => {}
+        }
 
         // Add to appropriate feature lists based on feature type
         let needs_domain_metadata = feature == TableFeature::RowTracking;
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
-        // RowTracking requires DomainMetadata as a dependency. DomainMetadata is not the
-        // user's opt-in here -- it's an inferred dependency, so we don't add it to
-        // `user_opt_in`.
+        // RowTracking requires DomainMetadata as a dependency, added here by kernel inference.
         if needs_domain_metadata {
             add_feature_to_lists(
                 TableFeature::DomainMetadata,
@@ -728,7 +732,6 @@ fn validate_extract_table_features_and_properties(
         properties,
         reader_features,
         writer_features,
-        user_opt_in,
     })
 }
 
@@ -901,12 +904,6 @@ impl CreateTableTransactionBuilder {
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
 
         // Snapshot the user-provided properties before any kernel-driven cascade mutates them.
-        // The property-driven auto-enable pass below uses this snapshot to distinguish user
-        // opt-in from kernel inference: a feature whose enablement-check passes against the
-        // *current* (post-cascade) properties but NOT against the *user-provided* snapshot was
-        // added by the kernel, not the user.
-        let user_provided_properties = validated.properties.clone();
-
         // When IcebergCompatV3 is enabled, fill in / validate required dependencies before
         // column mapping is applied so the CM mode is in place. The returned witness is
         // required by `maybe_apply_column_mapping_for_table_create` below.
@@ -934,9 +931,8 @@ impl CreateTableTransactionBuilder {
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
-        // Property-driven auto-enablement: check enablement properties. The snapshot lets
-        // the pass distinguish "user opt-in" from "kernel inference via dependency cascade".
-        maybe_auto_enable_property_driven_features(&mut validated, &user_provided_properties);
+        // Property-driven auto-enablement: enable features whose `delta.*` property is set.
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
@@ -965,19 +961,10 @@ impl CreateTableTransactionBuilder {
             validated.properties,
         )?;
 
-        // Build TableConfiguration directly for the new table
+        // Build TableConfiguration directly for the new table. User-originated feature opt-ins
+        // were already gated against each feature's `ddl.create_table` cell in
+        // `validate_extract_table_features_and_properties`; kernel-inferred features need no gate.
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
-
-        // Validate every feature that landed in the protocol against its `CreateSupport`
-        // cell using the path it took (user opt-in vs kernel inference).
-        for feature in table_configuration.all_supported_features() {
-            let path = if validated.user_opt_in.contains(&feature) {
-                CreatePath::UserOptIn
-            } else {
-                CreatePath::KernelInference
-            };
-            table_configuration.ensure_create_supported(&feature, path)?;
-        }
 
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
@@ -1125,27 +1112,26 @@ mod tests {
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
 
-        // Feature signals are accepted by the property extractor (the per-feature
-        // `CreateSupport::Forbidden` gate runs later, in `build()` via
-        // `ensure_create_supported`). The extractor records the signaled feature in
-        // `user_opt_in` and leaves rejection to the gate.
+        // Feature signals are gated by the extractor against each feature's `ddl.create_table`
+        // cell: a feature that is not user-creatable is rejected with its cell's description.
         let properties = HashMap::from([(
             "delta.feature.identityColumns".to_string(),
             "supported".to_string(),
         )]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
-        assert!(validated
-            .user_opt_in
-            .contains(&TableFeature::IdentityColumns));
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            "Feature 'identityColumns': cannot be enabled at table create time",
+        );
 
+        // Clustering is enabled via `with_data_layout`, not an explicit feature signal.
         let properties = HashMap::from([(
             "delta.feature.clustering".to_string(),
             "supported".to_string(),
         )]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
-        assert!(validated
-            .user_opt_in
-            .contains(&TableFeature::ClusteredTable));
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            "Feature 'clustering': is enabled by with_data_layout",
+        );
 
         // Mixed properties with unsupported delta property are still rejected at parse time.
         let mut properties = HashMap::new();
@@ -1158,41 +1144,30 @@ mod tests {
     }
 
     /// IcebergCompatV3's dependency cascade auto-adds `delta.enableRowTracking=true` and
-    /// `delta.columnMapping.mode=name` into the property map. The downstream
-    /// `maybe_auto_enable_property_driven_features` pass would otherwise see those
-    /// properties and incorrectly mark RowTracking/ColumnMapping as user opt-in. The fix
-    /// is the `user_provided_properties` snapshot: the property-driven pass evaluates
-    /// each enablement check against both the current and the user-snapshot properties,
-    /// and only marks user_opt_in when the user-snapshot answer is `true`.
-    ///
-    /// Today every `CreateSupport` cell for the cascaded features is `Allowed`, so a
-    /// misclassification has no externally visible effect. This test pins the invariant
-    /// so any future tightening (e.g. `RowTracking.create =
-    /// AllowedOnlyViaKernelInference(...)`) does not silently break V3 creation.
+    /// `delta.columnMapping.mode=name`, which in turn enable RowTracking, ColumnMapping, and
+    /// (as a RowTracking dependency) DomainMetadata. V3 is create-supported, and the cascaded
+    /// dependencies are kernel-inferred -- none of them flow through the user-opt-in create gate,
+    /// so V3 creation must succeed with all four features landing in the protocol.
     #[test]
-    fn test_v3_cascade_does_not_mark_deps_as_user_opt_in() {
+    fn test_v3_cascade_enables_dependencies() {
         let mut properties = HashMap::new();
         properties.insert(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string());
+        // `delta.enableIcebergCompatV3` is a property (whitelisted in ALLOWED_DELTA_PROPERTIES),
+        // not a feature signal, so extraction succeeds without hitting the create gate.
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
 
-        let user_snapshot = validated.properties.clone();
         let _ = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
-        maybe_auto_enable_property_driven_features(&mut validated, &user_snapshot);
+        maybe_auto_enable_property_driven_features(&mut validated);
 
-        assert!(
-            validated
-                .user_opt_in
-                .contains(&TableFeature::IcebergCompatV3),
-            "V3 was user-opted-in; should remain in user_opt_in",
-        );
         for feature in [
+            TableFeature::IcebergCompatV3,
             TableFeature::ColumnMapping,
             TableFeature::RowTracking,
             TableFeature::DomainMetadata,
         ] {
             assert!(
-                !validated.user_opt_in.contains(&feature),
-                "{feature:?} was kernel-inferred via V3 cascade and must NOT be in user_opt_in",
+                validated.writer_features.contains(&feature),
+                "{feature:?} must be enabled by the V3 cascade",
             );
         }
     }
@@ -1395,7 +1370,6 @@ mod tests {
             properties: HashMap::new(),
             reader_features: vec![],
             writer_features: vec![],
-            user_opt_in: HashSet::new(),
         };
 
         maybe_enable_variant_type(&schema, &mut validated);
@@ -1460,7 +1434,6 @@ mod tests {
             properties: HashMap::new(),
             reader_features: vec![],
             writer_features: vec![],
-            user_opt_in: HashSet::new(),
         };
 
         maybe_enable_invariants(&schema, &mut validated);
@@ -1494,8 +1467,7 @@ mod tests {
             .collect();
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
 
-        let snapshot = validated.properties.clone();
-        maybe_auto_enable_property_driven_features(&mut validated, &snapshot);
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         assert_eq!(
             validated
@@ -1603,7 +1575,6 @@ mod tests {
             properties: HashMap::new(),
             reader_features: vec![],
             writer_features: vec![],
-            user_opt_in: HashSet::new(),
         };
 
         let result = apply_data_layout(
@@ -1650,7 +1621,6 @@ mod tests {
             properties: HashMap::new(),
             reader_features: vec![],
             writer_features: vec![],
-            user_opt_in: HashSet::new(),
         };
 
         let result = apply_data_layout(&layout, &schema, ColumnMappingMode::None, &mut validated);
@@ -1732,8 +1702,7 @@ mod tests {
             "supported".to_string(),
         )]);
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
-        let snapshot = validated.properties.clone();
-        maybe_auto_enable_property_driven_features(&mut validated, &snapshot);
+        maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
         assert!(
@@ -1762,8 +1731,7 @@ mod tests {
             ),
         ]);
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
-        let snapshot = validated.properties.clone();
-        maybe_auto_enable_property_driven_features(&mut validated, &snapshot);
+        maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
         assert!(validated
@@ -1792,8 +1760,7 @@ mod tests {
         #[case] expect_enablement_property: bool,
     ) {
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
-        let snapshot = validated.properties.clone();
-        maybe_auto_enable_property_driven_features(&mut validated, &snapshot);
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         assert!(
             validated
@@ -1827,8 +1794,7 @@ mod tests {
             ),
         ]);
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
-        let snapshot = validated.properties.clone();
-        maybe_auto_enable_property_driven_features(&mut validated, &snapshot);
+        maybe_auto_enable_property_driven_features(&mut validated);
         let err = maybe_enable_ict_for_catalog_managed(&mut validated).unwrap_err();
         assert!(
             err.to_string().contains("enableInCommitTimestamps"),
@@ -1987,8 +1953,7 @@ mod tests {
 
         // === Property-driven feature enablement + Invariants ===
         maybe_enable_invariants(&effective_schema, &mut validated);
-        let snapshot = validated.properties.clone();
-        maybe_auto_enable_property_driven_features(&mut validated, &snapshot);
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         for f in expected_features {
             assert!(
@@ -2046,7 +2011,6 @@ mod tests {
             properties,
             reader_features: Vec::new(),
             writer_features: Vec::new(),
-            user_opt_in: HashSet::new(),
         };
         let err = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap_err();
         assert!(

@@ -378,6 +378,9 @@ impl MetricsReporter for FfiMetricsReporter {
             }
         };
         if let Some(callback) = callback {
+            // The closure is not redundant: it adapts the `extern "C" fn` to the Rust `Fn`
+            // closure `with_ffi_event` expects.
+            #[allow(clippy::redundant_closure)]
             with_ffi_event(&event, |ffi_event| callback(ffi_event));
         }
     }

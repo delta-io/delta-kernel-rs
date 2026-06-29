@@ -531,8 +531,9 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 #[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true)]
 // ReaderWriter features (EnabledIf -- feature signal alone does not enable)
 #[case("deletionVectors", TableFeature::DeletionVectors, true, false)]
-// `typeWidening` cannot be enabled at create time (kernel cannot write to such tables);
-// see `test_create_table_rejects_unsupported_feature_signals` for the rejection assertion.
+// `typeWidening` is create-supported (parity with the create-table allow-list): the signal
+// lands the feature in the protocol even though kernel cannot yet write widened data.
+#[case("typeWidening", TableFeature::TypeWidening, true, false)]
 // WriterOnly features (EnabledIf -- feature signal alone does not enable)
 #[case("appendOnly", TableFeature::AppendOnly, false, false)]
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
@@ -589,16 +590,13 @@ fn test_create_table_with_feature_signal(
     Ok(())
 }
 
-/// Kernel cannot write to tables with certain features (`typeWidening`, `checkConstraints`,
-/// `generatedColumns`, `identityColumns`, `icebergCompatV1`, `icebergCompatV2`,
-/// `catalogOwned-preview`). Accepting the corresponding `delta.feature.*=supported` signal at
-/// create time would produce an immediately-unwritable table; the signal is rejected up front.
+/// Certain features cannot be enabled via an explicit `delta.feature.*=supported` signal at
+/// create time (`typeWidening-preview`, `checkConstraints`, `generatedColumns`, `identityColumns`,
+/// `icebergCompatV1`, `icebergCompatV2`, `catalogOwned-preview`); the signal is rejected up front.
+///
+/// Note `typeWidening` (non-preview) IS create-supported -- see
+/// `test_create_table_with_feature_signal`.
 #[rstest]
-#[case::feature_signal_type_widening(
-    "delta.feature.typeWidening",
-    "supported",
-    "cannot be enabled at table create time"
-)]
 #[case::feature_signal_type_widening_preview(
     "delta.feature.typeWidening-preview",
     "supported",
@@ -633,11 +631,6 @@ fn test_create_table_with_feature_signal(
     "delta.feature.catalogOwned-preview",
     "supported",
     "deprecated for CREATE TABLE; use 'catalogManaged' instead"
-)]
-#[case::enablement_property_type_widening(
-    "delta.enableTypeWidening",
-    "true",
-    "cannot be enabled at table create time"
 )]
 fn test_create_table_rejects_unsupported_feature_signals(
     #[case] property: &str,
@@ -721,8 +714,7 @@ fn test_create_table_with_checkpoint_stats_properties(
 #[rstest]
 // ReaderWriter features
 #[case("delta.enableDeletionVectors", TableFeature::DeletionVectors, true)]
-// `delta.enableTypeWidening=true` is rejected at create time; see
-// `test_create_table_rejects_unsupported_feature_signals`.
+#[case("delta.enableTypeWidening", TableFeature::TypeWidening, true)]
 // WriterOnly features
 #[case("delta.enableChangeDataFeed", TableFeature::ChangeDataFeed, false)]
 #[case("delta.appendOnly", TableFeature::AppendOnly, false)]

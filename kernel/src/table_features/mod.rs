@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
@@ -234,9 +236,9 @@ pub(crate) enum DataWriteOp {
     /// those have no file-level effect and are treated as Append for gating purposes.
     /// Schema-modifying DDL (`AlterTable`) goes through `Operation::Ddl`, not this op.
     Append,
-    /// DML data write (UPDATE / DELETE / MERGE-shaped commit, with remove actions or
-    /// mixed add+remove with `data_change=true`).
-    Dml,
+    /// DML data write that removes rows (UPDATE / DELETE / MERGE-shaped commit, with remove
+    /// actions or mixed add+remove with `data_change=true`).
+    DmlRemove,
     /// Maintenance (any data-preserving commit with `data_change=false`). Covers OPTIMIZE
     /// and ZORDER file compaction, statistics updates, row-id / row-commit-version
     /// backfill, and any other file-action commit that does not change the logical
@@ -252,17 +254,14 @@ pub(crate) enum DdlOp {
     AddColumn,
     /// Relax a column from NOT NULL to nullable.
     SetNullable,
-    /// Drop an existing column.
-    DropColumn,
-    /// Rename an existing column.
-    RenameColumn,
 }
 
 /// Represents the type of operation being performed on a table.
 ///
-/// CREATE is intentionally not represented here. CREATE needs an "origin" distinction
-/// (user opt-in vs kernel inference) that the unified operation dispatcher does not have;
-/// see [`ensure_create_supported`](crate::table_configuration::TableConfiguration::ensure_create_supported).
+/// CREATE is intentionally not represented here: it is gated only over user-originated feature
+/// signals against each feature's `ddl.create_table` cell (in
+/// `validate_extract_table_features_and_properties`), not via this dispatcher's
+/// per-supported-feature walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum Operation {
@@ -274,153 +273,160 @@ pub(crate) enum Operation {
     Ddl(DdlOp),
 }
 
-/// Distinguishes how a feature came to be in the protocol at CREATE time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[internal_api]
-pub(crate) enum CreatePath {
-    /// The user explicitly opted in (e.g. via `delta.feature.X=supported`, or a property
-    /// that drives auto-enablement like `delta.enableRowTracking=true`).
-    UserOptIn,
-    /// The kernel inferred the feature was needed (e.g. from a `timestampNtz` schema
-    /// column, a clustering layout, or a dependency cascade).
-    KernelInference,
-}
-
-/// Per-cell policy for Read / DataWrite / DDL operations.
+/// Context a [`ProtocolImplement::Partial`] check is evaluated against. Which variant is built
+/// depends on *when* the op is gated: post-build ops have a validated [`TableConfiguration`]; the
+/// create-table gate runs before any [`TableConfiguration`] exists, so it carries only the raw
+/// properties.
 ///
-/// On rejection every variant produces an error of the form `"Feature 'X': <msg>"` where
-/// `<msg>` is the cell's static suffix and the dispatcher (`apply_cell`) prepends the
-/// feature name.
-pub(crate) enum OpSupport {
-    /// Operation is allowed.
-    Allowed,
-    /// Cell is not reachable from the dispatcher under the current design. Used at the
-    /// definition site to make intent explicit (e.g. the `read.scan` / `read.cdf` cells on
-    /// a writer-only feature, which are never iterated because the read path only walks
-    /// reader features). The dispatcher treats `NotApplicable` as `Allowed` at runtime;
-    /// debug builds `debug_assert!(false)` to fail loud if a refactor ever reaches this
-    /// cell.
-    NotApplicable,
-    /// Blocks whenever the feature is in the protocol (writerFeatures / readerFeatures),
-    /// regardless of active state. Use when kernel cannot safely handle the op even when
-    /// the feature is "idle". The `&'static str` is the error message suffix.
-    ForbiddenIfSupported(&'static str),
-    /// Blocks only when the feature is active per its [`EnablementCheck`] (i.e. the
-    /// relevant property is set). The `&'static str` is the error message suffix.
-    ForbiddenIfEnabled(&'static str),
-    /// Blocks when the predicate returns `true`. Use for schema- or property-state-dependent
-    /// checks that can't be expressed as `ForbiddenIfSupported`/`ForbiddenIfEnabled`. The
-    /// `&'static str` is the error message suffix. Used sparingly.
-    ForbiddenIf {
-        msg: &'static str,
-        predicate: fn(&crate::table_configuration::TableConfiguration) -> bool,
-    },
+/// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
+pub(crate) enum OpAllowedCtx<'a> {
+    /// Post-build ops (read / data-write / ALTER): the table's validated configuration.
+    Validated(&'a crate::table_configuration::TableConfiguration),
+    /// CREATE TABLE: the raw, not-yet-validated table properties (no `TableConfiguration` yet).
+    /// Carried for property-driven create checks; the current inference-only create cells use a
+    /// constant-false check and ignore it, so the payload reads as dead until such a check lands.
+    UnvalidatedProperties(#[allow(dead_code)] &'a HashMap<String, String>),
 }
 
-/// Per-cell policy for the CREATE path. CREATE has its own origin (user opt-in vs kernel
-/// inference) and therefore a different cell enum from [`OpSupport`].
-pub(crate) enum CreateSupport {
-    /// Feature may land in protocol via either path (user opt-in or kernel inference).
-    Allowed,
-    /// Feature may only land via kernel inference (e.g. schema-implied, dep cascade,
-    /// or `with_data_layout`). User opt-in is rejected.
-    AllowedOnlyViaKernelInference(&'static str),
-    /// Feature cannot land in protocol via any path.
-    Forbidden(&'static str),
+/// How completely the kernel implements the Delta protocol's rule for a single (feature,
+/// operation) cell.
+///
+/// A cell states only its **implementation extent**; whether the operation is permitted is
+/// *derived* from it by [`apply_cell`](crate::table_configuration::TableConfiguration), never
+/// stored directly. When an op is refused, the error is `"Feature 'X': <msg>"` (the dispatcher
+/// prepends the feature name).
+pub(crate) enum ProtocolImplement {
+    /// Kernel fully implements the protocol rule for this op. -> operation permitted.
+    Full,
+    /// Kernel implements the rule only when `pred(ctx)` returns `true`; in the other states it
+    /// cannot comply, so the op is refused with the `&'static str` suffix. -> permitted iff
+    /// `pred`. The predicate hardcodes the owning [`TableFeature`], so it needs only the
+    /// [`OpAllowedCtx`]: a [`TableConfiguration`] for post-build ops, or the raw properties
+    /// for the create gate. A predicate handed a context it does not apply to returns `false`
+    /// (fail-safe -> the op blocks).
+    ///
+    /// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
+    Partial(fn(&OpAllowedCtx<'_>) -> bool, &'static str),
+    /// Kernel does not implement the protocol rule for this op. Runtime depends on polarity:
+    /// - `blocks: true` -- a *capability* the kernel cannot perform; the op is refused with `msg`.
+    /// - `blocks: false` -- a protocol *restriction* the kernel does not enforce; the op proceeds
+    ///   and the caller owns compliance. `msg` documents the unenforced rule (e.g. appendOnly
+    ///   removes) and is never surfaced as an error.
+    NotImplemented { blocks: bool, msg: &'static str },
+    /// Cell is not reachable from the dispatcher under the current design. Used at the definition
+    /// site to make intent explicit (e.g. the `read.scan` / `read.cdf` cells on a writer-only
+    /// feature, which are never iterated because the read path only walks reader features). The
+    /// dispatcher treats `NotApplicable` as permitted at runtime; debug builds
+    /// `debug_assert!(false)` to fail loud if a refactor ever reaches this cell.
+    NotApplicable,
 }
 
 /// Read-side policy for a feature.
 pub(crate) struct ReadSupport {
-    pub(crate) scan: OpSupport,
-    pub(crate) cdf: OpSupport,
+    pub(crate) scan: ProtocolImplement,
+    pub(crate) cdf: ProtocolImplement,
 }
 
 impl ReadSupport {
     pub(crate) const ALL_ALLOWED: Self = Self {
-        scan: OpSupport::Allowed,
-        cdf: OpSupport::Allowed,
+        scan: ProtocolImplement::Full,
+        cdf: ProtocolImplement::Full,
     };
 
     /// For writer-only features whose `read` cells are unreachable. The dispatcher only
     /// iterates reader features for read ops, so a writer-only feature's read cells should
-    /// never run. Definition-site documentation only; runtime behavior is `Allowed` with a
+    /// never run. Definition-site documentation only; runtime behavior is supported with a
     /// `debug_assert!(false)` in `apply_cell` if the invariant ever breaks.
     pub(crate) const NOT_APPLICABLE: Self = Self {
-        scan: OpSupport::NotApplicable,
-        cdf: OpSupport::NotApplicable,
+        scan: ProtocolImplement::NotApplicable,
+        cdf: ProtocolImplement::NotApplicable,
     };
 }
 
 /// Data-write policy for a feature.
 pub(crate) struct DataWriteSupport {
-    pub(crate) append: OpSupport,
-    pub(crate) dml: OpSupport,
-    pub(crate) maintenance: OpSupport,
+    pub(crate) append: ProtocolImplement,
+    pub(crate) dml_remove: ProtocolImplement,
+    pub(crate) maintenance: ProtocolImplement,
 }
 
 impl DataWriteSupport {
     pub(crate) const ALL_ALLOWED: Self = Self {
-        append: OpSupport::Allowed,
-        dml: OpSupport::Allowed,
-        maintenance: OpSupport::Allowed,
+        append: ProtocolImplement::Full,
+        dml_remove: ProtocolImplement::Full,
+        maintenance: ProtocolImplement::Full,
     };
 
-    /// All data-write cells forbidden whenever the feature is supported by the protocol.
-    pub(crate) const fn all_forbidden_if_supported(msg: &'static str) -> Self {
+    /// No data write is supported while the feature is in the protocol.
+    pub(crate) const fn all_not_supported(msg: &'static str) -> Self {
         Self {
-            append: OpSupport::ForbiddenIfSupported(msg),
-            dml: OpSupport::ForbiddenIfSupported(msg),
-            maintenance: OpSupport::ForbiddenIfSupported(msg),
+            append: ProtocolImplement::NotImplemented { blocks: true, msg },
+            dml_remove: ProtocolImplement::NotImplemented { blocks: true, msg },
+            maintenance: ProtocolImplement::NotImplemented { blocks: true, msg },
         }
     }
 
-    /// Restrict data writes to Append-only when the feature is active. DML (UPDATE / DELETE /
-    /// MERGE) and Maintenance (OPTIMIZE, stats updates, row-id backfill, etc.) are forbidden;
-    /// blind append remains allowed.
-    pub(crate) const fn restrict_to_appends_when_enabled(msg: &'static str) -> Self {
+    /// Append is always supported; DML (UPDATE / DELETE / MERGE) and Maintenance (OPTIMIZE,
+    /// stats updates, row-id backfill, etc.) are supported only while `predicate` holds. Use for
+    /// features that permit blind append but block remove-producing writes under some condition.
+    pub(crate) const fn restrict_to_appends(
+        predicate: fn(&OpAllowedCtx<'_>) -> bool,
+        msg: &'static str,
+    ) -> Self {
         Self {
-            append: OpSupport::Allowed,
-            dml: OpSupport::ForbiddenIfEnabled(msg),
-            maintenance: OpSupport::ForbiddenIfEnabled(msg),
+            append: ProtocolImplement::Full,
+            dml_remove: ProtocolImplement::Partial(predicate, msg),
+            maintenance: ProtocolImplement::Partial(predicate, msg),
         }
     }
 }
 
-/// DDL (schema-modifying) policy for a feature.
-pub(crate) struct DdlSupport {
-    pub(crate) add_column: OpSupport,
-    pub(crate) set_nullable: OpSupport,
-    pub(crate) drop_column: OpSupport,
-    pub(crate) rename_column: OpSupport,
+/// ALTER TABLE (schema-modifying) policy for a feature's column operations.
+///
+/// Only the ALTER operations kernel actually implements are represented (ADD COLUMN, SET
+/// NULLABLE). DROP / RENAME COLUMN are not yet supported by the kernel and have no cell; add one
+/// here (and a [`DdlOp`] variant) when such an operation lands.
+pub(crate) struct AlterSupport {
+    pub(crate) add_column: ProtocolImplement,
+    pub(crate) set_nullable: ProtocolImplement,
 }
 
-impl DdlSupport {
+impl AlterSupport {
     pub(crate) const ALL_ALLOWED: Self = Self {
-        add_column: OpSupport::Allowed,
-        set_nullable: OpSupport::Allowed,
-        drop_column: OpSupport::Allowed,
-        rename_column: OpSupport::Allowed,
+        add_column: ProtocolImplement::Full,
+        set_nullable: ProtocolImplement::Full,
     };
 
-    /// All DDL cells forbidden whenever the feature is supported by the protocol.
-    pub(crate) const fn all_forbidden_if_supported(msg: &'static str) -> Self {
+    /// No ALTER op is supported while the feature is in the protocol.
+    pub(crate) const fn all_not_supported(msg: &'static str) -> Self {
         Self {
-            add_column: OpSupport::ForbiddenIfSupported(msg),
-            set_nullable: OpSupport::ForbiddenIfSupported(msg),
-            drop_column: OpSupport::ForbiddenIfSupported(msg),
-            rename_column: OpSupport::ForbiddenIfSupported(msg),
+            add_column: ProtocolImplement::NotImplemented { blocks: true, msg },
+            set_nullable: ProtocolImplement::NotImplemented { blocks: true, msg },
         }
     }
 
-    /// All DDL cells forbidden whenever the feature is active.
-    pub(crate) const fn all_forbidden_if_enabled(msg: &'static str) -> Self {
+    /// Every ALTER op is supported only while `predicate` holds.
+    pub(crate) const fn all_partially_supported(
+        predicate: fn(&OpAllowedCtx<'_>) -> bool,
+        msg: &'static str,
+    ) -> Self {
         Self {
-            add_column: OpSupport::ForbiddenIfEnabled(msg),
-            set_nullable: OpSupport::ForbiddenIfEnabled(msg),
-            drop_column: OpSupport::ForbiddenIfEnabled(msg),
-            rename_column: OpSupport::ForbiddenIfEnabled(msg),
+            add_column: ProtocolImplement::Partial(predicate, msg),
+            set_nullable: ProtocolImplement::Partial(predicate, msg),
         }
     }
+}
+
+/// DDL policy: the implemented ALTER ops plus the CREATE TABLE gate.
+///
+/// `create_table` has no whole-struct default (there is no `DdlSupport::ALL_ALLOWED`), so every
+/// [`FeatureInfo`] must state it explicitly. It is consulted only by the create-table gate over
+/// user-originated features; it is never selected by
+/// [`ensure_operation_supported`](crate::table_configuration::TableConfiguration::ensure_operation_supported)
+/// (there is no `DdlOp::CreateTable`).
+pub(crate) struct DdlSupport {
+    pub(crate) alter: AlterSupport,
+    pub(crate) create_table: ProtocolImplement,
 }
 
 /// Full per-feature operation support matrix. Every (feature, operation) pair has a
@@ -430,40 +436,63 @@ pub(crate) struct OperationSupport {
     pub(crate) read: ReadSupport,
     pub(crate) data_write: DataWriteSupport,
     pub(crate) ddl: DdlSupport,
-    pub(crate) create: CreateSupport,
 }
 
 impl OperationSupport {
     pub(crate) const ALL_ALLOWED: Self = Self {
         read: ReadSupport::ALL_ALLOWED,
         data_write: DataWriteSupport::ALL_ALLOWED,
-        ddl: DdlSupport::ALL_ALLOWED,
-        create: CreateSupport::Allowed,
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            create_table: ProtocolImplement::Full,
+        },
     };
 }
 
-/// `ForbiddenIf` predicate for the Invariants cells: returns `true` when the schema actually
-/// carries `delta.invariants` metadata on any field. The static feature presence in the
-/// protocol alone does not block writes; only an in-use invariant does.
-fn schema_has_invariants_predicate(
-    table_config: &crate::table_configuration::TableConfiguration,
-) -> bool {
-    schema_has_invariants(table_config.logical_schema().as_ref())
+/// Support-positive [`ProtocolImplement::Partial`] predicate for the Invariants cells:
+/// writes and DDL are supported only while the schema carries NO `delta.invariants` metadata. The
+/// static feature presence in the protocol alone does not block writes; only an in-use invariant
+/// does, so legacy tables that list the feature but do not use it remain writable.
+fn schema_has_no_invariants(ctx: &OpAllowedCtx<'_>) -> bool {
+    match ctx {
+        OpAllowedCtx::Validated(tc) => !schema_has_invariants(tc.logical_schema().as_ref()),
+        OpAllowedCtx::UnvalidatedProperties(_) => false,
+    }
 }
 
-/// `ForbiddenIf` predicate for [`ROW_TRACKING_INFO`]'s remove-producing cells.
+/// Support-positive [`ProtocolImplement::Partial`] predicate for [`ROW_TRACKING_INFO`]'s
+/// remove-producing cells: those ops are supported only while kernel will NOT need to write row
+/// tracking.
 ///
-/// Fires whenever the table may carry row IDs that kernel cannot preserve through the
-/// commit. Broader than `is_feature_enabled`: it fires whenever row tracking is supported
-/// by the protocol AND not suspended, even if `delta.enableRowTracking` is `false`. See
+/// Broader than `!is_feature_enabled`: row tracking writes are required whenever the feature is
+/// supported by the protocol AND not suspended, even if `delta.enableRowTracking` is `false`. See
 /// [`crate::table_configuration::TableConfiguration::should_write_row_tracking`] for the
-/// authoritative definition. Kernel cannot yet preserve stable row IDs across removes
-/// (#2538), so the predicate conservatively reports `true` whenever the table may have
-/// row IDs.
-fn row_tracking_supported_and_not_suspended_predicate(
-    table_config: &crate::table_configuration::TableConfiguration,
-) -> bool {
-    table_config.should_write_row_tracking()
+/// authoritative definition. Kernel cannot yet preserve stable row IDs across removes (#2538), so
+/// the predicate conservatively reports unsupported whenever the table may carry row IDs.
+fn row_tracking_writes_not_required(ctx: &OpAllowedCtx<'_>) -> bool {
+    match ctx {
+        OpAllowedCtx::Validated(tc) => !tc.should_write_row_tracking(),
+        OpAllowedCtx::UnvalidatedProperties(_) => false,
+    }
+}
+
+/// Support-positive [`ProtocolImplement::Partial`] predicate: DML / maintenance / ALTER
+/// are supported only while `icebergCompatV3` is NOT enabled (#2492).
+fn iceberg_compat_v3_not_enabled(ctx: &OpAllowedCtx<'_>) -> bool {
+    match ctx {
+        OpAllowedCtx::Validated(tc) => !tc.is_feature_enabled(&TableFeature::IcebergCompatV3),
+        OpAllowedCtx::UnvalidatedProperties(_) => false,
+    }
+}
+
+/// Support-positive [`ProtocolImplement::Partial`] predicate: DML is supported only
+/// while `changeDataFeed` is NOT enabled (kernel cannot yet write CDC files for DML-shaped
+/// commits).
+fn change_data_feed_not_enabled(ctx: &OpAllowedCtx<'_>) -> bool {
+    match ctx {
+        OpAllowedCtx::Validated(tc) => !tc.is_feature_enabled(&TableFeature::ChangeDataFeed),
+        OpAllowedCtx::UnvalidatedProperties(_) => false,
+    }
 }
 
 /// Types of requirements for feature dependencies
@@ -536,9 +565,14 @@ mod msg {
     pub(super) const CATALOG_OWNED_PREVIEW_DEPRECATED_FOR_CREATE: &str =
         "is deprecated for CREATE TABLE; use 'catalogManaged' instead";
 
+    // Documents the unenforced appendOnly restriction (a `NotImplemented { blocks: false }` cell);
+    // never surfaced as an error because the op is permitted.
+    pub(super) const APPEND_ONLY_REMOVES_UNENFORCED: &str =
+        "appendOnly forbids data-changing removes (DELETE/UPDATE/MERGE); kernel does not enforce this -- the caller must honor appendOnly";
     pub(super) const CDF_DML_NOT_YET_SUPPORTED: &str =
         "CDF writes not yet supported for UPDATE/DELETE/MERGE-shaped commits";
-    pub(super) const INVARIANTS_IN_SCHEMA: &str = "Column invariants are not yet supported";
+    pub(super) const INVARIANTS_IN_SCHEMA: &str =
+        "a schema with column invariants is not yet supported";
     pub(super) const ROW_TRACKING_BLOCKS_REMOVES: &str =
         "Remove actions are not yet supported when rowTracking is supported and not suspended (#2538)";
     pub(super) const V3_BLOCKS_REMOVES: &str =
@@ -552,7 +586,21 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
-    operation_support: OperationSupport::ALL_ALLOWED,
+    operation_support: OperationSupport {
+        // appendOnly forbids data-changing removes (`DataWriteOp::DmlRemove` by contract). Kernel
+        // does NOT enforce this yet, so the cell is `NotImplemented { blocks: false }`: the
+        // remove is permitted (the caller owns appendOnly compliance) while the matrix
+        // honestly records the unimplemented restriction. Append + `data_change=false`
+        // removes (Maintenance) are unrelated and fully supported.
+        data_write: DataWriteSupport {
+            dml_remove: ProtocolImplement::NotImplemented {
+                blocks: false,
+                msg: msg::APPEND_ONLY_REMOVES_UNENFORCED,
+            },
+            ..DataWriteSupport::ALL_ALLOWED
+        },
+        ..OperationSupport::ALL_ALLOWED
+    },
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
@@ -565,40 +613,26 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
     operation_support: OperationSupport {
+        // Writes/DDL are supported only while the schema carries no in-use invariants.
         data_write: DataWriteSupport {
-            append: OpSupport::ForbiddenIf {
-                msg: msg::INVARIANTS_IN_SCHEMA,
-                predicate: schema_has_invariants_predicate,
-            },
-            dml: OpSupport::ForbiddenIf {
-                msg: msg::INVARIANTS_IN_SCHEMA,
-                predicate: schema_has_invariants_predicate,
-            },
-            maintenance: OpSupport::ForbiddenIf {
-                msg: msg::INVARIANTS_IN_SCHEMA,
-                predicate: schema_has_invariants_predicate,
-            },
+            append: ProtocolImplement::Partial(schema_has_no_invariants, msg::INVARIANTS_IN_SCHEMA),
+            dml_remove: ProtocolImplement::Partial(
+                schema_has_no_invariants,
+                msg::INVARIANTS_IN_SCHEMA,
+            ),
+            maintenance: ProtocolImplement::Partial(
+                schema_has_no_invariants,
+                msg::INVARIANTS_IN_SCHEMA,
+            ),
         },
         ddl: DdlSupport {
-            add_column: OpSupport::ForbiddenIf {
-                msg: msg::INVARIANTS_IN_SCHEMA,
-                predicate: schema_has_invariants_predicate,
-            },
-            set_nullable: OpSupport::ForbiddenIf {
-                msg: msg::INVARIANTS_IN_SCHEMA,
-                predicate: schema_has_invariants_predicate,
-            },
-            drop_column: OpSupport::ForbiddenIf {
-                msg: msg::INVARIANTS_IN_SCHEMA,
-                predicate: schema_has_invariants_predicate,
-            },
-            rename_column: OpSupport::ForbiddenIf {
-                msg: msg::INVARIANTS_IN_SCHEMA,
-                predicate: schema_has_invariants_predicate,
-            },
+            alter: AlterSupport::all_partially_supported(
+                schema_has_no_invariants,
+                msg::INVARIANTS_IN_SCHEMA,
+            ),
+            create_table: ProtocolImplement::Full,
         },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Allowed,
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -608,10 +642,15 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 3)),
     feature_requirements: &[],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN,
+            },
+        },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN),
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -622,7 +661,10 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[],
     operation_support: OperationSupport {
         data_write: DataWriteSupport {
-            dml: OpSupport::ForbiddenIfEnabled(msg::CDF_DML_NOT_YET_SUPPORTED),
+            dml_remove: ProtocolImplement::Partial(
+                change_data_feed_not_enabled,
+                msg::CDF_DML_NOT_YET_SUPPORTED,
+            ),
             ..DataWriteSupport::ALL_ALLOWED
         },
         ..OperationSupport::ALL_ALLOWED
@@ -637,10 +679,15 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 4)),
     feature_requirements: &[],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN,
+            },
+        },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN),
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -650,10 +697,15 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN,
+            },
+        },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN),
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -686,15 +738,15 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
         // Gate fires whenever row tracking is *supported and not suspended* (broader than
         // just *enabled*). See [`row_tracking_supported_and_not_suspended_predicate`].
         data_write: DataWriteSupport {
-            append: OpSupport::Allowed,
-            dml: OpSupport::ForbiddenIf {
-                msg: msg::ROW_TRACKING_BLOCKS_REMOVES,
-                predicate: row_tracking_supported_and_not_suspended_predicate,
-            },
-            maintenance: OpSupport::ForbiddenIf {
-                msg: msg::ROW_TRACKING_BLOCKS_REMOVES,
-                predicate: row_tracking_supported_and_not_suspended_predicate,
-            },
+            append: ProtocolImplement::Full,
+            dml_remove: ProtocolImplement::Partial(
+                row_tracking_writes_not_required,
+                msg::ROW_TRACKING_BLOCKS_REMOVES,
+            ),
+            maintenance: ProtocolImplement::Partial(
+                row_tracking_writes_not_required,
+                msg::ROW_TRACKING_BLOCKS_REMOVES,
+            ),
         },
         ..OperationSupport::ALL_ALLOWED
     },
@@ -728,10 +780,15 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN,
+            },
+        },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN),
     },
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v1 == Some(true)
@@ -756,10 +813,15 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN,
+            },
+        },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN),
     },
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v2 == Some(true)
@@ -800,10 +862,18 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
     ],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::restrict_to_appends_when_enabled(msg::V3_BLOCKS_REMOVES),
-        ddl: DdlSupport::all_forbidden_if_enabled(msg::V3_BLOCKS_ALTER),
+        data_write: DataWriteSupport::restrict_to_appends(
+            iceberg_compat_v3_not_enabled,
+            msg::V3_BLOCKS_REMOVES,
+        ),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_partially_supported(
+                iceberg_compat_v3_not_enabled,
+                msg::V3_BLOCKS_ALTER,
+            ),
+            create_table: ProtocolImplement::Full,
+        },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Allowed,
     },
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v3 == Some(true)
@@ -815,9 +885,13 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     operation_support: OperationSupport {
-        create: CreateSupport::AllowedOnlyViaKernelInference(
-            msg::CREATE_KERNEL_INFERENCE_ONLY_CLUSTERING,
-        ),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_KERNEL_INFERENCE_ONLY_CLUSTERING,
+            },
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -841,15 +915,26 @@ static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[],
     #[cfg(feature = "column-defaults-in-dev")]
     operation_support: OperationSupport {
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE,
+            },
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     #[cfg(not(feature = "column-defaults-in-dev"))]
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE,
+            },
+        },
         read: ReadSupport::NOT_APPLICABLE,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE),
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -860,7 +945,10 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     operation_support: OperationSupport {
         read: ReadSupport {
-            cdf: OpSupport::ForbiddenIfSupported(msg::NOT_SUPPORTED_FOR_CDF),
+            cdf: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::NOT_SUPPORTED_FOR_CDF,
+            },
             ..ReadSupport::ALL_ALLOWED
         },
         ..OperationSupport::ALL_ALLOWED
@@ -874,10 +962,19 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     operation_support: OperationSupport {
         read: ReadSupport {
-            cdf: OpSupport::ForbiddenIfSupported(msg::NOT_SUPPORTED_FOR_CDF),
+            cdf: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::NOT_SUPPORTED_FOR_CDF,
+            },
             ..ReadSupport::ALL_ALLOWED
         },
-        create: CreateSupport::Forbidden(msg::CATALOG_OWNED_PREVIEW_DEPRECATED_FOR_CREATE),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CATALOG_OWNED_PREVIEW_DEPRECATED_FOR_CREATE,
+            },
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -912,9 +1009,18 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     operation_support: OperationSupport {
-        create: CreateSupport::AllowedOnlyViaKernelInference(
-            msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
-        ),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            // Create IS supported -- but only via schema inference (a column of the relevant type),
+            // which never flows through the create gate. An explicit `delta.feature.*` signal is
+            // rejected, so the check is constant-false. `Partial` (not `NotImplemented`) because
+            // the capability exists; it is just not reachable through an explicit
+            // opt-in.
+            create_table: ProtocolImplement::Partial(
+                |_ctx| false,
+                msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
+            ),
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -928,10 +1034,15 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        // Kernel cannot yet write type-widened data, but CREATE only adds the feature to the
+        // protocol (matching main's allow-list), so `delta.feature.typeWidening=supported` is
+        // accepted at create time.
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+            create_table: ProtocolImplement::Full,
+        },
         read: ReadSupport::ALL_ALLOWED,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE),
     },
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
@@ -944,10 +1055,16 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     operation_support: OperationSupport {
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        // The preview variant is not user-creatable; `typeWidening` is the create-time opt-in.
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED_FOR_WRITES),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN,
+            },
+        },
         read: ReadSupport::ALL_ALLOWED,
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN_KERNEL_CANNOT_WRITE),
     },
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
@@ -973,9 +1090,18 @@ static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     operation_support: OperationSupport {
-        create: CreateSupport::AllowedOnlyViaKernelInference(
-            msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
-        ),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            // Create IS supported -- but only via schema inference (a column of the relevant type),
+            // which never flows through the create gate. An explicit `delta.feature.*` signal is
+            // rejected, so the check is constant-false. `Partial` (not `NotImplemented`) because
+            // the capability exists; it is just not reachable through an explicit
+            // opt-in.
+            create_table: ProtocolImplement::Partial(
+                |_ctx| false,
+                msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
+            ),
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -986,9 +1112,18 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     operation_support: OperationSupport {
-        create: CreateSupport::AllowedOnlyViaKernelInference(
-            msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
-        ),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            // Create IS supported -- but only via schema inference (a column of the relevant type),
+            // which never flows through the create gate. An explicit `delta.feature.*` signal is
+            // rejected, so the check is constant-false. `Partial` (not `NotImplemented`) because
+            // the capability exists; it is just not reachable through an explicit
+            // opt-in.
+            create_table: ProtocolImplement::Partial(
+                |_ctx| false,
+                msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
+            ),
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -999,9 +1134,18 @@ static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     operation_support: OperationSupport {
-        create: CreateSupport::AllowedOnlyViaKernelInference(
-            msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
-        ),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            // Create IS supported -- but only via schema inference (a column of the relevant type),
+            // which never flows through the create gate. An explicit `delta.feature.*` signal is
+            // rejected, so the check is constant-false. `Partial` (not `NotImplemented`) because
+            // the capability exists; it is just not reachable through an explicit
+            // opt-in.
+            create_table: ProtocolImplement::Partial(
+                |_ctx| false,
+                msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
+            ),
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1012,9 +1156,18 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     operation_support: OperationSupport {
-        create: CreateSupport::AllowedOnlyViaKernelInference(
-            msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
-        ),
+        ddl: DdlSupport {
+            alter: AlterSupport::ALL_ALLOWED,
+            // Create IS supported -- but only via schema inference (a column of the relevant type),
+            // which never flows through the create gate. An explicit `delta.feature.*` signal is
+            // rejected, so the check is constant-false. `Partial` (not `NotImplemented`) because
+            // the capability exists; it is just not reachable through an explicit
+            // opt-in.
+            create_table: ProtocolImplement::Partial(
+                |_ctx| false,
+                msg::CREATE_KERNEL_INFERENCE_ONLY_SCHEMA,
+            ),
+        },
         ..OperationSupport::ALL_ALLOWED
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1029,12 +1182,23 @@ static UNKNOWN_FEATURE_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[],
     operation_support: OperationSupport {
         read: ReadSupport {
-            scan: OpSupport::ForbiddenIfSupported(msg::NOT_SUPPORTED),
-            cdf: OpSupport::ForbiddenIfSupported(msg::NOT_SUPPORTED),
+            scan: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::NOT_SUPPORTED,
+            },
+            cdf: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::NOT_SUPPORTED,
+            },
         },
-        data_write: DataWriteSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
-        ddl: DdlSupport::all_forbidden_if_supported(msg::NOT_SUPPORTED),
-        create: CreateSupport::Forbidden(msg::CREATE_FORBIDDEN),
+        data_write: DataWriteSupport::all_not_supported(msg::NOT_SUPPORTED),
+        ddl: DdlSupport {
+            alter: AlterSupport::all_not_supported(msg::NOT_SUPPORTED),
+            create_table: ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: msg::CREATE_FORBIDDEN,
+            },
+        },
     },
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -1234,10 +1398,10 @@ pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()>
 ///
 /// Unlike [`TableConfiguration::ensure_operation_supported`], this does not require a
 /// [`Metadata`] action or any table properties, so it can only consult the protocol-static read
-/// policy: a reader feature is rejected only when its `read.scan` cell unconditionally forbids the
-/// op ([`OpSupport::ForbiddenIfSupported`]). Enablement- or schema-dependent read policies
-/// ([`OpSupport::ForbiddenIfEnabled`] / [`OpSupport::ForbiddenIf`]) require a full
-/// [`TableConfiguration`] and are not evaluated here.
+/// policy: a reader feature is rejected only when its `read.scan` cell is unconditionally
+/// [`ProtocolImplement::NotImplemented`]. State-dependent read policies
+/// ([`ProtocolImplement::Partial`]) require a full [`TableConfiguration`] and are
+/// leniently allowed here.
 ///
 /// [`Metadata`]: crate::actions::Metadata
 /// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
@@ -1246,7 +1410,9 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
     check_reader_version_range(protocol)?;
 
     for feature in extract_enabled_reader_features(protocol) {
-        if let OpSupport::ForbiddenIfSupported(msg) = feature.info().operation_support.read.scan {
+        if let ProtocolImplement::NotImplemented { blocks: true, msg } =
+            feature.info().operation_support.read.scan
+        {
             return Err(Error::unsupported(format!("Feature '{feature}': {msg}")));
         }
     }
@@ -1354,6 +1520,207 @@ mod tests {
                 "expected Unsupported, got: {result:?}"
             ),
         }
+    }
+
+    /// Pins each feature's `ddl.create_table` cell to main's historical `ALLOWED_DELTA_FEATURES`
+    /// membership: features a user may opt into at CREATE via `delta.feature.X=supported` are
+    /// `Full`; every other feature is `NotImplemented { blocks: true }`. Guards against silent
+    /// drift when a feature inherits its `ddl` from `OperationSupport::ALL_ALLOWED`.
+    #[test]
+    fn test_create_table_cell_matches_allowed_features() {
+        use strum::IntoEnumIterator as _;
+
+        // Mirrors the create-table builder's allow-list (kernel-inferred features -- timestampNtz,
+        // variant*, clustering -- and unsupported features are intentionally absent).
+        let create_supported = [
+            TableFeature::AppendOnly,
+            TableFeature::CatalogManaged,
+            TableFeature::ChangeDataFeed,
+            TableFeature::ColumnMapping,
+            TableFeature::DeletionVectors,
+            TableFeature::DomainMetadata,
+            TableFeature::IcebergCompatV3,
+            TableFeature::InCommitTimestamp,
+            TableFeature::Invariants,
+            TableFeature::MaterializePartitionColumns,
+            TableFeature::RowTracking,
+            TableFeature::TypeWidening,
+            TableFeature::V2Checkpoint,
+            TableFeature::VacuumProtocolCheck,
+        ];
+
+        // Kernel-inference-only features: create IS supported, but only via schema inference; an
+        // explicit `delta.feature.*` signal is still rejected, so the create cell is a `Partial`
+        // whose check is constant-false (see the create gate).
+        let inference_only = [
+            TableFeature::TimestampWithoutTimezone,
+            TableFeature::VariantType,
+            TableFeature::VariantTypePreview,
+            TableFeature::VariantShredding,
+            TableFeature::VariantShreddingPreview,
+        ];
+
+        for feature in TableFeature::iter() {
+            if feature == TableFeature::Unknown(String::new()) {
+                continue; // Unknown carries data; covered explicitly below.
+            }
+            let cell = &feature.info().operation_support.ddl.create_table;
+            if create_supported.contains(&feature) {
+                assert!(
+                    matches!(cell, ProtocolImplement::Full),
+                    "{feature} must be Full (create-supported)",
+                );
+            } else if inference_only.contains(&feature) {
+                assert!(
+                    matches!(cell, ProtocolImplement::Partial(..)),
+                    "{feature} must be Partial (create supported only via inference)",
+                );
+            } else {
+                assert!(
+                    matches!(
+                        cell,
+                        ProtocolImplement::NotImplemented {
+                            blocks: true,
+                            msg: _
+                        }
+                    ),
+                    "{feature} must be NotImplemented{{blocks:true}} at create",
+                );
+            }
+        }
+
+        // Unknown features are never user-creatable.
+        assert!(matches!(
+            TableFeature::unknown("x")
+                .info()
+                .operation_support
+                .ddl
+                .create_table,
+            ProtocolImplement::NotImplemented {
+                blocks: true,
+                msg: _
+            }
+        ));
+    }
+
+    /// Doc generator (not an assertion): walks the `ProtocolImplement` matrix and writes
+    /// `docs/protocol-support.md`. Ignored by default; regenerate explicitly with
+    /// `scripts/generate-protocol-support.sh` (or
+    /// `cargo test -p delta_kernel --lib generate_protocol_support_md -- --ignored --nocapture`).
+    /// The output reflects the cargo features the generator was built with.
+    #[test]
+    #[ignore = "doc generator; run explicitly to regenerate docs/protocol-support.md"]
+    fn generate_protocol_support_md() {
+        use std::fmt::Write as _;
+
+        use strum::IntoEnumIterator as _;
+
+        // Status code for the matrix table. A `NotImplemented` cell with `blocks: false` is a
+        // protocol-disallowed operation kernel does not enforce (permitted; caller must comply).
+        fn code(cell: &ProtocolImplement) -> &'static str {
+            match cell {
+                ProtocolImplement::Full => "yes",
+                ProtocolImplement::Partial(..) => "partial",
+                ProtocolImplement::NotImplemented { blocks: false, .. } => {
+                    "unimplemented(disallow)"
+                }
+                ProtocolImplement::NotImplemented { blocks: true, .. } => "unimplemented",
+                ProtocolImplement::NotApplicable => "n/a",
+            }
+        }
+        // Description for the Notes section -- only partially-supported operations are listed.
+        fn note(cell: &ProtocolImplement) -> Option<&'static str> {
+            match cell {
+                ProtocolImplement::Partial(_, d) => Some(d),
+                _ => None,
+            }
+        }
+
+        type Selector = fn(&OperationSupport) -> &ProtocolImplement;
+        let ops: &[(&str, Selector)] = &[
+            ("read-scan", |o| &o.read.scan),
+            ("read-cdf", |o| &o.read.cdf),
+            ("append", |o| &o.data_write.append),
+            ("dmlRemove", |o| &o.data_write.dml_remove),
+            ("maintenance", |o| &o.data_write.maintenance),
+            ("alter", |o| &o.ddl.alter.add_column),
+            ("create", |o| &o.ddl.create_table),
+        ];
+
+        let mut table = String::from(
+            "| Feature | Type | read-scan | read-cdf | append | dmlRemove | maintenance | alter | create |\n\
+             |---|---|---|---|---|---|---|---|---|\n",
+        );
+        let mut notes = String::new();
+        for f in TableFeature::iter() {
+            if matches!(f, TableFeature::Unknown(_)) {
+                continue;
+            }
+            let os = &f.info().operation_support;
+            let ty = match f.feature_type() {
+                FeatureType::WriterOnly => "writer",
+                FeatureType::ReaderWriter => "reader+writer",
+                FeatureType::Unknown => "unknown",
+            };
+            write!(table, "| `{f}` | {ty} |").unwrap();
+            for (_, sel) in ops {
+                write!(table, " {} |", code(sel(os))).unwrap();
+            }
+            table.push('\n');
+            for (op_name, sel) in ops {
+                if let Some(d) = note(sel(os)) {
+                    writeln!(notes, "- `{f}` / {op_name}: {d}").unwrap();
+                }
+            }
+        }
+
+        let mut out = String::new();
+        out.push_str("# Delta protocol feature implementation in delta-kernel-rs\n\n");
+        out.push_str(
+            "Generated from the `ProtocolImplement` matrix in `kernel/src/table_features/mod.rs` by \
+             the `generate_protocol_support_md` test -- do not edit by hand; regenerate with \
+             `scripts/generate-protocol-support.sh`.\n\n",
+        );
+        out.push_str(
+            "Statuses: **yes** = fully implemented; **partial** = implemented under a condition \
+             (see Notes); **unimplemented** = operation not implemented; \
+             **unimplemented(disallow)** = see note below; **n/a** = not applicable (e.g. read \
+             cells on a writer-only feature).\n\n",
+        );
+        out.push_str(
+            "**Note:** statuses are protocol-oriented. For an operation Op and feature A, **yes** \
+             means every protocol-legal Op is allowed when A is enabled -- not that Op always \
+             succeeds: a protocol-illegal input still fails. E.g. kernel fully implements \
+             `icebergCompatV3` for append, yet an append whose addFile omits `stats.numRecords` is \
+             rejected, as the protocol requires.\n\n",
+        );
+        out.push_str(
+            "**Note:** some features **disallow** an operation. `unimplemented(disallow)` means \
+             kernel does not enforce that restriction, so the operation is permitted when the \
+             feature is enabled and the caller must honor the protocol. E.g. `appendOnly` \
+             disallows data-changing removes (DELETE/UPDATE/MERGE), and its `dmlRemove` cell is \
+             `unimplemented(disallow)`: kernel currently allows such removes when `appendOnly` is \
+             enabled (we intend to enforce this in the future).\n\n",
+        );
+        out.push_str(
+            "**Note:** the data-write operations are `append` -- an add-only commit (no removes); \
+             `dmlRemove` -- a data-changing commit that removes rows (DELETE/UPDATE/MERGE); and \
+             `maintenance` -- a commit that rewrites files without changing data (OPTIMIZE, \
+             compaction, stats/row-id backfill).\n\n",
+        );
+        out.push_str("## Support matrix\n\n");
+        out.push_str(&table);
+        out.push_str("\nUnknown / unrecognized features are forbidden for every operation.\n\n");
+        out.push_str("## Notes (partial support)\n\n");
+        if notes.is_empty() {
+            out.push_str("_none_\n");
+        } else {
+            out.push_str(&notes);
+        }
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/protocol-support.md");
+        std::fs::write(path, out).expect("write docs/protocol-support.md");
+        eprintln!("wrote {path}");
     }
 
     #[test]

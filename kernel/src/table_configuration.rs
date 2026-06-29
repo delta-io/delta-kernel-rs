@@ -26,11 +26,11 @@ use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, CreatePath, CreateSupport,
-    DataWriteOp, DdlOp, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType, OpSupport,
-    Operation, ReadOp, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
-    MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, DataWriteOp, DdlOp, EnablementCheck,
+    FeatureInfo, FeatureRequirement, FeatureType, OpAllowedCtx, Operation, ProtocolImplement,
+    ReadOp, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -573,14 +573,23 @@ impl TableConfiguration {
         Ok(())
     }
 
-    /// Applies a per-cell [`OpSupport`] policy to the given feature.
+    /// Derives whether `feature`'s operation is permitted from its [`ProtocolImplement`] cell.
     ///
-    /// Returns `Ok` if the operation is allowed for this feature; otherwise an `unsupported`
-    /// error of the form `"Feature 'X': <cell's static suffix>"`.
-    fn apply_cell(&self, feature: &TableFeature, cell: &OpSupport) -> DeltaResult<()> {
+    /// Returns `Ok` if permitted; otherwise an `unsupported` error of the form
+    /// `"Feature 'X': <cell's static msg>"`.
+    fn apply_cell(&self, feature: &TableFeature, cell: &ProtocolImplement) -> DeltaResult<()> {
+        let ctx = OpAllowedCtx::Validated(self);
         let blocked_msg = match cell {
-            OpSupport::Allowed => None,
-            OpSupport::NotApplicable => {
+            // Fully implemented, or an unenforced restriction (`blocks: false`), or an unreachable
+            // cell: the operation proceeds.
+            ProtocolImplement::Full => None,
+            ProtocolImplement::NotImplemented { blocks: false, .. } => None,
+            // Conditionally implemented: permitted only while the predicate holds.
+            ProtocolImplement::Partial(predicate, _) if predicate(&ctx) => None,
+            ProtocolImplement::Partial(_, msg) => Some(*msg),
+            // A capability the kernel cannot perform: refused.
+            ProtocolImplement::NotImplemented { blocks: true, msg } => Some(*msg),
+            ProtocolImplement::NotApplicable => {
                 debug_assert!(
                     false,
                     "Feature '{feature}': NotApplicable cell reached at runtime; dispatcher \
@@ -588,11 +597,6 @@ impl TableConfiguration {
                 );
                 None
             }
-            OpSupport::ForbiddenIfSupported(msg) => Some(*msg),
-            OpSupport::ForbiddenIfEnabled(msg) if self.is_feature_enabled(feature) => Some(*msg),
-            OpSupport::ForbiddenIfEnabled(_) => None,
-            OpSupport::ForbiddenIf { msg, predicate } if predicate(self) => Some(*msg),
-            OpSupport::ForbiddenIf { .. } => None,
         };
         match blocked_msg {
             Some(msg) => Err(Error::unsupported(format!("Feature '{feature}': {msg}"))),
@@ -673,7 +677,7 @@ impl TableConfiguration {
                     self.get_supported_writer_features(),
                     |info| match data_write_op {
                         DataWriteOp::Append => &info.operation_support.data_write.append,
-                        DataWriteOp::Dml => &info.operation_support.data_write.dml,
+                        DataWriteOp::DmlRemove => &info.operation_support.data_write.dml_remove,
                         DataWriteOp::Maintenance => &info.operation_support.data_write.maintenance,
                     },
                 )
@@ -681,10 +685,8 @@ impl TableConfiguration {
             Operation::Ddl(ddl_op) => {
                 self.check_writer_version()?;
                 self.gate(self.get_supported_writer_features(), |info| match ddl_op {
-                    DdlOp::AddColumn => &info.operation_support.ddl.add_column,
-                    DdlOp::SetNullable => &info.operation_support.ddl.set_nullable,
-                    DdlOp::DropColumn => &info.operation_support.ddl.drop_column,
-                    DdlOp::RenameColumn => &info.operation_support.ddl.rename_column,
+                    DdlOp::AddColumn => &info.operation_support.ddl.alter.add_column,
+                    DdlOp::SetNullable => &info.operation_support.ddl.alter.set_nullable,
                 })
             }
         }
@@ -694,7 +696,7 @@ impl TableConfiguration {
     /// `select` returns. Each feature's `feature_requirements` are validated after its cell.
     fn gate<F>(&self, features: Vec<TableFeature>, select: F) -> DeltaResult<()>
     where
-        F: Fn(&FeatureInfo) -> &OpSupport,
+        F: Fn(&FeatureInfo) -> &ProtocolImplement,
     {
         for feature in features {
             self.apply_cell(&feature, select(feature.info()))?;
@@ -735,50 +737,6 @@ impl TableConfiguration {
             )));
         }
         Ok(())
-    }
-
-    /// Returns `Ok` if the given `feature` is allowed to land in the protocol via the given
-    /// `path` at table creation time.
-    ///
-    /// Path-based create validation is separate from [`Self::ensure_operation_supported`] because
-    /// CREATE needs origin information (user opt-in vs kernel inference) that the unified
-    /// dispatcher does not have.
-    #[internal_api]
-    pub(crate) fn ensure_create_supported(
-        &self,
-        feature: &TableFeature,
-        path: CreatePath,
-    ) -> DeltaResult<()> {
-        match (&feature.info().operation_support.create, path) {
-            (CreateSupport::Allowed, _) => Ok(()),
-            (CreateSupport::AllowedOnlyViaKernelInference(_), CreatePath::KernelInference) => {
-                Ok(())
-            }
-            (CreateSupport::AllowedOnlyViaKernelInference(msg), CreatePath::UserOptIn) => {
-                Err(Error::unsupported(format!("Feature '{feature}': {msg}")))
-            }
-            (CreateSupport::Forbidden(msg), _) => {
-                Err(Error::unsupported(format!("Feature '{feature}': {msg}")))
-            }
-        }
-    }
-
-    /// Returns an iterator over all features supported by this table's protocol (union of
-    /// reader and writer feature lists, deduplicated).
-    pub(crate) fn all_supported_features(&self) -> impl Iterator<Item = TableFeature> {
-        let mut seen: HashSet<TableFeature> = HashSet::new();
-        let mut out: Vec<TableFeature> = Vec::new();
-        for f in self.get_supported_reader_features() {
-            if seen.insert(f.clone()) {
-                out.push(f);
-            }
-        }
-        for f in self.get_supported_writer_features() {
-            if seen.insert(f.clone()) {
-                out.push(f);
-            }
-        }
-        out.into_iter()
     }
 
     /// Returns information about in-commit timestamp enablement state.
@@ -2749,7 +2707,7 @@ mod test {
         );
     }
 
-    /// The RowTracking `data_write` matrix cells must reject `Dml` and `Maintenance` whenever
+    /// The RowTracking `data_write` matrix cells must reject `DmlRemove` and `Maintenance` whenever
     /// row tracking is _supported_ and not _suspended_, which is broader than just _enabled_.
     /// Append is always allowed. See
     /// [`crate::table_features::row_tracking_supported_and_not_suspended_predicate`]
@@ -2766,7 +2724,7 @@ mod test {
             props,
             &[TableFeature::RowTracking, TableFeature::DomainMetadata],
         );
-        for op in [DataWriteOp::Dml, DataWriteOp::Maintenance] {
+        for op in [DataWriteOp::DmlRemove, DataWriteOp::Maintenance] {
             let result = config.ensure_operation_supported(Operation::DataWrite(op));
             match expected_error_substring {
                 Some(msg) => assert_result_error_with_message(result, msg),
@@ -2779,7 +2737,7 @@ mod test {
             .is_ok());
     }
 
-    /// The IcebergCompatV3 `data_write` matrix cells must reject `Dml` and `Maintenance`
+    /// The IcebergCompatV3 `data_write` matrix cells must reject `DmlRemove` and `Maintenance`
     /// whenever V3 is enabled. On a typical V3 table the RowTracking cell would also fire
     /// and could mask the V3-specific message. This test orders V3 first in the writer
     /// feature list so the V3 cell is the one observed; V3's dependency cascade
@@ -2803,7 +2761,7 @@ mod test {
                 TableFeature::ColumnMapping,
             ],
         );
-        for op in [DataWriteOp::Dml, DataWriteOp::Maintenance] {
+        for op in [DataWriteOp::DmlRemove, DataWriteOp::Maintenance] {
             assert_result_error_with_message(
                 config.ensure_operation_supported(Operation::DataWrite(op)),
                 "Remove actions are not yet supported on icebergCompatV3-enabled tables",
@@ -2813,6 +2771,28 @@ mod test {
         assert!(config
             .ensure_operation_supported(Operation::DataWrite(DataWriteOp::Append))
             .is_ok());
+    }
+
+    /// appendOnly's `dmlRemove` cell is `NotImplemented { blocks: false }` -- the protocol's
+    /// no-data-change-remove restriction is recorded but NOT enforced by kernel -- so a
+    /// data-changing remove is permitted (the caller owns appendOnly compliance), enabled or not.
+    /// Append + maintenance are unrelated and always permitted.
+    #[test]
+    fn test_append_only_dml_remove_is_unenforced_and_permitted() {
+        use crate::table_properties::APPEND_ONLY;
+
+        for props in [&[(APPEND_ONLY, "true")][..], &[][..]] {
+            let config = create_mock_table_config(props, &[TableFeature::AppendOnly]);
+            for op in [
+                DataWriteOp::Append,
+                DataWriteOp::DmlRemove,
+                DataWriteOp::Maintenance,
+            ] {
+                assert!(config
+                    .ensure_operation_supported(Operation::DataWrite(op))
+                    .is_ok());
+            }
+        }
     }
 
     /// CatalogManaged and CatalogOwnedPreview's `read.cdf` cell must block CDF reads
