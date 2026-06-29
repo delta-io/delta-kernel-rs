@@ -210,23 +210,21 @@ pub unsafe extern "C" fn rest_engine_builder_build(
 fn rest_engine_builder_build_impl(
     builder: &RestEngineBuilder,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    // Defaults live on RestEndpointConfig; options only override what the caller set.
-    let d = RestEndpointConfig::default();
+    // Field-name and query-param fallbacks mirror the Databricks Files API; a caller targeting a
+    // different REST backend overrides any of them via `set_rest_engine_builder_option`.
     let config = RestEndpointConfig {
-        files_prefix: builder.opt_or("files_prefix", &d.files_prefix),
-        directories_prefix: builder.opt_or("directories_prefix", &d.directories_prefix),
-        page_token_param: builder.opt_or("page_token_param", &d.page_token_param),
-        start_from_param: builder.opt_or("start_from_param", &d.start_from_param),
-        recursive_param: builder.opt_or("recursive_param", &d.recursive_param),
-        overwrite_param: builder.opt_or("overwrite_param", &d.overwrite_param),
-        contents_field: builder.opt_or("contents_field", &d.contents_field),
-        next_page_token_field: builder.opt_or("next_page_token_field", &d.next_page_token_field),
-        entry_path_field: builder.opt_or("entry_path_field", &d.entry_path_field),
-        entry_size_field: builder.opt_or("entry_size_field", &d.entry_size_field),
-        entry_is_directory_field: builder
-            .opt_or("entry_is_directory_field", &d.entry_is_directory_field),
-        entry_last_modified_field: builder
-            .opt_or("entry_last_modified_field", &d.entry_last_modified_field),
+        files_prefix: builder.opt_or("files_prefix", ""),
+        directories_prefix: builder.opt_or("directories_prefix", ""),
+        page_token_param: builder.opt_or("page_token_param", "page_token"),
+        start_from_param: builder.opt_or("start_from_param", "start_from"),
+        recursive_param: builder.opt_or("recursive_param", "recursive"),
+        overwrite_param: builder.opt_or("overwrite_param", "overwrite"),
+        contents_field: builder.opt_or("contents_field", "contents"),
+        next_page_token_field: builder.opt_or("next_page_token_field", "nextPageToken"),
+        entry_path_field: builder.opt_or("entry_path_field", "path"),
+        entry_size_field: builder.opt_or("entry_size_field", "fileSize"),
+        entry_is_directory_field: builder.opt_or("entry_is_directory_field", "isDirectory"),
+        entry_last_modified_field: builder.opt_or("entry_last_modified_field", "lastModified"),
         entry_strip_prefix: builder.options.get("entry_strip_prefix").cloned(),
     };
 
@@ -324,6 +322,10 @@ mod tests {
         }
     }
 
+    // Building the engine spawns a Tokio background thread (DefaultEngine's executor) that the test
+    // does not join, which Miri's leak check rejects. The `build_rejects_*` tests cover the build
+    // logic's error paths without spawning a thread.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_succeeds_with_defaults_and_options() {
         let b = builder(&[
