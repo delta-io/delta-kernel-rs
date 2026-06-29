@@ -7,6 +7,7 @@
 //! the [executor] module.
 
 use std::future::Future;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
@@ -133,9 +134,9 @@ pub struct DefaultEngineBuilder<E> {
 struct ReadIoConfig {
     /// Maximum number of files read concurrently (file-level readahead depth). See
     /// [`DefaultEngineBuilder::with_buffer_size`].
-    buffer_size: Option<usize>,
+    buffer_size: Option<NonZero<usize>>,
     /// Maximum number of rows per yielded batch. See [`DefaultEngineBuilder::with_batch_size`].
-    batch_size: Option<usize>,
+    batch_size: Option<NonZero<usize>>,
 }
 
 /// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
@@ -178,9 +179,9 @@ impl<E> DefaultEngineBuilder<E> {
     /// `read_*_files` paths. This is the file-level I/O readahead depth: higher values overlap more
     /// object-store requests to hide latency, at the cost of more in-flight memory.
     ///
-    /// Defaults to the handlers' built-in value (1000) when unset. Ordering of returned data is
-    /// preserved regardless of this value.
-    pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
+    /// Defaults to the handlers' built-in value when unset. Ordering of returned data is preserved
+    /// regardless of this value.
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
         self.io_config.buffer_size = Some(buffer_size);
         self
     }
@@ -188,9 +189,9 @@ impl<E> DefaultEngineBuilder<E> {
     /// Set the maximum number of rows per batch yielded by the JSON and Parquet handlers in their
     /// `read_*_files` paths.
     ///
-    /// Defaults to the handlers' built-in value (1000 rows) when unset. Overall read memory usage
-    /// is roughly proportional to `buffer_size * batch_size`.
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+    /// Defaults to the handlers' built-in value when unset. Overall read memory usage is roughly
+    /// proportional to `buffer_size * batch_size`.
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.io_config.batch_size = Some(batch_size);
         self
     }
@@ -228,12 +229,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         let mut json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone());
         let mut parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone());
         if let Some(buffer_size) = io_config.buffer_size {
-            json = json.with_buffer_size(buffer_size);
-            parquet = parquet.with_buffer_size(buffer_size);
+            json = json.with_buffer_size(buffer_size.get());
+            parquet = parquet.with_buffer_size(buffer_size.get());
         }
         if let Some(batch_size) = io_config.batch_size {
-            json = json.with_batch_size(batch_size);
-            parquet = parquet.with_batch_size(batch_size);
+            json = json.with_batch_size(batch_size.get());
+            parquet = parquet.with_batch_size(batch_size.get());
         }
         let raw_json: Arc<dyn JsonHandler> = Arc::new(json);
         let raw_parquet = Arc::new(parquet);
@@ -433,8 +434,8 @@ mod tests {
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
         let engine = DefaultEngineBuilder::new(object_store)
             .with_task_executor(executor)
-            .with_buffer_size(4)
-            .with_batch_size(8)
+            .with_buffer_size(NonZero::new(4).unwrap())
+            .with_batch_size(NonZero::new(8).unwrap())
             .build();
         test_arrow_engine(&engine, &url);
     }

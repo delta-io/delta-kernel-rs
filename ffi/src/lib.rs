@@ -27,7 +27,7 @@ use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
     delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
-    std::collections::HashMap,
+    std::collections::HashMap, std::num::NonZero,
 };
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -561,9 +561,9 @@ pub struct EngineBuilder {
 struct IoConcurrencyConfig {
     /// Maximum number of files read concurrently (file-level readahead depth). `None` uses the
     /// engine default.
-    buffer_size: Option<usize>,
+    buffer_size: Option<NonZero<usize>>,
     /// Maximum number of rows per yielded batch. `None` uses the engine default.
-    batch_size: Option<usize>,
+    batch_size: Option<NonZero<usize>>,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -688,9 +688,10 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
     buffer_size: usize,
     batch_size: usize,
 ) {
+    // `NonZero::new` maps 0 -> `None`, which the engine reads as "use the default".
     builder.io_config = IoConcurrencyConfig {
-        buffer_size: (buffer_size != 0).then_some(buffer_size),
-        batch_size: (batch_size != 0).then_some(batch_size),
+        buffer_size: NonZero::new(buffer_size),
+        batch_size: NonZero::new(batch_size),
     };
 }
 

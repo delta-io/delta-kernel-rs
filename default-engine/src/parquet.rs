@@ -48,8 +48,7 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     /// The maximum number of files to read concurrently in [`Self::read_parquet_files()`]. This is
     /// the number of futures buffered by `buffered`, i.e. the file-level I/O readahead depth.
     buffer_size: usize,
-    /// Limit the number of rows per batch. For `batch_size = N`, each RecordBatch yielded by the
-    /// read stream will have at most N rows.
+    /// The maximum number of rows per RecordBatch yielded by the read stream.
     batch_size: usize,
 }
 
@@ -161,7 +160,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
     /// Set the maximum number of files to read concurrently in [Self::read_parquet_files()].
     ///
-    /// Defaults to 1000.
+    /// Defaults to `super::DEFAULT_BUFFER_SIZE`.
     ///
     /// Memory constraints can be imposed by constraining the buffer size and batch size. Note that
     /// overall memory usage is proportional to the product of these two values.
@@ -173,10 +172,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         self
     }
 
-    /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
-    /// yielded by [Self::read_parquet_files()] will have at most N rows.
+    /// Set the maximum number of rows per RecordBatch yielded by [Self::read_parquet_files()].
     ///
-    /// Defaults to 1000 rows.
+    /// Defaults to `super::DEFAULT_BATCH_SIZE` rows.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
