@@ -362,6 +362,59 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, MISSING, None, None);
 }
 
+/// Validates that the production data-skipping path (the `eval_sql_where` rewrite used by
+/// `DataSkippingFilter::new`) prunes a present-but-all-null file for every null-intolerant
+/// comparison operator. The bare `eval` rewrite (test-only callers) lacks the not-all-null
+/// guard and keeps the file. Each operator's predicate evaluates over stats for a file with
+/// `nullCount == numRecords` (all-null) and null min/max -- the `<col> IS NOT NULL` guard that
+/// `eval_sql_where` prepends rewrites to `nullCount != numRecords`, which is FALSE here and
+/// forces the comparison to skip.
+#[rstest]
+#[case::eq(Pred::eq(column_expr!("x"), Expr::literal(10)))]
+#[case::ne(Pred::ne(column_expr!("x"), Expr::literal(10)))]
+#[case::lt(Pred::lt(column_expr!("x"), Expr::literal(10)))]
+#[case::gt(Pred::gt(column_expr!("x"), Expr::literal(10)))]
+#[case::le(Pred::le(column_expr!("x"), Expr::literal(10)))]
+#[case::ge(Pred::ge(column_expr!("x"), Expr::literal(10)))]
+fn test_all_null_pruning_all_comparison_ops(#[case] pred: Pred) {
+    // All-null file: nullCount == numRecords, and min/max are NULL.
+    let resolver = HashMap::from_iter([
+        (column_name!("stats_parsed.numRecords"), Scalar::from(2i64)),
+        (column_name!("stats_parsed.nullCount.x"), Scalar::from(2i64)),
+        (
+            column_name!("stats_parsed.minValues.x"),
+            Scalar::Null(DataType::INTEGER),
+        ),
+        (
+            column_name!("stats_parsed.maxValues.x"),
+            Scalar::Null(DataType::INTEGER),
+        ),
+    ]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    let stats_columns: HashSet<ColumnName> = [column_name!("x")].into_iter().collect();
+
+    // Production path (eval_sql_where): the IS NOT NULL guard prunes the all-null file.
+    let sql_pred = as_sql_data_skipping_predicate_with_stats_columns(
+        &pred,
+        &Default::default(),
+        &stats_columns,
+    )
+    .unwrap();
+    expect_eq!(
+        filter.eval(&sql_pred),
+        FALSE,
+        "{pred:#?} became {sql_pred:#?} (production eval_sql_where -> skip)"
+    );
+
+    // Bare path (eval, test-only): no not-all-null guard, so the file is kept.
+    let bare_pred = as_data_skipping_predicate(&pred).unwrap();
+    expect_eq!(
+        filter.eval(&bare_pred),
+        NULL,
+        "{pred:#?} became {bare_pred:#?} (bare eval -> keep)"
+    );
+}
+
 #[test]
 fn test_timestamp_stats_enabled() {
     let empty = HashSet::new();

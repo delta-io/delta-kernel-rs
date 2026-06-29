@@ -10,7 +10,7 @@ use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
-use crate::scan::{PhysicalPredicate, StatsOptions, StructStats};
+use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
@@ -32,9 +32,11 @@ pub(crate) struct StateInfo {
     /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
     pub(crate) physical_stats_schema: Option<SchemaRef>,
-    /// Physical partition schema with native types for partition pruning via
-    /// `partitionValues_parsed`. Fields use physical column names (for column mapping).
-    /// Only present when the table has partition columns and a predicate is provided.
+    /// Physical partition schema with native types for `partitionValues_parsed`. Fields use
+    /// physical column names (for column mapping) and are always nullable. Present when the
+    /// table has partition columns and either a predicate is provided (narrowed to
+    /// predicate-referenced columns, for partition pruning) or the engine requested the typed
+    /// struct in scan output (all partition columns).
     pub(crate) physical_partition_schema: Option<SchemaRef>,
     /// Physical leaf paths which are expected to have stats collected.
     ///
@@ -47,6 +49,12 @@ pub(crate) struct StateInfo {
     /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
     /// [`TableType`](crate::metrics::TableType) at event construction.
     pub(crate) is_catalog_managed: bool,
+    /// When set, log replay does not build per-file transform expressions:
+    /// `parse_partition_values` and `get_transform_expr` are skipped and every
+    /// `ScanMetadata::scan_file_transforms` entry is left `None`. `transform_spec` is retained
+    /// so the scan can still describe the transform structurally. Set by
+    /// [`ScanBuilder::without_row_transforms`](crate::scan::ScanBuilder::without_row_transforms).
+    pub(crate) skip_row_transforms: bool,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -235,6 +243,8 @@ impl StateInfo {
     /// `predicate` - Optional predicate to filter data during the scan
     /// `stats` - Engine-facing stats options. Drives which stats columns appear in scan
     ///   metadata output and whether the JSON synthesis fallback fires.
+    /// `partition_values` - Engine-facing partition value options. Drives whether the typed
+    ///   `partitionValues_parsed` column appears in scan metadata output.
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_read_schema: SchemaRef,
@@ -242,6 +252,7 @@ impl StateInfo {
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
         stats: &StatsOptions,
+        partition_values: &PartitionValuesOptions,
         classifier: C,
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.partition_columns();
@@ -373,40 +384,59 @@ impl StateInfo {
             }
         }
 
-        // Build partition schema with physical names for partition pruning in data skipping.
-        // Only needed when we have a predicate and partition columns.
+        // Build partition schema with physical names, used for partition pruning in data
+        // skipping and for the engine-facing `partitionValues_parsed` output column. Needed
+        // when partition columns exist and either a predicate is present or the engine
+        // requested the typed struct in scan output.
         // partition_columns stores logical names (per Delta protocol), so we zip the table's
         // logical and physical schemas (same field ordering, guaranteed by `make_physical`)
         // to match logical names and extract the corresponding physical fields without
         // per-field metadata lookups.
-        let table_partition_schema = if !matches!(
+        let has_predicate = !matches!(
             physical_predicate,
             PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll
-        ) && !partition_columns.is_empty()
-        {
-            let partition_fields: Vec<StructField> = table_configuration
-                .logical_schema()
-                .fields()
-                .zip(table_configuration.physical_schema().fields())
-                .filter(|(logical_f, _)| partition_columns.contains(logical_f.name()))
-                .map(|(_, physical_f)| physical_f.clone())
-                .collect();
-            if partition_fields.is_empty() {
-                None
+        );
+        let table_partition_schema =
+            if (has_predicate || partition_values.parsed_struct) && !partition_columns.is_empty() {
+                let partition_fields: Vec<StructField> = table_configuration
+                    .logical_schema()
+                    .fields()
+                    .zip(table_configuration.physical_schema().fields())
+                    .filter(|(logical_f, _)| partition_columns.contains(logical_f.name()))
+                    .map(|(_, physical_f)| physical_f.clone())
+                    .collect();
+                if partition_fields.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(StructType::new_unchecked(partition_fields)))
+                }
             } else {
-                Some(Arc::new(StructType::new_unchecked(partition_fields)))
-            }
-        } else {
-            None
-        };
+                None
+            };
 
-        let (physical_stats_schema, physical_partition_schema) = build_data_skipping_schemas(
+        let (physical_stats_schema, predicate_partition_schema) = build_data_skipping_schemas(
             &stats.struct_stats,
             &physical_predicate,
             &predicate_column_names,
             table_configuration,
-            table_partition_schema,
+            table_partition_schema.clone(),
         )?;
+
+        // When the engine requested the typed struct, emit all partition columns rather than
+        // the predicate-narrowed subset. The data skipping filter only references the columns
+        // its predicate needs, so the superset is safe for pruning too. All fields are forced
+        // nullable: MapToStruct can yield null even for a non-nullable column (a missing key, or
+        // the protocol's empty-string-is-null rule), and a non-nullable field would then error.
+        let physical_partition_schema = if partition_values.parsed_struct {
+            table_partition_schema.map(|tps| {
+                let nullable_fields = tps
+                    .fields()
+                    .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
+                Arc::new(StructType::new_unchecked(nullable_fields))
+            })
+        } else {
+            predicate_partition_schema
+        };
 
         let transform_spec =
             if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
@@ -425,6 +455,7 @@ impl StateInfo {
             physical_partition_schema,
             physical_stats_columns,
             is_catalog_managed: table_configuration.is_catalog_managed(),
+            skip_row_transforms: false,
         })
     }
 
@@ -499,6 +530,29 @@ pub(crate) mod tests {
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
     ) -> DeltaResult<StateInfo> {
+        get_state_info_with_options(
+            schema,
+            partition_columns,
+            predicate,
+            features,
+            metadata_configuration,
+            metadata_cols,
+            stats,
+            PartitionValuesOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_state_info_with_options(
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        predicate: Option<PredicateRef>,
+        features: &[TableFeature],
+        metadata_configuration: HashMap<String, String>,
+        metadata_cols: Vec<(&str, MetadataColumnSpec)>,
+        stats: StatsOptions,
+        partition_values: PartitionValuesOptions,
+    ) -> DeltaResult<StateInfo> {
         let metadata = Metadata::try_new(
             None,
             None,
@@ -545,6 +599,7 @@ pub(crate) mod tests {
             &table_configuration,
             predicate,
             &stats,
+            &partition_values,
             (),
         )
     }
@@ -944,6 +999,7 @@ pub(crate) mod tests {
             &table_configuration,
             None,
             &StatsOptions::default(),
+            &PartitionValuesOptions::default(),
             (),
         );
         assert_result_error_with_message(
@@ -1179,6 +1235,74 @@ pub(crate) mod tests {
             "partition schema should use physical column name, not logical"
         );
         assert_eq!(field.data_type(), &DataType::DATE);
+    }
+
+    /// `with_struct` builds `physical_partition_schema` from all partition columns (independent of
+    /// predicate and `StatsOptions::none`), and omits it entirely on non-partitioned tables.
+    #[rstest]
+    #[case::all_columns_without_predicate(
+        vec![
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("region", DataType::STRING),
+            StructField::nullable("date", DataType::DATE),
+        ],
+        vec!["region".to_string(), "date".to_string()],
+        StatsOptions::default(),
+        Some(vec!["region", "date"]),
+    )]
+    #[case::survives_stats_none(
+        vec![
+            StructField::nullable("value", DataType::LONG),
+            StructField::nullable("date", DataType::DATE),
+        ],
+        vec!["date".to_string()],
+        StatsOptions::none(),
+        Some(vec!["date"]),
+    )]
+    #[case::omitted_for_non_partitioned_table(
+        vec![
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("value", DataType::STRING),
+        ],
+        vec![],
+        StatsOptions::default(),
+        None,
+    )]
+    fn partition_values_with_struct(
+        #[case] fields: Vec<StructField>,
+        #[case] partition_columns: Vec<String>,
+        #[case] stats: StatsOptions,
+        #[case] expected_names: Option<Vec<&str>>,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked(fields));
+        let state_info = get_state_info_with_options(
+            schema,
+            partition_columns,
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+            stats,
+            PartitionValuesOptions::with_struct(),
+        )
+        .unwrap();
+
+        match expected_names {
+            Some(expected) => {
+                let partition_schema = state_info
+                    .physical_partition_schema
+                    .as_ref()
+                    .expect("with_struct should build a partition schema");
+                let names: Vec<&str> = partition_schema
+                    .fields()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                assert_eq!(names, expected);
+                // MapToStruct lookups can return null, so every field must be nullable.
+                assert!(partition_schema.fields().all(|f| f.is_nullable()));
+            }
+            None => assert!(state_info.physical_partition_schema.is_none()),
+        }
     }
 
     #[test]

@@ -55,9 +55,8 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
-    fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-        // TODO: serialize `_op` to bytes once proto schema is checked in.
-        let plan_proto_bytes: &[u8] = &[];
+    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+        let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
         let mut out = EngineExecResult::Uninit;
@@ -108,8 +107,10 @@ mod tests {
     use std::sync::Mutex;
 
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
+    use delta_kernel::plans::proto::operation as proto;
     use delta_kernel::schema::DataType as KernelDataType;
     use delta_kernel::Error;
+    use prost::Message;
     use url::Url;
 
     use super::*;
@@ -326,5 +327,37 @@ mod tests {
         let id_field = footer.schema.field("id").expect("id field");
         assert_eq!(id_field.data_type(), &KernelDataType::INTEGER);
         assert!(id_field.is_nullable());
+    }
+
+    #[test]
+    fn execute_op_passes_serialized_operation_bytes() {
+        extern "C" fn validate_op(
+            _context: NullableCvoid,
+            plan_proto: KernelBytesSlice,
+            out: *mut EngineExecResult<CPlanResult>,
+        ) {
+            let bytes = unsafe { std::slice::from_raw_parts(plan_proto.ptr, plan_proto.len) };
+            let op = proto::Operation::decode(bytes).expect("decode Operation proto");
+            let Some(proto::operation::Op::Io(io)) = op.op else {
+                panic!("expected an IoOperation");
+            };
+            let Some(proto::io_operation::Op::FileListing(file_listing)) = io.op else {
+                panic!("expected a FileListing");
+            };
+            assert_eq!(file_listing.url, "memory:///table/");
+            unsafe { out.write(EngineExecResult::Success(CPlanResult::Unit)) };
+        }
+
+        let executor = unsafe { get_plan_executor(None, validate_op) };
+        let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
+
+        let url = Url::parse("memory:///table/").unwrap();
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+
+        plan_executor
+            .execute_op(op)
+            .expect("execute_op succeeds")
+            .into_unit()
+            .expect("Unit variant");
     }
 }

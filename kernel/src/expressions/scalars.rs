@@ -831,6 +831,9 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
+            IntervalYearMonth | IntervalDayTime => Err(Error::unsupported(
+                "Interval types are not supported as scalar or partition values",
+            )),
         }
     }
 
@@ -1513,5 +1516,81 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+    }
+
+    // #[ignore]d checklist of core kernel interval dataflows, red until interval support lands
+    const INTERVAL_YM_LITERAL: &str = "INTERVAL '1-0' YEAR TO MONTH";
+    const INTERVAL_YM_LITERAL_LARGER: &str = "INTERVAL '2-0' YEAR TO MONTH";
+    const INTERVAL_DT_LITERAL: &str = "INTERVAL '0 01:00:00.000000' DAY TO SECOND";
+    const INTERVAL_DT_LITERAL_LARGER: &str = "INTERVAL '0 02:00:00.000000' DAY TO SECOND";
+
+    #[ignore = "needs Scalar::Interval* variant + parse_scalar/data_type() support"]
+    #[test]
+    fn interval_parse_and_data_type() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        assert_eq!(ym.data_type(), DataType::INTERVAL_YEAR_MONTH);
+
+        let dt = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL)
+            .unwrap();
+        assert_eq!(dt.data_type(), DataType::INTERVAL_DAY_TIME);
+    }
+
+    #[ignore = "needs interval Display impl that round-trips with parse_scalar"]
+    #[test]
+    fn interval_display_round_trips() {
+        for (ptype, lit) in [
+            (PrimitiveType::IntervalYearMonth, INTERVAL_YM_LITERAL),
+            (PrimitiveType::IntervalDayTime, INTERVAL_DT_LITERAL),
+        ] {
+            let scalar = ptype.parse_scalar(lit).unwrap();
+            let reparsed = ptype.parse_scalar(&scalar.to_string()).unwrap();
+            assert_eq!(
+                scalar, reparsed,
+                "Display is not the inverse of parse for {lit}"
+            );
+        }
+    }
+
+    #[ignore = "needs interval logical_partial_cmp (orders within a family, incomparable across)"]
+    #[test]
+    fn interval_logical_partial_cmp() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        let ym_larger = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL_LARGER)
+            .unwrap();
+        assert_eq!(ym.logical_partial_cmp(&ym_larger), Some(Ordering::Less));
+        assert_eq!(ym_larger.logical_partial_cmp(&ym), Some(Ordering::Greater));
+        assert_eq!(ym.logical_partial_cmp(&ym), Some(Ordering::Equal));
+
+        let dt = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL)
+            .unwrap();
+        let dt_larger = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL_LARGER)
+            .unwrap();
+        assert_eq!(dt.logical_partial_cmp(&dt_larger), Some(Ordering::Less));
+
+        // Comparison is defined only within a family; everything else is incomparable.
+        assert_eq!(ym.logical_partial_cmp(&dt), None);
+        assert_eq!(ym.logical_partial_cmp(&Scalar::Integer(0)), None);
+    }
+
+    #[ignore = "needs interval logical_eq (NULL-aware equality via logical_partial_cmp)"]
+    #[test]
+    fn interval_logical_eq() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        let ym_same = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        assert!(ym.logical_eq(&ym_same));
+        // SQL NULL semantics: NULL is not equal to anything, including a like-typed value.
+        assert!(!ym.logical_eq(&Scalar::null(DataType::INTERVAL_YEAR_MONTH)));
     }
 }

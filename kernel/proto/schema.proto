@@ -4,6 +4,9 @@ syntax = "proto3";
 
 package delta.kernel.schema;
 
+// Java package for generated bindings. Ignored by prost (Rust codegen).
+option java_package = "io.delta.kernel.proto.schema";
+
 // ============================================================================
 // Primitive types
 // ============================================================================
@@ -22,6 +25,9 @@ enum SimplePrimitiveType {
   SIMPLE_PRIMITIVE_TYPE_DATE = 10;
   SIMPLE_PRIMITIVE_TYPE_TIMESTAMP = 11;
   SIMPLE_PRIMITIVE_TYPE_TIMESTAMP_NTZ = 12;
+  SIMPLE_PRIMITIVE_TYPE_VOID = 13;
+  SIMPLE_PRIMITIVE_TYPE_INTERVAL_YEAR_MONTH = 14;
+  SIMPLE_PRIMITIVE_TYPE_INTERVAL_DAY_TIME = 15;
 }
 
 // Rust uses `u8` (precision in [1,38], scale in [0,precision]); widened to uint32 because

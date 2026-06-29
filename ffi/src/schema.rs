@@ -365,6 +365,10 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             #[cfg(feature = "nanosecond-timestamps")]
             &DataType::TIMESTAMP_NANOS_NTZ => call!(visit_timestamp_nanos_ntz),
             &DataType::VOID => call!(visit_void),
+            &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+                // TODO(#2811): add visit_interval_* callbacks; skipping silently drops the column
+                tracing::warn!("Skipping unsupported interval field '{name}' in FFI schema visit");
+            }
         }
     }
 

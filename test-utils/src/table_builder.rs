@@ -715,6 +715,33 @@ impl TableConfig {
         ));
         self
     }
+
+    /// Set `delta.dataSkippingNumIndexedCols` to `n`: stats are capped to the first `n` leaf
+    /// columns. `-1` means all columns; the protocol default when unset is 32.
+    pub fn num_data_skipping_indexed_cols(mut self, n: i64) -> Self {
+        self.table_properties
+            .push(("delta.dataSkippingNumIndexedCols".into(), n.to_string()));
+        self
+    }
+
+    /// Set `delta.dataSkippingStatsColumns` to a comma-separated list of column names.
+    /// Per the Delta spec this takes precedence over `dataSkippingNumIndexedCols`. The
+    /// builder joins names verbatim and does not validate them; entries that don't
+    /// resolve in the active schema are silently skipped by kernel (with a warning).
+    pub fn data_skipping_stats_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let joined = columns
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.table_properties
+            .push(("delta.dataSkippingStatsColumns".into(), joined));
+        self
+    }
 }
 
 impl fmt::Display for TableConfig {
@@ -737,8 +764,20 @@ impl fmt::Display for TableConfig {
     }
 }
 
-// Canonical sweep rows for the TableConfig axis. These toggle only the *checkpoint*
-// stats encoding -- per-commit add-file stats are always written and unaffected.
+// Canonical sweep rows for the `TableConfig` axis. The sweep covers three checkpoint
+// stats encodings plus six data-skipping rows: three count-based (`numIndexedCols`)
+// values and three named-columns (`dataSkippingStatsColumns`) shapes, so each knob
+// varies across the full LogState x FeatureSet x DataLayout x VersionTarget cross
+// product. Per-commit add-file stats are always written and unaffected by the
+// checkpoint format flags.
+
+/// Stats-column names that span the schemas used by [`DataLayoutConfig`]: `int_col`
+/// exists in [`default_schema`], `value` in [`partitioned_schema`] and
+/// [`clustered_schema`]. Kernel silently skips entries that don't exist in the active
+/// schema, so each layout collects stats on whichever entry matches.
+pub(crate) const STATS_COLUMNS_BY_NAME: &[&str] = &["int_col", "value"];
+
+// === Checkpoint stats encoding rows ===
 
 pub fn checkpoint_json_stats() -> TableConfig {
     TableConfig::new()
@@ -752,10 +791,53 @@ pub fn checkpoint_struct_stats() -> TableConfig {
         .write_stats_as_struct(true)
 }
 
+/// Disables both checkpoint stats encodings; per-commit add-file stats are still written.
 pub fn no_checkpoint_stats() -> TableConfig {
     TableConfig::new()
         .write_stats_as_json(false)
         .write_stats_as_struct(false)
+}
+
+// === numIndexedCols rows (count-based data skipping) ===
+
+/// `numIndexedCols = 0`: zero leaf columns get stats.
+pub fn num_indexed_cols_zero() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(0)
+}
+
+/// `numIndexedCols = 2`: cap stats to the first 2 leaf columns.
+pub fn num_indexed_cols_narrow() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(2)
+}
+
+/// `numIndexedCols = -1`: stats on every leaf column.
+pub fn num_indexed_cols_all() -> TableConfig {
+    TableConfig::new().num_data_skipping_indexed_cols(-1)
+}
+
+// === dataSkippingStatsColumns rows (named-cols data skipping) ===
+
+/// `dataSkippingStatsColumns = []`: named-cols knob set, no columns listed.
+pub fn stats_columns_empty() -> TableConfig {
+    TableConfig::new().data_skipping_stats_columns(std::iter::empty::<&str>())
+}
+
+/// `dataSkippingStatsColumns` listing names that match at least one column in every
+/// `DataLayoutConfig` schema (kernel silently skips entries that don't match), in reverse
+/// schema order to exercise list-order preservation through write + read.
+pub fn stats_columns_reordered() -> TableConfig {
+    TableConfig::new().data_skipping_stats_columns(STATS_COLUMNS_BY_NAME.iter().rev().copied())
+}
+
+// === Composers: enable a checkpoint stats encoding on a data-skipping config ===
+// Each enables only its own encoding, so composing both writes stats in both encodings.
+
+pub fn with_json_stats(cfg: TableConfig) -> TableConfig {
+    cfg.write_stats_as_json(true)
+}
+
+pub fn with_struct_stats(cfg: TableConfig) -> TableConfig {
+    cfg.write_stats_as_struct(true)
 }
 
 // ===========================================================================
@@ -982,6 +1064,15 @@ pub enum VersionTarget {
     AtVersion(u64),
     /// Load at `from`, then incrementally update to latest.
     IncrementalToLatest { from: u64 },
+    /// Load at `from`, then incrementally update to a specific target `to`. Exercises the
+    /// `Snapshot::builder_from(base).at_version(to)` path with `to <= latest`. Requires
+    /// `from <= to`.
+    IncrementalFrom { from: u64, to: u64 },
+    /// Time travel by timestamp: resolves `timestamp` (milliseconds since Unix epoch) to a
+    /// version via [`history_manager::latest_version_as_of`], then loads that version.
+    ///
+    /// [`history_manager::latest_version_as_of`]: delta_kernel::history_manager::latest_version_as_of
+    AtTimestamp(i64),
 }
 
 impl fmt::Display for VersionTarget {
@@ -992,6 +1083,10 @@ impl fmt::Display for VersionTarget {
             VersionTarget::IncrementalToLatest { from } => {
                 write!(f, "incremental({from}->latest)")
             }
+            VersionTarget::IncrementalFrom { from, to } => {
+                write!(f, "incremental({from}->{to})")
+            }
+            VersionTarget::AtTimestamp(ts) => write!(f, "at_timestamp({ts})"),
         }
     }
 }
@@ -1004,10 +1099,29 @@ pub fn version_latest() -> VersionTarget {
 pub fn version_at_mid() -> VersionTarget {
     VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION)
 }
-pub fn version_incremental_to_latest() -> VersionTarget {
+pub fn version_incremental_from_mid_to_latest() -> VersionTarget {
     VersionTarget::IncrementalToLatest {
         from: DEFAULT_SWEEP_MID_VERSION,
     }
+}
+/// Incremental update from `mid` to `latest - 1`. The non-latest `to` exercises the
+/// partial-replay path that `version_incremental_from_mid_to_latest()` cannot reach, since
+/// updating to latest is indistinguishable from a non-incremental load.
+pub fn version_incremental_from_mid_to_pre_latest() -> VersionTarget {
+    VersionTarget::IncrementalFrom {
+        from: DEFAULT_SWEEP_MID_VERSION,
+        to: DEFAULT_SWEEP_LATEST_VERSION - 1,
+    }
+}
+/// Timestamp travel using `i64::MAX`, which always resolves to the latest version (every
+/// commit's timestamp is below `i64::MAX`). This is a smoke test that the timestamp
+/// conversion path runs without error across the sweep, not a resolution-correctness
+/// check: `InMemory` collapses successive `put` timestamps to a single millisecond, so the
+/// sweep can't reach an intermediate version. Resolution to an intermediate version is
+/// covered by `test_at_timestamp_resolves_to_intermediate_version`, which sets commit
+/// modification times explicitly on the local filesystem.
+pub fn version_at_timestamp_max() -> VersionTarget {
+    VersionTarget::AtTimestamp(i64::MAX)
 }
 
 // ===========================================================================
@@ -1607,6 +1721,30 @@ macro_rules! build_snapshot {
                     .unwrap();
                 Snapshot::builder_from(base).build($engine).unwrap()
             }
+            $crate::table_builder::VersionTarget::IncrementalFrom { from, to } => {
+                let base = Snapshot::builder_for($table_root)
+                    .at_version(*from)
+                    .build($engine)
+                    .unwrap();
+                Snapshot::builder_from(base)
+                    .at_version(*to)
+                    .build($engine)
+                    .unwrap()
+            }
+            $crate::table_builder::VersionTarget::AtTimestamp(ts) => {
+                let latest = Snapshot::builder_for($table_root).build($engine).unwrap();
+                let commit = ::delta_kernel::history_manager::latest_version_as_of(
+                    &latest,
+                    $engine,
+                    *ts,
+                    ::delta_kernel::history_manager::HistoryCommitType::Recreatable,
+                )
+                .unwrap();
+                Snapshot::builder_for($table_root)
+                    .at_version(commit.version)
+                    .build($engine)
+                    .unwrap()
+            }
         }
     };
 }
@@ -1720,6 +1858,9 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                     .expect("test seed produced invalid decimal")
             }
             PrimitiveType::Void => panic!("void type is not a valid partition column"),
+            PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                panic!("interval types are not supported as partition values")
+            }
         },
         other => panic!("partition columns must be primitive types, got: {other:?}"),
     }
@@ -1800,7 +1941,9 @@ mod tests {
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
-            VersionTarget::IncrementalToLatest { from: 1 }
+            VersionTarget::IncrementalToLatest { from: 1 },
+            VersionTarget::IncrementalFrom { from: 1, to: 3 },
+            VersionTarget::AtTimestamp(i64::MAX),
         )]
         version_target: VersionTarget,
     ) {
@@ -1813,7 +1956,12 @@ mod tests {
         );
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
+            VersionTarget::AtTimestamp(ts) if *ts == i64::MAX => 4,
             VersionTarget::AtVersion(v) => *v,
+            VersionTarget::IncrementalFrom { to, .. } => *to,
+            VersionTarget::AtTimestamp(ts) => {
+                panic!("test only uses AtTimestamp(i64::MAX), got {ts}")
+            }
         };
         assert_eq!(snap.version(), expected);
     }
@@ -1856,6 +2004,43 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_data_skipping_table_properties_in_metadata() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_table_config(
+                TableConfig::new()
+                    .num_data_skipping_indexed_cols(2)
+                    .data_skipping_stats_columns(["int_col", "long_col"]),
+            )
+            .build()?;
+        let config = read_metadata_configuration(table.store(), 0)?;
+        assert_eq!(
+            config
+                .get("delta.dataSkippingNumIndexedCols")
+                .map(|s| s.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            config
+                .get("delta.dataSkippingStatsColumns")
+                .map(|s| s.as_str()),
+            Some("int_col,long_col")
+        );
+        Ok(())
+    }
+
+    fn read_metadata_configuration(
+        store: &Arc<DynObjectStore>,
+        version: u64,
+    ) -> DeltaResult<std::collections::HashMap<String, String>> {
+        let store = store.clone();
+        block_on_sync(move || async move {
+            crate::read_metadata_configuration_from_store(store.as_ref(), version)
+                .await
+                .map_err(|e| delta_kernel::Error::generic(e.to_string()))
+        })
     }
 
     /// Verifies every common table config builds successfully.

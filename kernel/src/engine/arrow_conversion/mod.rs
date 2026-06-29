@@ -378,6 +378,11 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Nanosecond, None))
                     }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
+                    PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                        Err(ArrowError::SchemaError(format!(
+                            "Interval types are not yet supported in the default engine: {p}"
+                        )))
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -609,6 +614,15 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            // Millisecond is coarser than the kernel's microsecond logical timestamp, so
+            // mapping it onto the logical type is a lossless upscale (values are rescaled
+            // x1000 by the engine on read).
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, Some(tz))
+                if tz.eq_ignore_ascii_case("utc") =>
+            {
+                Ok(DataType::TIMESTAMP)
+            }
             ArrowDataType::Struct(fields) => DataType::try_struct_type_from_results(
                 fields.iter().map(|field| field.as_ref().try_into_kernel()),
             )
@@ -721,6 +735,22 @@ mod tests {
         Ok(())
     }
 
+    // Millisecond-precision timestamps (e.g. from externally-written checkpoint stats)
+    // must convert like microsecond/nanosecond: UTC tz -> TIMESTAMP, no tz -> TIMESTAMP_NTZ.
+    #[test]
+    fn test_millisecond_timestamp_conversion() -> DeltaResult<()> {
+        let utc = DataType::try_from_arrow(&ArrowDataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some("UTC".into()),
+        ))?;
+        assert_eq!(utc, DataType::TIMESTAMP);
+
+        let ntz = DataType::try_from_arrow(&ArrowDataType::Timestamp(TimeUnit::Millisecond, None))?;
+        assert_eq!(ntz, DataType::TIMESTAMP_NTZ);
+
+        Ok(())
+    }
+
     // void is inherently always-null, so nullable=false is semantically contradictory.
     // We tolerate it on reads (be permissive), and the Arrow conversion still
     // produces ArrowDataType::Null. The field retains nullable=false as-is — no coercion.
@@ -790,6 +820,15 @@ mod tests {
             .to_string()
             .contains("Incorrect Variant Schema"));
         Ok(())
+    }
+
+    // Make sure that interval types error gracefully since unsupported
+    #[rstest]
+    #[case(DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::INTERVAL_DAY_TIME)]
+    fn test_interval_type_arrow_conversion_unsupported(#[case] dt: DataType) {
+        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        assert!(matches!(result.unwrap_err(), ArrowError::SchemaError(_)));
     }
 
     /// Helper visitor to collect all field IDs from a kernel StructType

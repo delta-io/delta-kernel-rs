@@ -13,7 +13,7 @@ use super::TableChanges;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
-use crate::scan::{PhysicalPredicate, StatsOptions};
+use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
@@ -123,6 +123,7 @@ impl TableChangesScanBuilder {
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
             &StatsOptions::default(),
+            &PartitionValuesOptions::default(),
             CdfTransformFieldClassifier,
         )?;
 

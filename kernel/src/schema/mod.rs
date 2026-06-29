@@ -23,6 +23,10 @@ use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+#[cfg(feature = "column-defaults-in-dev")]
+mod column_default;
+#[cfg(feature = "column-defaults-in-dev")]
+pub use column_default::ColumnDefault;
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -1690,6 +1694,17 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_nanos_ntz")]
     TimestampNanosNtz,
     Void,
+    /// Year-month interval: a signed count of months (ANSI `INTERVAL YEAR TO MONTH` and its
+    /// narrowed `YEAR` / `MONTH` spellings). The serde rename is the `schemaString` type-name
+    /// string -- spelled with spaces, unlike the single-word siblings, so the mapping is not
+    /// self-evident.
+    #[serde(rename = "interval year to month")]
+    IntervalYearMonth,
+    /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
+    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings). As with the year-month
+    /// variant above, the serde rename is the multi-word `schemaString` type-name string.
+    #[serde(rename = "interval day to second")]
+    IntervalDayTime,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
@@ -1773,6 +1788,25 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
+fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
+    match s {
+        "interval year" | "interval month" | "interval year to month" => {
+            Some(PrimitiveType::IntervalYearMonth)
+        }
+        "interval day"
+        | "interval hour"
+        | "interval minute"
+        | "interval second"
+        | "interval day to hour"
+        | "interval day to minute"
+        | "interval day to second"
+        | "interval hour to minute"
+        | "interval hour to second"
+        | "interval minute to second" => Some(PrimitiveType::IntervalDayTime),
+        _ => None,
+    }
+}
+
 // Custom Deserialize to provide clear error messages for unsupported types.
 // The derived impl would produce: "unknown variant `interval second`, expected one of ..."
 // This impl produces: "Unsupported Delta table type: 'interval second'"
@@ -1801,6 +1835,10 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             #[cfg(feature = "nanosecond-timestamps")]
             "timestamp_nanos_ntz" => Ok(PrimitiveType::TimestampNanosNtz),
             "void" => Ok(PrimitiveType::Void),
+            // Accept canonical and narrowed interval spellings
+            s if s.starts_with("interval ") => normalize_interval_type(s).ok_or_else(|| {
+                serde::de::Error::custom(format!("Unsupported Delta table type: '{s}'"))
+            }),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1854,6 +1892,8 @@ impl Display for PrimitiveType {
             PrimitiveType::TimestampNanos => write!(f, "timestamp_nanos"),
             #[cfg(feature = "nanosecond-timestamps")]
             PrimitiveType::TimestampNanosNtz => write!(f, "timestamp_nanos_ntz"),
+            PrimitiveType::IntervalYearMonth => write!(f, "interval year to month"),
+            PrimitiveType::IntervalDayTime => write!(f, "interval day to second"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
@@ -1994,6 +2034,8 @@ impl DataType {
     #[cfg(feature = "nanosecond-timestamps")]
     pub const TIMESTAMP_NANOS_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNanosNtz);
     pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
+    pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
+    pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -2468,9 +2510,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case("interval second")]
-    #[case("interval day")]
     #[case("money")]
+    #[case("interval fortnight")]
+    // invalid orderings across year-month and day-time
+    #[case("interval month to day")]
+    #[case("interval year to second")]
+    // invalid orderings within year-month and day-time
+    #[case("interval month to year")]
+    #[case("interval year to year")]
+    #[case("interval second to day")]
+    #[case("interval minute to minute")]
+    // too many fields
+    #[case("interval year to month to year")]
     fn test_unsupported_type_error_message(#[case] unsupported_type: &str) {
         let data = format!(
             r#"{{
@@ -2503,6 +2554,19 @@ mod tests {
     #[case("date", DataType::DATE)]
     #[case("timestamp", DataType::TIMESTAMP)]
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
+    #[case("interval year", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval day", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to hour", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval hour to second", DataType::INTERVAL_DAY_TIME)]
+    #[case("interval minute to second", DataType::INTERVAL_DAY_TIME)]
     fn test_primitive_type_deserialization_still_works(
         #[case] type_str: &str,
         #[case] expected_type: DataType,
@@ -2590,10 +2654,27 @@ mod tests {
     #[case("\"date\"", DataType::DATE)]
     #[case("\"timestamp\"", DataType::TIMESTAMP)]
     #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
     #[case("\"variant\"", DataType::unshredded_variant())]
     fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
         let data_type: DataType = serde_json::from_str(type_json).unwrap();
         assert_eq!(data_type, expected);
+    }
+
+    #[rstest]
+    #[case(PrimitiveType::IntervalYearMonth, "interval year to month")]
+    #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
+    fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
+        assert_eq!(ptype.to_string(), name);
+        assert_eq!(
+            serde_json::to_string(&ptype).unwrap(),
+            format!("\"{name}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<PrimitiveType>(&format!("\"{name}\"")).unwrap(),
+            ptype
+        );
     }
 
     #[test]

@@ -190,6 +190,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
+            skip_row_transforms: false,
         }
     }
 
@@ -413,6 +414,7 @@ mod tests {
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: false,
+            skip_row_transforms: false,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
