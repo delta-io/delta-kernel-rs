@@ -1,0 +1,6 @@
+Schema column defaults (2):
+  b: raw_sql="1337" kernel_parsable=true has_parsed_expr=true
+  c: raw_sql="current_timestamp()" kernel_parsable=false has_parsed_expr=false
+Transaction column defaults (2):
+  b: raw_sql="1337" kernel_parsable=true has_parsed_expr=true
+  c: raw_sql="current_timestamp()" kernel_parsable=false has_parsed_expr=false
