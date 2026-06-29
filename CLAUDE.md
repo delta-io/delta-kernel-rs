@@ -243,7 +243,7 @@ is the source of truth. Key concepts:
 - Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
   `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
   `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
-  `typeWidening`
+  `typeWidening`, `timestampNanos`
 
 Keep this list updated when new protocol features are added to kernel.
 

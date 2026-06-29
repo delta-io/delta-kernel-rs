@@ -90,6 +90,10 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Float(v) => Ok(Some(format_f32(*v))),
         Scalar::Double(v) => Ok(Some(format_f64(*v))),
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanos(ns) => Ok(Some(format_timestamp_nanos(*ns)?)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanosNtz(ns) => Ok(Some(format_timestamp_nanos_ntz(*ns)?)),
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
@@ -176,6 +180,35 @@ fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
             "{label} value {micros} microseconds from epoch is out of range"
         ))
     })
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+/// Converts nanoseconds since epoch to a [`DateTime`], returning an error if out of range.
+fn nanos_to_datetime(nanos: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
+    DateTime::from_timestamp(
+        nanos.div_euclid(1_000_000_000),
+        nanos.rem_euclid(1_000_000_000) as u32,
+    )
+    .ok_or_else(|| {
+        Error::generic(format!(
+            "{label} value {nanos} nanoseconds from epoch is out of range"
+        ))
+    })
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+/// Formats a timestamp (nanoseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.fffffffffZ".
+fn format_timestamp_nanos(nanos: i64) -> DeltaResult<String> {
+    nanos_to_datetime(nanos, "timestamp_nanos")
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string())
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+/// Formats a nanosecond timestamp without timezone as "YYYY-MM-DD HH:MM:SS.fffffffff".
+/// Space separator, no Z suffix (there is no timezone).
+fn format_timestamp_nanos_ntz(nanos: i64) -> DeltaResult<String> {
+    nanos_to_datetime(nanos, "timestamp_nanos_ntz")
+        .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string())
 }
 
 /// Formats a timestamp (microseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ".

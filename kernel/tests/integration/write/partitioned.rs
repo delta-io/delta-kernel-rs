@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
+#[cfg(feature = "nanosecond-timestamps")]
+use delta_kernel::arrow::array::TimestampNanosecondArray;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -53,7 +55,10 @@ async fn test_write_partitioned_normal_values_roundtrip(
         normal_partition_values()?,
     )
     .await?;
-    assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
+    assert_eq!(
+        snapshot.table_configuration().partition_columns().len(),
+        13 + 2 * cfg!(feature = "nanosecond-timestamps") as usize
+    );
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
     let (add, rel_path) = read_single_add(&table_path, 1)?;
@@ -356,6 +361,10 @@ fn all_types_schema() -> Arc<StructType> {
             StructField::nullable("p_decimal", DataType::decimal(10, 2).unwrap()),
             StructField::nullable("p_binary", DataType::BINARY),
             StructField::nullable("p_timestamp_ntz", DataType::TIMESTAMP_NTZ),
+            #[cfg(feature = "nanosecond-timestamps")]
+            StructField::nullable("p_timestamp_nanos", DataType::TIMESTAMP_NANOS),
+            #[cfg(feature = "nanosecond-timestamps")]
+            StructField::nullable("p_timestamp_nanos_ntz", DataType::TIMESTAMP_NANOS_NTZ),
         ])
         .unwrap(),
     )
@@ -375,6 +384,10 @@ const PARTITION_COLS: &[&str] = &[
     "p_decimal",
     "p_binary",
     "p_timestamp_ntz",
+    #[cfg(feature = "nanosecond-timestamps")]
+    "p_timestamp_nanos",
+    #[cfg(feature = "nanosecond-timestamps")]
+    "p_timestamp_nanos_ntz",
 ];
 
 // ==============================================================================
@@ -399,6 +412,10 @@ fn normal_arrow_columns() -> Vec<ArrayRef> {
         decimal_array(12345, 10, 2),
         Arc::new(BinaryArray::from_vec(vec![b"Hello"])),
         ts_ntz_array(ts),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![ts * 1000 + 123]).with_timezone("UTC")),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![ts * 1000 + 456])),
     ]
 }
 
@@ -419,6 +436,16 @@ fn normal_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::err
         ("p_decimal".into(), Scalar::decimal(12345, 10, 2)?),
         ("p_binary".into(), Scalar::Binary(b"Hello".to_vec())),
         ("p_timestamp_ntz".into(), Scalar::TimestampNtz(ts)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos".into(),
+            Scalar::TimestampNanos(ts * 1000 + 123),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_ntz".into(),
+            Scalar::TimestampNanosNtz(ts * 1000 + 456),
+        ),
     ]))
 }
 
@@ -437,6 +464,10 @@ const EXPECTED_NORMAL_PVS: &[(&str, &str)] = &[
     ("p_decimal", "123.45"),
     ("p_binary", "Hello"),
     ("p_timestamp_ntz", "2025-03-31 15:30:00.123456"),
+    #[cfg(feature = "nanosecond-timestamps")]
+    ("p_timestamp_nanos", "2025-03-31T15:30:00.123456123Z"),
+    #[cfg(feature = "nanosecond-timestamps")]
+    ("p_timestamp_nanos_ntz", "2025-03-31 15:30:00.123456456"),
 ];
 
 // ==============================================================================
@@ -464,6 +495,10 @@ fn null_arrow_columns() -> Vec<ArrayRef> {
         ),
         Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
         Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>])),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>])),
     ]
 }
 
@@ -485,6 +520,16 @@ fn null_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::error
         (
             "p_timestamp_ntz".into(),
             Scalar::Null(DataType::TIMESTAMP_NTZ),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos".into(),
+            Scalar::Null(DataType::TIMESTAMP_NANOS),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_ntz".into(),
+            Scalar::Null(DataType::TIMESTAMP_NANOS_NTZ),
         ),
     ]))
 }
@@ -538,12 +583,20 @@ fn assert_normal_values(sorted: &RecordBatch) {
         b"Hello"
     );
     assert_col!(sorted, 13, TimestampMicrosecondArray, ts); // p_timestamp_ntz
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_col!(sorted, 14, TimestampNanosecondArray, ts * 1000 + 123); // p_timestamp_nanos
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_col!(sorted, 15, TimestampNanosecondArray, ts * 1000 + 456); // p_timestamp_nanos_ntz
 }
 
 /// Asserts all partition columns (indices 1-13) are null for the single row.
 fn assert_all_partition_columns_null(sorted: &RecordBatch) {
     assert_eq!(sorted.num_rows(), 1);
-    for col_idx in 1..=13 {
+    let mut num_columns = 13;
+    if cfg!(feature = "nanosecond-timestamps") {
+        num_columns += 2;
+    }
+    for col_idx in 1..=num_columns {
         assert!(
             sorted.column(col_idx).is_null(0),
             "partition column at index {col_idx} ({}) should be null",

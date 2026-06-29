@@ -189,6 +189,14 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
         (Date, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, Statistics::Int64(s)) => Scalar::TimestampNanos(*s.min_opt()?),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, Statistics::Int64(s)) => Scalar::TimestampNanosNtz(*s.min_opt()?),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, _) => return None,
         (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.min_opt()?),
         (Timestamp, _) => return None, // TODO: Int96 timestamps
         (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
@@ -236,6 +244,14 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
         (Date, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, Statistics::Int64(s)) => Scalar::TimestampNanos(*s.max_opt()?),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanos, _) => return None,
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, Statistics::Int64(s)) => Scalar::TimestampNanosNtz(*s.max_opt()?),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (TimestampNanosNtz, _) => return None,
         (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.max_opt()?),
         (Timestamp, _) => return None, // TODO: Int96 timestamps
         (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
@@ -452,18 +468,23 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
 
 /// Adjusts a max stat value to account for millisecond truncation in JSON-serialized stats.
 /// `stats_parsed` inherits from JSON stats which truncate timestamps to millisecond precision:
-/// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us ensures we never falsely
-/// prune files whose actual max exceeds the truncated value. Non-timestamp values pass through
-/// unchanged.
+/// `stored_max <= actual_max <= stored_max + max_gap`. Adding the maximum possible truncation gap
+/// ensures we never falsely prune files whose actual max exceeds the truncated value. The gap is
+/// one millisecond minus one unit, expressed in each type's resolution: 999us for microsecond
+/// timestamps, 999_999ns for nanosecond timestamps. Non-timestamp values pass through unchanged.
 ///
 /// See also [`DataSkippingPredicateCreator::adjust_scalar_for_max_stat_truncation`] in
 /// `scan/data_skipping.rs`, which handles the same truncation issue from the predicate side
-/// (subtracting 999us from the comparison value instead of adding to the stat).
+/// (subtracting the gap from the comparison value instead of adding to the stat).
 #[allow(dead_code)]
 fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(us) => Scalar::Timestamp(us.saturating_add(999)),
         Scalar::TimestampNtz(us) => Scalar::TimestampNtz(us.saturating_add(999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanos(ns) => Scalar::TimestampNanos(ns.saturating_add(999_999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanosNtz(ns) => Scalar::TimestampNanosNtz(ns.saturating_add(999_999)),
         other => other,
     }
 }

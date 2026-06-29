@@ -416,8 +416,10 @@ fn collect_junction_preds(
 /// protocol allowing timestamp stats to be truncated to millisecond precision (see Per-file
 /// Statistics: "Timestamp columns are truncated down to milliseconds"). Truncation floors to
 /// the nearest millisecond, so: `stored_max <= actual_max <= stored_max + 999us`. We subtract
-/// 999us from the comparison value to avoid incorrectly pruning files whose actual max may be
-/// higher than the stored (truncated) max.
+/// the maximum possible truncation gap from the comparison value to avoid incorrectly pruning
+/// files whose actual max may be higher than the stored (truncated) max. The gap is one
+/// millisecond minus one unit, expressed in each type's resolution: 999us for microsecond
+/// timestamps, 999_999ns for nanosecond timestamps.
 ///
 /// For example, if a file's actual max is `4_000_500us` (4.000500s), Spark truncates the
 /// stored max stat to `4_000_000us` (4.000s). A predicate `ts > 4_000_400` would incorrectly
@@ -429,6 +431,12 @@ fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(micros) => Scalar::Timestamp(micros.saturating_sub(999)),
         Scalar::TimestampNtz(micros) => Scalar::TimestampNtz(micros.saturating_sub(999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanos(nanos) => Scalar::TimestampNanos(nanos.saturating_sub(999_999)),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Scalar::TimestampNanosNtz(nanos) => {
+            Scalar::TimestampNanosNtz(nanos.saturating_sub(999_999))
+        }
         other => other.clone(),
     }
 }

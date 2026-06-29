@@ -71,3 +71,6 @@ declarative-plans = ["delta_kernel/declarative-plans", "arrow", "default-engine-
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
+
+# Preview feature, not yet part of Delta protocol.
+nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps", "test_utils/nanosecond-timestamps"]

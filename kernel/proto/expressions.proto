@@ -110,6 +110,8 @@ message Scalar {
     StructData struct = 15;
     ArrayData array = 16;
     MapData map = 17;
+    int64 timestamp_nanos = 18;       // nanos since epoch, UTC
+    int64 timestamp_nanos_ntz = 19;   // nanos since epoch, no tz
   }
 }
 

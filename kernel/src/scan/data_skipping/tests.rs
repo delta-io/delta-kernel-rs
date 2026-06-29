@@ -459,6 +459,24 @@ fn test_adjust_scalar_for_max_stat_truncation() {
         adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNtz(1_000_000)),
         Scalar::TimestampNtz(999_001)
     );
+    // TimestampNanos: subtracts 999_999ns (one millisecond minus one nanosecond)
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNanos(1_000_000_000)),
+        Scalar::TimestampNanos(999_000_001)
+    );
+    // TimestampNanosNtz: subtracts 999_999ns
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNanosNtz(1_000_000_000)),
+        Scalar::TimestampNanosNtz(999_000_001)
+    );
+    // TimestampNanos saturates at i64::MIN
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNanos(i64::MIN)),
+        Scalar::TimestampNanos(i64::MIN)
+    );
     // Non-timestamp: unchanged
     assert_eq!(
         adjust_scalar_for_max_stat_truncation(&Scalar::from(42i64)),

@@ -545,6 +545,10 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Scalar::TimestampNanos(v) => Value::TimestampNanos(*v),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Scalar::TimestampNanosNtz(v) => Value::TimestampNanosNtz(*v),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
             Scalar::Decimal(decimal) => Value::Decimal(decimal.into()),
@@ -635,6 +639,10 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Date => Kind::Simple(Simple::Date as i32),
             PrimitiveType::Timestamp => Kind::Simple(Simple::Timestamp as i32),
             PrimitiveType::TimestampNtz => Kind::Simple(Simple::TimestampNtz as i32),
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanos => Kind::Simple(Simple::TimestampNanos as i32),
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanosNtz => Kind::Simple(Simple::TimestampNanosNtz as i32),
             PrimitiveType::Decimal(decimal) => Kind::Decimal((*decimal).into()),
             PrimitiveType::Void => Kind::Simple(Simple::Void as i32),
             PrimitiveType::IntervalYearMonth => Kind::Simple(Simple::IntervalYearMonth as i32),
@@ -1632,6 +1640,8 @@ mod tests {
             Value::Boolean(_) => "boolean",
             Value::Timestamp(_) => "timestamp",
             Value::TimestampNtz(_) => "timestamp_ntz",
+            Value::TimestampNanos(_) => "timestamp_nanos",
+            Value::TimestampNanosNtz(_) => "timestamp_nanos_ntz",
             Value::Date(_) => "date",
             Value::Binary(_) => "binary",
             Value::Decimal(_) => "decimal",
