@@ -312,7 +312,7 @@ jobs:
           cargo build --locked
           popd
           pushd ffi
-          cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog
+          cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog,column-defaults-in-dev
           popd
       - name: build and run read-table test
         run: |
@@ -352,6 +352,14 @@ jobs:
       - name: build and run write-table test
         run: |
           pushd ffi/examples/write-table
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
+      - name: build and run column-defaults test
+        run: |
+          pushd ffi/examples/column-defaults
           mkdir build
           pushd build
           cmake ..
