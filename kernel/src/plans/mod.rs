@@ -4,10 +4,13 @@
 pub mod ir;
 pub mod proto;
 mod query_builder;
+mod scan_shape;
 
 use bytes::Bytes;
 pub use ir::{IoOperation, Operation};
 pub use query_builder::QueryPlanBuilder;
+#[allow(unused_imports)]
+pub(crate) use scan_shape::{CheckpointShape, ScanShape, StatsInfo};
 
 use crate::{
     AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,
