@@ -62,19 +62,27 @@ pub(crate) fn parse_schema(
     fallible: bool,
     wrap: impl FnOnce(TokenStream) -> TokenStream,
 ) -> proc_macro::TokenStream {
-    let mut errors: Vec<syn::Error> = Vec::new();
-    let parser = |input: ParseStream| emit_struct(input, fallible, &mut errors);
-    let result = match parser.parse2(input.into()) {
-        Ok(block) if errors.is_empty() => Ok(block),
-        Ok(_) => Err(errors),
-        Err(parse_error) => Err(vec![parse_error]),
-    };
     // Emits a block of 1+ errors, in case parsing failed or duplicate fields were detected.
     let compile_errors_block = |errors: Vec<syn::Error>| {
         let invocations = errors.iter().map(syn::Error::to_compile_error);
         quote!({ #( #invocations )* })
     };
-    result.map_or_else(compile_errors_block, wrap).into()
+    try_parse_schema(input.into(), fallible)
+        .map_or_else(compile_errors_block, wrap)
+        .into()
+}
+
+/// Runs the parser over a [`proc_macro2::TokenStream`], returning the schema-building tokens or the
+/// accumulated errors. Splitting this out from [`parse_schema`] keeps the `compile_error!`-rendering
+/// and wrapping concerns separate, and lets unit tests drive the parser directly.
+fn try_parse_schema(input: TokenStream, fallible: bool) -> Result<TokenStream, Vec<syn::Error>> {
+    let mut errors: Vec<syn::Error> = Vec::new();
+    let parser = |input: ParseStream| emit_struct(input, fallible, &mut errors);
+    match parser.parse2(input) {
+        Ok(block) if errors.is_empty() => Ok(block),
+        Ok(_) => Err(errors),
+        Err(parse_error) => Err(vec![parse_error]),
+    }
 }
 
 /// `body := (entry ',')* entry?`
@@ -285,5 +293,94 @@ fn check_for_duplicates(
         MapEntry::Vacant(slot) => {
             slot.insert(span);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // These tests drive `try_parse_schema` directly (the same code path the proc macros run),
+    // asserting only on the parse outcome and on the *caller-facing* diagnostics -- the compile
+    // errors a user sees when they mistype an invocation. They deliberately avoid inspecting the
+    // generated token stream, since its exact shape is an implementation detail.
+    use super::*;
+    use rstest::rstest;
+
+    /// Malformed invocations that must be rejected with a specific, caller-facing diagnostic.
+    #[rstest]
+    #[case::missing_top_level_nullability(quote! { "a": INTEGER }, "nullable")]
+    #[case::missing_array_element_nullability(quote! { nullable "a": [ STRING ] }, "nullable")]
+    #[case::missing_map_value_nullability(quote! { nullable "a": { STRING => STRING } }, "nullable")]
+    #[case::qualified_path_type(quote! { nullable "a": a::b }, "qualified path")]
+    #[case::non_datatype_bare_type(quote! { nullable "a": 42 }, "data type")]
+    #[case::trailing_tokens_in_parenthesized_type(quote! { nullable "a": (foo bar) }, "unexpected tokens")]
+    #[case::trailing_tokens_in_array_element(quote! { nullable "a": [ nullable STRING extra ] }, "unexpected tokens")]
+    #[case::trailing_tokens_in_map_value(quote! { nullable "a": { STRING => nullable STRING extra } }, "unexpected tokens")]
+    fn rejects_with_diagnostic(#[case] input: TokenStream, #[case] needle: &str) {
+        let errors = try_parse_schema(input, false).expect_err("expected rejection");
+        let messages = Vec::from_iter(errors.iter().map(ToString::to_string));
+        assert!(
+            messages.iter().any(|m| m.contains(needle)),
+            "no error contained {needle:?}; got: {messages:?}",
+        );
+    }
+
+    /// Structurally broken invocations that `syn` rejects for us. We assert only that they fail,
+    /// not on the wording, to avoid coupling the tests to `syn`'s error messages.
+    #[rstest]
+    #[case::missing_colon(quote! { nullable "a" INTEGER })]
+    #[case::missing_comma_between_fields(quote! { not_null "a": INTEGER not_null "b": LONG })]
+    fn rejects_structurally_invalid_input(#[case] input: TokenStream) {
+        assert!(try_parse_schema(input, false).is_err());
+    }
+
+    /// Statically-detectable duplicate field names are rejected, with errors pointing at both the
+    /// duplicate and the original occurrence. Literals collide case-insensitively (per Delta's
+    /// column-name rule); bare identifiers collide by their text.
+    #[rstest]
+    #[case::case_insensitive_string_literals(quote! { nullable "id": INTEGER, nullable "ID": STRING })]
+    #[case::repeated_identifiers(quote! { nullable NAME: INTEGER, not_null NAME: STRING })]
+    fn rejects_duplicate_field_names(#[case] input: TokenStream) {
+        let errors = try_parse_schema(input, false).expect_err("expected duplicate rejection");
+        let messages = Vec::from_iter(errors.iter().map(ToString::to_string));
+        assert!(messages.iter().any(|m| m.contains("duplicate field name")), "got: {messages:?}");
+        assert!(messages.iter().any(|m| m.contains("first defined here")), "got: {messages:?}");
+    }
+
+    /// Well-formed invocations parse cleanly in both the infallible and fallible modes (the grammar
+    /// is identical; only the generated constructor differs). The last two cases pin the boundary
+    /// of static duplicate detection: it is per-struct-body, and interpolated `(EXPR)` names are
+    /// opaque, so neither is flagged here (the fallible macro defers such checks to runtime).
+    #[rstest]
+    #[case::flat_fields(quote! {
+        not_null "id": LONG,
+        nullable "name": STRING,
+        not_null "score": (DataType::DOUBLE),
+    })]
+    #[case::nested_struct_array_and_map(quote! {
+        not_null "user": { nullable "city": STRING, nullable "zip": STRING },
+        nullable "tags": [ not_null STRING ],
+        not_null "props": { STRING => nullable STRING },
+    })]
+    #[case::interpolated_name_type_field_and_splice(quote! {
+        not_null (format!("col_{}", 1)): (DataType::LONG),
+        (StructField::nullable("z", DataType::STRING)),
+        ..(::std::vec::Vec::<StructField>::new()),
+    })]
+    #[case::empty_body(quote! {})]
+    #[case::same_name_in_sibling_nested_structs(quote! {
+        not_null "a": { nullable "x": INTEGER },
+        not_null "b": { nullable "x": INTEGER },
+    })]
+    #[case::interpolated_name_collision_deferred(quote! {
+        nullable (n): INTEGER,
+        nullable (n): STRING,
+    })]
+    fn accepts_well_formed_schema(#[case] input: TokenStream, #[values(false, true)] fallible: bool) {
+        let result = try_parse_schema(input, fallible);
+        assert!(
+            result.is_ok(),
+            "expected acceptance, got: {:?}",
+            result.err().map(|e| Vec::from_iter(e.iter().map(ToString::to_string))),
+        );
     }
 }
