@@ -1,4 +1,6 @@
 //! This module holds functionality for managing transactions.
+#[cfg(feature = "column-defaults-in-dev")]
+mod column_defaults;
 mod deletion_vector;
 mod partition_value;
 mod transaction_id;
@@ -6,6 +8,10 @@ mod write_context;
 
 use std::sync::Arc;
 
+#[cfg(feature = "column-defaults-in-dev")]
+pub use column_defaults::{
+    visit_column_defaults, visit_schema_column_defaults, EngineColumnDefaultVisitor,
+};
 pub use deletion_vector::{
     dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor,
     free_dv_descriptor_map, transaction_update_deletion_vectors, ExclusiveDvDescriptor,
