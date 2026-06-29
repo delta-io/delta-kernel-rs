@@ -73,8 +73,8 @@ pub(crate) fn parse_schema(
 }
 
 /// Runs the parser over a [`proc_macro2::TokenStream`], returning the schema-building tokens or the
-/// accumulated errors. Splitting this out from [`parse_schema`] keeps the `compile_error!`-rendering
-/// and wrapping concerns separate, and lets unit tests drive the parser directly.
+/// accumulated errors. Splitting this out from [`parse_schema`] separates the wrapping of the
+/// `compile_error!` block from its rendering, and lets unit tests drive the parser directly.
 fn try_parse_schema(input: TokenStream, fallible: bool) -> Result<TokenStream, Vec<syn::Error>> {
     let mut errors: Vec<syn::Error> = Vec::new();
     let parser = |input: ParseStream| emit_struct(input, fallible, &mut errors);
@@ -302,8 +302,9 @@ mod tests {
     // asserting only on the parse outcome and on the *caller-facing* diagnostics -- the compile
     // errors a user sees when they mistype an invocation. They deliberately avoid inspecting the
     // generated token stream, since its exact shape is an implementation detail.
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     /// Malformed invocations that must be rejected with a specific, caller-facing diagnostic.
     #[rstest]
@@ -342,8 +343,14 @@ mod tests {
     fn rejects_duplicate_field_names(#[case] input: TokenStream) {
         let errors = try_parse_schema(input, false).expect_err("expected duplicate rejection");
         let messages = Vec::from_iter(errors.iter().map(ToString::to_string));
-        assert!(messages.iter().any(|m| m.contains("duplicate field name")), "got: {messages:?}");
-        assert!(messages.iter().any(|m| m.contains("first defined here")), "got: {messages:?}");
+        assert!(
+            messages.iter().any(|m| m.contains("duplicate field name")),
+            "got: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("first defined here")),
+            "got: {messages:?}"
+        );
     }
 
     /// Well-formed invocations parse cleanly in both the infallible and fallible modes (the grammar
@@ -375,12 +382,17 @@ mod tests {
         nullable (n): INTEGER,
         nullable (n): STRING,
     })]
-    fn accepts_well_formed_schema(#[case] input: TokenStream, #[values(false, true)] fallible: bool) {
+    fn accepts_well_formed_schema(
+        #[case] input: TokenStream,
+        #[values(false, true)] fallible: bool,
+    ) {
         let result = try_parse_schema(input, fallible);
         assert!(
             result.is_ok(),
             "expected acceptance, got: {:?}",
-            result.err().map(|e| Vec::from_iter(e.iter().map(ToString::to_string))),
+            result
+                .err()
+                .map(|e| Vec::from_iter(e.iter().map(ToString::to_string))),
         );
     }
 }
