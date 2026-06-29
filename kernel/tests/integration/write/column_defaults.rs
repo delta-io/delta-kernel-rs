@@ -1,10 +1,11 @@
 //! Integration tests for the `allowColumnDefaults` writer feature.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+use delta_kernel::schema::{
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::DeltaResult;
 use test_utils::{schema_with_column_defaults, test_table_setup};
@@ -13,10 +14,7 @@ use test_utils::{schema_with_column_defaults, test_table_setup};
 #[test]
 fn test_create_table_rejects_col_defaults() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::LONG,
-    )])?);
+    let schema = schema_ref! { nullable "id": LONG };
 
     let err = kernel_create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.allowColumnDefaults", "supported")])

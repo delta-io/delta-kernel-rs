@@ -15,7 +15,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
@@ -262,10 +262,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "value": INTEGER };
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -767,10 +764,7 @@ async fn test_checkpoint_spec_rejected(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "value": INTEGER };
 
     let mut builder = create_table(&table_path, schema, "Test/1.0");
     if enable_v2checkpoint {
@@ -800,10 +794,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "value": INTEGER };
 
     // v2 table, no data commits -> only protocol + metadata at version 0.
     let _ = create_table(&table_path, schema, "Test/1.0")

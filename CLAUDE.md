@@ -295,6 +295,9 @@ Keep this list updated when new protocol features are added to kernel.
   string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
   same as `column_expr!`); one or more comma-separated args build a column with each segment taken
   verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
+- Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals, and
+  `try_schema!` when names of interpolated fields might collide. Prefer `StructType::try_new`
+  or schema builder/patch APIs for complex data-dependent schema manipulation.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 

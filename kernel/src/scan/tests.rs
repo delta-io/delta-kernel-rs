@@ -24,7 +24,7 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
+    self, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
 };
 use crate::transaction::create_table::create_table;
 use crate::{
@@ -372,10 +372,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store);
 
-    let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "id",
-        DataType::LONG,
-    )]));
+    let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()

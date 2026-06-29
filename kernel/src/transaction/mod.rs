@@ -38,8 +38,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 use crate::schema::{
-    ArrayType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
-    StructTypeBuilder,
+    schema_ref, ArrayType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -89,15 +88,12 @@ pub(crate) type EngineDataResultIterator<'a> =
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::not_null("path", DataType::STRING),
-        StructField::not_null(
-            "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::not_null("size", DataType::LONG),
-        StructField::not_null("modificationTime", DataType::LONG),
-    ]))
+    schema_ref! {
+        not_null "path": STRING,
+        not_null "partitionValues": { STRING => nullable STRING },
+        not_null "size": LONG,
+        not_null "modificationTime": LONG,
+    }
 });
 
 /// Returns a reference to the mandatory fields in an add action.
@@ -121,23 +117,19 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 /// and which columns have statistics enabled. Use [`Transaction::stats_schema`] to get the
 /// expected stats schema for a specific table.
 pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let stats = StructField::nullable(
-        "stats",
-        DataType::struct_type_unchecked(vec![
-            StructField::nullable(NUM_RECORDS, DataType::LONG),
-            // nullCount, minValues, maxValues are dynamic based on data schema.
-            // Empty struct placeholders indicate these fields exist but their inner
-            // structure depends on the table schema and stats column configuration.
-            StructField::nullable(NULL_COUNT, DataType::struct_type_unchecked(vec![])),
-            StructField::nullable(MIN_VALUES, DataType::struct_type_unchecked(vec![])),
-            StructField::nullable(MAX_VALUES, DataType::struct_type_unchecked(vec![])),
-            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
-        ]),
-    );
-
-    StructTypeBuilder::from_schema(mandatory_add_file_schema())
-        .add_field(stats)
-        .build_arc_unchecked()
+    schema_ref! {
+        ..(mandatory_add_file_schema().fields().cloned()),
+        nullable "stats": {
+            nullable NUM_RECORDS: LONG,
+            // nullCount, minValues, maxValues are dynamic based on data schema. Empty struct
+            // placeholders indicate these fields exist but their inner structure depends on the
+            // table schema and stats column configuration.
+            nullable NULL_COUNT: {},
+            nullable MIN_VALUES: {},
+            nullable MAX_VALUES: {},
+            nullable TIGHT_BOUNDS: BOOLEAN,
+        },
+    }
 });
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
@@ -2587,10 +2579,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_rejects_create_table() -> DeltaResult<()> {
         let tempdir = tempfile::tempdir()?;
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
+        let schema = schema_ref! { nullable "id": INTEGER };
         let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),

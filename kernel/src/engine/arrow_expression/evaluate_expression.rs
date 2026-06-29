@@ -1083,7 +1083,7 @@ mod tests {
         col, column_expr, column_expr_ref, lit, BinaryExpressionOp, Expression as Expr,
         ExpressionStructPatchBuilder,
     };
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn create_test_batch() -> RecordBatch {
@@ -1774,14 +1774,13 @@ mod tests {
 
         let patch = ExpressionStructPatchBuilder::new().replace_at(["nested"], "x", lit(999));
 
-        let nested_output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("x", DataType::INTEGER),
-            StructField::not_null("y", DataType::INTEGER),
-        ]);
-        let output_schema = StructType::new_unchecked(vec![
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::not_null("nested", nested_output_schema),
-        ]);
+        let output_schema = schema! {
+            not_null "a": INTEGER,
+            not_null "nested": {
+                not_null "x": INTEGER,
+                not_null "y": INTEGER,
+            },
+        };
 
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
@@ -1949,14 +1948,13 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
         // Define nested output schema
-        let inner_schema = StructType::new_unchecked(vec![
-            StructField::new("x", DataType::LONG, true),
-            StructField::new("y", DataType::LONG, true),
-        ]);
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("outer", DataType::LONG, true),
-            StructField::new("inner", inner_schema, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "outer": LONG,
+            nullable "inner": {
+                nullable "x": LONG,
+                nullable "y": LONG,
+            },
+        };
 
         let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2000,11 +1998,7 @@ mod tests {
         let json_strings = StringArray::from(vec![Some(r#"{"a": 1}"#), None, Some(r#"{"a": 3}"#)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "a",
-            DataType::LONG,
-            true,
-        )]));
+        let output_schema = schema_ref! { nullable "a": LONG };
 
         let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2031,11 +2025,7 @@ mod tests {
         let json_strings: StringArray = StringArray::from(Vec::<Option<&str>>::new());
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "a",
-            DataType::LONG,
-            true,
-        )]));
+        let output_schema = schema_ref! { nullable "a": LONG };
 
         let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2138,11 +2128,7 @@ mod tests {
         let json_arr = StringArray::from(json_strings);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_arr)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "a",
-            DataType::LONG,
-            true,
-        )]));
+        let output_schema = schema_ref! { nullable "a": LONG };
         let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
 
@@ -2236,8 +2222,7 @@ mod tests {
     #[test]
     fn test_map_to_struct_missing_key() {
         let batch = create_partition_map_batch();
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::nullable("nonexistent", DataType::STRING)]);
+        let output_schema = schema! { nullable "nonexistent": STRING };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(column_expr!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -2304,8 +2289,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::nullable("count", DataType::INTEGER)]);
+        let output_schema = schema! { nullable "count": INTEGER };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(column_expr!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
@@ -2358,8 +2342,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::nullable("x", DataType::STRING)]);
+        let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(column_expr!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
@@ -2449,8 +2432,7 @@ mod tests {
         let pv_parsed = new_null_array(schema.field(0).data_type(), 2);
         let batch = RecordBatch::try_new(schema, vec![pv_parsed, Arc::new(map_array)]).unwrap();
 
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::new("date", DataType::DATE, false)]);
+        let output_schema = schema! { not_null "date": DATE };
         let result_type = DataType::from(output_schema);
         let expr = Expr::coalesce([
             Expr::column(["pv_parsed"]),
@@ -2471,8 +2453,7 @@ mod tests {
         let strings = StringArray::from(vec![Some("hello")]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
 
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::nullable("x", DataType::STRING)]);
+        let output_schema = schema! { nullable "x": STRING };
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(column_expr!("s"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
@@ -2606,11 +2587,7 @@ mod tests {
         #[case] expected_valid: Vec<bool>,
     ) {
         let batch = create_batch_with_bool_col(a_vals, pred_vals);
-        let schema = DataType::from(StructType::new_unchecked(vec![StructField::new(
-            "a",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema = DataType::from(schema! { nullable "a": INTEGER });
         let expr = Expr::struct_with_nullability_from(
             [column_expr_ref!("a")],
             column_expr_ref!("is_valid"),
@@ -2629,13 +2606,9 @@ mod tests {
             vec![Some(1), Some(2), Some(3)],
             vec![Some(true), Some(false), Some(true)],
         );
-        let inner_schema =
-            StructType::new_unchecked(vec![StructField::new("a", DataType::INTEGER, true)]);
-        let schema = DataType::from(StructType::new_unchecked(vec![StructField::new(
-            "nested",
-            inner_schema,
-            true,
-        )]));
+        let schema = DataType::from(schema! {
+            nullable "nested": { nullable "a": INTEGER },
+        });
         let inner_expr = Expr::struct_from([column_expr_ref!("a")]);
         let expr = Expr::struct_with_nullability_from([inner_expr], column_expr_ref!("is_valid"));
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
@@ -2697,11 +2670,7 @@ mod tests {
             vec![Some(1), Some(2), Some(3)],
             vec![Some(true), Some(false), Some(true)],
         );
-        let schema = DataType::from(StructType::new_unchecked(vec![StructField::new(
-            "a",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema = DataType::from(schema! { nullable "a": INTEGER });
         let expr =
             Expr::struct_with_nullability_from([column_expr_ref!("a")], column_expr_ref!("a"));
         let result = evaluate_expression(&expr, &batch, Some(&schema));

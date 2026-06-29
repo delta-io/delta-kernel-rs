@@ -154,7 +154,8 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+        StructType,
     };
 
     // === Schema builders for test cases ===
@@ -200,56 +201,31 @@ mod tests {
     }
 
     fn schema_with_space() -> StructType {
-        StructType::new_unchecked(vec![StructField::new(
-            "my column",
-            DataType::INTEGER,
-            false,
-        )])
+        schema! { not_null "my column": INTEGER }
     }
 
     fn schema_with_semicolon() -> StructType {
-        StructType::new_unchecked(vec![StructField::new("col;name", DataType::INTEGER, false)])
+        schema! { not_null "col;name": INTEGER }
     }
 
     fn schema_with_newline() -> StructType {
-        StructType::new_unchecked(vec![StructField::new(
-            "col\nname",
-            DataType::INTEGER,
-            false,
-        )])
+        schema! { not_null "col\nname": INTEGER }
     }
 
     fn schema_with_empty_name() -> StructType {
-        StructType::new_unchecked(vec![StructField::new("", DataType::INTEGER, false)])
+        schema! { not_null "": INTEGER }
     }
 
     fn schema_nested_bad_char() -> StructType {
-        let inner = StructType::new_unchecked(vec![StructField::new(
-            "bad column",
-            DataType::INTEGER,
-            false,
-        )]);
-        StructType::new_unchecked(vec![StructField::new("parent", inner, false)])
+        schema! { not_null "parent": { not_null "bad column": INTEGER } }
     }
 
     fn schema_array_bad_char() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![StructField::new("bad col", DataType::INTEGER, false)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "arr",
-            ArrayType::new(inner, true),
-            false,
-        )])
+        schema! { not_null "arr": [ nullable { not_null "bad col": INTEGER } ] }
     }
 
     fn schema_map_bad_char() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![StructField::new("bad;val", DataType::INTEGER, false)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "m",
-            MapType::new(DataType::STRING, inner, true),
-            false,
-        )])
+        schema! { not_null "m": { STRING => nullable { not_null "bad;val": INTEGER } } }
     }
 
     fn schema_top_level_dup() -> StructType {
