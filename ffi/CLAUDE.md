@@ -1,14 +1,31 @@
 # FFI Layer
 
+Scope: `ffi/**`. Cross-cutting Rust/comment/protocol conventions live in the root
+`CLAUDE.md`; this file is the FFI-boundary context.
+
 The `delta_kernel_ffi` crate exposes the kernel to C/C++ via a stable FFI boundary using
 cbindgen-generated headers (`.h` and `.hpp`).
+
+## Terminology
+
+- **Kernel vs engine** -- "kernel" is the native Rust side; "engine" is the foreign runtime
+  on the other side of the boundary. This is the lens for "which side allocated/owns this".
+- **Downcall vs upcall** -- a downcall is the engine invoking an exported Rust function; an
+  upcall is Rust invoking an engine-provided function pointer.
+- **Allocator vs owner** -- the allocator initialized the memory and knows *how* to free it;
+  the owner decides *when*. Ownership can transfer across the boundary (e.g. a handle returned
+  from a builder), so track both independently.
 
 ## Handle System
 
 Objects crossing the FFI boundary may be wrapped in **handles** -- opaque pointers with
 ownership semantics:
-- **Mutable handles** (`Box`-like) -- exclusive ownership, neither `Copy` nor `Clone`
+- **Exclusive handles** (`Box`-like) -- exclusive ownership, neither `Copy` nor `Clone`
 - **Shared handles** (`Arc`-like) -- shared ownership via reference counting
+
+Declare them with the `#[handle_descriptor]` macro and prefix the type name with `Exclusive`
+or `Shared` so the ownership model is visible at the use site (e.g. `SharedSnapshot`,
+`ExclusiveTransaction`).
 
 A handle is needed when a value might outlive the function call that passes it across the
 FFI boundary, or when the type is not representable in C/C++ (dyn trait references, slices,
@@ -16,6 +33,30 @@ options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelE
 `KernelStringSlice`, and `EngineIterator` do not need handles.
 
 Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_snapshot`).
+
+## Memory Ownership
+
+Default to **kernel-allocated** data whose ownership transfers via a handle: it keeps freeing
+explicit (the engine calls `free_*`) and avoids upcalls just to release memory. Reach for
+**engine-allocated** data only where it genuinely pays off:
+- Arrow `EngineData` (Arrow's C Data Interface already carries ownership-transfer semantics),
+- error strings (the callee allocates them in the caller's space; see Error Handling), and
+- engine-owned iterators, where kernel must re-enter engine state across upcalls.
+
+For engine-allocated state, the engine supplies the data plus a `free` callback. Mirror its
+layout with a `repr(C)` struct prefixed `C` (e.g. `CEngineDataIterator`), and wrap it in a
+Rust adapter prefixed `Ffi` (e.g. `FfiEngineDataIter`) whose `Drop` invokes that `free`
+callback -- so the engine resource is released deterministically by Rust's ownership rules.
+
+## repr(C) structs & out-pointers
+
+Small `repr(C)` structs cross the boundary by value (inputs, grouped primitive returns,
+tagged unions like `ExternResult`/`OptionalValue`). Prefix the transparent type with `C`.
+
+Upcalls that return a struct use an **out-pointer**: Rust passes `*mut T` and the engine
+writes into it. Before invoking the upcall, always initialize `*out` to a well-defined
+sentinel (e.g. `EngineExecResult::Uninit`) so a callback that fails to write cannot leave
+Rust reading uninitialized memory -- treat a still-sentinel value after the call as failure.
 
 ## Error Handling
 
