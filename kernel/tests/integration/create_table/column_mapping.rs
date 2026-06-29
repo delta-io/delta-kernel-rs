@@ -68,7 +68,7 @@ pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
 /// For `Name` / `Id`: feature supported & enabled, mode matches, `maxColumnId` equals
 /// the maximum `delta.columnMapping.id` reachable in the schema. Callers can pre-populate
 /// CM annotations on the input schema, in which case the persisted `maxColumnId` reflects
-/// any preserved IDs (matching Spark/DBR's `assignColumnIdAndPhysicalName`).
+/// any preserved IDs (matching Spark's `assignColumnIdAndPhysicalName`).
 ///
 /// For `None`: mode is `None`, no `maxColumnId`, and no column mapping metadata (IDs or
 /// physical names) on any field. Note: whether `ColumnMapping` appears in the protocol
@@ -653,7 +653,7 @@ fn test_create_table_dup_physical_name(
 }
 
 // ============================================================================
-// CREATE TABLE accepts pre-populated column mapping metadata (DBR/Spark parity).
+// CREATE TABLE accepts pre-populated column mapping metadata (Spark parity).
 // See https://github.com/delta-io/delta-kernel-rs/issues/2377.
 // ============================================================================
 
