@@ -244,9 +244,24 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        self.write_parquet_with_config(data, write_context, &parquet::ParquetWriteConfig::default())
+            .await
+    }
+
+    /// Like [`Self::write_parquet`] but with explicit [`ParquetWriteConfig`] write tuning (e.g.
+    /// compression codec), for benchmarking format parity. Default config matches
+    /// [`Self::write_parquet`] (no codec set on the writer).
+    ///
+    /// [`ParquetWriteConfig`]: parquet::ParquetWriteConfig
+    pub async fn write_parquet_with_config(
+        &self,
+        data: &ArrowEngineData,
+        write_context: &WriteContext,
+        config: &parquet::ParquetWriteConfig,
+    ) -> DeltaResult<Box<dyn EngineData>> {
         let physical_data = self.logical_to_physical_data(data, write_context)?;
         self.raw_parquet
-            .write_parquet_file(physical_data, write_context)
+            .write_parquet_file(physical_data, write_context, config.compression)
             .await
     }
 

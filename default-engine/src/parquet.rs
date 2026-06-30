@@ -26,6 +26,8 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+use delta_kernel::parquet::basic::Compression;
+use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
@@ -46,6 +48,15 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
+}
+
+/// Engine-side write tuning for Parquet files. [`Default`] reproduces the kernel's standard
+/// uncompressed-codec behavior; the benchmark harness overrides the codec for format-parity testing.
+/// Mirrors [`crate::vortex::VortexWriteConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParquetWriteConfig {
+    /// Compression codec to apply. `None` keeps the kernel default (no codec set on the writer).
+    pub compression: Option<Compression>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -178,6 +189,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        compression: Option<Compression>,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
@@ -185,12 +197,15 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         // Collect statistics before writing (includes numRecords)
         let stats = collect_stats(record_batch, stats_columns)?;
 
+        // Start from the kernel's standard writer options (skips the Arrow IPC schema) and layer the
+        // requested codec on top. `None` leaves the writer at its default (no codec set).
+        let mut opts = writer_options();
+        if let Some(c) = compression {
+            opts = opts.with_properties(WriterProperties::builder().set_compression(c).build());
+        }
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new_with_options(
-            &mut buffer,
-            record_batch.schema(),
-            writer_options(),
-        )?;
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut buffer, record_batch.schema(), opts)?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
@@ -236,12 +251,14 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         data: Box<dyn EngineData>,
         write_context: &WriteContext,
+        compression: Option<Compression>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let file_metadata = self
             .write_parquet(
                 &write_context.write_dir(),
                 data,
                 write_context.stats_columns(),
+                compression,
             )
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
@@ -1086,7 +1103,7 @@ mod tests {
         ));
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[], None)
             .await
             .unwrap();
 
@@ -1166,7 +1183,7 @@ mod tests {
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[], None)
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
@@ -1693,7 +1710,7 @@ mod tests {
             .unwrap(),
         ));
         let metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[], None)
             .await
             .unwrap();
 

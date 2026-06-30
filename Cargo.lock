@@ -5892,6 +5892,7 @@ dependencies = [
  "arrow-schema 58.3.0",
  "flatbuffers",
  "jiff",
+ "object_store 0.13.2",
  "prost 0.14.3",
  "tokio",
 ]
@@ -5927,6 +5928,7 @@ dependencies = [
  "itertools 0.14.0",
  "kanal",
  "moka",
+ "object_store 0.13.2",
  "oneshot",
  "parking_lot",
  "pin-project-lite",
@@ -5998,6 +6000,7 @@ dependencies = [
  "futures",
  "glob",
  "kanal",
+ "object_store 0.13.2",
  "oneshot",
  "parking_lot",
  "pin-project-lite",

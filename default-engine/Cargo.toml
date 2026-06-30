@@ -29,8 +29,10 @@ tracing = { version = "0.1", features = ["log"] }
 url = "2"
 uuid = { version = "1.18.0", features = ["v4"] }
 # Vortex alternate file-format support (hackathon POC). Pinned to a release whose arrow major
-# (58.3) matches kernel's active arrow-58 feature so RecordBatch/ArrayRef types unify.
-vortex = { version = "=0.75.0", features = ["tokio"] }
+# (58.3) matches kernel's active arrow-58 feature so RecordBatch/ArrayRef types unify. The
+# `object_store` feature enables ranged reads straight from the engine's object store (footer +
+# projected column ranges) instead of fetching the whole file into memory.
+vortex = { version = "=0.75.0", features = ["tokio", "object_store"] }
 
 [features]
 default = ["arrow", "rustls"]

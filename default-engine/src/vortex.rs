@@ -137,13 +137,17 @@ async fn decode_vortex_file(
 ) -> DeltaResult<BoxStream<'static, DeltaResult<ArrowEngineData>>> {
     let file_location = file.location.to_string();
     let path = Path::from_url_path(file.location.path())?;
-    let bytes = store.get(&path).await?.bytes().await?;
 
     let session = VortexSession::default();
-    // `open_buffer` is synchronous (no I/O runtime); the scan decode is async.
+    // Open via the object store so Vortex does ranged reads (footer + projected column ranges)
+    // rather than fetching the whole file into memory. The `file.size` hint lets it locate the
+    // footer without a separate suffix/HEAD request. `open_object_store` spawns its I/O on the
+    // session's runtime handle, resolved from the ambient Tokio runtime this future runs in.
     let file = session
         .open_options()
-        .open_buffer(bytes.to_vec())
+        .with_file_size(file.size)
+        .open_object_store(&store, path.as_ref())
+        .await
         .map_err(vortex_err)?;
 
     // Projection pushdown: decode only the file columns the scan requests. We intersect the
