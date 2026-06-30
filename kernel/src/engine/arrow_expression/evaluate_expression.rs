@@ -1073,11 +1073,11 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, MapBuilder, StringArray,
-        StringBuilder, StructArray, TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, LargeStringArray, MapBuilder,
+        StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
         col, column_expr, column_expr_ref, lit, BinaryExpressionOp, Expression as Expr,
@@ -1892,6 +1892,41 @@ mod tests {
         assert_eq!(b_col.value(0), "hello");
         assert_eq!(b_col.value(1), "world");
         assert_eq!(b_col.value(2), "test");
+    }
+
+    #[rstest]
+    fn test_extract_variant_column_preserves_binary_representation(
+        #[values(
+            ArrowDataType::Binary,
+            ArrowDataType::LargeBinary,
+            ArrowDataType::BinaryView
+        )]
+        binary_type: ArrowDataType,
+    ) {
+        let metadata = cast(
+            &BinaryArray::from(vec![&[0x01, 0x00, 0x00][..]]),
+            &binary_type,
+        )
+        .unwrap();
+        let value = cast(&BinaryArray::from(vec![&[0x0C, 0x01][..]]), &binary_type).unwrap();
+        let fields: Fields = vec![
+            ArrowField::new("metadata", binary_type.clone(), false),
+            ArrowField::new("value", binary_type, false),
+        ]
+        .into();
+        let variant_arrow_type = ArrowDataType::Struct(fields.clone());
+        let variant = StructArray::try_new(fields, vec![metadata, value], None).unwrap();
+        let schema = ArrowSchema::new(vec![ArrowField::new("v", variant_arrow_type.clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(variant)]).unwrap();
+
+        let result = evaluate_expression(
+            &column_expr!("v"),
+            &batch,
+            Some(&DataType::unshredded_variant()),
+        )
+        .unwrap();
+
+        assert_eq!(result.data_type(), &variant_arrow_type);
     }
 
     #[test]
