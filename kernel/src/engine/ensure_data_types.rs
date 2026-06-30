@@ -697,6 +697,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interval_maps_to_physical_integer() {
+        assert_eq!(
+            ensure_data_types(
+                &DataType::INTERVAL_YEAR_MONTH,
+                &ArrowDataType::Int32,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::INTERVAL_DAY_TIME,
+                &ArrowDataType::Int64,
+                ValidationMode::TypesAndNames
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+    }
+
     /// Ensures that every kernel-level checkpoint reinterpretation rule in
     /// `PrimitiveType::is_checkpoint_cast_compatible` has a corresponding Arrow cast
     /// in `check_cast_compat`. If one side is updated without the other, this test fails.
