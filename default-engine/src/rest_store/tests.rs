@@ -54,16 +54,36 @@ fn refreshing_header_provider_with_ttl_caches() {
     assert_eq!(second.get("authorization").unwrap(), "Bearer token-0");
 }
 
+/// The Databricks Files API dialect: empty path prefixes, `*_param` query names, and the
+/// `contents`/`nextPageToken`/`path`/`fileSize`/`isDirectory`/`lastModified` list-response field
+/// names. A test overrides any field it cares about and spreads the rest from here.
+fn default_config() -> RestEndpointConfig {
+    RestEndpointConfig {
+        files_prefix: String::new(),
+        directories_prefix: String::new(),
+        page_token_param: "page_token".into(),
+        start_from_param: "start_from".into(),
+        recursive_param: "recursive".into(),
+        overwrite_param: "overwrite".into(),
+        contents_field: "contents".into(),
+        next_page_token_field: "nextPageToken".into(),
+        entry_path_field: "path".into(),
+        entry_size_field: "fileSize".into(),
+        entry_is_directory_field: "isDirectory".into(),
+        entry_last_modified_field: "lastModified".into(),
+        entry_strip_prefix: None,
+    }
+}
+
 /// A minimal REST dialect for tests: files at `/files/{path}`, directories at `/dirs/{path}`, and
 /// a `{ "contents": [{path, size}], "nextPageToken" }` list body. Other field names and the
-/// canonical 404 -> NotFound / 409 -> AlreadyExists status mapping come from
-/// [`RestEndpointConfig::default`].
+/// canonical 404 -> NotFound / 409 -> AlreadyExists status mapping come from [`default_config`].
 fn test_config() -> RestEndpointConfig {
     RestEndpointConfig {
         files_prefix: "files".into(),
         directories_prefix: "dirs".into(),
         entry_size_field: "size".into(),
-        ..Default::default()
+        ..default_config()
     }
 }
 
@@ -464,7 +484,7 @@ async fn config_driven_contract_parses_list_and_reads() {
     let config = RestEndpointConfig {
         files_prefix: "api/2.0/fs/files".into(),
         directories_prefix: "api/2.0/fs/directories".into(),
-        ..Default::default()
+        ..default_config()
     };
     // Listing with one file and one subdirectory; the directory entry must be filtered out.
     Mock::given(method("GET"))
@@ -522,7 +542,7 @@ fn store_with_strip_prefix(server: &MockServer, prefix: &str) -> RestObjectStore
     let config = RestEndpointConfig {
         directories_prefix: "dirs".into(),
         entry_strip_prefix: Some(prefix.into()),
-        ..Default::default()
+        ..default_config()
     };
     RestObjectStore::new(
         server.uri(),

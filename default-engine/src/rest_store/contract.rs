@@ -53,29 +53,6 @@ pub struct RestEndpointConfig {
     pub entry_strip_prefix: Option<String>,
 }
 
-impl Default for RestEndpointConfig {
-    /// The default dialect mirrors the Databricks Files API: empty path prefixes, `*_param` query
-    /// names, and the `contents`/`nextPageToken`/`path`/`fileSize`/`isDirectory`/`lastModified`
-    /// list-response field names. A caller targeting a different backend overrides any field.
-    fn default() -> Self {
-        Self {
-            files_prefix: String::new(),
-            directories_prefix: String::new(),
-            page_token_param: "page_token".into(),
-            start_from_param: "start_from".into(),
-            recursive_param: "recursive".into(),
-            overwrite_param: "overwrite".into(),
-            contents_field: "contents".into(),
-            next_page_token_field: "nextPageToken".into(),
-            entry_path_field: "path".into(),
-            entry_size_field: "fileSize".into(),
-            entry_is_directory_field: "isDirectory".into(),
-            entry_last_modified_field: "lastModified".into(),
-            entry_strip_prefix: None,
-        }
-    }
-}
-
 /// Join `base_url`, a path `prefix`, and a store-relative `path` into a single URL, trimming
 /// stray slashes at each seam.
 fn join_url(base_url: &str, prefix: &str, path: &str) -> String {
