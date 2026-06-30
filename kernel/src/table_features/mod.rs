@@ -68,7 +68,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 /// - **WriterOnly** (applies only to writers).
 /// There are no ReaderOnly features. See `TableFeature::feature_type` for the category of each.
 ///
-/// The kernel currently supports all reader features except `V2Checkpoint`.
+/// The kernel currently supports all reader features.
 #[derive(
     Serialize,
     Deserialize,
