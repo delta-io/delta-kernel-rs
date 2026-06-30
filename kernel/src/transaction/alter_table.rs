@@ -7,6 +7,7 @@
 #![allow(unreachable_pub)]
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::committer::Committer;
 use crate::metrics::MetricId;
@@ -38,6 +39,7 @@ impl AlterTableTransaction {
         read_snapshot: SnapshotRef,
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
+        correlation_id: Option<Arc<str>>,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
@@ -49,7 +51,7 @@ impl AlterTableTransaction {
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
-            correlation_id: None,
+            correlation_id,
             read_snapshot_opt: Some(read_snapshot),
             effective_table_config,
             should_emit_protocol: false,
