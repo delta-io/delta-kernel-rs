@@ -67,18 +67,27 @@ mod tests {
     use std::io::Write as _;
     use std::sync::Arc;
 
+    use rstest::rstest;
     use tempfile::NamedTempFile;
     use url::Url;
 
     use super::PlanBasedJsonHandler;
     use crate::arrow::array::{Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::plans::parquet::PlanBasedParquetHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::schema::{DataType, StructField, StructType};
-    use crate::{EngineData, FileMeta, JsonHandler as _};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::{
+        DeltaResult, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler as _,
+        ParquetHandler as _,
+    };
 
     fn make_handler() -> PlanBasedJsonHandler {
         PlanBasedJsonHandler::new(Arc::new(SyncPlanExecutor::new()))
+    }
+
+    fn make_parquet_handler() -> PlanBasedParquetHandler {
+        PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::new()))
     }
 
     fn temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
@@ -124,16 +133,16 @@ mod tests {
         assert!(iter.next().is_none(), "expected exactly one batch");
     }
 
-    /// No files -> an absent plan -> a zero-row result (no rows, no error).
-    #[test]
-    fn test_read_json_files_empty_is_empty() {
-        let schema =
-            Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap());
-        let rows: usize = make_handler()
-            .read_json_files(&[], schema, None)
-            .unwrap()
-            .map(|batch| batch.unwrap().len())
-            .sum();
+    fn test_schema() -> SchemaRef {
+        Arc::new(StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap())
+    }
+
+    /// No files -> an absent plan -> a zero-row result (no rows, no error), for either handler.
+    #[rstest]
+    #[case(make_handler().read_json_files(&[], test_schema(), None))]
+    #[case(make_parquet_handler().read_parquet_files(&[], test_schema(), None))]
+    fn empty_input_yields_no_rows(#[case] res: DeltaResult<FileDataReadResultIterator>) {
+        let rows: usize = res.unwrap().map(|batch| batch.unwrap().len()).sum();
         assert_eq!(rows, 0);
     }
 

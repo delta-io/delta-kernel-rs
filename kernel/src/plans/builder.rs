@@ -3,24 +3,50 @@
 //! a new builder; clone a builder (cheap) to feed it into more than one transform. Validating
 //! methods return [`DeltaResult`] and surface errors at the call site.
 //!
-//! A source with no rows (e.g. a scan over no files) is the *absent* relation -- uninhabited, but
-//! it still carries its output schema. Transforms validate against that schema as usual and
-//! propagate absence (a union drops absent arms, an anti-join with an absent build forwards its
-//! probe, etc.). [`build`](PlanBuilder::build) materializes an absent relation as an empty
-//! [`Values`] node, so it always yields a runnable plan; [`build_opt`](PlanBuilder::build_opt)
-//! yields `None` for it.
+//! A source with no rows (e.g. a scan over no files) is the *absent* relation. The builder treats
+//! it as dead code: transforms validate as usual but propagate absence, eliminating the parts of
+//! the plan that cannot contribute rows (a union drops absent arms, an anti-join with an absent
+//! build forwards its probe, etc.). [`build`](PlanBuilder::build) collapses the plan to its
+//! minimal correct shape, emitting a single empty [`Values`] node when the whole relation is
+//! absent, so it always yields a runnable plan; [`build_opt`](PlanBuilder::build_opt) yields
+//! `None` for it.
+//!
+//! ```
+//! use std::sync::Arc;
+//! use delta_kernel::PlanBuilder;
+//! use delta_kernel::FileMeta;
+//! use delta_kernel::plans::ir::nodes::Operator;
+//! use delta_kernel::schema::{DataType, StructField, StructType};
+//!
+//! let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
+//!
+//! // A scan over no files is the *absent* relation: it produces no rows, so the builder
+//! // eliminates it as dead code, collapsing the plan to its minimal correct shape. Downstream
+//! // transforms still validate and chain exactly as they would over a populated source.
+//! let scan = PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], schema)?;
+//!
+//! // `build_opt` reports the eliminated plan as `None` ...
+//! assert!(scan.build_opt()?.is_none());
+//! // ... while `build` keeps the plan runnable, replacing the absent relation with a single
+//! // empty `Values` node.
+//! let plan = scan.build()?;
+//! let [node] = plan.nodes.as_slice() else { panic!("expected one node") };
+//! assert!(matches!(&node.op, Operator::Values(values) if values.rows.is_empty()));
+//! # Ok::<(), delta_kernel::Error>(())
+//! ```
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::ir::nodes::{
-    Aggregate, Filter, Load, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin,
-    UnionAll, Values,
+    Aggregate, AggregateBuilder, FileType, Filter, Load, Operator, Project, ScanFile, ScanJson,
+    ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::SchemaRef;
 use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
 
 /// One node of a plan DAG: an operator, its inputs, and its output schema. Node identity is the
@@ -74,6 +100,15 @@ impl PlanBuilder {
         }
     }
 
+    /// Apply a single-input transform: wrap `op` (output `schema`) over a present input, or stay
+    /// absent. Callers validate against [`Self::schema`] first.
+    fn apply_op(self, op: impl Into<Operator>, schema: SchemaRef) -> Self {
+        match self.0 {
+            PlanBuilderRoot::Present(node) => Self::node(op, vec![node], schema),
+            PlanBuilderRoot::Absent(_) => Self::absent(schema),
+        }
+    }
+
     /// A Parquet scan source over `files` producing rows matching `schema`.
     ///
     /// `file_constant_columns` names the per-file-constant output columns (see [`ScanParquet`]);
@@ -86,16 +121,7 @@ impl PlanBuilder {
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(
-            files,
-            file_constant_columns,
-            schema,
-            |files, file_constant_columns, schema| ScanParquet {
-                files,
-                file_constant_columns,
-                schema,
-            },
-        )
+        Self::scan_source(FileType::Parquet, files, file_constant_columns, schema)
     }
 
     /// A newline-delimited JSON scan source over `files` producing rows matching `schema`. See
@@ -105,64 +131,82 @@ impl PlanBuilder {
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(
-            files,
-            file_constant_columns,
-            schema,
-            |files, file_constant_columns, schema| ScanJson {
-                files,
-                file_constant_columns,
-                schema,
-            },
-        )
+        Self::scan_source(FileType::Json, files, file_constant_columns, schema)
     }
 
-    /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Yields the absent relation for
-    /// an empty file set, else the source node that `build` constructs from the normalized files,
-    /// file-constant columns, and schema.
-    fn scan_source<O: Into<Operator>>(
+    /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Normalizes and validates the
+    /// inputs, then yields the absent relation for an empty file set, else the scan source node for
+    /// `file_type`.
+    fn scan_source(
+        file_type: FileType,
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
-        build: impl FnOnce(Vec<ScanFile>, Vec<ColumnName>, SchemaRef) -> O,
     ) -> DeltaResult<Self> {
         let schema = schema.into();
         let files = Vec::from_iter(files.into_iter().map(Into::into));
-        let cols = Vec::from_iter(file_constant_columns.iter().map(|c| ColumnName::new([*c])));
+        let cols = Vec::from_iter(file_constant_columns.iter().map(|&c| c.to_string()));
         for (i, file) in files.iter().enumerate() {
             if file.file_constants.len() != cols.len() {
                 return Err(Error::generic(format!(
-                    "scan: file {i} has {} constant value(s) for {} file-constant column(s)",
+                    "scan: file {i} has {} constant value(s) {:?} for {} file-constant column(s) {:?}",
                     file.file_constants.len(),
+                    file.file_constants,
                     cols.len(),
+                    cols,
                 )));
             }
         }
-        check_columns_resolve(&schema, &cols, "scan file_constant_columns")?;
+        check_file_constant_columns(&schema, &cols, "scan file_constant_columns")?;
         if files.is_empty() {
             return Ok(Self::absent(schema));
         }
-        let node = build(files, cols, Arc::clone(&schema));
-        Ok(Self::node(node, vec![], schema))
+        let op: Operator = match file_type {
+            FileType::Parquet => ScanParquet {
+                files,
+                file_constant_columns: cols,
+                schema: Arc::clone(&schema),
+            }
+            .into(),
+            FileType::Json => ScanJson {
+                files,
+                file_constant_columns: cols,
+                schema: Arc::clone(&schema),
+            }
+            .into(),
+        };
+        Ok(Self::node(op, vec![], schema))
     }
 
     /// Inline literal rows. See [`Values`] for the row encoding. Empty `rows` yields the absent
     /// relation.
     ///
     /// Produces an error when any row's width differs from `schema`'s top-level field count.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
+    /// let plan = PlanBuilder::values(schema, vec![vec![1.into()], vec![2.into()]])?.build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
     pub fn values(schema: impl Into<SchemaRef>, rows: Vec<Vec<Scalar>>) -> DeltaResult<Self> {
         let schema = schema.into();
-        if rows.is_empty() {
-            return Ok(Self::absent(schema));
-        }
         let width = schema.fields().count();
         for (i, row) in rows.iter().enumerate() {
             if row.len() != width {
                 return Err(Error::generic(format!(
-                    "values: row {i} has {} value(s) but schema has {width} field(s)",
+                    "values: row {i} has {} value(s) {:?} but schema has {width} field(s) {:?}",
                     row.len(),
+                    row,
+                    Vec::from_iter(schema.fields().map(|f| f.name())),
                 )));
             }
+        }
+        if rows.is_empty() {
+            return Ok(Self::absent(schema));
         }
         let node = Values {
             schema: Arc::clone(&schema),
@@ -174,16 +218,26 @@ impl PlanBuilder {
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
     ///
     /// Produces an error when `predicate` references a column absent from the input schema.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use url::Url;
+    /// # use delta_kernel::{FileMeta, PlanBuilder};
+    /// # use delta_kernel::expressions::col;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
+    /// let file = FileMeta::new(Url::parse("file:///table/part-0.parquet")?, 0, 1024);
+    /// let plan = PlanBuilder::scan_parquet([file], &[], schema)?
+    ///     .filter(col!("id").is_not_null())?
+    ///     .build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> DeltaResult<Self> {
         let predicate = predicate.into();
         check_columns_resolve(self.schema(), predicate.references(), "filter")?;
-        match self.0 {
-            PlanBuilderRoot::Present(node) => {
-                let schema = Arc::clone(&node.schema);
-                Ok(Self::node(Filter { predicate }, vec![node], schema))
-            }
-            PlanBuilderRoot::Absent(schema) => Ok(Self::absent(schema)),
-        }
+        let schema = Arc::clone(self.schema());
+        Ok(self.apply_op(Filter { predicate }, schema))
     }
 
     /// Project `self` through `expr` into rows of the caller-declared `schema`. `expr` must be a
@@ -191,9 +245,28 @@ impl PlanBuilder {
     ///
     /// Produces an error when `expr` references a column absent from the input schema. References
     /// inside a `StructPatch` are validated by [`ProjectionStructPatchBuilder`] when the patch is
-    /// built.
     ///
     /// [`ProjectionStructPatchBuilder`]: crate::struct_patch::ProjectionStructPatchBuilder
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use url::Url;
+    /// # use delta_kernel::{FileMeta, PlanBuilder};
+    /// # use delta_kernel::expressions::{col, Expression};
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let input = Arc::new(StructType::try_new([
+    ///     StructField::not_null("id", DataType::INTEGER),
+    ///     StructField::nullable("name", DataType::STRING),
+    /// ])?);
+    /// let out = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
+    /// let file = FileMeta::new(Url::parse("file:///table/part-0.parquet")?, 0, 1024);
+    /// // Keep only `id`.
+    /// let plan = PlanBuilder::scan_parquet([file], &[], input)?
+    ///     .project(Expression::struct_from([col!("id")]), out)?
+    ///     .build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
     pub fn project(
         self,
         expr: impl Into<ExpressionRef>,
@@ -202,16 +275,11 @@ impl PlanBuilder {
         let out = schema.into();
         let expr = expr.into();
         check_columns_resolve(self.schema(), expr.references(), "project")?;
-        match self.0 {
-            PlanBuilderRoot::Present(node) => {
-                let project = Project {
-                    expr,
-                    schema: Arc::clone(&out),
-                };
-                Ok(Self::node(project, vec![node], out))
-            }
-            PlanBuilderRoot::Absent(_) => Ok(Self::absent(out)),
-        }
+        let project = Project {
+            expr,
+            schema: Arc::clone(&out),
+        };
+        Ok(self.apply_op(project, out))
     }
 
     /// Project `self` by editing its columns. `edit` receives a [`ProjectionStructPatchBuilder`]
@@ -222,19 +290,10 @@ impl PlanBuilder {
     /// absent from the input schema, or a nested path does not resolve.
     pub fn project_patch(
         self,
-        edit: impl FnOnce(ProjectionStructPatchBuilder<'_>) -> ProjectionStructPatchBuilder<'_>,
+        patch: impl FnOnce(ProjectionStructPatchBuilder<'_>) -> ProjectionStructPatchBuilder<'_>,
     ) -> DeltaResult<Self> {
-        let (out, expr) = edit(ProjectionStructPatchBuilder::new(self.schema())).build()?;
-        match self.0 {
-            PlanBuilderRoot::Present(node) => {
-                let project = Project {
-                    expr,
-                    schema: Arc::clone(&out),
-                };
-                Ok(Self::node(project, vec![node], out))
-            }
-            PlanBuilderRoot::Absent(_) => Ok(Self::absent(out)),
-        }
+        let (out, expr) = patch(ProjectionStructPatchBuilder::new(self.schema())).build()?;
+        self.project(expr, out)
     }
 
     /// Read data files named by `self`'s rows. Output schema is `load.schema`. See [`Load`].
@@ -251,21 +310,18 @@ impl PlanBuilder {
         ];
         check_columns_resolve(self.schema(), meta, "load")?;
         // File-constant columns are sourced upstream and emitted in the output, so check both.
-        check_columns_resolve(
+        check_file_constant_columns(
             self.schema(),
             &load.file_constant_columns,
             "load file_constant source",
         )?;
-        check_columns_resolve(
+        check_file_constant_columns(
             &load.schema,
             &load.file_constant_columns,
             "load file_constant",
         )?;
         let out = Arc::clone(&load.schema);
-        match self.0 {
-            PlanBuilderRoot::Present(node) => Ok(Self::node(load, vec![node], out)),
-            PlanBuilderRoot::Absent(_) => Ok(Self::absent(out)),
-        }
+        Ok(self.apply_op(load, out))
     }
 
     /// Aggregate `self` into `aggregate` (build one with [`Aggregate::group_by`]). The output
@@ -301,6 +357,40 @@ impl PlanBuilder {
         }
     }
 
+    /// Aggregate `self`, grouped by `keys`. `aggs` receives an [`AggregateBuilder`] rooted at
+    /// `self`'s schema and adds the aggregate columns (see [`AggregateBuilder::max`], ...). Mirrors
+    /// [`Self::aggregate`] but spares the caller from naming the input schema, just as
+    /// [`Self::project_patch`] does for [`Self::project`]. See [`Aggregate`].
+    ///
+    /// Produces an error under the same conditions as [`Self::aggregate`].
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use url::Url;
+    /// # use delta_kernel::{FileMeta, PlanBuilder};
+    /// # use delta_kernel::expressions::column_name;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([
+    ///     StructField::not_null("id", DataType::INTEGER),
+    ///     StructField::nullable("version", DataType::LONG),
+    /// ])?);
+    /// let file = FileMeta::new(Url::parse("file:///table/part-0.parquet")?, 0, 1024);
+    /// // Latest `version` per `id`.
+    /// let plan = PlanBuilder::scan_parquet([file], &[], schema)?
+    ///     .aggregate_by([column_name!("id")], |a| a.max(column_name!("version")))?
+    ///     .build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
+    pub fn aggregate_by(
+        self,
+        keys: impl CollectInto<Vec<ColumnName>>,
+        aggs: impl FnOnce(AggregateBuilder) -> AggregateBuilder,
+    ) -> DeltaResult<Self> {
+        let builder = Aggregate::group_by(Arc::clone(self.schema()), keys);
+        self.aggregate(aggs(builder))
+    }
+
     /// Semi join: emit the `self` (probe) rows that have a match in `build` on the join keys.
     /// Output schema mirrors `self`. Inputs are recorded as `[probe, build]`. See [`SemiJoin`].
     ///
@@ -308,6 +398,20 @@ impl PlanBuilder {
     ///
     /// Produces an error when the probe and build key counts differ, or a probe/build key is absent
     /// from its input schema.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::expressions::column_name;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
+    /// let probe = PlanBuilder::values(Arc::clone(&schema), vec![vec![1.into()], vec![2.into()]])?;
+    /// let allow = PlanBuilder::values(schema, vec![vec![2.into()]])?;
+    /// // Probe rows whose `id` appears in `allow`.
+    /// let plan = probe.semi_join(allow, [column_name!("id")], [column_name!("id")])?.build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
     pub fn semi_join(
         self,
         build: PlanBuilder,
@@ -339,7 +443,8 @@ impl PlanBuilder {
         let build_keys = Vec::from_iter(build_keys);
         if probe_keys.len() != build_keys.len() {
             return Err(Error::generic(format!(
-                "join: {} probe key(s) but {} build key(s); they must match",
+                "join: {} probe key(s) {probe_keys:?} but {} build key(s) {build_keys:?}; \
+                 they must match in length.",
                 probe_keys.len(),
                 build_keys.len(),
             )));
@@ -371,6 +476,18 @@ impl PlanBuilder {
     /// dropped, and a lone present input is forwarded unchanged.
     ///
     /// Produces an error when `inputs` is empty, or two inputs have differing schemas.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
+    /// let a = PlanBuilder::values(Arc::clone(&schema), vec![vec![1.into()]])?;
+    /// let b = PlanBuilder::values(schema, vec![vec![2.into()]])?;
+    /// let plan = PlanBuilder::union_all([a, b])?.build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
     pub fn union_all(inputs: impl IntoIterator<Item = PlanBuilder>) -> DeltaResult<Self> {
         let inputs = Vec::from_iter(inputs);
         let Some(schema) = inputs.first().map(|b| Arc::clone(b.schema())) else {
@@ -378,7 +495,9 @@ impl PlanBuilder {
         };
         if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
             return Err(Error::generic(format!(
-                "union_all: input {i} has a schema differing from input 0"
+                "union_all: input {i} has a schema differing from input 0: {:?} vs {:?}",
+                inputs[i].schema(),
+                schema,
             )));
         }
         let mut present = Vec::from_iter(inputs.into_iter().filter_map(|b| match b.0 {
@@ -396,7 +515,7 @@ impl PlanBuilder {
     /// single empty [`Values`] node carrying its schema, so the result is always a runnable plan.
     pub fn build(&self) -> DeltaResult<Plan> {
         Ok(match &self.0 {
-            PlanBuilderRoot::Present(root) => linearize(root),
+            PlanBuilderRoot::Present(root) => Self::build_plan(root),
             PlanBuilderRoot::Absent(schema) => Plan {
                 nodes: vec![PlanNode {
                     op: Values {
@@ -413,40 +532,41 @@ impl PlanBuilder {
     /// Like [`Self::build`], but yields `None` for an absent relation instead of an empty plan.
     pub fn build_opt(&self) -> DeltaResult<Option<Plan>> {
         Ok(match &self.0 {
-            PlanBuilderRoot::Present(root) => Some(linearize(root)),
+            PlanBuilderRoot::Present(root) => Some(Self::build_plan(root)),
             PlanBuilderRoot::Absent(_) => None,
         })
     }
-}
 
-/// Linearize the DAG rooted at `root` into a [`Plan`]. A post-order walk emits each node after its
-/// inputs (topological order), so `root` -- the terminal -- is the last node. A node is identified
-/// by its index in [`Plan::nodes`]; shared subgraphs are emitted once (a node reached again reuses
-/// its first-assigned index), and nodes unreachable from `root` are dropped.
-fn linearize(root: &BuilderNodeRef) -> Plan {
-    // `emitted` maps a node's address to its index, deduping shared subgraphs. The address is a
-    // stable identity while the DAG holds the `Arc` alive.
-    fn emit(
-        node: &BuilderNodeRef,
-        nodes: &mut Vec<PlanNode>,
-        emitted: &mut HashMap<*const BuilderNode, usize>,
-    ) -> usize {
-        let key = Arc::as_ptr(node);
-        if let Some(&index) = emitted.get(&key) {
-            return index;
+    /// Linearize the DAG rooted at `root` into a [`Plan`]. A post-order walk emits each node after
+    /// its inputs (topological order), so `root` -- the terminal -- is the last node. A node is
+    /// identified by its index in [`Plan::nodes`]; shared subgraphs are emitted once (a node
+    /// reached again reuses its first-assigned index), and nodes unreachable from `root` are
+    /// dropped.
+    fn build_plan(root: &BuilderNodeRef) -> Plan {
+        // `emitted` maps a node's address to its index, deduping shared subgraphs. The address is a
+        // stable identity while the DAG holds the `Arc` alive.
+        fn emit(
+            node: &BuilderNodeRef,
+            nodes: &mut Vec<PlanNode>,
+            emitted: &mut HashMap<*const BuilderNode, usize>,
+        ) -> usize {
+            let key = Arc::as_ptr(node);
+            if let Some(&index) = emitted.get(&key) {
+                return index;
+            }
+            let inputs = Vec::from_iter(node.inputs.iter().map(|i| emit(i, nodes, emitted)));
+            let index = nodes.len();
+            nodes.push(PlanNode {
+                op: node.op.clone(),
+                inputs,
+            });
+            emitted.insert(key, index);
+            index
         }
-        let inputs = Vec::from_iter(node.inputs.iter().map(|i| emit(i, nodes, emitted)));
-        let index = nodes.len();
-        nodes.push(PlanNode {
-            op: node.op.clone(),
-            inputs,
-        });
-        emitted.insert(key, index);
-        index
+        let mut nodes = Vec::new();
+        emit(root, &mut nodes, &mut HashMap::new());
+        Plan { nodes }
     }
-    let mut nodes = Vec::new();
-    emit(root, &mut nodes, &mut HashMap::new());
-    Plan { nodes }
 }
 
 /// Error if any of `cols` fails to resolve against `schema` (nested paths supported).
@@ -456,9 +576,39 @@ fn check_columns_resolve<'a>(
     ctx: &str,
 ) -> DeltaResult<()> {
     for col in cols {
-        schema
-            .field_at(col)
-            .map_err(|_| Error::generic(format!("{ctx}: column `{col}` not found in schema")))?;
+        schema.field_at(col).map_err(|_| {
+            Error::generic(format!(
+                "{ctx}: column `{col}` not found; schema has {:?}",
+                Vec::from_iter(schema.fields().map(|f| f.name())),
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Error unless each of `names` is a top-level, non-metadata field of `schema`. A file-constant is
+/// one scalar broadcast into a top-level field, so nested paths and engine-generated metadata
+/// columns are rejected.
+fn check_file_constant_columns<'a>(
+    schema: &SchemaRef,
+    names: impl IntoIterator<Item = &'a String>,
+    ctx: &str,
+) -> DeltaResult<()> {
+    for name in names {
+        match schema.field(name.as_str()) {
+            Some(field) if field.is_metadata_column() => {
+                return Err(Error::generic(format!(
+                    "{ctx}: column `{name}` is a metadata column"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                return Err(Error::generic(format!(
+                    "{ctx}: column `{name}` not found; schema has {:?}",
+                    Vec::from_iter(schema.fields().map(|f| f.name())),
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -505,9 +655,14 @@ mod tests {
         PlanBuilder::values(schema, vec![row]).unwrap()
     }
 
-    /// The absent (uninhabited) relation over `id_schema`: an empty scan.
+    /// The absent (uninhabited) relation over `schema`.
+    fn absent_over(schema: SchemaRef) -> PlanBuilder {
+        PlanBuilder::values(schema, vec![]).unwrap()
+    }
+
+    /// The absent (uninhabited) relation over `id_schema`.
     fn absent_src() -> PlanBuilder {
-        PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], id_schema()).unwrap()
+        absent_over(id_schema())
     }
 
     /// A discriminant tag for asserting a node's operator without matching its payload.
@@ -566,7 +721,7 @@ mod tests {
     /// Both scan sources carry file-constant columns and record them on the node.
     #[test]
     fn scans_record_file_constant_columns() -> DeltaResult<()> {
-        let part = vec![column_name!("part")];
+        let part = vec!["part".to_string()];
 
         let parquet = PlanBuilder::scan_parquet(
             vec![one_constant_file("file:///a.parquet")],
@@ -703,11 +858,17 @@ mod tests {
     #[case::empty_json(PlanBuilder::scan_json(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_values(PlanBuilder::values(id_schema(), vec![]))]
     #[case::filter(absent_src().filter(col!("id").is_not_null()))]
+    #[case::project(absent_src().project(Expression::struct_from([col!("id")]), id_schema()))]
     #[case::project_patch(absent_src().project_patch(|p| p.drop("id")))]
+    #[case::load(absent_over(load_input_schema()).load(load_node(load_output_schema())))]
     #[case::grouped_aggregate(absent_src().aggregate(
         Aggregate::group_by(part_schema(), [column_name!("id")]).max(column_name!("part"))))]
-    #[case::semi_join(
+    #[case::semi_join_absent_build(
         vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("id")]))]
+    #[case::semi_join_absent_probe(
+        absent_src().semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
+    #[case::anti_join_absent_probe(
+        absent_src().anti_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
     #[case::union_all_of_absent(PlanBuilder::union_all([absent_src(), absent_src()]))]
     fn collapses_to_absent(#[case] builder: DeltaResult<PlanBuilder>) -> DeltaResult<()> {
         assert!(builder?.build_opt()?.is_none()); // absent has no plan to run
@@ -760,6 +921,18 @@ mod tests {
             Aggregate::group_by(part_schema(), [column_name!("id")])
                 .max_non_null_by(column_name!("part"), column_name!("id")),
         )?;
+        assert_eq!(agg.schema(), &part_schema());
+        assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
+        Ok(())
+    }
+
+    /// `aggregate_by` roots the `AggregateBuilder` at the input schema, yielding the same plan as
+    /// `aggregate` with an explicitly schema'd builder.
+    #[test]
+    fn aggregate_by_infers_input_schema() -> DeltaResult<()> {
+        let agg = vals(part_schema()).aggregate_by([column_name!("id")], |a| {
+            a.max_non_null_by(column_name!("part"), column_name!("id"))
+        })?;
         assert_eq!(agg.schema(), &part_schema());
         assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
         Ok(())
@@ -900,7 +1073,7 @@ mod tests {
         );
         Load::new(out_schema, FileType::Parquet, file_meta, column_name!("dv"))
             .with_base_url(url::Url::parse("memory:///").unwrap())
-            .with_file_constant_columns([column_name!("version")])
+            .with_file_constant_columns(["version"])
     }
 
     /// An upstream (input) schema carrying every column `load_node` reads, including the
