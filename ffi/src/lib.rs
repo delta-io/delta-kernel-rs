@@ -1584,6 +1584,7 @@ mod tests {
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
+    use serde_json::Value;
     use test_utils::{
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
         actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
@@ -2170,6 +2171,51 @@ mod tests {
         }
     }
 
+    /// Common setup for the checkpoint tests: seed an in-memory table (V1 or V2) with
+    /// `num_add_actions` single-add commits, then build a `DefaultEngine` and a latest-version
+    /// snapshot.
+    ///
+    /// The engine is wired to a multi-threaded task executor on purpose: `Snapshot::checkpoint`
+    /// drives nested `block_on` calls that would deadlock on the default single-threaded
+    /// background executor.
+    ///
+    /// Returns the backing `storage` (for post-checkpoint assertions) plus the owned `engine`
+    /// and `snapshot` handles; the caller must `free_snapshot` and `free_engine` them.
+    async fn setup_checkpoint_test(
+        is_v2: bool,
+        num_add_actions: usize,
+    ) -> Result<
+        (
+            Arc<InMemory>,
+            Handle<SharedExternEngine>,
+            Handle<SharedSnapshot>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        if is_v2 {
+            seed_v2_table(storage.as_ref(), table_root, num_add_actions).await?;
+        } else {
+            seed_v1_table(storage.as_ref(), table_root, num_add_actions).await?;
+        }
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        Ok((storage, engine, snapshot))
+    }
+
     // Checkpoint sidecar shape is driven by (table kind, spec). Each case writes a checkpoint and
     // asserts the resulting `_delta_log/_sidecars/` object count.
     //
@@ -2204,27 +2250,7 @@ mod tests {
         #[case] spec: Option<FfiCheckpointSpec>,
         #[case] expected_sidecars: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        if is_v2 {
-            seed_v2_table(storage.as_ref(), table_root, num_add_actions).await?;
-        } else {
-            seed_v1_table(storage.as_ref(), table_root, num_add_actions).await?;
-        }
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
-        );
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let (storage, engine, snapshot) = setup_checkpoint_test(is_v2, num_add_actions).await?;
 
         let result = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -2250,23 +2276,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        seed_v2_table(storage.as_ref(), table_root, 3).await?;
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
-        );
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let (_storage, engine, snapshot) = setup_checkpoint_test(true, 3).await?;
 
         let spec = FfiCheckpointSpec::V2WithSidecar {
             file_actions_per_sidecar_hint: OptionalValue::Some(0),
@@ -2289,23 +2299,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        seed_v1_table(storage.as_ref(), table_root, 1).await?;
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
-        );
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let (_storage, engine, snapshot) = setup_checkpoint_test(false, 1).await?;
 
         let spec = FfiCheckpointSpec::V2NoSidecar;
         let extern_result = unsafe {
@@ -2334,23 +2328,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        seed_v1_table(storage.as_ref(), table_root, 2).await?;
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
-        );
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let (_storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
         // First call on the original snapshot: writes the checkpoint => `Written`.
@@ -2382,29 +2360,14 @@ mod tests {
         Ok(())
     }
 
-    // The snapshot handle returned by the `Written` variant is usable for downstream
-    // calls (here: `version(returned_snap)` matches input; chained `checkpoint_snapshot`
-    // returns `AlreadyExists` since we're still at the same table version).
+    // The `Written` snapshot is usable downstream: `version` matches input, and a chained
+    // `checkpoint_snapshot` returns `AlreadyExists` (same table version). Also validates the
+    // `_delta_log/_last_checkpoint` content (version, numOfAddFiles, size, sizeInBytes), which
+    // `test_checkpoint_snapshot_sidecar_shape` doesn't cover.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_written_snapshot_is_usable(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        seed_v1_table(storage.as_ref(), table_root, 2).await?;
-
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = engine_to_handle(
-            Arc::new(
-                DefaultEngineBuilder::new(storage.clone())
-                    .with_task_executor(executor)
-                    .build(),
-            ),
-            allocate_err,
-        );
-        let snapshot =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let (storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
         let result = unsafe {
@@ -2420,7 +2383,22 @@ mod tests {
         let returned_version = unsafe { version(written_snap.shallow_copy()) };
         assert_eq!(returned_version, input_version);
 
-        // (b) chain a second checkpoint_snapshot(returned_snap, engine, None) =>
+        // (b) `_last_checkpoint` exists and describes the checkpoint we just wrote.
+        let last_checkpoint = storage
+            .get(&Path::from("_delta_log/_last_checkpoint"))
+            .await?;
+        let v: Value = serde_json::from_slice(last_checkpoint.bytes().await?.as_ref())?;
+        assert_eq!(v["version"].as_u64(), Some(2));
+        // 2 adds at versions 1..=2, no removes => 2 live add files.
+        assert_eq!(v["numOfAddFiles"].as_u64(), Some(2));
+        // size = 1 protocol + 1 metadata + 2 live adds.
+        assert_eq!(v["size"].as_u64(), Some(4));
+        // Cross-check the checkpoint parquet file size against `_last_checkpoint.sizeInBytes`.
+        let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
+        let checkpoint_size = storage.head(&checkpoint_path).await?.size;
+        assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
+
+        // (c) chain a second checkpoint_snapshot(returned_snap, engine, None) =>
         // AlreadyExists.
         let chained = unsafe {
             ok_or_panic(checkpoint_snapshot(
