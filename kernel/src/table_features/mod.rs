@@ -146,9 +146,12 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
-    /// timestamps without timezone support
-    #[strum(serialize = "timestampNtz")]
-    #[serde(rename = "timestampNtz")]
+    /// Timestamps without timezone support.
+    ///
+    /// Accepts the legacy `timestampWithoutTimezone` alias on read; always writes the canonical
+    /// `timestampNtz`. See <https://github.com/delta-io/delta-kernel-rs/issues/2557>.
+    #[strum(to_string = "timestampNtz", serialize = "timestampWithoutTimezone")]
+    #[serde(rename = "timestampNtz", alias = "timestampWithoutTimezone")]
     TimestampWithoutTimezone,
     // Allow columns to change type
     TypeWidening,
@@ -961,6 +964,40 @@ mod tests {
                 "expected Unsupported, got: {result:?}"
             ),
         }
+    }
+
+    #[test]
+    fn test_timestamp_ntz_legacy_alias() {
+        assert_eq!(
+            "timestampNtz".into_table_feature(),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            "timestampWithoutTimezone".into_table_feature(),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampNtz\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampWithoutTimezone\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.to_string(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.as_ref(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            serde_json::to_string(&TableFeature::TimestampWithoutTimezone).unwrap(),
+            "\"timestampNtz\""
+        );
     }
 
     #[test]
