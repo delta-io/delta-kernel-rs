@@ -117,11 +117,12 @@ pub struct RestEngineBuilder {
 }
 
 impl RestEngineBuilder {
-    fn opt_or(&self, key: &str, default: &str) -> String {
-        self.options
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| default.to_string())
+    /// Apply the option named `key` to `field`, leaving `field` (its [`Default`]) untouched when
+    /// the option is unset. Centralizes field defaults in [`RestEndpointConfig::default`].
+    fn apply_opt(&self, key: &str, field: &mut String) {
+        if let Some(value) = self.options.get(key) {
+            field.clone_from(value);
+        }
     }
 }
 
@@ -210,23 +211,31 @@ pub unsafe extern "C" fn rest_engine_builder_build(
 fn rest_engine_builder_build_impl(
     builder: &RestEngineBuilder,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    // Field-name and query-param fallbacks mirror the Databricks Files API; a caller targeting a
-    // different REST backend overrides any of them via `set_rest_engine_builder_option`.
-    let config = RestEndpointConfig {
-        files_prefix: builder.opt_or("files_prefix", ""),
-        directories_prefix: builder.opt_or("directories_prefix", ""),
-        page_token_param: builder.opt_or("page_token_param", "page_token"),
-        start_from_param: builder.opt_or("start_from_param", "start_from"),
-        recursive_param: builder.opt_or("recursive_param", "recursive"),
-        overwrite_param: builder.opt_or("overwrite_param", "overwrite"),
-        contents_field: builder.opt_or("contents_field", "contents"),
-        next_page_token_field: builder.opt_or("next_page_token_field", "nextPageToken"),
-        entry_path_field: builder.opt_or("entry_path_field", "path"),
-        entry_size_field: builder.opt_or("entry_size_field", "fileSize"),
-        entry_is_directory_field: builder.opt_or("entry_is_directory_field", "isDirectory"),
-        entry_last_modified_field: builder.opt_or("entry_last_modified_field", "lastModified"),
+    // Field-name and query-param fallbacks live in `RestEndpointConfig::default` (the Databricks
+    // Files API dialect); a caller targeting a different REST backend overrides any of them via
+    // `set_rest_engine_builder_option`.
+    let mut config = RestEndpointConfig {
         entry_strip_prefix: builder.options.get("entry_strip_prefix").cloned(),
+        ..Default::default()
     };
+    builder.apply_opt("files_prefix", &mut config.files_prefix);
+    builder.apply_opt("directories_prefix", &mut config.directories_prefix);
+    builder.apply_opt("page_token_param", &mut config.page_token_param);
+    builder.apply_opt("start_from_param", &mut config.start_from_param);
+    builder.apply_opt("recursive_param", &mut config.recursive_param);
+    builder.apply_opt("overwrite_param", &mut config.overwrite_param);
+    builder.apply_opt("contents_field", &mut config.contents_field);
+    builder.apply_opt("next_page_token_field", &mut config.next_page_token_field);
+    builder.apply_opt("entry_path_field", &mut config.entry_path_field);
+    builder.apply_opt("entry_size_field", &mut config.entry_size_field);
+    builder.apply_opt(
+        "entry_is_directory_field",
+        &mut config.entry_is_directory_field,
+    );
+    builder.apply_opt(
+        "entry_last_modified_field",
+        &mut config.entry_last_modified_field,
+    );
 
     // When an auth callback is registered, the kernel pulls headers from it (caching for the TTL
     // it reports, if any). Otherwise use the static `header.<Name>` options.

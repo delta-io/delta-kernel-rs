@@ -111,6 +111,11 @@ impl RestObjectStore {
     /// error). Reads the object back to distinguish a write that landed (success) from a real
     /// conflict, retrying only while the write is confirmed absent.
     ///
+    /// A `409` (conflict) on the *first* attempt is a genuine pre-existing object and returns
+    /// `AlreadyExists` immediately. On a *retry*, a `409` is most likely the writer's own
+    /// already-landed write (the prior attempt succeeded despite an ambiguous error), so it is
+    /// routed through the read-back instead of being trusted verbatim.
+    ///
     /// Assumes the backend writes objects verbatim and atomically, and that commit bodies carry
     /// writer-unique content -- so a byte-for-byte match implies we wrote it, not a competitor.
     async fn put_create_verified(
@@ -133,10 +138,16 @@ impl RestObjectStore {
                 .await
             {
                 Ok(resp) => {
-                    if let Some(err) = self.status_error(resp.status(), path) {
-                        return Err(err);
-                    }
-                    if !resp.status().is_server_error() {
+                    let status = resp.status();
+                    if let Some(err) = self.status_error(status, path) {
+                        // A conflict on a retry may be our own landed write, so reconcile it via
+                        // read-back rather than trusting it; on the first attempt it is a genuine
+                        // pre-existing conflict and is returned as-is.
+                        let conflict = matches!(err, ObjectStoreError::AlreadyExists { .. });
+                        if !(conflict && retry > 0) {
+                            return Err(err);
+                        }
+                    } else if !status.is_server_error() {
                         resp.error_for_status().map_err(generic_err)?;
                         return Ok(put_result());
                     }
@@ -144,16 +155,20 @@ impl RestObjectStore {
                 Err(e) if is_transient(&e) => {}
                 Err(e) => return Err(generic_err(e)),
             }
-            // Ambiguous outcome -- read back to tell a landed write from a real conflict.
-            match self.read_back(path, &body).await? {
-                WriteState::Matches => return Ok(put_result()),
-                WriteState::Differs => {
+            // Ambiguous outcome -- read back to tell a landed write from a real conflict. A
+            // transient read-back failure leaves the outcome ambiguous, so treat it like an absent
+            // write and consume a retry rather than making it terminal.
+            match self.read_back(path, &body).await {
+                Ok(WriteState::Matches) => return Ok(put_result()),
+                Ok(WriteState::Differs) => {
                     return Err(ObjectStoreError::AlreadyExists {
                         path: path.to_string(),
                         source: "verified conflicting write".into(),
                     })
                 }
-                WriteState::Absent => {}
+                Ok(WriteState::Absent) => {}
+                Err(e) if retry >= self.max_retries => return Err(e),
+                Err(_) => {}
             }
             if retry >= self.max_retries {
                 return Err(generic_msg(format!(
@@ -168,24 +183,21 @@ impl RestObjectStore {
     /// Read `path` back and compare its bytes with `expected`.
     async fn read_back(&self, path: &str, expected: &Bytes) -> ObjectStoreResult<WriteState> {
         match self.get_file(path, None).await {
-            Ok((bytes, _)) if bytes == *expected => Ok(WriteState::Matches),
+            Ok((bytes, _, _)) if bytes == *expected => Ok(WriteState::Matches),
             Ok(_) => Ok(WriteState::Differs),
             Err(ObjectStoreError::NotFound { .. }) => Ok(WriteState::Absent),
             Err(e) => Err(e),
         }
     }
 
-    /// Delete a single object via HTTP `DELETE`.
+    /// Delete a single object via HTTP `DELETE`. DELETE is idempotent, so transient failures are
+    /// retried via [`Self::send_idempotent`].
     async fn delete_one(&self, location: &Path) -> ObjectStoreResult<()> {
         let path = location.as_ref().trim_end_matches('/');
         let url = self.config.file_url(&self.base_url, path);
         let response = self
-            .client
-            .delete(&url)
-            .headers(self.headers()?)
-            .send()
-            .await
-            .map_err(generic_err)?;
+            .send_idempotent(|c, h| c.delete(&url).headers(h))
+            .await?;
         self.check_status(response, path)?;
         Ok(())
     }
@@ -217,11 +229,14 @@ impl RestObjectStore {
         response.error_for_status().map_err(generic_err)
     }
 
+    /// GET `path` (optionally with a `Range` header) and return the body, response headers, and
+    /// HTTP status. The status lets a ranged caller distinguish a partial (`206`) response from a
+    /// full-body `200`.
     async fn get_file(
         &self,
         path: &str,
         range_header: Option<&str>,
-    ) -> ObjectStoreResult<(Bytes, HeaderMap)> {
+    ) -> ObjectStoreResult<(Bytes, HeaderMap, reqwest::StatusCode)> {
         let url = self.config.file_url(&self.base_url, path);
         let range = range_header
             .map(reqwest::header::HeaderValue::from_str)
@@ -236,9 +251,10 @@ impl RestObjectStore {
             })
             .await?;
         let response = self.check_status(response, path)?;
+        let status = response.status();
         let resp_headers = response.headers().clone();
         let body = response.bytes().await.map_err(generic_err)?;
-        Ok((body, resp_headers))
+        Ok((body, resp_headers, status))
     }
 
     /// Issue an HTTP `HEAD` and build [`ObjectMeta`] from the response headers, without
@@ -272,15 +288,13 @@ impl RestObjectStore {
         prefix: String,
         start_from: Option<String>,
         exclusive_offset: Option<Path>,
+        recursive: bool,
     ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let store = self.clone();
         let stream = async_stream::stream! {
             let mut page_token: Option<String> = None;
             // start_from applies only to the first request; page_token drives later pages.
             let mut start_from = start_from;
-            // A `start_from` offset implies a flat (non-recursive) listing; a plain list with no
-            // offset recurses to honor the ObjectStore::list contract.
-            let recursive = start_from.is_none();
             // The contract requires ascending paths across the whole listing; verified here so a
             // misordered backend fails loudly instead of corrupting log replay.
             let mut last_path: Option<Path> = None;
@@ -374,6 +388,11 @@ fn parse_content_range(header: &str) -> ObjectStoreResult<(std::ops::Range<u64>,
     let (start, end) = range_part.split_once('-').ok_or_else(invalid)?;
     let start = start.parse::<u64>().map_err(|_| invalid())?;
     let end = end.parse::<u64>().map_err(|_| invalid())?;
+    // Reject a reversed or out-of-bounds range: `end < start` would underflow in
+    // `GetResult::bytes()`, and `start > total` is nonsensical for a partial response.
+    if end < start || start > total {
+        return Err(invalid());
+    }
     Ok((start..end.saturating_add(1), total))
 }
 
@@ -439,6 +458,8 @@ impl ObjectStore for RestObjectStore {
         // don't download the object just to read its size/etag (e.g. parquet footer probes).
         if options.head {
             let meta = self.head_meta(path_str, location).await?;
+            // Enforce client-side conditional preconditions against the HEAD metadata.
+            options.check_preconditions(&meta)?;
             let size = meta.size;
             return Ok(GetResult {
                 payload: GetResultPayload::Stream(Box::pin(futures::stream::empty())),
@@ -448,8 +469,19 @@ impl ObjectStore for RestObjectStore {
             });
         }
 
+        let ranged = options.range.is_some();
         let range_header = options.range.as_ref().map(get_range_to_header);
-        let (content, headers) = self.get_file(path_str, range_header.as_deref()).await?;
+        let (content, headers, status) = self.get_file(path_str, range_header.as_deref()).await?;
+
+        // A ranged request that comes back non-partial (a 200 with the full body) must not be
+        // silently treated as the requested slice. Mirror object_store's `NotPartial` behavior and
+        // surface an error rather than handing back the wrong bytes.
+        if ranged && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(generic_msg(format!(
+                "ranged GET for `{path_str}` returned a non-partial response (HTTP {status}); \
+                 expected 206 Partial Content"
+            )));
+        }
 
         // Derive byte range + total size from Content-Range (partial responses) or the body length.
         let (range, total_size) = match headers
@@ -463,16 +495,21 @@ impl ObjectStore for RestObjectStore {
         let last_modified = parse_last_modified(&headers);
         let e_tag = parse_etag(&headers);
 
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified,
+            size: total_size,
+            e_tag,
+            version: None,
+        };
+        // Enforce client-side conditional preconditions (if_match / if_none_match /
+        // if_modified_since / if_unmodified_since) against the resolved metadata.
+        options.check_preconditions(&meta)?;
+
         let stream = Box::pin(futures::stream::once(futures::future::ready(Ok(content))));
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream),
-            meta: ObjectMeta {
-                location: location.clone(),
-                last_modified,
-                size: total_size,
-                e_tag,
-                version: None,
-            },
+            meta,
             range,
             attributes: Attributes::new(),
         })
@@ -515,7 +552,8 @@ impl ObjectStore for RestObjectStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let prefix = prefix.map(|p| p.as_ref().to_string()).unwrap_or_default();
-        self.list_paginated(prefix, None, None)
+        // Both `list` and `list_with_offset` recurse; only `list_with_delimiter` is non-recursive.
+        self.list_paginated(prefix, None, None, true)
     }
 
     fn list_with_offset(
@@ -535,7 +573,7 @@ impl ObjectStore for RestObjectStore {
                 raw.to_string()
             }
         };
-        self.list_paginated(prefix, Some(offset_str), Some(offset.clone()))
+        self.list_paginated(prefix, Some(offset_str), Some(offset.clone()), true)
     }
 
     // object_store 0.12 (arrow-57) has `delete` on the trait; 0.13 (arrow-58) replaced it with the
@@ -595,5 +633,28 @@ impl ObjectStore for RestObjectStore {
     #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
     async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> ObjectStoreResult<()> {
         Err(not_supported("copy_if_not_exists"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_range_accepts_valid() {
+        let (range, total) = parse_content_range("bytes 2-5/10").unwrap();
+        assert_eq!(range, 2..6);
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn parse_content_range_rejects_reversed_range() {
+        // `end < start` would underflow in GetResult::bytes(); it must be an error.
+        assert!(parse_content_range("bytes 5-2/10").is_err());
+    }
+
+    #[test]
+    fn parse_content_range_rejects_start_past_total() {
+        assert!(parse_content_range("bytes 20-25/10").is_err());
     }
 }

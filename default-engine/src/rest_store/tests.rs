@@ -54,35 +54,16 @@ fn refreshing_header_provider_with_ttl_caches() {
     assert_eq!(second.get("authorization").unwrap(), "Bearer token-0");
 }
 
-/// Files-API-shaped field names and query params, as a base for test configs to override. Mirrors
-/// what the FFI builder falls back to (the production type intentionally has no `Default`).
-fn default_config() -> RestEndpointConfig {
-    RestEndpointConfig {
-        files_prefix: String::new(),
-        directories_prefix: String::new(),
-        page_token_param: "page_token".into(),
-        start_from_param: "start_from".into(),
-        recursive_param: "recursive".into(),
-        overwrite_param: "overwrite".into(),
-        contents_field: "contents".into(),
-        next_page_token_field: "nextPageToken".into(),
-        entry_path_field: "path".into(),
-        entry_size_field: "fileSize".into(),
-        entry_is_directory_field: "isDirectory".into(),
-        entry_last_modified_field: "lastModified".into(),
-        entry_strip_prefix: None,
-    }
-}
-
 /// A minimal REST dialect for tests: files at `/files/{path}`, directories at `/dirs/{path}`, and
-/// a `{ "contents": [{path, size}], "nextPageToken" }` list body. Field names and the canonical
-/// 404 -> NotFound / 409 -> AlreadyExists status mapping come from [`default_config`].
+/// a `{ "contents": [{path, size}], "nextPageToken" }` list body. Other field names and the
+/// canonical 404 -> NotFound / 409 -> AlreadyExists status mapping come from
+/// [`RestEndpointConfig::default`].
 fn test_config() -> RestEndpointConfig {
     RestEndpointConfig {
         files_prefix: "files".into(),
         directories_prefix: "dirs".into(),
         entry_size_field: "size".into(),
-        ..default_config()
+        ..Default::default()
     }
 }
 
@@ -130,6 +111,34 @@ async fn get_malformed_content_range_yields_error() {
         .await;
     let store = store_for(&server, HeaderMap::new());
     let err = store.get(&Path::from("a.txt")).await.unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Generic { .. }),
+        "got {err:?}"
+    );
+}
+
+/// A ranged GET whose server ignores the range and returns a non-partial `200` with the full
+/// body must error rather than silently treating the whole body as the requested slice (mirrors
+/// object_store's `NotPartial` behavior).
+#[tokio::test]
+async fn ranged_get_non_partial_response_yields_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"full-body".as_slice()))
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let err = store
+        .get_opts(
+            &Path::from("a.txt"),
+            GetOptions {
+                range: Some((0..4).into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, ObjectStoreError::Generic { .. }),
         "got {err:?}"
@@ -357,6 +366,52 @@ async fn list_out_of_order_entries_yields_error() {
     assert!(matches!(results[1], Err(ObjectStoreError::Generic { .. })));
 }
 
+/// The sorted-listing contract holds *across* pages: a later page whose first entry sorts before
+/// the previous page's last entry must surface as an error, not feed log replay a misordered list.
+#[tokio::test]
+async fn list_out_of_order_across_pages_yields_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dirs/d"))
+        .and(wiremock::matchers::query_param_is_missing("page_token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"contents":[{"path":"d/3","size":3}],"nextPageToken":"p2"}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/dirs/d"))
+        .and(wiremock::matchers::query_param("page_token", "p2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"contents":[{"path":"d/1","size":1}]}"#),
+        )
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let results: Vec<_> = store.list(Some(&Path::from("d"))).collect::<Vec<_>>().await;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].as_ref().unwrap().location.as_ref(), "d/3");
+    assert!(
+        matches!(results[1], Err(ObjectStoreError::Generic { .. })),
+        "got {:?}",
+        results[1]
+    );
+}
+
+/// An unparseable entry path fails the whole page rather than being silently dropped, consistent
+/// with the module's fail-loudly philosophy.
+#[test]
+fn parse_list_rejects_unparseable_entry_path() {
+    let config = test_config();
+    // A `\0` byte in the path is not a valid object-store path.
+    let body = "{\"contents\":[{\"path\":\"d/\\u0000bad\",\"size\":1}]}";
+    assert!(matches!(
+        config.parse_list(body.as_bytes()),
+        Err(ObjectStoreError::Generic { .. })
+    ));
+}
+
 #[tokio::test]
 async fn auth_headers_are_sent() {
     let server = MockServer::start().await;
@@ -409,7 +464,7 @@ async fn config_driven_contract_parses_list_and_reads() {
     let config = RestEndpointConfig {
         files_prefix: "api/2.0/fs/files".into(),
         directories_prefix: "api/2.0/fs/directories".into(),
-        ..default_config()
+        ..Default::default()
     };
     // Listing with one file and one subdirectory; the directory entry must be filtered out.
     Mock::given(method("GET"))
@@ -467,7 +522,7 @@ fn store_with_strip_prefix(server: &MockServer, prefix: &str) -> RestObjectStore
     let config = RestEndpointConfig {
         directories_prefix: "dirs".into(),
         entry_strip_prefix: Some(prefix.into()),
-        ..default_config()
+        ..Default::default()
     };
     RestObjectStore::new(
         server.uri(),
@@ -641,6 +696,55 @@ async fn put_create_verified_retries_until_write_lands() {
     store_for(&server, HeaderMap::new())
         .with_verify_on_ambiguous(true)
         .with_max_retries(1)
+        .put_opts(
+            &Path::from("a.txt"),
+            PutPayload::from_static(b"hi"),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// On a retry, a `409` is the writer's own already-landed write rather than a foreign conflict:
+/// attempt1 PUT 500 with an absent read-back consumes a retry, then attempt2 PUT 409 reconciles
+/// via read-back to matching bytes and succeeds (not `AlreadyExists`).
+#[tokio::test]
+async fn put_create_verified_retry_conflict_matches_own_write_succeeds() {
+    let server = MockServer::start().await;
+    // Attempt 1 PUT -> 500 (ambiguous); attempt 2 PUT -> 409 (our own landed write).
+    Mock::given(method("PUT"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(409))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    // Read-back after attempt 1 -> 404 (absent, consume a retry); after attempt 2 -> matching body.
+    Mock::given(method("GET"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hi".as_slice()))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    store_for(&server, HeaderMap::new())
+        .with_verify_on_ambiguous(true)
+        .with_max_retries(2)
         .put_opts(
             &Path::from("a.txt"),
             PutPayload::from_static(b"hi"),

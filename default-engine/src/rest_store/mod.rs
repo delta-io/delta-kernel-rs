@@ -10,10 +10,10 @@
 //! - [`AuthHeaderProvider`] -- headers attached to every request (auth, identity). Consulted per
 //!   request, so an implementation can refresh short-lived credentials.
 //! - [`RestEndpointConfig`] -- the REST dialect, described as data: path-to-URL mapping, list and
-//!   write query parameters, list-response field names, and HTTP-status-to-[`ObjectStoreError`]
-//!   mapping.
+//!   write query parameters, list-response field names, and backend-specific HTTP statuses (e.g.
+//!   409) to [`ObjectStoreError`] mapping.
 //!
-//! Only the operations kernel needs are implemented (read, list, write, delete); the rest
+//! Only the operations kernel needs are implemented (read, head, list, write, delete); the rest
 //! return [`ObjectStoreError::NotSupported`].
 
 use delta_kernel::object_store::Error as ObjectStoreError;
