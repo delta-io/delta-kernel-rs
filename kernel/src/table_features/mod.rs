@@ -82,11 +82,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
     EnumCount,
     Hash,
 )]
-#[strum(
-    serialize_all = "camelCase",
-    parse_err_fn = xxx__not_needed__default_variant_means_parsing_is_infallible__xxx,
-    parse_err_ty = Infallible // ignored, sadly: https://github.com/Peternator7/strum/issues/430
-)]
+#[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 #[derive(EnumIter)]
@@ -761,38 +757,15 @@ impl TableFeature {
     }
 }
 
-/// Like `Into<TableFeature>`, but avoids collisions between strum's derived `EnumString` and the
-/// blanket impl `TryFrom<&str>` that `From<&str> for TableFeature` would trigger.
-///
-/// Parsing is infallible: the `Unknown` default variant catches any unrecognized feature name. If
-/// https://github.com/Peternator7/strum/pull/432 merges, use impl From for TableFeature instead.
-pub(crate) trait IntoTableFeature {
-    fn into_table_feature(self) -> TableFeature;
-}
-
-impl IntoTableFeature for TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self
+impl From<String> for TableFeature {
+    fn from(value: String) -> Self {
+        value.as_str().into()
     }
 }
 
-impl IntoTableFeature for &TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self.clone()
-    }
-}
-
-/// Parsing is infallible thanks to `TableFeature::Unknown` default variant
-impl IntoTableFeature for &str {
-    fn into_table_feature(self) -> TableFeature {
-        #[allow(clippy::unwrap_used)] // infallible, see strum parse_err_fn
-        self.parse().unwrap()
-    }
-}
-
-impl IntoTableFeature for String {
-    fn into_table_feature(self) -> TableFeature {
-        self.as_str().into_table_feature()
+impl From<&TableFeature> for TableFeature {
+    fn from(value: &TableFeature) -> Self {
+        value.clone()
     }
 }
 
@@ -1002,7 +975,7 @@ mod tests {
 
             // strum
             assert_eq!(feature.to_string(), expected);
-            assert_eq!(feature, expected.into_table_feature());
+            assert_eq!(feature, TableFeature::from(expected));
 
             // json
             let serialized = serde_json::to_string(&feature).unwrap();
