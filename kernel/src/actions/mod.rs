@@ -56,6 +56,8 @@ pub(crate) const SIDECAR_NAME: &str = "sidecar";
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
+#[internal_api]
+pub(crate) const CHECKPOINT_ACTION_NAME: &str = "checkpoint";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
@@ -92,6 +94,7 @@ static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
         StructField::nullable(CDC_NAME, Cdc::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+        StructField::nullable(CHECKPOINT_ACTION_NAME, CheckpointAction::to_schema()),
     ]))
 });
 
@@ -947,6 +950,160 @@ impl SetTransaction {
     }
 }
 
+/// Reference to the root of the V4 content metadata tree.
+///
+/// Contains the path and size of the root manifest file. This struct is nested inside
+/// [`CheckpointAction`] which adds the version field.
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
+pub(crate) struct ContentRoot {
+    /// Path to the root manifest file, relative to the table root unless it contains a URI
+    /// scheme (in which case it is absolute and used as-is). A relative path is resolved by
+    /// joining the table location and this path with a `/` separator, matching the [Iceberg V4
+    /// relative paths specification]. Unlike [`Add`]/[`Remove`] paths, this is not RFC 2396
+    /// percent-encoded.
+    ///
+    /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
+    pub(crate) path: String,
+    /// Size of the root manifest file in bytes. Not exposed directly -- use
+    /// [`CheckpointAction::root_filemeta`] to get a validated [`FileMeta`].
+    size_in_bytes: i64,
+}
+
+/// The checkpoint action embeds V4 metadata tree state in a Delta log entry.
+///
+/// When a manifest commit occurs, the Delta log entry contains a `checkpoint` action that
+/// references a V4 root manifest file. The `version` field indicates the table version up to
+/// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
+/// the table protocol and metadata, making the commit self-contained with respect to P+M.
+///
+/// The [adaptiveMetadata RFC] also defines optional `domainMetadata`, `txns`, and `sidecars`
+/// fields on this action (needed for full self-containedness); those are not yet modeled here.
+///
+/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
+///
+/// JSON format:
+/// ```json
+/// { "checkpoint": {
+///     "version": 42,
+///     "contentRoot": { "path": "...", "sizeInBytes": 1024 },
+///     "protocol": { ... },
+///     "metaData": { ... }
+/// } }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
+pub(crate) struct CheckpointAction {
+    /// The table version up to which the checkpoint is complete. May be less than or equal to
+    /// the commit version containing this checkpoint action.
+    pub(crate) version: i64,
+    /// Reference to the V4 root manifest file.
+    pub(crate) content_root: ContentRoot,
+    /// The table protocol at the checkpoint version.
+    pub(crate) protocol: Protocol,
+    /// The table metadata at the checkpoint version.
+    pub(crate) meta_data: Metadata,
+}
+
+impl CheckpointAction {
+    /// Path to the root manifest file (delegates to the nested [`ContentRoot`]).
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> &str {
+        &self.content_root.path
+    }
+
+    /// Get the checkpoint version.
+    #[allow(dead_code)]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O, resolving its
+    /// path against `table_root`. Mirrors [`Sidecar::to_filemeta`]'s size-conversion handling, but
+    /// follows the V4 root-manifest path scheme instead of the sidecar one: a path that parses
+    /// as an absolute URL with a real (multi-character) scheme is used as-is, otherwise it is
+    /// resolved relative to `table_root` by literal concatenation (not [`Url::join`] -- `join`
+    /// re-parses `path` as a standalone relative reference and, per RFC 3986 5.2.2, treats any
+    /// reference that itself looks like it has a scheme as already absolute, silently ignoring
+    /// `table_root`). A single-character "scheme" (e.g. `C:\foo`) is treated as a Windows drive
+    /// letter rather than a URI scheme, matching the convention already used by
+    /// [`crate::utils::try_parse_uri`]; this does not (and cannot, without a scheme allowlist)
+    /// disambiguate every possible multi-character pseudo-scheme. `table_root` is normalized to
+    /// end in `/` before concatenation, so callers don't need to guarantee that themselves. See
+    /// [`ContentRoot::path`].
+    ///
+    /// `table_root` must not carry a query string or fragment -- concatenation operates on its
+    /// full serialized form, so a query/fragment would otherwise silently absorb the appended
+    /// path instead of it becoming a new path segment. Returns an error if either is present.
+    ///
+    /// The root manifest has no recorded modification time. `last_modified` is set to
+    /// `i64::MAX` rather than `0` so that engines which cache or invalidate files based on
+    /// staleness (e.g. "evict if older than X") never treat the root manifest as stale.
+    #[allow(dead_code)]
+    pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
+        require!(
+            table_root.query().is_none() && table_root.fragment().is_none(),
+            Error::invalid_table_location(format!(
+                "table_root must not have a query or fragment, got: {table_root}"
+            ))
+        );
+        let path = self.path();
+        let location = match Url::parse(path) {
+            Ok(absolute) if absolute.scheme().len() > 1 => absolute,
+            _ => {
+                let mut table_root = table_root.as_str().to_string();
+                if !table_root.ends_with('/') {
+                    table_root.push('/');
+                }
+                Url::parse(&format!("{table_root}{path}")).map_err(|e| {
+                    Error::generic(format!(
+                        "Failed to resolve checkpoint contentRoot path {path:?} against table \
+                         root {table_root}: {e}"
+                    ))
+                })?
+            }
+        };
+        Ok(FileMeta {
+            location,
+            last_modified: i64::MAX,
+            size: self.content_root.size_in_bytes.try_into().map_err(|_| {
+                Error::generic(format!(
+                    "Failed to convert checkpoint contentRoot size {} to FileSize",
+                    self.content_root.size_in_bytes
+                ))
+            })?,
+        })
+    }
+
+    /// Fill missing protocol and metadata from this checkpoint action's nested fields.
+    ///
+    /// Manifest commits embed P+M inside the checkpoint action. This extracts them when
+    /// they haven't been found as top-level actions.
+    #[allow(dead_code)]
+    pub(crate) fn fill_missing_pm(
+        &self,
+        protocol_opt: &mut Option<Protocol>,
+        metadata_opt: &mut Option<Metadata>,
+    ) {
+        if protocol_opt.is_none() {
+            *protocol_opt = Some(self.protocol.clone());
+        }
+        if metadata_opt.is_none() {
+            *metadata_opt = Some(self.meta_data.clone());
+        }
+    }
+}
+
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
@@ -1089,7 +1246,8 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType, StructField};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{
-        Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
+        Engine, EvaluationHandler, FileSize, IntoEngineData, JsonHandler, ParquetHandler,
+        StorageHandler,
     };
 
     // duplicated
@@ -2180,5 +2338,173 @@ mod tests {
             tags.get("MIN_INSERTION_TIME"),
             Some(&Some("1677811178336000".to_string()))
         );
+    }
+
+    #[test]
+    fn test_checkpoint_action_schema() {
+        let schema = get_commit_schema()
+            .project(&[CHECKPOINT_ACTION_NAME])
+            .unwrap();
+
+        let checkpoint_field = schema.field(CHECKPOINT_ACTION_NAME).unwrap();
+        assert!(checkpoint_field.is_nullable());
+        let inner = match checkpoint_field.data_type() {
+            DataType::Struct(s) => s,
+            other => panic!("Expected struct, got {:?}", other),
+        };
+        let field_names: Vec<&str> = inner.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["version", "contentRoot", "protocol", "metaData"]
+        );
+
+        let protocol_field = inner.field("protocol").unwrap();
+        assert!(!protocol_field.is_nullable());
+        assert!(matches!(protocol_field.data_type(), DataType::Struct(_)));
+
+        let metadata_field = inner.field("metaData").unwrap();
+        assert!(!metadata_field.is_nullable());
+        assert!(matches!(metadata_field.data_type(), DataType::Struct(_)));
+    }
+
+    #[rstest]
+    #[case::relative_path(
+        "memory:///table/",
+        "metadata/root.parquet",
+        2048,
+        "memory:///table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::absolute_path(
+        "memory:///table/",
+        "s3://bucket/table/metadata/root.parquet",
+        2048,
+        "s3://bucket/table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::negative_size(
+        "memory:///table/",
+        "metadata/root.parquet",
+        -1,
+        "memory:///table/metadata/root.parquet",
+        Err("Failed to convert checkpoint contentRoot size -1")
+    )]
+    #[case::table_root_without_trailing_slash(
+        "memory:///table",
+        "metadata/root.parquet",
+        2048,
+        "memory:///table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::table_root_with_query_is_rejected(
+        "memory:///table/?foo=bar",
+        "metadata/root.parquet",
+        2048,
+        "",
+        Err("table_root must not have a query or fragment")
+    )]
+    #[case::table_root_with_fragment_is_rejected(
+        "memory:///table/#frag",
+        "metadata/root.parquet",
+        2048,
+        "",
+        Err("table_root must not have a query or fragment")
+    )]
+    #[case::windows_drive_letter_forward_slash_is_not_misclassified_as_absolute(
+        "memory:///table/",
+        "C:/root.parquet",
+        2048,
+        "memory:///table/C:/root.parquet",
+        Ok(2048)
+    )]
+    #[case::windows_drive_letter_backslash_is_not_misclassified_as_absolute(
+        "memory:///table/",
+        "C:\\root.parquet",
+        2048,
+        "memory:///table/C:\\root.parquet",
+        Ok(2048)
+    )]
+    // Known, accepted limitation (matching `crate::utils::try_parse_uri`'s same scope): a
+    // *multi*-character pseudo-scheme can't be distinguished from a real one without a scheme
+    // allowlist, so this relative path is (still) misclassified as absolute and used verbatim.
+    #[case::multi_character_pseudo_scheme_is_a_known_limitation(
+        "memory:///table/",
+        "part:1/root.parquet",
+        2048,
+        "part:1/root.parquet",
+        Ok(2048)
+    )]
+    fn test_checkpoint_action_root_filemeta(
+        #[case] table_root: &str,
+        #[case] path: &str,
+        #[case] size_in_bytes: i64,
+        #[case] expected_location: &str,
+        #[case] expected: Result<FileSize, &str>,
+    ) {
+        let table_root = Url::parse(table_root).unwrap();
+        let checkpoint_action = CheckpointAction {
+            version: 1,
+            content_root: ContentRoot {
+                path: path.to_string(),
+                size_in_bytes,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            meta_data: Metadata::default(),
+        };
+
+        let result = checkpoint_action.root_filemeta(&table_root);
+        match expected {
+            Ok(expected_size) => {
+                let file_meta = result.unwrap();
+                assert_eq!(file_meta.location.as_str(), expected_location);
+                assert_eq!(file_meta.size, expected_size);
+                assert_eq!(file_meta.last_modified, i64::MAX);
+            }
+            Err(expected_message) => assert_result_error_with_message(result, expected_message),
+        }
+    }
+
+    #[rstest]
+    fn test_fill_missing_pm_fills_only_when_absent(
+        #[values(true, false)] protocol_present: bool,
+        #[values(true, false)] metadata_present: bool,
+    ) {
+        let checkpoint_action = CheckpointAction {
+            version: 1,
+            content_root: ContentRoot {
+                path: "root.parquet".to_string(),
+                size_in_bytes: 1024,
+            },
+            protocol: Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![])),
+            meta_data: Metadata {
+                id: "from-checkpoint".to_string(),
+                ..Default::default()
+            },
+        };
+
+        // Distinct from the checkpoint's own P+M, so a wrongly-overwritten value is detectable.
+        let existing_protocol = Protocol::new_unchecked(1, 2, None, None);
+        let existing_metadata = Metadata {
+            id: "pre-existing".to_string(),
+            ..Default::default()
+        };
+
+        let mut protocol_opt = protocol_present.then(|| existing_protocol.clone());
+        let mut metadata_opt = metadata_present.then(|| existing_metadata.clone());
+
+        checkpoint_action.fill_missing_pm(&mut protocol_opt, &mut metadata_opt);
+
+        let expected_protocol = if protocol_present {
+            existing_protocol
+        } else {
+            checkpoint_action.protocol.clone()
+        };
+        let expected_metadata = if metadata_present {
+            existing_metadata
+        } else {
+            checkpoint_action.meta_data.clone()
+        };
+        assert_eq!(protocol_opt, Some(expected_protocol));
+        assert_eq!(metadata_opt, Some(expected_metadata));
     }
 }
