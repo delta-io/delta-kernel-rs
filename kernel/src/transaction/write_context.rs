@@ -25,6 +25,10 @@ pub(super) struct SharedWriteState {
     pub(super) physical_schema: SchemaRef,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
+    /// Subset of `stats_columns` eligible for min/max statistics. `nullCount` is collected for all
+    /// `stats_columns`, but min/max only for these (excludes interval columns; see
+    /// [`WriteContext::min_max_stats_columns`]).
+    pub(super) min_max_stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
     /// Resolved value of the `delta.randomizeFilePrefixes` table property. When true,
@@ -188,6 +192,18 @@ impl WriteContext {
         &self.shared.stats_columns
     }
 
+    /// Returns the subset of [`stats_columns`](Self::stats_columns) eligible for min/max
+    /// statistics.
+    ///
+    /// Engines must collect `nullCount` for every [`stats_columns`](Self::stats_columns) entry but
+    /// `minValues`/`maxValues` only for these. The two sets differ for types that have no
+    /// meaningful min/max -- notably interval columns, which are physically int32/int64: they
+    /// appear in [`stats_columns`](Self::stats_columns) (for `nullCount`) but not here, matching
+    /// DBR's behavior of recording interval `nullCount` without min/max.
+    pub fn min_max_stats_columns(&self) -> &[ColumnName] {
+        &self.shared.min_max_stats_columns
+    }
+
     /// Returns the serialized partition values for this write context. Keys are physical
     /// column names; values are protocol-serialized strings (`None` = null).
     ///
@@ -315,6 +331,7 @@ mod tests {
             physical_schema: schema.clone(),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
+            min_max_stats_columns: vec![],
             logical_partition_columns: partition_columns,
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)

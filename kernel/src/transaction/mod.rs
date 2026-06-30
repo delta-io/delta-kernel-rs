@@ -1052,6 +1052,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
             physical_schema: table_config.physical_write_schema(),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
+            min_max_stats_columns: table_config
+                .physical_min_max_stats_column_names(self.physical_clustering_columns.as_deref()),
             logical_partition_columns: table_config.partition_columns().to_vec(),
             randomize_file_prefixes: props.should_randomize_file_prefixes(),
             random_prefix_length: props.random_prefix_length(),

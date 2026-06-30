@@ -16,6 +16,9 @@ use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
+pub(crate) use interval_type::{
+    schema_contains_interval_type, validate_interval_type_feature_support,
+};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -33,6 +36,7 @@ use crate::{DeltaResult, Error};
 
 mod column_mapping;
 mod iceberg_compat;
+mod interval_type;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -147,8 +151,9 @@ pub(crate) enum TableFeature {
     DeletionVectors,
     /// ANSI interval types, in preview pending RFC ratification (`intervalType-preview`).
     ///
-    /// TODO(#2840): intervalType is not yet fully supported, gated on `interval-type-in-dev`. With
-    /// the gate on, tables that declare this feature are readable.
+    /// TODO(#2840): intervalType is not fully supported yet. Kernel support is gated by the
+    /// `interval-type-in-dev` cargo feature, and the feature is auto-enabled (like timestampNtz)
+    /// when a schema contains an interval column.
     #[strum(serialize = "intervalType-preview")]
     #[serde(rename = "intervalType-preview")]
     IntervalTypePreview,
@@ -565,21 +570,13 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#2840): allow `Operation::Write` once interval writes are implemented, and drop the gate
-// entirely once the RFC is ratified and interval support is merged.
+// TODO(#2840): drop the gate once the RFC is ratified and interval support is merged.
 static INTERVAL_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    // Read-only slice: kernel can scan interval tables and read their change feed, but cannot yet
-    // write them.
     #[cfg(feature = "interval-type-in-dev")]
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'intervalType-preview' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "interval-type-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
